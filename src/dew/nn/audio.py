@@ -24,7 +24,7 @@ from dew.registry import from_record, towers
 
 from .attention import LayerNorm, RMSNorm
 from .sharding import logical_axes
-from .text_encoders import checkpoint_array
+from .text_encoders import ParamTree, checkpoint_array, insert
 from .vision import TowerBase, TowerGeometry
 
 
@@ -605,7 +605,7 @@ def audio_weights(
     config: Gemma3nAudio | Gemma4Audio,
     *,
     param_dtype: str = "float32",
-) -> dict:
+) -> ParamTree:
     """Translate reference weights into params and frozen clipping constants.
 
     Prefix stripping belongs to the shared wrapper loader. Parameters use the
@@ -613,7 +613,7 @@ def audio_weights(
     retain their native dtype, and every shape is checked against the encoder.
     """
     expected = _audio_template(config)
-    placed = {}
+    placed: ParamTree = {}
     seen = set()
     for name, array in tensors.items():
         path = audio_weight_path(name, config)
@@ -623,10 +623,7 @@ def audio_weights(
         if path not in expected or value.shape != expected[path].shape:
             raise ValueError(f"audio tensor {name!r} with shape {value.shape} does not match the encoder")
         seen.add(path)
-        target = placed
-        for part in path[:-1]:
-            target = target.setdefault(part, {})
-        target[path[-1]] = value
+        insert(placed, path, value, name)
     missing = expected.keys() - seen
     if missing:
         raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")

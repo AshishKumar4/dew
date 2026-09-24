@@ -28,7 +28,7 @@ import numpy as np
 
 from dew import records
 from dew.nn.mixers.mamba2 import Mamba2Mixer
-from dew.nn.text_encoders import checkpoint_array
+from dew.nn.text_encoders import ParamTree, checkpoint_array, insert
 from dew.objectives.base import Variables
 
 if TYPE_CHECKING:
@@ -266,7 +266,7 @@ def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object]
     checkpoint's `[D, 1, K]`. A tied checkpoint's `lm_head.weight` is checked
     against the embedding and dropped.
     """
-    variables: dict[str, dict[str, object]] = {}
+    variables: ParamTree = {}
     for name, tensor in state_dict.items():
         path = weight_path(name, config)
         if path is None:
@@ -277,11 +277,5 @@ def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object]
         leaf = checkpoint_array(tensor, param_dtype)
         if path[-1] == "kernel":
             leaf = np.ascontiguousarray(leaf.T)
-        node: dict[str, object] = variables.setdefault(path[0], {})
-        for key in path[1:-1]:
-            child = node.setdefault(key, {})
-            if not isinstance(child, dict):
-                raise ValueError(f"{name!r} lands under a leaf at {'/'.join(path)}")
-            node = child
-        node[path[-1]] = leaf
+        insert(variables, path, leaf, name)
     return variables

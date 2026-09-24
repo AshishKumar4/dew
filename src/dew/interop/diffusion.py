@@ -17,31 +17,11 @@ from jax.typing import DTypeLike
 from dew import records
 from dew.interop.safetensors_io import read_weights
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
-from dew.nn.text_encoders import checkpoint_array
+from dew.nn.text_encoders import ParamTree, checkpoint_array, insert
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
-
-type TensorTree = dict[str, np.ndarray | TensorTree]
-
-
-def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
-    node = tree
-    for key in path[:-1]:
-        child = node.setdefault(key, {})
-        if not isinstance(child, dict):
-            raise ValueError(f"Tensor path crosses an existing leaf: {path}")
-        node = child
-    held = node.get(path[-1])
-    # A tied tensor a checkpoint stores under two names is one parameter,
-    # and each name is still bound for export. Two different arrays under
-    # one path are two parameters and one of them would be lost.
-    if isinstance(held, np.ndarray) and np.array_equal(held, value):
-        return
-    if held is not None:
-        raise ValueError(f"Two source tensors map to {path}")
-    node[path[-1]] = value
 
 
 def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
@@ -232,7 +212,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
 
 
 def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondition, *,
-                           param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+                           param_dtype: str = "float32") -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """Map UNet tensors into a parameter tree and the layouts that invert it.
 
     Each leaf is cast to `param_dtype` before its transpose. Attention kernels
@@ -240,7 +220,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     `record_layouts`.
     """
     from dew.interop.pretrained import WeightLayout
-    parameters: TensorTree = {}
+    parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
@@ -261,7 +241,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
                 else:
                     value = value.reshape(stage.heads, stage.features // stage.heads, stage.features)
                     transpose = (2, 0, 1)
-        _insert(parameters, path, value)
+        insert(parameters, path, value, name)
         layouts.append(WeightLayout("unet/" + name, (("params", *path),), tensor.shape, transpose))
     return parameters, tuple(layouts)
 
@@ -498,7 +478,7 @@ def _flux_path(name: str) -> tuple[str, ...]:
 
 
 def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-                           ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+                           ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """Map Flux tensors into a parameter tree and the layouts that invert it.
 
     Rotary tables are computed from input ids, so Flux stores no positional
@@ -508,7 +488,7 @@ def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: st
 
 
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-                          ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
+                          ) -> tuple[ParamTree, ParamTree, tuple[WeightLayout, ...]]:
     """Map SD3 tensors into a parameter tree, its buffers and the inverting layouts.
 
     The source's position embedding is a persistent sin/cos-initialized
@@ -520,7 +500,7 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
 
     parameters, layouts = record_layouts(
         "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype)
-    buffers: TensorTree = {}
+    buffers: ParamTree = {}
     position = tensors.get("pos_embed.pos_embed")
     if position is None:
         raise ValueError("An SD3 transformer stores its position embedding buffer")
@@ -627,7 +607,7 @@ def _qwen_image_path(name: str) -> tuple[str, ...]:
 
 
 def translate_qwen_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-                                 ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+                                 ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """Map Qwen-Image 2.1 transformer tensors into a parameter tree and the
     layouts that invert it. Its rotary table is computed from positions, so
     it stores no buffer."""
@@ -643,7 +623,7 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
 
 def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
                    path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...], *,
-                   param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+                   param_dtype: str = "float32") -> tuple[ParamTree, tuple[WeightLayout, ...]]:
     """Map a component's tensors into a parameter tree and the layouts that invert it.
 
     `path_of` gives each tensor's tree path, or None to skip it. Kernels are
@@ -652,7 +632,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
     the transpose; buffers and scoring state are the caller's to keep in FP32.
     """
     from dew.interop.pretrained import WeightLayout
-    parameters: TensorTree = {}
+    parameters: ParamTree = {}
     layouts = []
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
@@ -665,17 +645,17 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
         if path[-1] == "kernel":
             transpose = (3, 2, 0, 1) if array.ndim == 4 else (1, 0)
             array = array.transpose(2, 3, 1, 0) if array.ndim == 4 else array.T
-        _insert(parameters, path, np.ascontiguousarray(array))
+        insert(parameters, path, np.ascontiguousarray(array), name)
         layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tensor.shape, transpose))
     return parameters, tuple(layouts)
 
 
-def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> TensorTree:
+def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> ParamTree:
     """Map canonical tensor names into the storage tree a Flax checkpoint declares.
 
     This translates files only; no foreign model implementation is imported.
     """
-    parameters: TensorTree = {}
+    parameters: ParamTree = {}
     for name, tensor in tensors.items():
         array = np.asarray(tensor)
         parts = name.split(".")
@@ -704,7 +684,7 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
             path = (*parts, leaf)
         if path[-1] == "kernel":
             array = array.transpose(2, 3, 1, 0) if array.ndim == 4 else array.T
-        _insert(parameters, path, np.ascontiguousarray(array))
+        insert(parameters, path, np.ascontiguousarray(array), name)
     return parameters
 
 
