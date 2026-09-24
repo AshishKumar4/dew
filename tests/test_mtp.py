@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import TEXT_KEY, LMObjective
 
@@ -256,6 +257,14 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
         assert any(jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"][depth]))
 
 
+def packed_row():
+    """One row of two documents, four and three tokens, then padding (segment 0)."""
+    ids = np.random.RandomState(0).randint(1, VOCAB, (1, SEQ + 1)).astype(np.int32)
+    segments = np.array([[1, 1, 1, 1, 2, 2, 2, 0, 0]], np.int32)
+    positions = np.array([[0, 1, 2, 3, 0, 1, 2, 0, 0]], np.int32)
+    return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
+
+
 def test_a_packed_batch_keeps_the_depths_inside_their_documents():
     """A depth's target counts only when the state that predicts it sits in
     the same document: depth 1 drops the last two transitions of every
@@ -263,23 +272,32 @@ def test_a_packed_batch_keeps_the_depths_inside_their_documents():
     model = tiny(num_nextn_predict_layers=1)
     objective = LMObjective(model, SEQ, mtp_weight=0.3)
     params = objective.init(jax.random.key(0))
-    ids = np.random.RandomState(0).randint(1, VOCAB, (1, SEQ + 1)).astype(np.int32)
-    # Two documents of four and three tokens, then padding (segment 0).
-    segments = np.array([[1, 1, 1, 1, 2, 2, 2, 0, 0]], np.int32)
-    positions = np.array([[0, 1, 2, 3, 0, 1, 2, 0, 0]], np.int32)
-    batch = {TEXT_KEY: jnp.asarray(ids), "segment_ids": jnp.asarray(segments),
-             "positions": jnp.asarray(positions)}
+    ids, segments, positions = packed_row()
 
     depths = objective.token_scores(
-        params, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
-        positions=jnp.asarray(positions), depths=True).depths
+        params, ids, segment_ids=segments, positions=positions, depths=True).depths
     (_, weights), = depths
 
     # State at p predicts the target at p + 2: only p = 0, 1 (document 1)
     # and p = 4 (document 2) stay inside a document.
     assert weights.tolist() == [[1, 1, 0, 0, 1, 0, 0]]
-    loss, aux = scalar_loss(objective, params, batch, step_at())
-    assert np.isfinite(float(loss)) and float(aux.metrics["mtp_ce"]) > 0
+
+
+def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
+    """Segment ids and positions may ride the `ModelInputs` instead of the
+    batch's packing columns, and the depths' loss is the same either way."""
+    objective = LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.3)
+    params = objective.init(jax.random.key(0))
+    ids, segments, positions = packed_row()
+    columns = {TEXT_KEY: ids, "text_segment_ids": segments, "text_positions": positions}
+    carried = {TEXT_KEY: ModelInputs(ids, {"segment_ids": segments, "positions": positions})}
+
+    _, by_columns = scalar_loss(objective, params, columns, step_at())
+    _, by_inputs = scalar_loss(objective, params, carried, step_at())
+
+    assert float(by_inputs.metrics["ce"]) == pytest.approx(float(by_columns.metrics["ce"]), rel=1e-6)
+    assert float(by_inputs.metrics["mtp_ce"]) == pytest.approx(
+        float(by_columns.metrics["mtp_ce"]), rel=1e-6)
 
 
 def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view():

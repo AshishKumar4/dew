@@ -327,6 +327,14 @@ def _packing(batch):
             None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
+def _documents(prepared: ModelInputs, segment_ids: jax.Array | None) -> jax.Array | None:
+    """A packed row's segment ids, from the packing column or else the `ModelInputs`.
+
+    `token_scores` refuses a batch that names them in both places.
+    """
+    return prepared.token_fields.get("segment_ids") if segment_ids is None else segment_ids
+
+
 # The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
 # the frozen token-to-expert table it selects by in the same collection
 # (dew.nn.moe.Router), and no load-balance update moves that.
@@ -706,6 +714,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if segment_ids is not None and "segment_ids" in packing:
             raise ValueError("segment_ids must come from either ModelInputs or the packing column")
         packing.update(_packing_of(segment_ids, positions))
+        segment_ids = _documents(prepared, segment_ids)
         params = thaw(params)
         replay = {}
         if routes is not None:
@@ -763,12 +772,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _row_weights(self, prepared, targets, segment_ids, roles, dtype):
         """Weight the targets the row itself scores.
 
-        A packed batch's own `segment_ids` column serves when the caller
-        names none, a supplied validity mask drops the transitions across
-        padding, and `loss_role` keeps one role's targets alone.
+        A supplied validity mask drops the transitions across padding, and
+        `loss_role` keeps one role's targets alone.
         """
-        packed_segments = segment_ids if segment_ids is not None else prepared.token_fields.get("segment_ids")
-        weights = self._target_weights(targets, packed_segments, dtype)
+        weights = self._target_weights(targets, segment_ids, dtype)
         valid = prepared.token_fields.get("attention_mask")
         if valid is not None:
             weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
@@ -1039,7 +1046,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             # do, so one Mean carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
-            total, queries = self._indexer_term(kls, prepared.tokens[:, :-1], segment_ids)
+            total, queries = self._indexer_term(kls, prepared.tokens[:, :-1],
+                                                _documents(prepared, segment_ids))
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Mean(prediction.total + self.indexer.weight * total, mass)
         statistics: Mean | LMStatistics = prediction
