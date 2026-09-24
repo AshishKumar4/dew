@@ -247,10 +247,14 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         origin = f"{hub[0]}@{hub[1]}"
     else:
         # A local directory's configs can change in place, so their contents
-        # name them, not their path.
+        # name them, not their path, and so do the size and mtime of the
+        # weights it can lend a component the file lacks.
         digest = hashlib.sha256()
         for file in metadata:
             digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
+        for file in sorted(configs.glob("*/*.safetensors*")):
+            status = file.stat()
+            digest.update(f"{file.relative_to(configs).as_posix()}\0{status.st_size}\0{status.st_mtime_ns}\0".encode())
         origin = f"{configs.resolve()}#{digest.hexdigest()}"
     target = Path(dew_cache_dir()) / "single_file" / _key(source, origin)
     if (target / "model_index.json").is_file():
@@ -284,10 +288,11 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
             empty = []
             for name in missing:
                 selected = folder_weights(weights / name)
-                empty += [] if selected else [name]
-                index = [f"{stem}.safetensors.index.json" for stem in WEIGHT_STEMS
-                         if (weights / name / f"{stem}.safetensors.index.json").is_file()]
-                for file in (*selected, *index):
+                if not selected:
+                    empty.append(name)
+                indexes = [f"{stem}.safetensors.index.json" for stem in WEIGHT_STEMS
+                           if (weights / name / f"{stem}.safetensors.index.json").is_file()]
+                for file in (*selected, *indexes):
                     _link((weights / name / file).resolve(), staging / name / file)
             if empty:
                 raise ValueError(
