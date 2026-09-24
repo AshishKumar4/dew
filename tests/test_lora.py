@@ -218,6 +218,21 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
         np.testing.assert_array_equal(np.asarray(ours_leaf), np.asarray(theirs_leaf))
 
 
+def test_a_run_record_holds_an_adapters_targets_not_its_source_bindings(loaded):
+    """A loaded adapter carries the source projections it was bound over,
+    which follow from the source the run record already names. The record
+    carries the adapter itself, and a record without bindings rebuilds it,
+    unbound, as a run config declares it."""
+    from dew.config import RunConfig
+
+    adapter, _ = loaded
+    assert adapter.layouts
+    record = json.loads(json.dumps(RunConfig(lora=adapter).to_dict()))
+    assert "layouts" not in record["lora"]
+    rebuilt = RunConfig.from_dict(record).lora
+    assert rebuilt == adapter and not rebuilt.layouts
+
+
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
     """PEFT's target_modules: a suffix names every projection under it; B
     starts at zero so the adapted forward is the base forward; A is drawn
