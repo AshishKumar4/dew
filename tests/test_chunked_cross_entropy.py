@@ -28,6 +28,7 @@ import optax
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.precision import rounded_operand
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
@@ -223,7 +224,14 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     order. Two correct paths can then differ by one bf16 ulp of the largest
     entry (measured: 2**-9 on 0.44, in some processes and not others). The
     bound is one bf16 ulp, 2**-8 relative, with a margin: a real divergence of
-    the two paths is orders above it."""
+    the two paths is orders above it.
+
+    The reference takes the logits from the operands the head multiplies,
+    rounded to bf16, at the highest precision, so its backward carries the
+    logits' cotangent in fp32 as the chunked head's state gradient does. The
+    model's own bf16 product rounds that cotangent, which moved the tied
+    embedding's gradient 1.7% of its largest entry on an A100.
+    """
     model = small_model()
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
@@ -231,7 +239,13 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     targets = jax.random.randint(jax.random.PRNGKey(1), (2, 12), 0, 97)
 
     def full(params):
-        logits = model.apply({'params': params}, ids)
+        hidden = model.apply({'params': params}, ids,
+                             method=CausalTransformer.hidden_states)
+        head = model.apply({'params': params}, params,
+                           method=CausalTransformer.head_weight)
+        operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16)
+                    for value in (hidden, head))
+        logits = jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST)
         return jnp.mean(
             optax.softmax_cross_entropy_with_integer_labels(logits, targets))
 
