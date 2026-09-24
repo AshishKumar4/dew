@@ -11,3 +11,7 @@ public/tutorials/
 
 # Built by `pnpm concepts:build`.
 dist-concepts/
+
+# Colab cells and logs written by concepts/model/make_cell.py and training runs.
+concepts/model/train_cell_*.py
+concepts/model/*.log
