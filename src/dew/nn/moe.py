@@ -794,7 +794,12 @@ def expert_dispatch[Parameters](
     # A pipeline vmaps its stages with spmd_axis_name=stage, and a vmapped
     # shard_map can split the new dimension only over an axis it holds
     # manual; the operands, which name no stage, are replicated over it.
-    if STAGE_AXIS in mesh.axis_names and STAGE_AXIS not in mesh.manual_axes:
+    # A stage axis of one runs no pipeline (`pipeline_stages`) and stays
+    # automatic: held manual, it would have the map's transpose psum the
+    # tokens' cotangents over it in their own dtype, and XLA's CPU compiler
+    # aborts on such a bf16 all-reduce (its AllReducePromotion clones only a
+    # binary reducer, and JAX wraps this one's add in a sharding constraint).
+    if mesh.shape.get(STAGE_AXIS, 1) > 1 and STAGE_AXIS not in mesh.manual_axes:
         manual.add(STAGE_AXIS)
     stored = []
     for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
