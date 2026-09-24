@@ -92,7 +92,7 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
 
 
-def gemma4_shaped(**overrides):
+def gemma4_shaped(dtype=jnp.float32, **overrides):
     """A gemma4-e2b shaped decoder twice the fixture's depth: runs of sliding
     layers, a full layer between them, four sharing layers at the end."""
     config = translate_config(json.loads((FIXTURES / "gemma4-e2b" / "config.json").read_text()))
@@ -102,11 +102,11 @@ def gemma4_shaped(**overrides):
         + ("sliding_attention",) * 5 + ("full_attention",),
         num_kv_shared_layers=4, max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    return models.build("causal_transformer", **{**with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
 
 
-def gemma3n_shaped(**overrides):
+def gemma3n_shaped(dtype=jnp.float32, **overrides):
     """A gemma3n-tiny shaped decoder of ten layers: sparsity on the first
     five, one width, the last two sharing keys and values."""
     config = translate_config(json.loads((FIXTURES / "gemma3n-tiny" / "config.json").read_text()))
@@ -117,35 +117,33 @@ def gemma3n_shaped(**overrides):
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
         num_kv_shared_layers=2, max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    return models.build("causal_transformer", **{**with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
 
 
-def deepseek_shaped(**overrides):
+def deepseek_shaped(dtype=jnp.float32, **overrides):
     """A deepseek-v3-tiny shaped decoder of six layers, one dense then five routed."""
     config = translate_config(json.loads((FIXTURES / "deepseek-v3-tiny" / "config.json").read_text()))
     config.update(num_layers=6, layer_types=("full_attention",) * 6, max_seq_len=16)
     config["mixture"] = {**config["mixture"], "layers": (1, 2, 3, 4, 5)}
     config.update(overrides)
-    return models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    return models.build("causal_transformer", **{**with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
 
 
-# Bounds on scanned logits and gradients against the plain loop.
-# Gemma 3n keeps the initialized forward check but checks gradients
-# at reference-scale projections with a live per-layer-input residual; its
+# Gemma 3n keeps the initialized forward check but checks gradients at
+# reference-scale projections with a live per-layer-input residual; its
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
 # one-ULP weight perturbations without any sparse-ReLU branch changing.
-# CE gradients are of order one. At fp32, Transformers 5.16.1 on identical
-# weights differs by at most 6.92e-6; scan/plain by 7.53e-7 on CPU and
-# 8.11e-6 on RTX 4080 (JAX 0.10/0.11). The 1e-5 bound also rejects
-# wrong-layer and missing-residual mutations.
-SHAPES = {
-    "gemma4": (gemma4_shaped, 1e-4, 1e-4),
-    "gemma3n": (gemma3n_shaped, 5e-4, 1e-5),
-    "deepseek": (deepseek_shaped, 1e-6, 1e-6),
-}
+SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped}
+
+FLOOR_FACTOR = 4.0
+"""How far a scanned stack may sit from the plain loop, in multiples of the
+plain loop's own distance from its float64 run: the rule tools/layout_parity.py
+judges a layout by. Scanning reorders the loop's fp32 sums, since a GPU fuses
+a scanned layer apart from its neighbours (a CPU compiles the two alike), so
+each run sits within its own rounding of the float64 result."""
 
 
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
@@ -162,35 +160,57 @@ def scanned_pair(build):
     return plain, scanned, variables, ids
 
 
+def widened(tree):
+    """`tree` as float64 host arrays, its integer leaves as they are."""
+    return jax.tree.map(lambda leaf: np.asarray(
+        leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
+
+
+def judged(single, double, candidate) -> tuple[float, str]:
+    """The worst leaf of `candidate` against `single`, as a fraction of
+    FLOOR_FACTOR times `single`'s distance from `double`, and its path. A
+    leaf's floor is never below one fp32 rounding of its largest value, so a
+    leaf the float64 run happens to match exactly still has a bound."""
+    worst = (0.0, "")
+    for (path, reference), exact, other in zip(
+            jax.tree_util.tree_leaves_with_path(single), jax.tree.leaves(double),
+            jax.tree.leaves(candidate), strict=True):
+        reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
+        floor = max(float(np.max(np.abs(reference - exact))),
+                    float(np.finfo(np.float32).eps * np.max(np.abs(exact))))
+        difference = float(np.max(np.abs(other - reference)))
+        ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
+        worst = max(worst, (ratio, jax.tree_util.keystr(path)))
+    return worst
+
+
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
-    """The grouping read off the geometry, and the scanned logits and
-    gradients against the plain loop's on a stack deep enough to scan, to
-    the bounds SHAPES states."""
-    build, logit_bound, gradient_bound = SHAPES[shape]
+    """The grouping read off the geometry, and the scanned logits, loss and
+    gradients against the plain loop's on a stack deep enough to scan, each
+    leaf within FLOOR_FACTOR of the plain loop's own distance from its
+    float64 run. That run is on the CPU backend, which every lane keeps
+    beside its accelerator, since a TPU has no float64."""
+    build = SHAPES[shape]
     plain, scanned, variables, ids = scanned_pair(build)
-    
+    ids = np.asarray(ids)
+    training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
 
-    logits = jax.jit(scanned.apply)(variables, ids)
-    difference = float(jnp.max(jnp.abs(logits - jax.jit(plain.apply)(variables, ids))))
-    assert difference < logit_bound, f"max |logit difference| {difference:.3e}"
-
-    if shape == "gemma3n":
-        variables = gemma3n_training_variables(variables)
-
-    def gradients(model):
+    def measured(model, forward, trained):
         def loss(params):
-            current = {**variables, "params": params}
+            current = {**trained, "params": params}
             if shape == "gemma3n":
                 return next_token_loss(model, current, ids)
             return jnp.mean(model.apply(current, ids) ** 2)
-        return jax.jit(jax.value_and_grad(loss))(variables["params"])
+        value, gradients = jax.jit(jax.value_and_grad(loss))(trained["params"])
+        return {"logits": jax.jit(model.apply)(forward, ids), "loss": value, "gradients": gradients}
 
-    loss, grads = gradients(plain)
-    scanned_loss, scanned_grads = gradients(scanned)
-    assert abs(float(loss - scanned_loss)) < logit_bound
-    difference = largest_difference(grads, scanned_grads)
-    assert difference < gradient_bound, f"max |gradient difference| {difference:.3e}"
+    single = measured(plain, variables, training)
+    candidate = measured(scanned, variables, training)
+    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
+        double = measured(build(dtype=jnp.float64), widened(variables), widened(training))
+    ratio, path = judged(single, double, candidate)
+    assert ratio <= 1, f"{path} is {ratio:.2f} of its bound"
 
 
 def gemma3n_training_variables(variables):
@@ -220,7 +240,7 @@ def test_a_scanned_init_is_the_plain_init(shape):
     """`init` draws the same way whatever `scan_layers` says, so the tree
     holds the same leaves with the same values, and the scanned model reads
     a checkpoint of the plain one leaf for leaf."""
-    build = SHAPES[shape][0]
+    build = SHAPES[shape]
     plain, scanned = build(), build(scan_layers=True)
     ids = jnp.ones((1, 4), jnp.int32)
     first, second = plain.init(jax.random.key(0), ids), scanned.init(jax.random.key(0), ids)
