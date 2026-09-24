@@ -1207,12 +1207,16 @@ def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
 def test_an_sm80_step_compiles_its_dots_to_cublas():
     """On sm80 the compiled training step holds no Triton GEMM fusion: every
-    dot is a cuBLAS call. Elsewhere XLA keeps its default."""
+    dot is a cuBLAS call. Elsewhere the step asks XLA for nothing, whether
+    or not XLA fuses GEMMs with Triton on that GPU."""
     from dew.nn.kernels.generation import device_generation
     from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS
+    from dew.training.trainer import step_compiler_options
 
     trainer, _, _ = held_lm_trainer()
+    if device_generation() not in TRITON_GEMM_OFF_GENERATIONS:
+        assert step_compiler_options(trainer.objective) is None
+        return
     state, _, _ = trainer.place()
     trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
-    triton = "__triton_gemm" in trainer.executable.as_text()
-    assert triton == (device_generation() not in TRITON_GEMM_OFF_GENERATIONS)
+    assert "__triton_gemm" not in trainer.executable.as_text()

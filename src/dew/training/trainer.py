@@ -33,7 +33,6 @@ from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.kernels.generation import device_generation
-from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
@@ -189,20 +188,18 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 def step_compiler_options(objective) -> dict[str, bool] | None:
     """XLA options for this objective's training step on this device: Triton
     GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
-    the model has no SSD mixer, unless the run set the flag itself."""
+    no mixer of the model keeps them, unless the run set the flag itself."""
     if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
             or xla_flag('xla_gpu_enable_triton_gemm') is not None):
         return None
     model = getattr(objective, 'model', None)
-    if model is None or _has_ssd_mixer(model):
+    if model is None:
         return None
-    return {'xla_gpu_enable_triton_gemm': False}
-
-
-def _has_ssd_mixer(model) -> bool:
     mixers = [getattr(model, 'mixer', None)]
     mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
-    return any(isinstance(mixer, Mamba2Mixer) for mixer in mixers)
+    if any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers):
+        return None
+    return {'xla_gpu_enable_triton_gemm': False}
 
 
 class Trainer(Generic[Loss, Effects]):

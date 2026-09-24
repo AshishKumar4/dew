@@ -115,6 +115,10 @@ class MixerBase:
     introspection and a tyro subcommand per kind.
     """
 
+    keeps_triton_gemm = False
+    """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
+    `dew.telemetry.devices.TRITON_GEMM_OFF_GENERATIONS` turns them off."""
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(
