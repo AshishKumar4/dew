@@ -820,13 +820,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
         return weights
 
-    def tile_head(self) -> bool:
+    def tile_head(self) -> str | None:
         """Move a head that keeps its whole logits to the generation's tile
-        (`chunked.chunked_tile`), and say whether it moved."""
+        (`chunked.chunked_tile`), and say what it moved to."""
         if self.head_tile is not None:
-            return False
+            return None
         self.head_tile = chunked_tile()
-        return True
+        return f"the head tiled {self.head_tile}"
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
