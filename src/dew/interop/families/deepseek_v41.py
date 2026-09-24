@@ -414,12 +414,11 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
     engram = record.get('engram')
     if not isinstance(engram, Mapping):
         return {}
-    from transformers import AutoTokenizer
-
+    from dew.data.text import load_tokenizer
     from dew.nn.engram import compressed_token_map
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
+        tokenizer = load_tokenizer(str(directory), local_files_only=True)
     except (OSError, ValueError) as error:
         raise ValueError(f"engram hashes over the tokenizer's compressed vocabulary, and "
                          f"{directory} ships no tokenizer it can read: {error}") from error

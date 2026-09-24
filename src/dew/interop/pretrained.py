@@ -2146,8 +2146,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
                                         dict[str, Mapping[str, object]]]:
     """Build Qwen-Image's conditioner: the Qwen3-VL language model, its
     processor's tokenizer and chat template, the parameters and their layouts."""
-    from transformers import AutoTokenizer
-
+    from dew.data.text import load_tokenizer
     from dew.interop import diffusion
 
     config = _component_config(directory, "text_encoder")
@@ -2170,7 +2169,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
     encoder = QwenImageConditioner(
-        decoder, AutoTokenizer.from_pretrained(directory / "processor"), params, str(directory),
+        decoder, load_tokenizer(str(directory / "processor")), params, str(directory),
         height, width, tokens=tokens, param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
 
