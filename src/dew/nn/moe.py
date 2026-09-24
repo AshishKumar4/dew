@@ -44,7 +44,16 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, STAGE_AXIS, LogicalAxes, batch_axes, logical_axes, logical_spec, mesh_axes
+from .sharding import (
+    EXPERT_AXIS,
+    STAGE_AXIS,
+    LayoutRefused,
+    LogicalAxes,
+    batch_axes,
+    logical_axes,
+    logical_spec,
+    mesh_axes,
+)
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -771,7 +780,7 @@ def expert_dispatch[Parameters](
     shards = mesh.shape.get(EXPERT_AXIS, 1)
     if dispatch == 'exchange' and not initializing and (
             shards <= 1 or num_experts % shards):
-        raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
+        raise LayoutRefused("exchange dispatch needs an expert mesh axis greater than one "
                          "that divides num_experts")
     capacity = None
     if capacity_factor is not None:
@@ -899,7 +908,7 @@ def _dispatched[Parameters](
     held = jax.tree.unflatten(jax.tree.structure(parameters), stored)
     if exchanging:
         if any(not spec or EXPERT_AXIS not in mesh_axes(spec[0]) for spec in stored):
-            raise ValueError("exchange dispatch holds each device's own experts, so every "
+            raise LayoutRefused("exchange dispatch holds each device's own experts, so every "
                              "expert parameter splits its first dimension over the expert "
                              f"axis; the rule table places them {stored}")
         inner = functools.partial(_exchange_shard, project, num_experts=num_experts,

@@ -56,8 +56,11 @@ batch is placed from every process alike:
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
 
-Process 0 prints a line per layout and writes the rows; the exit status is
-nonzero when a layout mismatches or fails.
+Process 0 prints a line per layout and writes the rows. A layout Dew refuses
+by design (`dew.nn.sharding.LayoutRefused`: a stage axis over a model that
+runs no pipeline) is a row with its reason, listed again at the end, and
+passes the run; the exit status is nonzero when a layout mismatches, repeats
+work or fails in any other way.
 """
 
 from __future__ import annotations
@@ -81,6 +84,10 @@ if TYPE_CHECKING:
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
+
+PASSING = ("works", "refused")
+"""The statuses of a row that pass a run: a layout that matches one device,
+and a layout Dew refuses by design, with its reason."""
 
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
@@ -616,6 +623,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     import jax
 
     from dew.artifacts import agreed
+    from dew.nn.sharding import LayoutRefused
 
     rows = []
     for model in models:
@@ -667,6 +675,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     row["flops_bound"] = flops_bound(LAYOUTS[name])
                     if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
                         row["status"] = "REDUNDANT"
+            except LayoutRefused as refusal:
+                row.update(status="refused", reason=str(refusal))
             except Exception as error:  # a failing layout is a row of the matrix
                 row.update(status="error", error=f"{type(error).__name__}: {error}"[:2000],
                            traceback=traceback.format_exc()[-4000:])
@@ -677,8 +687,24 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                   + (f"leaf {row['worst_ratio']:.2f} of bound at {row['worst_leaf']}, "
                      f"loss {row['loss_error']:.1e} of {row['loss_bound']:.1e}, "
                      f"flops x{row.get('flops_ratio', float('nan')):.2f} of x{row.get('flops_bound', float('nan')):.2f}"
-                     if "worst_ratio" in row else row["error"][:300]))
+                     if "worst_ratio" in row else row.get("reason", row.get("error", ""))[:300]))
     return rows
+
+
+def verdict(rows: Sequence[Mapping[str, Any]]) -> int:
+    """The run's exit status: 1 when a row is past `PASSING`, else 0."""
+    return int(any(row["status"] not in PASSING for row in rows))
+
+
+def summary(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """How many rows took each status, then each refusal with its reason."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    lines = [", ".join(f"{status} {count}" for status, count in counts.items())]
+    lines += [f"refused {row['model']}/{row['layout']}: {row['reason']}"
+              for row in rows if row["status"] == "refused"]
+    return lines
 
 
 def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] = ("dense",),
@@ -721,8 +747,9 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
                objective=json.loads(objective), references=store,
                speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
-    if any(row["status"] != "works" for row in rows):
-        raise SystemExit(1)
+    if speaker:
+        print("\n".join(summary(rows)), flush=True)
+    raise SystemExit(verdict(rows))
 
 
 if __name__ == "__main__":

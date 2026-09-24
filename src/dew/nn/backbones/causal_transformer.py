@@ -70,6 +70,7 @@ from ..sharding import (
     MLP_HIDDEN,
     RESIDUAL,
     STAGE_AXIS,
+    LayoutRefused,
     constrain,
     logical_axes,
     microbatches,
@@ -2825,11 +2826,11 @@ class CausalTransformer(nn.Module):
             view = StackView(self.groups, banked=banked)
         else:
             if decode:
-                raise ValueError(
+                raise LayoutRefused(
                     "decoding appends one token at a time to the cache, which no "
                     "pipeline over the stage axis runs; decode outside jax.set_mesh")
             if banked:
-                raise ValueError(
+                raise LayoutRefused(
                     f"a pipeline over the stage axis stacks every stage's copy of a "
                     f"layer, which a store already banked by run cannot be reshaped "
                     f"into; {list(banked)} arrived banked. Place the weights per layer "
@@ -2842,7 +2843,7 @@ class CausalTransformer(nn.Module):
             batch_axis = 1 if self.altup is not None else 0
             rows, count_microbatches = x.shape[batch_axis], microbatches()
             if count_microbatches % stages or rows % count_microbatches:
-                raise ValueError(
+                raise LayoutRefused(
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
@@ -2989,7 +2990,7 @@ class CausalTransformer(nn.Module):
         pair of layers that differ and what differs between them.
         """
         if self.num_layers % stages:
-            raise ValueError(
+            raise LayoutRefused(
                 f"{self.num_layers} layers do not split into {stages} stages of "
                 f"equal length; set stage to a divisor of num_layers")
         count = self.num_layers // stages
@@ -2999,7 +3000,7 @@ class CausalTransformer(nn.Module):
                 continue
             differing = [field.name for field in dataclasses.fields(LayerSpec)
                          if getattr(spec, field.name) != getattr(first, field.name)]
-            raise ValueError(
+            raise LayoutRefused(
                 f"layer {index} differs from layer {index % count} in "
                 f"{', '.join(differing)}, so stage {index // count} cannot run the "
                 f"first stage's program; a pipeline of {stages} stages needs the "

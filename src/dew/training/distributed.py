@@ -31,6 +31,7 @@ from dew.nn.sharding import (
     MESH_AXES,
     SEQUENCE_AXIS,
     TENSOR_AXIS,
+    LayoutRefused,
     LogicalAxisRules,
     MeshAxes,
     declared_axes,
@@ -158,7 +159,7 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
     if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
             or spec.sequence < 1 or len(devices) % sharded):
-        raise ValueError(
+        raise LayoutRefused(
             f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
             f"{spec.tensor} times sequence {spec.sequence} times stage "
             f"{spec.stage} must be a positive divisor of device count {len(devices)}")
@@ -209,12 +210,12 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     if replicas == 1 and not by_process and data_width % granules == 0:
         replicas = granules
     if granules % replicas or data_width % replicas:
-        raise ValueError(
+        raise LayoutRefused(
             f"replicas {replicas} must divide both the {granules} granules "
             f"(slices, or processes) the devices form and the data axis of {data_width}")
     per_replica = granules // replicas
     if spec.fsdp % per_replica:
-        raise ValueError(
+        raise LayoutRefused(
             f"each of the {replicas} replicas spans {per_replica} granules, "
             f"which only the fsdp axis may cross, and fsdp {spec.fsdp} does not "
             "divide over them")
@@ -468,7 +469,7 @@ class Layout:
         details = "\n".join(
             f"  {name}: shape={tuple(shape)}, elements={elements}"
             for elements, name, shape in sorted(replicated, reverse=True)[:5])
-        raise ValueError(
+        raise LayoutRefused(
             f"{fraction:.2%} of shardable parameter elements are replicated, over "
             f"the sharding tolerance of {self.tolerance:.2%}.\n"
             f"Largest replicated parameters:\n{details}")
@@ -528,7 +529,7 @@ def data_partition(mesh: Mesh) -> DataPartition:
     groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
     if (sum(len(group) for group in groups) != shards
             or len({len(group) for group in groups}) != 1):
-        raise ValueError(
+        raise LayoutRefused(
             f"the processes of this mesh hold the row shards "
             f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
             f"which overlap without being the same; each group of processes has to "

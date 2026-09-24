@@ -30,6 +30,7 @@ from .sharding import (
     HEADS,
     KV_HEADS,
     SEQUENCE_AXIS,
+    LayoutRefused,
     constrain,
     logical_axes,
     logical_spec,
@@ -359,7 +360,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     """
     shards = sequence_shards()
     if shards > 1:
-        raise ValueError(
+        raise LayoutRefused(
             f"decoding is not supported under a sequence axis of {shards}: the KV "
             "cache holds whole sequences. Generate on a mesh with sequence=1.")
     if max_seq_len is None:
@@ -463,7 +464,7 @@ def stripe(x, shards: int, axis: int = 1):
     axis %= x.ndim
     length = x.shape[axis]
     if length % (2 * shards):
-        raise ValueError(
+        raise LayoutRefused(
             f"sequence parallelism over {shards} shards pairs chunks of the "
             f"sequence to balance the causal work, which needs the sequence "
             f"length to be a multiple of {2 * shards}, got {length}")
@@ -598,7 +599,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     tensor = mesh_axes(_entry(queries, 2))
     split = shards * math.prod(mesh.shape[axis] for axis in tensor)
     if heads % split or query.shape[1] % shards or key.shape[1] % shards:
-        raise ValueError(
+        raise LayoutRefused(
             f"the all-to-all sequence exchange splits the {heads} query heads "
             f"{split} ways (tensor times sequence) and the query and key lengths "
             f"({query.shape[1]}, {key.shape[1]}) {shards} ways, and one of them does "
