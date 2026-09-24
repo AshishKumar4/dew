@@ -231,13 +231,18 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
     def position(grid: tuple[int, ...]) -> tuple[int, int, int]:
         return grid[0], grid[1], chunks - 1 - grid[2] if reverse else grid[2]
 
+    def indices(*values):
+        # int32 whatever the process's integer width: under x64 a Python
+        # int traces as int64, and Mosaic cannot return one from an index map.
+        return tuple(jnp.asarray(value, jnp.int32) for value in values)
+
     def over_chunk(*grid):
         batch, head, chunk = position(grid)
-        return batch, head, chunk, 0, 0
+        return indices(batch, head, chunk, 0, 0)
 
     def over_carry(*grid):
         batch, head, _ = position(grid)
-        return batch, head, 0, 0
+        return indices(batch, head, 0, 0)
 
     return (pl.BlockSpec((None, None, None, chunk_size, head_dim), over_chunk),
             pl.BlockSpec((None, None, None, chunk_size, state_size), over_chunk),
