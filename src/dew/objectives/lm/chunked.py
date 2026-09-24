@@ -513,6 +513,13 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty:
         return head(hidden, table, targets, cap)
+    return _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, predict=predict)
+
+
+def _sharded_head(mesh, hidden, table, targets, cap, head, column_logits, *, predict: bool):
+    """`head` on a mesh: each device scores its own tokens in a `shard_map`,
+    against the head's own columns where they stay split (`_vocabulary_split`)
+    or the head gathered whole (`chunked_cross_entropy`)."""
     spec = _token_spec(targets.shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
