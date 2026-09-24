@@ -123,10 +123,13 @@ class AdaLNParams(nn.Module):
     SiLU then a zero-init projection, as in the DiT paper: without the
     nonlinearity every block's modulation would be an affine map of the same
     shared vector, and the zero init makes every block the identity at start.
+    `silu` False projects the conditioning vector as it is, which is how
+    FlaxDiff 0.2's DiT blocks were built, so their checkpoints load.
     """
     features: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    silu: bool = True
 
     @nn.compact
     def __call__(self, conditioning):
@@ -138,7 +141,7 @@ class AdaLNParams(nn.Module):
             precision=self.precision,
             kernel_init=nn.initializers.zeros,
             name="ada_proj"
-        )(nn.silu(conditioning))
+        )(nn.silu(conditioning) if self.silu else conditioning)
 
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")},
@@ -208,11 +211,16 @@ class ConditioningEmbed(nn.Module):
     the projected tokens is the projection of the mean, computed for a row
     rather than for each of its tokens. A row with no real tokens gets no
     text, its bias included, as it would from a mean over no tokens.
+
+    `text_pooling` "all" averages every position the text tower returns, the
+    padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
+    their checkpoints load.
     """
     emb_features: int
     mlp_ratio: int = 4
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    text_pooling: Literal["real", "all"] = "real"
 
     def setup(self):
         self.time_embed = nn.Sequential([
@@ -228,8 +236,9 @@ class ConditioningEmbed(nn.Module):
     def __call__(self, temb, textcontext: TextContext | None = None):
         cond_emb = self.time_embed(temb)
         if textcontext is not None:
-            text_emb = self.text_proj(masked_mean(textcontext.hidden, textcontext.mask))
-            present = jnp.sum(textcontext.mask, axis=1, keepdims=True) > 0
+            mask = textcontext.mask if self.text_pooling == "real" else jnp.ones_like(textcontext.mask)
+            text_emb = self.text_proj(masked_mean(textcontext.hidden, mask))
+            present = jnp.sum(mask, axis=1, keepdims=True) > 0
             cond_emb = cond_emb + jnp.where(present, text_emb, 0)
         return cond_emb
 
@@ -354,6 +363,7 @@ class ModulatedBlock(nn.Module):
     modulated=False drops the adaLN-Zero conditioning path entirely, leaving a
     plain pre-norm residual block with learned affine norms, the ViT block a
     JEPA encoder needs, where there is no timestep to condition on.
+    `adaln_silu` is `AdaLNParams.silu`.
     """
     features: int
     num_heads: int
@@ -366,6 +376,7 @@ class ModulatedBlock(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     use_gating: bool = True
+    adaln_silu: bool = True
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
     # ssm mixer options
@@ -380,7 +391,7 @@ class ModulatedBlock(nn.Module):
 
         if self.modulated:
             self.ada_params_module = AdaLNParams(
-                self.features, dtype=self.dtype, precision=self.precision)
+                self.features, dtype=self.dtype, precision=self.precision, silu=self.adaln_silu)
         # Without modulation the norms carry their own affine, since there is
         # no conditioning vector left to supply the shift and scale
         affine = not self.modulated

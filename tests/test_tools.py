@@ -174,6 +174,41 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# tools/flaxdiff_reference.py
+# ---------------------------------------------------------------------------
+
+# The modules FlaxDiff's SimpleUDiT and FourierEmbedding import, at the pin.
+FLAXDIFF_SOURCES = ("flaxdiff/__init__.py", "flaxdiff/models/__init__.py",
+                    "flaxdiff/models/attention.py", "flaxdiff/models/common.py",
+                    "flaxdiff/models/hilbert.py", "flaxdiff/models/simple_dit.py",
+                    "flaxdiff/models/simple_unet.py", "flaxdiff/models/simple_vit.py",
+                    "flaxdiff/models/vit_common.py")
+
+
+@pytest.mark.network
+def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path):
+    """FlaxDiff's own code at the pinned commit writes the committed fixture:
+    exact config, weights and inputs, and the output at test_flaxdiff.py's bound."""
+    pytest.importorskip("matplotlib")  # FlaxDiff's hilbert module imports it
+    import urllib.request
+
+    tool = load("flaxdiff_reference")
+    source = tmp_path / "flaxdiff-src"
+    for name in FLAXDIFF_SOURCES:
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        url = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{tool.COMMIT}/{name}"
+        with urllib.request.urlopen(url, timeout=60) as response:
+            target.write_bytes(response.read())
+    tool.main(["--flaxdiff-path", str(source), "--out", str(tmp_path / "out")])
+
+    committed = FIXTURES / "flaxdiff"
+    assert_fixture_json(tmp_path / "out", committed)
+    assert_fixture_arrays(tmp_path / "out" / "reference.npz", committed / "reference.npz",
+                          {"output": 1e-6})
+
+
+# ---------------------------------------------------------------------------
 # tools/optimizer_curve.py
 # ---------------------------------------------------------------------------
 
