@@ -21,6 +21,7 @@ the one case whose head is bf16 rounds at the end and holds to 1e-4.
 import math
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -660,3 +661,29 @@ def test_the_gemma_bound_is_tighter_than_a_dropped_chunk(gemma_vocabulary):
     peak = kept.max(-1, keepdims=True)
     partial = (peak + np.log(np.exp(kept - peak).sum(-1, keepdims=True)))[:, 0]
     assert np.all(np.abs(partial - exact["log_z"]) > bounds["log_z"])
+
+
+def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
+    """Under bf16 the forward multiplies the table rounded to bf16. Rounding
+    each vocabulary chunk inside the token loop reads the fp32 table once per
+    token tile: on an A100, Qwen3-0.6B's 4 x 1024 tokens in 1024-token tiles
+    spent 2.65 ms of a 162 ms step converting it, where once costs 0.65."""
+    hidden, head, targets = inputs(vocab=64, features=16, tokens=(4, 32), dtype=jnp.bfloat16)
+    program = jax.make_jaxpr(lambda h, w: chunked_cross_entropy(h, w, targets, 4, tile=(32, 16)))(
+        hidden, head)
+
+    def converts(jaxpr, looped):
+        found = []
+        for eqn in jaxpr.eqns:
+            inner = [sub for param in eqn.params.values()
+                     for sub in (param if isinstance(param, tuple) else (param,))
+                     if isinstance(sub, jax.extend.core.ClosedJaxpr | jax.extend.core.Jaxpr)]
+            for sub in inner:
+                found += converts(getattr(sub, "jaxpr", sub), looped or eqn.primitive.name in ("while", "scan"))
+            if eqn.primitive.name == "convert_element_type" and eqn.outvars[0].aval.ndim == 2 \
+                    and eqn.outvars[0].aval.shape[-1] == 16 and eqn.outvars[0].aval.dtype == jnp.bfloat16:
+                found.append((eqn.outvars[0].aval.shape, looped))
+        return found
+
+    tables = converts(program.jaxpr, False)
+    assert tables == [((64, 16), False)], tables

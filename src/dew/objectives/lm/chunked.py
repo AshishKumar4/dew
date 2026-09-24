@@ -145,6 +145,9 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
     bounds = vocabulary_chunks(table.shape[0], chunks)
     width = bounds[0][1]
     operands = _operand_dtype(precision)
+    # Once, not per token tile: every tile multiplies the same rounded table,
+    # and a conversion inside the loop reads the fp32 table once per tile.
+    table = table.astype(operands)
 
     def tokens(start, outputs, size):
         states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands)
