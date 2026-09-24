@@ -162,6 +162,42 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                rtol=TOLERANCE)
 
 
+@pytest.mark.parametrize('sizes', [np.full(8, 3), np.array([0, 5, 0, 0, 12, 1, 0, 3])],
+                         ids=['even', 'ragged'])
+def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
+    """bf16 operands multiply exactly into fp32 sums at any precision, so
+    'highest' asks for the product the default gives: forward and both
+    cotangents are float64 sums of the rounded operands, on every backend.
+    XLA's TPU ragged-dot kernel refuses bf16 operands at fp32 contract
+    precision (Mosaic "Bad lhs type" on a v6e, jax 0.11.2), which any run
+    that sets jax_default_matmul_precision to 'highest' reaches."""
+    rng = np.random.default_rng(89)
+    x = rounded(rng.normal(size=(24, 16)))
+    kernel = rounded(rng.normal(size=(8, 16, 16)))
+    dy = rounded(rng.normal(size=(24, 16)))
+    sizes = sizes.astype(np.int32)
+    # Rows past the routed ones belong to no expert and come back zero.
+    rows = np.searchsorted(np.cumsum(sizes), np.arange(24), side='right')
+    forward, input_oracle = np.zeros((24, 16)), np.zeros((24, 16))
+    kernel_oracle = np.zeros((8, 16, 16))
+    for row in np.flatnonzero(np.arange(24) < sizes.sum()):
+        forward[row] = x[row] @ kernel[rows[row]]
+        input_oracle[row] = dy[row] @ kernel[rows[row]].T
+        kernel_oracle[rows[row]] += np.outer(x[row], dy[row])
+
+    def loss(x, kernel):
+        projected = expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16, 'xla', 'highest')
+        return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(dy, jnp.float32)), projected
+
+    # A float32 master kernel, as training keeps it: the projection rounds it
+    # to bf16 for the product, and its gradient comes back in float32.
+    (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
+        jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel, jnp.float32))
+    assert dx.dtype == jnp.bfloat16 and dk.dtype == jnp.float32
+    for got, want in ((y, rounded(forward)), (dx, rounded(input_oracle)), (dk, kernel_oracle)):
+        np.testing.assert_allclose(np.asarray(got, np.float64), want, atol=TOLERANCE, rtol=TOLERANCE)
+
+
 @pytest.mark.usefixtures('x64')
 @pytest.mark.parametrize('compute,input_dtype,master', [
     (jnp.bfloat16, jnp.bfloat16, jnp.float32), (jnp.bfloat16, jnp.float32, jnp.float64),
