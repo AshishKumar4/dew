@@ -11,8 +11,8 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 | Where you run | Who provides the three facts |
 |---|---|
 | Cloud TPU VM or pod | The TPU metadata server. JAX reads it. |
-| Slurm (`srun`) | Slurm's `SLURM_*` variables. JAX reads them. One task (`SLURM_NTASKS=1`) is no pool, and the process runs on its own. |
-| Open MPI (`mpirun`) | The `OMPI_*` variables. JAX reads them. |
+| Slurm (`srun`) | Slurm's `SLURM_*` variables. JAX reads them. One task (`SLURM_NTASKS=1`) forms no pool unless the run asks for one with `multi_host=True`; the process runs on its own. |
+| Open MPI (`mpirun`) | The `OMPI_*` variables. JAX reads them, before Slurm's, so an `mpirun` inside a one-task allocation forms its pool. |
 | Plain machines over ssh | `dew launch`, through `JAX_COORDINATOR_ADDRESS`, `DEW_PROCESS_COUNT` and `DEW_PROCESS_ID`. |
 
 `--devices-per-process N` makes `dew launch` set `JAX_LOCAL_DEVICE_IDS`, so each of a host's processes takes its own N accelerators. Without it every process takes every local device, which is right for one process per host and wrong for several.

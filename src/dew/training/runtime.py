@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import jax
+from jax._src.clusters import OmpiCluster, SlurmCluster
 from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
@@ -61,10 +62,11 @@ def prepare_process(wandb: Wandb | None = None,
     environment it raises a ValueError naming the missing coordinator
     address, the single-host signature. Every other failure propagates,
     since a pod run would otherwise continue on one host. multi_host=True
-    requires the pool, multi_host=False never asks for it. A Slurm
-    allocation of one task is no pool: JAX's Slurm detection would still
-    start one, at a coordinator named after the node, which a container on
-    the node need not resolve.
+    requires the pool, multi_host=False never asks for it. A Slurm step of
+    one task forms no pool unless the run asks for one with multi_host=True
+    or mpirun started its ranks there, which JAX's detection reads before
+    Slurm's: JAX would still start a pool of that one task, at a coordinator
+    named after the node, which a container on the node need not resolve.
 
     xla_flags reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
@@ -95,8 +97,11 @@ def prepare_process(wandb: Wandb | None = None,
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
 
+    # The cluster JAX's detection would take, in its own order: Open MPI's
+    # ranks when mpirun started them, then Slurm's tasks.
     one_task = (multi_host is None and PROCESS_COUNT not in os.environ
-                and os.environ.get("SLURM_NTASKS") == "1")
+                and not OmpiCluster.is_env_present() and SlurmCluster.is_env_present()
+                and SlurmCluster.get_process_count() == 1)
     if multi_host is not False and not one_task:
         try:
             if PROCESS_COUNT in os.environ:
