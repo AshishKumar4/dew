@@ -7,8 +7,9 @@ one thing, on the backend JAX picks:
 
     PYTHONPATH=src:.:tests python tools/deepseek_v41_numerics.py residuals
 
-(on a GPU with JAX_PLATFORMS=cuda,cpu: the float64 twins' decisions cross
-through host callbacks, which JAX places on a CPU device)
+(on an accelerator, list cpu beside it, as in JAX_PLATFORMS=tpu,cpu: the
+float64 twins run on the CPU backend, and their decisions cross through
+host callbacks, which JAX places on a CPU device)
 
 every compared output's and every quantizer input's and top-k row's RMS
 distance from the float64 truth, Dew's beside the reference's, whose
@@ -175,6 +176,10 @@ def decided(run, model, variables):
     of such a boundary, and the given run is held to the reference's
     rounding error alone.
 
+    The twin runs on the CPU backend whichever device runs the given run:
+    a TPU only emulates float64, which cannot round (reduce_precision), and
+    a GPU runs float64 at a fraction of its float32 rate.
+
     Wrappers stand in for `dew.nn.deepseek_v4`'s quantizers and for
     `jax.lax.top_k` while the runs trace or execute: the twin's hand each
     decision to the host through an ordered callback, and the given run's
@@ -238,12 +243,13 @@ def decided(run, model, variables):
         jax.debug.callback(selected, values, picks, ordered=True)
         return jnp.take_along_axis(values, picks, -1), picks
 
+    host = jax.devices("cpu")[0]
     try:
         deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = exact(fp8), exact(fp4), picked
-        with jax.enable_x64(new_val=True):
+        with jax.enable_x64(new_val=True), jax.default_device(host):
             jnp.float32 = jnp.float64
             try:
-                wide = run(*widened(model, variables))
+                wide = run(*widened(model, jax.device_put(variables, host)))
                 jax.effects_barrier()
             finally:
                 jnp.float32 = single

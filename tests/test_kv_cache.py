@@ -142,10 +142,7 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens, monkeyp
 
     # The interpreter runs its kernel through io_callback, which places on a
     # CPU device, so the call runs there even on a GPU host.
-    try:
-        host = jax.devices("cpu")[0]
-    except RuntimeError:
-        pytest.skip("the TPU interpreter needs the cpu platform (JAX_PLATFORMS=cuda,cpu)")
+    host = jax.devices("cpu")[0]
     blocks = []
     kernel = kernels.paged_attention
 
