@@ -438,6 +438,105 @@ def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
+    """A pool brings a tree of 25 small global leaves home. Every group size
+    gives the same leaves and dtypes as one leaf a group. With the default
+    size the tree takes one transfer agreement, four in all, where one a leaf
+    took 28 round trips: a weight push of Qwen3-0.6B's 310 leaves spent 4.6 s
+    of its 6.8 s in them on 4x RTX 3090. With `held_by="first"`, process 0
+    holds the tree and process 1, which took part in every agreement, holds
+    none."""
+    program = ("import json\n"
+               "import dew.training.runtime as runtime\n"
+               "runtime.prepare_process()\n"
+               "import jax, jax.numpy as jnp, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew import artifacts\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "rows, rng = jax.device_count(), np.random.default_rng(0)\n"
+               "values = {'replicated': rng.standard_normal((3, 5)).astype(np.float32)}\n"
+               "for i in range(8):\n"
+               "    values[f'f32 {i}'] = rng.standard_normal((2 * rows, 3)).astype(np.float32)\n"
+               "    values[f'bf16 {i}'] = rng.standard_normal((4 * rows,)).astype(jnp.bfloat16)\n"
+               "    values[f'i32 {i}'] = rng.integers(0, 100, (rows, 2)).astype(np.int32)\n"
+               "def placed(name, value):\n"
+               "    spec = PartitionSpec() if name == 'replicated' else PartitionSpec('fsdp')\n"
+               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+               " lambda index: value[index])\n"
+               "tree = {name: placed(name, value) for name, value in values.items()}\n"
+               "tree['host'] = np.arange(3)\n"
+               "agreements = []\n"
+               "agree = artifacts.agree_process_phase\n"
+               "def counted(error, *, phase, available=True):\n"
+               "    agreements.append(phase)\n"
+               "    return agree(error, phase=phase, available=available)\n"
+               "artifacts.agree_process_phase = counted\n"
+               "def same(got):\n"
+               "    return got is not None and np.array_equal(got['host'], np.arange(3)) and all(\n"
+               "        type(got[name]) is np.ndarray and got[name].dtype == value.dtype\n"
+               "        and np.array_equal(got[name], value) for name, value in values.items())\n"
+               "report = {}\n"
+               "for size in ('default', 'one leaf'):\n"
+               "    if size == 'one leaf':\n"
+               "        artifacts.GATHER_BYTES = 1\n"
+               "    agreements.clear()\n"
+               "    report[f'{size} every'] = [same(artifacts.collective_host(tree, phase='t')), len(agreements)]\n"
+               "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n"
+               "    agreements.clear()\n"
+               "    got = artifacts.collective_host(tree, phase='t', held_by='first')\n"
+               "    report[f'{size} first'] = [None if got is None else same(got), len(agreements)]\n"
+               "    print('gathered', jax.process_index(), json.dumps(report), flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    # Each rank prints its report after every gather; the last line is the whole report.
+    reports = dict(line.split("] gathered ", 1)[1].split(" ", 1)
+                   for line in done.stdout.splitlines() if "] gathered " in line)
+    assert {rank: json.loads(report) for rank, report in reports.items()} == {
+        "0": {"default every": [True, 4], "default first": [True, 4],
+              "one leaf every": [True, 28], "one leaf first": [True, 28]},
+        "1": {"default every": [True, 4], "default first": [None, 4],
+              "one leaf every": [True, 28], "one leaf first": [None, 28]}}, done.stdout
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_rank_that_fails_in_a_gather_group_ends_the_gather_at_that_groups_agreement():
+    """Rank 1's host copy of the second of four groups fails. Both ranks
+    finished that group's computation, so rank 0 waits at the group's
+    agreement rather than inside the next computation, hears the failure
+    there, and never starts the third group."""
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.prepare_process()\n"
+               "import jax, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew import artifacts\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
+               "tree = [jax.make_array_from_callback(value.shape, NamedSharding(mesh, PartitionSpec('fsdp')),"
+               " lambda index: value[index]) for _ in range(4)]\n"
+               "artifacts.GATHER_BYTES = 1\n"
+               "started = []\n"
+               "gathered = artifacts._gathered\n"
+               "def failing(group, held):\n"
+               "    started.append(group)\n"
+               "    whole = gathered(group, held)\n"
+               "    if jax.process_index() == 1 and len(started) == 2:\n"
+               "        raise RuntimeError('injected failure copying the second group')\n"
+               "    return whole\n"
+               "artifacts._gathered = failing\n"
+               "try:\n"
+               "    artifacts.collective_host(tree, phase='t')\n"
+               "finally:\n"
+               "    print('groups started', jax.process_index(), len(started), flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "groups started 0 2" in done.stdout, done.stdout
+    assert "Process phase t transfer leaves 1-1 failed on rank 1" in done.stdout, done.stdout
+    assert "RuntimeError: injected failure copying the second group" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_whose_data_fails_mid_fit_stops_the_pool(tmp_path):
     """Rank 1's loader raises on its fourth batch while rank 0 has gone on to
     that step, whose collectives wait for rank 1 for ever on a GPU. Rank 1's
