@@ -175,8 +175,10 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["first"]) -> T 
 def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first"] = "every") -> T | None:
     """Materialize an evaluation tree on every rank with transfer consensus.
 
-    All ranks must call this, even for entirely local trees. Local leaves and
-    global arrays' addressable shards are checked before any data gather.
+    All ranks must call this, even for entirely local trees. Every array leaf
+    is waited on before any data gather, so a computation that failed on a
+    rank reports at the preflight rather than inside a gather collective;
+    a wait raises what a host copy would, and moves nothing.
     Ranks then agree the ordered global gather plan and each transfer outcome.
     Local-only trees may differ, as with root-only decoded previews. A device
     failure inside an in-flight collective still needs runtime termination.
@@ -198,14 +200,13 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
         paths, tree = jax.tree_util.tree_flatten_with_path(value)
         for path, leaf in paths:
             if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
-                for shard in leaf.addressable_shards:
-                    np.asarray(shard.data)
                 global_indices.append(len(leaves))
                 plan.append([jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype),
                              str(leaf.sharding)])
                 leaves.append(leaf)
             else:
-                leaves.append(np.asarray(leaf))
+                leaves.append(np.asarray(leaf) if held else leaf)
+        jax.block_until_ready(leaves)
     except BaseException as failure:
         error = failure
     agree_process_phase(error, phase=f"{phase} transfer preflight")

@@ -537,6 +537,70 @@ def test_a_rank_that_fails_in_a_gather_group_ends_the_gather_at_that_groups_agre
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
+    """Rank 1 has lost one of its shards (deleted, as a failed or donated
+    computation leaves it). The gather's preflight finds it on rank 1 before
+    either rank enters a gather computation, and both ranks end there with
+    rank 1's error rather than waiting in a collective rank 1 never joins."""
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.prepare_process()\n"
+               "import jax, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew import artifacts\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
+               "tree = [jax.make_array_from_callback(value.shape, NamedSharding(mesh, PartitionSpec('fsdp')),"
+               " lambda index: value[index]) for _ in range(2)]\n"
+               "if jax.process_index() == 1:\n"
+               "    tree[1].delete()\n"
+               "artifacts.collective_host(tree, phase='t')\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "Process phase t transfer preflight failed on rank 1" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
+    """With held_by="first" only process 0 holds the gathered tree. Process 1
+    takes part in every computation and agreement, and copies none of the
+    tree's values to its host: its preflight waits on each shard, which raises
+    a failed computation's error as a copy would. The copy moved every rank's
+    whole replica of a data-parallel policy to its host, 1.2 GiB of
+    Qwen3-0.6B's weight push on each of three RTX 3090s. JAX's transfer guard
+    logs every implicit device-to-host copy on a GPU, where the count is
+    taken; process 0's copies of the tree show that the log is on."""
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("a CPU array reaches its host without a device-to-host transfer")
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.prepare_process()\n"
+               "import jax, jax.numpy as jnp, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew import artifacts\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "def placed(value, spec):\n"
+               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+               " lambda index: value[index])\n"
+               "tree = {'sharded': [placed(np.full((2 * jax.device_count(), 37), i, np.float32),"
+               " PartitionSpec('fsdp')) for i in range(3)],\n"
+               "        'replicated': [placed(np.full((7, 37), i, np.float32), PartitionSpec()) for i in range(3)],\n"
+               "        'local': jnp.ones((5, 37))}\n"
+               "with jax.transfer_guard_device_to_host('log'):\n"
+               "    held = artifacts.collective_host(tree, phase='t', held_by='first')\n"
+               "print('held', jax.process_index(), held is not None, flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "held 0 True" in done.stdout and "held 1 False" in done.stdout, done.stdout
+    # Every leaf of the tree, and every shard of one, is (n, 37); nothing else the gather moves is.
+    copies = {rank: sum(line.startswith(f"[{rank}] ") and "device-to-host transfer: shape=(" in line
+                        and ",37)" in line for line in done.stdout.splitlines()) for rank in "01"}
+    assert copies["0"] > 0 and copies["1"] == 0, (copies, done.stdout)
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_whose_data_fails_mid_fit_stops_the_pool(tmp_path):
     """Rank 1's loader raises on its fourth batch while rank 0 has gone on to
     that step, whose collectives wait for rank 1 for ever on a GPU. Rank 1's
