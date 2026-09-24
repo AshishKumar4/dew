@@ -22,6 +22,14 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def inverse_frequencies(theta: float, dim: int, pairs: int | None = None) -> np.ndarray:
+    """`1 / theta ** (2i / dim)` for i below `pairs` (all of `dim // 2` by
+    default), transformers' `compute_default_rope_parameters` table, built on
+    the host (`_base_powers`)."""
+    count = dim // 2 if pairs is None else pairs
+    return 1.0 / _base_powers(theta, np.arange(0, 2 * count, 2, dtype=jnp.float32) / dim)
+
+
 def _base_powers(theta: float, exponents: np.ndarray) -> np.ndarray:
     """`theta ** exponents` correctly rounded to float32, whatever the backend.
 
@@ -118,7 +126,7 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
             f"'proportional' or 'default', got {partial_rotary_type!r}")
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
-    inv_freq = 1.0 / _base_powers(theta, np.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor)
+    inv_freq = inverse_frequencies(theta, divisor, pairs)
     if rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':

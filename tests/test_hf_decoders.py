@@ -429,7 +429,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     from transformers import Olmo3Config
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq
+    from dew.nn.rope import YarnScaling, inverse_frequencies, yarn_attention_factor, yarn_inv_freq
 
     released = fixture_config("olmo-3-7b")
     reference = Olmo3Config.from_dict(released)
@@ -444,8 +444,20 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     scaled = yarn_inv_freq(128, 5e5, scaling)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
 
-    # Both tables are built on the host (Dew's in NumPy, the reference's in
-    # torch on the CPU), so they agree bit for bit on every lane.
+    # The tables are equal only where torch's float32 pow rounds 5e5 ** x as
+    # Dew's correctly rounded pow does; the rest of the table is the same
+    # float32 arithmetic. 11 of these 64 powers lie within 0.1 ulp of a
+    # rounding midpoint, so the precondition is checked, not assumed: a lane
+    # whose torch pow rounds one differently fails here, naming torch's pow,
+    # and there the tables may differ by up to 2 ulps.
+    import torch
+
+    exponents = torch.arange(0, 128, 2, dtype=torch.int64).float() / 128
+    torch_powers = (1.0 / 5e5 ** exponents).numpy()
+    rounded = inverse_frequencies(5e5, 128)
+    assert np.array_equal(torch_powers, rounded), (
+        "torch's float32 pow rounds 5e5 ** x differently from the correctly rounded value at "
+        f"{np.flatnonzero(torch_powers != rounded).tolist()}; the YaRN tables then differ by up to 2 ulps")
     assert isinstance(scaled, np.ndarray)
     np.testing.assert_array_equal(scaled, expected.numpy())
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
