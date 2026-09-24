@@ -271,8 +271,9 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
 
 @pytest.mark.parametrize("height, width", [(440, 440), (320, 360), (360, 320)])
 def test_clip_image_transform_matches_the_reference_processor(height, width):
-    """The safety checker's preprocessing, against transformers' own. The
-    shorter side resizes to exactly `shortest_edge` and the longer to
+    """The safety checker's preprocessing, against the PIL processor it
+    follows (`CLIPImageTransform` says why that one). The shorter side
+    resizes to exactly `shortest_edge` and the longer to
     int(size * long / short), so an image whose side the size does not
     divide still fills the crop."""
     from transformers import CLIPImageProcessorPil
