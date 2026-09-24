@@ -467,40 +467,86 @@ def test_two_pools_on_one_machine_take_a_free_port_each():
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_gpu_pool_compiles_without_the_persistent_cache(tmp_path):
-    """JAX keys a cached executable by a topology serialization that differs
-    between the processes of one GPU pool, so on a second run some ranks load
-    a step that the others compile, and that compile waits for every rank for
-    ever: on the box, ranks 0 and 1 hit and ranks 2 and 3 missed one shared
-    cache. A GPU pool runs twice over a shared cache directory and leaves
-    nothing in it."""
-    import jax
-
-    if jax.default_backend() != "gpu":
-        pytest.skip("the cache key differs between GPU processes only")
-    cache = tmp_path / "cache"
-    program = ("import sys\n"
+def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
+    """A pool runs twice over one persistent compilation cache, and the second
+    run loads its step on every process. jax 0.11.2 keyed an executable by the
+    compiling process's topology fingerprint, which on a GPU describes the
+    device down to its NVLink links, and only process 0 writes entries. On the
+    box, whose GPUs 0 and 1 share NVLink and 2 and 3 do not, a pool of GPUs 1
+    and 2 loaded the step on one process and compiled it on the other, whose
+    sharded autotuning then waited for ever for its peer's share. Each process
+    here reports a fingerprint of its own, as those two did, whatever devices
+    the run has; the pinned jax hashes the fingerprints of every process a
+    computation spans."""
+    cache, records = tmp_path / "cache", tmp_path / "records"
+    program = ("import json, sys\n"
+               "from pathlib import Path\n"
+               "import jax\n"
+               "from jax._src.lib import xla_client\n"
+               "topology_of = xla_client.get_topology_for_devices\n"
+               "class Apart:\n"
+               "    def __init__(self, topology):\n"
+               "        self.topology = topology\n"
+               "    def fingerprint(self):\n"
+               "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
+               "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
+               "events = []\n"
+               "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process(compilation_cache_dir=sys.argv[1])\n"
-               "import jax, jax.numpy as jnp, numpy as np\n"
+               "import jax.numpy as jnp, numpy as np\n"
                "from jax.sharding import NamedSharding, PartitionSpec\n"
                "from dew.training import MeshSpec, build_mesh\n"
-               "rows = NamedSharding(build_mesh(MeshSpec(fsdp=jax.device_count())), PartitionSpec('fsdp'))\n"
-               "weights = [jnp.asarray(np.random.default_rng(i).standard_normal((1024, 1024)) / 32,"
-               " jnp.bfloat16) for i in range(4)]\n"
-               "def loss(x):\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "def placed(value, spec):\n"
+               "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
+               " lambda index: value[index])\n"
+               "weights = [placed((np.random.default_rng(i).standard_normal((1024, 1024)) / 32)"
+               ".astype(jnp.bfloat16), PartitionSpec()) for i in range(4)]\n"
+               "x = placed(np.ones((jax.device_count() * 512, 1024), jnp.bfloat16), PartitionSpec('fsdp'))\n"
+               "def loss(x, weights):\n"
                "    for weight in weights:\n"
                "        x = jax.nn.gelu(x @ weight)\n"
                "    return (x.astype(jnp.float32) ** 2).mean()\n"
-               "x = jax.device_put(jnp.ones((jax.device_count() * 512, 1024), jnp.bfloat16), rows)\n"
-               "print('gradient', float(jax.jit(jax.grad(loss))(x).astype(jnp.float32).sum()))\n")
-    for run in ("first", "second"):
-        started = time.monotonic()
+               "before = len(events)\n"
+               "float(jax.jit(lambda x, weights: jax.grad(loss)(x, weights).astype(jnp.float32).sum())(x, weights))\n"
+               "step = events[before:]\n"
+               "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
+               "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
+               "     step.count('/jax/compilation_cache/cache_hits')]))\n")
+    runs = []
+    for run in range(2):
+        out = records / str(run)
+        out.mkdir(parents=True)
         done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
-                      str(cache), devices=1, timeout=300)
+                      str(cache), str(out), devices=1, timeout=150)
         assert done.returncode == 0, done.stdout + done.stderr
-        assert time.monotonic() - started < 120, (run, done.stdout)
-    assert not [path for path in cache.rglob("*") if path.is_file()]
+        runs.append([json.loads(path.read_text()) for path in sorted(out.iterdir())])
+    # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
+    compiled = runs[0][0][0]
+    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], runs
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_gpu_pool_whose_jax_keys_its_processes_apart_compiles_without_the_cache():
+    """A jax installed around Dew's pin, such as an image's own, may key a
+    computation that spans processes apart on each of them. A GPU pool on one
+    turns the persistent cache off before its first compile: a rank that
+    compiled a step its peers loaded would wait for ever for their shares of
+    its autotuning. A CPU pool keeps the cache, since its compiles wait on no
+    peer."""
+    import jax
+
+    program = ("import jax\n"
+               "jax.config.update('jax_enable_compilation_cache', True)\n"
+               "import dew.training.runtime as runtime\n"
+               "runtime._pool_keys_alike = lambda: False\n"
+               "runtime.prepare_process()\n"
+               "print('cache', jax.process_index(), jax.config.jax_enable_compilation_cache, flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=150)
+    assert done.returncode == 0, done.stdout + done.stderr
+    kept = jax.default_backend() != "gpu"
+    assert f"cache 0 {kept}" in done.stdout and f"cache 1 {kept}" in done.stdout, done.stdout
 
 
 @pytest.mark.mesh(devices=2)

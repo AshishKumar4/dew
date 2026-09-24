@@ -16,7 +16,19 @@ dependencies = [
     # nnx): fixed in flax 01854da1, after 0.12.9, the latest release. Return
     # to a release floor once one ships.
     "flax @ https://github.com/google/flax/archive/4f42ed069731c83ef27fccb0cc42647684f80109.tar.gz",
-    "jax>=0.11.2",
+    # 0.11.2 with the multi-process cache-key fix (AshishKumar4/jax branch
+    # v0.11.2-cache-key-pool-fingerprints, reported as jax-ml/jax#ISSUE): 0.11.2
+    # keys an executable by the compiling process's topology fingerprint, which
+    # differs between GPUs with and without NVLink, so a pool across both kinds
+    # loaded a step on some processes and compiled it on others, whose sharded
+    # autotuning then waited for ever. The fix hashes the fingerprints of every
+    # process a computation spans when they compile for the same accelerators,
+    # and caches nothing when they don't. A direct-URL dependency can't go into
+    # a PyPI wheel, so a published Dew needs a release floor, and a jax
+    # installed around the pin makes GPU pools compile without the cache
+    # (dew.training.runtime._pool_keys_alike). Return to a release floor once
+    # one ships the fix.
+    "jax @ https://github.com/AshishKumar4/jax/archive/19a48d1decce77ee228334d56f7a9f78bf6f478b.tar.gz",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",

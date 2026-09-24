@@ -81,10 +81,11 @@ def prepare_process(wandb: Wandb | None = None,
     establish one CPU device per local accelerator before this call.
     Validation never changes backend configuration after initialization.
 
-    A GPU pool compiles without the persistent compilation cache. JAX keys a
-    cached executable by a topology serialization that differs between the
-    processes of one GPU pool, so some ranks would load a step that the
-    others compile, and that compile waits for every rank for ever.
+    A GPU pool keeps the persistent compilation cache when its jax keys a
+    computation that spans processes alike on every one of them, as the jax
+    Dew pins does (`_pool_keys_alike`). With another jax it compiles without
+    the cache: some ranks would load a step that the others compile, and that
+    compile waits for every rank for ever.
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -131,7 +132,7 @@ def prepare_process(wandb: Wandb | None = None,
                 apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
-            if jax.process_count() > 1 and jax.default_backend() == "gpu":
+            if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
                 # Before the first compile, which fixes whether the cache is used.
                 jax.config.update("jax_enable_compilation_cache", val=False)
             # One collective while the processes are still in lockstep;
@@ -148,6 +149,24 @@ def prepare_process(wandb: Wandb | None = None,
         from dew.training.host import companion_mesh
         companion_mesh(build_mesh())
     print(f"Number of devices: {jax.device_count()}")
+
+
+def _pool_keys_alike() -> bool:
+    """Whether this jax keys a computation that spans processes alike on
+    every one of them (jax-ml/jax#ISSUE).
+
+    jax 0.11.2 keys an executable by the compiling process's own topology
+    fingerprint, which on a GPU describes the device down to its NVLink
+    links. In a pool across GPUs linked differently the processes keyed a
+    step apart, and on the next run some loaded it while the others compiled
+    it and waited for ever for their shares of its sharded autotuning. Dew
+    pins a jax that hashes every process's fingerprint. A jax installed
+    around the pin, such as an image's own or a `--no-deps` install, may
+    lack it.
+    """
+    from jax._src import cache_key
+
+    return hasattr(cache_key, "_shared_fingerprints")
 
 
 def cuda_plugin() -> bool:
