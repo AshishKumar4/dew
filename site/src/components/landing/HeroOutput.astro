@@ -63,7 +63,7 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 					if (out.type === 'stream') raw += out.text;
 					else if (out.type === 'error') raw += `\n${out.ename}: ${out.evalue}\n`;
 					else if (out.type === 'display' && out.text) raw += `${out.text}\n`;
-					const lines = terminalText(raw).split('\n');
+					const lines = terminalText(raw).replace(/\n+$/, '').split('\n');
 					output.replaceChildren(
 						...lines.map((line) => {
 							const span = document.createElement('span');
@@ -77,7 +77,7 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 				const seconds = Math.round((performance.now() - started) / 1000);
 				status(
 					done.status === 'ok'
-						? `Ran live just now on one vCPU of a Cloudflare container in ${seconds} s, most of it compiling. Each run trains from scratch, so the numbers can differ slightly from the recorded ones.`
+						? `Ran live just now on one vCPU of a Cloudflare container, in ${seconds} s from import to the last line.`
 						: 'The live run stopped before it finished. The output above is what it printed.',
 				);
 			} catch (error) {

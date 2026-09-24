@@ -180,16 +180,15 @@ export function renderOutput(into: HTMLElement, output: Output): void {
 	if (output.type === 'stream') {
 		const last = into.lastElementChild;
 		const kind = output.name === 'stderr' ? 'nb-stderr-live' : 'nb-stream';
-		if (last instanceof HTMLPreElement && last.classList.contains(kind)) {
-			last.textContent = terminalText((last.dataset.raw ?? '') + output.text);
-			last.dataset.raw = (last.dataset.raw ?? '') + output.text;
-		} else {
-			const pre = document.createElement('pre');
+		let pre = last instanceof HTMLPreElement && last.classList.contains(kind) ? last : undefined;
+		if (!pre) {
+			pre = document.createElement('pre');
 			pre.className = kind;
-			pre.dataset.raw = output.text;
-			pre.textContent = terminalText(output.text);
 			into.append(pre);
 		}
+		pre.dataset.raw = (pre.dataset.raw ?? '') + output.text;
+		pre.textContent = terminalText(pre.dataset.raw).replace(/^\n+/, '').replace(/\n+$/, '');
+		pre.hidden = pre.textContent === '';
 		return;
 	}
 	if (output.type === 'display') {
