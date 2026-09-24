@@ -349,19 +349,15 @@ class FlaxEncoder(nn.Module):
     output channels so the caller can split them into mean and log-variance.
     """
 
-    in_channels: int = 3
     out_channels: int = 3
-    down_block_types: Sequence[str] = ("DownEncoderBlock2D",)
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    act_fn: str = "silu"
     double_z: bool = False
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         block_out_channels = self.block_out_channels
-        # in
         self.conv_in = nn.Conv(
             block_out_channels[0],
             kernel_size=(3, 3),
@@ -370,26 +366,18 @@ class FlaxEncoder(nn.Module):
             dtype=self.dtype,
         )
 
-        # downsampling
-        down_blocks = []
-        output_channel = block_out_channels[0]
-        for i, _ in enumerate(self.down_block_types):
-            input_channel = output_channel
-            output_channel = block_out_channels[i]
-            is_final_block = i == len(block_out_channels) - 1
-
-            down_block = FlaxDownEncoderBlock2D(
-                in_channels=input_channel,
-                out_channels=output_channel,
+        levels = len(block_out_channels)
+        self.down_blocks = [
+            FlaxDownEncoderBlock2D(
+                in_channels=block_out_channels[max(i - 1, 0)],
+                out_channels=channels,
                 num_layers=self.layers_per_block,
                 resnet_groups=self.norm_num_groups,
-                add_downsample=not is_final_block,
+                add_downsample=i != levels - 1,
                 dtype=self.dtype,
             )
-            down_blocks.append(down_block)
-        self.down_blocks = down_blocks
+            for i, channels in enumerate(block_out_channels)]
 
-        # middle
         self.mid_block = FlaxUNetMidBlock2D(
             in_channels=block_out_channels[-1],
             resnet_groups=self.norm_num_groups,
@@ -397,7 +385,6 @@ class FlaxEncoder(nn.Module):
             dtype=self.dtype,
         )
 
-        # end
         conv_out_channels = 2 * self.out_channels if self.double_z else self.out_channels
         self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
         self.conv_out = nn.Conv(
@@ -409,17 +396,10 @@ class FlaxEncoder(nn.Module):
         )
 
     def __call__(self, sample, deterministic: bool = True):
-        # in
         sample = self.conv_in(sample)
-
-        # downsampling
         for block in self.down_blocks:
             sample = block(sample, deterministic=deterministic)
-
-        # middle
         sample = self.mid_block(sample, deterministic=deterministic)
-
-        # end
         sample = self.conv_norm_out(sample)
         sample = nn.swish(sample)
         return self.conv_out(sample)
@@ -432,19 +412,14 @@ class FlaxDecoder(nn.Module):
     `layers_per_block + 1` resnets; the last level does not upsample.
     """
 
-    in_channels: int = 3
     out_channels: int = 3
-    up_block_types: Sequence[str] = ("UpDecoderBlock2D",)
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    act_fn: str = "silu"
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         block_out_channels = self.block_out_channels
-
-        # z to block_in
         self.conv_in = nn.Conv(
             block_out_channels[-1],
             kernel_size=(3, 3),
@@ -453,7 +428,6 @@ class FlaxDecoder(nn.Module):
             dtype=self.dtype,
         )
 
-        # middle
         self.mid_block = FlaxUNetMidBlock2D(
             in_channels=block_out_channels[-1],
             resnet_groups=self.norm_num_groups,
@@ -461,29 +435,19 @@ class FlaxDecoder(nn.Module):
             dtype=self.dtype,
         )
 
-        # upsampling
         reversed_block_out_channels = list(reversed(block_out_channels))
-        output_channel = reversed_block_out_channels[0]
-        up_blocks = []
-        for i, _ in enumerate(self.up_block_types):
-            prev_output_channel = output_channel
-            output_channel = reversed_block_out_channels[i]
-
-            is_final_block = i == len(block_out_channels) - 1
-
-            up_block = FlaxUpDecoderBlock2D(
-                in_channels=prev_output_channel,
-                out_channels=output_channel,
+        levels = len(block_out_channels)
+        self.up_blocks = [
+            FlaxUpDecoderBlock2D(
+                in_channels=reversed_block_out_channels[max(i - 1, 0)],
+                out_channels=channels,
                 num_layers=self.layers_per_block + 1,
                 resnet_groups=self.norm_num_groups,
-                add_upsample=not is_final_block,
+                add_upsample=i != levels - 1,
                 dtype=self.dtype,
             )
-            up_blocks.append(up_block)
+            for i, channels in enumerate(reversed_block_out_channels)]
 
-        self.up_blocks = up_blocks
-
-        # end
         self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
         self.conv_out = nn.Conv(
             self.out_channels,
@@ -494,13 +458,8 @@ class FlaxDecoder(nn.Module):
         )
 
     def __call__(self, sample, deterministic: bool = True):
-        # z to block_in
         sample = self.conv_in(sample)
-
-        # middle
         sample = self.mid_block(sample, deterministic=deterministic)
-
-        # upsampling
         for block in self.up_blocks:
             sample = block(sample, deterministic=deterministic)
 

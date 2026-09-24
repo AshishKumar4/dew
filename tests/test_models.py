@@ -72,15 +72,13 @@ def _unet_condition():
 
 
 def _vae_encoder():
-    model = FlaxEncoder(in_channels=3, out_channels=4, down_block_types=("DownEncoderBlock2D",) * 2,
-                        block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
+    model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
                         double_z=True, dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
 
 
 def _vae_decoder():
-    model = FlaxDecoder(in_channels=4, out_channels=3, up_block_types=("UpDecoderBlock2D",) * 2,
-                        block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
+    model = FlaxDecoder(out_channels=3, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
                         dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
 
