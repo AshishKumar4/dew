@@ -342,9 +342,9 @@ The loader reads these quantized storage formats:
 - DeepSeek-V4 and V4.1's `.scale` storage (FP8 layers, FP4 routed experts,
   engram tables);
 - GPT-OSS's MXFP4;
-- compressed-tensors' `mxfp4-pack-quantized`, `pack-quantized` (int codes of 1
-  to 8 bits), `float-quantized` (FP8 by tensor, channel or block) and
-  `int-quantized`;
+- compressed-tensors' `mxfp4-pack-quantized`, `nvfp4-pack-quantized` (weights
+  only), `pack-quantized` (int codes of 1 to 8 bits), `float-quantized` (FP8 by
+  tensor, channel or block), `int-quantized` and `naive-quantized`;
 - AutoAWQ's 4-bit gemm packing;
 - GPTQ at 2, 4 and 8 bits, act-order included.
 
@@ -354,7 +354,7 @@ trained model saves back mostly as its source. A trained value outside that
 grid is refused: AutoAWQ's packing would spill it into the neighbouring
 codes and gptqmodel's would clamp it. A substantially trained model saves
 dense instead (the error names the call). A compressed-tensors weight is saved as the library's own compressor
-writes it against the source's scales, clamping a value past the code range
+writes it, for the weight in the dtype Dew holds, against the source's scales, clamping a value past the code range
 as the library does. Activations that a checkpoint quantizes dynamically run
 in the model's dtype; static activation scales are refused.
 

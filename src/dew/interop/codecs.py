@@ -945,7 +945,8 @@ def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[in
 # (ints half to even) or cast (fp8). A value outside the range is clamped,
 # as the library clamps it.
 
-COMPRESSED_TENSORS_FORMATS = ('pack-quantized', 'float-quantized', 'int-quantized', 'naive-quantized')
+COMPRESSED_TENSORS_FORMATS = ('pack-quantized', 'float-quantized', 'int-quantized', 'naive-quantized',
+                              'nvfp4-pack-quantized')
 """The compressed-tensors formats `compressed_tensors` reads, beside MXFP4."""
 
 
@@ -957,7 +958,7 @@ class _WeightScheme:
     bits: int
     kind: Literal['int', 'float']
     symmetric: bool
-    strategy: Literal['tensor', 'channel', 'group', 'block']
+    strategy: Literal['tensor', 'channel', 'group', 'block', 'tensor_group']
     group: int | None
     block: tuple[int, int] | None
 
@@ -985,14 +986,16 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
         if group.get('output_activations') is not None:
             raise ValueError(f"config_groups.{name}.output_activations quantizes outputs, which this loader does not")
         activations = group.get('input_activations')
-        if activations is not None and records.record(activations, 'input_activations').get('dynamic') is not True:
-            raise ValueError(f"config_groups.{name}.input_activations are static, with scales stored beside the "
-                             "weights that this loader would drop; load a dynamic or weight-only checkpoint")
+        dynamic = None if activations is None else records.record(activations, 'input_activations').get('dynamic')
+        if activations is not None and dynamic is not True:
+            raise ValueError(f"config_groups.{name}.input_activations have dynamic={dynamic!r}, with scales stored "
+                             "beside the weights that this loader would drop; load a weight-only checkpoint or one "
+                             "whose activations are quantized dynamically")
         weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
         strategy, kind = weights.get('strategy'), weights.get('type')
-        if strategy not in ('tensor', 'channel', 'group', 'block') or kind not in ('int', 'float'):
+        if strategy not in ('tensor', 'channel', 'group', 'block', 'tensor_group') or kind not in ('int', 'float'):
             raise ValueError(f"config_groups.{name}.weights: {kind!r} codes by {strategy!r}; this loader reads "
-                             "int or float codes by tensor, channel, group or block")
+                             "int or float codes by tensor, channel, group, block or tensor_group")
         if weights.get('dynamic', False):
             raise ValueError(f"config_groups.{name}.weights are dynamic, with no stored scales to read")
         schemes.add(_WeightScheme(
@@ -1007,8 +1010,10 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
     fits = {'pack-quantized': scheme.kind == 'int' and 1 <= scheme.bits <= 8,
             'float-quantized': scheme.kind == 'float' and scheme.bits == 8,
             'int-quantized': scheme.kind == 'int' and scheme.bits == 8,
-            'naive-quantized': scheme.bits == 8}[scheme.format]
-    if not fits or (scheme.strategy == 'group') != (scheme.group is not None) \
+            'naive-quantized': scheme.bits == 8,
+            'nvfp4-pack-quantized': (scheme.kind, scheme.bits, scheme.strategy, scheme.group, scheme.symmetric)
+            == ('float', 4, 'tensor_group', 16, True)}[scheme.format]
+    if not fits or (scheme.strategy in ('group', 'tensor_group')) != (scheme.group is not None) \
             or (scheme.strategy == 'block') != (scheme.block is not None):
         raise ValueError(f"compressed-tensors {scheme.format} with {scheme.bits}-bit {scheme.kind} codes by "
                          f"{scheme.strategy} (group {scheme.group}, block {scheme.block}) is not a layout the "
@@ -1038,7 +1043,7 @@ def _per_input(values: np.ndarray, scheme: _WeightScheme, shape: tuple[int, int]
         return values.reshape(())
     if scheme.strategy == 'channel':
         return values.reshape(outputs, 1)
-    if scheme.strategy == 'group':
+    if scheme.strategy in ('group', 'tensor_group'):
         assert scheme.group is not None
         return values[:, np.arange(inputs) // scheme.group if order is None else order.astype(np.int64)]
     assert scheme.block is not None
@@ -1050,6 +1055,8 @@ def _ct_parts(scheme: _WeightScheme, name: str) -> dict[str, str]:
     parts = {'scale': stem + '.weight_scale'}
     if scheme.format == 'pack-quantized':
         parts |= {'packed': stem + '.weight_packed', 'shape': stem + '.weight_shape'}
+    if scheme.format == 'nvfp4-pack-quantized':
+        parts |= {'packed': stem + '.weight_packed', 'global': stem + '.weight_global_scale'}
     if not scheme.symmetric:
         parts['zero'] = stem + '.weight_zero_point'
     return parts
@@ -1061,7 +1068,7 @@ def _ct_names(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray]) -> tuple
     names = sorted(name.removesuffix('_scale') for name in tensors if name.endswith('.weight_scale'))
     for name in names:
         missing = [part for part in _ct_parts(scheme, name).values() if part not in tensors]
-        if scheme.format != 'pack-quantized' and name not in tensors:
+        if 'packed' not in _ct_parts(scheme, name) and name not in tensors:
             missing.append(name)
         if missing:
             raise ValueError(f"{name} arrives quantized and the checkpoint holds no {missing}")
@@ -1104,8 +1111,27 @@ def _ct_order(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray | None
     return None if order is None else np.asarray(order)
 
 
+def _nvfp4_scales(scheme: _WeightScheme, scales: np.ndarray, overall: np.ndarray,
+                  shape: tuple[int, int]) -> np.ndarray:
+    """NVFP4's effective per-input scale: the E4M3 group scale over the float32
+    global scale, a float32 division, as `_dequantize` divides them."""
+    spread = np.asarray(_per_input(scales.astype(np.float32), scheme, shape, None))
+    return spread / np.asarray(overall, np.float32).reshape(())
+
+
 def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightScheme) -> np.ndarray:
-    """One quantized Linear's weight, float32 [output, input], as the library dequantizes it."""
+    """One quantized Linear's weight, float32 [output, input], as the library dequantizes it.
+
+    NVFP4 decompresses into bfloat16: E2M1 codes times the group scale over
+    the global scale, taken in float32 and rounded once to bfloat16
+    (compressors/nvfp4/base.py `decompress`)."""
+    if scheme.format == 'nvfp4-pack-quantized':
+        parts = _ct_parts(scheme, name)
+        packed = np.asarray(tensors[parts['packed']])
+        values = _E2M1_BYTES[_bytes(packed, _CODE_DTYPES)].reshape(packed.shape[0], packed.shape[1] * 2)
+        scales = _nvfp4_scales(scheme, np.asarray(tensors[parts['scale']]), np.asarray(tensors[parts['global']]),
+                               (values.shape[0], values.shape[1]))
+        return (values * scales).astype(ml_dtypes.bfloat16).astype(np.float32)
     codes = _ct_codes(scheme, tensors, name)
     shape = (codes.shape[0], codes.shape[1])
     scales = np.asarray(tensors[_ct_parts(scheme, name)['scale']])
@@ -1118,24 +1144,38 @@ def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightS
 def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
                grid: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
     """`name` quantized against the scales, zeros and order its source shipped,
-    as compressed-tensors' compressor quantizes given them, in the scales' dtype."""
+    as compressed-tensors' compressor quantizes given them: `weight / scale`
+    and the zero point taken in torch's promotion of the weight's dtype and
+    the scales' (float32 when either is, or for bfloat16 with float16)."""
     parts = _ct_parts(scheme, name)
-    kept = {role: part for role, part in parts.items() if role in ('scale', 'zero', 'shape')}
+    kept = {role: part for role, part in parts.items() if role in ('scale', 'zero', 'shape', 'global')}
     order_name = name.removesuffix('.weight') + '.weight_g_idx'
     stored = dict(zip(kept, _gridded(grid, name, tuple(kept.values())), strict=True))
     order = None if grid is None or order_name not in grid else np.asarray(grid[order_name])
     scales = stored['scale']
     shape = (weight.shape[0], weight.shape[1])
-    dtype = scales.dtype
+    out: dict[str, np.ndarray] = {part: stored[role] for role, part in kept.items()}
+    if scheme.format == 'nvfp4-pack-quantized':
+        # The global scale is float32, so the quotient is a float32 division
+        # whatever the weight's dtype. A -0.0 keeps its sign: it is what
+        # code 8 (-0) decodes to, so an untrained save writes code 8 back.
+        # The library's compressor adds its zero point and would write 0
+        # there; released checkpoints carry code 8 (Qwen3-0.6B-NVFP4A16: 3.5%
+        # of codes), which only a sign-keeping encoding round-trips.
+        quotients = np.asarray(weight).astype(np.float32) / _nvfp4_scales(scheme, scales, stored['global'], shape)
+        out[parts['packed']] = encode_e2m1(np.clip(quotients, -6.0, 6.0), ties='even')
+        return out
+    held = np.asarray(weight)
+    # Two float dtypes that differ promote to float32 in torch.
+    dtype = scales.dtype if held.dtype == scales.dtype else np.dtype(np.float32)
     zero = 0 if 'zero' not in stored else _ct_zero(scheme, {parts['zero']: stored['zero']}, name, shape)
     zeros = zero if isinstance(zero, int) else _per_input(zero, scheme, shape, order)
-    over = (np.asarray(weight).astype(dtype).astype(np.float32)
+    over = (held.astype(dtype).astype(np.float32)
             / np.asarray(_per_input(scales, scheme, shape, order)).astype(np.float32)).astype(dtype)
     if not isinstance(zeros, int):
         over = (over.astype(np.float32) + zeros.astype(np.float32)).astype(dtype)
     low, high = _code_range(scheme)
     clamped = np.clip(over.astype(np.float32), low, high)
-    out: dict[str, np.ndarray] = {part: stored[role] for role, part in kept.items()}
     if order is not None:
         out[order_name] = order
     if scheme.kind == 'float':

@@ -11,7 +11,9 @@ each tensor, channel, group or block, then the format's compressor
 - `<scheme>/dequantized`: the library's `decompress` of them, float32;
 - `<scheme>/trained` and `<scheme>/requantized/<part>`: a weight moved off
   the grid, including values past the code range, and what the compressor
-  writes for it against the same scales and zero points.
+  writes for it against the same scales and zero points;
+- `<scheme>/trained32` and `<scheme>/requantized32/<part>`: the same weight
+  kept in float32, and what the compressor writes for that.
 
 bfloat16 and the fp8 codes have no NumPy dtype here, so they are stored as
 their raw bits (int16, uint8) with the dtype in `<scheme>/dtypes`.
@@ -31,9 +33,10 @@ from compressed_tensors.compressors.naive_quantized.base import (
     FloatQuantizationCompressor,
     IntQuantizationCompressor,
 )
+from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
 from compressed_tensors.compressors.pack_quantized.base import PackedQuantizationCompressor
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-from compressed_tensors.quantization.utils.helpers import calculate_qparams
+from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "compressed_tensors.npz"
 
@@ -53,7 +56,9 @@ SCHEMES = {
                                                     "block_structure": [16, 32], "symmetric": True}),
     "int8_channel": (IntQuantizationCompressor, {"num_bits": 8, "type": "int", "strategy": "channel", "symmetric": True}),
 }
-FORMATS = {PackedQuantizationCompressor: "pack-quantized", FloatQuantizationCompressor: "float-quantized",
+SCHEMES["nvfp4"] = (NVFP4PackedCompressor, {"num_bits": 4, "type": "float", "strategy": "tensor_group",
+                                            "group_size": 16, "symmetric": True})
+FORMATS = {NVFP4PackedCompressor: "nvfp4-pack-quantized", PackedQuantizationCompressor: "pack-quantized", FloatQuantizationCompressor: "float-quantized",
            IntQuantizationCompressor: "int-quantized"}
 
 
@@ -63,7 +68,7 @@ def extremes(weight: torch.Tensor, args: QuantizationArgs) -> tuple[torch.Tensor
         return weight.amin().reshape(1), weight.amax().reshape(1)
     if args.strategy == "channel":
         return weight.amin(-1, keepdim=True), weight.amax(-1, keepdim=True)
-    if args.strategy == "group":
+    if args.strategy in ("group", "tensor_group"):
         groups = weight.unflatten(-1, (-1, args.group_size))
         return groups.amin(-1), groups.amax(-1)
     rows, columns = args.block_structure
@@ -88,9 +93,14 @@ def main() -> None:
         args = QuantizationArgs(**fields)
         scheme = QuantizationScheme(targets=["Linear"], weights=args)
         low, high = extremes(weight.float(), args)
-        scale, zero = calculate_qparams(low, high, args)
-        scale = scale.to(torch.bfloat16)
-        state = {"weight": weight, "weight_scale": scale}
+        overall = (generate_gparam(weight.float().amin(), weight.float().amax()).reshape(1)
+                   if args.strategy == "tensor_group" else None)
+        scale, zero = calculate_qparams(low, high, args, global_scale=overall)
+        state = {"weight": weight, "weight_scale": scale.to(torch.bfloat16)}
+        if overall is not None:
+            # The lifecycle keeps the scale in the model's dtype and a zero
+            # point until compression, as for MXFP4.
+            state |= {"weight_scale": scale.float(), "weight_global_scale": overall, "weight_zero_point": zero}
         if not args.symmetric:
             state["weight_zero_point"] = zero
         if args.actorder == "group":
@@ -100,14 +110,22 @@ def main() -> None:
         decompressed = compressor.decompress(dict(stored), scheme)["weight"].float()
         trained = weight.float() + torch.randn(48, 96, generator=generator) * 0.02
         trained[0, :4] = torch.tensor([10.0, -10.0, 1e-8, -1e-8])
+        if overall is not None:
+            # Decompressing gives the model the stored E4M3 scale in bfloat16.
+            state["weight_scale"] = stored["weight_scale"].to(torch.bfloat16)
         requantized = compressor.compress({**state, "weight": trained.to(torch.bfloat16)}, scheme)
+        # A float32 fine-tune: the library divides in float32, the promotion of the weight and the scale.
+        requantized32 = compressor.compress({**state, "weight": trained}, scheme)
         dtypes[label] = {"format": FORMATS[compressor], "weights": fields}
         for part, tensor in stored.items():
             arrays[f"{label}/{part}"], dtypes[label][part] = raw(tensor)
         for part, tensor in requantized.items():
             arrays[f"{label}/requantized/{part}"], _ = raw(tensor)
+        for part, tensor in requantized32.items():
+            arrays[f"{label}/requantized32/{part}"], _ = raw(tensor)
         arrays[f"{label}/dequantized"] = decompressed.numpy()
         arrays[f"{label}/trained"], _ = raw(trained.to(torch.bfloat16))
+        arrays[f"{label}/trained32"] = trained.numpy()
     arrays["dtypes"] = np.frombuffer(json.dumps(dtypes).encode(), np.uint8)
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE, **arrays)

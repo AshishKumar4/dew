@@ -25,6 +25,7 @@ from pathlib import Path
 REPOS = {
     "RedHatAI/Qwen3-0.6B-quantized.w4a16": "3bceedd23534ac8ef59952f72c94790b27938e42",
     "RedHatAI/Qwen3-0.6B-FP8-BLOCK": "5def00c475640c0527e3a7067b1a26b94decefb5",
+    "apolloparty/Qwen3-0.6B-NVFP4A16": "9537cb799d1c61c761104b39833c4d66fd382219",
 }
 IDS = [[151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198]]
 
