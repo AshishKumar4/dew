@@ -68,6 +68,8 @@ async function writeImage(buffer, stem, name) {
 async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 	const html = [];
 	let stream = null;
+	// An install cell's log (download bars, build steps) folds away like stderr.
+	const install = /^\s*[%!]pip\s/.test(joined(cell.source));
 	const flush = () => {
 		if (!stream) return;
 		const text = terminal(stream.text).replace(/\n+$/, '');
@@ -77,7 +79,9 @@ async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 			html.push(
 				stream.name === 'stderr'
 					? `<details class="nb-output nb-stderr"><summary>stderr</summary>${body}</details>`
-					: `<div class="nb-output nb-stdout">${body}</div>`,
+					: install
+						? `<details class="nb-output nb-install"><summary>install log</summary>${body}</details>`
+						: `<div class="nb-output nb-stdout">${body}</div>`,
 			);
 		}
 		stream = null;
@@ -98,6 +102,9 @@ async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 			continue;
 		}
 		const data = output.data ?? {};
+		// A widget's state lives in the browser that ran it; the notebook keeps only its first
+		// text repr, such as a download bar at 0%, so a static page shows nothing for it.
+		if (data['application/vnd.jupyter.widget-view+json']) continue;
 		const raster = data['image/png'] ?? data['image/jpeg'];
 		if (raster) {
 			const image = await writeImage(Buffer.from(joined(raster), 'base64'), stem, `${cell.id ?? `cell-${index}`}-${figure++}`);
