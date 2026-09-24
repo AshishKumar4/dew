@@ -920,6 +920,7 @@ class Trainer(Generic[Loss, Effects]):
         tracer = profiler if profiler is not None else outer
         try:
             mesh = self.device_mesh
+            self._check_pipelined_batch(dataset.batch, mesh)
 
             state, shardings, position = self.place()
             current = int(state.step)
@@ -1172,6 +1173,33 @@ class Trainer(Generic[Loss, Effects]):
             return telemetry_profile.profile(profile.directory)
 
         return agreed("profiling window setup", own_window)
+
+    def _check_pipelined_batch(self, batch: int, mesh: Mesh) -> None:
+        """Refuse, before anything is placed, a global batch that a pipeline
+        cannot cut into its microbatches (`batch_divisor`): each device's
+        rows are cut into M microbatches, and a device that holds none of a
+        microbatch's rows computes another's again. The message names the
+        batches and the microbatch counts that fit. A rollout's rows are
+        its own, so a run with one is checked where its step traces."""
+        if self.mesh.stage == 1 or self.rollout is not None:
+            return
+        divisor = batch_divisor(mesh, self.mesh)
+        if batch % divisor == 0:
+            return
+        count = self.mesh.microbatches or self.mesh.stage
+        shards = divisor // count
+        suggestions = [f"a batch that is a multiple of {divisor} rows, {-(-batch // divisor) * divisor} "
+                       f"the nearest above {batch}"]
+        if batch % shards == 0:
+            fitting = [m for m in range(self.mesh.stage, batch // shards + 1, self.mesh.stage)
+                       if (batch // shards) % m == 0]
+            if fitting:
+                suggestions.append(f"microbatches={fitting[-1]}, the most that divide the "
+                                   f"{batch // shards} rows a device holds")
+        raise LayoutRefused(
+            f"a global batch of {batch} rows over {shards} row shards and {count} microbatches "
+            f"leaves some microbatch without rows on some device, which then computes another "
+            f"microbatch's again; use {' or '.join(suggestions)}")
 
     def _check_stream(self, source, mesh: Mesh, *, checkpointing: bool) -> None:
         """Refuse a training stream this run cannot checkpoint or cannot shard.

@@ -267,16 +267,17 @@ def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
     """Return the row count every global batch must be a multiple of.
 
     A batch's rows are sharded over the batch axes as whole rows, and a
-    pipelined step cuts them again into `spec`'s microbatches, one per stage
-    when unset. A batch that divides by neither fails where it is placed or
-    traced.
+    pipelined step cuts each device's rows again into `spec`'s microbatches,
+    one per stage when unset: microbatch m takes rows m, m + M, ..., which
+    is a share of every device's rows only where M divides them. A batch
+    that divides by neither is refused where it is placed or traced.
 
-    A run whose batch never changes hits that on its first step. A batch ramp
-    is checked against this before it reads, since a later stage would
-    otherwise fail an hour in.
+    `Trainer.fit` checks a batch against this before it places anything,
+    and a batch ramp's every stage, since a later stage would otherwise fail
+    an hour in.
     """
     shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
-    return math.lcm(shards, spec.microbatches or spec.stage)
+    return shards * (spec.microbatches or spec.stage)
 
 
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:

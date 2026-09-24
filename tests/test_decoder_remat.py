@@ -178,7 +178,9 @@ def test_remat_prefills_and_appends_the_same_cache(shape, scan):
 def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     plain = model_for(shape, scan_layers=scan, num_nextn_predict_layers=0)
     remat = plain.clone(remat='full')
-    mesh_spec = MeshSpec(fsdp=2, stage=2, microbatches=4)
+    # Eight rows split four ways over data x fsdp hold two a device, which
+    # two microbatches divide.
+    mesh_spec = MeshSpec(fsdp=2, stage=2, microbatches=2)
     mesh = build_mesh(mesh_spec)
     tokens = shard_batch(mesh, batch())
     variables = plain.init(jax.random.key(0), batch()["text"][:, :-1])

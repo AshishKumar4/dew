@@ -323,9 +323,15 @@ def routed(**overrides):
     return tiny(mixture={"experts": 4, "top_k": 2, "bias": True}, **overrides)
 
 
-def token_batch():
+def token_batch(rows: int = BATCH):
     rng = np.random.default_rng(0)
-    return {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
+    return {"text": rng.integers(0, VOCAB, size=(rows, SEQ_LEN + 1)).astype(np.int32)}
+
+
+# A pipeline of four microbatches over two stages beside a row axis of four
+# shards (data2 x fsdp2 on the eight devices) needs a multiple of sixteen
+# rows, so each microbatch takes a share of every device's.
+PIPELINED_ROWS = 16
 
 
 def loss_and_grads(objective, spec, variables, batch):
@@ -364,7 +370,7 @@ def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, bala
     model = build()
     objective = LMObjective(model, SEQ_LEN, **balance)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    batch = token_batch()
+    batch = token_batch(PIPELINED_ROWS)
 
     loss, metrics, grads = loss_and_grads(objective, MeshSpec(fsdp=4), variables, batch)
     piped, piped_metrics, piped_grads = loss_and_grads(
@@ -385,7 +391,7 @@ def test_a_pipeline_trains_an_exchange_dispatch():
     model = tiny(mixture={"experts": 4, "top_k": 2, "dispatch": "exchange"})
     objective = LMObjective(model, SEQ_LEN)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    batch = token_batch()
+    batch = token_batch(PIPELINED_ROWS)
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(expert=2, fsdp=2), variables, batch)
     piped, _, piped_grads = loss_and_grads(
@@ -422,7 +428,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     CPU: 3.4e-04 on a loss of order 5."""
     model = bf16()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    batch = token_batch()
+    batch = token_batch(PIPELINED_ROWS)
 
     loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
     piped, _, piped_grads = loss_and_grads(

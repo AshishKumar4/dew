@@ -302,13 +302,13 @@ TOPOLOGIES = {
     # plus the sequence axis beside a data axis, where the batch rows split
     # over data and fsdp and the sequence over its own axis, and the stage
     # axis beside them: the two-layer model splits into two stages of one
-    # layer, fed four microbatches of two rows.
+    # layer, fed two microbatches of four rows, one of each device's two.
     "fsdp": (MeshSpec(fsdp=8), dense_layout()),
     "tensor": (MeshSpec(fsdp=4, tensor=2), tensor_layout()),
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
     "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
     "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), tensor_layout()),
-    "stage": (MeshSpec(fsdp=2, stage=2, microbatches=4), dense_layout()),
+    "stage": (MeshSpec(fsdp=2, stage=2, microbatches=2), dense_layout()),
     "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), tensor_layout()),
 }
 
@@ -576,7 +576,7 @@ def test_a_pipeline_moves_no_microbatch_between_the_batch_shards():
     microbatch over the shards again. Strided, each keeps its rows where
     they are."""
     hidden = BATCH * SEQ_LEN * 32
-    moved = [shape for op, shapes in collectives(MeshSpec(fsdp=2, stage=2, microbatches=4), tiny())
+    moved = [shape for op, shapes in collectives(MeshSpec(fsdp=2, stage=2, microbatches=2), tiny())
              if op in ("all-gather", "all-to-all") for shape in shapes]
 
     assert not [shape for shape in moved if math.prod(shape) >= hidden], moved

@@ -201,7 +201,10 @@ def zoo() -> dict[str, Any]:
              "kinds": {"mamba": mamba, "sliding": {"window": 12}}}
     dit: dict[str, object] = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
            "output_channels": 4}
-    lm: TokenRows = {"batch_size": 8, "seq_len": 32, "fsdp_min_param_size": 256}
+    # Sixteen rows: a pipeline's microbatch has to take a share of every
+    # device's rows, and stage2_fsdp2 on eight devices splits the rows four
+    # ways into four microbatches.
+    lm: TokenRows = {"batch_size": 16, "seq_len": 32, "fsdp_min_param_size": 256}
     decoders = {"dense": dense, "moe": moe, "hybrid": hybrid, "mla": mla}
     trained = {f"{name}_{kind}": Case("causal_transformer", config, decoder_objective=kind,
                                       objective={"beta": 0.01} if kind == "grpo" else {}, **lm)
