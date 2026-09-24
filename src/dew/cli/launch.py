@@ -25,6 +25,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -235,7 +236,7 @@ class Launch:
                 "coordinator; use --processes-per-host for the GPUs a node has, and drop "
                 "--devices-per-process, --port and --coordinator")
         allocation = f"slurm allocation {os.environ['SLURM_JOB_ID']}"
-        gpus = 0
+        gpus: int | None = 0
         if runs_on_gpu({**os.environ, **self.extra_env()}):
             per_node = os.environ.get("SLURM_GPUS_PER_NODE")
             # --gpus-per-node reads `[type:]count`, several types separated by commas.
@@ -277,28 +278,45 @@ class Launch:
 
     def layout(self, first_host: str) -> tuple[int, int | None]:
         """Processes per host and GPUs per process. A host's GPUs are
-        counted on the first host, only when the flags leave them to decide,
-        and not at all when JAX_PLATFORMS keeps the pool off GPUs, as a CPU
-        rehearsal on a GPU machine does. GPUs are named only where several
-        processes split a host's: one process holds every GPU and names
-        none, and prepare_process keeps a cluster's detection from narrowing
-        a pool the launcher placed."""
+        counted on the first host, when the flags leave them to decide or
+        name some, and not at all when JAX_PLATFORMS keeps the pool off GPUs,
+        as a CPU rehearsal on a GPU machine does. A pool that names more GPUs
+        than the host shows is refused before any rank starts. GPUs are named
+        only where several processes split a host's: one process holds every
+        GPU and names none, and prepare_process keeps a cluster's detection
+        from narrowing a pool the launcher placed."""
         processes, devices = self.processes_per_host, self.devices_per_process
-        if processes is not None and (devices is not None or processes == 1):
+        if processes == 1 and devices is None:
             return processes, devices
         # What the pool's processes will see: the --env values, and on this
         # machine the launcher's own environment, which ssh does not carry.
         env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
-        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if runs_on_gpu(env) else 0
+        on_gpu = runs_on_gpu(env)
+        # None where the GPUs could not be counted, which is not zero of them.
+        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
         if processes is None:
-            processes = max(1, gpus // (devices or 1))
+            processes = max(1, (gpus or 0) // (devices or 1))
         # More processes than GPUs, as in a rehearsal of programs that do
         # not use them, leaves every process every GPU.
-        if devices is None and 1 < processes <= gpus:
+        if devices is None and gpus is not None and 1 < processes <= gpus:
             if gpus % processes:
                 raise ValueError(f"{processes} processes do not split {first_host}'s {gpus} "
                                  "GPUs evenly; set --devices-per-process")
             devices = gpus // processes
+        if not on_gpu or devices is None:
+            return processes, devices
+        if gpus is None:
+            sys.stderr.write(
+                f"could not count {first_host}'s GPUs (nvidia-smi is missing there or failed); "
+                f"starting {processes} process{'es' if processes > 1 else ''} with {devices} "
+                f"GPU{'s' if devices > 1 else ''} each without checking that they exist\n")
+        elif processes * devices > gpus:
+            raise ValueError(
+                f"a pool of {processes} process{'es' if processes > 1 else ''} with {devices} "
+                f"GPU{'s' if devices > 1 else ''} each needs {processes * devices} GPUs on "
+                f"{first_host}, which shows {gpus}; ask for fewer with --processes-per-host "
+                f"or --devices-per-process, or keep the pool off GPUs with "
+                f"--env JAX_PLATFORMS=cpu")
         return processes, devices
 
     def pool(self, hosts: Sequence[str]) -> list[Process]:
@@ -382,10 +400,11 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
     return f"cd {shlex.quote(cwd)} && {run}" if cwd else run
 
 
-def gpu_count(host: str, visible: str | None) -> int:
+def gpu_count(host: str, visible: str | None) -> int | None:
     """GPUs a pool process on `host` may use: those `visible` lists when
     the pool sets CUDA_VISIBLE_DEVICES itself, else what `host` shows,
-    asked over ssh when it is another machine."""
+    asked over ssh when it is another machine; None when they could not be
+    counted there."""
     if visible is not None:
         return visible_gpus(visible)
     if host in LOCAL_HOSTS:
