@@ -1,7 +1,8 @@
 """Train a diffusion model over images or latents.
 
-    python recipes/diffusion/train.py --data.image-size 128 --trainer.batch-size 32 \
-        --trainer.epochs 2000 --model.architecture simple_dit \
+    python recipes/diffusion/train.py --data.path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
+        --data.image-size 128 --trainer.batch-size 32 --trainer.epochs 2000 \\
+        --model.architecture simple_dit \\
         --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
 
 The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),

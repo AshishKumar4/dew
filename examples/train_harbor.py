@@ -1,6 +1,6 @@
 """Agentic GRPO: a harness runs in Harbor sandboxes, a gateway records its model calls, and Dew trains on them.
 
-    python examples/train_harbor.py --tasks path/to/harbor/task ... --gateway http://127.0.0.1:9090 \
+    python examples/train_harbor.py --tasks path/to/harbor/task ... --gateway http://127.0.0.1:9090 \\
         --sandbox-gateway http://proxy:9091 --engines http://127.0.0.1:8011 --served runs/harbor/served
     JAX_PLATFORMS=cpu python examples/train_harbor.py --smoke --out /tmp/harbor-smoke
 

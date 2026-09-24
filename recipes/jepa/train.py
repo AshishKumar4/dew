@@ -1,8 +1,8 @@
 """Train a JEPA encoder (I-JEPA over images, V-JEPA over video).
 
-    python recipes/jepa/train.py --data.image-size 224 --trainer.batch-size 64 \
-        --trainer.epochs 300 --model.config '{"patch_size": 16, "emb_features": 384, \
-        "num_layers": 12, "num_heads": 6}' --probe-classes 102
+    python recipes/jepa/train.py --data.path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
+        --data.image-size 224 --trainer.batch-size 64 --trainer.epochs 300 --probe-classes 102 \\
+        --model.config '{"patch_size": 16, "emb_features": 384, "num_layers": 12, "num_heads": 6}'
 
 The encoder is --model, the predictor takes the encoder's width and heads plus
 --predictor, and the probes score the frozen encoder at every validation.

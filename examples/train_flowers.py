@@ -1,6 +1,6 @@
 """Train a pixel-space diffusion model on prepared Oxford Flowers ArrayRecords.
 
-CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \\
     --data ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --steps 1000
 """
 from dataclasses import dataclass
