@@ -239,18 +239,19 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
     from dew.training.trainer import recompute_more
 
-    decoder = SimpleNamespace(model=CausalTransformer(
+    decoder = SimpleNamespace(tile_head=lambda: False, model=CausalTransformer(
         vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=8))
     climbed = []
     while recompute_more(decoder):
         climbed.append(decoder.model.remat)
     assert climbed == [REMAT_POLICIES['minimal'], REMAT_POLICIES['full']]
 
-    diffusion = SimpleNamespace(model=BUILDERS['simple_dit'](True))
+    diffusion = SimpleNamespace(tile_head=lambda: False, model=BUILDERS['simple_dit'](True))
     assert recompute_more(diffusion) and diffusion.model.remat == 'full'
     assert not recompute_more(diffusion)
 
-    custom = SimpleNamespace(model=decoder.model.clone(remat='save_qkv_proj'))
+    custom = SimpleNamespace(tile_head=lambda: False,
+                             model=decoder.model.clone(remat='save_qkv_proj'))
     assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
 
 
