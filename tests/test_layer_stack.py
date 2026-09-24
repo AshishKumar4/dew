@@ -487,3 +487,13 @@ def test_the_init_program_draws_a_run_of_like_layers_once():
 
     assert draws(2) == draws(6) > 0
 
+
+def test_the_layers_of_a_run_draw_their_own_weights():
+    """A run's layers are drawn under one scan with the params stream split
+    per iteration; a shared draw would give every layer the same kernel."""
+    variables = tiny(num_layers=4).init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    layers = variables["params"]
+    kernels = [np.asarray(layers[f"layers_{index}"]["self_attn"]["q_proj"]["kernel"])
+               for index in range(4)]
+    assert all(not np.array_equal(kernels[i], kernels[j])
+               for i in range(4) for j in range(i + 1, 4))
