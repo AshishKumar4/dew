@@ -120,12 +120,23 @@ def lm_objective(pretrained=None, **options):
     return LMObjective(model, seq_len=4, pretrained=pretrained, **options)
 
 
+def model_constants(objective) -> int:
+    """What the model's own initialization compiles in: its static tables
+    (the rotary inverse frequencies, built on the host), a few hundred bytes."""
+    return captured_bytes(lambda key: objective.model.init(key, jnp.zeros((1, 4), jnp.int32)),
+                          jax.random.key(0))
+
+
 def test_an_objective_that_holds_nothing_binds_no_initializer_arguments():
     """The default initializer is `init` itself: an objective that draws its
-    whole tree from the key has no data to hand over."""
+    whole tree from the key has no data to hand over, and compiles in nothing
+    past the model's own static tables."""
     objective = lm_objective()
     assert jax.tree.leaves(objective.initializer) == []
-    assert captured_bytes(lambda key: objective.initializer(key), jax.random.key(0)) == 0
+    # The tiny model's tables are 16 bytes; a baseline past a few KiB would
+    # be an array the model itself bakes in.
+    assert model_constants(objective) < 4096
+    assert captured_bytes(lambda key: objective.initializer(key), jax.random.key(0)) == model_constants(objective)
 
 
 def test_a_held_tree_crosses_into_a_jit_as_data_rather_than_as_a_constant():
