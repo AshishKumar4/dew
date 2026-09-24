@@ -78,7 +78,7 @@ import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import tyro
 
@@ -132,6 +132,20 @@ def _fixture(name: str) -> dict[str, Any]:
     return dict(translate_config(config.get("text_config", config)))
 
 
+class TokenRows(TypedDict):
+    """The batch every decoder of the zoo trains on."""
+    batch_size: int
+    seq_len: int
+    fsdp_min_param_size: int
+
+
+class ImageRows(TypedDict):
+    """The batch every image model of the zoo trains on."""
+    batch_size: int
+    channels: int
+    fsdp_min_param_size: int
+
+
 def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
     decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
@@ -158,7 +172,7 @@ def zoo() -> dict[str, Any]:
     tokens every layout above divides."""
     from benchmark_step import Case
 
-    dense = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
+    dense: dict[str, object] = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
              "num_kv_heads": 4, "head_dim": 8, "mlp_features": 128, "max_seq_len": 33}
     moe = {**dense, "mixture": {"experts": 8, "top_k": 2, "expert_features": 32,
                                 "layers": (0, 1, 2, 3)}}
@@ -185,19 +199,22 @@ def zoo() -> dict[str, Any]:
     mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
     rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),
              "kinds": {"mamba": mamba, "sliding": {"window": 12}}}
-    dit = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
+    dit: dict[str, object] = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
            "output_channels": 4}
-    lm = {"batch_size": 8, "seq_len": 32, "fsdp_min_param_size": 256}
+    lm: TokenRows = {"batch_size": 8, "seq_len": 32, "fsdp_min_param_size": 256}
     decoders = {"dense": dense, "moe": moe, "hybrid": hybrid, "mla": mla}
     trained = {f"{name}_{kind}": Case("causal_transformer", config, decoder_objective=kind,
                                       objective={"beta": 0.01} if kind == "grpo" else {}, **lm)
                for name, config in decoders.items() for kind in ("sft", "dpo", "grpo")}
     # Mamba-2's recurrence has no bidirectional mode, which the hybrid's
     # model refuses on one device; masked diffusion takes the others.
-    diffused = {f"{name}_mdlm": Case("causal_transformer", {**config, "causal": False},
+    def bidirectional(config: Mapping[str, object]) -> dict[str, object]:
+        return {**config, "causal": False}
+
+    diffused = {f"{name}_mdlm": Case("causal_transformer", bidirectional(config),
                                      decoder_objective="mdlm", **lm)
                 for name, config in decoders.items() if name != "hybrid"}
-    images = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
+    images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "moe": Case("causal_transformer", moe, **lm),
