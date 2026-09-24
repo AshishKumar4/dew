@@ -584,12 +584,11 @@ def mode_fit(args) -> dict:
     evaluate = trainer.objective.evaluate
     trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
     if args.tokens:
-        from dew.training.distributed import data_partition
-
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
         from dew.data import PackedTokens
+        from dew.training.distributed import data_partition
 
         data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
@@ -844,20 +843,25 @@ def mode_pipeline(args) -> dict:
     }
 
 
-def mode_evaluation_contract(args) -> dict:
-    """Tiny all-rank numerical scoring with root-only metrics and previews."""
+class _EvaluationCase:
+    """What mode_evaluation_contract's objective, metric, tracker and data
+    read: this rank, the failure the current round injects, and what the
+    round recorded."""
+
+    def __init__(self, rank: int):
+        self.rank, self.failure = rank, "normal"
+        self.events: list = []
+        self.closed: list = []
+
+
+def _evaluation_parts(case: _EvaluationCase):
+    """The scoring objective, host metric, tracker and data a round of
+    mode_evaluation_contract runs, each failing as `case.failure` says."""
     import jax
     import jax.numpy as jnp
-    import optax
 
     from dew.artifacts import Representations, host
-    from dew.data import Dataset
     from dew.objectives.base import Aux, Objective
-    from dew.training import Trainer
-
-    rank = jax.process_index()
-    events = []
-    closed = []
 
     class Numerical(Objective):
         artifact = Representations
@@ -869,34 +873,34 @@ def mode_evaluation_contract(args) -> dict:
             return jnp.mean((batch["x"] + params["params"]["offset"]) ** 2), Aux({})
 
         def evaluate(self, params, batch, step):
-            events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
+            case.events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
             global_artifact = Representations(features=features, labels=batch["x"][:, 0])
-            if failure in ("deleted_first", "deleted_later", "mismatched_plan"):
+            if case.failure in ("deleted_first", "deleted_later", "mismatched_plan"):
                 local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
-                if rank == 0 and failure != "mismatched_plan":
+                if case.rank == 0 and case.failure != "mismatched_plan":
                     local.delete()
                 local_artifact = Representations(features=local, labels=np.arange(3))
-                if failure == "mismatched_plan":
-                    return local_artifact if rank == 0 else global_artifact
-                return ((local_artifact, global_artifact) if failure == "deleted_first"
+                if case.failure == "mismatched_plan":
+                    return local_artifact if case.rank == 0 else global_artifact
+                return ((local_artifact, global_artifact) if case.failure == "deleted_first"
                         else (global_artifact, local_artifact))
-            if failure == "deleted_batch" and rank == 0:
+            if case.failure == "deleted_batch" and case.rank == 0:
                 batch["a_metadata"].delete()
             return global_artifact
 
         def preview(self, params, batch, step, *, scored=None):
-            events.append(["preview", np.asarray(jax.random.key_data(step.key)).tolist()])
-            if failure == "deleted_preview":
+            case.events.append(["preview", np.asarray(jax.random.key_data(step.key)).tolist()])
+            if case.failure == "deleted_preview":
                 local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
-                if rank == 0:
+                if case.rank == 0:
                     local.delete()
                 return Representations(features=local, labels=np.arange(3))
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
             preview = host(Representations(features=features, labels=batch["x"][:, 0]))
-            if rank == 0 and failure == "preview":
+            if case.rank == 0 and case.failure == "preview":
                 raise ValueError("preview decoding failed")
             return preview
 
@@ -904,9 +908,9 @@ def mode_evaluation_contract(args) -> dict:
         name, reads = "mean", Representations
 
         def __call__(self, artifact, batch):
-            if rank != 0:
+            if case.rank != 0:
                 raise AssertionError("host metric executed off root")
-            if failure == "metric":
+            if case.failure == "metric":
                 raise ValueError("host metric failed")
             values = np.asarray(artifact.features)
             assert np.array_equal(artifact.labels, np.arange(8))
@@ -917,41 +921,57 @@ def mode_evaluation_contract(args) -> dict:
             return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
 
         def finalize(self, accumulated):
-            if failure == "finalize":
+            if case.failure == "finalize":
                 raise ValueError("metric finalization failed")
             return accumulated[0] / accumulated[1]
 
     class Drawing:
         def log(self, scalars, step):
-            if failure == "log":
+            if case.failure == "log":
                 raise ValueError("tracker logging failed")
 
         def artifact(self, artifact, step):
-            assert rank == 0
-            if failure == "render":
+            assert case.rank == 0
+            if case.failure == "render":
                 raise ValueError("tracker rendering failed")
             assert np.shape(artifact.features) == (8, 1)
 
     def batches():
         try:
-            count = 0 if failure == "empty" else (
-                1 if failure == "next" or (rank == 0 and failure == "uneven") else 2)
+            count = 0 if case.failure == "empty" else (
+                1 if case.failure == "next" or (case.rank == 0 and case.failure == "uneven") else 2)
             for index in range(count):
-                if failure == "preview_only" and index:
+                if case.failure == "preview_only" and index:
                     raise OSError("unrequested validation tail was read")
                 yield {"a_metadata": np.asarray(7), "a_python": 9,
-                       "x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
-            if failure == "next" and rank == 1:
+                       "x": np.arange(case.rank * 4, (case.rank + 1) * 4, dtype=np.float32)[:, None]}
+            if case.failure == "next" and case.rank == 1:
                 raise OSError("iterator next failed")
         finally:
-            closed.append(failure)
+            case.closed.append(case.failure)
 
     def validation():
-        if failure == "no_consumer":
+        if case.failure == "no_consumer":
             raise OSError("validation opened without a consumer")
-        if failure == "construct" and rank == 1:
+        if case.failure == "construct" and case.rank == 1:
             raise OSError("iterator construction failed")
         return batches()
+
+    return Numerical, Mean, Drawing, batches, validation
+
+
+def mode_evaluation_contract(args) -> dict:
+    """Tiny all-rank numerical scoring with root-only metrics and previews."""
+    import jax
+    import optax
+
+    from dew.data import Dataset
+    from dew.training import Trainer
+
+    rank = jax.process_index()
+    case = _EvaluationCase(rank)
+    events, closed = case.events, case.closed
+    Numerical, Mean, Drawing, batches, validation = _evaluation_parts(case)
 
     objective = Numerical()
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
@@ -962,6 +982,7 @@ def mode_evaluation_contract(args) -> dict:
                     "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
                     "log", "render", "construct", "next", "deleted_first", "deleted_later",
                     "deleted_batch", "deleted_preview", "mismatched_plan"):
+        case.failure = failure
         events.clear()
         trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
         metric = Mean()
@@ -1220,6 +1241,48 @@ def rollout_prompts() -> dict:
             "extra_info": np.zeros((8, 1), np.int32)}
 
 
+def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -> dict:
+    """Each rank-local invalid input the pool must refuse on every rank (a
+    token past the vocabulary, a zero prompt length, a split key, a
+    component only one rank can describe), and the refusal it raised; both
+    ranks return from each before the next."""
+    import jax
+    from jax.experimental import multihost_utils
+
+    from dew.sampling import generate
+
+    invalid_errors = {}
+    # A component only one rank can describe: its closure holds an object
+    # whose identity is this process's address.
+    captured = None if rank == 0 else object()
+
+    def rewrite(state, logits):
+        return logits if captured is None else logits
+
+    for fault in ("token", "length", "key", "component"):
+        broken = {name: np.array(value, copy=True) for name, value in local.items()}
+        if rank == 1:
+            if fault == "token":
+                broken["prompt"][0, -1] = 13
+            elif fault == "length":
+                broken["prompt_length"][0] = 0
+        key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
+        try:
+            if fault == "component":
+                generate(model, state.params, inputs_for(local), 4, key=key, sampling=sampling,
+                         logits=(jax.tree_util.Partial(rewrite),))
+            else:
+                rollout(state, broken, key)
+        except (ValueError, RuntimeError) as error:
+            invalid_errors[fault] = str(error)
+        else:
+            raise AssertionError("rank-local invalid input was accepted")
+        reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+        if reached.tolist() != [0, 1]:
+            raise AssertionError("a rank did not return from input rejection")
+    return invalid_errors
+
+
 def mode_rollout(args) -> dict:
     """One sampled rollout and one GRPO update across the pool.
 
@@ -1289,34 +1352,7 @@ def mode_rollout(args) -> dict:
     direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
-        # A component only one rank can describe: its closure holds an object
-        # whose identity is this process's address.
-        captured = None if rank == 0 else object()
-
-        def rewrite(state, logits):
-            return logits if captured is None else logits
-
-        for fault in ("token", "length", "key", "component"):
-            broken = {name: np.array(value, copy=True) for name, value in local.items()}
-            if rank == 1:
-                if fault == "token":
-                    broken["prompt"][0, -1] = 13
-                elif fault == "length":
-                    broken["prompt_length"][0] = 0
-            key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
-            try:
-                if fault == "component":
-                    generate(model, state.params, inputs_for(local), 4, key=key, sampling=sampling,
-                             logits=(jax.tree_util.Partial(rewrite),))
-                else:
-                    rollout(state, broken, key)
-            except (ValueError, RuntimeError) as error:
-                invalid_errors[fault] = str(error)
-            else:
-                raise AssertionError("rank-local invalid input was accepted")
-            reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
-            if reached.tolist() != [0, 1]:
-                raise AssertionError("a rank did not return from input rejection")
+        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
     single = None
     if processes == 1:
         single = rolled
