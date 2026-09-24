@@ -33,6 +33,7 @@ from __future__ import annotations
 import errno
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -127,17 +128,14 @@ def _component(name: str, library: str, class_name: str, checkpoint: Mapping[str
     return None
 
 
-def pipeline_index(configs: Path) -> dict[str, object]:
+def pipeline_index(configs: Path) -> Mapping[str, object]:
     """The configs' model_index.json without the components `from_single_file`
     leaves out (diffusers' SINGLE_FILE_OPTIONAL_COMPONENTS: the safety checker
     and its feature extractor)."""
     from diffusers.loaders.single_file import SINGLE_FILE_OPTIONAL_COMPONENTS
 
     index = json.loads((configs / "model_index.json").read_text())
-    for name in SINGLE_FILE_OPTIONAL_COMPONENTS:
-        if name in index:
-            index[name] = [None, None]
-    return index
+    return {name: [None, None] if name in SINGLE_FILE_OPTIONAL_COMPONENTS else spec for name, spec in index.items()}
 
 
 def converted(checkpoint: Mapping[str, torch.Tensor], configs: Path,
@@ -225,13 +223,10 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
     when the caller's block exits without an error, so an interrupted or
     failed load leaves nothing cached.
     """
-    try:
-        import diffusers  # noqa: F401
-        import huggingface_hub  # noqa: F401
-        import torch  # noqa: F401
-    except ImportError as error:
-        raise ImportError(f"a single-file checkpoint converts through diffusers' key maps, which run in torch; "
-                          f"{INSTALL}") from error
+    missing = [name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None]
+    if missing:
+        raise ImportError(f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
+                          f"and {missing} are not installed; {INSTALL}")
 
     source = Path(path)
     checkpoint: dict[str, torch.Tensor] = {}
