@@ -38,6 +38,33 @@ def equal(left, right):
         np.testing.assert_array_equal(a, b, err_msg=path)
 
 
+FUSED_PER_STEP = 8
+"""Multiply-adds a step's optimizer may fuse per element on a GPU or a TPU,
+where the CPU rounds the product and the sum apart: Adam's two moments,
+AdamW's decay, the parameter update and the EMA, one each, and up to three
+units in the last place the global clip's scale moves by, the sum of five
+squares. Each fusion moves a value by at most one unit in its last place."""
+
+
+def platforms_agree(resident, host, steps: int):
+    """The resident layout's state and the host layout's after `steps`
+    optimizer steps, the host's run on the CPU: bitwise when the accelerator
+    is the CPU too. Elsewhere the resident optimizer runs where XLA fuses
+    multiply-adds, so a floating leaf is held to FUSED_PER_STEP ulps a step
+    of its own magnitude, and every other leaf (counts, steps, keys) is exact.
+    A leaf lost or reset at the boundary is wrong in its leading digits."""
+    if jax.default_backend() == "cpu":
+        equal(resident, host)
+        return
+    for path, a, b in _leaves(resident, host):
+        if not np.issubdtype(a.dtype, np.floating):
+            np.testing.assert_array_equal(a, b, err_msg=path)
+            continue
+        bound = FUSED_PER_STEP * steps * float(np.finfo(a.dtype).eps)
+        np.testing.assert_allclose(b, a, rtol=bound, atol=bound * float(np.max(np.abs(a), initial=0.0)),
+                                   err_msg=path)
+
+
 def close(left, right, bound=STREAMED_BOUND):
     """`left`, a CPU-owned state, agrees with `right`, a device one, leaf by
     leaf; the frozen collection is compared per layer, the host's banks
@@ -102,7 +129,7 @@ def test_complete_optimizer_tree_crosses_the_execution_boundary(optimizer):
         for _ in range(3):
             state, *_ = step(state, data)
         states.append(state)
-    equal(*states)
+    platforms_agree(*states, steps=3)
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -127,7 +154,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
         assert int(state.updates) == 1
         assert float(state.params["stats"]["seen"]) == 2
         states.append(state)
-    equal(*states)
+    platforms_agree(*states, steps=1)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = ShortScaleTrainer(
