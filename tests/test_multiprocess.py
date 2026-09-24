@@ -60,9 +60,11 @@ def free_port() -> int:
 
 
 def worker_env(devices: int) -> dict:
-    """A worker's environment: this worktree's dew, on `devices` CPU devices."""
+    """A worker's environment: this worktree's dew, on `devices` CPU devices,
+    with Python's faulthandler on, so a worker stopped by SIGABRT prints every
+    thread's stack first (`stuck`)."""
     return {**os.environ, "JAX_PLATFORMS": "cpu",
-            "PYTHONPATH": str(REPO_ROOT / "src"),
+            "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONFAULTHANDLER": "1",
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
@@ -85,6 +87,24 @@ def spawn(mode, out, processes=1, process_id=0, coordinator=None, devices=None, 
         command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes if devices is None else devices),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True)
+
+
+def stuck(pool, what: str) -> str:
+    """A pool that never reached `what`, stopped with each worker's output
+    and, through faulthandler, the stacks of every thread it had when it
+    stopped: where a stuck pool waits is what its failure has to say."""
+    for process in pool:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(process.pid, signal.SIGABRT)
+    outputs = []
+    for index, process in enumerate(pool):
+        try:
+            output = process.communicate(timeout=60)[0]
+        except subprocess.TimeoutExpired:
+            terminate(process)
+            output = process.communicate()[0]
+        outputs.append(f"--- process {index}, exit {process.returncode}\n{output}")
+    return f"the pool did not {what}\n" + "\n".join(outputs)
 
 
 def terminate(process) -> None:
@@ -842,9 +862,9 @@ def killed_local_pool(tmp_path_factory):
                             f"{process.communicate()[0]}")
         time.sleep(0.05)
     else:
-        for process in pool:
-            terminate(process)
-        pytest.fail(f"the pool did not block with local step {LOCAL_KILL_AFTER} landed")
+        state = {"blocked": [marker.exists() for marker in markers],
+                 "landed": [path.exists() for path in landed]}
+        pytest.fail(stuck(pool, f"block with local step {LOCAL_KILL_AFTER} landed {state}"))
     for process in pool:
         terminate(process)
     assert all(process.returncode == -signal.SIGKILL for process in pool)
