@@ -50,7 +50,18 @@ class SimpleDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
         )
-        self.blocks = [
+        self.blocks = self.stack()
+        self.output = PatchSequenceOutput(
+            patch_size=self.patch_size,
+            output_channels=self.output_channels,
+            norm_epsilon=self.norm_epsilon,
+            dtype=self.dtype,
+            precision=self.precision,
+        )
+
+    def stack(self) -> list[ModulatedBlock]:
+        """The layers between the patch embedding and the output, all attention."""
+        return [
             remat_block(ModulatedBlock, self.remat)(
                 features=self.emb_features,
                 num_heads=self.num_heads,
@@ -66,13 +77,6 @@ class SimpleDiT(nn.Module):
                 name=f"dit_block_{i}"
             ) for i in range(self.num_layers)
         ]
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
