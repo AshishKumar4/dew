@@ -34,26 +34,28 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from common import (
+    TracedWindow,
+    attach_xplane_profile,
     dit_train_flops_per_image,
     git_head,
     host,
-    kernel_summary,
     peak_flops,
     sha256,
+    source_version,
     steps_for,
     throughput,
-    trim_trace,
     window_rows,
     write_record,
-    xplane_kernels,
 )
 from dew_lm import recorded_norm
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 # The DiT both packages define, at 64x64 pixels: 256 patches of 4x4.
 MODEL = {"output_channels": 3, "patch_size": 4, "emb_features": 384, "num_layers": 8,
@@ -86,7 +88,10 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--ema", type=float, default=0.999)
     parser.add_argument("--timing-warmup", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=5)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.framework == "flaxdiff" and args.flaxdiff_path is None:
+        parser.error("--framework flaxdiff needs --flaxdiff-path, the directory holding flaxdiff/")
+    return args
 
 
 def draws(seed: int, steps: int, batch: int, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
@@ -100,23 +105,15 @@ def draws(seed: int, steps: int, batch: int, shape: tuple[int, ...]) -> tuple[np
     return levels, noise
 
 
-def flat(tree, prefix: str = "") -> dict[str, np.ndarray]:
-    out = {}
-    for key, value in tree.items():
-        name = f"{prefix}/{key}" if prefix else key
-        out.update(flat(value, name) if isinstance(value, dict) else {name: np.asarray(value)})
-    return out
+def load_tree(path: str | Path) -> dict:
+    """The npz of `/`-joined leaf paths `save_tree` writes, as its nested dict."""
+    with np.load(path) as arrays:
+        return unflatten_dict({name: np.asarray(arrays[name]) for name in arrays.files}, sep="/")
 
 
-def nested(arrays) -> dict:
-    tree: dict = {}
-    for name in arrays.files if hasattr(arrays, "files") else arrays:
-        node = tree
-        *path, leaf = name.split("/")
-        for part in path:
-            node = node.setdefault(part, {})
-        node[leaf] = np.asarray(arrays[name])
-    return tree
+def save_tree(path: str | Path, tree) -> None:
+    arrays: dict[str, Any] = {name: np.asarray(leaf) for name, leaf in flatten_dict(tree, sep="/").items()}
+    np.savez(path, **arrays)
 
 
 def solver(args, total: int) -> tuple[optax.GradientTransformation, optax.Schedule]:
@@ -170,8 +167,8 @@ def flaxdiff_side(args, images, total, attention):
     state = trainer.state
     init = Path(args.init)
     if not init.exists():
-        np.savez(init, **flat(jax.device_get(state.params)))
-    initial = nested(np.load(init))
+        save_tree(init, jax.device_get(state.params))
+    initial = load_tree(init)
     params = jax.device_put(initial, trainer.state_sharding.params)
     state = state.replace(
         params=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
@@ -225,7 +222,7 @@ def dew_side(args, images, total, attention):
     model = models.build("simple_dit", with_precision("simple_dit", MODEL, dtype=args.dtype,
                                                       attention_impl=attention))
     # The npz holds flaxdiff's whole variables dict, {"params": ...}.
-    initial = {**nested(np.load(args.init)), "encoders": {}}
+    initial = {**load_tree(args.init), "encoders": {}}
     objective = FixedDraws(model, EDM()(), InputSpec(sample=Field("image", images.shape[1:])),
                            ema_decay=args.ema, guidance=None, pretrained=initial)
     optimizer, schedule = solver(args, total)
@@ -253,6 +250,10 @@ def dew_side(args, images, total, attention):
 
 def main() -> None:
     args = arguments()
+    # Read before the run, so a source that cannot be traced fails at once.
+    built_from = {"jax": jax.__version__, "optax": optax.__version__, "flax": __import__("flax").__version__,
+                  "dew": git_head(Path(__file__).resolve().parents[2]),
+                  "flaxdiff": source_version(args.flaxdiff_path) if args.flaxdiff_path else None}
     if args.dtype == "float32":
         jax.config.update("jax_default_matmul_precision", "highest")
     attention = args.attention or ("cudnn" if args.dtype == "bfloat16" else "xla")
@@ -270,37 +271,23 @@ def main() -> None:
                       "t": levels[step], "noise": noise[step]})
 
     losses, norms = [], []
-    profile_from = total - args.profile_steps if args.profile_steps else total
     trace_dir = Path(args.out).with_suffix("").resolve()
-    window_start = window_end = None
+    window = TracedWindow(total, args.timing_warmup, args.profile_steps, trace_dir)
     loss = None
     compile_start = time.perf_counter()
     for step in range(total):
-        if step in (args.timing_warmup, profile_from):
-            jax.block_until_ready(loss)
-            now = time.perf_counter()
-            if step == args.timing_warmup:
-                window_start = now
-            if step == profile_from:
-                window_end = now
-                jax.profiler.start_trace(str(trace_dir))
+        window.before(step, loss)
         state, loss = run(state, batch(step))
         if step == 0:
             jax.block_until_ready(loss)
             first_step_seconds = time.perf_counter() - compile_start
         losses.append(loss)
         norms.append(jnp.copy(state.opt_state[0].norm))
-    jax.block_until_ready(loss)
-    end = time.perf_counter()
-    if window_end is None:
-        window_end = end
-    else:
-        jax.profiler.stop_trace()
+    window_seconds = window.close(loss)
 
     device_kind = jax.devices()[0].device_kind
     devices = jax.device_count()
-    samples_per_step = args.batch
-    timed = throughput(window_end - window_start, profile_from - args.timing_warmup, samples_per_step)
+    timed = throughput(window_seconds, window.timed_steps, args.batch)
     timed["images_per_s"] = timed.pop("tokens_per_s")
     flops_image = dit_train_flops_per_image(MODEL, *images.shape[1:])
     peak_rate = peak_flops(device_kind)
@@ -315,10 +302,7 @@ def main() -> None:
                    "init_sha256": sha256(args.init), "mesh": mesh_shape,
                    "convention": "EDM (P_mean -0.4, P_std 1, sigma_data 0.5), l2 loss, EDM weight",
                    "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw)"},
-        "versions": {"jax": jax.__version__, "optax": optax.__version__,
-                     "flax": __import__("flax").__version__,
-                     "dew": git_head(Path(__file__).resolve().parents[2]),
-                     "flaxdiff": git_head(args.flaxdiff_path) if args.flaxdiff_path else None},
+        "versions": built_from,
         "device": device_kind,
         "host": host(),
         "loss": np.asarray(jax.device_get(losses), np.float64).tolist(),
@@ -332,18 +316,8 @@ def main() -> None:
         "memory": {"peak_allocated_bytes": [int(s.get("peak_bytes_in_use", 0)) for s in stats]},
     }
     if args.profile_steps:
-        # A trace the summary cannot read is recorded as such; the run's
-        # curves above stand without it.
         write_record(args.out, record)
-        try:
-            kernels, lines = xplane_kernels(trace_dir)
-            record["profile"] = kernel_summary(kernels, args.profile_steps)
-            record["profile"]["kernels"] = str(trim_trace(kernels, trace_dir / "kernels.json.gz"))
-            record["profile"]["device_lines"] = lines
-        except (ValueError, FileNotFoundError) as error:
-            record["profile"] = {"error": str(error)}
-        for raw in trace_dir.rglob("*.xplane.pb"):
-            raw.unlink()
+        attach_xplane_profile(record, trace_dir, args.profile_steps)
     write_record(args.out, record)
     print(json.dumps({"first_loss": record["loss"][0], "last_loss": record["loss"][-1],
                       "images_per_s": timed["images_per_s"],

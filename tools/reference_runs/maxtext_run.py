@@ -29,16 +29,7 @@ from pathlib import Path
 os.environ.setdefault("DECOUPLE_GCLOUD", "TRUE")
 
 import jax
-from common import (
-    host,
-    kernel_summary,
-    peak_flops,
-    throughput,
-    train_flops_per_token,
-    trim_trace,
-    write_record,
-    xplane_kernels,
-)
+from common import attach_xplane_profile, host, peak_flops, throughput, train_flops_per_token, write_record
 
 
 def arguments() -> argparse.Namespace:
@@ -133,14 +124,8 @@ def main() -> None:
                    "bytes_limit": [int(s.get("bytes_limit", 0)) for s in stats]},
     }
     if args.profile_steps:
-        out = Path(args.out)
-        try:
-            kernels, lines = xplane_kernels(workdir)
-            record["profile"] = kernel_summary(kernels, args.profile_steps)
-            record["profile"]["kernels"] = str(trim_trace(kernels, out.resolve().with_suffix("") / "kernels.json.gz"))
-            record["profile"]["device_lines"] = lines
-        except (ValueError, FileNotFoundError) as error:
-            record["profile"] = {"error": str(error)}
+        attach_xplane_profile(record, workdir, args.profile_steps,
+                              rows=Path(args.out).resolve().with_suffix("") / "kernels.json.gz")
     shutil.rmtree(workdir)
     write_record(args.out, record)
     print(json.dumps({"tokens_per_s": rate["tokens_per_s"], "step_ms": rate["step_ms_mean"], "mfu": record["mfu"],

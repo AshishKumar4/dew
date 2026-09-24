@@ -20,6 +20,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -224,6 +225,85 @@ def git_head(path: str | Path) -> str:
     traced, so a checkout git cannot read fails the run."""
     return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
                           text=True, check=True).stdout.strip()
+
+
+def source_version(path: str | Path) -> str:
+    """Where a reference package's source came from: its checkout's commit,
+    or for a copied tree the sha256 over its Python files' paths and bytes."""
+    head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode == 0:
+        return head.stdout.strip()
+    digest = hashlib.sha256()
+    for file in sorted(Path(path).rglob("*.py")):
+        digest.update(str(file.relative_to(path)).encode())
+        digest.update(file.read_bytes())
+    return f"sha256:{digest.hexdigest()}"
+
+
+class TracedWindow:
+    """The timed window and the traced tail of a JAX run of `total` steps.
+
+    The steps from `warmup` up to the last `profiled` ones are timed,
+    synchronized at both ends and nowhere inside; the last `profiled` are
+    traced by jax.profiler into `trace_dir`. Call `before(step, pending)`
+    ahead of each step with the newest output still in flight, add any
+    in-window seconds that are not training to `excluded`, and end with
+    `close(pending)`, which returns the window's training seconds."""
+
+    def __init__(self, total: int, warmup: int, profiled: int, trace_dir: str | Path):
+        self.warmup, self.profiled, self.trace_dir = warmup, profiled, Path(trace_dir)
+        self.profile_from = total - profiled if profiled else total
+        self.timed_steps = self.profile_from - warmup
+        self.start: float | None = None
+        self.end: float | None = None
+        self.excluded = 0.0
+
+    def times(self, step: int) -> bool:
+        return self.warmup <= step < self.profile_from
+
+    def before(self, step: int, pending) -> None:
+        import jax
+
+        if step not in (self.warmup, self.profile_from):
+            return
+        jax.block_until_ready(pending)
+        now = time.perf_counter()
+        if step == self.warmup:
+            self.start = now
+        if step == self.profile_from and self.profiled:
+            self.end = now
+            jax.profiler.start_trace(str(self.trace_dir))
+
+    def close(self, pending) -> float:
+        import jax
+
+        jax.block_until_ready(pending)
+        end = time.perf_counter()
+        if self.end is None:
+            self.end = end
+        else:
+            jax.profiler.stop_trace()
+        if self.start is None:
+            raise ValueError(f"the timed window never opened: warm-up {self.warmup} is past the run")
+        return self.end - self.start - self.excluded
+
+
+def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
+                          rows: str | Path | None = None) -> None:
+    """The traced tail's kernel summary as `record["profile"]`, beside its
+    trimmed kernel rows (`rows`, by default `trace_dir/kernels.json.gz`),
+    with the raw xplane files deleted. A trace the summary cannot read is
+    recorded as such: the run's curves stand without it."""
+    trace_dir = Path(trace_dir)
+    try:
+        kernels, lines = xplane_kernels(trace_dir)
+        record["profile"] = kernel_summary(kernels, steps)
+        record["profile"]["kernels"] = str(trim_trace(kernels, rows or trace_dir / "kernels.json.gz"))
+        record["profile"]["device_lines"] = lines
+    except (ValueError, FileNotFoundError) as error:
+        record["profile"] = {"error": str(error)}
+    for raw in trace_dir.rglob("*.xplane.pb"):
+        raw.unlink()
 
 
 def host() -> dict:
