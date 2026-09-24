@@ -36,7 +36,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
-from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
@@ -640,26 +640,35 @@ class WeightLayout:
     dtype: np.dtype | None = None
     padded: int | None = None
 
+    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
+              scalar_mode: str | None) -> np.ndarray | jax.Array:
+        if path[-1] == "layer_scalar":
+            if scalar_mode not in ("frozen", "trainable"):
+                raise ValueError("layer_scalar export requires an explicit model mode")
+            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
+        node: object = variables
+        for part in path:
+            if not isinstance(node, Mapping):
+                raise ValueError(f"parameter path {path} does not traverse a mapping")
+            node = node[part]
+        if not isinstance(node, (np.ndarray, jax.Array)):
+            raise ValueError(f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array")
+        return node
+
+    def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
+        """The dtype `export` writes, read from the leaf without copying it."""
+        if self.dtype is not None:
+            return np.dtype(self.dtype)
+        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
+
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
         for path in self.paths:
-            if path[-1] == "layer_scalar":
-                if scalar_mode not in ("frozen", "trainable"):
-                    raise ValueError("layer_scalar export requires an explicit model mode")
-                path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
-            node: object = variables
-            for part in path:
-                if not isinstance(node, Mapping):
-                    raise ValueError(f"parameter path {path} does not traverse a mapping")
-                node = node[part]
+            node = self._leaf(variables, path, scalar_mode)
             if self.expert_index is not None:
                 # Slice the expert where the leaf lives. One stacked leaf
                 # answers for E source tensors, so copying it to the host
                 # per tensor would move the whole stack E times.
-                if not isinstance(node, (np.ndarray, jax.Array)):
-                    raise ValueError(
-                        f"{self.name} takes an expert of {path}, which holds "
-                        f"{type(node).__name__} rather than an array")
                 if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
                     raise ValueError(
                         f"{self.name} is expert {self.expert_index} of {path}, which "
@@ -1025,8 +1034,17 @@ class Pretrained:
             # Source names and geometry first; the packed format goes back over them.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
+            layouts = {layout.name: layout for layout in self.weight_layouts}
+            if quantization is None:
+                # Each tensor is assembled when its shard is written (`save_sharded`).
+                specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
+                            for name, value in self.retained_tensors.items()},
+                         **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(values, scalar_mode))
+                            for name, layout in layouts.items()}}
+                return LazyTensors(specs, lambda name: (layouts[name].export(values, scalar_mode) if name in layouts
+                                                        else self.retained_tensors[name]))
             tensors = {**self.retained_tensors,
-                       **{layout.name: layout.export(values, scalar_mode) for layout in self.weight_layouts}}
+                       **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
             raise ValueError("this source has no reversible weight layout")
         if quantization is not None:

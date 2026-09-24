@@ -124,7 +124,7 @@ The two rows have different numbers of images, so the processor left-pads the sh
 
 Padding belongs to each process's own rows, so on a process pool the processes agree about a missing mask before anything is assembled. A generation request creates the field on every process if any process has it, and leaves it out if none does. A training batch placed by `shard_batch` has it on every process. For text-only prompts, leave out the `images` argument. Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
 
-To keep training, hand the loaded variables to the objective and feed the trainer `{"text": inputs}` batches. `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both here and in Transformers.
+To keep training, hand the loaded variables to the objective and feed the trainer `{"text": inputs}` batches. `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both here and in Transformers. Past `max_shard_size` (default 5 GB) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, Gemma 4 and GLM-5-next build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
 
 ```python
 import optax
