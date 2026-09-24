@@ -33,21 +33,19 @@ from dew.nn.sharding import logical_axes
 from dew.registry import models
 
 
-def sincos_position(channels: int, grid: int, *, base_size: int,
-                    interpolation_scale: float = 1.0):
+def sincos_position(channels: int, grid: int, *, base_size: int):
     """`get_2d_sincos_pos_embed` at the grid the source builds its buffer on.
 
     The source meshes width first and then reads that first mesh into the
     leading half of the channels, so the leading half carries the column
     coordinate and the trailing half the row, each as sine then cosine over
-    frequencies 10000^-(2i/half); both axes are divided by `grid / base_size`
-    and the interpolation scale.
+    frequencies 10000^-(2i/half); both axes are divided by `grid / base_size`.
 
     This is only the buffer's initializer. A published checkpoint stores the
     buffer and that stored value is what a load reads; this is here so a
     model built without one starts where the source starts.
     """
-    steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size) / interpolation_scale
+    steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
     columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
     half = channels // 2
     omega = 1.0 / 10000 ** (jnp.arange(half // 2, dtype=jnp.float32) / (half / 2.0))
