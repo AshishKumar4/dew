@@ -2001,10 +2001,10 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     """Build Qwen-Image 2.1's transformer: one stream over the Qwen3-VL
     encoder's prompt states and the latent, one token per position.
 
-    The class declares no sample size; its pipeline renders at
-    `output_resolution` 1024 pixels, 64 latent positions through the VAE's
-    16x, which a directory overrides with its own geometry. It starts from
-    the sigmas its pipeline hands the scheduler.
+    The class declares no sample size, and neither does the published
+    config; its pipeline renders at `output_resolution` 1024 pixels, 64
+    latent positions through the VAE's 16x. It starts from the sigmas its
+    pipeline hands the scheduler.
     """
     from dew.interop import diffusion
     from dew.nn.backbones.qwen_image import QwenImageTransformer
