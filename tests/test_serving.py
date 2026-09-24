@@ -184,6 +184,37 @@ def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
                                          sampling=bound.sampling, n=2), slots=2, capacity=64)
 
 
+def test_a_server_holds_its_capacity_in_whole_tiles_not_a_power_of_two():
+    """Every decode step's attention reads each slot of a row's cache, so the
+    cache holds the capacity asked for, rounded up to whole 64-slot tiles and
+    whole pages. A capacity of 384 was bucketed to 512 slots, a third more
+    cache memory and attention traffic than any row could use."""
+    bound = task(capacity=512)
+
+    def slots(**options):
+        server = Server.from_task(bound, slots=2, **options)
+        held = {leaf.shape for path, leaf in jax.tree_util.tree_flatten_with_path(server.cache)[0]
+                if jax.tree_util.keystr(path).endswith("['cache_valid']")}
+        return server.capacity, held
+
+    assert slots(capacity=384) == (384, {(2, 384)})
+    assert slots(capacity=300) == (320, {(2, 320)})
+    assert slots(capacity=300, kv_cache=KVCache(page_size=128)) == (384, {(2, 384)})
+
+
+def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serves_it():
+    """A capacity of 384 is no power of two, and a 300-token prompt's
+    prefill bucket is 512: the prefill is bounded by the capacity, so the
+    server draws what the task draws alone, where a 512-wide prefill did
+    not fit the 384-slot rows."""
+    bound = task(capacity=512)
+    prompt = "".join(str(1 + index % 9) for index in range(300))
+    server = Server.from_task(bound, slots=2, capacity=384)
+    ticket = server.submit(prompt, 50, seed=0)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt, 50, seed=0))
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
