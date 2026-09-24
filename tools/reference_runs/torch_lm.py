@@ -11,7 +11,10 @@ forward, the logits upcast to fp32 and cross entropy over every shifted
 target (`ForCausalLMLoss` with the shift done here, so a `seq + 1` row gives
 `seq` targets as Dew's LM objective takes them), `clip_grad_norm_`, and
 fused `torch.optim.AdamW` on the schedule `common.warmup_cosine`, which is
-optax's `warmup_cosine_decay_schedule`.
+optax's `warmup_cosine_decay_schedule`. `--compile` compiles what
+torchtitan's "model" and "loss" components do: every decoder layer before
+DDP or fully_shard wraps it, then the final norm and the head, and the loss,
+whose compiled upcast and cross entropy never hold the logits in fp32.
 
 Precision policies:
   autocast   fp32 parameters, forward and loss under torch.autocast(bf16);
@@ -80,8 +83,7 @@ def arguments() -> argparse.Namespace:
                              "grouped_mm, is outside autocast and runs the experts at the fp32 "
                              "weights' dtype; 'eager' loops F.linear, which autocast runs in bf16")
     parser.add_argument("--compile", action="store_true",
-                        help="torch.compile every decoder layer before DDP or fully_shard wraps it, "
-                             "the placement torchtitan uses")
+                        help="torch.compile each decoder layer, the final norm and head, and the loss")
     parser.add_argument("--steps", type=int, default=None, help="stop early; unset runs every epoch")
     parser.add_argument("--lr-peak", type=float, default=2e-5)
     parser.add_argument("--lr-init", type=float, default=2e-6)
@@ -180,6 +182,12 @@ def router_probe(model, tokens: torch.Tensor, active: int, precision: str) -> tu
     return loads, entropies
 
 
+def token_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Mean cross entropy over every target, the logits upcast to fp32 as
+    transformers' ForCausalLMLoss does."""
+    return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1))
+
+
 @dataclasses.dataclass
 class Ranks:
     """Where this process runs: its rank among `world` and its GPU."""
@@ -225,17 +233,23 @@ class Run:
     micro: int
     accumulation: int
     active: int  # experts a token takes; 0 without the balance loss
+    loss: Any  # token_loss, compiled under --compile
 
 
-def decoder_layers(model) -> torch.nn.ModuleList:
-    """The repeated blocks of a transformers causal LM: a decoder's
-    `model.layers`, a Mamba's `backbone.layers`."""
-    trunk = getattr(model, "model", None)
-    if trunk is None:
-        trunk = getattr(model, "backbone", None)
-    if trunk is None or not hasattr(trunk, "layers"):
+def trunk(model) -> torch.nn.Module:
+    """The stack under a transformers causal LM's head: a decoder's `model`,
+    a Mamba's `backbone`."""
+    stack = getattr(model, "model", None)
+    if stack is None:
+        stack = getattr(model, "backbone", None)
+    if stack is None or not hasattr(stack, "layers"):
         raise ValueError(f"{type(model).__name__} has no model.layers or backbone.layers")
-    return trunk.layers
+    return stack
+
+
+def final_norm(stack) -> torch.nn.Module:
+    """The norm a decoder's `model.norm` or a Mamba's `backbone.norm_f` is."""
+    return stack.norm if hasattr(stack, "norm") else stack.norm_f
 
 
 def build(args: argparse.Namespace, place: Ranks) -> Run:
@@ -251,8 +265,10 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     if args.precision == "autocast-bf16-residual":
         bf16_residual(model)
     if args.compile:
-        for layer in decoder_layers(model):
+        for layer in trunk(model).layers:
             layer.compile()
+        final_norm(trunk(model)).compile()
+        model.lm_head.compile()
     routed = args.router_aux is not None
     if routed:
         model.config.output_router_logits = False
@@ -278,13 +294,14 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
         policy = (MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
                   if args.precision == "fsdp-bf16" else MixedPrecisionPolicy())
-        for layer in decoder_layers(model):
+        for layer in trunk(model).layers:
             fully_shard(layer, mp_policy=policy)
         fully_shard(model, mp_policy=policy)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.b1, args.b2),
                                   eps=args.eps, weight_decay=args.weight_decay, fused=True)
     return Run(model, network, optimizer, windows, order, windows.shape[1] - 1, total, schedule_steps,
-               share, micro, share // micro, model.config.num_experts_per_tok if routed else 0)
+               share, micro, share // micro, model.config.num_experts_per_tok if routed else 0,
+               torch.compile(token_loss) if args.compile else token_loss)
 
 
 def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int
@@ -308,8 +325,7 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int
             with autocast(args.precision):
                 outputs = run.network(input_ids=chunk[:, :-1], output_router_logits=routed) if routed \
                     else run.network(input_ids=chunk[:, :-1])
-                logits = outputs.logits.float()
-                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), chunk[:, 1:].reshape(-1))
+                loss = run.loss(outputs.logits, chunk[:, 1:])
                 objective = loss
                 if routed:
                     aux = args.router_aux * moe_aux(outputs.router_logits, run.active, place.distributed)
