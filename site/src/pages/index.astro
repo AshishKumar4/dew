@@ -4,7 +4,6 @@ import { Code } from '@astrojs/starlight/components';
 import capture from '../data/capture.json';
 import objectiveCode from '../data/objective.py?raw';
 import models from '../generated/models.json';
-import outputs from '../generated/notebook-outputs.json';
 import registries from '../generated/registries.json';
 import tutorials from '../generated/tutorial-cards.json';
 import MeshDiagram from '../components/landing/MeshDiagram.astro';
@@ -12,30 +11,6 @@ import '../styles/landing.css';
 
 const objective = capture.snippets.objective;
 if (objective.returncode !== 0) throw new Error('src/data/capture.json: the objective snippet did not exit cleanly');
-
-// Real outputs from the tutorials' last complete runs, picked by notebook and cell id.
-function cell(notebook: string, id: string) {
-	const found = (outputs as Record<string, Record<string, { images: { src: string; width: number; height: number }[]; stdout?: string }>>)[notebook]?.[id];
-	if (!found) throw new Error(`landing page: no output for ${notebook} ${id}; the notebook changed, update src/pages/index.astro`);
-	return found;
-}
-const flowers = cell('02-train-a-diffusion-model', 'cell-24').images[0];
-const shakespeare = cell('05-train-a-language-model', 'cell-20').stdout ?? '';
-const samplers = cell('04-samplers-and-schedules', 'cell-15').images[2];
-
-// Model sizes and step counts as the notebooks print and set them.
-function parameters(notebook: string, id: string): string {
-	const printed = /([\d.]+)M parameters/.exec(cell(notebook, id).stdout ?? '');
-	if (!printed) throw new Error(`landing page: ${notebook} ${id} no longer prints its parameter count`);
-	return `${printed[1]}M`;
-}
-function steps(notebook: string): string {
-	const value = tutorials.find((entry) => entry.source.endsWith(`${notebook}.ipynb`))?.settings?.STEPS;
-	if (typeof value !== 'number') throw new Error(`landing page: ${notebook} has no STEPS setting`);
-	return value.toLocaleString('en-US');
-}
-const flowerModel = { parameters: parameters('02-train-a-diffusion-model', 'cell-18'), steps: steps('02-train-a-diffusion-model') };
-const textModel = { parameters: parameters('05-train-a-language-model', 'cell-14'), steps: steps('05-train-a-language-model') };
 
 const families = models.groups.reduce((sum, group) => sum + group.families.length, 0);
 // The solvers registered for continuous diffusion and flows, counted from the code.
@@ -155,28 +130,6 @@ const workloads = [
 						</article>
 					))
 				}
-			</div>
-			<div class="evidence-grid">
-				<figure class="evidence">
-					<img src={flowers.src} width={flowers.width} height={flowers.height} alt="A grid of 32 flower images generated from noise by a small diffusion transformer" loading="lazy" />
-					<figcaption>
-						Flowers sampled from noise by the {flowerModel.parameters}-parameter diffusion transformer that{' '}
-						<a href="/tutorials/02-train-a-diffusion-model/">tutorial 02</a> trains in {flowerModel.steps} steps.
-					</figcaption>
-				</figure>
-				<figure class="evidence text">
-					<pre>{shakespeare.trimEnd()}</pre>
-					<figcaption>
-						Text from the {textModel.parameters}-parameter byte-level model of{' '}
-						<a href="/tutorials/05-train-a-language-model/">tutorial 05</a>, after {textModel.steps} steps on Tiny Shakespeare.
-					</figcaption>
-				</figure>
-				<figure class="evidence tall">
-					<img src={samplers.src} width={samplers.width} height={samplers.height} alt="The same four starting noises sampled with seven different solvers at 40 steps" loading="lazy" />
-					<figcaption>
-						Seven solvers on one checkpoint and one set of starting noises, from <a href="/tutorials/04-samplers-and-schedules/">tutorial 04</a>.
-					</figcaption>
-				</figure>
 			</div>
 		</section>
 
