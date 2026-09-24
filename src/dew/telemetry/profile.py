@@ -50,6 +50,25 @@ def require_profile_support() -> _Converter:
     return converter
 
 
+def capture_options() -> jax.profiler.ProfileOptions:
+    """The options a Dew capture starts with, for any JAX trace that should read like one.
+
+    Host events at level 2 and the compiled HLO, and no Python tracer: it
+    records every Python and C call, which slows Python-heavy host work
+    several times over (a server's 512-row settle loop took 0.85 ms a step
+    traced against 0.18 ms untraced), so the trace would show host time,
+    and the device idle behind it, that the run never spends. On TPU the
+    trace also carries compute and sync events.
+    """
+    options = jax.profiler.ProfileOptions()
+    options.host_tracer_level = 2
+    options.python_tracer_level = 0
+    options.enable_hlo_proto = True
+    if jax.default_backend() == "tpu":
+        options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
+    return options
+
+
 def active_profile() -> Profiler | None:
     """The explicitly enabled process-local profiler, or None."""
     owner = _active
@@ -174,14 +193,7 @@ class Profiler:
         try:
             converter = require_profile_support()
             backend = jax.default_backend()
-            options = self._options
-            if options is None:
-                options = jax.profiler.ProfileOptions()
-                options.host_tracer_level = 2
-                options.python_tracer_level = 0
-                options.enable_hlo_proto = True
-                if backend == "tpu":
-                    options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
+            options = capture_options() if self._options is None else self._options
             _drain()
             if self._directory is None:
                 self._directory = Path(tempfile.mkdtemp(prefix="dew-profile-"))

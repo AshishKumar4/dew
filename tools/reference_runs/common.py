@@ -245,9 +245,12 @@ class TracedWindow:
 
     The steps from `warmup` up to the last `profiled` ones are timed,
     synchronized at both ends and nowhere inside; the last `profiled` are
-    traced by jax.profiler into `trace_dir`. Call `before(step, pending)`
-    ahead of each step with the newest output still in flight, add any
-    in-window seconds that are not training to `excluded`, and end with
+    traced by jax.profiler into `trace_dir`, with its Python tracer off as
+    in a Dew capture (`dew.telemetry.profile.capture_options`, which this
+    module can't import): the tracer records every Python and C call and
+    slows a host-bound run's steps. Call `before(step, pending)` ahead of
+    each step with the newest output still in flight, add any in-window
+    seconds that are not training to `excluded`, and end with
     `close(pending)`, which returns the window's training seconds."""
 
     def __init__(self, total: int, warmup: int, profiled: int, trace_dir: str | Path):
@@ -272,7 +275,9 @@ class TracedWindow:
             self.start = now
         if step == self.profile_from and self.profiled:
             self.end = now
-            jax.profiler.start_trace(str(self.trace_dir))
+            options = jax.profiler.ProfileOptions()
+            options.python_tracer_level = 0
+            jax.profiler.start_trace(str(self.trace_dir), profiler_options=options)
 
     def close(self, pending) -> float:
         import jax

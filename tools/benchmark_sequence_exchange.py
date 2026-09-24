@@ -44,6 +44,7 @@ from benchmark_step import communication
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 
 from dew.nn.attention import attention_kernel, exchanged_heads_attention, gathered_keys_attention
+from dew.telemetry.profile import capture_options
 from dew.training import MeshSpec, build_mesh
 
 EXCHANGES: dict[str, Callable] = {
@@ -141,7 +142,7 @@ def attention_case(batch: int, length: int, heads: int, kv_heads: int, head_dim:
                 directory = os.path.join(
                     profile_dir, f"{record['exchange']}-{length}-"
                     f"{'-'.join(str(d) for d in record['devices'])}")
-                jax.profiler.start_trace(directory)
+                jax.profiler.start_trace(directory, profiler_options=capture_options())
                 for _ in range(PROFILED_CALLS):
                     jax.block_until_ready(step(*operands))
                 jax.profiler.stop_trace()

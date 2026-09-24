@@ -68,7 +68,7 @@ device was deliberately left behind. The device step is 6.9 ms.
 | host work per step | ms | how measured |
 |---|---:|---|
 | XLA thunk execution inside PjRt Execute | 3.3 | `GpuExecutable::ExecuteThunks` on the host plane; 2.4 of it is three CUDA-graph launches |
-| Python in `jax.stages.Compiled.__call__` before Execute | 1.8 | `$stages.py __call__` 6.7 ms against `PjRtCApiLoadedExecutable::Execute` 5.0 ms |
+| Python in `jax.stages.Compiled.__call__` before Execute | 1.8 | `$stages.py __call__` 6.7 ms against `PjRtCApiLoadedExecutable::Execute` 5.0 ms. The `$` events come from JAX's Python tracer, which adds time to every Python and C call, so 1.8 is an upper bound on the untraced cost |
 | placing a fresh batch (`shard_batch`) | 0.25 | 200 calls timed in isolation, image plus tokens |
 | the loop with a fixed device batch | 5.0 | dispatch loop time, 100 steps, device 27 steps behind |
 | the loop with a fresh batch per step | 6.5 | same, device 7 steps behind |
@@ -77,7 +77,7 @@ device was deliberately left behind. The device step is 6.9 ms.
 On the smallest step, the host takes 94% of the device's time with a fresh
 batch every step, and 106% without command buffers. Two conclusions follow.
 
-First, the Python in `Compiled.__call__` costs 4.5 us per leaf, and this
+First, the Python in `Compiled.__call__` costs at most 4.5 us per leaf, and this
 state has 396 leaves (more on a mesh). That is why `Trainer.compile` returns
 the jitted step, starting with `de6b22c`. Since the sequence axis landed, the jitted step is wrapped in the
 mesh context, and a dispatch costs 32 us on the i9-12900K with or without
