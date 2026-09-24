@@ -273,6 +273,29 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
     assert runs == ["5 5", "6 6"]
 
 
+def test_train_rlvr_scorer_forgets_old_programs_in_a_long_run():
+    """A run scores each program once, but a long one does not keep them all:
+    after 65,536 other programs the first is scored again, where an unbounded
+    cache would still hold every program the run ever scored."""
+    from dew.objectives.rl import Action
+    from dew.sampling import Sampling
+
+    example = load_example("train_rlvr")
+    runs = []
+
+    def reward(source, completion, cases, info):
+        runs.append(completion)
+        return 0.0
+
+    score = example.attempt_scorer(reward, lambda ids: " ".join(map(str, ids)))
+    sampling = Sampling(temperature=1.0, eos_id=0)
+    programs = [Action((1,), (token,), (-.5,), (-.5,), False, 0, sampling) for token in range(1, 65_538)]
+    for action in (*programs, programs[0]):
+        score("cases", action)
+    assert runs.count("1") == 2
+
+
+
 def test_train_harbor_waits_for_the_gateway_it_is_told_to_launch(tmp_path):
     """The real path writes the served policy and then waits for the gateway the user starts; with none
     up it gives up with the readiness error instead of failing on the first gateway call."""

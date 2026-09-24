@@ -1,7 +1,8 @@
-"""recipes/lm/rigel.py: the published parameter counts."""
+"""recipes/lm/rigel.py: the published parameter counts, and its command line."""
 
 import importlib.util
 import math
+import runpy
 import sys
 from pathlib import Path
 
@@ -36,3 +37,22 @@ def test_rigel_has_its_published_parameter_counts():
         embedding += count if "embed_tokens" in names else 0
         active += count * 2 // 128 if "experts" in names else count
     assert (total, active - embedding) == (2_345_567_552, 260_998_464)
+
+
+def test_rigel_passes_the_lm_recipes_nested_flags_through(tmp_path, monkeypatch):
+    """After its own flags, rigel.py takes the LM recipe's, a nested field such
+    as `--data.seq-len` included, without naming the data subcommand, as
+    recipes/lm/train.py does."""
+    spec = importlib.util.spec_from_file_location("train", PATH.parent / "train.py")
+    assert spec is not None and spec.loader is not None
+    recipe = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "train", recipe)  # rigel.py imports it by that name
+    spec.loader.exec_module(recipe)
+    configs = []
+    monkeypatch.setattr(recipe, "main", configs.append)
+    monkeypatch.setattr(sys, "argv", ["rigel.py", "--corpora", "web", str(tmp_path), "--data.seq-len", "512",
+                                      "--trainer.checkpoint-dir", str(tmp_path / "runs")])
+    runpy.run_path(str(PATH), run_name="__main__")
+    (config,) = configs
+    assert config.data.seq_len == 512
+    assert config.trainer.checkpoint_dir == str(tmp_path / "runs")
