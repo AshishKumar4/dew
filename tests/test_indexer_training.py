@@ -19,6 +19,7 @@ import optax
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import FROZEN, Step, scalar_loss
@@ -304,6 +305,25 @@ def test_the_loss_is_the_cross_entropy_plus_the_weighted_kl():
     assert float(value) == pytest.approx(float(ce) + 0.25 * float(aux.metrics["indexer_kl"]), rel=1e-5)
 
 
+def packed_row(*documents):
+    """One `[SEQ + 1]` row: the documents back to back, then padding (segment 0)."""
+    ids = np.zeros((SEQ + 1,), np.int32)
+    segments = np.zeros((SEQ + 1,), np.int32)
+    positions = np.zeros((SEQ + 1,), np.int32)
+    cursor = 0
+    for index, document in enumerate(documents, start=1):
+        ids[cursor:cursor + len(document)] = document
+        segments[cursor:cursor + len(document)] = index
+        positions[cursor:cursor + len(document)] = np.arange(len(document))
+        cursor += len(document)
+    return ids, segments, positions
+
+
+def packed_batch(rows):
+    ids, segments, positions = (jnp.asarray(np.stack(column)) for column in zip(*rows, strict=True))
+    return {"text": ids, "text_segment_ids": segments, "text_positions": positions}
+
+
 def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
     """Two documents packed into one row, then each alone with padding:
     the KL per counted query is the same, so the packed mask isolates the
@@ -311,35 +331,35 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
     count nothing. A row of padding alone contributes no query."""
     tokens = np.random.default_rng(3).integers(1, VOCAB, size=(SEQ + 1,))
     first, second = tokens[:7], tokens[7:13]
-
-    def row(*documents):
-        ids = np.zeros((SEQ + 1,), np.int32)
-        segments = np.zeros((SEQ + 1,), np.int32)
-        positions = np.zeros((SEQ + 1,), np.int32)
-        cursor = 0
-        for index, document in enumerate(documents, start=1):
-            ids[cursor:cursor + len(document)] = document
-            segments[cursor:cursor + len(document)] = index
-            positions[cursor:cursor + len(document)] = np.arange(len(document))
-            cursor += len(document)
-        return ids, segments, positions
-
-    together = row(first, second)
-    apart = [row(first), row(second), row()]
-
-    def batch(rows):
-        ids, segments, positions = (np.stack(column) for column in zip(*rows))
-        return {"text": jnp.asarray(ids), "text_segment_ids": jnp.asarray(segments),
-                "text_positions": jnp.asarray(positions)}
+    together = packed_row(first, second)
+    apart = [packed_row(first), packed_row(second), packed_row()]
 
     for phase, topk in (("warmup", None), ("sparse", 4)):
         objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
         params = objective.init(jax.random.key(0))
-        _, packed = scalar_loss(objective, params, batch([together]), step_at())
-        _, alone = scalar_loss(objective, params, batch(apart), step_at())
+        _, packed = scalar_loss(objective, params, packed_batch([together]), step_at())
+        _, alone = scalar_loss(objective, params, packed_batch(apart), step_at())
         assert np.isfinite(float(packed.metrics["indexer_kl"]))
         assert float(packed.metrics["indexer_kl"]) == pytest.approx(
             float(alone.metrics["indexer_kl"]), rel=1e-5), phase
+
+
+def test_packing_carried_by_the_model_inputs_scores_the_same_kl():
+    """The sparse phase reads a packed row's documents off its `ModelInputs`
+    as it reads them off the batch's packing columns, padding queries
+    included, which count nothing either way."""
+    tokens = np.random.default_rng(3).integers(1, VOCAB, size=(SEQ + 1,))
+    columns = packed_batch([packed_row(tokens[:7], tokens[7:13])])
+    carried = {"text": ModelInputs(columns["text"], {"segment_ids": columns["text_segment_ids"],
+                                                     "positions": columns["text_positions"]})}
+    objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
+    params = objective.init(jax.random.key(0))
+
+    _, by_columns = scalar_loss(objective, params, columns, step_at())
+    _, by_inputs = scalar_loss(objective, params, carried, step_at())
+
+    assert float(by_inputs.metrics["indexer_kl"]) == pytest.approx(
+        float(by_columns.metrics["indexer_kl"]), rel=1e-6)
 
 
 def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
