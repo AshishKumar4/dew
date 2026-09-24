@@ -248,14 +248,14 @@ class Launch:
 
     def layout(self, first_host: str) -> tuple[int, int | None]:
         """Processes per host and GPUs per process. A host's GPUs are
-        counted on the first host, unless the flags already say both, and
-        not at all when JAX_PLATFORMS keeps the pool off GPUs, as a CPU
-        rehearsal on a GPU machine does. Every GPU process names its GPUs,
-        even a single process holding all of them: jax would otherwise let
-        a cluster it detects, such as the one-task Slurm step the launcher
-        may run in, narrow it to the GPU at the step's local rank."""
+        counted on the first host, only when the flags leave them to decide,
+        and not at all when JAX_PLATFORMS keeps the pool off GPUs, as a CPU
+        rehearsal on a GPU machine does. GPUs are named only where several
+        processes split a host's: one process holds every GPU and names
+        none, and prepare_process keeps a cluster's detection from narrowing
+        a pool the launcher placed."""
         processes, devices = self.processes_per_host, self.devices_per_process
-        if processes is not None and devices is not None:
+        if processes is not None and (devices is not None or processes == 1):
             return processes, devices
         # What the pool's processes will see: the --env values, and on this
         # machine the launcher's own environment, which ssh does not carry.
@@ -267,7 +267,7 @@ class Launch:
             processes = max(1, gpus // (devices or 1))
         # More processes than GPUs, as in a rehearsal of programs that do
         # not use them, leaves every process every GPU.
-        if devices is None and processes <= gpus:
+        if devices is None and 1 < processes <= gpus:
             if gpus % processes:
                 raise ValueError(f"{processes} processes do not split {first_host}'s {gpus} "
                                  "GPUs evenly; set --devices-per-process")
