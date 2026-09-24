@@ -16,12 +16,13 @@ import threading
 import time
 import types
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Literal, TypeVar, overload
 
 import jax
 import numpy as np
 from flax import struct
 from jax.experimental import multihost_utils
+from jax.sharding import NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
@@ -108,7 +109,70 @@ def host[T](value: T) -> T:
     return jax.tree.map(_addressable, value)
 
 
-def collective_host[T](value: T, *, phase: str) -> T:
+GATHER_BYTES = 256 * 2 ** 20
+"""The bytes of global leaves `collective_host` gathers in one computation.
+
+A group's leaves are replicated by one computation and agreed on once, so a
+tree of many small leaves pays one round trip a group rather than one a leaf,
+and a device holds at most one group's values, or its one larger leaf, beside
+the tree's shards. With `held_by="first"` a rank that holds nothing still
+holds one replicated group on its devices while that group's computation
+runs, as `process_allgather` replicated each leaf.
+"""
+
+
+def _mesh(leaf: jax.Array) -> jax.sharding.Mesh | None:
+    """The concrete mesh `leaf` is laid out on, if it is laid out on one."""
+    mesh = leaf.sharding.mesh if isinstance(leaf.sharding, NamedSharding) else None
+    return mesh if isinstance(mesh, jax.sharding.Mesh) else None
+
+
+def _identity(*values: jax.Array) -> tuple[jax.Array, ...]:
+    return values
+
+
+def _gather_groups(leaves: list[jax.Array]) -> list[list[int]]:
+    """`leaves`' positions in consecutive groups on one mesh, each of at most
+    GATHER_BYTES or one larger leaf. The same on every rank: it reads the
+    shapes, dtypes and shardings the ranks agreed in the gather plan."""
+    groups: list[list[int]] = []
+    size = 0
+    for index, leaf in enumerate(leaves):
+        mesh = _mesh(leaf)
+        if (groups and mesh is not None and mesh == _mesh(leaves[groups[-1][0]])
+                and size + leaf.nbytes <= GATHER_BYTES):
+            groups[-1].append(index)
+            size += leaf.nbytes
+        else:
+            groups.append([index])
+            size = leaf.nbytes
+    return groups
+
+
+def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:
+    """`group`'s global arrays whole, on this host where `held`. One mesh's
+    arrays are replicated by one computation; a leaf on another sharding
+    goes alone through `process_allgather`. A rank that holds nothing still
+    completes the computation, which is a collective."""
+    mesh = _mesh(group[0])
+    if mesh is None:
+        return [np.asarray(multihost_utils.process_allgather(group[0], tiled=True))]
+    replicated = NamedSharding(mesh, PartitionSpec())
+    outputs = jax.jit(_identity, out_shardings=(replicated,) * len(group))(*group)
+    if not held:
+        jax.block_until_ready(outputs)
+        return None
+    whole = [output.addressable_data(0) for output in outputs]
+    for value in whole:
+        value.copy_to_host_async()
+    return [np.asarray(value) for value in whole]
+
+
+@overload
+def collective_host[T](value: T, *, phase: str, held_by: Literal["every"] = "every") -> T: ...
+@overload
+def collective_host[T](value: T, *, phase: str, held_by: Literal["first"]) -> T | None: ...
+def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first"] = "every") -> T | None:
     """Materialize an evaluation tree on every rank with transfer consensus.
 
     All ranks must call this, even for entirely local trees. Local leaves and
@@ -116,7 +180,15 @@ def collective_host[T](value: T, *, phase: str) -> T:
     Ranks then agree the ordered global gather plan and each transfer outcome.
     Local-only trees may differ, as with root-only decoded previews. A device
     failure inside an in-flight collective still needs runtime termination.
+
+    Global leaves are gathered in groups (`GATHER_BYTES`), one computation
+    and one agreement a group, and a rank that fails in a group reports at
+    that group's agreement, before any rank starts the next. With `held_by`
+    "first", only process 0 of the pool, `jax.process_index() == 0`, copies
+    the gathered tree to its host and returns it; the others take part in
+    every computation and agreement and return None.
     """
+    held = held_by == "every" or jax.process_index() == 0
     leaves = []
     tree = None
     global_indices = []
@@ -140,22 +212,27 @@ def collective_host[T](value: T, *, phase: str) -> T:
     root_plan = broadcast_from_process_zero(plan)
     error = None if plan == root_plan else ValueError("global array gather plans differ across ranks")
     agree_process_phase(error, phase=f"{phase} gather plan")
-    for index in global_indices:
+    for group in _gather_groups([leaves[index] for index in global_indices]):
+        indices = [global_indices[position] for position in group]
         error = None
         try:
-            leaves[index] = _addressable(leaves[index])
+            gathered = _gathered([leaves[index] for index in indices], held)
+            if gathered is not None:
+                for index, whole in zip(indices, gathered, strict=True):
+                    leaves[index] = whole
         except BaseException as failure:
             error = failure
-        agree_process_phase(error, phase=f"{phase} transfer leaf {index}")
+        agree_process_phase(error, phase=f"{phase} transfer leaves {indices[0]}-{indices[-1]}")
     error = None
     materialized = value
     try:
         assert tree is not None
-        materialized = jax.tree.unflatten(tree, leaves)
+        if held:
+            materialized = jax.tree.unflatten(tree, leaves)
     except BaseException as failure:
         error = failure
     agree_process_phase(error, phase=f"{phase} tree reconstruction")
-    return materialized
+    return materialized if held else None
 
 
 def broadcast_from_process_zero(value):
