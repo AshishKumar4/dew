@@ -50,66 +50,41 @@ from dew.nn.sharding import logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 
-def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *, valid=None):
-    """Compact per-row latent/rotary cache with optional sparse-index keys."""
+def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
+                   max_seq_len, *, valid=None):
+    """Open a compact per-row decode cache of two tensors, `first` and `second`
+    under `names`, and of the sparse indexer's keys when `index_keys` is given.
+
+    Dense MLA caches its latent and the latent's rotary part; the sparse
+    variants cache the expanded keys and values, as DeepSeek V3.2 stores
+    them. `index_keys` is None on a layer that owns no indexer and reads
+    another layer's selection. Returns the [B, S] slots and an `append` that
+    writes the new rows and returns the whole cache, the index keys last or
+    None.
+    """
     if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity latent cache")
-    batch, length = latent.shape[:2]
+        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
+    batch, length = first.shape[:2]
     if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a latent cache of {max_seq_len}.")
-    cached_latent = module.variable("cache", "cached_latent", jnp.zeros,
-                                    (batch, max_seq_len, latent.shape[-1]), latent.dtype)
-    cached_rot = module.variable("cache", "cached_rot", jnp.zeros,
-                                 (batch, max_seq_len, rot.shape[-1]), rot.dtype)
+        raise ValueError(f"{length} tokens do not fit a cache of {max_seq_len}.")
+    cached = [module.variable("cache", name, jnp.zeros, (batch, max_seq_len, *array.shape[2:]), array.dtype)
+              for name, array in zip(names, (first, second), strict=True)]
     cached_index = None
     if index_keys is not None:
         cached_index = module.variable("cache", "cached_index", jnp.zeros,
                                        (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
     positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
 
-    def append(new_latent, new_rot, new_index_keys):
+    def append(new_first, new_second, new_index_keys):
         if allocated:
-            cached_latent.value = write_cache(cached_latent.value, new_latent, positions)
-            cached_rot.value = write_cache(cached_rot.value, new_rot, positions)
+            for variable, rows in zip(cached, (new_first, new_second), strict=True):
+                variable.value = write_cache(variable.value, rows, positions)
             if cached_index is not None:
                 if new_index_keys is None:
                     raise ValueError("the indexer scores, so decode must append its keys")
                 cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
-        return cached_latent.value, cached_rot.value, full_index
-
-    return positions, append
-
-
-def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, *, valid=None):
-    """Per-row expanded K/V and sparse-index cache, as DeepSeek V3.2 stores it.
-
-    `index_keys` is None on a layer that owns no indexer and reads another
-    layer's selection; its cache holds the expanded keys and values alone.
-    """
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity sparse cache")
-    batch, length = key.shape[:2]
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a sparse cache of {max_seq_len}.")
-    cached_key = module.variable("cache", "cached_key", jnp.zeros,
-                                 (batch, max_seq_len, *key.shape[2:]), key.dtype)
-    cached_value = module.variable("cache", "cached_value", jnp.zeros,
-                                   (batch, max_seq_len, *value.shape[2:]), value.dtype)
-    cached_index = None
-    if index_keys is not None:
-        cached_index = module.variable("cache", "cached_index", jnp.zeros,
-                                       (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
-
-    def append(new_key, new_value, new_index_keys):
-        if allocated:
-            cached_key.value = write_cache(cached_key.value, new_key, positions)
-            cached_value.value = write_cache(cached_value.value, new_value, positions)
-            if cached_index is not None:
-                cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
-        full_index = None if cached_index is None else cached_index.value
-        return cached_key.value, cached_value.value, full_index
+        return cached[0].value, cached[1].value, full_index
 
     return positions, append
 
@@ -555,8 +530,8 @@ class MultiHeadLatentAttention(nn.Module):
                 # recomputed after rotation below, so only shapes flow here.
                 shape_key, shape_value = self._expand(latent, rot)
                 index_keys = self.indexer.keys(x) if self.indexed else None
-                positions, append = open_expanded_cache(
-                    self, shape_key, shape_value, index_keys,
+                positions, append = open_mla_cache(
+                    self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
                     self.max_seq_len, valid=valid)
                 q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                     q_rot, rot,
@@ -576,8 +551,9 @@ class MultiHeadLatentAttention(nn.Module):
                 mask = selection_mask(self._select(index_scores, keep, kv_store),
                                       key.shape[1])[:, None]
             else:
-                positions, append = open_latent_cache(
-                    self, latent, rot, None, self.max_seq_len, valid=valid)
+                positions, append = open_mla_cache(
+                    self, ("cached_latent", "cached_rot"), latent, rot, None,
+                    self.max_seq_len, valid=valid)
                 q_rot, rot, _, _ = self._rotated(
                     q_rot, rot,
                     positions if logical_positions is None else logical_positions)

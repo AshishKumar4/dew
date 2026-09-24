@@ -54,7 +54,7 @@ from .attention import (
 from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
 from .mixers import MixerBase, MixerContext, mixers
-from .mla import INDEXER, open_expanded_cache
+from .mla import INDEXER, open_mla_cache
 from .sharding import logical_axes
 from .sparse_selection import selection_mask
 
@@ -317,7 +317,8 @@ class KPoolSparseAttention(nn.Module):
         if decode:
             allocated = self.has_variable("cache", "cache_index")
             committed = self.get_variable("cache", "cache_index")
-            slots, append = open_expanded_cache(self, key, value, packed, self.max_seq_len, valid=valid)
+            slots, append = open_mla_cache(self, ("cached_key", "cached_value"), key, value, packed,
+                                           self.max_seq_len, valid=valid)
             key, value, packed = append(key, value, packed)
             # The reference's static cache: keys at every slot, causality
             # by slot against the query's, validity from the cache
