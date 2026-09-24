@@ -18,6 +18,7 @@ target is named.
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import os
 import re
@@ -406,16 +407,24 @@ def _relay(rank: int, stream: TextIO, tail: collections.deque[str]) -> None:
 
 
 def _stop(running: Sequence[subprocess.Popen]) -> None:
-    """SIGTERM every process group still alive, then SIGKILL after 10 s."""
+    """SIGTERM every process group still alive, and SIGKILL those still alive
+    10 s later, rank 0 last.
+
+    A JAX process of a pool takes SIGTERM as a preemption notice
+    (jax_enable_preemption_service) and runs on, so there the SIGKILL is what
+    stops each rank. Rank 0's process holds the pool's coordination service,
+    and a rank that outlives it aborts in XLA's error polling, with a Check
+    failure that reads as a crash of its own.
+    """
     for child in running:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
     deadline = time.monotonic() + 10
     for child in running:
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            child.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=max(0.0, deadline - time.monotonic()))
+    for child in (*running[1:], *running[:1]):
+        if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait()
 

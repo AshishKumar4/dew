@@ -51,7 +51,7 @@ last lines of rank 2:
 [2] OSError: shard 7 is gone
 ```
 
-A rank killed by a signal reads as `was killed by SIGKILL`, and the launch exits 128 plus the signal, as a shell reports it. Ctrl-C, a scheduler's SIGTERM and a closed terminal stop the whole pool the same way.
+A rank killed by a signal reads as `was killed by SIGKILL`, and the launch exits 128 plus the signal, as a shell reports it. Ctrl-C, a scheduler's SIGTERM and a closed terminal stop the whole pool the same way. The launcher sends each rank SIGTERM and, 10 seconds later, SIGKILL. A JAX process of a pool takes SIGTERM as a preemption notice and keeps running, so SIGKILL is what stops it. Rank 0 is killed last: its process holds the pool's coordination service, and a rank that outlived it would abort with an XLA `Check failure` that reads as a crash of its own.
 
 ## Launch on plain machines
 
