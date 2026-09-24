@@ -328,3 +328,38 @@ def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
     harness = json.loads((tmp_path / "report.json").read_text())["harness"]
     assert {name.split("/")[0] for name in harness} == {"hellaswag"}
     assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
+
+
+def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp_path, monkeypatch):
+    """The native backend pushes the policy into Dew's own server every
+    update. After a push the device holds the served weights once: the
+    trainer's copy is float32 and the server's bfloat16, so every live
+    bfloat16 array of a served leaf's shape is the server's. A second copy is
+    a model's worth of memory the run keeps for good (1.1 GiB on Qwen3-0.6B,
+    the headroom its single-turn run ran out of at update 19)."""
+    import collections
+
+    import jax
+
+    from dew.objectives.rl import RolloutScheduler
+
+    example = load_example("train_rlvr")
+    counts = []
+    schedule = RolloutScheduler.__call__
+
+    def counted(self, state, batch, key):
+        packed = schedule(self, state, batch, key)
+        served = collections.Counter((array.shape, array.dtype) for array in jax.live_arrays()
+                                     if array.dtype == jax.numpy.bfloat16)
+        counts.append(served)
+        return packed
+
+    monkeypatch.setattr(RolloutScheduler, "__call__", counted)
+    example.main(example.Config(smoke=True, out=tmp_path))
+    source = example.load_pretrained(str(example.SMOKE_MODEL), dtype="float32")
+    tree = collections.Counter((leaf.shape, jax.numpy.dtype(jax.numpy.bfloat16))
+                               for leaf in jax.tree.leaves(source.variables))
+    # The second call pushed update 1's weights before it returned.
+    assert len(counts) == 2
+    assert all(counts[-1][key] == number for key, number in tree.items()), \
+        {str(key): (counts[-1][key], number) for key, number in tree.items() if counts[-1][key] != number}
