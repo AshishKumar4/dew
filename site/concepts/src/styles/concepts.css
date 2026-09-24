@@ -1,0 +1,316 @@
+/* Landing-page prototypes: the site's palette and type, dark first. */
+
+:root {
+	--ink: #070d0f;
+	--ink-2: #0a1113;
+	--text: #eef6f4;
+	--text-2: #b2c6c2;
+	--muted: #7e9894;
+	--rule: rgba(178, 198, 194, 0.14);
+	--accent: #5fdcc9;
+	--accent-fill: #2fb8a8;
+	--display: var(--font-serif);
+	--sans: var(--font-inter);
+	--mono: var(--font-mono);
+	color-scheme: dark;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	background: var(--ink);
+	color: var(--text);
+	font-family: var(--sans);
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	text-rendering: optimizeLegibility;
+}
+
+a {
+	color: inherit;
+}
+
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 3px;
+	border-radius: 4px;
+}
+
+.site-header {
+	position: fixed;
+	inset: 0 0 auto;
+	z-index: 20;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 1.1rem clamp(1.25rem, 4vw, 3rem);
+	pointer-events: none;
+}
+
+.site-header > * {
+	pointer-events: auto;
+}
+
+.brand {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.6rem;
+	font: 600 1.35rem/1 var(--display);
+	letter-spacing: -0.01em;
+	text-decoration: none;
+}
+
+.brand img {
+	width: 1.55rem;
+	height: 1.55rem;
+}
+
+.site-nav {
+	display: flex;
+	align-items: center;
+	gap: clamp(0.9rem, 2.4vw, 1.8rem);
+	font-size: 0.9rem;
+	font-weight: 500;
+}
+
+.site-nav a {
+	text-decoration: none;
+	color: var(--text-2);
+	transition: color 120ms ease;
+}
+
+.site-nav a:hover {
+	color: var(--text);
+}
+
+.site-nav svg {
+	display: block;
+	width: 1.2rem;
+	height: 1.2rem;
+}
+
+@media (max-width: 34rem) {
+	.site-nav .optional {
+		display: none;
+	}
+}
+
+/* The hero: a full-screen canvas under the words. */
+
+.hero {
+	position: relative;
+	min-height: 100vh;
+	min-height: 100svh;
+	overflow: hidden;
+	isolation: isolate;
+}
+
+.hero canvas {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	display: block;
+	z-index: -1;
+}
+
+.hero .fallback {
+	position: absolute;
+	inset: 0;
+	z-index: -2;
+	background-size: cover;
+	background-position: center;
+	opacity: 0;
+	transition: opacity 400ms ease;
+}
+
+.hero.no-gl .fallback {
+	opacity: 1;
+}
+
+.hero-copy {
+	position: absolute;
+	left: clamp(1.25rem, 4vw, 3rem);
+	bottom: clamp(1.75rem, 7vh, 4.5rem);
+	max-width: min(36rem, calc(100% - 2.5rem));
+}
+
+.hero-copy h1 {
+	margin: 0;
+	font: 600 clamp(2.3rem, 5.6vw, 4.4rem) / 1.02 var(--display);
+	letter-spacing: -0.025em;
+	text-wrap: balance;
+	text-shadow: 0 2px 30px rgba(0, 0, 0, 0.55);
+}
+
+.hero-copy p {
+	margin: 1rem 0 0;
+	font-size: clamp(1rem, 1.35vw, 1.15rem);
+	line-height: 1.55;
+	color: var(--text-2);
+	max-width: 32rem;
+	text-shadow: 0 1px 18px rgba(0, 0, 0, 0.7);
+}
+
+.install {
+	display: flex;
+	align-items: center;
+	gap: 0.6rem;
+	margin-top: 1.5rem;
+	max-width: 32rem;
+	padding: 0.5rem 0.5rem 0.5rem 0.85rem;
+	border: 1px solid var(--rule);
+	border-radius: 0.6rem;
+	background: rgba(7, 13, 15, 0.62);
+	backdrop-filter: blur(10px);
+	-webkit-backdrop-filter: blur(10px);
+	font: 0.78rem/1.4 var(--mono);
+}
+
+.install code {
+	flex: 1;
+	min-width: 0;
+	overflow-x: auto;
+	white-space: nowrap;
+	scrollbar-width: none;
+}
+
+.install .prompt {
+	color: var(--accent);
+	user-select: none;
+}
+
+.install button {
+	flex: none;
+	display: grid;
+	place-items: center;
+	width: 1.9rem;
+	height: 1.9rem;
+	border: 1px solid var(--rule);
+	border-radius: 0.4rem;
+	background: rgba(255, 255, 255, 0.04);
+	color: var(--text-2);
+	cursor: pointer;
+}
+
+.install button:hover {
+	color: var(--text);
+}
+
+.install button[data-copied]::after {
+	content: '';
+}
+
+.links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem 1.4rem;
+	margin-top: 1.2rem;
+	font-size: 0.95rem;
+	font-weight: 550;
+}
+
+.links a {
+	text-decoration: none;
+	color: var(--text);
+	border-bottom: 1px solid rgba(95, 220, 201, 0.5);
+	padding-bottom: 0.1rem;
+}
+
+.links a:hover {
+	border-bottom-color: var(--accent);
+}
+
+.links a.primary {
+	color: var(--accent);
+}
+
+/* The process readout: step, noise level and the schedule. */
+
+.hud {
+	position: absolute;
+	right: clamp(1.25rem, 4vw, 3rem);
+	bottom: clamp(1.75rem, 7vh, 4.5rem);
+	display: grid;
+	grid-template-columns: auto auto;
+	align-items: end;
+	gap: 0.9rem;
+	font: 500 0.72rem/1.5 var(--mono);
+	color: var(--muted);
+	letter-spacing: 0.02em;
+	pointer-events: none;
+	font-variant-numeric: tabular-nums;
+}
+
+.hud strong {
+	color: var(--text);
+	font-weight: 600;
+}
+
+.hud svg {
+	width: 7.5rem;
+	height: 3.2rem;
+	overflow: visible;
+}
+
+.hud .curve {
+	fill: none;
+	stroke: rgba(178, 198, 194, 0.35);
+	stroke-width: 1.2;
+}
+
+.hud .axis {
+	stroke: rgba(178, 198, 194, 0.18);
+	stroke-width: 1;
+}
+
+.hud .dot {
+	fill: var(--accent);
+}
+
+@media (max-width: 40rem) {
+	.hud {
+		top: 4.2rem;
+		bottom: auto;
+		right: 1.25rem;
+	}
+	.hud svg {
+		width: 5.5rem;
+		height: 2.4rem;
+	}
+}
+
+.site-footer {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	gap: 0.75rem 2rem;
+	padding: 1.6rem clamp(1.25rem, 4vw, 3rem) 2rem;
+	border-top: 1px solid var(--rule);
+	font-size: 0.8rem;
+	color: var(--muted);
+	background: var(--ink);
+}
+
+.site-footer nav {
+	display: flex;
+	gap: 1.25rem;
+}
+
+.site-footer a {
+	color: var(--text-2);
+	text-decoration: none;
+}
+
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+}

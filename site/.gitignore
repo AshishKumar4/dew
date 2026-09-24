@@ -8,3 +8,6 @@ src/generated/
 src/assets/repo/
 public/repo/
 public/tutorials/
+
+# Built by `pnpm concepts:build`.
+dist-concepts/

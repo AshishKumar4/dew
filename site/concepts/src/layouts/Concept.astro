@@ -1,0 +1,94 @@
+---
+// The page around a landing-page prototype: fonts, header, hero copy, footer.
+import { Font } from 'astro:assets';
+import '../styles/concepts.css';
+
+interface Props {
+	title: string;
+	description: string;
+	/** The static frame shown when WebGL2 is missing. */
+	fallback?: string;
+}
+
+const { title, description, fallback } = Astro.props;
+const install = 'uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"';
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{title}</title>
+		<meta name="description" content={description} />
+		<meta name="theme-color" content="#070d0f" />
+		<meta name="robots" content="noindex" />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<Font cssVariable="--font-serif" preload />
+		<Font cssVariable="--font-inter" preload />
+		<Font cssVariable="--font-mono" />
+	</head>
+	<body>
+		<header class="site-header">
+			<a class="brand" href="https://dewml.dev/"><img src="/favicon.svg" alt="" width="25" height="25" />Dew</a>
+			<nav class="site-nav" aria-label="Site">
+				<a href="https://dewml.dev/docs/">Docs</a>
+				<a class="optional" href="https://dewml.dev/tutorials/">Tutorials</a>
+				<a class="optional" href="https://dewml.dev/api/">API</a>
+				<a href="https://github.com/AshishKumar4/dew" aria-label="GitHub"
+					><svg viewBox="0 0 24 24" aria-hidden="true"
+						><path
+							fill="currentColor"
+							d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.82 1.19 3.08 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5Z"
+						></path></svg
+					></a
+				>
+			</nav>
+		</header>
+		<main>
+			<section class="hero" data-hero>
+				<div class="fallback" style={fallback ? `background-image:url(${fallback})` : undefined}></div>
+				<slot name="stage" />
+				<div class="hero-copy">
+					<h1>Train models with JAX and Flax.</h1>
+					<p>Language models, diffusion and JEPA, trained by one trainer on one device or a mesh.</p>
+					<div class="install">
+						<span class="prompt" aria-hidden="true">$</span>
+						<code>{install}</code>
+						<button type="button" data-copy={install} aria-label="Copy the install command">
+							<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"
+								><path
+									fill="currentColor"
+									d="M16 3H8a3 3 0 0 0-3 3v1H4a1 1 0 0 0-1 1v11a3 3 0 0 0 3 3h9a1 1 0 0 0 1-1v-1h1a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3Zm-2 17H6a1 1 0 0 1-1-1V9h9Zm3-4a1 1 0 0 1-1 1h-1V8a1 1 0 0 0-1-1H7V6a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1Z"
+								></path></svg
+							>
+						</button>
+					</div>
+					<nav class="links" aria-label="Start">
+						<a class="primary" href="https://dewml.dev/getting-started/quickstart/">Get started</a>
+						<a href="https://dewml.dev/tutorials/">Tutorials</a>
+						<a href="https://dewml.dev/api/">API reference</a>
+					</nav>
+				</div>
+				<slot name="hud" />
+			</section>
+			<slot />
+		</main>
+		<footer class="site-footer">
+			<span>MIT license. Dew is research software before 1.0.</span>
+			<nav aria-label="Footer">
+				<a href="https://dewml.dev/docs/">Docs</a>
+				<a href="https://github.com/AshishKumar4/dew">GitHub</a>
+			</nav>
+		</footer>
+		<script>
+			for (const button of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+				button.addEventListener('click', async () => {
+					await navigator.clipboard.writeText(button.dataset.copy ?? '');
+					button.setAttribute('aria-label', 'Copied');
+					setTimeout(() => button.setAttribute('aria-label', 'Copy the install command'), 1500);
+				});
+			}
+		</script>
+	</body>
+</html>
