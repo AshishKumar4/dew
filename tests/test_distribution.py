@@ -343,8 +343,9 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
 
 @pytest.mark.mesh(devices=2)
 def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
-    """`dew launch` without --devices-per-process gives its one process every
-    local device. Inside a Slurm step, JAX's detection would still place it:
+    """`dew launch --processes-per-host 1` gives its one process every local
+    device, and names none of them. Inside a Slurm step, JAX's detection would
+    still place it:
     it pins a process it finds in Slurm's variables to the GPU at the step's
     SLURM_LOCALID, one device of the launcher's several. A process dew launch
     started takes its placement from the launcher."""
@@ -358,7 +359,8 @@ def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
                "import jax\n"
                "print('local devices', jax.local_device_count())\n")
     done = finished(subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--", sys.executable, "-c", program],
+        [sys.executable, "-m", "dew.cli.main", "launch", "--processes-per-host", "1", "--",
+         sys.executable, "-c", program],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
     assert f"local devices {jax.local_device_count()}" in done.stdout, done.stdout
