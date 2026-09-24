@@ -40,8 +40,15 @@ emit a bf16 dot at all - `float-normalization-bf16` rewrites every one of them
 to f32 before codegen, and disabling that pass makes CPU compilation fail in
 `dot_op_emitter.cc` - so on CPU every family's optimized module reads ~99%
 fp32 whatever the model asked for, and the module the compiler was *given* is
-the one that still holds the model's own dtypes. On an accelerator the
-optimized module keeps them, and is the better text because it is what runs.
+the one that still holds the model's own dtypes. A TPU's optimized module
+reads fp32 too: its compiler folds the converts beside a dot into the
+convolution it lowers the dot to, so an fp32 cotangent meeting bf16 weights,
+or a bf16 input meeting an fp32 table, lands as one mixed convolution. On a
+v6e (jax 0.11.2.post3) that read 6.4% of a decoder's matmul FLOPs, 66% of a
+hybrid DiT's and 9-10% of a hierarchical MM-DiT's as fp32, under HIGHEST and
+default precision alike, where the module it was given reads 0% for all
+three. On a GPU the optimized module keeps the model's dtypes, and is the
+better text because it is what runs.
 The compile happens either way: a graph that does not compile is not a graph
 whose dtypes are worth counting.
 """
@@ -246,13 +253,13 @@ def matmul_text(function, *arguments) -> str:
     """The HLO of `function` whose dtypes are the ones the model asked for.
 
     Compiled first, because a family whose loss-and-grad does not compile has
-    no dtypes worth counting. The text is the optimized module wherever the
-    backend can run a bf16 dot, and the module the compiler was given on CPU,
-    where it cannot (see this file's docstring).
+    no dtypes worth counting. The text is the optimized module on a GPU, and
+    the module the compiler was given on CPU and TPU, whose optimized modules
+    rewrite the dtypes (see this file's docstring).
     """
     lowered = jax.jit(function).lower(*arguments)
     compiled = lowered.compile()
-    if jax.default_backend() != "cpu":
+    if jax.default_backend() == "gpu":
         return compiled.as_text()
     return lowered.compiler_ir(dialect="hlo").get_hlo_module().to_string()
 
