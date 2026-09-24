@@ -19,7 +19,7 @@ import jax
 import ml_dtypes
 import numpy as np
 
-from dew.nn.text_encoders import ParamTree
+from dew.nn.text_encoders import ParamTree, insert
 from dew.records import JSON
 
 SEPARATOR = "/"
@@ -137,14 +137,7 @@ def _flatten(params) -> dict[str, np.ndarray]:
 def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
     tree: ParamTree = {}
     for name, tensor in tensors.items():
-        *branches, leaf = name.split(SEPARATOR)
-        node = tree
-        for branch in branches:
-            child = node.setdefault(branch, {})
-            if not isinstance(child, dict):
-                raise ValueError(f"{name} crosses the tensor already at {branch!r}")
-            node = child
-        node[leaf] = tensor
+        insert(tree, tuple(name.split(SEPARATOR)), tensor, name)
     return tree
 
 
