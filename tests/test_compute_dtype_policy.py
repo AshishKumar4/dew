@@ -41,9 +41,11 @@ to f32 before codegen, and disabling that pass makes CPU compilation fail in
 `dot_op_emitter.cc` - so on CPU every family's optimized module reads ~99%
 fp32 whatever the model asked for, and the module the compiler was *given* is
 the one that still holds the model's own dtypes. A TPU's optimized module
-reads fp32 too: its compiler folds the converts beside a dot into the
-convolution it lowers the dot to, so an fp32 cotangent meeting bf16 weights,
-or a bf16 input meeting an fp32 table, lands as one mixed convolution. On a
+reads fp32 too: its compiler lowers each dot to a convolution and folds the
+converts beside it into that convolution, so an fp32 cotangent meeting bf16
+weights lands as one mixed f32 x bf16 convolution, and a dot whose operands
+were both converted (or bf16 values upcast on the way in) as an f32 x f32
+one: most of a hybrid DiT's reading is the latter. On a
 v6e (jax 0.11.2.post3) that read 6.4% of a decoder's matmul FLOPs, 66% of a
 hybrid DiT's and 9-10% of a hierarchical MM-DiT's as fp32, under HIGHEST and
 default precision alike, where the module it was given reads 0% for all
