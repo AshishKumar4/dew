@@ -586,6 +586,7 @@ def test_package_spec_reads_source_extras_and_version():
     assert tpu_setup.package_spec("dew", "tfds,av", "") == ("dew[tpu,tfds,av]", True)
     assert tpu_setup.package_spec("dew", "", "") == ("dew[tpu]", True)
     assert tpu_setup.package_spec("dew", "tpu,tfds", "") == ("dew[tpu,tfds]", True)
+    assert tpu_setup.package_spec("dew", "tfds, tpu", "") == ("dew[tpu,tfds]", True)
     assert tpu_setup.package_spec("", "tfds", "0.2.1") == ("dew-ml[tfds]==0.2.1", False)
     assert tpu_setup.package_spec("", "", "") == ("dew-ml", False)
 
