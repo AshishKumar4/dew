@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import outside_any_cluster
 
 from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
@@ -524,9 +525,16 @@ def test_a_pool_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_
 def test_a_lone_process_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_path):
     """A process in no pool has no preemption service: SIGTERM's default
     ended it where it stood. The fit catches it and stops as a pool does."""
-    # Neither Slurm's variables nor Open MPI's around the test make a pool of it.
-    env = {name: value for name, value in os.environ.items() if not name.startswith(("SLURM_", "OMPI_"))}
-    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    import jax
+
+    # No cluster around the test makes a pool of it: not Slurm's, Open MPI's,
+    # a Cloud TPU VM's or a Kubernetes pod's.
+    env = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src")}
+    if jax.default_backend() != "gpu":
+        # A TPU belongs to the one process that opened it, and this one has:
+        # the worker aborted with "The TPU is already in use". It takes CPU
+        # devices, as the pool tests' ranks do off a GPU (`start`).
+        env["JAX_PLATFORMS"] = "cpu"
     # Each line as it is printed, as `dew launch` has its ranks write: a piped
     # stdout holds the step lines until exit, and the signal would come after
     # the fit had ended.
