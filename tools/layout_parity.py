@@ -18,8 +18,10 @@ and the loss within as much of its own.
 
 A split sequence, a tensor axis and an expert axis also reassociate sums
 inside a row (over positions, heads and widths), which no reordering of rows
-samples. With `--anchor` (and JAX_ENABLE_X64=1), each leaf's floor is at
-least the reference's own distance from the same step computed in fp64, so
+samples, and an objective that draws per row (a diffusion's noise, a masked
+objective's masks) has no reordering to sample at all. With `--anchor` (and
+JAX_ENABLE_X64=1), each leaf's floor is at least the reference's own
+distance from the same step computed in fp64, the same draws included, so
 any reassociation of fp32 sums is held to fp32's own rounding of the step,
 while a defect lands orders of magnitude past it; the loss's floor likewise
 takes the reference loss's distance from the fp64 one.
@@ -243,12 +245,6 @@ def reassociates(case) -> bool:
     return case.is_lm and case.canvas is None and case.decoder_objective != "mdlm"
 
 
-def anchored(case) -> bool:
-    """Whether the fp64 anchor computes the case's step: every case whose
-    step reassociates, a decoder alone or inside a media composite."""
-    return reassociates(case)
-
-
 def stash():
     """Pass the updates on unchanged and keep them as the optimizer state."""
     import jax
@@ -427,9 +423,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     import jax.numpy as jnp
     import numpy as np
 
-    from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.base import Step, scalar_loss
-    from dew.registry import models
     from dew.training.transaction import with_ema
 
     state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
@@ -439,17 +433,12 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
 
     wide = widened(state.params)
-    if case.media is None:
-        model = models.build(case.architecture, **case.config, dtype=None)
-    else:
-        family, tower, projector, token = bench.media_values(case)
-        model = MultimodalTransformer(models.build("causal_transformer", **case.config, dtype=None),
-                                      tower, projector, family, token, dtype=None)
-    objective = bench.decoder_objective(case, model)
-    # The reference DPO and GRPO hold is the objective's frozen EMA, as the
-    # trainer's step hands it over.
-    step = Step(step=state.step, key=state.key,
-                ema=with_ema(wide, None if state.ema is None else widened(state.ema)))
+    objective = bench.build_objective(case, widened=True)
+    # The trainer's first step: its key folded with the step, which draws a
+    # diffusion objective's noise and a masked one's masks, and the frozen
+    # EMA DPO and GRPO score against.
+    step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
+                with_ema(wide, None if state.ema is None else widened(state.ema)))
 
     def loss(params, batch):
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
@@ -670,7 +659,7 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
             case, reference = model_case(model, dtype, mixture, objective)
             batch = bench.global_batch(case)
             judge = references.reference(reference, batch, steps)
-            if anchor and anchored(reference):
+            if anchor:
                 references.anchor(reference, batch)
         except Exception as error:  # the other models' references are still worth keeping
             whole = False
@@ -707,7 +696,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     reference, batch, ref_gradient, ref_losses[0]))
             else:
                 floors, loss_floor = judge.floors, judge.loss_floor
-            if anchor and anchored(reference):
+            if anchor:
                 anchor_loss, anchor_gradient = agreed(f"anchor of {model}",
                                                       lambda: references.anchor(reference, batch))
                 rounding = leaf_errors(anchor_gradient, ref_gradient, dtype)
