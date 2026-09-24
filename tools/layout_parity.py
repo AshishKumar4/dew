@@ -21,7 +21,8 @@ inside a row (over positions, heads and widths), which no reordering of rows
 samples. With `--anchor` (and JAX_ENABLE_X64=1), each leaf's floor is at
 least the reference's own distance from the same step computed in fp64, so
 any reassociation of fp32 sums is held to fp32's own rounding of the step,
-while a defect lands orders of magnitude past it.
+while a defect lands orders of magnitude past it; the loss's floor likewise
+takes the reference loss's distance from the fp64 one.
 
 A layout also has to split one device's work rather than repeat it: its
 devices' FLOPs together, over the reference's, are at most `flops_bound`, an
@@ -415,11 +416,12 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
     return leaves, loss
 
 
-def anchor_gradient(case, batch) -> dict[str, NDArray]:
-    """Step one's gradient in fp64 by leaf name: the model built with no
-    dtype of its own, on the reference's own initial variables widened to
-    fp64. The trainer draws those from its key's first split, so they come
-    from the trainer, not from the objective's `init` on the key itself."""
+def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
+    """Step one's loss and its gradient by leaf name in fp64: the model built
+    with no dtype of its own, on the reference's own initial variables
+    widened to fp64. The trainer draws those from its key's first split, so
+    they come from the trainer, not from the objective's `init` on the key
+    itself."""
     import benchmark_step as bench
     import jax
     import jax.numpy as jnp
@@ -445,9 +447,9 @@ def anchor_gradient(case, batch) -> dict[str, NDArray]:
     def loss(params, batch):
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
 
-    gradient = jax.jit(jax.grad(loss))(wide["params"], batch)
-    return {jax.tree_util.keystr(path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_flatten_with_path(gradient)[0]}
+    value, gradient = jax.jit(jax.value_and_grad(loss))(wide["params"], batch)
+    return float(value), {jax.tree_util.keystr(path): np.asarray(leaf)
+                          for path, leaf in jax.tree_util.tree_flatten_with_path(gradient)[0]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -559,15 +561,16 @@ class References:
             "floors": computed.floors, "loss_floor": computed.loss_floor})
         return computed
 
-    def anchor(self, case, batch) -> dict[str, NDArray]:
+    def anchor(self, case, batch) -> tuple[float, dict[str, NDArray]]:
         if self.directory is None:
-            return anchor_gradient(case, batch)
+            return anchor_step(case, batch)
         path, inputs = self._path("anchor", case, batch)
         if path.exists():
-            return _read(path)[0]
-        computed = anchor_gradient(case, batch)
-        _write(path, computed, {"inputs": inputs})
-        return computed
+            gradient, meta = _read(path)
+            return meta["loss"], gradient
+        loss, gradient = anchor_step(case, batch)
+        _write(path, gradient, {"inputs": inputs, "loss": loss})
+        return loss, gradient
 
     def _path(self, kind: str, case, batch, **parts: object) -> tuple[Path, dict[str, Any]]:
         """The cached `kind`'s file, refused where a run of layouts would
@@ -698,8 +701,9 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             else:
                 floors, loss_floor = judge.floors, judge.loss_floor
             if anchor and anchored(reference):
-                rounding = leaf_errors(agreed(f"anchor of {model}", lambda: references.anchor(reference, batch)),
-                                       ref_gradient, dtype)
+                anchor_loss, anchor_gradient = agreed(f"anchor of {model}",
+                                                      lambda: references.anchor(reference, batch))
+                rounding = leaf_errors(anchor_gradient, ref_gradient, dtype)
                 farthest = max(rounding, key=rounding.__getitem__)
                 if rounding[farthest] > rounding_limit(dtype):
                     raise ValueError(
@@ -707,6 +711,10 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                         f"{farthest}, past {dtype} rounding ({rounding_limit(dtype):.1e}): the two "
                         f"compute different steps, so the anchor cannot bound the layouts")
                 floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
+                # The loss rounds the same sums, inside rows too: DPO's first
+                # step scores each pair from two log-likelihood sums that
+                # cancel, which no reordering of the rows moves.
+                loss_floor = max(loss_floor, abs(ref_losses[0] - anchor_loss))
             widest = widest_floor(floors, dtype)
         except Exception as error:  # no reference judges no layout: the model's one row
             rows.append({"model": model, "layout": "reference", "processes": jax.process_count(),
