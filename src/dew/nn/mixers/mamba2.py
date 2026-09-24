@@ -61,7 +61,14 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, logical_spec, manual_map, sequence_shards
+from dew.nn.sharding import (
+    SEQUENCE_AXIS,
+    LayoutRefused,
+    logical_axes,
+    logical_spec,
+    manual_map,
+    sequence_shards,
+)
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -391,7 +398,7 @@ class Mamba2(nn.Module):
         shards = sequence_shards()
         if decode or valid is not None:
             if shards > 1:
-                raise ValueError(
+                raise LayoutRefused(
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; "
                     "decoding and rows with padding slots (attention_metadata.valid) hold one "
                     "state per row. Run them on a mesh with sequence=1.")
@@ -504,7 +511,7 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     forward = None
     if axis is not None:
         if length < width:
-            raise ValueError(
+            raise LayoutRefused(
                 f"each sequence shard holds {length} tokens, fewer than the {width} the "
                 f"conv reads behind its first; use fewer sequence shards or longer sequences")
         shards = jax.lax.axis_size(axis)
@@ -532,7 +539,7 @@ def _over_sequence(mix, shards: int, mixed, dt, segments, weights):
     and stay with GSPMD outside it."""
     length = mixed.shape[1]
     if length % shards:
-        raise ValueError(
+        raise LayoutRefused(
             f"mamba2 splits the sequence of {length} tokens {shards} ways over the "
             "mesh's sequence axis, and it does not divide")
     tokens = logical_spec(("activation_batch", "activation_length"), mixed.shape[:2])

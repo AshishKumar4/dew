@@ -73,6 +73,13 @@ slice of the positions, stage the pipeline's stages that hand one batch's
 microbatches along, and tensor the widths of Megatron's split, so every
 tensor shard computes its share of the width for every row."""
 
+
+class LayoutRefused(ValueError):
+    """A mesh layout that a model, an objective or a device set does not run,
+    by design. The message names the axis, why it cannot hold what it would
+    split, and a layout that runs. Any other error on a layout is a defect.
+    It is a ValueError, so a caller that catches the one catches the other."""
+
 type MeshAxes = str | tuple[str, ...] | None
 type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 

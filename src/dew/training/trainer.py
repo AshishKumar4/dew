@@ -35,7 +35,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, RematPolicy
 from dew.nn.kernels.generation import device_generation
-from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
+from dew.nn.sharding import STAGE_AXIS, LayoutRefused, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
     Aux,
@@ -703,7 +703,7 @@ class Trainer(Generic[Loss, Effects]):
         with self._traced_on(mesh) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
-                raise ValueError(
+                raise LayoutRefused(
                     f"the stage axis of {mesh.shape[STAGE_AXIS]} holds a pipeline's stages of "
                     f"a decoder's layer stack, and {type(self.objective).__name__}'s model runs "
                     f"no pipeline, so every stage would compute the whole step; give those "
