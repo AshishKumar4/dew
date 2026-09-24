@@ -1,6 +1,6 @@
 # End-to-end examples
 
-Four scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a whole job: they read data, train weights and score them. By default each script uses settings for real hardware. The `--smoke` flag swaps in the repository's tiny fixtures, a few steps and one CPU device. Smoke runs need no network and no accelerator. `tests/test_examples.py` runs all four smoke runs as subprocesses and checks the files each one leaves behind.
+Four scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a whole job. Each reads data, trains weights and scores them. By default each script uses settings for real hardware. The `--smoke` flag swaps in the repository's tiny fixtures, a few steps and one CPU device. Smoke runs need no network and no accelerator. `tests/test_examples.py` runs all four smoke runs as subprocesses and checks the files each one leaves behind.
 
 Each smoke command below is the one that test runs. Set `JAX_PLATFORMS=cpu` and point `--out` at a scratch directory.
 

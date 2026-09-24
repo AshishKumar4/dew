@@ -143,7 +143,7 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 					label.textContent = 'Run live';
 					for (const button of document.querySelectorAll<HTMLButtonElement>('.nb-run')) button.remove();
 				};
-				say('Connected to a live kernel: one vCPU and JAX on the CPU, with no network access. It stops after 5 idle minutes or 20 minutes in all. Run the cells in order.');
+				say('Connected to a live kernel with one vCPU, JAX on the CPU and no network access. It stops after 5 idle minutes or 20 minutes in all. Run the cells in order.');
 				label.textContent = 'Live';
 				actions.hidden = false;
 				addRunButtons();
