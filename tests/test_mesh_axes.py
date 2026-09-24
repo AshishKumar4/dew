@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
+from dew.nn.conv import Conv
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
@@ -666,6 +667,36 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     for got, want, size in zip(jax.tree.leaves(split), jax.tree.leaves(alone),
                                jax.tree.leaves(magnitude), strict=True):
         np.testing.assert_array_less(np.abs(got - want), terms * np.finfo(np.float32).eps * size)
+
+
+def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devices_output():
+    """A 3x3 convolution of an 8x8 image under fsdp x tensor, its kernel's
+    input channels split over fsdp as the layout stores the UNet's (fsdp
+    takes the first of two equal widths), and its image rows split over
+    tensor by `Conv`'s placement. XLA's partitioner computed another result
+    (openxla/xla, a 3x3 convolution with a halo and a kernel split on its
+    input features): the UNet's second level's conv2 came out 13.4 off an
+    output of 4.5, so a UNet on fsdp2 x tensor2 trained on a loss 6.5e-3 off
+    one device's and gradients up to 2.6e5 times their bound."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(4, 8, 8, 64)).astype(np.float32)
+    conv = Conv(64, (3, 3))
+    params = conv.init(jax.random.key(0), x[:1])["params"]
+    alone = conv.apply({"params": params}, x)
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        stored = {"kernel": jax.device_put(params["kernel"], NamedSharding(mesh, P(None, None, "fsdp"))),
+                  "bias": params["bias"]}
+        split = jax.jit(conv.apply)({"params": stored}, jax.device_put(x, NamedSharding(mesh, P("fsdp"))))
+
+    # Each output sums one product per tap and input channel; any order of
+    # that sum lands within their count times fp32 epsilon times the sum of
+    # the products' magnitudes, which the same convolution of |x| and
+    # |kernel| is (the bias adds one term).
+    terms = 3 * 3 * x.shape[-1] + 1
+    magnitude = conv.apply({"params": jax.tree.map(np.abs, params)}, np.abs(x))
+    np.testing.assert_array_less(np.abs(np.asarray(split) - np.asarray(alone)),
+                                 terms * np.finfo(np.float32).eps * np.asarray(magnitude))
 
 
 def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
