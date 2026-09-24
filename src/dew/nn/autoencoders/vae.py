@@ -68,25 +68,18 @@ class FlaxDownsample2D(nn.Module):
 
 
 class FlaxResnetBlock2D(nn.Module):
-    """Run two group-normed 3x3 convolutions and add the input back.
-
-    `use_nin_shortcut` puts a 1x1 convolution on the residual; None takes it
-    whenever the block changes the channel count.
-    """
+    """Run two group-normed 3x3 convolutions and add the input back, through
+    a 1x1 convolution when the block changes the channel count."""
 
     in_channels: int
-    out_channels: int | None = None
-    dropout: float = 0.0
+    out_channels: int
     groups: int = 32
-    use_nin_shortcut: bool | None = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        out_channels = self.in_channels if self.out_channels is None else self.out_channels
-
         self.norm1 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
         self.conv1 = Conv(
-            out_channels,
+            self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
@@ -94,28 +87,25 @@ class FlaxResnetBlock2D(nn.Module):
         )
 
         self.norm2 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
-        self.dropout_layer = nn.Dropout(self.dropout)
         self.conv2 = Conv(
-            out_channels,
+            self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
 
-        use_nin_shortcut = self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
-
         self.conv_shortcut = None
-        if use_nin_shortcut:
+        if self.in_channels != self.out_channels:
             self.conv_shortcut = Conv(
-                out_channels,
+                self.out_channels,
                 kernel_size=(1, 1),
                 strides=(1, 1),
                 padding="VALID",
                 dtype=self.dtype,
             )
 
-    def __call__(self, hidden_states, deterministic=True):
+    def __call__(self, hidden_states):
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
         hidden_states = nn.swish(hidden_states)
@@ -123,7 +113,6 @@ class FlaxResnetBlock2D(nn.Module):
 
         hidden_states = self.norm2(hidden_states)
         hidden_states = nn.swish(hidden_states)
-        hidden_states = self.dropout_layer(hidden_states, deterministic)
         hidden_states = self.conv2(hidden_states)
 
         if self.conv_shortcut is not None:
@@ -135,32 +124,22 @@ class FlaxResnetBlock2D(nn.Module):
 class FlaxAttentionBlock(nn.Module):
     """Attend over an image's pixels as a sequence, with a residual.
 
-    `num_head_channels` is the width of one head, so the head count is
-    `channels // num_head_channels`; None is a single head. The scale is
-    split over the query and the key, as diffusers writes it, which is the
-    arithmetic the published weights were trained under.
+    One head as wide as the channels, which is what every AutoencoderKL
+    mid-block runs. The scale is split over the query and the key, as
+    diffusers writes it, which is the arithmetic the published weights were
+    trained under.
     """
 
     channels: int
-    num_head_channels: int | None = None
     num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.num_heads = self.channels // self.num_head_channels if self.num_head_channels is not None else 1
-
         dense = partial(nn.Dense, self.channels, dtype=self.dtype)
 
         self.group_norm = nn.GroupNorm(num_groups=self.num_groups, epsilon=1e-6, dtype=self.dtype)
         self.query, self.key, self.value = dense(), dense(), dense()
         self.proj_attn = dense()
-
-    def transpose_for_scores(self, projection):
-        new_projection_shape = (*projection.shape[:-1], self.num_heads, -1)
-        # move heads to 2nd position (B, T, H * D) -> (B, T, H, D)
-        new_projection = projection.reshape(new_projection_shape)
-        # (B, T, H, D) -> (B, H, T, D)
-        return jnp.transpose(new_projection, (0, 2, 1, 3))
 
     def __call__(self, hidden_states):
         residual = hidden_states
@@ -174,22 +153,11 @@ class FlaxAttentionBlock(nn.Module):
         key = self.key(hidden_states)
         value = self.value(hidden_states)
 
-        # transpose
-        query = self.transpose_for_scores(query)
-        key = self.transpose_for_scores(key)
-        value = self.transpose_for_scores(value)
-
-        # compute attentions
-        scale = 1 / math.sqrt(math.sqrt(self.channels / self.num_heads))
+        scale = 1 / math.sqrt(math.sqrt(self.channels))
         attn_weights = jnp.einsum("...qc,...kc->...qk", query * scale, key * scale)
         attn_weights = nn.softmax(attn_weights, axis=-1)
 
-        # attend to values
         hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
-
-        hidden_states = jnp.transpose(hidden_states, (0, 2, 1, 3))
-        new_hidden_states_shape = (*hidden_states.shape[:-2], self.channels)
-        hidden_states = hidden_states.reshape(new_hidden_states_shape)
 
         hidden_states = self.proj_attn(hidden_states)
         hidden_states = hidden_states.reshape((batch, height, width, channels))
@@ -205,7 +173,6 @@ class FlaxDownEncoderBlock2D(nn.Module):
 
     in_channels: int
     out_channels: int
-    dropout: float = 0.0
     num_layers: int = 1
     resnet_groups: int = 32
     add_downsample: bool = True
@@ -219,7 +186,6 @@ class FlaxDownEncoderBlock2D(nn.Module):
             res_block = FlaxResnetBlock2D(
                 in_channels=in_channels,
                 out_channels=self.out_channels,
-                dropout=self.dropout,
                 groups=self.resnet_groups,
                 dtype=self.dtype,
             )
@@ -229,9 +195,9 @@ class FlaxDownEncoderBlock2D(nn.Module):
         if self.add_downsample:
             self.downsamplers_0 = FlaxDownsample2D(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, deterministic=True):
+    def __call__(self, hidden_states):
         for resnet in self.resnets:
-            hidden_states = resnet(hidden_states, deterministic=deterministic)
+            hidden_states = resnet(hidden_states)
 
         if self.add_downsample:
             hidden_states = self.downsamplers_0(hidden_states)
@@ -248,7 +214,6 @@ class FlaxUpDecoderBlock2D(nn.Module):
 
     in_channels: int
     out_channels: int
-    dropout: float = 0.0
     num_layers: int = 1
     resnet_groups: int = 32
     add_upsample: bool = True
@@ -261,7 +226,6 @@ class FlaxUpDecoderBlock2D(nn.Module):
             res_block = FlaxResnetBlock2D(
                 in_channels=in_channels,
                 out_channels=self.out_channels,
-                dropout=self.dropout,
                 groups=self.resnet_groups,
                 dtype=self.dtype,
             )
@@ -272,9 +236,9 @@ class FlaxUpDecoderBlock2D(nn.Module):
         if self.add_upsample:
             self.upsamplers_0 = FlaxUpsample2D(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, deterministic=True):
+    def __call__(self, hidden_states):
         for resnet in self.resnets:
-            hidden_states = resnet(hidden_states, deterministic=deterministic)
+            hidden_states = resnet(hidden_states)
 
         if self.add_upsample:
             hidden_states = self.upsamplers_0(hidden_states)
@@ -283,63 +247,26 @@ class FlaxUpDecoderBlock2D(nn.Module):
 
 
 class FlaxUNetMidBlock2D(nn.Module):
-    """Alternate attention and resnet blocks at the bottleneck resolution.
-
-    There is always a leading resnet, then `num_layers` attention/resnet
-    pairs. The channel count does not change.
-    """
+    """A resnet, an attention block and a second resnet at the bottleneck
+    resolution. The channel count does not change."""
 
     in_channels: int
-    dropout: float = 0.0
-    num_layers: int = 1
     resnet_groups: int = 32
-    num_attention_heads: int | None = 1
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        resnet_groups = self.resnet_groups if self.resnet_groups is not None else min(self.in_channels // 4, 32)
+        resnet = partial(FlaxResnetBlock2D, in_channels=self.in_channels, out_channels=self.in_channels,
+                         groups=self.resnet_groups, dtype=self.dtype)
+        # Lists, so the params sit at resnets_0, resnets_1 and attentions_0,
+        # the names diffusers gives them.
+        self.resnets = [resnet(), resnet()]
+        self.attentions = [FlaxAttentionBlock(channels=self.in_channels, num_groups=self.resnet_groups,
+                                              dtype=self.dtype)]
 
-        # there is always at least one resnet
-        resnets = [
-            FlaxResnetBlock2D(
-                in_channels=self.in_channels,
-                out_channels=self.in_channels,
-                dropout=self.dropout,
-                groups=resnet_groups,
-                dtype=self.dtype,
-            )
-        ]
-
-        attentions = []
-
-        for _ in range(self.num_layers):
-            attn_block = FlaxAttentionBlock(
-                channels=self.in_channels,
-                num_head_channels=self.num_attention_heads,
-                num_groups=resnet_groups,
-                dtype=self.dtype,
-            )
-            attentions.append(attn_block)
-
-            res_block = FlaxResnetBlock2D(
-                in_channels=self.in_channels,
-                out_channels=self.in_channels,
-                dropout=self.dropout,
-                groups=resnet_groups,
-                dtype=self.dtype,
-            )
-            resnets.append(res_block)
-
-        self.resnets = resnets
-        self.attentions = attentions
-
-    def __call__(self, hidden_states, deterministic=True):
-        hidden_states = self.resnets[0](hidden_states, deterministic=deterministic)
-        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-            hidden_states = attn(hidden_states)
-            hidden_states = resnet(hidden_states, deterministic=deterministic)
-
-        return hidden_states
+    def __call__(self, hidden_states):
+        hidden_states = self.resnets[0](hidden_states)
+        hidden_states = self.attentions[0](hidden_states)
+        return self.resnets[1](hidden_states)
 
 
 class FlaxEncoder(nn.Module):
@@ -382,7 +309,6 @@ class FlaxEncoder(nn.Module):
         self.mid_block = FlaxUNetMidBlock2D(
             in_channels=block_out_channels[-1],
             resnet_groups=self.norm_num_groups,
-            num_attention_heads=None,
             dtype=self.dtype,
         )
 
@@ -396,11 +322,11 @@ class FlaxEncoder(nn.Module):
             dtype=self.dtype,
         )
 
-    def __call__(self, sample, deterministic: bool = True):
+    def __call__(self, sample):
         sample = self.conv_in(sample)
         for block in self.down_blocks:
-            sample = block(sample, deterministic=deterministic)
-        sample = self.mid_block(sample, deterministic=deterministic)
+            sample = block(sample)
+        sample = self.mid_block(sample)
         sample = self.conv_norm_out(sample)
         sample = nn.swish(sample)
         return self.conv_out(sample)
@@ -432,7 +358,6 @@ class FlaxDecoder(nn.Module):
         self.mid_block = FlaxUNetMidBlock2D(
             in_channels=block_out_channels[-1],
             resnet_groups=self.norm_num_groups,
-            num_attention_heads=None,
             dtype=self.dtype,
         )
 
@@ -458,11 +383,11 @@ class FlaxDecoder(nn.Module):
             dtype=self.dtype,
         )
 
-    def __call__(self, sample, deterministic: bool = True):
+    def __call__(self, sample):
         sample = self.conv_in(sample)
-        sample = self.mid_block(sample, deterministic=deterministic)
+        sample = self.mid_block(sample)
         for block in self.up_blocks:
-            sample = block(sample, deterministic=deterministic)
+            sample = block(sample)
 
         sample = self.conv_norm_out(sample)
         sample = nn.swish(sample)
