@@ -241,6 +241,86 @@ def microbatches() -> int:
     return pipeline_stages() if schedule.count is None else schedule.count
 
 
+@dataclasses.dataclass
+class TensorLink:
+    """The tensor axis's interconnect as the trainer measured it when it
+    placed a step (`dew.training.distributed.tensor_bandwidth`), one device's
+    dense bf16 peak, and whether a down-projection in the step ran on each
+    tensor shard's own tokens, which `down_projection` notes as it decides."""
+
+    bytes_per_second: float | None
+    """What one device receives a second in an all-gather over the tensor
+    axis: (T - 1) / T of the result, over the time it took. None where
+    nothing was measured: a CPU mesh, or a device the peak table does not
+    name."""
+    flops_per_second: float | None
+    """One device's dense bf16 peak, None for hardware the peak table does
+    not name (`dew.telemetry.instrumentation.peak_flops`)."""
+    platform: str
+    spread: bool = False
+
+
+_TENSOR_LINK: contextvars.ContextVar[TensorLink | None] = contextvars.ContextVar(
+    'tensor_link', default=None)
+
+
+@contextlib.contextmanager
+def tensor_link(link: TensorLink | None) -> Iterator[TensorLink | None]:
+    """Trace with `link` as the tensor axis's interconnect, for the
+    down-projections that decide from it; the link yielded says, once the
+    step has traced, whether one of them spread."""
+    token = _TENSOR_LINK.set(link)
+    try:
+        yield link
+    finally:
+        _TENSOR_LINK.reset(token)
+
+
+def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
+    """Where the down-projections of the residual `x` to `latent` features
+    in all run: `SPREAD`, each tensor shard on its own tokens, where that
+    cannot slow the step, else `RESIDUAL`, every tensor shard on every token.
+
+    Spreading takes from each of T shards (T - 1) / T of the projections'
+    6 * width * latent FLOPs a token (the forward product and the backward's
+    two) and adds (T - 1) / T of a token's residual gradient and latent,
+    gathered over the tensor axis, plus a step's sum of the projections' fp32
+    weight gradient over it, which a ring moves twice. It cannot lose where
+    the link moves those bytes in no more time than the device's peak takes
+    for the FLOPs: the step saves at least that time at any utilisation.
+    The weight gradient's sum is a microbatch's, so the fewer its tokens the
+    more it weighs: at DeepSeek-V3's widths in bf16 (7168 into 1536 + 512 +
+    64) and 16384 tokens that is 20.3 GB/s for an RTX 3090, which an NVLink
+    pair's 31.0 meets and a PCIe 3.0 pair's 5.8 does not (4x RTX 3090, PCIe
+    3.0, one host), and 283 GB/s for an H100, under NVLink 4's nominal 450
+    a direction; at 4096 tokens an H100 needs 524. A CPU mesh's devices
+    share one host's memory, which moves a byte in less time than a CPU's
+    matmul spends on a thousand FLOPs, and it spreads. Without a measured
+    link, or with a device the peak table does not name, the projections
+    stay on every token."""
+    mesh = jax.sharding.get_abstract_mesh()
+    link = _TENSOR_LINK.get()
+    if (mesh.empty or mesh.shape.get(TENSOR_AXIS, 1) == 1 or TENSOR_AXIS in mesh.manual_axes
+            or link is None):
+        return RESIDUAL
+    width = x.shape[-1]
+    # The tokens one tensor group computes: the rows and positions the
+    # residual's other axes leave it.
+    split = math.prod(mesh.shape[axis] for entry in logical_spec(RESIDUAL[:2], x.shape[:2])
+                      for axis in mesh_axes(entry))
+    tokens = math.prod(x.shape[:-1]) / split
+    flops = 6 * width * latent
+    moved = (width + latent) * x.dtype.itemsize + 2 * width * latent * 4 / tokens
+    if link.platform == 'cpu':
+        spreads = True
+    elif link.bytes_per_second is None or link.flops_per_second is None:
+        spreads = False
+    else:
+        spreads = link.bytes_per_second * flops >= link.flops_per_second * moved
+    link.spread = link.spread or spreads
+    return SPREAD if spreads else RESIDUAL
+
+
 def sequence_shards() -> int:
     """How many ways the mesh in context splits the sequence axis, 1 with no
     mesh or no such axis.

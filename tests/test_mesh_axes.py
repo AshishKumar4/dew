@@ -164,6 +164,40 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
 
+
+@pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "spreads"), [
+    (None, None, None, False),
+    (5.8e9, 71e12, "gpu", False),
+    (31.0e9, 71e12, "gpu", True),
+    (64e9, 756e12, "gpu", False),
+    (450e9, 989e12, "gpu", True),
+    (None, None, "gpu", False),
+    (None, None, "cpu", True),
+], ids=["unmeasured", "3090-pcie", "3090-nvlink", "h100-pcie", "h100-nvlink", "unknown-gpu", "cpu"])
+def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_second, peak, platform, spreads):
+    """Each tensor shard computing its own tokens' down-projection saves FLOPs
+    and gathers the residual's gradient and the latent back, and sums the
+    projection's weight gradient over the tensor axis. At DeepSeek-V3's
+    widths in bf16 (7168 into 1536 + 512 + 64) and 16384 tokens a microbatch
+    that pays, even at the device's peak, where the link moves at least
+    20.3 GB/s for an RTX 3090 (71 TFLOPS) and 283 GB/s for an H100 SXM
+    (989 TFLOPS), 216 GB/s for the PCIe card (756 TFLOPS). The 3090
+    rows are the box's measured all-gathers at 128 MiB (4x RTX 3090, PCIe
+    3.0, one host): the NVLink pair pays and the PCIe pair does not. The
+    H100 rows are the links' nominal rates a direction, PCIe 5.0 x16 for the
+    PCIe card and NVLink 4 for the SXM one. A device the peak table does not
+    name, and a step with no measured link, keep the projection on every
+    token; a CPU mesh spreads."""
+    from dew.nn.sharding import RESIDUAL, SPREAD, TensorLink, down_projection, tensor_link
+
+    mesh = build_mesh(MeshSpec(tensor=4), jax.devices()[:4])
+    residual = jax.ShapeDtypeStruct((4, 4096, 7168), jnp.bfloat16)
+    link = None if platform is None else TensorLink(bytes_per_second, peak, platform)
+    with jax.set_mesh(mesh), tensor_link(link):
+        assert down_projection(residual, 1536 + 512 + 64) == (SPREAD if spreads else RESIDUAL)
+    assert link is None or link.spread == spreads
+
+
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
     """Tensor parallelism alone, no fsdp: every attention and mlp projection
     names the tensor axis, so the default tolerance holds with nothing but
