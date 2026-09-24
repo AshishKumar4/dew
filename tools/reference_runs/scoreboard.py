@@ -38,23 +38,24 @@ NO_TRITON = "XLA_FLAGS=--xla_gpu_enable_triton_gemm=false"
 
 ROWS: list[dict] = [
     {"id": "qwen3-1gpu-a100", "path": "dense LM", "model": "Qwen3-0.6B", "gpus": 1,
-     "hardware": "A100-SXM4-40GB (Colab), one VM",
+     "hardware": "A100-SXM4-40GB (Colab)",
      "shape": "batch 4 x 1024 tokens, AdamW, 40 steps (25 timed, 5 profiled)",
-     "dew": [("dew", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16.json", f"{DEW_BF16}, cuDNN attention")],
-     "reference": [("torch.compile", "qwen3-1gpu-a100/c6-775e68d9/torch-autocast-compile.json",
+     "dew": [("dew", "qwen3-1gpu-a100/c7-d60c090a/dew-bf16.json", f"{DEW_BF16}, cuDNN attention")],
+     "reference": [("torch.compile", "qwen3-1gpu-a100/c7-d60c090a/torch-autocast-compile.json",
                     f"transformers + torch, autocast bf16 over fp32 params, SDPA (FlashAttention 2), "
-                    f"fused AdamW, {TORCH_COMPILE}"),
-                   ("torch.compile, bf16 params", "qwen3-1gpu-a100/c6-775e68d9/torch-fsdp-bf16-compile.json",
-                    f"FSDP2 on one GPU, MixedPrecisionPolicy bf16 params over fp32 masters, {TORCH_COMPILE}"),
-                   ("torch eager", "qwen3-1gpu-a100/c6-775e68d9/torch-autocast.json",
-                    "transformers + torch, autocast bf16, SDPA, eager"),
-                   ("MaxText recipe", "qwen3-1gpu-a100/c6-775e68d9/maxtext-recipe.json", MAXTEXT_RECIPE),
+                    f"fused AdamW, {TORCH_COMPILE}; Dew's VM"),
+                   ("torch.compile, bf16 params", "qwen3-1gpu-a100/c7-d60c090a/torch-fsdp-bf16-compile.json",
+                    f"FSDP2 on one GPU, MixedPrecisionPolicy bf16 params over fp32 masters, {TORCH_COMPILE}; "
+                    f"Dew's VM"),
+                   ("MaxText recipe", "qwen3-1gpu-a100/c6-775e68d9/maxtext-recipe.json",
+                    f"{MAXTEXT_RECIPE}; another A100 VM"),
                    ("MaxText default", "qwen3-1gpu-a100/c6-775e68d9/maxtext-default.json",
-                    "MaxText defaults: full remat, scanned layers, cuDNN flash; synthetic tokens, random init")],
-     "experiments": [("dew, no Triton GEMM", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16-no-triton-gemm.json",
-                      f"{DEW_BF16}, {NO_TRITON}"),
+                    "MaxText defaults: full remat, scanned layers, cuDNN flash; synthetic tokens, random init; "
+                    "another A100 VM")],
+     "experiments": [("dew, no Triton GEMM", "qwen3-1gpu-a100/c7-d60c090a/dew-bf16-no-triton-gemm.json",
+                      f"{DEW_BF16}, {NO_TRITON}; Dew's VM"),
                      ("dew, MaxText's XLA flags", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16-maxtext-flags.json",
-                      f"{DEW_BF16}, MaxText's GPU recipe XLA flags")]},
+                      f"{DEW_BF16}, MaxText's GPU recipe XLA flags; another A100 VM")]},
     {"id": "qwen3-4gpu-3090-b8", "path": "dense LM", "model": "Qwen3-0.6B", "gpus": 4,
      "hardware": "4x RTX 3090 (NVLink pair + PHB pair)",
      "shape": "global batch 8 x 1024 tokens (2 rows per GPU), AdamW, the 256-step curve case",
@@ -85,14 +86,14 @@ ROWS: list[dict] = [
     {"id": "moe-1gpu-a100", "path": "MoE", "model": "99M Qwen3-MoE shape (8 experts, top 2)", "gpus": 1,
      "hardware": "A100-SXM4-40GB (Colab), one VM",
      "shape": "global batch 8 x 1024 tokens, AdamW, Switch aux 0.01, 40 steps",
-     "dew": [("dew", "moe-1gpu-a100/c6-775e68d9/dew-bf16.json", DEW_BF16)],
-     "reference": [("torch.compile, bf16 experts", "moe-1gpu-a100/c6-775e68d9/torch-fsdp-bf16-compile.json",
+     "dew": [("dew", "moe-1gpu-a100/c7-d60c090a/dew-bf16.json", DEW_BF16)],
+     "reference": [("torch.compile, bf16 experts", "moe-1gpu-a100/c7-d60c090a/torch-fsdp-bf16-compile.json",
                     f"transformers Qwen3MoE, FSDP2 on one GPU with bf16 params over fp32 masters (grouped_mm "
                     f"in bf16), {TORCH_COMPILE}"),
-                   ("torch.compile, fp32 experts", "moe-1gpu-a100/c6-775e68d9/torch-autocast-compile.json",
+                   ("torch.compile, fp32 experts", "moe-1gpu-a100/c7-d60c090a/torch-autocast-compile.json",
                     f"transformers Qwen3MoE, autocast bf16 (grouped_mm outside it, at the fp32 weights' dtype), "
                     f"{TORCH_COMPILE}")],
-     "experiments": [("dew, no Triton GEMM", "moe-1gpu-a100/c6-775e68d9/dew-bf16-no-triton-gemm.json",
+     "experiments": [("dew, no Triton GEMM", "moe-1gpu-a100/c7-d60c090a/dew-bf16-no-triton-gemm.json",
                       f"{DEW_BF16}, {NO_TRITON}")],
      "missing": ["MaxText: its MoE path on GPU is not set up for this shape"]},
     {"id": "moe-4gpu-3090", "path": "MoE", "model": "99M Qwen3-MoE shape (8 experts, top 2)", "gpus": 4,
@@ -163,11 +164,15 @@ def side_rows(evidence: Path, sides: list[Side]) -> list[dict]:
 
 
 def verdict(row: dict) -> str:
-    dew = max((side for side in row["dew"] if not side.get("missing")), key=lambda s: s["rate"], default=None)
-    reference = max((side for side in row["reference"] if not side.get("missing")),
-                    key=lambda s: s["rate"], default=None)
-    if dew is None or reference is None:
+    # A verdict against whichever records happen to exist would read a
+    # weaker setup as the reference, so a row waits for all of its sides.
+    missing = [side["label"] for side in row["dew"] + row["reference"] if side.get("missing")]
+    if missing:
+        return f"incomplete: {', '.join(missing)} not measured"
+    if not row["dew"] or not row["reference"]:
         return "not measured"
+    dew = max(row["dew"], key=lambda side: side["rate"])
+    reference = max(row["reference"], key=lambda side: side["rate"])
     # Any gap is a loss to root-cause, so there is no band in which Dew
     # merely matches: a lower rate than the reference's best loses.
     ratio = dew["rate"] / reference["rate"]

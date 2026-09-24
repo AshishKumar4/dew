@@ -582,3 +582,23 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
 ])
 def test_kernel_categories_read_whole_tokens(name, category):
     assert load("trace_window").kernel_category(name) == category
+
+
+# ---------------------------------------------------------------------------
+# tools/reference_runs/scoreboard.py
+# ---------------------------------------------------------------------------
+
+def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
+    """While the strongest reference's record is missing, the row gives no
+    verdict: a ratio against the weaker reference that exists would read as
+    Dew's standing. With every record in, the best reference decides."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    scoreboard = load("reference_runs/scoreboard")
+    dew = {"label": "dew", "rate": 110.0}
+    weaker = {"label": "torch, fp32 experts", "rate": 50.0}
+    stronger = {"label": "torch, bf16 experts", "missing": True}
+    assert scoreboard.verdict({"dew": [dew], "reference": [weaker, stronger]}) == (
+        "incomplete: torch, bf16 experts not measured")
+    stronger = {"label": "torch, bf16 experts", "rate": 125.0}
+    assert scoreboard.verdict({"dew": [dew], "reference": [weaker, stronger]}) == (
+        "Dew (dew) LOSES to torch, bf16 experts: 0.880x")
