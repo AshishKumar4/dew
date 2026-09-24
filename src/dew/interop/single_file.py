@@ -4,9 +4,9 @@ SDXL and BFL's FLUX.1 `.safetensors`.
 A single-file checkpoint holds one or more pipeline components under the
 names of the codebase that trained it: `model.diffusion_model.*`,
 `first_stage_model.*`, `cond_stage_model.*`, `conditioner.embedders.*`,
-BFL's `double_blocks.*` and `single_blocks.*`.
-diffusers reads these with `from_single_file`, and this module reuses
-diffusers' own key maps, not a copy of them:
+BFL's `double_blocks.*` and `single_blocks.*`. diffusers reads these with
+`from_single_file`, and this module reuses diffusers' own key maps, not a
+copy of them:
 
 - `infer_diffusers_model_type` and `DIFFUSERS_DEFAULT_PIPELINE_PATHS` name
   the diffusers repo whose configs describe the checkpoint;
@@ -23,20 +23,21 @@ component the file does not carry (a Flux transformer file ships without its
 text encoders or VAE), taken from where the configs came from and linked,
 not copied, into the directory. The safety checker is left out, as
 `from_single_file` leaves it (diffusers' SINGLE_FILE_OPTIONAL_COMPONENTS).
-The pipeline then loads from there, and the entry is kept only once it has. diffusers' conversions are written in torch,
-so this route needs `pip install 'dew-ml[diffusers]'`; the loaded pipeline
-itself runs in JAX.
+The pipeline then loads from there, and the entry is kept only once it has.
+diffusers' conversions are written in torch, so this route needs
+`pip install 'dew-ml[diffusers]'`; the loaded pipeline itself runs in JAX.
 """
 
 from __future__ import annotations
 
 import errno
+import fnmatch
 import hashlib
 import json
 import os
 import shutil
 import tempfile
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,8 +45,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.interop import hf_decoders as decoders
 from dew.interop.pickles import host_view
-from dew.interop.safetensors_io import read_file, write_file
+from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
 from dew.telemetry.instrumentation import dew_cache_dir
 
 if TYPE_CHECKING:
@@ -155,11 +157,10 @@ def converted(checkpoint: Mapping[str, torch.Tensor], configs: Path,
 def _configs(repo: str) -> Path:
     """The config repo's configs, tokenizers and scheduler, without weights,
     in a snapshot directory named by the commit they came from."""
-    from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError
 
     try:
-        return Path(snapshot_download(repo, allow_patterns=["model_index.json", "*/*.json", "*/*.txt", "*/*.model"]))
+        return decoders._snapshot(repo, None, weights=False)
     except GatedRepoError as error:
         raise PermissionError(
             f"this checkpoint's configs come from {repo}, which is gated on the Hub: accept its license at "
@@ -168,28 +169,32 @@ def _configs(repo: str) -> Path:
             "single_file=") from error
 
 
-def _hub_weights(repo: str, revision: str, names: Collection[str]) -> Path:
-    """The snapshot of `repo` at `revision` holding these components' weights."""
-    from huggingface_hub import snapshot_download
-
-    return Path(snapshot_download(repo, revision=revision, allow_patterns=[
-        pattern for name in names for pattern in (f"{name}/*.safetensors", f"{name}/*.safetensors.index.json")]))
+def _metadata(configs: Path) -> list[Path]:
+    """The configs directory's files a load reads but weights (the metadata
+    patterns a snapshot fetches), so no other format of the weights beside
+    them, such as an ONNX export, is copied. A weights index is left out
+    too: a converted component is one file, and an index beside it would
+    name the repo's shards instead."""
+    return sorted(path for path in configs.rglob("*") if path.is_file()
+                  and not path.name.endswith(".safetensors.index.json")
+                  and any(fnmatch.fnmatch(path.name, pattern) for pattern in decoders._METADATA_PATTERNS))
 
 
 def _link(source: Path, destination: Path) -> None:
-    """A hard link, or a copy where the two sit on different filesystems."""
+    """A hard link, or a copy where there can be none: across filesystems,
+    or on one without hard links."""
     try:
         os.link(source, destination)
     except OSError as error:
-        if error.errno != errno.EXDEV:
+        if error.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP):
             raise
         shutil.copyfile(source, destination)
 
 
 def _key(path: Path, configs: str) -> str:
     """The cache entry's name: the file (a Hub file resolves to its
-    content-addressed blob), where the configs came from, and the diffusers
-    whose key maps convert it."""
+    content-addressed blob), the configs it was converted with, and the
+    diffusers whose key maps convert it."""
     import diffusers
 
     status = path.stat()
@@ -213,7 +218,9 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
     names when `configs` is that repo's metadata snapshot. One that has none
     there is refused by name.
 
-    A cached conversion is returned before the file is read. A new one is
+    The cache entry is named by the file, the Hub commit or the contents of
+    a local directory's configs, and diffusers' version, and a cached
+    conversion is returned before the file is read. A new one is
     written into a staging directory, which is published with one rename
     when the caller's block exits without an error, so an interrupted or
     failed load leaves nothing cached.
@@ -235,7 +242,16 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         repo = config_repo(checkpoint)
         configs = _configs(repo)
         hub = (repo, configs.name)
-    origin = f"{hub[0]}@{hub[1]}" if hub is not None else str(configs.resolve())
+    metadata = _metadata(configs)
+    if hub is not None:
+        origin = f"{hub[0]}@{hub[1]}"
+    else:
+        # A local directory's configs can change in place, so their contents
+        # name them, not their path.
+        digest = hashlib.sha256()
+        for file in metadata:
+            digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
+        origin = f"{configs.resolve()}#{digest.hexdigest()}"
     target = Path(dew_cache_dir()) / "single_file" / _key(source, origin)
     if (target / "model_index.json").is_file():
         yield target, target
@@ -247,10 +263,10 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".converting-"))
     try:
-        # The config snapshot may also hold weights an earlier download left.
-        shutil.copytree(configs, staging, dirs_exist_ok=True, symlinks=False,
-                        ignore=shutil.ignore_patterns("*.safetensors", "*.safetensors.index.json", "*.bin",
-                                                      "*.ckpt", "*.msgpack"))
+        for file in metadata:
+            copied = staging / file.relative_to(configs)
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(file, copied)
         (staging / "model_index.json").write_text(json.dumps(index, indent=2))
         missing = []
         for name, library, tensors in converted(checkpoint, configs, index):
@@ -261,11 +277,18 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
             write_file({key: host_view(value.contiguous(), f"{name}'s {key}") for key, value in tensors.items()},
                        staging / name / weights, {"format": "pt"})
         if missing:
-            weights = configs if hub is None else _hub_weights(*hub, missing)
+            # The Hub snapshot and the local directory are both read by
+            # `weight_files`' rule, so a precision variant or non-EMA copy
+            # beside the weights is neither fetched nor linked.
+            weights = configs if hub is None else decoders._snapshot(*hub, weights=tuple(missing))
+            empty = []
             for name in missing:
-                for file in (weights / name).glob("*.safetensors*"):
-                    _link(file.resolve(), staging / name / file.name)
-            empty = [name for name in missing if not any((staging / name).glob("*.safetensors"))]
+                selected = folder_weights(weights / name)
+                empty += [] if selected else [name]
+                index = [f"{stem}.safetensors.index.json" for stem in WEIGHT_STEMS
+                         if (weights / name / f"{stem}.safetensors.index.json").is_file()]
+                for file in (*selected, *index):
+                    _link((weights / name / file).resolve(), staging / name / file)
             if empty:
                 raise ValueError(
                     f"{source.name} carries no weights for {empty}, and {origin} has none for them either; "

@@ -254,6 +254,12 @@ def _json_reader(folder: Path) -> Callable[[str], JSON]:
     return lambda name: json.loads((folder / name).read_text())
 
 
+def folder_weights(folder: Path) -> tuple[str, ...]:
+    """The names of the files in `folder` that hold its weights, by
+    `weight_files`' rule; () when it holds none."""
+    return weight_files(_listing(folder), "", _json_reader(folder))
+
+
 def read_weights(folder) -> dict[str, np.ndarray]:
     """Read one checkpoint folder's weights, as `weight_files` selects them.
 
@@ -262,7 +268,7 @@ def read_weights(folder) -> dict[str, np.ndarray]:
     Raises FileNotFoundError when the folder holds no safetensors weights.
     """
     folder = Path(folder)
-    selected = weight_files(_listing(folder), "", _json_reader(folder))
+    selected = folder_weights(folder)
     if not selected:
         raise FileNotFoundError(
             f"no safetensors weights in {folder}: expected "
