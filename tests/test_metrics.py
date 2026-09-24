@@ -83,13 +83,25 @@ def pytorch_fid_reference():
 def test_frechet_distance_equals_pytorch_fids_on_the_same_statistics():
     """The distance alone, on the statistics of pytorch-fid's own features:
     both take scipy's `sqrtm` of the covariance product and nudge the
-    diagonal when it is singular, so the two numbers are one (observed equal
-    to the bit; the bound leaves room for a different scipy)."""
+    diagonal when it is singular.
+
+    Eight images a set leave rank-7 covariances, so 2041 of the product's
+    2048 eigenvalues are rounding, each at most eps * |Sa| * |Sb| (spectral
+    norms). sqrtm turns each into up to the square root of that, and FID
+    subtracts twice the trace, so two correct runs (another scipy, another
+    BLAS) can differ by 2 * (n - r) * sqrt(eps * |Sa| * |Sb|): 7.8e-4 here.
+    CI's scipy landed 4.2e-6 from pytorch-fid's number, a Colab CPU 1.8e-8.
+    Covariances without Bessel's correction move the distance by 7.6, one
+    trace term instead of two by 9.3, and dropping the mean term by 135."""
     reference, _, _ = pytorch_fid_reference()
-    stats = [(features.astype(np.float64).mean(axis=0),
-              np.cov(features.astype(np.float64), rowvar=False))
-             for features in (reference["features_a"], reference["features_b"])]
-    assert frechet_distance(*stats[0], *stats[1]) == pytest.approx(float(reference["fid"]), rel=1e-9)
+    (mu_a, sigma_a), (mu_b, sigma_b) = [
+        (features.astype(np.float64).mean(axis=0), np.cov(features.astype(np.float64), rowvar=False))
+        for features in (reference["features_a"], reference["features_b"])]
+    width = sigma_a.shape[0]
+    rank = min(len(reference["features_a"]), len(reference["features_b"])) - 1
+    rounding = np.finfo(np.float64).eps * np.linalg.norm(sigma_a, 2) * np.linalg.norm(sigma_b, 2)
+    bound = 2 * (width - rank) * np.sqrt(rounding)
+    assert frechet_distance(mu_a, sigma_a, mu_b, sigma_b) == pytest.approx(float(reference["fid"]), abs=bound)
 
 
 @pytest.mark.network
