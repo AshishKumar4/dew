@@ -38,7 +38,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.interop import hf_decoders as decoders
+from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import AUTO, Pretrained, _source_processor
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
@@ -254,7 +254,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
 
     `directory` is the metadata snapshot `load_pretrained` resolved and
     `revision` its commit (None for a local directory); the weights come
-    from the same commit through `hf_decoders._snapshot`, so the file
+    from the same commit through `sources.snapshot`, so the file
     selection is the native loader's.
     """
     if attention_impl != "auto":
@@ -284,7 +284,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
         from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
-    directory = decoders._snapshot(str(name_or_dir), revision)
+    directory = sources.snapshot(str(name_or_dir), revision)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
     model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True)
     model.eval()

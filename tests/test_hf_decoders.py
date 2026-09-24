@@ -105,13 +105,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
-from dew.interop import hf_decoders
+from dew.interop import hf_decoders, load_pretrained
+from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
-from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.moe import Situ
 from dew.registry import models, with_precision
@@ -741,8 +740,8 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
     model = models.build('causal_transformer', **built)
     initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
 
-    from dew.interop.hf_decoders import _load_shards
-    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config))
+    from dew.interop.sources import load_shards
+    loaded = flat_tree(translate_weights(load_shards(FIXTURES / name), config))
 
     assert set(loaded) == set(initialised)
     for path, leaf in loaded.items():
@@ -1409,11 +1408,12 @@ def test_the_router_bias_lands_in_the_moe_collection():
     and the loaded model selects on it: zeroing the bias moves the logits by
     2.1 on deepseek-v3-tiny.
     """
-    from dew.interop.hf_decoders import _dew_path, _load_shards
+    from dew.interop.hf_decoders import _dew_path
+    from dew.interop.sources import load_shards
 
     directory = FIXTURES / "deepseek-v3-tiny"
     config = translate_config(fixture_config("deepseek-v3-tiny"))
-    tensors = _load_shards(directory)
+    tensors = load_shards(directory)
     name = 'model.layers.1.mlp.gate.e_score_correction_bias'
     assert _dew_path(name, config) == (
         'moe', 'layers_1', 'mlp', 'gate', 'e_score_correction_bias')
@@ -1439,11 +1439,11 @@ def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
     """The tree check holds every collection to account, so a checkpoint
     that drops the balancing bias fails naming the leaf, and no router loads
     at zeros."""
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
 
     directory = FIXTURES / "deepseek-v3-tiny"
-    tensors = _load_shards(directory)
+    tensors = load_shards(directory)
     del tensors['model.layers.1.mlp.gate.e_score_correction_bias']
     save_hf_layout(tensors, fixture_config("deepseek-v3-tiny"), str(tmp_path))
 
@@ -1640,7 +1640,7 @@ def test_qwen35_weights_are_exactly_the_models_param_tree(rng):
     """The linear_attn tensors land under self_attn with the checkpoint's
     leaf names, the doubled q_proj fits the gated attention, and nothing is
     left over or missing."""
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("qwen35-tiny"))
     built = with_precision("causal_transformer", dict(config),
@@ -1648,7 +1648,7 @@ def test_qwen35_weights_are_exactly_the_models_param_tree(rng):
     model = models.build("causal_transformer", **built)
     expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
     loaded = flat_tree(translate_weights(
-        _load_shards(FIXTURES / "qwen35-tiny"), config)["params"])
+        load_shards(FIXTURES / "qwen35-tiny"), config)["params"])
 
     assert set(loaded) == set(expected)
     assert {name: leaf.shape for name, leaf in loaded.items()} == {
@@ -1835,14 +1835,14 @@ def test_qwen3_next_weights_are_exactly_the_models_param_tree(rng):
     """The fused in_proj_qkvz and in_proj_ba land under self_attn at the
     checkpoint's widths, the packed experts unpack into stacked kernels, and
     nothing is left over or missing."""
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("qwen3-next-tiny"))
     built = with_precision("causal_transformer", dict(config),
                            dtype="float32", attention_impl="reference")
     model = models.build("causal_transformer", **built)
     expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
-    loaded = flat_tree(translate_weights(_load_shards(QWEN3_NEXT), config)["params"])
+    loaded = flat_tree(translate_weights(load_shards(QWEN3_NEXT), config)["params"])
 
     assert set(loaded) == set(expected)
     assert {name: leaf.shape for name, leaf in loaded.items()} == {
@@ -2367,9 +2367,9 @@ def test_a_kimi_k25_load_binds_the_decoder_and_retains_the_vision_halves():
     Every decoder tensor binds to a leaf, every vision tensor is retained
     by name, and the retained bytes reach the export untouched."""
     loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
-    tensors = _load_shards(KIMI_K25)
+    tensors = load_shards(KIMI_K25)
     bound = {layout.name for layout in loaded.weight_layouts}
     retained = set(loaded.retained_tensors)
 
@@ -2388,12 +2388,12 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
     tree under the release's names, the tower and the projector from the
     bytes they were retained as, and the source's own config beside them."""
     loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
     destination = tmp_path / "export"
     loaded.save(destination)
-    exported = _load_shards(destination)
-    source = _load_shards(KIMI_K25)
+    exported = load_shards(destination)
+    source = load_shards(KIMI_K25)
 
     assert set(exported) == set(source)
     for name, tensor in source.items():
@@ -2415,14 +2415,14 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     under those names rather than the unnested ones."""
     from shutil import copytree
 
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import write_file
+    from dew.interop.sources import load_shards
 
     source = Path(copytree(KIMI_K25, tmp_path / "tied"))
     config = fixture_config("kimi-k25-tiny")
     config["tie_word_embeddings"] = True
     (source / "config.json").write_text(json.dumps(config))
-    tensors = _load_shards(source)
+    tensors = load_shards(source)
     embedding = tensors["language_model.model.embed_tokens.weight"]
     write_file({**tensors, "language_model.lm_head.weight": embedding},
                source / "model.safetensors", {"format": "pt"})
@@ -2942,10 +2942,10 @@ def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, save
 def test_both_spellings_of_one_deepseek_v4_tensor_are_refused():
     """The two spellings land on one leaf, so a checkpoint carrying both
     with different values would load whichever came last."""
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("deepseek-v4-tiny"))
-    tensors = dict(_load_shards(DEEPSEEK_V4))
+    tensors = dict(load_shards(DEEPSEEK_V4))
     tensors["model.embed_tokens.weight"] = tensors["embed.weight"] + 1
 
     with pytest.raises(ValueError, match="model.embed_tokens.weight lands on params/embed_tokens"):
@@ -2956,14 +2956,14 @@ def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
     """Same collections, paths and shapes as a freshly initialised model,
     with the `moe` collection holding the hash layers' int32 table and the
     top-k layers' fp32 balancing bias."""
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("deepseek-v4-tiny"))
     built = with_precision("causal_transformer", dict(config),
                            dtype="float32", attention_impl="reference")
     model = models.build("causal_transformer", **built)
     initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
-    loaded = flat_tree(translate_weights(_load_shards(DEEPSEEK_V4), config))
+    loaded = flat_tree(translate_weights(load_shards(DEEPSEEK_V4), config))
 
     assert set(loaded) == set(initialised)
     for path, leaf in loaded.items():
@@ -3013,10 +3013,10 @@ def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
 
 @pytest.mark.parametrize('saved_spelling', [False, True], ids=['released', 'hf_saved'])
 def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
 
-    tensors = _load_shards(DEEPSEEK_V4)
+    tensors = load_shards(DEEPSEEK_V4)
     tensors['head.weight'] = tensors['embed.weight'].copy()
     if saved_spelling:
         # HF's reverse converter prefixes the trunk and misses the anchored
@@ -3040,7 +3040,7 @@ def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
     source = load_pretrained(directory, dtype='float32', attention_impl='reference')
     export = tmp_path / 'export'
     source.save(export)
-    emitted = _load_shards(export)
+    emitted = load_shards(export)
     assert set(emitted) == set(tensors)
     for name, tensor in tensors.items():
         np.testing.assert_array_equal(emitted[name], tensor, err_msg=name)
@@ -3055,10 +3055,10 @@ def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
 
 @pytest.mark.parametrize('invalid', [2**32, 8])
 def test_deepseek_v4_hash_table_refuses_invalid_expert_indices(tmp_path, invalid):
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
 
-    tensors = _load_shards(DEEPSEEK_V4)
+    tensors = load_shards(DEEPSEEK_V4)
     name = 'layers.0.ffn.gate.tid2eid'
     tensors[name] = tensors[name].copy()
     tensors[name][0, 0] = invalid

@@ -584,8 +584,8 @@ def reexport(request, tmp_path_factory):
     parameters V3.2's `scale_fmt`. Run once per format for the tests below,
     which take the pipeline apart rather than run it again.
     """
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import read_file
+    from dew.interop.sources import load_shards
     ue8m0 = request.param
     root = tmp_path_factory.mktemp("fp8-reexport")
     directory, destination = root / "source", root / "reexport"
@@ -601,7 +601,7 @@ def reexport(request, tmp_path_factory):
             shipped[name], REEXPORT_BLOCK, ue8m0=ue8m0)
     write_safetensors(directory / "model.safetensors", shipped)
 
-    names = scaled_names(_load_shards(directory))
+    names = scaled_names(load_shards(directory))
     loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
