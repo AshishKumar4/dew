@@ -298,3 +298,13 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
     assert len(compiled) == 2
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
     assert trainer_module.remat_record(trainer.objective.model.remat) == 'minimal'
+@pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
+def test_a_gated_product_keeps_only_its_16_bit_inputs_for_the_backward(activation):
+    """The product runs in fp32. Differentiated as written it kept five fp32
+    copies of the MLP's width, which a scanned stack stores per layer."""
+    from dew.nn.moe import gated_product
+
+    product = gated_product(activation)
+    gate, up = (jnp.ones((2, 8, 32), jnp.bfloat16) * value for value in (0.5, 1.5))
+    lines = saved_residuals(lambda g, u: jnp.sum(product(g, u).astype(jnp.float32)), gate, up)
+    assert lines and not [line for line in lines if 'f32[2,8,32]' in line], lines
