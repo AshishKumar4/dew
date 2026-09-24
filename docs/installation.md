@@ -48,15 +48,15 @@ Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or under `$XDG_
 
 ## Use a GPU or TPU
 
-The plain install brings the CPU build of JAX. For an accelerator, install the matching JAX build in the same environment:
+The plain install brings JAX for the CPU. Dew pins JAX to a build of 0.11.2 from GitHub that fixes its compilation cache for pools of processes on different GPUs, until a JAX release ships the fix. The extras that ask PyPI for JAX, such as `jax[cuda13]`, conflict with that pin, so install the accelerator plugin for jaxlib 0.11.2 in the same environment instead:
 
 | Hardware | Command |
 |---|---|
-| NVIDIA GPU, CUDA 13 driver | `uv pip install -U "jax[cuda13]"` |
-| NVIDIA GPU, CUDA 12 driver | `uv pip install -U "jax[cuda12]"` |
-| Google TPU | `uv pip install -U "jax[tpu]"` |
+| NVIDIA GPU, CUDA 13 driver | `uv pip install "jax-cuda13-plugin[with-cuda]==0.11.2"` |
+| NVIDIA GPU, CUDA 12 driver | `uv pip install "jax-cuda12-plugin[with-cuda]==0.11.2"` |
+| Google TPU | `uv pip install "libtpu==0.0.48.*"` |
 
-The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install `jax[cuda13]`, which matches the CUDA plugin Colab ships.
+The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install the CUDA 13 plugin, which replaces the one Colab ships.
 
 On NVIDIA hardware, check that JAX lists a CUDA device before you run a GPU example. Dew can use cuDNN attention for the GPU shapes and dtypes that support it, but whether it is available depends on your JAX and CUDA install. A TPU needs its own runtime setup. [The TPU guide](tpu.md) describes Dew's provisioning commands. Creating a cloud resource can cost money, so it is not part of this quickstart.
 
