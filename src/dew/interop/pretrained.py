@@ -2432,11 +2432,13 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     ships no tokenizer.
 
     ``single_file`` names an original-format diffusion checkpoint in the
-    repo or directory (an LDM or SGM `.safetensors`, or BFL's Flux file):
-    diffusers' own key maps convert it once into Dew's cache as the diffusers
-    pipeline it describes (`dew.interop.single_file`), which then loads. The
-    configs are the repo or directory's own when it has a model_index.json,
-    and otherwise the diffusers repo diffusers infers from the checkpoint.
+    repo or directory: diffusers' own key maps convert it once into Dew's
+    cache as the diffusers pipeline it describes (`dew.interop.single_file`),
+    which then loads; the cache entry is published only once that load
+    succeeds. The configs are the repo or directory's own when it has a
+    model_index.json, and otherwise the diffusers repo diffusers infers from
+    the checkpoint, at the commit fetched. A component the file lacks gets
+    its weights from the same place, or is refused by name.
 
     `fallback="torchax"` opts into tier 3 for any causal LM transformers
     can build, registered or not: transformers' PyTorch forward lowered to
@@ -2464,12 +2466,29 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len)
         return replace(loaded, variables=placed(loaded.variables))
+    def diffusion_pipeline(directory: Path) -> Pretrained:
+        with open(directory / "model_index.json") as handle:
+            index = json.load(handle)
+        storage = param_dtype
+        if storage == AUTO:
+            from dew.interop import diffusion
+            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
+            storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
+        loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
+                                        param_dtype=storage)
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+
     if single_file is not None:
         from dew.interop import single_file as original
-        # A directory that describes the pipeline (model_index.json and its
-        # component configs) is the configs, as from_single_file(config=) takes.
-        local = directory if (directory / "model_index.json").is_file() else None
-        directory = original.unpacked(decoders.repo_file(name_or_dir, directory, single_file), local)
+        # A repo or directory that describes the pipeline (model_index.json
+        # and its component configs) is the configs, as from_single_file(config=)
+        # takes; a Hub repo's are its metadata snapshot, so the weights of a
+        # component the file lacks come from the repo at that commit.
+        configs = directory if (directory / "model_index.json").is_file() else None
+        hub = None if configs is None or commit is None else (str(name_or_dir), commit)
+        with original.unpacked(decoders.repo_file(name_or_dir, directory, single_file), configs, hub) as (
+                converted, published):
+            return replace(diffusion_pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
         # A latent diffusion pipeline is a directory of components with no
         # model of its own; a decoder that also ships a pipeline index for its
@@ -2477,18 +2496,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         with open(directory / "model_index.json") as handle:
             index = json.load(handle)
         # The metadata fetch returns its commit directory, so the weights
-        # come from that commit even if the requested branch moves; a
-        # converted single file holds them already.
-        if single_file is None:
-            directory = decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
-                name for name in index if _present(index, name)))
-        if param_dtype == AUTO:
-            from dew.interop import diffusion
-            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            param_dtype = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
-        loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
-                                        param_dtype=param_dtype)
-        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+        # come from that commit even if the requested branch moves.
+        return diffusion_pipeline(decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
+            name for name in index if _present(index, name))))
     tensors = None
     gguf_path = None if gguf_file is None else decoders.repo_file(name_or_dir, directory, gguf_file)
     if gguf_path is not None:
