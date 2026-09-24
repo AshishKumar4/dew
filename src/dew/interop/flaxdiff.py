@@ -93,10 +93,15 @@ def flaxdiff_weights(tree: Mapping, *, ema: bool = True, best: bool = False) -> 
 
 def fourier_table(features: int, jax_version: str, scale: float = 16) -> np.ndarray:
     """The frequencies FlaxDiff's FourierEmbedding drew under `jax_version`,
-    `jax.random.normal(PRNGKey(42), (features // 2,)) * scale`.
+    `jax.random.normal(PRNGKey(42), (features // 2,)) * scale`, drawn on the
+    backend this runs on.
 
     jax 0.5.0 made the partitionable threefry stream the default, which
     changed every draw; a run's own `requirements.txt` names its version.
+    The stream's bits are the same on every backend, but the normal
+    transform (`erf_inv`) rounds its last bit the backend's way, so a table
+    drawn on a GPU can differ from a CPU's by an ulp in an entry, as
+    FlaxDiff's own draw followed the device the run trained on.
     """
     release = tuple(int(part) for part in jax_version.split(".")[:2])
     with jax.threefry_partitionable(release >= (0, 5)):
