@@ -1870,14 +1870,17 @@ def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nda
                      "float16 tensor in the checkpoint")
 
 
-def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None, *,
-                     dtype: str, attention_impl: str, param_dtype: str) -> Pretrained | None:
+def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
+                     placed: Callable[[Variables], Variables], *, dtype: str, attention_impl: str,
+                     param_dtype: str) -> Pretrained | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
 
     A single file converts into the pipeline it describes; a directory with
     a model_index.json and no config.json of its own is one. A decoder that
     also ships a pipeline index for its sampler (DiffusionGemma) is loaded as
-    the decoder its config names."""
+    the decoder its config names. `placed` puts the pipeline's variables on
+    the mesh; a single file's conversion is kept only once that succeeds too.
+    """
 
     def pipeline(directory: Path) -> Pretrained:
         with open(directory / "model_index.json") as handle:
@@ -1889,7 +1892,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
             storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
         loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
                                         param_dtype=storage)
-        return replace(loaded, revision=commit)
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
     if single_file is not None:
         from dew.interop import single_file as original
@@ -1928,6 +1931,7 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
         config = records.record(json.load(handle), "config.json")
+    # A GGUF file holds no kimi_k25 wrapper, so only a config.json can carry this.
     text_config = config.get("text_config")
     if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
             and text_config.get("quantization_config") is not None):
@@ -2118,10 +2122,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len)
         return replace(loaded, variables=placed(loaded.variables))
-    pipeline = _pipeline_source(name_or_dir, directory, commit, single_file, dtype=dtype,
+    pipeline = _pipeline_source(name_or_dir, directory, commit, single_file, placed, dtype=dtype,
                                 attention_impl=attention_impl, param_dtype=param_dtype)
     if pipeline is not None:
-        return replace(pipeline, variables=placed(pipeline.variables))
+        return pipeline
     gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
     config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     mamba_ssm = mamba2.is_mamba_ssm(config)

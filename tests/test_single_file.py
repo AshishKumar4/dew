@@ -122,6 +122,22 @@ def test_a_failed_load_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: 
     assert [entry.name.startswith(".") for entry in cache.iterdir()] == [False]
 
 
+def test_a_failed_placement_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Placing the pipeline on the mesh is part of the load: a placement that
+    fails (a device out of memory, a layout refusal) keeps no conversion."""
+    from dew.training.distributed import MeshSpec
+
+    repo = _repo(tmp_path, "sd")
+
+    def refused(*args: object, **kwargs: object) -> None:
+        raise MemoryError("device out of memory")
+
+    monkeypatch.setattr(pretrained, "place", refused)
+    with pytest.raises(MemoryError):
+        load_pretrained(repo, single_file="sd.safetensors", dtype="float32", param_dtype="auto", mesh=MeshSpec())
+    assert list(cache.iterdir()) == []
+
+
 def _without_vae(tmp_path: Path, vae_weights: bool) -> Path:
     """The SD fixture's file without its VAE, beside configs that hold the
     VAE's diffusers weights or, like a Hub repo's metadata snapshot, none."""
