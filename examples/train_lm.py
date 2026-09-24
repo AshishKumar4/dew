@@ -1,5 +1,7 @@
 """Train a byte-level language model on a directory of token files, then generate.
 
+    curl -o data/shakespeare.txt --create-dirs \\
+        https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
     python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
@@ -55,9 +57,11 @@ def main(config: Config):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    # No reload is needed; the averaged weights
-    # stay where the trainer placed them, and the tokenizer decodes the rows.
-    task = objective.pipeline(state, processor=RunProcessor(tokenizer))
+    # No reload is needed; the weights stay where the trainer placed them, and
+    # the tokenizer decodes the rows. Four epochs of tiny Shakespeare are 268
+    # steps, after which a 0.999 average is still three quarters the
+    # initialization, so the sample comes from the live weights.
+    task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
     text = config.prompt + task(config.prompt, seed=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)

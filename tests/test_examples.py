@@ -121,7 +121,10 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
 
 
 @pytest.mark.mesh
-def test_train_lm_example_trains_and_generates(tmp_path):
+def test_train_lm_example_samples_what_it_trained(tmp_path):
+    """A short run's sample continues the corpus it learned. Sixty steps
+    learn the alternation of one repeated pair, while a 0.999 average of
+    those steps is still nine tenths the initialization and draws noise."""
     tokens = tmp_path / "tokens"
     tokens.mkdir()
     text = ("ab" * 2000).encode()
@@ -130,15 +133,14 @@ def test_train_lm_example_trains_and_generates(tmp_path):
     (tokens / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
     example = load_example("train_lm")
-    config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=3,
-                            model=dict(emb_features=16, num_layers=1, num_heads=2),
+    config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
+                            learning_rate=1e-2, model=dict(emb_features=16, num_layers=1, num_heads=2),
                             prompt="ab", sample_tokens=8, out=tmp_path / "run")
 
     state = example.main(config)
 
-    assert int(state.step) == 3
-    sample = (tmp_path / "run" / "sample.txt").read_text()
-    assert sample.startswith("ab") and len(sample) > 2
+    assert int(state.step) == 60
+    assert (tmp_path / "run" / "sample.txt").read_text() == "ab" * 5
 
 
 # ---------------------------------------------------------------------------------

@@ -5,10 +5,12 @@ checkpoints, and a different objective. The data is not images but the
 `train.bin` / `val.bin` / `meta.json` a tokenizer run wrote, so the recipe
 takes the vocabulary from the data, not the command line.
 
-    python tools/tokenize_text.py --input data/shakespeare.txt \
+    curl -o data/shakespeare.txt --create-dirs \\
+        https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+    python tools/tokenize_text.py --input data/shakespeare.txt \\
         --out data/shakespeare-byte --tokenizer byte
-    python recipes/lm/train.py --data.path data/shakespeare-byte \
-        --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \
+    python recipes/lm/train.py --data.path data/shakespeare-byte \\
+        --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \\
         --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}'
 
 `data:packed-tokens` packs whole documents into the windows instead.

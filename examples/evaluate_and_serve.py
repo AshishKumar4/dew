@@ -1,7 +1,7 @@
 """Score a finished run four ways, then compare it against a served model.
 
 Perplexity over held-out tokens, an lm-evaluation-harness suite, greedy
-continuations, and — for a diffusion run — FID and CLIPScore of a sampled
+continuations, and, for a diffusion run, FID and CLIPScore of a sampled
 grid against a reference set. Everything is read through `dew.pipeline`, so
 a run directory, a published checkpoint and a Hub repository all work.
 
