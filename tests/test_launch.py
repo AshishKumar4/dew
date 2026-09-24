@@ -280,7 +280,11 @@ def test_a_slurm_placement_that_leaves_gpus_idle_is_refused(variables, arguments
 
 def fake_srun(tmp_path: Path) -> dict:
     """An allocation's environment whose `srun` records its arguments and
-    the variables it would hand its tasks, in place of Slurm's."""
+    the variables it would hand its tasks, in place of Slurm's: four GPUs
+    and a jax that runs on them. Every source the launcher counts GPUs from
+    is set here, so the lane the tests run on decides nothing: the CPU
+    lane's JAX_PLATFORMS=cpu would keep a pool off the GPUs, and a GPU
+    lane's SLURM_* or visible devices would count its own."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     srun = bin_dir / "srun"
@@ -290,7 +294,7 @@ def fake_srun(tmp_path: Path) -> dict:
     srun.chmod(0o755)
     env = {name: value for name, value in ENV.items() if not name.startswith("SLURM_")}
     return {**env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_JOB_ID": "77",
-            "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+            "JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
 
 
 def test_srun_runs_a_task_per_gpu_and_receives_values_with_commas_whole(tmp_path):
