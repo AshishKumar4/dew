@@ -189,11 +189,21 @@ def test_the_quantizers_pass_their_gradient_straight_through():
     for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, True)):
         np.testing.assert_array_equal(jax.grad(lambda v: jnp.sum(quant(v) * v))(x),
                                       quant(x) + x)
-    # bf16 input whose E4M3 scale saturates: the forward value is the
-    # rounded one exactly, not a bf16 re-rounding of the correction
-    big = jnp.asarray([[1e4] + [3.0] * 15], jnp.bfloat16)
-    rounded = fake_quant_fp4(big.astype(jnp.float32), 16, True).astype(jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(fake_quant_fp4(big, 16, True)), np.asarray(rounded))
+
+
+def test_a_value_far_past_the_clamp_reads_back_as_what_it_rounds_to():
+    """A block led by 1e5 or 1e10 saturates its E4M3 scale at 448, so the lead
+    stores the largest code, 6 * 448 = 2688, and the 3.0s store 0; compiled,
+    that is the forward value in either dtype. `x + (rounded - x)` rounds
+    the correction when x is far from what it rounds to: summed in bf16 it
+    gives 2560 for 1e5, summed in fp32 3072 for 1e10."""
+    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, True))
+    for dtype in (jnp.bfloat16, jnp.float32):
+        big = jnp.asarray([[lead] + [3.0] * 15 for lead in (1e5, 1e10)], dtype)
+        expected = np.zeros(big.shape, np.float32)
+        expected[:, 0] = 6 * 448
+        np.testing.assert_array_equal(np.asarray(quantize(big), np.float32), expected,
+                                      err_msg=jnp.dtype(dtype).name)
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():
