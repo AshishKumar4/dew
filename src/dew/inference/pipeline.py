@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from etils import epath
-from flax.core import FrozenDict
 
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -153,15 +152,14 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
 
 
 def _updatable(tree: Variables) -> Variables:
-    """`tree` with each frozen node rebuilt as a dict over the same children;
-    its dict nodes stay the same objects, so `stream` still updates them."""
-    if isinstance(tree, FrozenDict):
-        tree = dict(tree)
-    if isinstance(tree, dict):
-        for name, child in tree.items():
-            if isinstance(child, Mapping):
-                tree[name] = _updatable(child)
-    return tree
+    """`tree` with each node that is not a plain dict (a FrozenDict) rebuilt
+    as one over the same children; its dict nodes stay the same objects, so
+    `stream` still updates them in place."""
+    rebuilt: dict[str, object] = tree if type(tree) is dict else dict(tree)
+    for name, child in rebuilt.items():
+        if isinstance(child, Mapping):
+            rebuilt[name] = _updatable(child)
+    return rebuilt
 
 
 class RunTokenizer(Protocol):

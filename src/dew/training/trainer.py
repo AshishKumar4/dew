@@ -207,14 +207,35 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
             or xla_flag('xla_gpu_enable_triton_gemm') is not None):
         return None
-    model = getattr(objective, 'model', None)
-    if model is None:
-        return None
-    mixers = [getattr(model, 'mixer', None)]
-    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
-    if any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers):
+    model = _model_of(objective)
+    if model is None or _keeps_triton_gemm(model):
         return None
     return {'xla_gpu_enable_triton_gemm': False}
+
+
+def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
+    """The one module an objective trains, or None. `Objective` declares no
+    model, since some train none (JEPA's pair, the RL actors' wrappers), so
+    the trainer reads it at this boundary: LM, diffusion and masked
+    objectives name theirs `model`."""
+    return getattr(objective, 'model', None)
+
+
+def _keeps_triton_gemm(model: nn.Module) -> bool:
+    """Whether a mixer of the model keeps XLA's Triton GEMM fusions
+    (`MixerBase.keeps_triton_gemm`). Any flax module arrives here, so its
+    mixer fields are read at this boundary: a decoder names its mixer and its
+    layer kinds', and a model without them keeps no mixer."""
+    mixers = [getattr(model, 'mixer', None)]
+    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
+    return any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers)
+
+
+def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
+    """The model's remat setting, read at the boundary with any flax module:
+    a decoder's `RematPolicy`, a diffusion backbone's bool or name, and
+    None for a model with no remat field."""
+    return getattr(model, 'remat', None)
 # What a model recomputes in its backward pass when its step does not fit,
 # weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
 # jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
@@ -303,10 +324,12 @@ def recompute_more(objective) -> bool:
         print(colored(f"the step does not fit the devices with the whole logits kept; "
                       f"compiling it again with {moved}", "yellow"), file=sys.stderr)
         return True
-    model = getattr(objective, 'model', None)
+    model = _model_of(objective)
     if model is None:
         return False
-    current = getattr(model, 'remat', ...)
+    # A decoder always has a remat field; any other model climbs only a
+    # bool or named policy, so a missing field and None both stay put.
+    current = _remat_of(model)
     ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
               else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
     current = 'dots' if current is True else current
@@ -1291,9 +1314,8 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-            model = getattr(self.objective, 'model', None)
             self._report(StepCompiled(time.perf_counter() - began,
-                                      remat_record(getattr(model, 'remat', None)),
+                                      remat_record(_remat_of(_model_of(self.objective))),
                                       self._tensor_bandwidths.get(self.device_mesh), self.tensor_spread),
                          int(state.step))
         return compiled[shapes]
