@@ -42,6 +42,7 @@ from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
+from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.inference.tasks import TextGeneration, _ceiling
 from dew.objectives.likelihood import token_log_probs
@@ -49,6 +50,9 @@ from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
+
+DEFAULT_BUDGET = 256
+"""The generation budget of a request that names none, `HFLM.max_gen_toks`."""
 
 TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
@@ -91,8 +95,8 @@ class DewLM(TemplateLM):
 
     Likelihoods are exact: the model's log-softmax at the continuation's own
     targets, summed. Generation is greedy unless a request's `gen_kwargs`
-    ask for a temperature, which is the harness's own default and what a
-    suite's reported numbers assume.
+    ask for sampling with a temperature, as `HFLM` reads them, which is the
+    harness's own default and what a suite's reported numbers assume.
     """
 
     def __init__(self, task: TextGeneration, *, batch_size: int = 1) -> None:
@@ -274,20 +278,32 @@ class DewLM(TemplateLM):
     def generate_until(self, requests: list[Instance], disable_tqdm: bool = False) -> list[str]:
         """Continue each context until one of its stop strings or its budget.
 
+        A request is read as `HFLM.generate_until` reads it, through
+        lm-eval's own helpers: `normalize_gen_kwargs` takes the budget under
+        any of its names and makes `do_sample=False` greedy whatever the
+        temperature, the EOS token's text joins the stop strings, and a
+        context longer than the window less the budget keeps its last ids.
         The stop strings cut the decoded text, so a sequence that spans two
         tokens ends the answer the way the harness expects it to.
         """
+        del disable_tqdm
+        eos = None if self.task.sampling.eos_id in (None, ()) else self.tok_decode([self.eot_token_id])
         answers = []
         for request in requests:
             arguments = list(request.args)
-            context, controls = str(arguments[0]), dict(arguments[1])
-            until = controls.get("until") or []
-            stops = [until] if isinstance(until, str) else [str(entry) for entry in until]
+            context, raw = str(arguments[0]), dict(arguments[1])
+            # normalize_gen_kwargs sets the budget and the stop strings; the
+            # type leaves every key optional.
+            controls = normalize_gen_kwargs(raw, DEFAULT_BUDGET)
+            budget = controls.get("max_gen_toks", DEFAULT_BUDGET)
+            if budget >= self.max_length:
+                raise ValueError(
+                    f"a budget of {budget} ids leaves no room for a context in this model's "
+                    f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
+            ids = self.tok_encode(context)[-(self.max_length - budget):]
             sampling = Sampling(temperature=float(controls.get("temperature", 0.0)),
                                 eos_id=self.task.sampling.eos_id)
-            drawn = self.task(context, int(controls.get("max_gen_toks", 256)),
-                              seed=int(controls.get("seed", 0)), sampling=sampling)
-            text = self.task.decode(drawn)[0]
-            cuts = [text.index(stop) for stop in stops if stop and stop in text]
-            answers.append(text[:min(cuts)] if cuts else text)
+            drawn = self.task([ids], budget, seed=int(raw.get("seed", 0)), sampling=sampling)
+            stops = handle_stop_sequences(controls.get("until"), eos=eos)
+            answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
         return answers
