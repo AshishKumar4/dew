@@ -13,6 +13,7 @@ compiles on CPU in seconds.
 import dataclasses
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -39,10 +40,13 @@ VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
 
 
 def load(name: str):
-    """tools/ holds scripts, not a package, so a tool is loaded from its file."""
+    """tools/ holds scripts, not a package, so a tool is loaded from its file,
+    registered as the Python docs' recipe for a source file does: a
+    dataclass looks its module up while the module executes."""
     spec = importlib.util.spec_from_file_location(
         f"{name}_under_test", REPO_ROOT / "tools" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -314,8 +318,39 @@ def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_
 
     errors = tool.leaf_errors(reference, moved, "float32")
 
-    assert errors["['weight']"] == pytest.approx(1e-6, rel=1e-6)
-    assert errors["['scale']"] == pytest.approx(2e-9 / (tool.rounding_limit("float32") * 10), rel=1e-6)
+    assert errors["weight"] == pytest.approx(1e-6, rel=1e-6)
+    assert errors["scale"] == pytest.approx(2e-9 / (tool.rounding_limit("float32") * 10), rel=1e-6)
+
+
+def test_layout_parity_reads_a_prepared_reference_and_computes_none(tmp_path, monkeypatch):
+    """A run of layouts holds every device of its job, and its reference
+    side (one device's step, the permutation floor, the fp64 anchor) left
+    the others idle while it ran. `--prepare` writes each reference into
+    --references in a job of one device; a run of layouts reads it back and
+    computes none, and refuses one it would have to compute. A reference of
+    other steps is another reference."""
+    tool = load("layout_parity")
+    import benchmark_step
+
+    case = tool.zoo()["dense"]
+    batch = benchmark_step.global_batch(case)
+    computed = tool.Reference(losses=[6.2, 6.1], gradient={"['w']": np.array([1.0, -2.5, 3e-9])},
+                              flops_per_device=1.5e9, floors={"['w']": 2e-7}, loss_floor=4e-7)
+    monkeypatch.setattr(tool, "computed_reference", lambda *arguments: computed)
+    with pytest.raises(FileNotFoundError, match="--prepare"):
+        tool.References(tmp_path).reference(case, batch, 3)
+
+    tool.References(tmp_path, prepare=True).reference(case, batch, 3)
+    monkeypatch.setattr(tool, "computed_reference",
+                        lambda *arguments: pytest.fail("a prepared reference was computed again"))
+    read = tool.References(tmp_path).reference(case, batch, 3)
+
+    assert (read.losses, read.flops_per_device, read.floors, read.loss_floor) == (
+        computed.losses, computed.flops_per_device, computed.floors, computed.loss_floor)
+    assert read.gradient.keys() == computed.gradient.keys()
+    np.testing.assert_array_equal(read.gradient["['w']"], computed.gradient["['w']"])
+    with pytest.raises(FileNotFoundError, match="--prepare"):
+        tool.References(tmp_path).reference(case, batch, 2)
 
 
 # ---------------------------------------------------------------------------

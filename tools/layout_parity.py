@@ -29,10 +29,24 @@ a reassociation of its step. Its floor is data parallelism over every device
 instead, the layout that splits the batch sum and nothing else; the
 next-token models check that layout against the permutation floor.
 
+The reference side (the one-device step, its permutation floor and the fp64
+anchor) runs on one device while the others wait. With `--references DIR`,
+`--prepare` computes each model's reference and anchor into DIR in a job of
+one device, and a run of layouts reads them back and computes none; a
+missing one is refused, naming `--prepare`. A reference is keyed by all its
+numbers depend on: the case, the batch, the steps, the device kind and
+backend that ran it, jax, x64 and Dew's source. The fp64 anchor rounds
+nowhere a device's kind shows, so it is keyed without one, and any machine
+may compute it. A model whose noise is drawn per row takes its floor from
+data parallelism over the run's own devices, which the run of layouts
+computes.
+
 The same command runs in one process or under `dew launch`, where the global
 batch is placed from every process alike:
 
     python tools/layout_parity.py --models dense --layouts data4,fsdp4,tensor4
+    python tools/layout_parity.py --models dense moe --references refs --prepare  # one device
+    python tools/layout_parity.py --models dense moe --references refs              # every device
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
         --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' --objective '{"aux_loss_alpha": 0.01}'
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
@@ -45,15 +59,21 @@ nonzero when a layout mismatches or fails.
 from __future__ import annotations
 
 import dataclasses
+import functools
+import hashlib
 import json
+import os
 import sys
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import tyro
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
@@ -208,39 +228,38 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     return trainer
 
 
-def _gradient(state):
-    """The gradient the optimizer was handed, whole on every process. A
-    one-device reference's leaves are already whole where they are, and
-    gathering those would stack every process's copy."""
+def _gradient(state) -> dict[str, NDArray]:
+    """The gradient the optimizer was handed, whole on every process, by leaf
+    name. A one-device reference's leaves are already whole where they are,
+    and gathering those would stack every process's copy."""
     import jax
     import numpy as np
     from jax.experimental import multihost_utils
 
-    return jax.tree.map(
-        lambda leaf: np.asarray(leaf if leaf.is_fully_addressable
-                                else multihost_utils.process_allgather(leaf, tiled=True)),
-        state.opt_state[0]["gradient"])
+    return {jax.tree_util.keystr(path): np.asarray(
+        leaf if leaf.is_fully_addressable else multihost_utils.process_allgather(leaf, tiled=True))
+        for path, leaf in jax.tree_util.tree_flatten_with_path(state.opt_state[0]["gradient"])[0]}
 
 
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False
-            ) -> tuple[list[float], Any, dict[str, Any]]:
+            ) -> tuple[list[float], dict[str, NDArray], dict[str, Any]]:
     """The losses of `steps` steps on the layout `fields` names, step one's
     gradient gathered whole, and what the compiler says of the step."""
     trainer = _trainer(case, fields, one_device=one_device)
     state, _, _ = trainer.place()
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
-    losses, gradient = [], None
+    losses, gradient = [], {}
     for _ in range(steps):
         state, loss, _, _, _ = step(state, data)
         losses.append(float(loss))
-        gradient = _gradient(state) if gradient is None else gradient
+        gradient = gradient or _gradient(state)
     compiled = {"flops_per_device": trainer.flops_per_step,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
     return losses, gradient, compiled
 
 
-def pooled(case, batches, pieces: int) -> list[tuple[float, Any]]:
+def pooled(case, batches, pieces: int) -> list[tuple[float, dict[str, NDArray]]]:
     """Step one's loss and gradient on one device for each batch, each pooled
     from `pieces` consecutive slices of its rows by accumulation, from one
     initial state through one compiled step."""
@@ -263,10 +282,11 @@ def pooled(case, batches, pieces: int) -> list[tuple[float, Any]]:
     return results
 
 
-def leaf_errors(reference, other, dtype: str) -> dict[str, float]:
+def leaf_errors(reference: Mapping[str, NDArray], other: Mapping[str, NDArray],
+                dtype: str) -> dict[str, float]:
     """Each leaf's L2 distance from the reference over the reference leaf's
     norm, or over the compute dtype's rounding of the whole gradient's norm
-    where the leaf is smaller than that.
+    where the leaf is smaller than that. Both hold the same leaves by name.
 
     A leaf's reassociation error scales with its terms, not with their sum,
     and a leaf whose terms cancel has a gradient below the rounding of the
@@ -276,12 +296,12 @@ def leaf_errors(reference, other, dtype: str) -> dict[str, float]:
     is measured against what rounding the whole step moves instead; every
     other leaf is measured against itself.
     """
-    import jax
     import numpy as np
 
-    pairs = [(jax.tree_util.keystr(path), np.asarray(want, np.float64), np.asarray(got, np.float64))
-             for (path, want), got in zip(jax.tree_util.tree_flatten_with_path(reference)[0],
-                                          jax.tree.leaves(other), strict=True)]
+    if reference.keys() != other.keys():
+        raise ValueError(f"the gradients hold different leaves: {sorted(reference.keys() ^ other.keys())[:6]}")
+    pairs = [(name, np.asarray(want, np.float64), np.asarray(other[name], np.float64))
+             for name, want in reference.items()]
     noise = rounding_limit(dtype) * float(np.sqrt(sum(np.sum(want ** 2) for _, want, _ in pairs)))
     return {name: float(np.linalg.norm(got - want) / max(float(np.linalg.norm(want)), noise))
             for name, want, got in pairs}
@@ -298,12 +318,21 @@ def strided(batch, pieces: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, float], float]:
+def data_parallel_floor(case, batch, reference: Mapping[str, NDArray],
+                        reference_loss: float) -> tuple[dict[str, float], float]:
+    """Per leaf, the deviation from the reference of data parallelism over
+    every device of the run, the layout that splits the batch sum and
+    nothing else, and the same of the step-one loss: the floor of an
+    objective that draws noise per row, which no reordering of rows keeps."""
+    losses, gradient, _ = trained(case, {}, batch, steps=1)
+    return leaf_errors(reference, gradient, case.dtype), abs(losses[0] - reference_loss)
+
+
+def permutation_floor(case, batch, reference: Mapping[str, NDArray],
+                      reference_loss: float) -> tuple[dict[str, float], float]:
     """Per leaf, the largest deviation of the reference from itself under a
-    reassociation of the batch's sums, and the same of the step-one loss."""
-    if not reassociates(case):
-        losses, gradient, _ = trained(case, {}, batch, steps=1)
-        return leaf_errors(reference, gradient, case.dtype), abs(losses[0] - reference_loss)
+    reassociation of the batch's sums, and the same of the step-one loss,
+    on the reference's own device."""
     runs = pooled(case, [reordered(batch, seed) for seed in range(PERMUTATIONS)], 1)
     loss = max(abs(moved - reference_loss) for moved, _ in runs)
     for pieces in (2, 4):
@@ -315,15 +344,15 @@ def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, floa
     return leaves, loss
 
 
-def exact(case, reference_gradient) -> dict[str, float]:
-    """Each leaf's distance, relative to the fp64 gradient, of the fp32
-    reference's step one from the same step in fp64: the model built with no
+def anchor_gradient(case, batch) -> dict[str, NDArray]:
+    """Step one's gradient in fp64 by leaf name: the model built with no
     dtype of its own, on the reference's own initial variables widened to
     fp64. The trainer draws those from its key's first split, so they come
     from the trainer, not from the objective's `init` on the key itself."""
     import benchmark_step as bench
     import jax
     import jax.numpy as jnp
+    import numpy as np
 
     from dew.objectives.base import Step, scalar_loss
     from dew.registry import models
@@ -337,8 +366,141 @@ def exact(case, reference_gradient) -> dict[str, float]:
     def loss(params, batch):
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
 
-    gradient = jax.jit(jax.grad(loss))(wide["params"], bench.global_batch(case))
-    return leaf_errors(gradient, reference_gradient, case.dtype)
+    gradient = jax.jit(jax.grad(loss))(wide["params"], batch)
+    return {jax.tree_util.keystr(path): np.asarray(leaf)
+            for path, leaf in jax.tree_util.tree_flatten_with_path(gradient)[0]}
+
+
+@dataclasses.dataclass(frozen=True)
+class Reference:
+    """A model's step on one device, which its layouts are judged against:
+    the step losses, step one's gradient by leaf name and the FLOPs of the
+    device, and, where reordering the batch only reassociates the step, each
+    leaf's floor and the loss's (`permutation_floor`)."""
+
+    losses: list[float]
+    gradient: dict[str, NDArray]
+    flops_per_device: float | None
+    floors: dict[str, float] | None
+    loss_floor: float | None
+
+
+def computed_reference(case, batch, steps: int) -> Reference:
+    """The reference of `case`, computed on this process's first device."""
+    losses, gradient, compiled = trained(case, {}, batch, steps=steps, one_device=True)
+    floors, loss_floor = (permutation_floor(case, batch, gradient, losses[0]) if reassociates(case)
+                          else (None, None))
+    return Reference(losses, gradient, compiled["flops_per_device"], floors, loss_floor)
+
+
+@functools.cache
+def source_digest() -> str:
+    """The Dew this process imported and the tools that build and judge a
+    reference, wherever each was imported from."""
+    import benchmark_step
+
+    import dew
+
+    package = Path(dew.__file__).parent
+    files = [(str(path.relative_to(package)), path) for path in sorted(package.glob("**/*.py"))]
+    files += [(f"tools/{Path(tool).name}", Path(tool)) for tool in (benchmark_step.__file__, __file__)]
+    digest = hashlib.sha256()
+    for name, path in files:
+        digest.update(name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _cache_name(kind: str, case, batch, **parts: object) -> tuple[str, dict[str, Any]]:
+    """The file a cached `kind` of `case` is kept in, and what it depends on."""
+    import importlib.metadata
+
+    import jax
+    import numpy as np
+
+    digest = hashlib.sha256()
+    for leaf in jax.tree.leaves(batch):
+        array = np.ascontiguousarray(leaf)
+        digest.update(f"{array.dtype}{array.shape}".encode())
+        digest.update(array.tobytes())
+    inputs = {"case": dataclasses.asdict(case), "batch": digest.hexdigest(), "jax": jax.__version__,
+              "jaxlib": importlib.metadata.version("jaxlib"), "x64": jax.config.jax_enable_x64,
+              "source": source_digest(), **parts}
+    name = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:24]
+    return f"{kind}-{name}.npz", inputs
+
+
+def _write(path: Path, arrays: Mapping[str, NDArray], meta: dict[str, Any]) -> None:
+    """`arrays`, widened to fp64 (exactly), and `meta` in one file, written
+    whole or not at all."""
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}")
+    with partial.open("wb") as file:
+        # Stored as arr_0 (the metadata), arr_1, ... in the names' order.
+        np.savez(file, np.array(json.dumps({**meta, "names": list(arrays)})),
+                 *[np.asarray(array, np.float64) for array in arrays.values()])
+    partial.replace(path)
+
+
+def _read(path: Path) -> tuple[dict[str, NDArray], dict[str, Any]]:
+    import numpy as np
+
+    with np.load(path) as stored:
+        meta = json.loads(str(stored["arr_0"]))
+        return {name: stored[f"arr_{index}"] for index, name in enumerate(meta["names"], start=1)}, meta
+
+
+@dataclasses.dataclass(frozen=True)
+class References:
+    """Where a model's reference and fp64 anchor come from: computed here,
+    or, with a `directory`, read from the files a `prepare` run wrote there;
+    see the module docstring."""
+
+    directory: Path | None = None
+    prepare: bool = False
+
+    def reference(self, case, batch, steps: int) -> Reference:
+        if self.directory is None:
+            return computed_reference(case, batch, steps)
+        import jax
+        from jax.extend import backend
+
+        path, inputs = self._path("reference", case, batch, steps=steps,
+                                  device=jax.local_devices()[0].device_kind,
+                                  backend=backend.get_backend().platform_version)
+        if path.exists():
+            gradient, meta = _read(path)
+            return Reference(meta["losses"], gradient, meta["flops_per_device"], meta["floors"],
+                             meta["loss_floor"])
+        computed = computed_reference(case, batch, steps)
+        _write(path, computed.gradient, {
+            "inputs": inputs, "losses": computed.losses, "flops_per_device": computed.flops_per_device,
+            "floors": computed.floors, "loss_floor": computed.loss_floor})
+        return computed
+
+    def anchor(self, case, batch) -> dict[str, NDArray]:
+        if self.directory is None:
+            return anchor_gradient(case, batch)
+        path, inputs = self._path("anchor", case, batch)
+        if path.exists():
+            return _read(path)[0]
+        computed = anchor_gradient(case, batch)
+        _write(path, computed, {"inputs": inputs})
+        return computed
+
+    def _path(self, kind: str, case, batch, **parts: object) -> tuple[Path, dict[str, Any]]:
+        """The cached `kind`'s file, refused where a run of layouts would
+        have to compute it."""
+        assert self.directory is not None
+        name, inputs = _cache_name(kind, case, batch, **parts)
+        path = self.directory / name
+        if not self.prepare and not path.exists():
+            raise FileNotFoundError(
+                f"no {kind} of this case in {self.directory} ({name}); compute it first with "
+                f"--prepare in a job of one device")
+        return path, inputs
 
 
 def rounding_limit(dtype: str) -> float:
@@ -379,9 +541,51 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
             "status": "works" if ratios[worst] <= 1.0 and loss <= loss_bound else "MISMATCH"}
 
 
+def model_case(model: str, dtype: str, mixture: dict[str, Any], objective: dict[str, Any]):
+    """`model`'s zoo case in `dtype`, with the flags' mixture and objective
+    keywords merged in, and the case its one-device reference runs: the
+    exchange needs an expert axis, so one device computes the same layer
+    through the global dispatch."""
+    case = dataclasses.replace(zoo()[model], dtype=dtype)
+    if mixture:
+        if "mixture" not in case.config:
+            raise ValueError(f"{model} has no mixture for --mixture to change")
+        case = dataclasses.replace(case, config={
+            **case.config, "mixture": {**case.config["mixture"], **mixture}})
+    case = dataclasses.replace(case, objective={**case.objective, **objective})
+    reference = case if case.config.get("mixture", {}).get("dispatch") != "exchange" else (
+        dataclasses.replace(case, config={
+            **case.config, "mixture": {**case.config["mixture"], "dispatch": "global"}}))
+    return case, reference
+
+
+def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mixture: dict[str, Any],
+             objective: dict[str, Any], references: References, speak: Callable[[str], None]) -> bool:
+    """Each model's reference, and with `anchor` its fp64 anchor, computed
+    into `references` where missing; whether every model's is there."""
+    import benchmark_step as bench
+
+    whole = True
+    for model in models:
+        started = time.perf_counter()
+        try:
+            case, reference = model_case(model, dtype, mixture, objective)
+            batch = bench.global_batch(case)
+            judge = references.reference(reference, batch, steps)
+            if anchor and reassociates(reference):
+                references.anchor(reference, batch)
+        except Exception as error:  # the other models' references are still worth keeping
+            whole = False
+            speak(f"[{model}] reference error {type(error).__name__}: {error}"[:400])
+            continue
+        floor = "" if judge.floors is None else f", largest floor {max(judge.floors.values()):.2e}"
+        speak(f"[{model}] reference losses {judge.losses}{floor}, {time.perf_counter() - started:.0f} s")
+    return whole
+
+
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
-        mixture: dict[str, Any], objective: dict[str, Any], speak: Callable[[str], None],
-        keep: Callable[[list[dict[str, Any]]], None]) -> list[dict[str, Any]]:
+        mixture: dict[str, Any], objective: dict[str, Any], references: References,
+        speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None]) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
     far after each. A reference and a layout run as agreed phases: a failure
     on one process fails that row on every process, or, where the others
@@ -392,29 +596,21 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
 
     from dew.artifacts import agreed
 
-    jax.config.update("jax_default_matmul_precision", "highest")
     rows = []
     for model in models:
-        case = dataclasses.replace(zoo()[model], dtype=dtype)
-        if mixture:
-            if "mixture" not in case.config:
-                raise ValueError(f"{model} has no mixture for --mixture to change")
-            case = dataclasses.replace(case, config={
-                **case.config, "mixture": {**case.config["mixture"], **mixture}})
-        case = dataclasses.replace(case, objective={**case.objective, **objective})
+        case, reference = model_case(model, dtype, mixture, objective)
         batch = bench.global_batch(case)
-        # The exchange needs an expert axis; one device computes the same
-        # layer through the global dispatch.
-        reference = case if case.config.get("mixture", {}).get("dispatch") != "exchange" else (
-            dataclasses.replace(case, config={
-                **case.config, "mixture": {**case.config["mixture"], "dispatch": "global"}}))
         try:
-            ref_losses, ref_gradient, ref_compiled = agreed(
-                f"reference of {model}",
-                lambda: trained(reference, {}, batch, steps=steps, one_device=True))
-            floors, loss_floor = floor(reference, batch, ref_gradient, ref_losses[0])
+            judge = agreed(f"reference of {model}", lambda: references.reference(reference, batch, steps))
+            ref_losses, ref_gradient = judge.losses, judge.gradient
+            if judge.floors is None or judge.loss_floor is None:
+                floors, loss_floor = agreed(f"floor of {model}", lambda: data_parallel_floor(
+                    reference, batch, ref_gradient, ref_losses[0]))
+            else:
+                floors, loss_floor = judge.floors, judge.loss_floor
             if anchor and reassociates(reference):
-                rounding = exact(reference, ref_gradient)
+                rounding = leaf_errors(agreed(f"anchor of {model}", lambda: references.anchor(reference, batch)),
+                                       ref_gradient, dtype)
                 farthest = max(rounding, key=rounding.__getitem__)
                 if rounding[farthest] > rounding_limit(dtype):
                     raise ValueError(
@@ -444,10 +640,9 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     leaf_errors(ref_gradient, gradient, dtype), floors, abs(losses[0] - ref_losses[0]),
                     loss_floor, ref_losses[0]))
                 devices = jax.device_count()
-                if compiled["flops_per_device"] and ref_compiled["flops_per_device"]:
+                if compiled["flops_per_device"] and judge.flops_per_device:
                     # Above one when devices compute what one device need not.
-                    row["flops_ratio"] = (compiled["flops_per_device"] * devices
-                                          / ref_compiled["flops_per_device"])
+                    row["flops_ratio"] = compiled["flops_per_device"] * devices / judge.flops_per_device
             except Exception as error:  # a failing layout is a row of the matrix
                 row.update(status="error", error=f"{type(error).__name__}: {error}"[:2000],
                            traceback=traceback.format_exc()[-4000:])
@@ -470,6 +665,10 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
              help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
          objective: Annotated[str, tyro.conf.arg(
              help="JSON of LMObjective keywords, e.g. '{\"aux_loss_alpha\": 0.01}'")] = "{}",
+         references: Annotated[Path | None, tyro.conf.arg(
+             help="a directory of references a --prepare run wrote, read instead of computed")] = None,
+         prepare: Annotated[bool, tyro.conf.arg(
+             help="compute each model's missing references into --references and run no layout")] = False,
          ) -> None:
     """Run the layouts of each model against one device; see the module docstring."""
     from dew.training.runtime import prepare_process
@@ -479,14 +678,25 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
 
     if anchor and not jax.config.jax_enable_x64:
         raise SystemExit("--anchor computes the step in fp64, which needs JAX_ENABLE_X64=1")
+    if prepare and (references is None or jax.process_count() > 1):
+        raise SystemExit("--prepare writes the --references directory from one process")
+    jax.config.update("jax_default_matmul_precision", "highest")
     speaker = jax.process_index() == 0
+    store = References(references, prepare)
+    if prepare:
+        if not prepared(models, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
+                        objective=json.loads(objective), references=store,
+                        speak=lambda line: print(line, flush=True)):
+            raise SystemExit(1)
+        return
 
     def keep(rows: list[dict[str, Any]]) -> None:
         if speaker and out is not None:
             out.write_text(json.dumps(rows, indent=1))
 
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
-               objective=json.loads(objective), speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
+               objective=json.loads(objective), references=store,
+               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
     if any(row["status"] != "works" for row in rows):
         raise SystemExit(1)
 
