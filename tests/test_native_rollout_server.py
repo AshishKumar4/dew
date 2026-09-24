@@ -5,6 +5,11 @@ served tree keeps the server's precision; a refused request raises at
 submission and leaves the rest running.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -61,3 +66,27 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
         assert server.submit([4, 5], 3, seed=3).result(timeout=120).prompt == (4, 5)
     finally:
         server.close()
+
+
+def test_a_program_that_ends_with_draws_in_flight_exits_cleanly():
+    """The stepping thread spends its steps inside jaxlib. A program that
+    ended without `close` while draws were in flight left it there when
+    Python finalized, and the process aborted after its last line (SIGABRT,
+    "terminate called ..."). The stepping now stops at exit."""
+    program = (
+        "import jax, jax.numpy as jnp\n"
+        "from dew.inference import NativeRolloutServer, TextGeneration\n"
+        "from dew.inference.serving import Server\n"
+        "from dew.nn.backbones.causal_transformer import CausalTransformer\n"
+        "from dew.sampling import Sampling\n"
+        "model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,\n"
+        "                          mlp_features=32, max_seq_len=512, dtype='float32')\n"
+        "params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))\n"
+        "task = TextGeneration(model, params, None, sampling=Sampling(temperature=1.0))\n"
+        "servers = [NativeRolloutServer(Server.from_task(task, slots=4, capacity=512)) for _ in range(4)]\n"
+        "draws = [server.submit([1, 2, 3], 400, seed=seed) for server in servers for seed in range(64)]\n"
+        "draws[0].result()\n")
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run([sys.executable, "-c", program], cwd=root, capture_output=True, text=True, timeout=300,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    assert done.returncode == 0, done.stdout + done.stderr

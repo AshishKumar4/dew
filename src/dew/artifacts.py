@@ -376,6 +376,30 @@ def withdraw_failure() -> None:
     _client().key_value_delete(FAILURE_KEY)
 
 
+def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *, timeout: float) -> Callable[[], None]:
+    """End `thread` before Python finalizes, and return what withdraws that.
+
+    A thread still inside jaxlib when Python finalizes, its GIL released,
+    comes back to a runtime that ends it with pthread_exit (CPython before
+    3.14), and the unwind through jaxlib's C++ GIL guard aborts a process
+    whose program ran to its end: SIGABRT, "terminate called ...". The exit
+    handler registered here calls `stop`, then waits up to `timeout` seconds
+    for the thread. jax registered its own exit handler when it was
+    imported, and atexit runs the last registered first, so this one runs
+    while jax's clients are still open. An owner that stops the thread
+    itself calls the returned function, so the handler no longer holds it.
+    """
+
+    def finish() -> None:
+        try:
+            stop()
+        finally:
+            thread.join(timeout)
+
+    atexit.register(finish)
+    return lambda: atexit.unregister(finish)
+
+
 def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     """End this process when a failure goes unheard, or when it fails itself.
 
@@ -393,12 +417,8 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     after the pool has formed would otherwise wait in that barrier for peers
     that wait for its devices.
 
-    The watch ends with the program, in an exit handler that runs before
-    jax's: jax registered its own when it was imported, and atexit runs the
-    last registered first. A watch still reading when Python finalizes would
-    come back from jaxlib, GIL released, to a runtime that ends its thread
-    with pthread_exit, and that unwind through jaxlib's GIL guard aborts a
-    process whose program ran to its end (SIGABRT, "terminate called ...").
+    The watch ends with the program (`stop_at_exit`), so it is not reading
+    the coordination service through jaxlib when Python finalizes.
     """
     previous = sys.excepthook
     client = _client()
@@ -437,15 +457,10 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
             os._exit(1)
 
     watcher = threading.Thread(target=watch, name="dew-failure-watch", daemon=True)
-
-    def stop_watching() -> None:
-        stop.set()
-        # Every client leaves the pool's service in jax's handler, after this
-        # one, so the service still answers a read under way within
-        # milliseconds. The bound only keeps an exit from waiting on a service
-        # that stopped answering.
-        watcher.join(timeout=5.0)
-
     sys.excepthook = leave
     watcher.start()
-    atexit.register(stop_watching)
+    # Every client leaves the pool's service in jax's exit handler, after this
+    # one, so the service still answers a read under way within milliseconds.
+    # The bound only keeps an exit from waiting on a service that stopped
+    # answering.
+    stop_at_exit(watcher, stop.set, timeout=5.0)

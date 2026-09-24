@@ -4,8 +4,11 @@ import gc
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import weakref
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -493,3 +496,25 @@ def test_zero_validation_bound_opens_no_source():
         raise AssertionError("zero bound opened its source")
 
     assert list(bounded(unexpected, 0)(DataPartition())) == []
+
+
+def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
+    """The worker places each batch inside jaxlib. A program that ended
+    without `close` left it there when Python finalized, and the process
+    aborted after its last line (SIGABRT, "terminate called ..."). The
+    worker now stops at exit."""
+    program = (
+        "import numpy as np\n"
+        "from dew.training import MeshSpec, build_mesh\n"
+        "from dew.training.distributed import DevicePrefetchIterator\n"
+        "batch = {'x': np.ones((2048, 4096), np.float32)}\n"
+        "def endless():\n"
+        "    while True:\n"
+        "        yield batch\n"
+        "prefetch = DevicePrefetchIterator(endless(), build_mesh(MeshSpec()), depth=1)\n"
+        "for _ in range(20):\n"
+        "    next(prefetch)\n")
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run([sys.executable, "-c", program], cwd=root, capture_output=True, text=True, timeout=300,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    assert done.returncode == 0, done.stdout + done.stderr
