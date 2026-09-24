@@ -77,9 +77,11 @@ def test_a_stacked_transposed_leaf_reads_any_block_as_the_whole_leaf_holds_it():
 
 @pytest.mark.mesh
 def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
-    """Each shard a `HostSource` reads is on its device and released before
-    the next is read, so the host never holds two of a leaf's shards; a
-    placement that read every shard first would hold all eight."""
+    """Each shard a `HostSource` reads is on its device before the next is
+    read, so the host never holds two of a leaf's shards; a placement that
+    read every shard first would hold all eight. On CPU a placed shard may
+    keep the read buffer as its device storage, so a buffer that is some
+    live device array's storage counts as placed, not held."""
     import gc
     import weakref
 
@@ -90,15 +92,17 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
     class Recorded:
         def __init__(self, value: np.ndarray):
             self.value, self.shape, self.ndim = value, value.shape, value.ndim
-            self.held: list[weakref.ref] = []
+            self.reads: list[tuple[weakref.ref, int]] = []
             self.most = 0
 
         def read(self, index):
             gc.collect()
-            self.held = [ref for ref in self.held if ref() is not None]
-            self.most = max(self.most, len(self.held) + 1)
+            placed = {shard.data.unsafe_buffer_pointer() for array in jax.live_arrays()
+                      for shard in array.addressable_shards}
+            held = [ref for ref, address in self.reads if ref() is not None and address not in placed]
+            self.most = max(self.most, len(held) + 1)
             part = np.array(self.value[index])
-            self.held.append(weakref.ref(part))
+            self.reads.append((weakref.ref(part), part.ctypes.data))
             return part
 
         def release(self):
