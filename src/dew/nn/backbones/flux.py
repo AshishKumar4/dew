@@ -15,7 +15,7 @@ the layer norm the MM-DiT family uses; what differs is here.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,13 +23,15 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
 from .sd3 import _FeedForward, _layer_norm, _modulate, _Modulation
+
+if TYPE_CHECKING:
+    from dew.diffusion.process import DenoisingCondition
 
 
 def rotary_table(positions: np.ndarray, axes: Sequence[int], *, theta: float = 10000.0,

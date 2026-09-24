@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
 from dew.registry import models
+
+if TYPE_CHECKING:
+    from dew.diffusion.process import DenoisingCondition
 
 
 @dataclass(frozen=True)

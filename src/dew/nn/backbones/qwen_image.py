@@ -26,7 +26,7 @@ it is batched with.
 from __future__ import annotations
 
 import functools
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +34,6 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
@@ -43,6 +42,9 @@ from dew.registry import models
 from .causal_transformer import GatedMLP
 from .flux import apply_rotary
 from .sd3 import _layer_norm
+
+if TYPE_CHECKING:
+    from dew.diffusion.process import DenoisingCondition
 
 
 def _image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:

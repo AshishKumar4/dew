@@ -20,18 +20,20 @@ values are what the model reads and what export writes back.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.sharding import logical_axes
 from dew.registry import models
+
+if TYPE_CHECKING:
+    from dew.diffusion.process import DenoisingCondition
 
 
 def sincos_position(channels: int, grid: int, *, base_size: int):
