@@ -919,6 +919,7 @@ def test_a_ramp_and_an_accumulation_window_are_refused_together():
                     steps=2, log_every=100)
 
 
+@pytest.mark.mesh
 def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_path):
     """Eight devices hold whole rows, so a stage of four records has nowhere
     to put them; the run says so before it trains rather than an hour in,
@@ -931,6 +932,7 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
                     steps=2, log_every=100)
 
 
+@pytest.mark.mesh
 def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     """A pipelined step cuts its batch into microbatches, which the decoder
     checks when it traces, so a stage a later compile would refuse is
