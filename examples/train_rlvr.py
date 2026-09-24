@@ -280,6 +280,19 @@ def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
     raise TimeoutError(f"{config.backend} did not come up within fifteen minutes") from unanswered
 
 
+def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> NativeRolloutServer:
+    """Dew's own server on a bfloat16 copy of the checkpoint.
+
+    Nothing but the server holds that copy: the first push replaces it, and a
+    reference kept past this call would keep a model's worth of device
+    memory for the whole run.
+    """
+    served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                          else jnp.asarray(leaf), source.variables)
+    return NativeRolloutServer(Server.from_task(TextGeneration(source.model, served, source.processor,
+                                                               sampling=sampling), slots=slots, capacity=capacity))
+
+
 def main(config: Config) -> dict:
     if config.smoke:
         config = replace(config, model=str(SMOKE_MODEL), backend="native", steps=2, prompts=2, groups=2,
@@ -307,11 +320,7 @@ def main(config: Config) -> dict:
                               behavior_importance=2.0, epsilon_high=0.28)
     pushes: list[float] = []
     if config.backend == "native":
-        served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                              else jnp.asarray(leaf), source.variables)
-        engine = Server.from_task(TextGeneration(source.model, served, source.processor, sampling=sampling),
-                                  slots=config.prompts * config.groups, capacity=width)
-        server = NativeRolloutServer(engine)
+        server = native_server(source, sampling, slots=config.prompts * config.groups, capacity=width)
         remote = None
     elif config.backend in ("vllm", "sglang"):
         import openai
