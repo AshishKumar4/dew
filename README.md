@@ -397,50 +397,67 @@ A training run combines a model, an objective, a dataset, and an optimizer:
 
 ### Language modeling
 
-This decoder learns a repeating token sequence. Each row has 17 IDs: the model receives the first 16 and predicts the following 16. A real corpus uses the same layout, with IDs produced by its tokenizer.
+This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it into the `train.bin`, `val.bin` and `meta.json` that `TokenWindows` reads. The tool holds out the first 1% of the tokens for validation.
+
+```bash
+hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
+    --repo-type dataset --local-dir data
+python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+    --out data/tinystories --tokenizer gpt2
+```
+
+Each row holds 257 token IDs: the model receives the first 256 and predicts the following 256.
+
+```python
+import jax
+import jax.numpy as jnp
+import optax
+
+from dew import Trainer, metrics, models
+from dew.data import HFTokenizer, Loading, TokenWindows
+from dew.objectives.lm import LMObjective
+from dew.sampling import Sampling, generate
+
+tokenizer = HFTokenizer("gpt2")
+data = TokenWindows(path="data/tinystories", seq_len=256,
+                    loading=Loading(workers=0)).load(batch=32)
+model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
+                     emb_features=256, num_layers=4, num_heads=4, max_seq_len=256,
+                     dtype=jnp.bfloat16)
+objective = LMObjective(model, seq_len=256)
+lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
+    data, steps=2000, log_every=500, eval_every=1000, metrics=(metrics.perplexity(),))
+continuation = generate(model, lm_state.params, [tokenizer.encode("Once upon a time")],
+                        max_new_tokens=40, key=jax.random.key(1),
+                        sampling=Sampling(temperature=0.0))
+print(tokenizer.decode(continuation.tokens[0]))
+```
+
+On one Colab L4 GPU the run takes about three minutes. The training loss falls from 2.75 at step 500 to 1.95 at step 2,000, and validation perplexity reaches 8.7. One run's greedy continuation reads:
+
+> Once upon a time, there was a little girl named Lily. She had a big, red ball. Lily loved to play with her ball. One day, she saw a big box. She wanted to open it.
+
+`temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
+
+`PackedTokens` packs whole documents into the windows instead, with segment IDs and positions; it splits the stream at the EOS ID that `tools/tokenize_text.py --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+
+### Supervised fine-tuning
+
+Fine-tune the decoder above on a response to a prompt. Each token carries a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. `ChatMessages` produces this role column from chat templates when reading conversation data.
 
 ```python
 import itertools
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
 
-from dew import Dataset, Trainer, metrics, models
-from dew.objectives.lm import LMObjective
-from dew.sampling import Sampling, generate
-
-row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
-batch = {"text": np.tile(row, (8, 1))}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=lambda partition: iter([batch]), records=8, batch=8)
-model = models.build("causal_transformer", vocab_size=8, emb_features=32,
-                     num_layers=1, num_heads=2, mlp_features=64, max_seq_len=32,
-                     dtype=jnp.float32, attention_impl="xla")
-objective = LMObjective(model, seq_len=16)
-lm_state = Trainer(objective, optax.adam(0.01), key=jax.random.key(0)).fit(
-    data, steps=40, log_every=10, eval_every=20, metrics=(metrics.perplexity(),))
-continuation = generate(model, lm_state.params, jnp.array([[1, 2]], jnp.int32),
-                        max_new_tokens=8, key=jax.random.key(1),
-                        sampling=Sampling(temperature=0.0))
-print(np.asarray(continuation.tokens))
-```
-
-The continuation includes the prompt and follows the learned pattern: `[[1, 2, 3, 4, 1, 2, 3, 4, 1, 2]]`. `temperature=0` selects the highest-probability token. Validation uses EMA weights, which can lag the live parameters during a short run.
-
-For corpus training, `TokenWindows` reads tokenized binary files and `PackedTokens` packs documents with segment IDs and positions. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
-
-### Supervised fine-tuning
-
-Fine-tune the trained decoder above by marking which targets belong to the assistant. Here the first four tokens provide the prompt; the remaining tokens are the response. `ChatMessages` produces this role column from chat templates when reading conversation data.
-
-```python
+from dew import Dataset
 from dew.data.chat import Role
 
-roles = np.full(batch["text"].shape, Role.USER, dtype=np.int8)
-roles[:, 4:] = Role.ASSISTANT
-sft_batch = {**batch, "text_roles": roles}
+prompt = tokenizer.encode("Tom had a red ball.")
+response = tokenizer.encode(" He kicked it to his dog.")
+row = np.array(prompt + response, dtype=np.int32)
+roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
+sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
 sft_data = Dataset(
     train=lambda partition: itertools.repeat(sft_batch),
     val=None,
@@ -449,7 +466,7 @@ sft_data = Dataset(
 )
 sft_objective = LMObjective(
     model,
-    seq_len=16,
+    seq_len=len(row) - 1,
     pretrained=lm_state.params,
     loss_role=Role.ASSISTANT,
     ema_decay=None,
@@ -465,24 +482,26 @@ The loss counts assistant targets after the next-token shift. Prompt tokens stil
 
 ### Preference optimization
 
-Continue from `model` and `lm_state` above with a chosen and rejected response. Both start with the prompt `[1, 2]`; the masks restrict the loss to the two response tokens.
+Continue from `model` and `lm_state` above with a chosen and a rejected response to the same prompt. The masks restrict the loss to the response tokens.
 
 ```python
 import json
 
-from dew.data import Loading, PreferencePairs
+from dew.data import PreferencePairs
 from dew.objectives.rl import DPOObjective
 
-pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 6, 4],
-        "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]}
-pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=4,
+rejected = tokenizer.encode(" He kicked kicked kicked it.")
+pair = {"chosen": prompt + response, "rejected": prompt + rejected,
+        "chosen_mask": [0] * len(prompt) + [1] * len(response),
+        "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
+pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=3, beta=0.1, pretrained=lm_state.params)
+dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.params)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
-`DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width; the objective scores one fewer position because of the next-token shift.
+`DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width, and shorter pairs are padded to it; the objective scores one fewer position because of the next-token shift.
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples image groups, evaluates rewards, and records the transition densities used by the clipped policy objective. See [FlowGRPO](docs/concepts/post_training.md) for a complete image-reward example.
 
@@ -490,25 +509,29 @@ For online reinforcement learning, `SampledRollout` generates groups of response
 
 ### Reinforcement learning with a reward function
 
-This example continues the same decoder with a reward for choosing the expected next token. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
+This example continues the same decoder with a reward for stories about a dog. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
 
 ```python
 from dew.objectives.rl import GRPOObjective, SampledRollout
 
+prompt = tokenizer.encode("Once upon a time, there was a little")
 prompt_batch = {
-    "prompt": np.tile(np.array([1, 2], dtype=np.int32), (8, 1)),
-    "prompt_length": np.full(8, 2, dtype=np.int32),
+    "prompt": np.tile(np.array(prompt, dtype=np.int32), (8, 1)),
+    "prompt_length": np.full(8, len(prompt), dtype=np.int32),
     "data_source": np.tile(
-        np.frombuffer(b"pattern", dtype=np.uint8).astype(np.int32),
+        np.frombuffer(b"tinystories", dtype=np.uint8).astype(np.int32),
         (8, 1),
     ),
-    "ground_truth": np.full((8, 1), ord("3"), dtype=np.int32),
+    "ground_truth": np.tile(
+        np.frombuffer(b"dog", dtype=np.uint8).astype(np.int32),
+        (8, 1),
+    ),
     "extra_info": np.zeros((8, 0), dtype=np.int32),
 }
 
 
 def reward(data_source, completion, ground_truth, extra_info):
-    return float(completion.split()[:1] == [ground_truth])
+    return float(ground_truth in completion)
 
 
 rl_data = Dataset(
@@ -519,7 +542,7 @@ rl_data = Dataset(
 )
 rl_objective = GRPOObjective(
     model,
-    seq_len=5,
+    seq_len=len(prompt) + 7,
     beta=0.01,
     pretrained=lm_state.params,
 )
@@ -527,8 +550,9 @@ rollout = SampledRollout(
     rl_objective,
     reward=reward,
     groups=4,
-    max_new_tokens=4,
-    sampling=Sampling(temperature=2.0, top_k=4),
+    max_new_tokens=8,
+    sampling=Sampling(temperature=1.0, top_k=40),
+    decode=tokenizer.decode,
 )
 rl_state = Trainer(
     rl_objective,
@@ -538,58 +562,47 @@ rl_state = Trainer(
 ).fit(rl_data, steps=20, log_every=10)
 ```
 
-Each prompt produces four responses. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. For language tasks, supply a tokenizer's decoding function through `SampledRollout.decode`.
+Each prompt produces four responses, and `SampledRollout.decode` turns each one into the text the reward reads. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift.
+
+In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
 
 ### Diffusion language models
 
-Masked diffusion trains a bidirectional decoder to recover corrupted tokens. Unlike autoregressive training, each input row contains exactly `seq_len` tokens; there is no next-token shift. Reserve a vocabulary ID for the mask.
+Masked diffusion trains a bidirectional decoder to recover corrupted tokens. Unlike autoregressive training, each input row contains exactly `seq_len` tokens; there is no next-token shift, so windows of `seq_len=127`, which hold 128 IDs each, feed a 128-token objective. The mask takes the ID after the last GPT-2 token.
 
 ```python
 from dew.diffusion.discrete import MDLM
-from dew.objectives import Step
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_batch = {"text": batch["text"][:, :16]}
-masked_data = Dataset(
-    train=lambda partition: itertools.repeat(masked_batch),
-    val=None,
-    records=8,
-    batch=8,
-)
+masked_data = TokenWindows(path="data/tinystories", seq_len=127,
+                           loading=Loading(workers=0)).load(batch=64)
+mask_id = tokenizer.vocab_size
+process = MDLM(mask_id=mask_id)()
 masked_model = models.build(
     "causal_transformer",
-    vocab_size=8,
-    emb_features=32,
-    num_layers=1,
-    num_heads=2,
-    mlp_features=64,
-    max_seq_len=16,
+    vocab_size=mask_id + 1,
+    emb_features=256,
+    num_layers=4,
+    num_heads=4,
+    max_seq_len=128,
     causal=False,
+    dtype=jnp.bfloat16,
 )
-masked_objective = MaskedDiffusionObjective(
-    masked_model,
-    MDLM(mask_id=7)(),
-    seq_len=16,
-    ema_decay=0.9,
-    samples=4,
-    steps=16,
-)
+masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=128)
 masked_state = Trainer(
     masked_objective,
-    optax.adamw(3e-3),
+    optax.adamw(1e-3),
     key=jax.random.key(4),
-).fit(masked_data, steps=100, log_every=50)
-generated = masked_objective.preview(
-    masked_state.params,
-    masked_batch,
-    Step(
-        step=masked_state.microstep,
-        key=jax.random.key(5),
-        ema=masked_state.averaged,
-    ),
-)
-print(np.asarray(generated.tokens))
+).fit(masked_data, steps=4000, log_every=1000, eval_every=2000,
+      metrics=(metrics.perplexity(),))
+drawn = process.generate(masked_model, masked_state.averaged,
+                         [tokenizer.encode("Once upon a time")], 48, key=jax.random.key(5))
+print(tokenizer.decode(drawn.tokens[0]))
 ```
+
+On the same L4 the 4,000 steps take about five minutes. The loss, MDLM's negative ELBO per token, falls from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reaches 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own, so it does not compare directly with the 8.7 above. `process.generate` unmasks the 48 tokens after the prompt in 64 reverse steps; one run's draw reads:
+
+> Once upon a time, in a small town, there lived a little girl named Lily. Mia loved whistle. She had an key telling to try to sleep. One day, she always to see her favorite mom, dad unate to have lots of.
 
 LLaDA and Dream use this masked-token path. Diffusion Gemma uses a different canvas/self-conditioning process.
 
@@ -999,18 +1012,19 @@ continues the decoder trained in [language modeling](#language-modeling):
 ```python
 from dew.inference import TextGeneration
 
+prompt = tokenizer.encode("Once upon a time")
 task = objective.policy(lm_state.params, Sampling(temperature=0.0))
-drawn = task([[1, 2]], 8, key=jax.random.key(1))
-print(np.asarray(drawn.tokens), np.asarray(drawn.lengths))
+drawn = task([prompt], 8, key=jax.random.key(1))
+print(tokenizer.decode(drawn.tokens[0]), np.asarray(drawn.lengths))
 
 same = TextGeneration(model, lm_state.params, sampling=Sampling(temperature=0.0))
-print(np.array_equal(np.asarray(same([[1, 2]], 8, key=jax.random.key(1)).tokens),
+print(np.array_equal(np.asarray(same([prompt], 8, key=jax.random.key(1)).tokens),
                      np.asarray(drawn.tokens)))
 ```
 
-This prints `[[1 2 3 4 1 2 3 4 1 2]] [8]` and `True`: the constructor and
+This prints `Once upon a time, there was a little girl named Lily [8]` and `True`: the constructor and
 `policy` build the same task. `lengths` counts the 8 response actions, not the
-2 prompt tokens the row also carries. `Generation` also returns `terminated`,
+4 prompt tokens the row also carries. `Generation` also returns `terminated`,
 and the `behavior_log_probs` and `raw_log_probs` a policy ratio needs.
 
 A task built by `Pretrained.text_generation()` carries the checkpoint's
