@@ -149,7 +149,6 @@ class UViT(nn.Module):
                 precision=self.precision, name="final_conv2"
             )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         original_img = x
         _, H, W, _ = original_img.shape
@@ -290,7 +289,6 @@ class SimpleUDiT(nn.Module):
             precision=self.precision,
         )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"

@@ -105,7 +105,6 @@ class MMDiTBlock(nn.Module):
 
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    @nn.compact
     def __call__(self, img, txt, conditioning, freqs_cis, train: bool = False):
         S_txt = txt.shape[1]
         i_scale_mlp, i_shift_mlp, i_gate_mlp, i_scale_attn, i_shift_attn, i_gate_attn = jnp.split(
@@ -216,7 +215,6 @@ class SimpleMMDiT(nn.Module):
             precision=self.precision,
         )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
         assert textcontext is not None, "textcontext must be provided for SimpleMMDiT"
         _, H, W, _ = x.shape
@@ -444,7 +442,6 @@ class HierarchicalMMDiT(nn.Module):
             precision=self.precision,
         )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext, train: bool = False):
         assert textcontext is not None, "textcontext must be provided"
         _, H, W, _ = x.shape

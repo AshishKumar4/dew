@@ -124,7 +124,6 @@ class HybridSSMAttentionDiT(nn.Module):
             precision=self.precision,
         )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
         x_seq, inv_idx = self.embed(x)
