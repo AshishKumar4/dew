@@ -1866,8 +1866,9 @@ def _snapshot(name_or_dir: str, revision: str | None, *,
 class ExportTokenizer(Protocol):
     """A tokenizer that writes its own HF files. The byte vocabulary has none, so it is recorded by name only."""
 
-    def save_pretrained(self, directory: str, /) -> tuple[str, ...] | None: ...
-    """The files it wrote, which transformers returns and this module does not read."""
+    def save_pretrained(self, directory: str, /) -> tuple[str, ...] | None:
+        """Return the files it wrote, which transformers returns and this module does not read."""
+        ...
 
 
 @runtime_checkable
