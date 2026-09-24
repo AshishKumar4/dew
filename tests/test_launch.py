@@ -259,6 +259,25 @@ def test_where_the_launch_runs_follows_jax_detection_and_names_win(variables, ar
     assert expected in done.stdout
 
 
+@pytest.mark.parametrize(("variables", "arguments"), [
+    ({"SLURM_JOB_ID": "77", "SLURM_NTASKS_PER_NODE": "1", "SLURM_GPUS_PER_NODE": "a100:4"}, ()),
+    ({"SLURM_JOB_ID": "77", "SLURM_GPUS_PER_NODE": "4"}, ("--processes-per-host", "2")),
+    ({**SLURM_STEP, "SLURM_NTASKS": "2", "SLURM_PROCID": "1", "SLURM_LOCALID": "0",
+      "SLURM_STEP_TASKS_PER_NODE": "1(x2)", "SLURM_NODEID": "1", "CUDA_VISIBLE_DEVICES": "0,1,2,3"}, ()),
+], ids=["allocation", "processes-per-host", "step"])
+def test_a_slurm_placement_that_leaves_gpus_idle_is_refused(variables, arguments):
+    """jax gives each Slurm task the one GPU at its SLURM_LOCALID, so a node
+    running fewer tasks than it has GPUs trains on that many and leaves the
+    rest idle, silently: `sbatch --ntasks-per-node 1 --gpus-per-node 4`
+    would use one GPU of four. An allocation the launcher starts srun in,
+    and a step already running, are refused, naming the task count."""
+    env = {name: value for name, value in ENV.items()
+           if not name.startswith(("SLURM_", "OMPI_")) and name != "JAX_PLATFORMS"}
+    done = launched("--dry-run", *arguments, "--", "python", "train.py", env={**env, **variables})
+    assert done.returncode != 0, done.stdout
+    assert "--ntasks-per-node=4" in done.stderr, done.stderr
+
+
 def fake_srun(tmp_path: Path) -> dict:
     """An allocation's environment whose `srun` records its arguments and
     the variables it would hand its tasks, in place of Slurm's."""
