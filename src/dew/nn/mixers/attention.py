@@ -34,7 +34,14 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.precision import scaled
-from dew.nn.rope import RopeScaling, YarnScaling, apply_rotary, rotary_freqs, yarn_rope_freqs
+from dew.nn.rope import (
+    RopeScaling,
+    YarnScaling,
+    apply_rotary,
+    inverse_frequencies,
+    rotary_freqs,
+    yarn_rope_freqs,
+)
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
@@ -206,7 +213,8 @@ class CausalSelfAttention(nn.Module):
         for axis in (1, 2):
             axes = jnp.where((indices % 3 == axis) & (indices < self.mrope_section[axis] * 3), axis, axes)
         selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
-        inv = self.rope_theta ** (-2 * indices.astype(jnp.float32) / rotated)
+        # transformers' 1 / theta ** (2i / dim) (Qwen2VLRotaryEmbedding), on the host.
+        inv = inverse_frequencies(self.rope_theta, rotated)
         angles = selected.astype(jnp.float32) * inv
         return jnp.cos(angles), jnp.sin(angles)
 

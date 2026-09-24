@@ -46,6 +46,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
+from dew.nn.rope import inverse_frequencies
 from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
@@ -281,8 +282,7 @@ def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.A
     kinds = jnp.where(positions == grid * grid, -2, positions)
     safe = jnp.where(kinds < 0, 0, kinds)
     freq_dim = head_dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, freq_dim, 2, dtype=jnp.float32)
-                                / freq_dim))
+    inv_freq = inverse_frequencies(theta, freq_dim)
     angles = jnp.concatenate([(safe % grid + 1)[:, None] * inv_freq[None, :],
                               (safe // grid + 1)[:, None] * inv_freq[None, :]], axis=1)
     angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
@@ -570,8 +570,7 @@ def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
     the dims concatenate, so `positions` [B, P, 2] yields [B, P, head_dim].
     """
     spatial = head_dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, spatial, 2, dtype=jnp.float32)
-                                / spatial))
+    inv_freq = inverse_frequencies(theta, spatial)
     angles = positions.astype(jnp.float32)[:, :, :, None] * inv_freq
     doubled = jnp.concatenate([angles, angles], axis=-1)
     cos = jnp.concatenate([jnp.cos(doubled[:, :, 0]), jnp.cos(doubled[:, :, 1])],
@@ -964,7 +963,7 @@ def _grid_rope_tables(positions: jax.Array, head_dim: int,
     vision.py:8-15), doubled the way the text rope doubles its pairs.
     """
     dim = head_dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    inv_freq = inverse_frequencies(theta, dim)
     flat = (positions.astype(jnp.float32)[..., None] * inv_freq).reshape(
         *positions.shape[:-1], -1)
     doubled = jnp.concatenate([flat, flat], axis=-1)
