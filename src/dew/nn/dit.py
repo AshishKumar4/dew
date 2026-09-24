@@ -202,7 +202,13 @@ class PatchSequenceEmbed(nn.Module):
 class ConditioningEmbed(nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
-    consumes."""
+    consumes.
+
+    The projection is affine and the pooling a weighted mean, so the mean of
+    the projected tokens is the projection of the mean, computed for a row
+    rather than for each of its tokens. A row with no real tokens gets no
+    text, its bias included, as it would from a mean over no tokens.
+    """
     emb_features: int
     mlp_ratio: int = 4
     dtype: Dtype | None = None
@@ -222,8 +228,9 @@ class ConditioningEmbed(nn.Module):
     def __call__(self, temb, textcontext: TextContext | None = None):
         cond_emb = self.time_embed(temb)
         if textcontext is not None:
-            text_emb = self.text_proj(textcontext.hidden)
-            cond_emb = cond_emb + masked_mean(text_emb, textcontext.mask)
+            text_emb = self.text_proj(masked_mean(textcontext.hidden, textcontext.mask))
+            present = jnp.sum(textcontext.mask, axis=1, keepdims=True) > 0
+            cond_emb = cond_emb + jnp.where(present, text_emb, 0)
         return cond_emb
 
 
