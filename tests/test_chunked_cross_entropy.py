@@ -743,3 +743,42 @@ def test_the_bf16_head_carries_its_logits_cotangent_in_fp32():
     # The state gradient; the head's own keeps its one bf16 product.
     have, reference = loss(chunked.BF16)[0], loss(jax.lax.Precision.HIGHEST)[0]
     assert jnp.abs(have - reference).max() <= 2 ** -14 * jnp.abs(reference).max()
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("softcap", [None, 30.0])
+def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
+    """`tile=None` keeps the logits for the backward instead of recomputing
+    them tile by tile. Same losses, predictions, log partitions and
+    gradients: the logits' cotangent stays fp32 into the state product
+    either way, and the head's gradient accumulates in fp32 once."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16,
+                                   tokens=(RAGGED_TOKENS,), dtype=dtype)
+
+    def run(tile):
+        def loss(states, matrix, cap):
+            losses, _, log_z = chunked_cross_entropy(
+                states, matrix, targets, 4, tile=tile, softcap=cap)
+            return jnp.mean(losses) + 0.01 * jnp.mean(jnp.square(log_z))
+        outputs = chunked_cross_entropy(hidden, head, targets, 4, tile=tile, softcap=softcap)
+        return outputs, jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1))(
+            hidden, head, softcap)
+
+    (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
+    assert jnp.array_equal(tiled[1], whole[1])
+    for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
+        have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
+        assert jnp.abs(have - want).max() <= 2e-6 * jnp.abs(want).max() + 1e-7
+
+
+def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
+    """The first rung of the fit ladder tiles a head that kept its whole
+    logits; only then does the model's remat climb."""
+    from dew.objectives.lm import LMObjective
+    from dew.training.trainer import recompute_more
+
+    objective = LMObjective(small_model(), seq_len=12)
+    assert objective.head_tile is None
+    assert recompute_more(objective) and objective.head_tile == chunked.chunked_tile()
+    assert objective.model.remat is None
+    assert recompute_more(objective) and objective.model.remat is not None

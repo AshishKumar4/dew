@@ -71,7 +71,7 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits, support_log_probs
+from dew.objectives.lm.chunked import chunked_cross_entropy, chunked_tile, head_logits, support_log_probs
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
@@ -479,6 +479,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         ema_decay: float | None = 0.999,
         pad_id: int | None = None,
         head_chunks: int = 4,
+        head_tile: tuple[int, int] | None = None,
         samples: Samples | None = None,
         pretrained: Variables | None = None,
         balance_rate: float | None = None,
@@ -503,6 +504,12 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         costs 2.2% of the step and saves 1.2 GiB of peak memory at
         vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md). The saving
         grows with the vocabulary, and one is the full pass.
+
+        `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
+        `tile`). None keeps the whole fp32 logits for the backward, the
+        fastest head where they fit; a trainer whose compiled step does not
+        fit the devices moves it to the generation's tile
+        (`chunked.chunked_tile`) before it recomputes any block.
 
         `pretrained` is a variables dict to start from instead of a fresh
         init, as `dew.interop.load_pretrained(...).variables` returns for a
@@ -576,6 +583,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.seq_len = seq_len
         self.pad_id = pad_id
         self.head_chunks = head_chunks
+        # A config gives a pair as a list; the head's tile is a static argument.
+        self.head_tile = None if head_tile is None else tuple(head_tile)
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
@@ -726,7 +735,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
         losses, predicted, log_z = chunked_cross_entropy(
-            hidden, head, targets, self.head_chunks,
+            hidden, head, targets, self.head_chunks, tile=self.head_tile,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision, predict=self.token_accuracy)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
@@ -751,7 +760,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
                 depth_losses, _, _ = chunked_cross_entropy(
-                    state, head, targets[:, depth:], self.head_chunks,
+                    state, head, targets[:, depth:], self.head_chunks, tile=self.head_tile,
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
@@ -797,6 +806,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if roles is not None and self.loss_role is not None:
             weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
         return weights
+
+    def tile_head(self) -> bool:
+        """Move a head that keeps its whole logits to the generation's tile
+        (`chunked.chunked_tile`), and say whether it moved."""
+        if self.head_tile is not None:
+            return False
+        self.head_tile = chunked_tile()
+        return True
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
@@ -856,7 +873,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         targets = tokens[:, 1:]
         if temperature != 1.0:
             losses, _, _ = chunked_cross_entropy(
-                scores.hidden, head, targets, self.head_chunks, softcap=softcap,
+                scores.hidden, head, targets, self.head_chunks, tile=self.head_tile,
+                softcap=softcap,
                 precision=self.model.precision, predict=False, temperature=temperature)
             log_probs = -losses
         if support is not None:

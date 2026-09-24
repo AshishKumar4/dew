@@ -292,8 +292,16 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
 
 
 def recompute_more(objective) -> bool:
-    """Move the objective's model one rung up its remat ladder, and say
-    whether there was a rung to move to."""
+    """Move the objective one rung up its ladder, and say whether there was a
+    rung to move to. A head that keeps its whole logits for the backward
+    moves to the generation's tile first (`LMObjective.head_tile`); then the
+    model's remat climbs."""
+    tile_head = getattr(objective, 'tile_head', None)
+    if tile_head is not None and tile_head():
+        print(colored(f"the step does not fit the devices with the whole logits kept; "
+                      f"compiling it again with the head tiled {objective.head_tile}", "yellow"),
+              file=sys.stderr)
+        return True
     model = getattr(objective, 'model', None)
     if model is None:
         return False
