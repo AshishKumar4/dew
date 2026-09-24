@@ -15,7 +15,9 @@
 		"check": "astro check",
 		"deploy": "wrangler deploy && wrangler deploy -c deploy/www/wrangler.jsonc",
 		"live:deploy": "node live/deploy.mjs",
-		"live:check": "tsc -p live/tsconfig.json"
+		"live:check": "tsc -p live/tsconfig.json",
+		"concepts:dev": "astro dev --config astro.concepts.mjs --port 4400",
+		"concepts:build": "astro build --config astro.concepts.mjs"
 	},
 	"dependencies": {
 		"@astrojs/markdown-remark": "7.3.1",

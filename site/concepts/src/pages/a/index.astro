@@ -1,0 +1,67 @@
+---
+// Concept A: condensation on glass. Fog clears into drops that spell "dew",
+// every pixel walking the reverse process of a cosine schedule.
+import Concept from '../../layouts/Concept.astro';
+import { STEPS } from '../../a/condensation';
+
+// sigma against the step: t = 1 - step / STEPS, sigma = sin(pi t / 2), drawn in a 120 x 52 box.
+const W = 120;
+const H = 52;
+const point = (step: number) => {
+	const t = 1 - step / STEPS;
+	return [(step / STEPS) * W, (1 - Math.sin((Math.PI / 2) * t)) * H] as const;
+};
+const curve = Array.from({ length: STEPS + 1 }, (_, step) => point(step))
+	.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(2)} ${y.toFixed(2)}`)
+	.join(' ');
+---
+
+<Concept
+	title="Dew: train models with JAX and Flax"
+	description="Dew is a JAX and Flax framework for training language models, diffusion models and JEPA encoders, on one device or a mesh of GPUs or TPUs."
+	fallback="/a/fallback.webp"
+>
+	<canvas slot="stage" data-stage aria-hidden="true"></canvas>
+	<div slot="hud" class="hud" aria-hidden="true">
+		<svg viewBox={`-2 -4 ${W + 4} ${H + 8}`}>
+			<line class="axis" x1="0" y1={H} x2={W} y2={H}></line>
+			<path class="curve" d={curve}></path>
+			<circle class="dot" r="2.6" cx="0" cy="0" data-dot></circle>
+		</svg>
+		<div>
+			<div>cosine schedule</div>
+			<div><strong data-step>step 0/{STEPS}</strong></div>
+			<div data-sigma>σ 1.00</div>
+		</div>
+	</div>
+</Concept>
+
+<script>
+	import { STEPS, startCondensation } from '../../a/condensation';
+
+	const hero = document.querySelector<HTMLElement>('[data-hero]')!;
+	const canvas = hero.querySelector<HTMLCanvasElement>('[data-stage]')!;
+	const stepText = hero.querySelector<HTMLElement>('[data-step]')!;
+	const sigmaText = hero.querySelector<HTMLElement>('[data-sigma]')!;
+	const dot = hero.querySelector<SVGCircleElement>('[data-dot]')!;
+
+	const readout = (step: number, sigma: number) => {
+		stepText.textContent = `step ${step}/${STEPS}`;
+		sigmaText.textContent = `σ ${sigma.toFixed(2)}`;
+		dot.setAttribute('cx', ((step / STEPS) * 120).toFixed(2));
+		dot.setAttribute('cy', ((1 - sigma) * 52).toFixed(2));
+	};
+
+	const family = getComputedStyle(document.documentElement).getPropertyValue('--font-serif').trim() || 'serif';
+	document.fonts
+		.load(`600 100px ${family}`, 'dew')
+		.catch(() => undefined)
+		.then(() => {
+			try {
+				if (!startCondensation(hero, canvas, 'dew', readout)) hero.classList.add('no-gl');
+			} catch (error) {
+				console.error(error);
+				hero.classList.add('no-gl');
+			}
+		});
+</script>
