@@ -165,11 +165,14 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
 
 @pytest.mark.parametrize('body_failure', [False, True])
 def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch, request, body_failure):
+    """An earlier sink's close failure, or the body's own, finishes the W&B
+    run with exit code 1, which W&B records as a failed run. The real SDK
+    runs offline underneath; wandb 0.30 keeps no public reader of the
+    offline run it writes, so the outcome is read where dew hands it over,
+    at the public `wandb.Run.finish`."""
     import functools
 
     import wandb
-    from wandb.proto import wandb_internal_pb2
-    from wandb.sdk.internal.datastore import DataStore
 
     from dew.training import WandbTracker
     request.addfinalizer(wandb.teardown)
@@ -179,6 +182,14 @@ def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch
     # Explicit SDK directory avoids its process-wide cached environment from
     # sending this run's transport file to a preceding test's temporary path.
     monkeypatch.setattr(wandb, 'init', functools.partial(wandb.init, dir=str(tmp_path)))
+    exit_codes = []
+    finish = wandb.Run.finish
+
+    def finished(run, exit_code=None, **options):
+        exit_codes.append(exit_code)
+        finish(run, exit_code=exit_code, **options)
+
+    monkeypatch.setattr(wandb.Run, 'finish', finished)
     original = ValueError('training failed')
     cleanup = OSError('local journal flush failed')
 
@@ -200,20 +211,6 @@ def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match='closed'):
         later_local.log({}, 2)
 
-    # Read the actual offline transport record a subsequent W&B sync would
-    # upload. This checks the persisted run outcome, not a mock finish echo.
-    journal = next((tmp_path / 'wandb').glob('offline-run-*/*.wandb'))
-    store = DataStore()
-    store.open_for_scan(str(journal))
-    exit_codes = []
-    try:
-        while (payload := store.scan_data()) is not None:
-            record = wandb_internal_pb2.Record()
-            record.ParseFromString(payload)
-            if record.HasField('exit'):
-                exit_codes.append(record.exit.exit_code)
-    finally:
-        store.close()
     assert exit_codes == [1]
 
 
