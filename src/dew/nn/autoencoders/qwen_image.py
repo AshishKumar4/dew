@@ -34,6 +34,7 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from .api import ModuleAutoEncoder
@@ -443,15 +444,7 @@ def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32
         param_dtype=param_dtype)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
-    declared = jax.eval_shape(model.init, jax.random.key(0), frame)["params"]
-    wanted = {jax.tree_util.keystr(path): leaf.shape
-              for path, leaf in jax.tree_util.tree_leaves_with_path(declared)}
-    held = {jax.tree_util.keystr(path): leaf.shape for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
-    if wanted != held:
-        missing = sorted(key for key in wanted if held.get(key) != wanted[key])
-        extra = sorted(key for key in held if key not in wanted)
-        raise ValueError(f"The published VAE does not fill QwenImageVAE: missing or reshaped {missing}, "
-                         f"unexpected {extra}")
+    check_tree({"params": params}, model, frame)
     autoencoder = QwenImageAutoencoder(model=model, params=params, latents_mean=config["latents_mean"],
                                        latents_std=config["latents_std"])
     return autoencoder, params, layouts, config

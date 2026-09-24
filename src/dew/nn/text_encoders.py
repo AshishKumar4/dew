@@ -571,10 +571,6 @@ def checkpoint_leaf(
 # builds one, here and in `nn.vision` and `interop.hf_decoders`.
 type ParamTree = dict[str, np.ndarray | ParamTree]
 
-# One leaf as a tree check reads it: a stored array, or the shape-and-dtype
-# stand-in `jax.eval_shape` builds a template out of.
-type Shaped = np.ndarray | jax.Array | jax.ShapeDtypeStruct
-
 
 def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
     params: ParamTree = {}
@@ -606,20 +602,21 @@ def translate_clip_weights(
     return _translate(hf_tensors, _clip_path, param_dtype)
 
 
-def _flat(tree: Mapping[str, object]) -> dict[str, Shaped]:
-    leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {".".join(entry.key for entry in path): leaf for path, leaf in leaves}
+def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
+    """Refuse variables the module would not accept, naming what is off.
 
-
-def _check_tree(params: Mapping[str, object], module: nn.Module, *inputs) -> None:
-    """Refuse a tree the module would not accept, naming what is off.
-
-    jax.eval_shape builds the template from shapes alone, so checking the real
+    Every collection `init` returns is held to account, so a routed model
+    whose checkpoint lacks its balancing bias fails here too. `inputs` are
+    what `init` is called with, arrays or `jax.ShapeDtypeStruct`s;
+    `jax.eval_shape` builds the template from shapes alone, so checking a
     checkpoint costs no second copy of its weights.
     """
-    template = jax.eval_shape(lambda: module.init(jax.random.PRNGKey(0), *inputs))["params"]
-    expected = {name: leaf.shape for name, leaf in _flat(template).items()}
-    loaded = {name: leaf.shape for name, leaf in _flat(params).items()}
+    def shapes(tree) -> dict[str, tuple[int, ...]]:
+        return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
+    loaded = shapes(dict(variables))
 
     missing = sorted(set(expected) - set(loaded))
     unexpected = sorted(set(loaded) - set(expected))
@@ -695,7 +692,7 @@ class CLIPTextModel:
         params = variables["params"]
         if not isinstance(params, Mapping):
             raise ValueError("CLIP text variables require a params collection")
-        _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
+        check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, variables, config)
 
     def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:
@@ -737,8 +734,8 @@ class CLIPModel:
             projection_dim=config["projection_dim"], dtype=dtype)
         params = translate_clip_weights(_read_tensors(directory), param_dtype=param_dtype)
         vision = config["vision"]
-        _check_tree(
-            params, module,
+        check_tree(
+            {"params": params}, module,
             jnp.zeros((1, vision["num_channels"], vision["image_size"], vision["image_size"]),
                       jnp.float32),
             jnp.zeros((1, 2), jnp.int32))
@@ -1135,7 +1132,7 @@ class T5EncoderModel:
         params = variables["params"]
         if not isinstance(params, Mapping):
             raise ValueError("T5 variables require a params collection")
-        _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
+        check_tree({"params": params}, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, variables, config)
 
     def __call__(self, input_ids, attention_mask=None) -> jax.Array:

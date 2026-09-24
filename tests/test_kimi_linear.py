@@ -20,12 +20,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.traverse_util import flatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
+from dew.interop.hf_decoders import _FAMILIES, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -72,7 +73,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     fields, family = translate_config(released_config()), _FAMILIES["kimi_linear"]
     model = models.build("causal_transformer", fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    tree = {tuple(name.split(".")): leaf.shape for name, leaf in _flatten(dict(shapes)).items()}
+    tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}
     tensors = json.loads(lzma.decompress((SOURCE / "tensors.json.xz").read_bytes()))
     prepared = family.prepare_weights({name: np.broadcast_to(np.float32(0), shape)
                                        for name, (_, shape) in tensors.items()})
@@ -142,8 +143,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     assert written["model.layers.0.self_attn.A_log"].shape == (1, 1, 2, 1)
     assert json.loads((tmp_path / "config.json").read_text()) == json.loads((TINY / "config.json").read_text())
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    trained = _flatten(variables)
-    for name, after in _flatten(restored.variables).items():
+    trained = flatten_dict(variables, sep=".")
+    for name, after in flatten_dict(restored.variables, sep=".").items():
         np.testing.assert_array_equal(np.asarray(after), np.asarray(trained[name]), err_msg=name)
 
 

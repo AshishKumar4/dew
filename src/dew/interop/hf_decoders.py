@@ -41,9 +41,9 @@ from typing import (
     runtime_checkable,
 )
 
-import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
@@ -65,7 +65,7 @@ from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
-from dew.nn.text_encoders import checkpoint_dtype
+from dew.nn.text_encoders import check_tree, checkpoint_dtype
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
 from dew.telemetry.instrumentation import dew_cache_dir
@@ -2002,7 +2002,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
     tensors: dict[str, np.ndarray] = {}
-    for name, value in _flatten(params).items():
+    for name, value in flatten_dict(dict(params), sep='.').items():
         target = family.export_path(name, config)
         if target is not None:
             # A kernel is transposed on a device, one at a time, and copied to
@@ -2012,22 +2012,6 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
             tensors[target] = (np.asarray(jnp.asarray(value).T) if name.endswith('.kernel')
                                else np.ascontiguousarray(np.asarray(value)))
     return tensors
-
-
-def _flatten(tree: Mapping[str, object], prefix: str = '') -> Variables:
-    """Flatten a params tree to '.'-joined names, leaves untouched.
-
-    Untouched matters because the shape check flattens a jax.eval_shape template,
-    whose leaves carry a shape but no data to convert.
-    """
-    flat: dict[str, object] = {}
-    for key, value in tree.items():
-        name = f"{prefix}{key}"
-        if isinstance(value, Mapping):
-            flat.update(_flatten(value, f"{name}."))
-        else:
-            flat[name] = value
-    return flat
 
 
 def _export_config(model) -> Mapping[str, object]:
@@ -2315,28 +2299,8 @@ def _every_layer_windowed(fields: DecoderFields) -> bool:
 
 
 def _check_tree(variables: Mapping[str, object], model) -> None:
-    """Refuse variables the model would not accept, naming what is off.
-
-    Every collection init returns is held to account, so a routed model
-    whose checkpoint lacks the balancing bias fails here too.
-    jax.eval_shape builds the template without allocating it, so checking a
-    0.6B checkpoint costs no second copy of the weights.
-    """
-    template = jax.eval_shape(
-        lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
-    expected = {name: leaf.shape for name, leaf in _flatten(template).items()}
-    loaded = _flatten(variables)
-
-    missing = sorted(set(expected) - set(loaded))
-    unexpected = sorted(set(loaded) - set(expected))
-    mismatched = sorted(
-        f"{name} is {loaded[name].shape}, the model takes {shape}"
-        for name, shape in expected.items()
-        if name in loaded and loaded[name].shape != shape)
-    if missing or unexpected or mismatched:
-        raise ValueError(
-            f"the checkpoint does not fit the model: missing {missing}, "
-            f"unexpected {unexpected}, mismatched {mismatched}")
+    """`check_tree` against a decoder, whose `init` reads one row of token ids."""
+    check_tree(variables, model, np.zeros((1, 2), np.int32))
 
 
 # The family modules stand below the shared readers they call, so reaching one

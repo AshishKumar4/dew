@@ -38,13 +38,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import (
-    _FAMILIES,
-    _flatten,
-    _wrapper_sources,
-    translate_config,
-    translate_wrapper_config,
-)
+from dew.interop.hf_decoders import _FAMILIES, _wrapper_sources, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
@@ -276,7 +270,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
     bound = {tuple(part for index, part in enumerate(path)
                    if not (index and path[index - 1] == 'experts' and part.isdigit()))
              for path in bound}
-    tree = {tuple(name.split(".")) for name in _flatten(dict(shapes))}
+    tree = set(flatten_dict(dict(shapes)))
     tree.discard(("constants", "language_model", "engram_hashes", "token_map"))
     assert bound == tree
     language = model.language_model
@@ -352,12 +346,12 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
         lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
     loss_close(value, "")
     loss_close(twin_value, "", TWIN)
-    indexer = [np.max(np.abs(leaf)) for path, leaf in _flatten(gradient).items() if ".indexer." in f".{path}."]
+    indexer = [np.max(np.abs(leaf)) for path, leaf in flatten_dict(gradient, sep=".").items() if ".indexer." in f".{path}."]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     loaded.save(tmp_path, variables=variables)
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    held, again = _flatten(variables), _flatten(restored.variables)
+    held, again = flatten_dict(variables, sep="."), flatten_dict(dict(restored.variables), sep=".")
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]), err_msg=name)

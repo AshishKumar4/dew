@@ -13,6 +13,7 @@ import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
+from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.families.deepseek import _deepseek_config, _deepseek_layout, _deepseek_mixture
@@ -26,7 +27,6 @@ from dew.interop.hf_decoders import (
     _dew_path,
     _fixed_fields,
     _fixed_mixture,
-    _flatten,
     _hf_name,
     _record_float,
     _record_int,
@@ -278,7 +278,7 @@ def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, 
     _check_tree(persistent, model)
     fields = translate_config(config)
     tensors: dict[str, np.ndarray] = {}
-    for name, raw in _flatten(persistent).items():
+    for name, raw in flatten_dict(persistent, sep='.').items():
         collection, *path = name.split('.')
         leaf = np.asarray(raw)
         original = tuple(path)

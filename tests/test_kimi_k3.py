@@ -19,13 +19,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.traverse_util import flatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
 from dew.interop.codecs import PACKED_MXFP4, decode_e2m1, quantize_packed_mxfp4
-from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
+from dew.interop.hf_decoders import _FAMILIES, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.nn.moe import Situ
 from dew.objectives.base import Step
@@ -79,7 +80,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     fields, family = translate_config(config), _FAMILIES["kimi_k3"]
     model = models.build("causal_transformer", fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    tree = {tuple(name.split(".")): leaf.shape for name, leaf in _flatten(dict(shapes)).items()}
+    tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}
     tensors = released_tensors()
     decoded = {}
     for name, (dtype, shape) in tensors.items():
@@ -175,8 +176,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     assert written["language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed"].dtype == np.uint8
     assert json.loads((tmp_path / "config.json").read_text()) == json.loads((TINY / "config.json").read_text())
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    trained = _flatten(variables)
-    for name, after in _flatten(restored.variables).items():
+    trained = flatten_dict(variables, sep=".")
+    for name, after in flatten_dict(dict(restored.variables), sep=".").items():
         before = np.asarray(trained[name])
         if ".experts." in name:
             # Stacked [E, in, out]; compressed-tensors groups each [out, in] weight along its input.
