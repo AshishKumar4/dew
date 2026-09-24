@@ -153,7 +153,7 @@ def prepare_process(wandb: Wandb | None = None,
 
 def _pool_keys_alike() -> bool:
     """Whether this jax keys a computation that spans processes alike on
-    every one of them (jax-ml/jax#ISSUE).
+    every one of them (jax-ml/jax#40940).
 
     jax 0.11.2 keys an executable by the compiling process's own topology
     fingerprint, which on a GPU describes the device down to its NVLink
