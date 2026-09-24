@@ -13,7 +13,7 @@ A training run in Dew is four objects: a Flax model, an objective, a dataset and
 
 ## One run, end to end
 
-This trains a small decoder on one repeated sentence and then generates from it. It downloads nothing and runs on a CPU in under a minute.
+This trains a small decoder on one repeated sentence and then generates from it. It downloads nothing and runs on a CPU in about twenty seconds.
 
 ```python
 import itertools
@@ -28,24 +28,40 @@ from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
 tokenizer = ByteTokenizer()
-row = np.asarray(tokenizer.encode("dew trains jax models. " * 3)[:65], np.int32)
-batch = {"text": np.tile(row, (8, 1))}
-data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
-               records=8, batch=8)
+text = tokenizer.encode("dew trains jax models. " * 3)
+batch = {"text": np.tile(np.asarray(text[:65], np.int32), (8, 1))}
+data = Dataset(train=lambda partition: itertools.repeat(batch),
+               val=None, records=8, batch=8)
 
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=4,
-                     mlp_features=256, max_seq_len=128)
+model = models.build(
+    "causal_transformer", vocab_size=tokenizer.vocab_size,
+    emb_features=64, num_layers=2, num_heads=4,
+    mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-trainer = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0))
+trainer = Trainer(objective, optax.adamw(3e-3),
+                  key=jax.random.key(0))
 state = trainer.fit(data, steps=100, log_every=25)
 
-out = generate(model, state.params, [tokenizer.encode("dew")], max_new_tokens=40,
-               key=jax.random.key(1), sampling=Sampling(temperature=0))
+prompt = [tokenizer.encode("dew")]
+out = generate(model, state.params, prompt, max_new_tokens=40,
+               key=jax.random.key(1),
+               sampling=Sampling(temperature=0))
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-Each row holds 65 byte ids: `LMObjective(seq_len=64)` feeds the first 64 to the model and predicts the 64 that follow, one position later. `records` is the number of training examples and `batch` the global batch size. `generate` returns the prompt followed by the new tokens, and `temperature=0` picks the most likely token at every step.
+On the two vCPUs of a Colab runtime it prints:
+
+```text
+Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
+step 25: loss 0.0336
+step 50: loss 0.0107
+step 75: loss 0.0070
+step 100: loss 0.0053
+Goodput: first step after 6.81 s, 23.4% of the wall time in steps
+dew trains jax models. dew trains jax model
+```
+
+Each row holds 65 byte ids: `LMObjective(seq_len=64)` feeds the first 64 to the model and predicts the 64 that follow, one position later. The loss falls from 0.034 at step 25 to 0.005 at step 100, and the model continues the prompt with the sentence it learned. `records` is the number of training examples and `batch` the global batch size. `generate` returns the prompt followed by the new tokens, and `temperature=0` picks the most likely token at every step.
 
 ## Models are plain Flax modules
 

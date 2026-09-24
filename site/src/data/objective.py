@@ -23,8 +23,10 @@ class Regression(Objective):
 
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-data = Dataset(train=lambda partition: itertools.repeat({"x": x, "y": 2 * x + 1}),
+batch = {"x": x, "y": 2 * x + 1}
+data = Dataset(train=lambda partition: itertools.repeat(batch),
                val=None, records=32, batch=32)
 objective = Regression()
-state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(data, steps=100, log_every=50)
+trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
+state = trainer.fit(data, steps=100, log_every=50)
 print(objective.model.apply(state.params, jnp.array([[0.0], [1.0]])))

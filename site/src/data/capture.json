@@ -1,0 +1,25 @@
+{
+	"about": "What site/src/data/hero.py and objective.py printed, written by site/scripts/capture_snippets.py.",
+	"meta": {
+		"where": "the CPU of a Colab runtime",
+		"vcpus": 2,
+		"python": "3.13.15",
+		"jax": "0.11.2",
+		"flax": "0.12.9",
+		"optax": "0.2.8",
+		"dew": "60d49d23d34f4573d6a86a0f4f4133fcf42b2d21",
+		"date": "2026-09-24"
+	},
+	"snippets": {
+		"hero": {
+			"returncode": 0,
+			"seconds": 19.4,
+			"stdout": "Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))\nstep 25: loss 0.0336\nstep 50: loss 0.0107\nstep 75: loss 0.0070\nstep 100: loss 0.0053\nGoodput: first step after 6.81 s, 23.4% of the wall time in steps\ndew trains jax models. dew trains jax model\n"
+		},
+		"objective": {
+			"returncode": 0,
+			"seconds": 9.1,
+			"stdout": "Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))\nstep 50: loss 0.0002\nstep 100: loss 0.0000\nGoodput: first step after 0.75 s, 20.5% of the wall time in steps\n[[0.99999994]\n [2.999413  ]]\n"
+		}
+	}
+}

@@ -235,3 +235,216 @@ header.header {
 	outline: 2px solid var(--dew-accent-text);
 	outline-offset: 2px;
 }
+
+/* Tutorial pages: each code cell with its recorded outputs. */
+
+.sl-markdown-content .nb-cell {
+	margin-top: 1.5rem;
+}
+
+.sl-markdown-content .nb-cell > * + * {
+	margin-top: 0;
+}
+
+.sl-markdown-content .nb-cell .expressive-code figure {
+	border-bottom-left-radius: 0;
+	border-bottom-right-radius: 0;
+}
+
+.sl-markdown-content .nb-cell:not(:has(.nb-output)) .expressive-code figure {
+	border-radius: 0.5rem;
+}
+
+.nb-output {
+	border: 1px solid var(--dew-rule);
+	border-top: 0;
+	background: var(--dew-output-bg);
+	font-size: 0.8rem;
+}
+
+.nb-output:last-child {
+	border-radius: 0 0 0.5rem 0.5rem;
+}
+
+.sl-markdown-content .nb-output pre {
+	margin: 0;
+	padding: 0.7rem 1rem;
+	border: 0;
+	background: transparent;
+	font: 0.78rem/1.6 var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 28rem;
+	overflow: auto;
+}
+
+.nb-output.nb-result pre {
+	color: var(--sl-color-white);
+}
+
+.nb-output.nb-image {
+	padding: 0.75rem;
+	text-align: center;
+}
+
+.nb-output.nb-image img {
+	max-width: 100%;
+	height: auto;
+	border-radius: 0.3rem;
+	background: #fff;
+}
+
+.nb-output.nb-stderr summary {
+	padding: 0.35rem 1rem;
+	cursor: pointer;
+	font: 600 0.72rem var(--__sl-font-mono);
+	color: var(--dew-warn);
+	list-style-position: inside;
+}
+
+.nb-output.nb-stderr pre {
+	color: var(--dew-muted);
+}
+
+.nb-output.nb-error pre {
+	color: var(--dew-error);
+}
+
+.sl-markdown-content .nb-output.nb-html {
+	padding: 0.7rem 1rem;
+	overflow-x: auto;
+}
+
+.sl-markdown-content .nb-output.nb-html table {
+	font-size: 0.78rem;
+}
+
+/* The tutorials grid, on /tutorials/ and on the landing page. */
+
+.tutorial-grid {
+	display: grid;
+	gap: 1rem;
+	grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+	margin-top: 2rem;
+}
+
+.tutorial-card {
+	display: flex;
+	flex-direction: column;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.75rem;
+	overflow: hidden;
+	background: var(--dew-surface);
+	color: inherit;
+	text-decoration: none;
+	transition: border-color 120ms ease, transform 120ms ease;
+}
+
+.tutorial-card:hover {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 55%, var(--dew-rule));
+}
+
+.tutorial-card-media {
+	display: grid;
+	place-items: center;
+	aspect-ratio: 16 / 9;
+	overflow: hidden;
+	background: var(--dew-output-bg);
+	border-bottom: 1px solid var(--dew-rule);
+}
+
+.tutorial-card-media img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	object-position: center top;
+	background: #fff;
+}
+
+.tutorial-card-glyph {
+	font: 600 2.2rem var(--dew-font-display);
+	color: var(--sl-color-gray-4);
+}
+
+.tutorial-card-body {
+	display: flex;
+	flex-direction: column;
+	gap: 0.35rem;
+	padding: 0.85rem 1rem 1rem;
+}
+
+.tutorial-card-meta {
+	display: flex;
+	justify-content: space-between;
+	font: 600 0.7rem var(--__sl-font-mono);
+	letter-spacing: 0.05em;
+	color: var(--dew-muted);
+}
+
+.tutorial-card-title {
+	font-weight: 620;
+	font-size: 0.95rem;
+	line-height: 1.35;
+	color: var(--sl-color-white);
+}
+
+.tutorial-card-text {
+	font-size: 0.82rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-3);
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+/* API reference pages. */
+
+.api-meta {
+	display: flex;
+	gap: 0.75rem;
+	align-items: center;
+	margin-top: 0.25rem !important;
+	font-size: 0.78rem;
+}
+
+.api-kind {
+	font: 600 0.7rem var(--__sl-font-mono);
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--dew-accent-text);
+	border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 45%, var(--dew-rule));
+	border-radius: 999px;
+	padding: 0.1rem 0.5rem;
+}
+
+.sl-markdown-content .api-source {
+	color: var(--dew-muted);
+}
+
+.sl-markdown-content dl.api-fields {
+	border-left: 2px solid var(--dew-rule);
+	padding-left: 1rem;
+}
+
+.sl-markdown-content dl.api-fields dt {
+	font-weight: 500;
+	margin-top: 0.75rem;
+}
+
+.sl-markdown-content dl.api-fields dt code {
+	border: 0;
+	background: transparent;
+	padding: 0;
+	color: var(--sl-color-white);
+}
+
+.sl-markdown-content dl.api-fields dd {
+	margin: 0.25rem 0 0;
+	color: var(--sl-color-gray-2);
+}
+
+.sl-markdown-content dl.api-fields dd > p {
+	margin: 0.25rem 0 0;
+}

@@ -1,0 +1,68 @@
+---
+// Eight devices as MeshSpec(fsdp=4, tensor=2) lays them out, each holding its
+// block of an MLP weight: the model width split over fsdp, the hidden width over tensor.
+const columns = 4;
+const rows = 2;
+const cell = { w: 92, h: 104, gap: 12 };
+const origin = { x: 64, y: 44 };
+const devices = Array.from({ length: columns * rows }, (_, i) => ({ col: i % columns, row: Math.floor(i / columns), i }));
+---
+
+<figure class="mesh-figure">
+	<svg viewBox="0 0 480 320" role="img" aria-labelledby="mesh-title mesh-desc">
+		<title id="mesh-title">MeshSpec(fsdp=4, tensor=2)</title>
+		<desc id="mesh-desc">
+			Eight devices in a grid of four columns along the fsdp axis and two rows along the tensor axis. Each device holds one
+			of the eight blocks of an MLP weight matrix.
+		</desc>
+		<g class="mesh-axis">
+			<line x1={origin.x} y1="22" x2={origin.x + columns * (cell.w + cell.gap) - cell.gap} y2="22" marker-end="url(#mesh-arrow)"></line>
+			<text x={origin.x} y="14">fsdp = 4</text>
+			<line x1="30" y1={origin.y} x2="30" y2={origin.y + rows * (cell.h + cell.gap) - cell.gap} marker-end="url(#mesh-arrow)"></line>
+			<text x="22" y={origin.y} transform={`rotate(-90 22 ${origin.y})`} text-anchor="end">tensor = 2</text>
+		</g>
+		<defs>
+			<marker id="mesh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+				<path d="M0 0L10 5L0 10z" class="mesh-arrowhead"></path>
+			</marker>
+		</defs>
+		{
+			devices.map(({ col, row, i }) => {
+				const x = origin.x + col * (cell.w + cell.gap);
+				const y = origin.y + row * (cell.h + cell.gap);
+				const block = { w: 12, h: 10, gap: 3 };
+				const gridX = x + (cell.w - (columns * block.w + (columns - 1) * block.gap)) / 2;
+				const gridY = y + 40;
+				return (
+					<g class="mesh-device">
+						<rect x={x} y={y} width={cell.w} height={cell.h} rx="10" class="mesh-device-box" />
+						<text x={x + 12} y={y + 22} class="mesh-device-label">
+							device {i}
+						</text>
+						{Array.from({ length: columns * rows }, (_, b) => {
+							const bc = b % columns;
+							const br = Math.floor(b / columns);
+							return (
+								<rect
+									x={gridX + bc * (block.w + block.gap)}
+									y={gridY + br * (block.h + block.gap)}
+									width={block.w}
+									height={block.h}
+									rx="2"
+									class={bc === col && br === row ? 'mesh-block own' : 'mesh-block'}
+								/>
+							);
+						})}
+						<text x={x + 12} y={y + cell.h - 14} class="mesh-device-shard">
+							W[{col}, {row}]
+						</text>
+					</g>
+				);
+			})
+		}
+	</svg>
+	<figcaption>
+		<code>MeshSpec(fsdp=4, tensor=2)</code> on eight devices. An MLP weight splits its model width over <code>fsdp</code> and
+		its hidden width over <code>tensor</code>, so each device holds one of eight blocks.
+	</figcaption>
+</figure>
