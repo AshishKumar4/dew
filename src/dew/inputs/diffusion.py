@@ -228,11 +228,11 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             raise ValueError("A record's guidance must be a finite number")
         return float(value)
 
-    def time_ids(self, count, dtype, *, original_size=None, crops_coords_top_left=(0, 0),
-                 target_size=None, aesthetic_score=6.0):
+    def time_ids(self, count, dtype):
+        """SDXL's micro-conditioning: the original size, no crop, then the
+        target size or the refiner's aesthetic score."""
         size = (self.height, self.width)
-        values = (*(original_size or size), *crops_coords_top_left,
-                  *((aesthetic_score,) if self.aesthetics else (target_size or size)))
+        values = (*size, 0, 0, *((6.0,) if self.aesthetics else size))
         return jnp.broadcast_to(jnp.asarray(values, dtype), (count, len(values)))
 
     def _clip(self, params, ids) -> list[_TextFeatures]:
