@@ -357,13 +357,16 @@ def test_ssim_falls_as_noise_grows(rng):
 
 def test_ssim_matches_the_closed_form_on_constant_images():
     """Constant images have zero local variance, which collapses SSIM to
-    (2 mu_x mu_y + C1) / (mu_x^2 + mu_y^2 + C1)."""
+    (2 mu_x mu_y + C1) / (mu_x^2 + mu_y^2 + C1), and the variance has to come
+    out zero in fp32 whatever order a backend sums the window in. Taken as
+    E[x^2] - E[x]^2 over the raw planes it cancels to a few ulp, which 1 / C2
+    turns into 1e-4 of SSIM: 6e-5 on CPU, 1.25e-4 on a TPU at HIGHEST."""
     data_range = 1.0
     x = jnp.full((1, 16, 16, 1), 0.5)
     y = jnp.full((1, 16, 16, 1), 0.7)
     c1 = (0.01 * data_range) ** 2
     expected = (2 * 0.5 * 0.7 + c1) / (0.5**2 + 0.7**2 + c1)
-    assert float(ssim(x, y, data_range=data_range)) == pytest.approx(expected, rel=1e-4)
+    assert float(ssim(x, y, data_range=data_range)) == pytest.approx(expected, rel=1e-6)
 
 
 def _reference_ssim(x, y, data_range):
