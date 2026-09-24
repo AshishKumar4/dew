@@ -126,6 +126,9 @@ function fence(code) {
 // `node scripts/render-notebooks.mjs 02 05` renders only the notebooks whose names
 // start with those prefixes, for working on the site while a notebook is re-executed.
 const only = process.argv.slice(2);
+// DEW_OUTPUTS_PENDING=01,03 renders those notebooks without outputs, under a notice, for a deploy
+// made while they are being executed again. CI never sets it, so there a notebook without outputs fails.
+const pending = (process.env.DEW_OUTPUTS_PENDING ?? '').split(',').filter(Boolean);
 const files = (await readdir(notebooksDir))
 	.filter((name) => name.endsWith('.ipynb') && (only.length === 0 || only.some((prefix) => name.startsWith(prefix))))
 	.sort();
@@ -139,6 +142,7 @@ for (const file of files) {
 	const source = `tutorials/${file}`;
 	const slug = `tutorials/${stem}`;
 	const notebook = JSON.parse(await readFile(path.join(notebooksDir, file), 'utf8'));
+	const outputsPending = pending.some((prefix) => file.startsWith(prefix));
 	const accelerator = notebook.metadata?.accelerator === 'GPU' ? 'GPU' : 'CPU';
 	const cells = notebook.cells;
 	const firstMarkdown = cells.findIndex((cell) => cell.cell_type === 'markdown');
@@ -158,7 +162,7 @@ for (const file of files) {
 			continue;
 		}
 		if (cell.cell_type !== 'code' || !text.trim()) continue;
-		if (cell.execution_count == null) {
+		if (cell.execution_count == null && !outputsPending) {
 			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');
@@ -173,7 +177,15 @@ for (const file of files) {
 		block.push('', '</div>');
 		parts.push(block.join('\n'));
 	}
-	if (outputs === 0) throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
+	if (outputsPending) {
+		parts.splice(
+			1,
+			0,
+			':::note[Outputs coming]\nThis notebook is running again against the current code, and its outputs will appear here when the run finishes. The code below is final. To run it now, open it in Colab.\n:::',
+		);
+	} else if (outputs === 0) {
+		throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
+	}
 
 	const live = accelerator === 'CPU';
 	if (live) {
@@ -199,13 +211,13 @@ for (const file of files) {
 		},
 		parts.join('\n\n'),
 	);
-	listing.push({ slug, label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0] });
+	listing.push({ slug, number: stem.slice(0, 2), label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0] });
 	notebookOutputs[stem] = outputsByCell;
 }
 
 // The tutorials overview: sync-docs wrote its prose from docs/tutorials.md; the cards come from the notebooks.
-const cards = listing.map((entry, i) => {
-	const number = String(i + 1).padStart(2, '0');
+const cards = listing.map((entry) => {
+	const number = entry.number;
 	const media = entry.thumbnail
 		? `<img src="${entry.thumbnail.src}" width="${entry.thumbnail.width}" height="${entry.thumbnail.height}" alt="" loading="lazy" decoding="async">`
 		: `<span class="tutorial-card-glyph" aria-hidden="true">${number}</span>`;
