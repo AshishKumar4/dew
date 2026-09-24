@@ -696,3 +696,25 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
 
     tables = converts(program.jaxpr, False)
     assert tables == [((64, 16), False)], tables
+
+
+@pytest.mark.skipif(jax.default_backend() == "cpu",
+                    reason="a CPU dot runs the bf16 algorithm without rounding")
+def test_the_bf16_head_carries_its_logits_cotangent_in_fp32():
+    """The bf16 algorithm rounds each operand to bf16, and the logits'
+    cotangent was one of them: a 4-GPU run's gradients then moved past the
+    layout parity bound (1.75x on a dense model's final norm, 5758x on an
+    MoE's expert kernels). On operands already exact in bf16 the state
+    gradient matches the fp32 product's to far below a bf16 rounding."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=64, tokens=(RAGGED_TOKENS,))
+    hidden = hidden.astype(jnp.bfloat16).astype(jnp.float32)
+    head = head.astype(jnp.bfloat16).astype(jnp.float32)
+
+    def loss(precision):
+        return jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
+            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0]),
+            argnums=(0, 1))(hidden, head)
+
+    # The state gradient; the head's own keeps its one bf16 product.
+    have, reference = loss(chunked.BF16)[0], loss(jax.lax.Precision.HIGHEST)[0]
+    assert jnp.abs(have - reference).max() <= 2 ** -14 * jnp.abs(reference).max()
