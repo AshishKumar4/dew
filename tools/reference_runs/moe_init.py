@@ -18,6 +18,9 @@ layout. The scaffold's own weights are never read by either run, and it is
 deleted. The saved directory is read back and must hold Dew's draw exactly.
 
     PYTHONPATH=src:<torch cpu site> python tools/reference_runs/moe_init.py --out <dir> --seed 0
+
+A checkpoint drawn before Dew drew runs of like layers under one scan
+(docs/concepts/distributed.md) holds different weights at the same seed.
 """
 
 import argparse
