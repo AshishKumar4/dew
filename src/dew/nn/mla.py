@@ -192,7 +192,6 @@ class SparseIndexer(nn.Module):
     (modeling_glm_moe_dsa.py:231-232), which `rope_interleave` selects.
     """
 
-    q_lora_rank: int
     n_heads: int
     head_dim: int
     rope_head_dim: int
@@ -427,7 +426,7 @@ class MultiHeadLatentAttention(nn.Module):
                     "the indexer reads the query residual, which only exists "
                     "with a q_lora_rank")
             self.indexer = SparseIndexer(
-                q_lora_rank=self.q_lora_rank, n_heads=self.index_n_heads,
+                n_heads=self.index_n_heads,
                 head_dim=self.index_head_dim,
                 rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
                 rope_interleave=self.index_rope_interleave,

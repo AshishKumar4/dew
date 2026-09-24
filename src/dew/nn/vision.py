@@ -489,8 +489,7 @@ class Llama4VisionTransformer(nn.Module):
             for index in range(self.num_layers)]
         self.layernorm_post = norm(name="layernorm_post")
         self.vision_adapter = Llama4VisionAdapter(
-            self.pixel_shuffle_ratio, self.intermediate_size,
-            self.projector_input_dim, self.projector_output_dim,
+            self.pixel_shuffle_ratio, self.projector_input_dim, self.projector_output_dim,
             dtype=self.dtype, precision=self.precision, name="vision_adapter")
 
     def __call__(self, pixel_values) -> jax.Array:
@@ -522,7 +521,6 @@ class Llama4VisionAdapter(nn.Module):
     """Pixel shuffle into the adapter MLP, the tower's last stage."""
 
     ratio: float
-    intermediate_size: int
     input_dim: int
     output_dim: int
     dtype: Dtype | None = None
@@ -759,7 +757,6 @@ class Gemma4VisionEncoderLayer(nn.Module):
     num_key_value_heads: int
     hidden_act: str = "gelu_pytorch_tanh"
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 100.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
@@ -837,7 +834,7 @@ class Gemma4VisionTransformer(nn.Module):
             Gemma4VisionEncoderLayer(
                 self.hidden_size, self.intermediate_size, self.num_heads,
                 self.num_key_value_heads, self.hidden_act,
-                rms_norm_eps=self.rms_norm_eps, rope_theta=self.rope_theta,
+                rms_norm_eps=self.rms_norm_eps,
                 dtype=self.dtype, precision=self.precision,
                 use_clipped_linears=self.use_clipped_linears, name=f"layers_{index}")
             for index in range(self.num_layers)]
@@ -1093,7 +1090,6 @@ class Qwen35VisionTransformer(nn.Module):
     patch_size: int = 16
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
-    out_hidden_size: int = 3584
     num_position_embeddings: int = 2304
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -1184,7 +1180,6 @@ class Qwen35Vision(TowerBase):
             in_channels=self.in_channels, patch_size=self.patch_size,
             spatial_merge_size=self.spatial_merge_size,
             temporal_patch_size=self.temporal_patch_size,
-            out_hidden_size=self.out_hidden_size,
             num_position_embeddings=self.num_position_embeddings)
 
     def geometry(self) -> TowerGeometry:

@@ -32,7 +32,6 @@ class VisionConditioner(nn.Module):
     per-image lengths and does not substitute preprocessing inside the model.
     """
 
-    family: str
     vision: TowerBase
     projection: ProjectorBase
     dtype: Dtype | None = None
@@ -174,7 +173,7 @@ class MultimodalTransformer(nn.Module):
 
     def setup(self):
         self.conditioner = VisionConditioner(
-            self.family, self.vision, self.projection,
+            self.vision, self.projection,
             dtype=self.dtype, precision=self.precision)
         nn.share_scope(self.conditioner, self)
         if (self.audio is None) != (self.audio_projection is None):
