@@ -66,6 +66,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.backbones.flux import FluxTransformer
+from dew.nn.backbones.qwen_image import QwenImageTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.diffusion_gemma import DiffusionGemma
@@ -442,6 +443,9 @@ def small_cases(dtype: str) -> list[Case]:
                                    "head_dim": 64, "axes_dims_rope": (16, 24, 24),
                                    "guidance_embeds": True},
              batch_size=4, image_size=32, channels=16),
+        Case("qwen_image_transformer", {"in_channels": 16, "out_channels": 16, "num_layers": 3,
+                                         "heads": 6, "head_dim": 64, "axes_dims_rope": (16, 24, 24)},
+             batch_size=4, image_size=32, channels=16),
         Case("uvit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_dit", dit, batch_size=16, image_size=64),
@@ -642,7 +646,11 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
     else:
         model = built(case.architecture, case.config)
         process = presets.EDM()()
-        if isinstance(model, (SD3Transformer, FluxTransformer)):
+        if isinstance(model, QwenImageTransformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained()
+            process = presets.Flow()()
+        elif isinstance(model, (SD3Transformer, FluxTransformer)):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained(
                 features=model.joint_attention_dim, pooled_features=model.pooled_projection_dim,
