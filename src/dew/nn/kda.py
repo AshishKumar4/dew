@@ -99,6 +99,14 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
     state = (jnp.zeros((B, H, Dk, Dv), jnp.float32) if state is None else state.astype(jnp.float32))
+    # XLA:CPU workaround. Under a jitted scan over the layers (scan_layers),
+    # the chunk loop's zero initial state came back with other values in
+    # most processes: GLM-5-Next's scanned forward was off by 8.7, 10.1 or
+    # NaN, while the compiled module was byte-identical across good and bad
+    # runs. The barrier hands the loop a materialized zero, and the scan was
+    # exact in 0 of 20 processes. Remove it when XLA fixes the draft in
+    # verification-evidence/upstream-reports/xla-cpu-scan-uninitialized.
+    state = jax.lax.optimization_barrier(state)
 
     def one_chunk(s, step):
         q_i, k_i, v_i, decay_i, kd_i, gc_i = (step[name] for name in ('q', 'k', 'v', 'decay', 'kd', 'gc'))
