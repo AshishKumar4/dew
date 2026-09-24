@@ -133,7 +133,10 @@ def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
     decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
     Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
-    above divides. The last two MoE models and DiffusionGemma keep their
+    above divides. The DiT's rows hold 256 patches, as a DiT's smallest
+    release does (DiT-B/2 at 256 px): a sequence or tensor split repeats each
+    row's conditioning on every shard by design, which the FLOPs bound would
+    count against a row of only a few patches. The last two MoE models and DiffusionGemma keep their
     released configs' routing and layer kinds. The layers a sequence axis
     splits differently come too: latent attention (MLA), a window (12 rows:
     a sequence split two ways reads it from one neighbour, four ways through
@@ -182,7 +185,7 @@ def zoo() -> dict[str, Any]:
         "mamba2": Case("causal_transformer", mamba2, **lm),
         "dense_packed": Case("causal_transformer", dense, packed_documents=3, **lm),
         "rigel_packed": Case("causal_transformer", rigel, packed_documents=3, **lm),
-        "dit": Case("simple_dit", dit, batch_size=8, image_size=8, channels=4,
+        "dit": Case("simple_dit", dit, batch_size=8, image_size=32, channels=4,
                     fsdp_min_param_size=256),
         "dgemma": Case("diffusion_gemma", dgemma, canvas={"prompt_length": 16, "canvas_size": 8},
                        batch_size=8, seq_len=31, fsdp_min_param_size=256),
