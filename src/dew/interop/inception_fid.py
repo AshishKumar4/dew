@@ -15,6 +15,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.traverse_util import flatten_dict
 
 from dew.interop.safetensors_io import SEPARATOR, _flatten, _unflatten, read_file, write_file
 from dew.nn.text_encoders import ParamTree
@@ -182,16 +183,6 @@ def _module_leaves() -> list[tuple[str, ...]]:
     return [tuple(entry.key for entry in path) for path, _ in paths]
 
 
-def _pickle_leaves(tree: Mapping, prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
-    leaves: list[tuple[str, ...]] = []
-    for key, value in tree.items():
-        if isinstance(value, Mapping):
-            leaves.extend(_pickle_leaves(value, (*prefix, key)))
-        else:
-            leaves.append((*prefix, key))
-    return leaves
-
-
 def upstream_names() -> dict[str, tuple[str, ...]]:
     """Return every leaf the extractor initialises, against its jax-fid name.
 
@@ -223,7 +214,7 @@ def convert(pickle_path) -> Variables:
             node = node[step]
         converted[name] = np.asarray(node)
         taken.add(upstream)
-    for leaf in _pickle_leaves(source):
+    for leaf in flatten_dict(source):
         if leaf not in taken and leaf[0] not in _HEAD:
             raise ValueError(
                 f"{pickle_path} carries {SEPARATOR.join(leaf)}, which the extractor "
