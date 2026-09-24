@@ -20,6 +20,7 @@ compilation rather than a constant embedded in the executable.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Callable, Sequence
 
 import jax
@@ -132,8 +133,20 @@ class MaskedDiffusionObjective(Objective[Mean]):
         validation pass is exp of the ELBO bound per token, the number MDLM
         reports."""
         params = params if step.ema is None else step.ema
-        _, losses, weights, _, _ = self._token_losses(params, batch, step.key, train=False)
-        return TokenScores(losses=losses * weights, weights=jnp.ones_like(losses))
+        losses, weights = self._scored(params, batch, step.key)
+        return TokenScores(losses=losses, weights=weights)
+
+    @functools.cached_property
+    def _scored(self):
+        """Compile the evaluation's corruption and scores once per objective.
+        Run op by op, the model's forward would dispatch every operation of
+        every validation batch from the host, and jax's eager shard_map
+        refuses the chunked head's map over the data axis alone."""
+        def scored(params, batch, key):
+            _, losses, weights, _, _ = self._token_losses(params, batch, key, train=False)
+            return losses * weights, jnp.ones_like(losses)
+
+        return jax.jit(scored)
 
     def _token_losses(self, params, batch, key, *, train: bool):
         """Corrupt the batch once and score it.

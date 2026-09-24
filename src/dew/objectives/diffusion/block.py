@@ -14,6 +14,7 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import TYPE_CHECKING
 
@@ -286,8 +287,18 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         when the run keeps them, so `perplexity` over a validation pass is
         exp of the denoising loss per target."""
         params = params if step.ema is None else step.ema
-        canvas_losses, target_mask, _, _ = self._token_losses(params, batch, step.key, train=False)
-        return TokenScores(losses=canvas_losses, weights=target_mask.astype(canvas_losses.dtype))
+        losses, weights = self._scored(params, batch, step.key)
+        return TokenScores(losses=losses, weights=weights)
+
+    @functools.cached_property
+    def _scored(self):
+        """Compile the evaluation's canvas and scores once per objective, as
+        `MaskedDiffusion._scored` does, rather than running the model op by op."""
+        def scored(params, batch, key):
+            canvas_losses, target_mask, _, _ = self._token_losses(params, batch, key, train=False)
+            return canvas_losses, target_mask.astype(canvas_losses.dtype)
+
+        return jax.jit(scored)
 
     def _row(self, batch: Batch):
         """Read one batch's rows and the masks every later phase reads.
