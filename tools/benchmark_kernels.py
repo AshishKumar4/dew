@@ -33,6 +33,7 @@ import optax
 
 from dew.config import OptimConfig
 from dew.nn.moe import expert_projection
+from dew.telemetry.profile import capture_options
 from dew.training.optim import build_optimizer
 
 VOCAB = 50304
@@ -194,7 +195,7 @@ def step(args: argparse.Namespace) -> dict[str, object]:
         loss.block_until_ready()
         step_ms = (time.perf_counter() - start) / args.steps * 1e3
         if args.trace:
-            with jax.profiler.trace(args.trace):
+            with jax.profiler.trace(args.trace, profiler_options=capture_options()):
                 for _ in range(3):
                     state, loss, *_ = compiled(state, next(source))
                 loss.block_until_ready()

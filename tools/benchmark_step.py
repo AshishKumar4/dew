@@ -79,6 +79,7 @@ from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.registry import resolve_dtype, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
+from dew.telemetry.profile import capture_options
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.runtime import prepare_process
@@ -950,7 +951,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             # directory, since the trace file is named after the host.
             directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"),
                                      f"process{jax.process_index()}")
-            jax.profiler.start_trace(directory)
+            jax.profiler.start_trace(directory, profiler_options=capture_options())
             try:
                 for _ in range(config.profile_steps):
                     state, loss, is_finite = step(state)

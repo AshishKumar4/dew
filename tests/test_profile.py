@@ -184,6 +184,25 @@ def test_explicit_options_control_native_host_events(tmp_path, native_reports):
     assert "host_option_marker" in event_names(captures(tmp_path / "default")[0])
 
 
+def test_a_default_capture_leaves_python_calls_out_of_the_trace(tmp_path, native_reports):
+    """JAX's Python tracer records every Python and C call and slows Python-heavy host work
+    several times over, so a default capture leaves it off: the host time a trace shows is
+    the time the run spends."""
+
+    def python_tracer_marker():
+        return sum(range(100))
+
+    traced = jax.profiler.ProfileOptions()
+    traced.python_tracer_level = 1
+    for name, options in (("traced", traced), ("default", None)):
+        with dew.profile(tmp_path / name, options=options):
+            python_tracer_marker()
+    marked = {name: [event for event in event_names(captures(tmp_path / name)[0])
+                     if "python_tracer_marker" in event]
+              for name in ("traced", "default")}
+    assert marked["traced"] and not marked["default"], marked
+
+
 def test_missing_extra_fails_at_start_without_running_body(tmp_path, monkeypatch):
     module = importlib.import_module("dew.telemetry.profile")
     original = module.importlib.import_module

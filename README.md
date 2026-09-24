@@ -941,6 +941,8 @@ finally:
 
 Each capture gets a new directory, so restarting a profiler keeps earlier results. Without a path, the first start creates a persistent temporary directory, available as `prof.directory`. A capture keeps the native XPlane traces, the available HLO files, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's own viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
 
+A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `profile` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
+
 To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.profile`, not both.
 
 ### Sweeping a hyperparameter
