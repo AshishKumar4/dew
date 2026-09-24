@@ -430,8 +430,12 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
     x, cotangent = (rng.normal(size=(4, 16, 8)).astype(np.float32) for _ in range(2))
     taps = rng.normal(size=(16, 4)).astype(np.float32)
 
+    # The conv alone: its taps' gradient sums products of x and the
+    # cotangent, whose magnitudes bound the sum's rounding. After the
+    # activation the cotangent is scaled by silu', which is negative below
+    # about -1.28, so that bound would not hold for |x| and |cotangent|.
     def loss(x, taps, cotangent):
-        return jnp.sum(causal_conv1d(x, taps) * cotangent)
+        return jnp.sum(causal_conv1d(x, taps, activation=False) * cotangent)
 
     alone = jax.grad(loss, argnums=1)(x, taps, cotangent)
     mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
