@@ -344,22 +344,43 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
             float(alone.metrics["indexer_kl"]), rel=1e-5), phase
 
 
-def test_packing_carried_by_the_model_inputs_scores_the_same_kl():
-    """The sparse phase reads a packed row's documents off its `ModelInputs`
-    as it reads them off the batch's packing columns, padding queries
-    included, which count nothing either way."""
+@pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
+def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
+    """Either phase reads a packed row's documents off its `ModelInputs` as
+    it reads them off the batch's packing columns, to the bit, padding
+    queries included, which count nothing either way."""
     tokens = np.random.default_rng(3).integers(1, VOCAB, size=(SEQ + 1,))
     columns = packed_batch([packed_row(tokens[:7], tokens[7:13])])
     carried = {"text": ModelInputs(columns["text"], {"segment_ids": columns["text_segment_ids"],
                                                      "positions": columns["text_positions"]})}
-    objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
+    objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
     params = objective.init(jax.random.key(0))
 
     _, by_columns = scalar_loss(objective, params, columns, step_at())
     _, by_inputs = scalar_loss(objective, params, carried, step_at())
 
-    assert float(by_inputs.metrics["indexer_kl"]) == pytest.approx(
-        float(by_columns.metrics["indexer_kl"]), rel=1e-6)
+    assert float(by_inputs.metrics["indexer_kl"]) == float(by_columns.metrics["indexer_kl"])
+
+
+@pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
+def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
+    """One document, then padding whose ids are real tokens. The attention
+    mask of the `ModelInputs` marks the padding as the segment column's zeros
+    do, and the KL per counted query is the same number either way."""
+    tokens = np.random.default_rng(3).integers(1, VOCAB, size=(SEQ + 1,))
+    ids, segments, positions = packed_row(tokens[:7])
+    ids[7:] = np.random.default_rng(5).integers(1, VOCAB, size=ids.shape[0] - 7)
+    by_segments = packed_batch([(ids, segments, positions)])
+    by_mask = {"text": ModelInputs(jnp.asarray(ids[None]),
+                                   {"attention_mask": jnp.asarray(segments[None] != 0)})}
+    objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
+    params = objective.init(jax.random.key(0))
+
+    _, masked_by_segments = scalar_loss(objective, params, by_segments, step_at())
+    _, masked_by_inputs = scalar_loss(objective, params, by_mask, step_at())
+
+    assert (float(masked_by_inputs.metrics["indexer_kl"])
+            == float(masked_by_segments.metrics["indexer_kl"]))
 
 
 def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
