@@ -848,10 +848,24 @@ def killed_local_pool(tmp_path_factory):
                   process_id=index, coordinator=coordinator,
                   **local_flags(directory, block_after=LOCAL_KILL_AFTER, marker=marker))
             for index, marker in enumerate(markers)]
-    deadline = time.monotonic() + 600
+    began = time.monotonic()
     landed = [local_committed(directory, index, LOCAL_KILL_AFTER) for index in range(2)]
     landed.append(committed(worker.checkpoint_dir(directory / "run", "local"), 2 * SAVE_EVERY))
-    while time.monotonic() < deadline:
+    # When each step of the run landed and each process blocked, so a pool
+    # that progressed slowly reads differently from one that stopped. A local
+    # directory keeps one step, so a step replaced within one poll reads
+    # "never" while the later steps' times still show the run moving.
+    milestones = {
+        **{f"process {index} local step {step}": local_committed(directory, index, step)
+           for index in range(2) for step in range(LOCAL_EVERY, LOCAL_KILL_AFTER + 1, LOCAL_EVERY)},
+        **{f"persistent step {step}": committed(worker.checkpoint_dir(directory / "run", "local"), step)
+           for step in range(SAVE_EVERY, 2 * SAVE_EVERY + 1, SAVE_EVERY)},
+        **{f"process {index} blocked": marker for index, marker in enumerate(markers)}}
+    reached: dict[str, float] = {}
+    while time.monotonic() - began < 600:
+        for name, path in milestones.items():
+            if name not in reached and path.exists():
+                reached[name] = time.monotonic() - began
         if all(marker.exists() for marker in markers) and all(path.exists() for path in landed):
             break
         for process in pool:
@@ -862,9 +876,9 @@ def killed_local_pool(tmp_path_factory):
                             f"{process.communicate()[0]}")
         time.sleep(0.05)
     else:
-        state = {"blocked": [marker.exists() for marker in markers],
-                 "landed": [path.exists() for path in landed]}
-        pytest.fail(stuck(pool, f"block with local step {LOCAL_KILL_AFTER} landed {state}"))
+        timeline = ", ".join(f"{name} at {reached[name]:.1f} s" if name in reached else f"{name} never"
+                             for name in milestones)
+        pytest.fail(stuck(pool, f"block with local step {LOCAL_KILL_AFTER} landed: {timeline}"))
     for process in pool:
         terminate(process)
     assert all(process.returncode == -signal.SIGKILL for process in pool)
