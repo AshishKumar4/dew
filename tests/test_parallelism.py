@@ -546,11 +546,15 @@ def test_fsdp_shards_parameters_and_optimizer_state():
         assert param.shape[split[0]] // 2 == local.shape[split[0]]
         assert param.sharding.spec[split[0]] == 'fsdp'
 
-    # Adam moments and the EMA copy must follow the params they track, without
-    # the optimizer or the model ever describing a layout.
-    param_specs = [x.sharding.spec for x in jax.tree.leaves(state.params)]
-    assert param_specs == [x.sharding.spec for x in jax.tree.leaves(state.opt_state[0].mu)]
-    assert param_specs == [x.sharding.spec for x in jax.tree.leaves(state.ema)]
+    # Adam moments and the EMA copy must follow the variables they track,
+    # without the optimizer or the model ever describing a layout. The
+    # optimizer tracks the params collection; this objective's EMA tracks
+    # every collection.
+    def specs(tree):
+        return [x.sharding.spec for x in jax.tree.leaves(tree)]
+
+    assert specs(state.params["params"]) == specs(state.opt_state[0].mu)
+    assert specs(state.params) == specs(state.ema)
 
 
 def test_muon_masked_optimizer_state_shards_with_its_parameters():

@@ -674,7 +674,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
     params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
-    params = {**params, "constants": {"scale": jnp.asarray([1.003], jnp.float32)}}
+    params = {**params, "constants": {**params["constants"], "scale": jnp.asarray([1.003], jnp.float32)}}
     params["params"]["packed"] = jnp.asarray([16777217], jnp.int32)
     params["encoders"]["textcontext"]["constants"] = {
         "scale": jnp.asarray([3.14159], jnp.float32), "ids": jnp.asarray([16777217], jnp.int32)}

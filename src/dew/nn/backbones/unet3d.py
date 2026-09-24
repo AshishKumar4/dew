@@ -4,7 +4,7 @@ UNet3D: the 2D UNet inflated for video, AnimateDiff-style.
 Every frame goes through the 2D UNet's body, with a zero-initialized
 temporal attention block after the residual blocks of each resolution level.
 Zero init means a freshly inflated model reproduces the 2D UNet frame by
-frame, so a pretrained image checkpoint (inflate_unet_params) is the starting
+frame, so a pretrained image checkpoint (inflate_unet_variables) is the starting
 point and training only has to learn motion.
 """
 
@@ -82,13 +82,15 @@ class UNet3D(Unet):
         return out.reshape(B, T, H, W, self.output_channels)
 
 
-def inflate_unet_params(params_2d, params_3d):
-    """Copy a trained 2D Unet param tree into a UNet3D init.
+def inflate_unet_variables(variables_2d, variables_3d):
+    """Copy a trained 2D Unet's variables into a UNet3D init.
 
     Spatial module names are identical between the two models, so every 2D
-    leaf lands on its 3D counterpart; the temporal blocks keep their
-    (zero-init) fresh params. The result reproduces the 2D model frame by
-    frame until training moves the temporal weights.
+    leaf lands on its 3D counterpart, in every collection: the weights and
+    the Fourier table the 2D model's time embedding was trained against. The
+    temporal blocks keep their (zero-init) fresh params. The result
+    reproduces the 2D model frame by frame until training moves the temporal
+    weights.
     """
     def merge(dst, src):
         out = dict(dst)
@@ -99,4 +101,4 @@ def inflate_unet_params(params_2d, params_3d):
             else:
                 out[key] = value
         return out
-    return merge(params_3d, params_2d)
+    return merge(variables_3d, variables_2d)
