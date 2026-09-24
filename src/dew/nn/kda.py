@@ -25,11 +25,12 @@ recurrence and a different parameterisation around it
 - q and k are l2-normalised inside the rule as `x / sqrt(sum x^2 + eps)`
   (modeling_glm5_next.py:416-424).
 
-Both rule forms live here beside their GDN counterparts' shapes:
 `chunk_kimi_delta_rule` is `chunk_kimi_delta_attention`
-(modeling_glm5_next.py:482-578) and `recurrent_kimi_delta_rule` is
-`recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478), both in
-fp32. tests/test_kda.py holds them to a float64 oracle of the reference.
+(modeling_glm5_next.py:482-578) in fp32. The recurrent form is
+`dew.nn.linear.recurrent_delta_rule`, `recurrent_kimi_delta_attention`
+(modeling_glm5_next.py:428-478), which the gated delta rule shares with one
+decay per head. tests/test_kda.py holds both to a float64 oracle of the
+reference.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from .linear import (
     causal_conv1d,
     chunk_decay,
     l2norm,
+    recurrent_delta_rule,
     strictly_lower_inverse,
 )
 from .mixers import MixerBase, MixerContext, mixers
@@ -116,30 +118,6 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     core = jnp.moveaxis(core, 0, 2).reshape(B, H, T, Dv)
     core = jnp.moveaxis(core, 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
-
-
-def recurrent_kimi_delta_rule(query, key, value, g, beta, state=None):
-    """One token at a time, `recurrent_kimi_delta_attention`
-    (modeling_glm5_next.py:428-478) in fp32 as a scan over time."""
-    dtype = query.dtype
-    query, key, value, g, beta = (x.astype(jnp.float32) for x in (query, key, value, g, beta))
-    query = query * (key.shape[-1] ** -0.5)
-
-    def one_token(s, step):
-        q_t, k_t, v_t, g_t, beta_t = (step[name] for name in ('q', 'k', 'v', 'g', 'beta'))
-        s = s * jnp.exp(g_t)[..., :, None]                  # rows decay per key dimension
-        kv_mem = jnp.sum(s * k_t[..., :, None], axis=-2)   # [B, H, Dv]
-        delta = (v_t - kv_mem) * beta_t[..., None]
-        s = s + k_t[..., :, None] * delta[..., None, :]
-        return s, jnp.sum(s * q_t[..., :, None], axis=-2)
-
-    if state is None:
-        state = jnp.zeros((query.shape[0], query.shape[2], key.shape[-1], value.shape[-1]), jnp.float32)
-    state, out = jax.lax.scan(
-        one_token, state.astype(jnp.float32),
-        {name: jnp.moveaxis(x, 1, 0) for name, x in
-         (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta))})
-    return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the
@@ -272,7 +250,7 @@ class KimiDeltaAttention(nn.Module):
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)
             beta = jnp.where(valid[:, :, None], beta, 0.0)
-        rule = recurrent_kimi_delta_rule if S == 1 else functools.partial(
+        rule = recurrent_delta_rule if S == 1 else functools.partial(
             chunk_kimi_delta_rule, chunk_size=self.chunk_size)
         out, final = rule(query, key, value, g, beta, None if recurrent is None else recurrent.value)
         if recurrent is not None:

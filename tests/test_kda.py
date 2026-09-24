@@ -21,12 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kda import (
-    KimiDeltaAttention,
-    KimiDeltaAttentionMixer,
-    chunk_kimi_delta_rule,
-    recurrent_kimi_delta_rule,
-)
+from dew.nn.kda import KimiDeltaAttention, KimiDeltaAttentionMixer, chunk_kimi_delta_rule
+from dew.nn.linear import recurrent_delta_rule
 from dew.registry import mixers
 
 BOUND = 1e-4
@@ -157,7 +153,7 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule(operands):
     from dew.nn.linear import l2norm
 
     ql, kl = l2norm(jnp.asarray(q, jnp.float32)), l2norm(jnp.asarray(k, jnp.float32))
-    out, final = recurrent_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state))
+    out, final = recurrent_delta_rule(ql, kl, *as_f32(v, g, beta, state))
     chunked, chunked_state = chunk_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
