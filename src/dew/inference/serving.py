@@ -764,8 +764,9 @@ class Server:
                   chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1) -> Server:
         """A server over the task's model, weights, processor and policy.
 
-        `capacity` rounds up to a shape bucket and may not exceed the
-        model's context. The task's `n` has to be one and its strategy the
+        `capacity` rounds up to whole 64-slot tiles, and whole pages of a
+        paged cache, and may not exceed the model's context. The task's `n`
+        has to be one and its strategy the
         row-wise sampler (with or without a grammar), since the server's loop
         is that sampler over rows that come and go.
 
@@ -820,15 +821,20 @@ class Server:
             raise ValueError("a server needs a model that declares max_seq_len for its cache")
         if type(capacity) is not int or capacity < 1:
             raise ValueError("capacity must be a positive number of cache slots per row")
-        rounded = _bucket(capacity, 64)
-        if rounded > ceiling:
-            raise ValueError(f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}")
-        model = _sized(task.model, rounded)
+        model = task.model
         if kv_cache is not None:
             if not any(entry.name == "kv_cache" for entry in dataclasses.fields(model)):
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
             model = model.clone(kv_cache=kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
+        # One program serves one capacity, so the cache holds whole tiles of it
+        # rather than a power-of-two bucket: every decode step's attention reads
+        # each slot, and a capacity of 384 bucketed to 512 read a third more.
+        unit = math.lcm(64, layout.page_size or 64)
+        rounded = -(-capacity // unit) * unit
+        if rounded > ceiling:
+            raise ValueError(f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}")
+        model = _sized(model, rounded)
         groups = _row_groups(mesh)
         rows: Rows
         if layout.page_size is None:
@@ -997,7 +1003,8 @@ class Server:
                   for index, (slot, row) in enumerate(waiting)]
         if not chosen:
             return None
-        width = _bucket(max(len(row.prompt) - row.prefilled for _, _, row in chosen), 64)
+        # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
+        width = min(_bucket(max(len(row.prompt) - row.prefilled for _, _, row in chosen), 64), self.capacity)
         width = width if self.rows.chunk is None else min(width, self.rows.chunk)
         count, capacity = self.admission, self.capacity
         tokens = np.zeros((count, width), np.int32)
