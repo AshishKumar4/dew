@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import jax
+from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
@@ -108,8 +109,13 @@ def prepare_process(wandb: Wandb | None = None,
                 raise
         else:
             # Before the backend opens, which can fail on one process of a
-            # pool that has formed, a GPU with no memory left for one.
-            end_pool_on_failure()
+            # pool that has formed, a GPU with no memory left for one. The
+            # watch leaves through os._exit, past the atexit handlers, which
+            # only a peer waiting in a collective justifies; a pool of one
+            # process keeps Python's own exit. The count is the pool's as it
+            # formed: jax.process_count() would open the backend.
+            if global_state.num_processes > 1:
+                end_pool_on_failure()
             # XLA reads its flags when the backend opens, which the first
             # line below does. The watchdog is the CUDA plugin's, and a TPU
             # host's libtpu need not know its flag.
