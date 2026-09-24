@@ -91,6 +91,8 @@ JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlv
 
 `--openai-base-url` and `--ollama-host` also send the same prompt to a served model, through the adapters in `dew.inference.clients`. Both SDKs are optional extras. If one is not installed, the report says so and the script carries on.
 
+`data/shakespeare` is the token directory that the commands in [`train_lm.py`](../examples.md#train_lmpy) download and write.
+
 ```bash
 python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
     --tokens data/shakespeare --tasks hellaswag arc_easy --harness-limit 200 \

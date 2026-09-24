@@ -463,6 +463,8 @@ not depend on the card's kernels, and the run is small enough that one
 workstation CPU does nine of them in under an hour.
 
 ```
+curl -o data/shakespeare.txt --create-dirs \
+    https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 python tools/tokenize_text.py --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
@@ -471,9 +473,8 @@ JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --out /tmp/muon-3e-3.json
 ```
 
-I ran the second command once per arm, learning rate and seed.
-`data/shakespeare.txt` is not in the repository; point `--input` at your own
-copy of the corpus.
+The first command downloads the corpus, which is not in the repository. I ran
+the last command once per arm, learning rate and seed.
 
 Conditions: `causal_transformer`, 128 wide, 2 layers, 2 heads, tied head, byte
 vocabulary of 256, sequence length 128, batch 16, 557,952 parameters, bf16
