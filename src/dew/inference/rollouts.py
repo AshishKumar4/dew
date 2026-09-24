@@ -277,11 +277,12 @@ class SafetensorsReload:
     the stamp a recording gateway needs.
 
     A multi-process trainer calls the push on every process. The pool
-    gathers the served tree to host memory on every process
-    (`collective_host`), process 0 writes and publishes, and every process
-    learns the outcome at an agreement point, so a failed push raises on
-    all of them instead of leaving the others to hang at the next
-    collective.
+    gathers the served tree to process 0's host memory (`collective_host`
+    with `held_by="first"`: every process takes part in the gather, and
+    only process 0 holds the policy), process 0 writes and publishes, and
+    every process learns the outcome at an agreement point, so a failed
+    push raises on all of them instead of leaving the others to hang at the
+    next collective.
     """
 
     source: Pretrained
@@ -297,8 +298,9 @@ class SafetensorsReload:
 
     def write(self, variables: Variables) -> None:
         """Write `variables` into `directory`, file by file atomically; every process of a pool calls it."""
-        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight export gather")
-        agreed("weight export", lambda: self._save(served) if jax.process_index() == 0 else None)
+        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight export gather",
+                                 held_by="first")
+        agreed("weight export", lambda: None if served is None else self._save(served))
 
     def _save(self, variables: Variables) -> None:
         directory = Path(self.directory)
