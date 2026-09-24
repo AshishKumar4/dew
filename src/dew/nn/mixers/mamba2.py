@@ -345,8 +345,8 @@ class Mamba2(nn.Module):
         self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
                                       use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         # The reference's init: A_log = log(1..H), dt_bias the inverse
-        # softplus of a step drawn between time_step_min and max, D ones
-        # (init_mamba2_weights, modeling_mamba2.py:428-442).
+        # softplus of a step drawn between its default time_step_min and
+        # max, D ones (init_mamba2_weights, modeling_mamba2.py:428-442).
         self.A_log = self.param('A_log', _log_head_index, (self.num_heads,))
         self.dt_bias = self.param('dt_bias', _inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
@@ -546,12 +546,13 @@ def _log_head_index(key, shape):
     return jnp.log(jnp.arange(1, shape[0] + 1, dtype=jnp.float32))
 
 
-def _inverse_softplus_step(key, shape, minimum: float = 0.001, maximum: float = 0.1, floor: float = 1e-4):
-    """`init_mamba2_weights`' dt_bias (modeling_mamba2.py:434-442): a step
-    log-uniform between the config's time_step_min and max, floored, then
-    the inverse of softplus so the forward's softplus recovers it."""
-    step = jnp.exp(jax.random.uniform(key, shape) * (jnp.log(maximum) - jnp.log(minimum)) + jnp.log(minimum))
-    step = jnp.maximum(step, floor)
+def _inverse_softplus_step(key, shape):
+    """`init_mamba2_weights`' dt_bias (modeling_mamba2.py:434-442) at the
+    reference config's defaults: a step log-uniform between time_step_min
+    0.001 and time_step_max 0.1, floored at time_step_floor 1e-4, then the
+    inverse of softplus so the forward's softplus recovers it."""
+    step = jnp.exp(jax.random.uniform(key, shape) * (jnp.log(0.1) - jnp.log(0.001)) + jnp.log(0.001))
+    step = jnp.maximum(step, 1e-4)
     return step + jnp.log(-jnp.expm1(-step))
 
 
