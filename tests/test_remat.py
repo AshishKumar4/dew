@@ -111,8 +111,8 @@ def test_norms_keep_the_residual_stream_in_its_compute_dtype(rng, remat):
     for the stream itself.
 
     `normalized_in_fp32` recomputes that half. What is left at the stream's
-    shape is one fp32 tensor for the whole model, the fp32 output head's own
-    promoted input, and one bf16 tensor per norm: the norm's input, which is
+    shape is at most one fp32 tensor for the whole model, the fp32 output
+    head's own promoted input, and one bf16 tensor per norm: the norm's input, which is
     the stream as the block already holds it.
     """
     batch, features, layers = 2, 64, 2
@@ -126,7 +126,8 @@ def test_norms_keep_the_residual_stream_in_its_compute_dtype(rng, remat):
 
     stream = f'[{batch},{tokens},{features}]'
     in_fp32 = [line for line in lines if f'f32{stream}' in line]
-    assert len(in_fp32) == 1 and 'promote_dtype' in in_fp32[0], in_fp32
+    # At most the output head's promoted input; jax 0.11.2 saves none.
+    assert len(in_fp32) <= 1 and all('promote_dtype' in line for line in in_fp32), in_fp32
     assert [line for line in lines if f'bf16{stream}' in line]
     # What a norm leaves behind is its own cast output and nothing else: the
     # fp32 reductions are recomputed rather than named, so a block's remat
