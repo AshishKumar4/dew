@@ -116,8 +116,8 @@ def is_fourier_table(path: jax.tree_util.KeyPath) -> bool:
     the module's `features` and `scale`, so it is the table those weights
     trained against.
     """
-    keys = [getattr(key, "key", key) for key in path]
-    return len(keys) > 1 and keys[0] == "constants" and keys[-1] == "frequencies"
+    names = jax.tree_util.keystr(path, simple=True, separator="/").split("/")
+    return len(names) > 1 and names[0] == "constants" and names[-1] == "frequencies"
 
 
 @logical_axes({}, heuristic=(("DenseGeneral_*",),))
