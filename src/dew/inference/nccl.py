@@ -27,11 +27,12 @@ the weights that computed it; `POST /resume`. A replica that fails after the
 pause stays paused, as under `SafetensorsReload`.
 
 Every process of a multi-process trainer calls the push. The pool gathers
-the served policy to host memory leaf by leaf, as `SafetensorsReload` does
-(`collective_host`), so a device holds one leaf of it at a time beside the
-trainer's state. The process holding the mesh's first device exports it and
-sends from that device, `chunk` bytes placed there at a time, and every
-process learns the outcome at an agreement point.
+the served policy to process 0's host memory, as `SafetensorsReload` does
+(`collective_host` with `held_by="first"`), in groups of at most
+`dew.artifacts.GATHER_BYTES`, so a device holds one group of it at a time
+beside the trainer's state. Process 0 exports it and sends from its first
+device of the mesh, `chunk` bytes placed there at a time, and every process
+learns the outcome at an agreement point.
 """
 
 from __future__ import annotations
@@ -171,9 +172,9 @@ class NCCLPush:
     the first push and stay open until `close`.
 
     `timings` holds the seconds each phase of the last push took: `gather`
-    (the cast and the gather to host, every process), and on the sending
-    process `export`, `send` (copies and broadcasts until every replica has
-    loaded the tensors) and `total`.
+    (the cast and the gather to process 0's host, every process), and on
+    process 0, which sends, `export`, `send` (copies and broadcasts until
+    every replica has loaded the tensors) and `total`.
     """
 
     source: Pretrained
@@ -196,11 +197,14 @@ class NCCLPush:
     def __call__(self, variables: Variables, version: int) -> None:
         began = time.perf_counter()
         mesh = mesh_of(variables)
-        sender = jax.local_devices()[0] if mesh is None else mesh.devices.flat[0]
-        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight push gather")
+        # Process 0 holds the gathered policy, so it sends, from its first device of the mesh.
+        sender = jax.local_devices()[0] if mesh is None else next(
+            device for device in mesh.devices.flat if device.process_index == 0)
+        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight push gather",
+                                 held_by="first")
         self.timings["gather"] = time.perf_counter() - began
-        agreed("weight push", lambda: self._push(served, SingleDeviceSharding(sender), sender.local_hardware_id,
-                                                 version) if sender in jax.local_devices() else None)
+        agreed("weight push", lambda: None if served is None else self._push(
+            served, SingleDeviceSharding(sender), sender.local_hardware_id, version))
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
