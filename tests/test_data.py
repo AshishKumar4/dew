@@ -737,13 +737,14 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     frame_samples = 640
     seen = {}
 
-    def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed):
+    def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
+                                 fps=25.0):
         seen.update(video_path=video_path, num_frames=num_frames,
                     audio_padding=audio_padding, seed=seed)
         padded = num_frames + 2 * audio_padding
-        audio = np.linspace(-0.5, 0.5, padded * frame_samples, dtype=np.float32)
+        audio = np.linspace(-0.5, 0.5, padded * int(sample_rate / fps), dtype=np.float32)
         # Native resolution differs from frame_size, so the resize must happen
-        return np.zeros((num_frames, 96, 48, 3), np.uint8), audio.reshape(padded, frame_samples)
+        return np.zeros((num_frames, 96, 48, 3), np.uint8), audio.reshape(padded, -1)
 
     monkeypatch.setattr(av_utils, "read_av_random_clip", fake_read_av_random_clip)
     monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
@@ -761,6 +762,31 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     flat = waveform.reshape(-1)
     normalised = (flat - flat.mean()) / np.sqrt(flat.var() + 1e-7)
     assert np.allclose(batch["audio"]["input_values"], normalised, atol=1e-5)
+
+
+def test_a_clip_is_decoded_at_the_rate_its_audio_model_reads(tmp_path, monkeypatch):
+    """The extractor is told the waveform is at its own rate, so the clip has
+    to be decoded at that rate: a 48 kHz model's record holds 1920 samples a
+    frame at 25 fps, where a 16 kHz read would hand it 640 and the extractor
+    would take a third of a second of sound for a whole one."""
+    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
+
+    _voxceleb_tree(tmp_path)
+    spec = VoxCeleb2(path=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
+
+    def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
+                                 fps=25.0):
+        rows = num_frames + 2 * audio_padding
+        return (np.zeros((num_frames, 32, 32, 3), np.uint8),
+                np.zeros((rows, int(sample_rate / fps)), np.float32))
+
+    monkeypatch.setattr(av_utils, "read_av_random_clip", fake_read_av_random_clip)
+    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
+                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=48000))
+
+    batch = video.AudioVideoTransform(spec).random_map(spec.source()[0], np.random.default_rng(0))
+
+    assert batch["audio"]["full_audio"].shape == (6, 48000 // 25)
 
 
 def keep_captions(captions):

@@ -68,18 +68,20 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         # moviepy is imported on the first record, so importing this module needs no `av` extra.
         from .sources.av_utils import read_av_random_clip
+        # The extractor is told the waveform is at its own rate, so it is read at that rate.
         frames, audio = read_av_random_clip(
             element["video_path"], num_frames=self.spec.frames,
-            audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)))
+            audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)),
+            sample_rate=self.audio.sampling_rate)
         size = self.spec.frame_size
         if frames.shape[1] != size or frames.shape[2] != size:
             import cv2
             frames = np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
                                for frame in frames])
         # The extractor takes one waveform and hands back a batch of one;
-        # given the rows it would read each frame's 640 samples as a clip
-        # of its own. Key names differ per audio model, so its output
-        # passes through untouched.
+        # given the rows it would read each frame's samples as a clip of
+        # its own. Key names differ per audio model, so its output passes
+        # through untouched.
         features = self.audio(audio.reshape(-1))
         return {
             "video": frames,
