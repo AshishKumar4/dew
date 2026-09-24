@@ -188,10 +188,23 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, platform, in_float64)
     (the final state: 2.8e-07 against 2.1e-07 on CPU, 1.8e-07 against
     3.7e-07 under CUDA)."""
     operands = scan_operands(reference, 128)
-    exact = [jnp.asarray(t, jnp.float64) for t in operands]
-    truth, truth_final = xla_chunk_scan(*exact)
-    seeded = cotangents(truth, truth_final)
-    exact_gradients = jax.vjp(xla_chunk_scan, *exact)[1](tuple(t.astype(jnp.float64) for t in seeded))
+    # The float64 oracle runs on the host where there is one: a TPU emulates
+    # float64 op by op, and compiling its vjp there ran past the lane's 900 s
+    # on a cold compile cache (main c206616e and ca41020b). A TPU process
+    # without the cpu platform falls back to the device.
+    try:
+        oracle = jax.devices("cpu")[0]
+    except RuntimeError:
+        oracle = jax.devices()[0]
+    with jax.default_device(oracle):
+        exact = [jax.device_put(np.asarray(t, np.float64), oracle) for t in operands]
+        truth, truth_final = xla_chunk_scan(*exact)
+        seeded = cotangents(truth, truth_final)
+        exact_gradients = jax.vjp(xla_chunk_scan, *exact)[1](
+            tuple(t.astype(jnp.float64) for t in seeded))
+    # The oracle's values stay where they were computed (`largest` reads
+    # them as numpy); the cotangents feed the device's own vjps.
+    seeded = jax.device_put(seeded, jax.devices()[0])
 
     rounded, rounded_final = xla_chunk_scan(*operands)
     scanned, final = ssd_chunk_scan(*operands, platform)
