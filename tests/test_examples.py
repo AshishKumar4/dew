@@ -213,6 +213,16 @@ def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     assert summary["updates"] == 2 and summary["max_lag"] == 1
 
 
+def test_train_rlvr_accumulation_pools_steps_into_one_update(tmp_path):
+    """`--accumulation 2` pools the smoke's two steps into one optimizer
+    update: an update trains on both steps' rows while a step, and the
+    native server's cache with it, holds half of them. That is how the
+    two-attempt run fits one 24 GB GPU."""
+    smoke("train_rlvr", tmp_path, "--accumulation", "2")
+    summary = json.loads((tmp_path / "rewards.json").read_text())
+    assert summary["updates"] == 1
+
+
 def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
     """`--turns 2` runs its sessions through EnvironmentSource and commits both updates, one behind.
     The tiny model's attempts end on the token budget, so the feedback path
