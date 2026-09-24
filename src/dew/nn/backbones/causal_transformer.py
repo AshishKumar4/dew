@@ -24,7 +24,7 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, Sequence
+from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 
 import flax.core
 import jax
@@ -593,6 +593,38 @@ def remat_policy(
     ("per_layer_input_gate",): ("embed", "mlp"),
     ("per_layer_projection",): ("mlp", "embed"),
 })
+class _Plain(NamedTuple):
+    """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
+    predictions of every copy when the block runs AltUp."""
+
+    x: jax.Array
+    predictions: jax.Array | None
+
+
+class _Streams(NamedTuple):
+    """mHC's streams `[B, S, hc_mult, D]` inside a block, and under Single-Pass
+    the fp32 `pre` the next site collapses them by."""
+
+    streams: jax.Array
+    pre: jax.Array | None
+
+
+class _Depth(NamedTuple):
+    """Kimi K3's depth state inside a block: the block slots `[B, S, blocks, D]`,
+    the partial sum `[B, S, D]` and how many slots are finished.
+
+    `finished` is a Python int, static per layer (`ResidualSite.finished`), so
+    a `_Depth` lives only inside one block's forward and never crosses a jax
+    transform, where it would become a traced leaf."""
+
+    blocks: jax.Array
+    partial: jax.Array
+    finished: int
+
+
+_BlockState = _Plain | _Streams | _Depth
+
+
 class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
@@ -644,6 +676,12 @@ class DecoderBlock(nn.Module):
     (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
     of the finished blocks and the partial its site holds, as a plain
     pre-norm block reads the residual, and adds its output to the partial.
+
+    Every form runs one forward (`_forward`): `_enter` turns the residual
+    the block receives into its state, each sublayer `_read`s its input
+    from that state and `_write`s its output back, and `_leave` hands the
+    next block its residual. The model's `_expand` and `_collapse` turn the
+    embeddings into the first block's residual and the last block's back.
 
     engram writes the layer's n-gram lookup into the streams before anything
     else reads them (V4.1 inference/model.py:1261-1263); `engram_index` is
@@ -735,11 +773,12 @@ class DecoderBlock(nn.Module):
         if self.hyper_connections is not None:
             if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
                     or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim):
+                    or self.laurel_rank is not None or self.per_layer_input_dim
+                    or self.residual_multiplier != 1.0):
                 raise ValueError(
                     "hyper_connections runs the mHC block, a plain pre-norm block whose "
                     "residual is the stream stack: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel or per-layer inputs")
+                    "branch, altup, laurel, per-layer inputs or residual multiplier")
             site = functools.partial(HyperConnection, spec=self.hyper_connections,
                                      emb_features=self.emb_features, norm_eps=self.norm_eps)
             self.attn_hc = site(name='attn_hc')
@@ -797,136 +836,153 @@ class DecoderBlock(nn.Module):
 
     def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
                  kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
-        if self.hyper_connections is not None:
-            return self._forward_streams(x, train, decode, positions, segment_ids,
-                                         kv_store, attention_metadata, prediction_phase, per_layer_input)
-        if self.residual_site is not None:
-            return self._forward_depth(x, train, decode, positions, segment_ids,
-                                       kv_store, attention_metadata, prediction_phase, per_layer_input)
-        altup = self.altup
-        predictions = None if altup is None else self.altup_layer.predict(x, train=train)
-        if altup is not None and predictions is not None:
-            x = predictions[altup.active_idx]
-        # The residual stream sits where the batch does, before and after
-        # each sublayer: fsdp gathers weights rather than sum partial
-        # products, and a row-parallel projection's sum scatters back.
-        x = constrain(x, RESIDUAL)
-        normed = self.input_layernorm(x) if self.wiring.pre_norms else x
+        """The block's one forward over whichever residual form it runs.
+
+        The form (`_enter`, `_read`, `_write`, `_leave`) decides what the
+        residual is and how each sublayer reads it and writes back into it:
+        the plain `[B, S, D]` stream, Gemma 3n's AltUp copies, mHC's streams
+        with or without the Single-Pass schedule, or Kimi K3's depth state.
+        The sublayers themselves, their norms and their branches run the same
+        for every form.
+        """
+        state = self._enter(x, train, attention_metadata)
+        state, read, site = self._read(state, "attention")
+        normed = self.input_layernorm(read) if self.wiring.pre_norms else read
         mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
-        mixed = self._scaled_branch(mixed)
-        x = constrain(x + self.dropout(mixed, deterministic=not train), RESIDUAL)
+        state = self._write(state, "attention", self._branch(mixed, train), site)
         if self.laurel_rank is not None:
-            x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
+            # Only the plain form admits LAuReL (setup refuses the rest).
+            assert isinstance(state, _Plain)
+            state = state._replace(x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype))
         if self.feedforward is not None:
             routes = self._routes(per_layer_input)
-            hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x,
+            state, read, site = self._read(state, "mlp")
+            hidden = self.mlp(self.post_attention_layernorm(read) if self.wiring.pre_norms else read,
                               **self._feedforward_inputs(attention_metadata),
                               **({} if self.parallel is not None else routes))
             if self.parallel is not None:
-                hidden = self.moe(x, hidden, **routes)
+                hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
-            hidden = self._scaled_branch(hidden)
-            x = constrain(x + self.dropout(hidden, deterministic=not train), RESIDUAL)
-        if altup is not None and predictions is not None:
-            corrected = self.altup_layer.correct(predictions, x, train=train)
-            if self.per_layer_input_dim and per_layer_input is not None and per_layer_input.embeddings is not None:
-                first = corrected[altup.active_idx]
-                if altup.correct_scale:
+            state = self._write(state, "mlp", self._branch(hidden, train), site)
+        return self._leave(state, train, per_layer_input)
+
+    def _branch(self, output, train: bool):
+        """A sublayer's output as it joins the residual: times
+        `residual_multiplier` (lm-engine's m_residual, GraniteMoeHybrid's
+        residual_multiplier) in its own dtype, then dropped out."""
+        return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
+
+    def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:
+        """The residual the block received, as the state its sublayers read."""
+        if self.hyper_connections is not None:
+            streams, pre = residual if self.hyper_connections.single_pass else (residual, None)
+            if self.engram is not None:
+                if attention_metadata is None or attention_metadata.engram_ids is None:
+                    raise ValueError("an engram layer reads the bucket ids the model hashes into "
+                                     "attention_metadata.engram_ids")
+                # A media position takes no engram contribution (V4.1 model.py:351-365), and
+                # the lookup lands before anything reads the streams (:1261-1263).
+                streams = self.engram_layer(
+                    streams, attention_metadata.engram_ids[:, :, self.engram_index],
+                    None if attention_metadata.media is None else ~attention_metadata.media)
+            if (self.prediction_slot is not None and not self.is_initializing()
+                    and self.is_mutable_collection('prediction_inputs')):
+                # DSpark reads each target layer's attention input, after its
+                # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
+                mean = jnp.mean(streams, axis=2)
+                self.sow('prediction_inputs', 'draft_context', mean,
+                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+            return _Streams(constrain(streams, STREAMS), pre)
+        if self.residual_site is not None:
+            return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
+        predictions = None if self.altup is None else self.altup_layer.predict(residual, train=train)
+        x = residual if self.altup is None or predictions is None else predictions[self.altup.active_idx]
+        # The residual stream sits where the batch does, before and after
+        # each sublayer: fsdp gathers weights rather than sum partial
+        # products, and a row-parallel projection's sum scatters back.
+        return _Plain(constrain(x, RESIDUAL), predictions)
+
+    def _read(self, state: _BlockState, site: Literal["attention", "mlp"]):
+        """What the sublayer at `site` reads, as `(state, input, mapping)`;
+        `mapping` is what `_write` needs from the read (mHC's post and comb)."""
+        if isinstance(state, _Plain):
+            return state, state.x, None
+        if isinstance(state, _Streams):
+            spec = self.hyper_connections
+            assert spec is not None
+            pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
+            # Under Single-Pass, a site collapses by the `pre` the site before
+            # it computed and hands its own on (V4.1 inference/model.py:968-994).
+            by = state.pre if spec.single_pass else pre
+            return (_Streams(state.streams, pre if spec.single_pass else None),
+                    collapse_by(by, state.streams), (post, comb))
+        site_spec = self.residual_site
+        assert site_spec is not None
+        if site == "mlp":
+            return state, self.mlp_res(sources(state.blocks, state.finished, state.partial)), None
+        # The attention reads the mixture of the blocks finished before this
+        # layer with the partial it received, or that partial alone before any
+        # block is finished (KimiDecoderLayer._forward_attn_residual,
+        # modeling_kimi_linear.py:973-1046).
+        if not state.finished:
+            if self.is_initializing():
+                # Layer 0 carries the site like every layer and never reads it
+                # (the reference skips it on an empty block list, :987-993); the
+                # tree holds it so the checkpoint's tensors have a leaf.
+                self.attention_res(state.partial[:, :, None])
+            read = state.partial
+        else:
+            read = self.attention_res(sources(state.blocks, state.finished, state.partial))
+        if site_spec.opens:
+            # A layer that opens a block closes the partial it received into
+            # the next slot, and its attention output starts the new partial.
+            state = _Depth(state.blocks.at[:, :, state.finished].set(state.partial), state.partial,
+                           state.finished + 1)
+        return state, read, None
+
+    def _write(self, state: _BlockState, site: Literal["attention", "mlp"], output, mapping) -> _BlockState:
+        """The state after the sublayer at `site` adds `output` to it."""
+        if isinstance(state, _Plain):
+            return state._replace(x=constrain(state.x + output, RESIDUAL))
+        if isinstance(state, _Streams):
+            post, comb = mapping
+            return state._replace(streams=constrain(mix_streams(post, comb, output, state.streams), STREAMS))
+        site_spec = self.residual_site
+        assert site_spec is not None
+        opens = site == "attention" and site_spec.opens
+        return state._replace(partial=output if opens else state.partial + output)
+
+    def _leave(self, state: _BlockState, train: bool, per_layer_input):
+        """The residual the block hands the next one."""
+        if isinstance(state, _Streams):
+            spec = self.hyper_connections
+            assert spec is not None
+            if not spec.single_pass:
+                return state.streams
+            assert state.pre is not None
+            return Carried(state.streams, state.pre)
+        if isinstance(state, _Depth):
+            return jnp.concatenate([state.blocks, state.partial[:, :, None]], axis=2)
+        x = state.x
+        embeddings = None if per_layer_input is None else per_layer_input.embeddings
+        if self.altup is not None and state.predictions is not None:
+            corrected = self.altup_layer.correct(state.predictions, x, train=train)
+            if self.per_layer_input_dim and embeddings is not None:
+                first = corrected[self.altup.active_idx]
+                if self.altup.correct_scale:
                     first = self.altup_layer.scale_corrected_output(first)
                 # The per-layer residual lands on the copies past the first,
                 # the active one left as corrected.
-                corrected = corrected.at[1:].add(self._per_layer_residual(first, per_layer_input.embeddings))
+                corrected = corrected.at[1:].add(self._per_layer_residual(first, embeddings))
             return corrected
-        if self.per_layer_input_dim and per_layer_input is not None and per_layer_input.embeddings is not None:
-            x = x + self._per_layer_residual(x, per_layer_input.embeddings)
+        if self.per_layer_input_dim and embeddings is not None:
+            x = x + self._per_layer_residual(x, embeddings)
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
-
-    def _forward_streams(self, residual, train: bool, decode: bool, positions, segment_ids,
-                         kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
-                         per_layer_input: LayerInputs | None = None):
-        """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327),
-        each sublayer collapsing by its own site's `pre`, or under the
-        Single-Pass schedule by the one the site before it computed and
-        handing its own on (V4.1 inference/model.py:968-994)."""
-        spec = self.hyper_connections
-        assert spec is not None
-        streams, carried = residual if spec.single_pass else (residual, None)
-        if self.engram is not None:
-            if attention_metadata is None or attention_metadata.engram_ids is None:
-                raise ValueError("an engram layer reads the bucket ids the model hashes into "
-                                 "attention_metadata.engram_ids")
-            # A media position takes no engram contribution (model.py:351-365).
-            streams = self.engram_layer(
-                streams, attention_metadata.engram_ids[:, :, self.engram_index],
-                None if attention_metadata.media is None else ~attention_metadata.media)
-        if (self.prediction_slot is not None and not self.is_initializing()
-                and self.is_mutable_collection('prediction_inputs')):
-            # DSpark reads each target layer's attention input, after its
-            # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
-            mean = jnp.mean(streams, axis=2)
-            self.sow('prediction_inputs', 'draft_context', mean,
-                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
-        streams = constrain(streams, STREAMS)
-        attn_pre, post, comb = self.attn_hc.mapping(streams)
-        collapsed = collapse_by(attn_pre if carried is None else carried, streams)
-        mixed = self._mix(self.input_layernorm(collapsed), decode, positions, segment_ids,
-                          kv_store, attention_metadata, prediction_phase)
-        streams = constrain(
-            mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams), STREAMS)
-        handed = attn_pre
-        if self.feedforward is not None:
-            ffn_pre, post, comb = self.ffn_hc.mapping(streams)
-            collapsed = collapse_by(ffn_pre if carried is None else attn_pre, streams)
-            hidden = self.mlp(self.post_attention_layernorm(collapsed),
-                              **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
-            streams = constrain(
-                mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams), STREAMS)
-            handed = ffn_pre
-        return streams if carried is None else Carried(streams, handed)
-
-    def _scaled_branch(self, branch):
-        """A sublayer's output times `residual_multiplier` (lm-engine's
-        m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
-        return scaled(branch, self.residual_multiplier)
-
-    def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
-                       kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
-                       per_layer_input: LayerInputs | None = None):
-        """Kimi K3's block over `[B, S, blocks + 1, D]`
-        (`KimiDecoderLayer._forward_attn_residual`, modeling_kimi_linear.py:973-1046).
-
-        The attention reads the mixture of the blocks finished before this
-        layer with the partial it received, or that partial alone before any
-        block is finished. A layer that opens a block closes that partial
-        into the next slot, and the attention output starts the new partial.
-        """
-        site = self.residual_site
-        assert site is not None
-        blocks, partial = state[:, :, :-1], state[:, :, -1]
-        finished = site.finished
-        if not finished and self.is_initializing():
-            # Layer 0 carries the site like every layer and never reads it
-            # (the reference skips it on an empty block list, :987-993); the
-            # tree holds it so the checkpoint's tensors have a leaf.
-            self.attention_res(partial[:, :, None])
-        read = partial if not finished else self.attention_res(sources(blocks, finished, partial))
-        if site.opens:
-            blocks = blocks.at[:, :, finished].set(partial)
-            finished += 1
-        mixed = self._mix(self.input_layernorm(read), decode, positions, segment_ids,
-                          kv_store, attention_metadata, prediction_phase)
-        mixed = self.dropout(mixed, deterministic=not train)
-        partial = mixed if site.opens else partial + mixed
-        if self.feedforward is not None:
-            hidden = self.mlp(self.post_attention_layernorm(self.mlp_res(sources(blocks, finished, partial))),
-                              **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
-            partial = partial + self.dropout(hidden, deterministic=not train)
-        return jnp.concatenate([blocks, partial[:, :, None]], axis=2)
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
              prediction_phase: PredictionPhase):
@@ -2425,6 +2481,52 @@ class CausalTransformer(nn.Module):
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
 
+    def _expand(self, x):
+        """The embeddings `[B, S, D]` as the residual form the blocks take and
+        return (`DecoderBlock._enter`): Gemma 3n's AltUp copies, mHC's
+        streams (with Single-Pass's first collapse), Kimi K3's depth state,
+        or the embeddings themselves."""
+        if self.altup is not None:
+            # The embeddings and, rescaled to their magnitude, each projected
+            # copy: [num_inputs, B, S, D].
+            return jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
+        hc, depth = self.hyper_connections, self.attention_residuals
+        if hc is not None:
+            # The embeddings copied into every residual stream: [B, S, hc_mult, D].
+            streams = expand_streams(x, hc.hc_mult)
+            return Carried(streams, first_stream(streams)) if hc.single_pass else streams
+        if depth is not None:
+            # The embeddings as the first partial sum after empty blocks: [B, S, blocks + 1, D].
+            return jnp.pad(x[:, :, None], ((0, 0), (0, 0), (depth.blocks(self.num_layers), 0), (0, 0)))
+        return x
+
+    def _collapse(self, residual):
+        """The last block's residual back to `[B, S, D]` for the final norm,
+        as `(uncollapsed, collapsed)`: V4's MTP reads the uncollapsed streams
+        (after AltUp's copies are already merged)."""
+        x = residual
+        if self.altup is not None:
+            # The copies past the first come back through their own
+            # projections, rescaled to the first's magnitude, and the mean of
+            # all of them is what the final norm reads.
+            copies = [x[0]] + [rescale_to(project(copy), x[0])
+                               for project, copy in zip(self.altup_unembed_projections, x[1:], strict=True)]
+            x = jnp.mean(jnp.stack(copies), axis=0)
+        streams = x
+        hc = self.hyper_connections
+        if hc is not None and hc.head == 'carried':
+            assert isinstance(x, Carried)
+            x = collapse_by(x.pre, x.streams)
+        elif hc is not None:
+            x = collapse_streams(x.streams if isinstance(x, Carried) else x,
+                                 self.hc_head if hc.head == 'weighted' else None)
+        if self.attention_residuals is not None:
+            # Every block is finished after the last layer, so the whole state,
+            # the blocks and the last partial, is what the output site mixes
+            # (modeling_kimi_linear.py:1215-1233).
+            x = self.output_res(x)
+        return streams, x
+
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
                  input_embeddings=None, embedding_positions=None,
@@ -2714,40 +2816,9 @@ class CausalTransformer(nn.Module):
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
-        if self.altup is not None:
-            # The embeddings and, rescaled to their magnitude, each projected
-            # copy: [num_inputs, B, S, D].
-            x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
-        hc, depth = self.hyper_connections, self.attention_residuals
-        if hc is not None:
-            # The embeddings copied into every residual stream: [B, S, hc_mult, D].
-            x = expand_streams(x, hc.hc_mult)
-            if hc.single_pass:
-                x = Carried(x, first_stream(x))
-        elif depth is not None:
-            # The embeddings as the first partial sum after empty blocks: [B, S, blocks + 1, D].
-            x = jnp.pad(x[:, :, None], ((0, 0), (0, 0), (depth.blocks(self.num_layers), 0), (0, 0)))
-        x = self.stack(x, train=train, decode=decode, positions=positions,
-                       segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
-        if self.altup is not None:
-            # The copies past the first come back through their own
-            # projections, rescaled to the first's magnitude, and the mean of
-            # all of them is what the final norm reads.
-            copies = [x[0]] + [rescale_to(project(copy), x[0])
-                               for project, copy in zip(self.altup_unembed_projections, x[1:], strict=True)]
-            x = jnp.mean(jnp.stack(copies), axis=0)
-        streams = x
-        if hc is not None and hc.head == 'carried':
-            assert isinstance(x, Carried)
-            x = collapse_by(x.pre, x.streams)
-        elif hc is not None:
-            x = collapse_streams(x.streams if isinstance(x, Carried) else x,
-                                 self.hc_head if hc.head == 'weighted' else None)
-        if depth is not None:
-            # Every block is finished after the last layer, so the whole state,
-            # the blocks and the last partial, is what the output site mixes
-            # (modeling_kimi_linear.py:1215-1233).
-            x = self.output_res(x)
+        residual = self.stack(self._expand(x), train=train, decode=decode, positions=positions,
+                              segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
+        streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
