@@ -5,8 +5,10 @@ so this script holds no per-notebook knowledge. `--full` runs the notebooks as
 committed, on whatever accelerator JAX finds. Either way the script skips the
 `%pip install` cells, since Dew comes from the checkout, and runs the
 notebooks in file order in one working directory, which lets notebook 04 read
-the checkpoint that 02 writes. A cell that raises fails the run, unless the
-cell carries the `raises-exception` tag that marks a deliberate error.
+the checkpoint that 02 writes. A cell that raises, runs past `--timeout`, or
+kills its kernel fails its notebook, unless the cell carries the
+`raises-exception` tag that marks a deliberate error; the other notebooks
+still run, and the script exits nonzero if any failed.
 
 `--save DIR` writes each notebook to DIR as the repository keeps it, with the
 run's outputs in place of the old ones and its install cells unexecuted; that
@@ -25,6 +27,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -32,7 +35,7 @@ from pathlib import Path
 
 import nbformat
 from nbclient import NotebookClient
-from nbclient.exceptions import CellExecutionError
+from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
 from nbformat.v4.rwbase import split_lines
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,8 +76,9 @@ def this_python_kernel(directory: Path) -> str:
     from ipykernel.kernelspec import write_kernel_spec
 
     name = "dew-tutorials"
-    if not (directory / "kernels" / name).exists():
-        write_kernel_spec(directory / "kernels" / name)
+    # Written on every run: a --workdir an earlier run used may hold a spec for its interpreter.
+    shutil.rmtree(directory / "kernels" / name, ignore_errors=True)
+    write_kernel_spec(directory / "kernels" / name)
     os.environ["JUPYTER_PATH"] = os.pathsep.join(filter(None, [str(directory), os.environ.get("JUPYTER_PATH")]))
     return name
 
@@ -124,7 +128,7 @@ def main() -> int:
         print(f"{path.name}: running in {workdir}", flush=True)
         try:
             seconds = execute(path, workdir, options.timeout, options.save, kernel)
-        except CellExecutionError as error:
+        except (CellExecutionError, CellTimeoutError, DeadKernelError) as error:
             failed.append(path.name)
             print(f"{path.name}: FAILED\n{error}", flush=True)
             continue
