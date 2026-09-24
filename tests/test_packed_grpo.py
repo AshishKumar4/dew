@@ -13,7 +13,8 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
-from dew.objectives.rl import GRPOObjective
+from dew.objectives.lm import LMObjective
+from dew.objectives.rl import DPOObjective, GRPOObjective
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -191,3 +192,19 @@ def test_the_loss_never_holds_the_logits_of_the_whole_batch():
     compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
     logits = rows * width * vocab * 4
     assert compiled.memory_analysis().temp_size_in_bytes < logits / 2
+
+
+@pytest.mark.parametrize("build, whole", [
+    (lambda model: LMObjective(model, WIDTH - 1), True),
+    (lambda model: GRPOObjective(model, WIDTH - 1), False),
+    (lambda model: DPOObjective(model, WIDTH - 1), False),
+])
+def test_only_the_plain_lm_loss_keeps_the_whole_logits_by_default(build, whole):
+    """The plain LM step holds the whole logits for its backward, which the
+    trainer tiles when the step does not fit. An RL objective's device also
+    holds rollouts or a frozen reference, so it keeps the tiled head unless
+    asked: 'whole' is the ask, and 'tiled' is the plain loss's way back."""
+    objective = build(_model())
+    assert (objective.head_tile is None) == whole
+    assert type(objective)(_model(), WIDTH - 1, head_tile='whole').head_tile is None
+    assert type(objective)(_model(), WIDTH - 1, head_tile='tiled').head_tile is not None

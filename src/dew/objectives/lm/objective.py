@@ -30,7 +30,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -471,6 +471,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
 
     artifact = TokenScores
 
+    keeps_whole_logits: ClassVar[bool] = True
+    """Whether the head's default (`head_tile` None) keeps the whole fp32
+    logits for the backward. A plain LM step does: the trainer's fit ladder
+    tiles it when the step does not fit (`recompute_more`). An objective
+    whose device also holds rollouts or a frozen reference, as GRPO's and
+    DPO's do, keeps the tiled head as its default, so the loss's temporaries
+    stay a tile whatever the vocabulary (tests/test_packed_grpo.py)."""
+
     def __init__(
         self,
         model,
@@ -479,7 +487,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         ema_decay: float | None = 0.999,
         pad_id: int | None = None,
         head_chunks: int = 4,
-        head_tile: tuple[int, int] | None = None,
+        head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         samples: Samples | None = None,
         pretrained: Variables | None = None,
         balance_rate: float | None = None,
@@ -500,8 +508,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         rest trade memory against time.
 
         `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
-        `tile`). None, the default, keeps the whole fp32 logits for the
-        backward, the fastest head where they fit: on one A100, a Qwen3-0.6B
+        `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
+        objective that keeps the whole logits (`keeps_whole_logits`) and
+        the generation's tile on one that does not. Whole logits are the
+        fastest head where they fit: on one A100, a Qwen3-0.6B
         step at 4 x 1024 tokens took 142 ms against 163 ms tiled, for 5.3 GiB
         more peak. A trainer whose compiled step does not fit the devices
         moves it to the generation's tile (`chunked.chunked_tile`) before it
@@ -587,8 +597,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.seq_len = seq_len
         self.pad_id = pad_id
         self.head_chunks = head_chunks
-        # A config gives a pair as a list; the head's tile is a static argument.
-        self.head_tile = None if head_tile is None else (int(head_tile[0]), int(head_tile[1]))
+        self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
@@ -1231,3 +1240,15 @@ class Perplexity:
 @metrics("perplexity")
 def perplexity() -> Perplexity:
     return Perplexity()
+
+
+def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:
+    """The head's tile: None keeps the whole logits; 'whole' and 'tiled' name
+    the choice; None on an objective that does not keep them by default is
+    the generation's tile (`chunked_tile`). A config's pair is a list, and
+    the tile is a static argument, so it becomes a tuple."""
+    if tile == 'whole' or (tile is None and keeps_whole_logits):
+        return None
+    if tile is None or tile == 'tiled':
+        return chunked_tile()
+    return (int(tile[0]), int(tile[1]))

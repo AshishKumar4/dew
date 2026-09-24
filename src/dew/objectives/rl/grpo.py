@@ -135,6 +135,8 @@ class GRPOObjective(LMObjective):
 
     _ema_is_reference = True
 
+    keeps_whole_logits = False
+
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
                  dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",
