@@ -1,16 +1,19 @@
 # Runs every tutorial notebook top to bottom at smoke size on a CPU, so a
 # change to the library cannot break a notebook without failing a check.
 # Each notebook's Settings cell holds its own smoke sizes (DEW_TUTORIAL_SMOKE).
+# Then it checks that each notebook's recorded outputs are newer than every
+# change to the Dew modules the notebook imports; outputs made before such a
+# change fail the check until the notebook is executed again in full.
 
 name: Tutorials
 
 on:
   push:
     branches: [ "main" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", ".github/workflows/tutorials.yml" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   pull_request:
     branches: [ "main" ]
-    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", ".github/workflows/tutorials.yml" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", "tools/check_tutorial_outputs.py", ".github/workflows/tutorials.yml" ]
   schedule:
     - cron: "23 5 * * *"
   workflow_dispatch:
@@ -24,6 +27,8 @@ jobs:
     timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # the outputs check reads the history since each notebook's recorded commit
     - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
@@ -38,4 +43,7 @@ jobs:
         path: ~/.cache/huggingface
         key: tutorials-hf-v1
     - name: Run the tutorials
-      run: python tools/run_tutorials.py --workdir "$RUNNER_TEMP/tutorials"
+      run: python tools/run_tutorials.py --workdir "$RUNNER_TEMP/tutorials" --imports "$RUNNER_TEMP/imports.json"
+    - name: The recorded outputs are newer than the code they ran
+      if: success() || failure()
+      run: python tools/check_tutorial_outputs.py "$RUNNER_TEMP/imports.json"
