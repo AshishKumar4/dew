@@ -66,7 +66,7 @@ def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
         tower = translate_gemma4_vision_config(_section(config, "vision_config"))
         projector = translate_gemma4_projector_config(tower, text.emb_features)
         conditioner = VisionConditioner(
-            family="diffusion_gemma", vision=towers.from_record(tower),
+            vision=towers.from_record(tower),
             projection=projectors.from_record(projector), dtype=text.dtype,
             precision=text.precision)
     if config.get("audio_config") is not None:

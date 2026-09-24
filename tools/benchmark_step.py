@@ -297,8 +297,8 @@ def image_tokens(case: Case) -> int:
     row cannot mark a width the modules do not produce. The trace is
     abstract: no parameter is allocated and no kernel compiles.
     """
-    family, tower, projector, _ = media_values(case)
-    conditioner = VisionConditioner(family, tower, projector)
+    _, tower, projector, _ = media_values(case)
+    conditioner = VisionConditioner(tower, projector)
     features = jax.eval_shape(
         lambda pixels: conditioner.init_with_output(
             jax.random.key(0), {"pixel_values": pixels})[0],

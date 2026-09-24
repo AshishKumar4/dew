@@ -49,7 +49,7 @@ def fixture(kind):
         variables = model.init(jax.random.key(0), tokens, image_indices=indices, conditioning=media)
         return model, variables, tokens, indices, media
     model = DiffusionGemma(text, canvas_length=2, conditioner=VisionConditioner(
-        "gemma3", vision, projection, dtype=jnp.float32))
+        vision, projection, dtype=jnp.float32))
 
     def initialize(bound):
         bound(tokens)
