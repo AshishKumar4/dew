@@ -1688,9 +1688,10 @@ class CausalTransformer(nn.Module):
     """The most layers one scanned run holds, which is how many its parameter
     bank stacks. A longer run of like layers splits into consecutive runs of
     at most this many, each its own bank under its own name; None puts a
-    whole run in one bank. Only `scan_layers` reads it, and the split is
-    what bounds the memory that building a host-resident bank and reading it
-    back cost, so a deep stack offloaded to the host sets it."""
+    whole run in one bank. `scan_layers` and `init` read it: init draws each
+    run under one scan, so it decides the draw at a seed. The split is what
+    bounds the memory that building a host-resident bank and reading it back
+    cost, so a deep stack offloaded to the host sets it."""
     remat: RematPolicy | None = None
     """Recompute each block in the backward pass, keeping its inputs, any K/V
     supplied to later layers and the residuals the policy names. A name from
@@ -2789,9 +2790,10 @@ class CausalTransformer(nn.Module):
         """The layer stack over `x`: the plain loop, the scanned runs, or the
         pipeline over the mesh's stages.
 
-        The plain loop is what `init` always runs, so the variables tree is
-        the one it creates whatever the model is asked to do afterwards.
-        With `scan_layers`, or a stage axis above one on the mesh in context,
+        `init` draws each run of like layers under the scan and unstacks it,
+        so the variables tree is the plain loop's whatever the model is asked
+        to do afterwards; under a stage mesh or with `decode` it runs the
+        plain loop. With `scan_layers`, or a stage axis above one on the mesh in context,
         the stack runs under `StackView`: the same leaves, stacked along the
         loops' axes while the loops run and unstacked on the way out. The
         loops carry the residual stream in one dtype, so it enters them in
