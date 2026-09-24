@@ -47,7 +47,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop import mamba2, pickles
-from dew.interop.safetensors_io import read_file, read_weights, weight_files
+from dew.interop.safetensors_io import read_weights, weight_files
 from dew.interop.streaming import LazyTree, SourceLeaf, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
@@ -1756,14 +1756,6 @@ def translate_denoiser_weights(
             "params": translate_sc_weights(sc, param_dtype=param_dtype)
         },
     }
-
-
-def _read_shard(path: Path) -> dict[str, np.ndarray]:
-    """Read every tensor of one safetensors file, memory mapped in its stored
-    dtype. The translator chooses each bound leaf's storage precision;
-    packed payloads such as MXFP4 stay bytes for their dequantizer."""
-    tensors, _ = read_file(path)
-    return tensors
 
 
 def _load_shards(directory: Path) -> dict[str, np.ndarray]:

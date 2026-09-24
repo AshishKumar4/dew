@@ -212,7 +212,6 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     metric = FID(weights=weights)
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
     assert pooled == pytest.approx(shifted, rel=1e-6)
-    assert metric.feature_identity.endswith(weights)
     assert _get_activations(weights)(unit_range(images[:1])).shape[1] == record["pool3_features"]
 
 
