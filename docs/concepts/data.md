@@ -9,7 +9,7 @@ A `Dataset` holds four things: a callable that opens a training iterator, an opt
 ```python
 import itertools
 import numpy as np
-from dew.data import Dataset
+from dew.data import DataPartition, Dataset
 
 x = np.arange(16, dtype=np.float32).reshape(8, 2)
 y = x.sum(axis=1, keepdims=True)
@@ -23,7 +23,7 @@ np.testing.assert_array_equal(first["target"], y)
 
 This example uses the same records for both splits only to show how the iterators are built. For a real validation result, use records the model does not train on. The training iterator must yield enough batches for the number of steps you ask for. The validation iterator must end after one pass.
 
-`train` is a callable for a reason: each new or resumed run calls `train()` and gets a fresh iterator. If it returned the same, partly consumed iterator, the run could see different records. The iterator belongs to whoever opened it. Close it when you are done if it has a `close` method, and never close the shared dataset or its backing store. I have not finished reviewing iterator lifetime and cancellation, so for now run repeated, isolated smoke runs in separate processes.
+`train` is a callable for a reason: each new or resumed run calls it and gets a fresh iterator. If it returned the same, partly consumed iterator, the run could see different records. The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is right for a single process; in a pool of processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`). The iterator belongs to whoever opened it. Close it when you are done if it has a `close` method, and never close the shared dataset or its backing store. I have not finished reviewing iterator lifetime and cancellation, so for now run repeated, isolated smoke runs in separate processes.
 
 ## Match the objective's fields
 
