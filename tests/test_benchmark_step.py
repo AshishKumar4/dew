@@ -94,3 +94,12 @@ def test_device_timeline_covers_nested_and_disjoint_kernels(
     assert row["device_busy_ms_per_step"] == pytest.approx(busy)
     assert row["device_window_ms_per_step"] == pytest.approx(window)
     assert row["device_busy_percent"] == pytest.approx(100 * busy / window)
+
+
+def test_every_small_case_builds_its_trainer():
+    """The small preset runs every registry architecture in one process, and
+    one case its model refuses ends the sweep: uvit has no mlp_ratio, and
+    the preset gave it one."""
+    tool = _benchmark_step()
+    for case in tool.small_cases('bfloat16'):
+        tool.build_trainer(case)
