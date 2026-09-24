@@ -948,6 +948,25 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
                     steps=2, log_every=100)
 
 
+@pytest.mark.mesh
+def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_compiles():
+    """Eight rows over data2 x fsdp2 hold two a device, which four
+    microbatches do not divide: a device that holds none of a microbatch's
+    rows would compute another's again. The run is refused as it starts,
+    before anything compiles, naming a batch and a microbatch count that
+    fit."""
+    from dew.nn.sharding import LayoutRefused
+
+    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2, stage=2, microbatches=4),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+
+    with pytest.raises(LayoutRefused, match=r"multiple of 16 rows, 16 the nearest above 8 or "
+                                            r"microbatches=2, the most that divide the 2 rows"):
+        trainer.fit(indexed_data(256, 8), steps=2, log_every=100)
+    assert trainer.executable is None
+
+
 def test_the_log_tick_reports_the_records_a_ramped_interval_read():
     """`samples_per_sec` is the records the interval read over its wall time,
     summed per step, so a ramped interval is not reported as if every step

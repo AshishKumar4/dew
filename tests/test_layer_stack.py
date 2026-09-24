@@ -470,6 +470,20 @@ def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
 
 
 @mesh_lane
+def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
+    """Eight rows over fsdp=4 hold two a device. Four microbatches cannot
+    each take a share of every device's rows, so devices would compute each
+    other's microbatches again: 1.43 times one device's FLOPs for a
+    stage x fsdp step, where the bubble accounts for 1.25. Refused before
+    anything runs; two microbatches divide the two rows and run."""
+    model = tiny()
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    with pytest.raises(ValueError, match="2 rows a device, which 4 microbatches do not divide"):
+        loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4, stage=2, microbatches=4),
+                       variables, token_batch())
+
+
+@mesh_lane
 def test_decoding_under_a_stage_axis_is_refused():
     model = tiny()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
