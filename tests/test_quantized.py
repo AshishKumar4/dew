@@ -250,14 +250,14 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
     partners (one of them with a partial block), everything else is as it
     was. `load_pretrained` lands the dequantized weight, transposed
     as every kernel is, and the untouched tensors bit for bit."""
-    from dew.interop.hf_decoders import _read_shard
+    from dew.interop.safetensors_io import read_file
     directory = tmp_path / "fp8"
     shutil.copytree(FIXTURE, directory)
     block = 16
     config = json.loads((directory / "config.json").read_text())
     config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": [block, block]}
     (directory / "config.json").write_text(json.dumps(config))
-    tensors = _read_shard(directory / "model.safetensors")
+    tensors, _ = read_file(directory / "model.safetensors")
     quantized = ("model.layers.0.mlp.up_proj.weight",        # [48, 32]: 3 x 2 blocks
                  "model.layers.0.self_attn.kv_b_proj.weight")  # [64, 8]: a partial column block
     shipped = dict(tensors)
@@ -285,12 +285,12 @@ def test_a_re_ship_writes_over_the_shard_its_own_tensors_are_mapped_from(tmp_pat
     must keep reading their old bytes and the shard must hold the new table.
     The fp8 payload is a quarter of the fp32 it replaces, so a truncating
     writer leaves the mapped bytes past end-of-file and SIGBUS is certain."""
-    from dew.interop.hf_decoders import _read_shard
+    from dew.interop.safetensors_io import read_file
     directory = tmp_path / "reship"
     shutil.copytree(FIXTURE, directory)
     shard = directory / "model.safetensors"
     name = "model.layers.0.mlp.up_proj.weight"
-    tensors = _read_shard(shard)
+    tensors, _ = read_file(shard)
     assert isinstance(tensors[name].base, np.memmap), "the shard is not mapped; nothing to lose"
     held = {key: array.tobytes() for key, array in tensors.items()}
     shipped = dict(tensors)
@@ -584,7 +584,8 @@ def reexport(request, tmp_path_factory):
     parameters V3.2's `scale_fmt`. Run once per format for the tests below,
     which take the pipeline apart rather than run it again.
     """
-    from dew.interop.hf_decoders import _load_shards, _read_shard
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import read_file
     ue8m0 = request.param
     root = tmp_path_factory.mktemp("fp8-reexport")
     directory, destination = root / "source", root / "reexport"
@@ -594,7 +595,7 @@ def reexport(request, tmp_path_factory):
     config = {**json.loads((directory / "config.json").read_text()),
               "quantization_config": quantization}
     (directory / "config.json").write_text(json.dumps(config))
-    shipped = dict(_read_shard(directory / "model.safetensors"))
+    shipped = dict(read_file(directory / "model.safetensors")[0])
     for name in QUANTIZED_TENSORS:
         shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(
             shipped[name], REEXPORT_BLOCK, ue8m0=ue8m0)

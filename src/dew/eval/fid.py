@@ -270,10 +270,6 @@ class FID:
     name = "fid"
     reads = ImageGrid
 
-    @property
-    def feature_identity(self) -> str:
-        return _features(self.weights)
-
     def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
         with metric_device():
             return FIDStats(_pooled_stats([artifact.images], population="generated",
