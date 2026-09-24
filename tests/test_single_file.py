@@ -207,6 +207,22 @@ def test_an_edited_local_config_converts_again(tmp_path: Path, cache: Path) -> N
     assert json.loads((loaded.source / "scheduler" / "scheduler_config.json").read_text())["beta_end"] == 0.02
 
 
+def test_a_replaced_lent_weight_converts_again(tmp_path: Path, cache: Path) -> None:
+    """The VAE the configs lend a file without one is replaced (a new file):
+    the next load converts again and links the new weights, not the old."""
+    repo = _without_vae(tmp_path, vae_weights=True)
+    _load(repo, "sd")
+    before = len(_entries(cache))
+    lent = repo / "vae" / WEIGHTS["vae"]
+    tensors, _ = read_file(lent)
+    replaced = tmp_path / "replaced.safetensors"
+    write_file({name: np.asarray(value) * 2 for name, value in tensors.items()}, replaced, {"format": "pt"})
+    os.replace(replaced, lent)
+    loaded = _load(repo, "sd")
+    assert len(_entries(cache)) == before + 1
+    assert (loaded.source / "vae" / WEIGHTS["vae"]).read_bytes() == lent.read_bytes()
+
+
 @pytest.mark.parametrize("code", [errno.EXDEV, errno.EPERM, errno.ENOTSUP])
 def test_weights_that_cannot_be_hard_linked_are_copied(code: int, tmp_path: Path, cache: Path,
                                                        monkeypatch: pytest.MonkeyPatch) -> None:
