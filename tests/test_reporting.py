@@ -3,6 +3,8 @@
 import io
 import json
 import math
+import subprocess
+import sys
 
 import jax
 import numpy as np
@@ -15,6 +17,17 @@ from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, 
 from dew.data import Dataset
 from dew.telemetry.records import RunRecord, json_value
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
+
+
+def test_the_trackers_import_no_text_stack():
+    """A tracker turns a preview into bytes with numpy alone, so importing
+    the training package loads neither the input encoders nor transformers;
+    reaching the helper through dew.inputs took the import from 0.7 s to
+    3.2 s."""
+    probe = ("import sys, dew.training\n"
+             "print(sorted(name for name in ('dew.inputs', 'transformers') if name in sys.modules))\n")
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert done.stdout.strip() == "[]"
 
 
 def records(path):
