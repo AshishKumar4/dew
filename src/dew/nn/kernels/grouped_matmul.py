@@ -92,8 +92,9 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """`jax.lax.ragged_dot` as every backend runs it alike.
 
     A 16-bit product is exact at any precision, and XLA's TPU ragged-dot
-    kernel refuses 16-bit operands at HIGHEST ("Bad lhs type"), so they
-    multiply at DEFAULT: the same products, summed in the preferred type.
+    kernel refuses 16-bit operands at HIGHEST ("Bad lhs type"), so two of
+    them multiply at DEFAULT: the same products, summed in the preferred
+    type. A 16-bit operand beside a wider one is widened to it.
     XLA's TPU kernel writes values into the rows past the groups, where
     other backends write zeros, and its lhs cotangent is the same kernel.
     Those rows are zeroed going in and coming out, so neither the output
@@ -101,6 +102,12 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
         precision = jax.lax.Precision.DEFAULT
+    elif tokens.dtype != kernel.dtype:
+        # A 16-bit operand beside a wider one would reach the TPU kernel
+        # 16-bit at HIGHEST too; widened, it is the same values (exactly),
+        # and the wider operand keeps the precision the call asked for.
+        wide = jnp.promote_types(tokens.dtype, kernel.dtype)
+        tokens, kernel = tokens.astype(wide), kernel.astype(wide)
     grouped = jnp.arange(tokens.shape[0])[:, None] < jnp.sum(group_sizes)
     out = jax.lax.ragged_dot(
         jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
