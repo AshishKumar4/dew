@@ -155,30 +155,65 @@ def test_a_component_with_no_weights_anywhere_is_refused_by_name(tmp_path: Path,
     assert _entries(cache) == []
 
 
-def test_a_hub_repo_gives_the_missing_weights_at_its_commit(tmp_path: Path, cache: Path,
-                                                            monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = _without_vae(tmp_path, vae_weights=False)
-    hub = tmp_path / "hub-snapshot"
+def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit(
+        tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """load_pretrained("org/repo", single_file=...) for a repo whose metadata
+    snapshot holds the configs and a file without its VAE: the VAE comes from
+    the repo at the snapshot's commit, fetched and linked by `weight_files`'
+    rule, so the fp16 variant beside it stays behind."""
+    from dew.interop import hf_decoders
+
+    metadata = _without_vae(tmp_path, vae_weights=False)
+    hub = tmp_path / "hub-weights"
     (hub / "vae").mkdir(parents=True)
     _vae_weights(tmp_path / "whole", hub / "vae")
+    shutil.copy(hub / "vae" / WEIGHTS["vae"], hub / "vae" / "diffusion_pytorch_model.fp16.safetensors")
     asked = []
 
-    def snapshot(name: str, revision: str, names: list[str]) -> Path:
-        asked.append((name, revision, list(names)))
-        return hub
+    def snapshot(name: str, revision: str | None, *, weights: bool | tuple[str, ...] = True) -> Path:
+        asked.append((name, revision, weights))
+        return metadata if weights is False else hub
 
-    monkeypatch.setattr(single_file, "_hub_weights", snapshot)
-    with single_file.unpacked(repo / "sd.safetensors", repo, ("org/sd-tiny", "0123abcd")) as (converted, _):
-        assert (converted / "vae" / WEIGHTS["vae"]).read_bytes() == (hub / "vae" / WEIGHTS["vae"]).read_bytes()
-    assert asked == [("org/sd-tiny", "0123abcd", ["vae"])]
+    monkeypatch.setattr(hf_decoders, "_snapshot", snapshot)
+    monkeypatch.setattr(hf_decoders, "repo_file", lambda name, directory, filename: metadata / filename)
+    loaded = load_pretrained("org/sd-tiny", single_file="sd.safetensors", dtype="float32", param_dtype="auto")
+    assert asked == [("org/sd-tiny", None, False), ("org/sd-tiny", metadata.name, ("vae",))]
+    assert loaded.revision == metadata.name
+    assert sorted(path.name for path in (loaded.source / "vae").iterdir()) == ["config.json", WEIGHTS["vae"]]
+    assert (loaded.source / "vae" / WEIGHTS["vae"]).read_bytes() == (hub / "vae" / WEIGHTS["vae"]).read_bytes()
 
 
-def test_weights_on_another_filesystem_are_copied(tmp_path: Path, cache: Path,
-                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+def test_only_the_configs_metadata_is_copied(tmp_path: Path, cache: Path) -> None:
+    """Other formats of the weights beside the configs (an ONNX export, a
+    precision variant, a weights index) and anything else stay out."""
+    repo = _repo(tmp_path, "sd")
+    for extra in ("unet/model.onnx", "unet/model.onnx_data", "unet/diffusion_pytorch_model.fp16.safetensors",
+                  "unet/diffusion_pytorch_model.safetensors.index.json", "README.md"):
+        (repo / extra).write_bytes(b"{}")
+    loaded = _load(repo, "sd")
+    copied = {path.relative_to(loaded.source).as_posix() for path in loaded.source.rglob("*") if path.is_file()}
+    configs = {path.relative_to(FIXTURE / "sd" / "configs").as_posix()
+               for path in (FIXTURE / "sd" / "configs").rglob("*") if path.is_file()}
+    assert copied == configs | {f"{name}/{WEIGHTS[name]}" for name in ("unet", "vae", "text_encoder")}
+
+
+def test_an_edited_local_config_converts_again(tmp_path: Path, cache: Path) -> None:
+    repo = _repo(tmp_path, "sd")
+    _load(repo, "sd")
+    scheduler = repo / "scheduler" / "scheduler_config.json"
+    scheduler.write_text(json.dumps(json.loads(scheduler.read_text()) | {"beta_end": 0.02}))
+    loaded = _load(repo, "sd")
+    assert len(_entries(cache)) == 2
+    assert json.loads((loaded.source / "scheduler" / "scheduler_config.json").read_text())["beta_end"] == 0.02
+
+
+@pytest.mark.parametrize("code", [errno.EXDEV, errno.EPERM, errno.ENOTSUP])
+def test_weights_that_cannot_be_hard_linked_are_copied(code: int, tmp_path: Path, cache: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _without_vae(tmp_path, vae_weights=True)
 
     def cross_device(source: object, destination: object) -> None:
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), source, None, destination)
+        raise OSError(code, os.strerror(code), source, None, destination)
 
     monkeypatch.setattr(os, "link", cross_device)
     vae = _load(repo, "sd").source / "vae" / WEIGHTS["vae"]
