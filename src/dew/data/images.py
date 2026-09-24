@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 import os
 import struct
+from collections.abc import Mapping
 from typing import Literal
 
 import grain.python as pygrain
@@ -41,6 +43,20 @@ from .sources.hf import HFOptions, HubOptions
 from .tokens import bounded
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
+
+
+def import_opencv() -> None:
+    """Import OpenCV in the thread that opens a loader, before its readers start.
+
+    The reader threads reach their first decode together, so each would
+    otherwise make the first import of cv2 at once. An import that fails in
+    one of them leaves the others the half-built module, which surfaces as
+    `module 'cv2' has no attribute 'INTER_AREA'` instead of the failure
+    itself. Imported here, a broken install raises its own error when the
+    loader opens. The import stays out of the module's top so that reading
+    text never loads OpenCV.
+    """
+    importlib.import_module("cv2")
 
 
 def unpack_dict_of_byte_arrays(packed_data: bytes) -> dict[str, bytes]:
@@ -261,11 +277,21 @@ def _fields(element: Batch | bytes, name: str) -> Batch:
 
 
 class ImageTransform(pygrain.RandomMapTransform):
-    """Resizes, augments and captions one record, seeded by the record's own rng."""
+    """Resizes, augments and captions one record, seeded by the record's own rng.
+
+    It is built where its loader opens and unpickled where a spawned worker
+    starts, both before any reader thread runs, and both import OpenCV
+    (`import_opencv`).
+    """
 
     def __init__(self, spec: ImageDataset):
+        import_opencv()
         self.spec = spec
         self.augments = image_augmentations(spec.augmentation)
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        import_opencv()
+        self.__dict__.update(state)
 
     def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
         image, caption, label = self.spec.record(element, rng)
