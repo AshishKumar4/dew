@@ -2517,7 +2517,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     quantized_tensors, scale_dtype = ((), None) if quantization is None else (
         quantization.names(tensors), quantization.scale_dtype(tensors))
     grid = {part: tensors[part] for name in quantized_tensors
-            for part in (quantization.grid(name) if quantization is not None else ())}
+            for part in (quantization.grid(name) if quantization is not None else ()) if part in tensors}
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()
         if param_dtype != "float32":
