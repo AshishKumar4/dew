@@ -218,8 +218,11 @@ The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` hol
 
 ## Models
 
-Each table below lists native architectures or supported checkpoint families,
-followed by notes on their training, inference and export workflows.
+[Supported models](https://dewml.dev/reference/models/) lists every checkpoint
+family `load_pretrained` reads, by the `model_type` in its `config.json`, and
+every architecture `models.build` trains from scratch. The site generates the
+page from Dew's registries when it builds. The notes below cover their
+training, inference and export workflows.
 
 ### Text decoders
 
@@ -233,29 +236,6 @@ followed by notes on their training, inference and export workflows.
 storage. `load_pretrained` keeps FP32 parameters by default. Pass
 `param_dtype="bfloat16"` to reduce weight storage without changing the
 compute dtype. Non-parameter state retains its declared precision.
-
-| Model or family | `model_type` |
-|---|---|
-| Llama 2, Llama 3, Llama 3.1 | `llama` |
-| Mistral | `mistral` |
-| Qwen 2, Qwen 3 | `qwen2`, `qwen3` |
-| Qwen 3.5 text | `qwen3_5_text` |
-| Qwen 3.5 MoE text | `qwen3_5_moe_text` |
-| Gemma 1, Gemma 2, Gemma 3 text | `gemma`, `gemma2`, `gemma3_text` |
-| Gemma 3n text, Gemma 4 text | `gemma3n_text`, `gemma4_text` |
-| OLMo 3 | `olmo3` |
-| gpt-oss | `gpt_oss` |
-| Mixtral, Qwen3-MoE | `mixtral`, `qwen3_moe` |
-| Qwen3-Next | `qwen3_next` |
-| GLM floating-point checkpoints, GLM-5.3, GLM-5.3-Flash | `glm4_moe`, `glm_moe_dsa`, `glm5_next_text` |
-| DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
-| DeepSeek-V4 | `deepseek_v4` |
-| DeepSeek-V4.1-Flash text | `deepseek_v41` |
-| Kimi K2, Kimi K2.5 text | `kimi_k2`, `kimi_k25` |
-| Kimi K3 text, MXFP4 routed experts | `kimi_k3` |
-| Kimi Linear | `kimi_linear` |
-| Llama 4 text | `llama4_text` |
-| Mamba 2 | `mamba2` |
 
 Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
 when exported. Small fixtures cover loading, a `Trainer` update, export, and
@@ -298,15 +278,6 @@ weights. The processor turns text and raw media into `ModelInputs`, which
 `LMObjective`, `Trainer` and cached generation take unchanged. The export
 carries the processor and tokenizer files beside the weights.
 
-| Model or family | `model_type` | Media |
-|---|---|---|
-| Gemma 3 | `gemma3` | Images |
-| Gemma 3n | `gemma3n` | Images through MobileNet-v5; waveforms |
-| Gemma 4 | `gemma4` | Images; videos; waveforms |
-| Qwen 3.5 | `qwen3_5` | Images and timestamped videos, with M-RoPE positions |
-| Llama 4 | `llama4` | Tiled images |
-| DeepSeek-V4.1-Flash | `deepseek_v41` | Images |
-
 The image, video and audio inputs a model accepts follow the checkpoint's
 modality configuration. `Processor.__call__` takes `text`, `images`, `audio`,
 `videos` and `video_metadata`. `Processor.chat` runs the checkpoint's own chat
@@ -333,9 +304,8 @@ prediction layer.
 
 ### Block-diffusion decoders
 
-| Model | `model_type` | Workflow |
-|---|---|---|
-| Diffusion Gemma | `diffusion_gemma` | Canvas generation; text and image-conditioned SFT |
+Diffusion Gemma (`diffusion_gemma`) generates canvases and trains with text
+and image-conditioned SFT.
 
 `BlockDiffusionObjective` trains the canvas loss from the loaded weights and
 `Pretrained.block_generation()` decodes canvases. Text SFT follows Google's
@@ -348,10 +318,8 @@ through the objective's model:
 
 ### Masked-diffusion decoders
 
-| Model | `model_type` | Workflow |
-|---|---|---|
-| LLaDA | `llada` | MDLM training from the released weights |
-| Dream | `dream`, `Dream` | MDLM training from the released weights |
+LLaDA (`llada`) and Dream (`dream`, `Dream`) train on the MDLM loss from their
+released weights.
 
 `MaskedDiffusionObjective(model, MDLM(mask_id=...)(), seq_len,
 pretrained=loaded.variables)` trains the MDLM negative ELBO from a loaded
@@ -386,17 +354,10 @@ runs. Video inputs are tested on Gemma 4 and Qwen 3.5.
 
 ### Diffusion and representation models
 
-These Dew architectures can be trained from scratch.
-
-| Model | Registry name | Training |
-|---|---|---|
-| Image/video UNet | `unet`, `unet_3d` | Diffusion and flow matching |
-| U-shaped transformers | `uvit`, `simple_udit` | Diffusion and flow matching |
-| DiT | `simple_dit` | Diffusion and flow matching |
-| Dual-stream MMDiT | `simple_mmdit`, `hierarchical_mmdit` | Text-conditioned diffusion |
-| S5/transformer hybrid | `hybrid_dit` | Diffusion |
-| Video DiT | `video_dit` | Video diffusion |
-| I-JEPA / V-JEPA | `jepa_encoder`, `jepa_video_encoder`, `jepa_predictor` | Masked representation prediction |
+Dew trains its own UNets, DiTs, MMDiTs, a video DiT and the I-JEPA and V-JEPA
+encoders from scratch, for diffusion, flow matching and masked representation
+prediction; [Supported models](https://dewml.dev/reference/models/#architectures-you-can-train-from-scratch)
+lists them by registry name.
 
 CLIP and T5 text encoders and VAE interfaces provide conditioning and latent-space training.
 
