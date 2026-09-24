@@ -36,6 +36,14 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.generation_config import (
+    audit_masked,
+    eos_ids,
+    generation_limit,
+    pad_id,
+    return_sequences,
+    source_decoding,
+)
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
@@ -56,10 +64,8 @@ from dew.registry import (
     towers,
     with_precision,
 )
-from dew.sampling import decoding
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
-from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -351,34 +357,8 @@ class Processor:
             lengths = np.prod(grid, axis=1) // merge ** 2
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values or "video_position_ids" in values:
-            vision = self.config.get("vision_config")
-            if not isinstance(vision, Mapping):
-                raise ValueError("patch position ids require a vision config")
-            kernel = vision.get("pooling_kernel_size")
-            if type(kernel) is not int or kernel < 1:
-                raise ValueError("pooling_kernel_size must be a positive integer")
-            table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
-            if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
-                raise ValueError("position_embedding_size and patch_size must be positive integers")
-            streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                     table_size=table_size, patch_size=patch_size)
-            offsets = dict.fromkeys(streams, 0)
-            chunks, patch_positions, lengths = [], [], []
-            for row, blocks in enumerate(runs):
-                for slots in blocks:
-                    token_id = int(tokens[row, slots[0]])
-                    stream = streams.get(token_id)
-                    offset = offsets.get(token_id, 0)
-                    if stream is None or offset >= len(stream[0]):
-                        raise ValueError("pixel_values and image/video placeholder counts disagree")
-                    chunks.append(stream[0][offset])
-                    patch_positions.append(stream[1][offset])
-                    lengths.append(int(stream[2][offset]))
-                    offsets[token_id] += 1
-            if any(offsets[token_id] != len(stream[0]) for token_id, stream in streams.items()):
-                raise ValueError("pixel_values and image/video placeholder counts disagree")
-            if not chunks:
-                raise ValueError("pixels require image or video placeholders")
+            chunks, patch_positions, lengths, kernel = self._positioned_chunks(values, tokens, runs,
+                                                                               image_id, video_id)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             pixel_dtype = np.result_type(*(chunk.dtype for chunk in chunks))
             capacity = shape[0] // kernel ** 2
@@ -431,6 +411,42 @@ class Processor:
         if groups is not None:
             fields["image_groups"] = jnp.asarray(groups)
         return fields, conditioning
+
+    def _positioned_chunks(self, values: Mapping[str, object], tokens: np.ndarray, runs: list[list[np.ndarray]],
+                           image_id: int, video_id: int | None
+                           ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], int]:
+        """The per-patch position layout's feature blocks, in placeholder order:
+        each image or video's patches, their positions and placeholder count,
+        and the vision pooling kernel that sets how many slots one fills."""
+        vision = self.config.get("vision_config")
+        if not isinstance(vision, Mapping):
+            raise ValueError("patch position ids require a vision config")
+        kernel = vision.get("pooling_kernel_size")
+        if type(kernel) is not int or kernel < 1:
+            raise ValueError("pooling_kernel_size must be a positive integer")
+        table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
+        if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
+            raise ValueError("position_embedding_size and patch_size must be positive integers")
+        streams = _patch_streams(values, image_id, video_id, kernel=kernel,
+                                 table_size=table_size, patch_size=patch_size)
+        offsets = dict.fromkeys(streams, 0)
+        chunks, patch_positions, lengths = [], [], []
+        for row, blocks in enumerate(runs):
+            for slots in blocks:
+                token_id = int(tokens[row, slots[0]])
+                stream = streams.get(token_id)
+                offset = offsets.get(token_id, 0)
+                if stream is None or offset >= len(stream[0]):
+                    raise ValueError("pixel_values and image/video placeholder counts disagree")
+                chunks.append(stream[0][offset])
+                patch_positions.append(stream[1][offset])
+                lengths.append(int(stream[2][offset]))
+                offsets[token_id] += 1
+        if any(offsets[token_id] != len(stream[0]) for token_id, stream in streams.items()):
+            raise ValueError("pixel_values and image/video placeholder counts disagree")
+        if not chunks:
+            raise ValueError("pixels require image or video placeholders")
+        return chunks, patch_positions, lengths, kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
@@ -975,20 +991,20 @@ class Pretrained:
             from dew.diffusion.discrete import MDLM
             if sampling is not None:
                 raise TypeError("native MDLM accepts denoising steps, not autoregressive sampling controls")
-            _audit_masked(self.config, self.generation_config)
+            audit_masked(self.config, self.generation_config)
             return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(), self.processor,
-                eos_token_ids=_eos_ids(self.config, self.generation_config),
-                pad_token_id=_pad_id(self.config, self.generation_config),
-                max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                max_length=_generation_limit(self.config, self.generation_config, "max_length"),
-                n=_return_sequences(self.config, self.generation_config))
-        rows = _return_sequences(self.config, self.generation_config)
-        policy, logits, stopping, strategy = _source_decoding(
+                eos_token_ids=eos_ids(self.config, self.generation_config),
+                pad_token_id=pad_id(self.config, self.generation_config),
+                max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                max_length=generation_limit(self.config, self.generation_config, "max_length"),
+                n=return_sequences(self.config, self.generation_config))
+        rows = return_sequences(self.config, self.generation_config)
+        policy, logits, stopping, strategy = source_decoding(
             self.config, self.generation_config, self.model, self.processor, rows,
             sampling)
         return TextGeneration(self.model, self.variables, self.processor, policy,
-                              max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                              max_length=_generation_limit(self.config, self.generation_config, "max_length"),
+                              max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                              max_length=generation_limit(self.config, self.generation_config, "max_length"),
                               n=rows, logits=logits, stopping=stopping, strategy=strategy)
 
     def block_generation(self) -> BlockGeneration:
@@ -998,11 +1014,11 @@ class Pretrained:
             raise TypeError("block generation needs a DiffusionGemma source")
         return BlockGeneration(self.model, self.variables,
                                diffusion_gemma.generation_process(self.config, self.generation_config),
-                               self.processor, _eos_ids(self.config, self.generation_config),
-                               _pad_id(self.config, self.generation_config),
-                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                               max_length=_generation_limit(self.config, self.generation_config, "max_length"),
-                               n=_return_sequences(self.config, self.generation_config))
+                               self.processor, eos_ids(self.config, self.generation_config),
+                               pad_id(self.config, self.generation_config),
+                               max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                               max_length=generation_limit(self.config, self.generation_config, "max_length"),
+                               n=return_sequences(self.config, self.generation_config))
 
     def text_to_image(self) -> TextToImage:
         """Build the latent diffusion source as an image task with its published policy."""
@@ -1087,558 +1103,6 @@ def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str,
         for collection, tree in variables.items():
             collections.setdefault(collection, {})[component] = tree
     return collections
-
-
-def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
-                      name: str, default: JSON = None) -> JSON:
-    text = config.get("text_config", config)
-    if not isinstance(text, Mapping):
-        raise ValueError("text_config must be a mapping")
-    return records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
-
-
-def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
-    value = _generation_value(config, generation_config, "eos_token_id")
-    if value is None:
-        return ()
-    values = (value,) if type(value) is int else value
-    if not isinstance(values, (tuple, list)):
-        raise ValueError("eos_token_id must be an integer or a sequence of integers")
-    ids: list[int] = []
-    for entry in values:
-        if type(entry) is not int or entry < 0:
-            raise ValueError("eos_token_id must be an integer or a sequence of integers")
-        ids.append(entry)
-    return tuple(ids)
-
-
-def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
-    value = _generation_value(config, generation_config, "pad_token_id", 0)
-    if value is None:
-        value = 0
-    if type(value) is not int or value < 0:
-        raise ValueError("pad_token_id must be a nonnegative integer")
-    return value
-
-
-def _generation_limit(config: Mapping[str, object], generation_config: Mapping[str, object], name: str) -> int | None:
-    """Read a nonnegative source generation limit."""
-    value = _generation_value(config, generation_config, name)
-    if value is None:
-        return None
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer")
-    return value
-
-
-def _return_sequences(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
-    """Return the source's continuations per prompt. One when it declares none."""
-    value = _generation_value(config, generation_config, "num_return_sequences")
-    if value is None:
-        return 1
-    if type(value) is not int or value < 1:
-        raise ValueError("num_return_sequences must be a positive integer")
-    return value
-
-def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
-                         name: str, default: float) -> float:
-    value = _generation_value(config, generation_config, name, default)
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        raise ValueError(f"{name} must be numeric")
-    return float(value)
-
-
-@dataclass(frozen=True)
-class _Control:
-    """Describes one source control's consumer, activation rule and unsupported case."""
-
-    owner: Literal["policy", "task", "metadata", "inapplicable", "transform",
-                   "criterion", "strategy", "capacity", "unsupported"]
-    neutral: tuple[JSON, ...] = ()
-    mode: Literal["always", "sampling", "beam"] = "always"
-    refusal: str | None = None
-    masked_neutral: tuple[JSON, ...] | None = None
-
-
-# GenerationConfig is external data. Keep each control's disposition and
-# neutral values together; the native component constructors own their defaults.
-# Supplied-input causal tasks do not synthesize BOS/decoder-start tokens or
-# switch their native result type through return_dict_in_generate.
-_CONTROLS = {
-    "_commit_hash": _Control("metadata"),
-    "_from_model_config": _Control("metadata"),
-    "assistant_confidence_threshold": _Control("strategy"),
-    "assistant_early_exit": _Control("unsupported", refusal="early-exit proposal is not implemented"),
-    "assistant_ensemble_weight": _Control(
-        "unsupported",
-        neutral=(1.0,),
-        refusal="ensemble verification below one accepts a biased distribution"),
-    "assistant_lookbehind": _Control(
-        "unsupported",
-        refusal="translating between two tokenizers' token spaces is not implemented"),
-    "bad_words_ids": _Control("transform"),
-    "begin_suppress_tokens": _Control("transform"),
-    "bos_token_id": _Control("inapplicable"),
-    "cache_config": _Control("unsupported", refusal="quantized and offloaded caches are not implemented"),
-    "cache_implementation": _Control(
-        "unsupported",
-        neutral=('static',),
-        refusal="the native cache is the fixed-capacity static one", masked_neutral=()),
-    "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
-    "constraints": _Control("unsupported", refusal="constrained beam search is not implemented"),
-    "continuous_batching_config": _Control("unsupported", refusal="continuous batching is not implemented"),
-    "decoder_start_token_id": _Control("inapplicable"),
-    "disable_compile": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="the native decoder always runs compiled"),
-    "diversity_penalty": _Control(
-        "unsupported",
-        neutral=(0.0,),
-        mode="beam",
-        refusal="diverse group beam search is not implemented"),
-    "do_sample": _Control("policy", masked_neutral=(True,)),
-    "dola_layers": _Control("unsupported", refusal="DoLa is a decoding strategy that is not implemented"),
-    "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
-    "encoder_no_repeat_ngram_size": _Control("transform", neutral=(0,)),
-    "encoder_repetition_penalty": _Control("transform", neutral=(1.0,)),
-    "eos_token_id": _Control("task"),
-    "epsilon_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
-    "eta_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
-    "exponential_decay_length_penalty": _Control("transform"),
-    "force_words_ids": _Control("unsupported", refusal="constrained beam search is not implemented"),
-    "forced_bos_token_id": _Control("transform"),
-    "forced_eos_token_id": _Control("transform"),
-    "guidance_scale": _Control(
-        "transform",
-        neutral=(1.0,),
-        refusal="classifier-free guidance evaluates the model a second time per step"),
-    "is_assistant": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="a source loads as a target model, not as another model's assistant"),
-    "length_penalty": _Control("strategy", neutral=(1.0,), mode="beam"),
-    "low_memory": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="sequential beam evaluation is not implemented"),
-    "max_cache_len": _Control("capacity"),
-    "max_length": _Control("task"),
-    "max_matching_ngram_size": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
-    "max_new_tokens": _Control("task"),
-    "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
-    "min_length": _Control("transform", neutral=(0,)),
-    "min_new_tokens": _Control("transform", neutral=(0,)),
-    "min_p": _Control("policy", mode="sampling", masked_neutral=(0.0,)),
-    "no_repeat_ngram_size": _Control("transform", neutral=(0,)),
-    "num_assistant_tokens": _Control("strategy"),
-    "num_assistant_tokens_schedule": _Control(
-        "unsupported",
-        neutral=('constant',),
-        refusal="only a constant proposal length fits a fixed device block"),
-    "num_beam_groups": _Control(
-        "unsupported",
-        neutral=(1,),
-        mode="beam",
-        refusal="diverse group beam search is not implemented"),
-    "num_beams": _Control("strategy", neutral=(1,)),
-    "num_return_sequences": _Control("task"),
-    "output_attentions": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return attentions"),
-    "output_hidden_states": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return hidden states"),
-    "output_logits": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return per-step logits"),
-    "output_scores": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="generation does not return per-step distributions"),
-    "pad_token_id": _Control("task"),
-    "penalty_alpha": _Control(
-        "unsupported",
-        neutral=(0.0,),
-        refusal="contrastive search is a decoding strategy that is not implemented"),
-    "prefill_chunk_size": _Control("unsupported", refusal="the native prefill evaluates a prompt in one call"),
-    "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
-    "remove_invalid_values": _Control("transform", neutral=(False,)),
-    "renormalize_logits": _Control("transform", neutral=(False,)),
-    "repetition_penalty": _Control("transform", neutral=(1.0,)),
-    "return_dict_in_generate": _Control("inapplicable"),
-    "sequence_bias": _Control("transform"),
-    "speculation_type": _Control("strategy"),
-    "stop_strings": _Control("criterion"),
-    "suppress_tokens": _Control("transform"),
-    "target_lookbehind": _Control(
-        "unsupported",
-        refusal="translating between two tokenizers' token spaces is not implemented"),
-    "temperature": _Control("policy", masked_neutral=(1.0,)),
-    "token_healing": _Control(
-        "unsupported",
-        neutral=(False,),
-        refusal="retokenizing the prompt is prompt construction, not decoding"),
-    "tokenizer_name": _Control("metadata"),
-    "top_h": _Control("transform", mode="sampling"),
-    "top_k": _Control("policy", masked_neutral=(0,)),
-    "top_p": _Control("policy", mode="sampling", masked_neutral=(1.0,)),
-    "transformers_version": _Control("metadata"),
-    "typical_p": _Control("transform", neutral=(1.0,), mode="sampling"),
-    "use_cache": _Control(
-        "unsupported",
-        neutral=(True,),
-        refusal="native decoding always runs through its own cache", masked_neutral=(False,)),
-    "use_mtp": _Control("strategy", neutral=(False,)),
-    "watermarking_config": _Control("transform", refusal="no watermarking transform is implemented"),
-}
-
-
-
-def _neutral(value: JSON, neutral: tuple[JSON, ...]) -> bool:
-    if value is None:
-        return True
-    # A config flag is not a config number, so 0 does not neutralize False.
-    numeric = type(value) in (int, float)
-    return any(value == entry and ((numeric and not isinstance(entry, bool)) or type(value) is type(entry))
-               for entry in neutral)
-
-
-def _active(config: Mapping[str, object], generation_config: Mapping[str, object],
-            name: str, *, masked: bool = False) -> JSON:
-    """Return the control's value when it is active, None when it changes nothing."""
-    value = _generation_value(config, generation_config, name)
-    rule = _CONTROLS.get(name)
-    neutral = () if rule is None else rule.neutral
-    if masked and rule is not None and rule.masked_neutral is not None:
-        neutral = rule.masked_neutral
-    return None if _neutral(value, neutral) else value
-
-
-def _audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object]) -> None:
-    """Refuse the active source controls a masked model cannot honour.
-
-    Native MDLM has no AR policy chain and no KV cache, so only the controls a
-    task owns are left standing.
-    """
-    refused = []
-    for name in sorted(_CONTROLS.keys() | generation_config.keys()):
-        rule = _CONTROLS.get(name)
-        if rule is not None and rule.owner in ("task", "metadata", "inapplicable"):
-            continue
-        if _active(config, generation_config, name, masked=True) is not None:
-            refused.append(name)
-    if refused:
-        raise ValueError(f"native MDLM cannot honor active source controls {refused}")
-
-
-def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],
-           model: nn.Module, do_sample: bool, beams: JSON, overridden: bool) -> None:
-    """Refuse active unsupported controls after applying the caller's override."""
-    refused: list[str] = []
-    for name in sorted(_CONTROLS.keys() | generation_config.keys()):
-        rule = _CONTROLS.get(name)
-        if rule is not None:
-            if rule.owner in ("policy", "metadata", "inapplicable", "task"):
-                continue
-            if overridden and rule.owner == "transform":
-                continue
-            if rule.mode == "beam" and _neutral(beams, _CONTROLS["num_beams"].neutral):
-                continue
-            if rule.mode == "sampling" and not do_sample:
-                continue
-            if rule.owner == "capacity":
-                _cache_capacity(config, generation_config, model)
-                continue
-        if _active(config, generation_config, name) is None:
-            continue
-        if rule is not None and rule.refusal is None:
-            continue
-        reason = rule.refusal if rule is not None else "the native decoder does not know this control"
-        refused.append(f"{name} ({reason})")
-    if refused:
-        raise ValueError(
-            f"native decoding cannot honor active source controls {refused}; "
-            "text_generation(sampling=Sampling(...)) replaces the basic policy and the "
-            "transform chain, and TextGeneration(model, variables, processor, logits=..., "
-            "stopping=..., strategy=...) builds the task from components outright")
-
-
-
-def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
-    """Return the decoder a source built, or None for a model that is not one.
-
-    `CausalTransformer` declares what native decoding reads off a model, and
-    `MultimodalTransformer` forwards those four fields to the decoder it
-    holds, so the two answer together for everything but the decoder's own.
-    """
-    return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
-
-
-def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
-                    model: nn.Module) -> None:
-    """Return the declared cache length, checked against the model's own."""
-    value = _generation_value(config, generation_config, "max_cache_len")
-    if value is None:
-        return
-    decoder = _decoder(model)
-    capacity = None if decoder is None else decoder.max_seq_len
-    if type(value) is not int or value < 1:
-        raise ValueError("max_cache_len must be a positive integer")
-    if capacity is not None and value > capacity:
-        raise ValueError(f"max_cache_len {value} exceeds the model's max_seq_len {capacity}")
-
-
-def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     do_sample: bool) -> Sampling:
-    """Return the policy tail a source declares, whatever else it also declares."""
-    temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
-    if temperature is None:
-        temperature = Sampling.temperature
-    if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
-        raise ValueError("temperature must be numeric")
-    top_k = _generation_value(config, generation_config, "top_k")
-    if top_k is not None and type(top_k) is not int:
-        raise ValueError("top_k must be an integer")
-    return Sampling(
-        temperature=float(temperature) if do_sample else 0.0,
-        top_k=top_k if do_sample and top_k else None,
-        eos_id=(_eos_ids(config, generation_config) or None),
-        pad_id=_pad_id(config, generation_config),
-        top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
-        if do_sample else Sampling.top_p,
-        min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
-        if do_sample else Sampling.min_p)
-
-
-def _token_list(value: object, name: str) -> list[int]:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return [value]
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"{name} must be a non-empty list of token ids")
-    ids = []
-    for token in value:
-        if type(token) is not int or token < 0:
-            raise ValueError(f"{name} must hold non-negative integer token ids")
-        ids.append(token)
-    return ids
-
-
-def _as_float(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
-    return float(value)
-
-
-def _as_decay(value: object) -> tuple[int, float]:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError("exponential_decay_length_penalty must be (start_index, factor)")
-    return (records.integer(value[0], "exponential_decay_length_penalty start"),
-            _as_float("exponential_decay_length_penalty factor", value[1]))
-
-
-def _as_bias(value: object) -> list[tuple[list[int], float]]:
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError("sequence_bias must be a non-empty list of token ids and bias pairs")
-    entries = []
-    for entry in value:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise ValueError("each sequence_bias entry is a token id list and a bias")
-        entries.append((_token_list(entry[0], "sequence_bias"), _as_float("sequence_bias", entry[1])))
-    return entries
-
-
-def _as_words(value: object) -> list[list[int]]:
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError("bad_words_ids must be a non-empty list of token id lists")
-    return [_token_list(word, "bad_words_ids") for word in value]
-
-
-def _as_strings(value: object) -> tuple[str, ...]:
-    strings = (value,) if isinstance(value, str) else value
-    if not isinstance(strings, (list, tuple)) or not strings:
-        raise ValueError("stop_strings must be a string or a non-empty list of strings")
-    for entry in strings:
-        if not isinstance(entry, str) or not entry:
-            raise ValueError("stop_strings must hold non-empty strings")
-    return tuple(entry for entry in strings if isinstance(entry, str))
-
-
-def _source_transforms(config: Mapping[str, object], generation_config: Mapping[str, object],
-                       sampling: Sampling, do_sample: bool,
-                       searching: bool) -> tuple[decoding.LogitsTransform, ...]:
-    """Build the source's whole transform chain, in `_get_logits_processor`'s order.
-
-    This is the complete chain the task runs, so the policy's own tail is
-    built here rather than appended afterwards and every warper lands where
-    the reference puts it: temperature, top-h, top-k, top-p, min-p, typical,
-    epsilon, eta, and `renormalize_logits` last of all. Without sampling the
-    reference adds no warper at all and picks the argmax, which is the
-    trailing `Greedy`. Beam search picks its own continuations, so it ends
-    the chain after the processors.
-    """
-    eos = jnp.asarray(_eos_ids(config, generation_config) or (), jnp.int32)
-    read = functools.partial(_active, config, generation_config)
-    transforms: list[decoding.LogitsTransform] = []
-    if (value := read("sequence_bias")) is not None:
-        transforms.append(decoding.sequence_bias(_as_bias(value)))
-    if (value := read("encoder_repetition_penalty")) is not None:
-        transforms.append(decoding.PromptRepetitionPenalty(_as_float("encoder_repetition_penalty", value)))
-    if (value := read("repetition_penalty")) is not None:
-        transforms.append(decoding.RepetitionPenalty(_as_float("repetition_penalty", value)))
-    if (value := read("no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.NoRepeatNGram(records.integer(value, "no_repeat_ngram_size")))
-    if (value := read("encoder_no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.PromptNoRepeatNGram(records.integer(value, "encoder_no_repeat_ngram_size")))
-    if (value := read("bad_words_ids")) is not None:
-        transforms.append(decoding.bad_words(_as_words(value), sampling.eos_id))
-    if (value := read("min_length")) is not None and eos.size:
-        transforms.append(decoding.MinLength(records.integer(value, "min_length"), eos))
-    if (value := read("min_new_tokens")) is not None and eos.size:
-        transforms.append(decoding.MinNewTokens(records.integer(value, "min_new_tokens"), eos))
-    if (value := read("forced_bos_token_id")) is not None:
-        transforms.append(decoding.ForcedBOS(records.integer(value, "forced_bos_token_id")))
-    if (value := read("forced_eos_token_id")) is not None:
-        # The reference forces at the effective end of the request, and a call
-        # may set its own budget, so the control stays request relative.
-        transforms.append(decoding.ForcedEOS(
-            jnp.asarray(_token_list(value, "forced_eos_token_id"), jnp.int32)))
-    if read("remove_invalid_values") is not None:
-        transforms.append(decoding.RemoveInvalidValues())
-    if (value := read("exponential_decay_length_penalty")) is not None:
-        start, factor = _as_decay(value)
-        transforms.append(decoding.ExponentialDecayLengthPenalty(start, factor, eos))
-    if (value := read("suppress_tokens")) is not None:
-        transforms.append(decoding.SuppressTokens(
-            jnp.asarray(_token_list(value, "suppress_tokens"), jnp.int32)))
-    if (value := read("begin_suppress_tokens")) is not None:
-        transforms.append(decoding.BeginSuppressTokens(
-            jnp.asarray(_token_list(value, "begin_suppress_tokens"), jnp.int32),
-            read("forced_bos_token_id") is not None))
-    if searching:
-        if read("renormalize_logits") is not None:
-            transforms.append(decoding.Renormalize())
-        return tuple(transforms)
-    if not do_sample:
-        transforms.append(decoding.Greedy())
-    else:
-        if sampling.temperature != 1.0:
-            transforms.append(decoding.Temperature(sampling.temperature))
-        if (value := read("top_h")) is not None:
-            transforms.append(decoding.TopH(_as_float("top_h", value)))
-        if sampling.top_k is not None:
-            transforms.append(decoding.TopK(sampling.top_k))
-        if sampling.top_p < 1.0:
-            transforms.append(decoding.TopP(sampling.top_p))
-        if sampling.min_p > 0.0:
-            transforms.append(decoding.MinP(sampling.min_p))
-        if (value := read("typical_p")) is not None:
-            transforms.append(decoding.Typical(_as_float("typical_p", value)))
-        if (value := read("epsilon_cutoff")) is not None:
-            transforms.append(decoding.EpsilonCutoff(_as_float("epsilon_cutoff", value)))
-        if (value := read("eta_cutoff")) is not None:
-            transforms.append(decoding.EtaCutoff(_as_float("eta_cutoff", value)))
-    if read("renormalize_logits") is not None:
-        transforms.append(decoding.Renormalize())
-    return tuple(transforms)
-
-
-def _source_stopping(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     processor: Processor | None, vocab_size: int | None
-                     ) -> tuple[decoding.Stopping, ...]:
-    """Return the source's active criteria beyond the policy's EOS ids."""
-    value = _active(config, generation_config, "stop_strings")
-    if value is None:
-        return ()
-    if processor is None:
-        raise ValueError("stop_strings need the source's processor to compile its vocabulary")
-    if vocab_size is None:
-        raise ValueError("stop_strings need the model's vocab_size to compile its vocabulary")
-    return (decoding.stop_strings(processor, _as_strings(value), vocab_size),)
-
-
-def _source_strategy(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, do_sample: bool, rows: int) -> Strategy | None:
-    """Return the device loop a source's config names, or None for plain sampling."""
-    read = functools.partial(_active, config, generation_config)
-    beams = read("num_beams")
-    speculating = read("use_mtp") is not None or _mtp_mode(read("speculation_type"))
-    if beams is not None and speculating:
-        raise ValueError("a source cannot ask for beam search and speculative decoding at once")
-    if beams is not None:
-        if do_sample:
-            raise ValueError("stochastic beam search is refused: a selected beam's marginal "
-                             "probability is not the per-step candidate probability, so no honest "
-                             "behaviour likelihood exists")
-        width = records.integer(beams, "num_beams")
-        if rows > width:
-            raise ValueError(f"num_return_sequences {rows} exceeds num_beams {width}")
-        early = _generation_value(config, generation_config, "early_stopping")
-        penalty = _generation_value(config, generation_config, "length_penalty")
-        if early is None:
-            early = Beam.early_stopping
-        if early not in (True, False, "never"):
-            raise ValueError("early_stopping is True, False or 'never'")
-        return Beam(width=width,
-                    length_penalty=Beam.length_penalty if penalty is None else _as_float("length_penalty", penalty),
-                    early_stopping=early is True if isinstance(early, bool) else "never",
-                    stop_ids=len(_eos_ids(config, generation_config)))
-    if not speculating:
-        return None
-    decoder = _decoder(model)
-    if decoder is None or not decoder.num_nextn_predict_layers:
-        raise ValueError("the source asks for multi-token-prediction speculation, but this "
-                         "checkpoint carries no prediction-depth weights")
-    length = read("num_assistant_tokens")
-    threshold = read("assistant_confidence_threshold")
-    drafted = Speculative.block - 1 if length is None else records.integer(length, "num_assistant_tokens")
-    if drafted < 1:
-        raise ValueError("num_assistant_tokens must draft at least one token")
-    # The block includes the target draw the proposer chains from.
-    return Speculative(block=drafted + 1,
-                       confidence=Speculative.confidence if threshold is None else
-                       _as_float("assistant_confidence_threshold", threshold))
-
-
-def _mtp_mode(value: object) -> bool:
-    if value is None:
-        return False
-    if not isinstance(value, str) or value.lower() not in ("mtp", "multi_token_prediction"):
-        raise ValueError(f"speculation_type {value!r} names no native proposer; only the model's "
-                         "own prediction depths draft natively")
-    return True
-
-
-def _source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None, rows: int,
-                     override: Sampling | None
-                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None,
-                                tuple[decoding.Stopping, ...], Strategy | None]:
-    """Return the policy, chain, criteria and strategy a loaded source decodes with.
-
-    An explicit policy replaces the first two, so they are not built and the
-    controls behind them are not judged: a watermark the caller just replaced
-    cannot block the call.
-    """
-    requested_mode = _generation_value(config, generation_config, "do_sample")
-    if override is None and requested_mode is not None and type(requested_mode) is not bool:
-        raise ValueError("do_sample must be a boolean")
-    do_sample = requested_mode is True
-    _audit(config, generation_config, model, do_sample,
-           _generation_value(config, generation_config, "num_beams"), override is not None)
-    strategy = _source_strategy(config, generation_config, model, do_sample, rows)
-    decoder = _decoder(model)
-    criteria = _source_stopping(config, generation_config, processor,
-                                None if decoder is None else decoder.vocab_size)
-    policy = override if override is not None else _source_sampling(config, generation_config, do_sample)
-    transforms = (None if override is not None else
-                  _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam)))
-    return policy, transforms, criteria, strategy
 
 
 class _Call(NamedTuple):
@@ -2400,6 +1864,188 @@ def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nda
                      "float16 tensor in the checkpoint")
 
 
+def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None, *,
+                     dtype: str, attention_impl: str, param_dtype: str) -> Pretrained | None:
+    """The source as a latent diffusion pipeline, or None when it is a decoder.
+
+    A single file converts into the pipeline it describes; a directory with
+    a model_index.json and no config.json of its own is one. A decoder that
+    also ships a pipeline index for its sampler (DiffusionGemma) is loaded as
+    the decoder its config names."""
+
+    def pipeline(directory: Path) -> Pretrained:
+        with open(directory / "model_index.json") as handle:
+            index = json.load(handle)
+        storage = param_dtype
+        if storage == AUTO:
+            from dew.interop import diffusion
+            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
+            storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
+        loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
+                                        param_dtype=storage)
+        return replace(loaded, revision=commit)
+
+    if single_file is not None:
+        from dew.interop import single_file as original
+        # A repo or directory that describes the pipeline (model_index.json
+        # and its component configs) is the configs, as from_single_file(config=)
+        # takes; a Hub repo's are its metadata snapshot, so the weights of a
+        # component the file lacks come from the repo at that commit.
+        configs = directory if (directory / "model_index.json").is_file() else None
+        hub = None if configs is None or commit is None else (str(name_or_dir), commit)
+        with original.unpacked(decoders.repo_file(name_or_dir, directory, single_file), configs, hub) as (
+                converted, published):
+            return replace(pipeline(converted), source=published)
+    if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
+        with open(directory / "model_index.json") as handle:
+            index = json.load(handle)
+        # The metadata fetch returns its commit directory, so the weights
+        # come from that commit even if the requested branch moves.
+        return pipeline(decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
+            name for name in index if _present(index, name))))
+    return None
+
+
+def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
+                   gguf_path: Path | None) -> tuple[Mapping[str, object], Mapping[str, np.ndarray] | None]:
+    """The decoder's config, and its tensors where the config came with them
+    (a GGUF file holds both); refused, naming what the source ships instead,
+    before any weight downloads when there is no config.json."""
+    if gguf_path is not None:
+        return gguf.read(gguf_path)
+    if not (directory / "config.json").is_file():
+        # A GGUF repo often ships none, and says which argument reads it.
+        files = (decoders._repo_files(str(name_or_dir), directory) if commit is not None else
+                 {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()})
+        shipped = decoders._missing_weights(str(name_or_dir), files)
+        raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
+                                f"are; {shipped}")
+    with open(directory / "config.json") as handle:
+        config = records.record(json.load(handle), "config.json")
+    text_config = config.get("text_config")
+    if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
+            and text_config.get("quantization_config") is not None):
+        raise ValueError(
+            "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
+            "provide dequantized text weights and remove that quantization descriptor")
+    return config, None
+
+
+def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str
+             ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray]]:
+    """The tensors with a quantized source's weights decoded, and what `save`
+    needs to write them back: the quantized names, the scales' dtype and the
+    integer formats' grid."""
+    quantization = source_quantization(config)
+    if quantization is None:
+        return tensors, (), None, {}
+    quantized_tensors, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
+    grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
+            if part in tensors}
+    aliases: tuple[tuple[str, str], ...] = ()
+    if param_dtype != "float32":
+        aliases = decoders.validate_source_aliases(
+            quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
+    tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
+    _share_quantized_aliases(tensors, aliases, quantized_tensors)
+    return tensors, quantized_tensors, scale_dtype, grid
+
+
+def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoders.DecoderFields, family: str,
+                     variables: Variables) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+    """Each source tensor's binding into the tree, and the tensors none binds."""
+    bindings, retained = [], {}
+    for name, tensor in tensors.items():
+        binding = _language_layout(name, name, tensor, record, family, variables)
+        if binding is None:
+            retained[name] = tensor
+        else:
+            bindings.append(binding)
+    return tuple(bindings), retained
+
+
+def _generation_config(directory: Path) -> Mapping[str, object]:
+    """The source's generation_config.json, or {} when it has none."""
+    generation_path = directory / "generation_config.json"
+    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
+
+    def policy_read() -> None:
+        """Refuse a generation_config.json that is not an object.
+
+        Loading for training or export does not opt into the source sampler;
+        active policy support is checked when the caller creates its task.
+        """
+        if not isinstance(generation_config, dict):
+            raise ValueError("generation_config.json must contain an object")
+
+    agreed("pretrained generation policy", policy_read)
+    return generation_config
+
+
+class _Built(NamedTuple):
+    """A decoder source built and bound: the model, its variables, the
+    record it was translated to, what it was built from, and the source
+    tensors' bindings and the ones none binds."""
+
+    model: nn.Module
+    variables: Variables
+    record: Mapping[str, object]
+    built: Mapping[str, object]
+    layouts: tuple[WeightLayout, ...]
+    retained: dict[str, np.ndarray]
+
+
+def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path, *,
+                    dtype: str, attention_impl: str, max_seq_len: int | None, param_dtype: str,
+                    lazy: bool) -> _Built:
+    """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
+    record = decoders.translate_wrapper_config(config)
+    text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    text: decoders.DecoderFields = {**text_fields, **precision_fields(
+        "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
+    wrapper: decoders.WrapperFields = {**record, "text": text}
+    language_model = models.build("causal_transformer", wrapper["text"])
+    if not isinstance(language_model, CausalTransformer):
+        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    model = _wrapper_model(config, record, language_model, dtype=dtype)
+    parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    variables = _native_variables({**parts, "language_model": decoders.with_constants(
+        parts["language_model"], record["text"], directory)})
+    layouts, retained = _wrapper_layouts(tensors, record, variables)
+    return _Built(model, variables, record, wrapper, layouts, retained)
+
+
+def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
+                    verified: verify.VerifiedMapping | None, *, dtype: str, attention_impl: str,
+                    max_seq_len: int | None, param_dtype: str, lazy: bool) -> _Built:
+    """A decoder of a registered family, or of one it was verified as (tier 2)."""
+    if verified is None:
+        record = decoders.translate_config(config)
+        # translate_config refused every model_type but a registered family's name.
+        family = records.text(config.get("model_type"), "model_type")
+    else:
+        record = verified.translate(config, tensors)
+        family = verify.CONVENTION
+    if max_seq_len is not None:
+        record["max_seq_len"] = max_seq_len
+    built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
+    model = models.build("causal_transformer", built)
+    variables = decoders.with_constants(decoders.translate_weights(
+        tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
+    decoders._check_tree(variables, model)
+    # The bindings are what an adapter loader resolves source names through
+    # and what a quantized source is written back through, so a
+    # derived-export family binds too; `save` picks its writer by
+    # preserve_source_layout and quantization, not by whether bindings exist.
+    # A family whose tensors are rewritten before the path map reads them
+    # (Gemma 4's prepare) has no raw-name bindings.
+    entry = decoders._FAMILIES[family]
+    layouts, retained = ((), {})
+    if entry.preserve_source_layout or entry.prepare_weights is dict:
+        layouts, retained = _decoder_layouts(tensors, record, family, variables)
+    return _Built(model, variables, record, built, layouts, retained)
+
+
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
                     revision: str | None = None, gguf_file: str | None = None,
@@ -2466,64 +2112,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len)
         return replace(loaded, variables=placed(loaded.variables))
-    def diffusion_pipeline(directory: Path) -> Pretrained:
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        storage = param_dtype
-        if storage == AUTO:
-            from dew.interop import diffusion
-            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
-        loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
-                                        param_dtype=storage)
-        return replace(loaded, variables=placed(loaded.variables), revision=commit)
-
-    if single_file is not None:
-        from dew.interop import single_file as original
-        # A repo or directory that describes the pipeline (model_index.json
-        # and its component configs) is the configs, as from_single_file(config=)
-        # takes; a Hub repo's are its metadata snapshot, so the weights of a
-        # component the file lacks come from the repo at that commit.
-        configs = directory if (directory / "model_index.json").is_file() else None
-        hub = None if configs is None or commit is None else (str(name_or_dir), commit)
-        with original.unpacked(decoders.repo_file(name_or_dir, directory, single_file), configs, hub) as (
-                converted, published):
-            return replace(diffusion_pipeline(converted), source=published)
-    if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
-        # A latent diffusion pipeline is a directory of components with no
-        # model of its own; a decoder that also ships a pipeline index for its
-        # sampler (DiffusionGemma) is loaded as the decoder its config names.
-        with open(directory / "model_index.json") as handle:
-            index = json.load(handle)
-        # The metadata fetch returns its commit directory, so the weights
-        # come from that commit even if the requested branch moves.
-        return diffusion_pipeline(decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
-            name for name in index if _present(index, name))))
-    tensors = None
+    pipeline = _pipeline_source(name_or_dir, directory, commit, single_file, dtype=dtype,
+                                attention_impl=attention_impl, param_dtype=param_dtype)
+    if pipeline is not None:
+        return replace(pipeline, variables=placed(pipeline.variables))
     gguf_path = None if gguf_file is None else decoders.repo_file(name_or_dir, directory, gguf_file)
-    if gguf_path is not None:
-        config, tensors = gguf.read(gguf_path)
-    else:
-        if not (directory / "config.json").is_file():
-            # Refused before any weight downloads or converts; a GGUF repo
-            # often ships none, and says which argument reads it.
-            files = (decoders._repo_files(str(name_or_dir), directory) if commit is not None else
-                     {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()})
-            shipped = decoders._missing_weights(str(name_or_dir), files)
-            raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
-                                    f"are; {shipped}")
-        with open(directory / "config.json") as handle:
-            config = records.record(json.load(handle), "config.json")
-    # mamba_ssm's own format reads as the transformers port it converts to.
+    config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
-    text_config = config.get("text_config")
-    if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
-            and text_config.get("quantization_config") is not None):
-        raise ValueError(
-            "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
-            "provide dequantized text weights and remove that quantization descriptor")
     family = config.get("model_type")
     # Before any weight downloads: a format the codec cannot read is refused
     # on the config alone.
@@ -2539,26 +2136,13 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if param_dtype == AUTO:
         param_dtype = _checkpoint_dtype(config, tensors)
-    quantization = source_quantization(config)
-    quantized_tensors, scale_dtype = ((), None) if quantization is None else (
-        quantization.names(tensors), quantization.scale_dtype(tensors))
-    grid = {part: tensors[part] for name in quantized_tensors
-            for part in (quantization.grid(name) if quantization is not None else ()) if part in tensors}
-    if quantization is not None:
-        aliases: tuple[tuple[str, str], ...] = ()
-        if param_dtype != "float32":
-            aliases = decoders.validate_source_aliases(
-                quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
-        tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
-        _share_quantized_aliases(tensors, aliases, quantized_tensors)
-    layouts: tuple[WeightLayout, ...] = ()
-    retained: dict[str, np.ndarray] = {}
+    tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
     export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
         model = diffusion_gemma.build(config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
         variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype)
-        record = config
+        record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
     elif "text_config" in config and (family not in decoders._FAMILIES or decoders._bundles(config)):
@@ -2567,64 +2151,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # counterpart and the text half, read from the nested config, is the
         # model, unless the family reads its media bundle whole
         # (`DecoderFamily.wrapper`); `translate_config` refuses the rest.
-        record = decoders.translate_wrapper_config(config)
-        text_fields = _wrapper_text_fields(config, record, max_seq_len)
-        text: decoders.DecoderFields = {**text_fields, **precision_fields(
-            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
-        wrapper: decoders.WrapperFields = {**record, "text": text}
-        built = wrapper
-        language_model = models.build("causal_transformer", wrapper["text"])
-        if not isinstance(language_model, CausalTransformer):
-            raise TypeError("causal_transformer registry entry must build CausalTransformer")
-        model = _wrapper_model(config, record, language_model, dtype=dtype)
-        parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=streaming)
-        variables = _native_variables({**parts, "language_model": decoders.with_constants(
-            parts["language_model"], record["text"], directory)})
-        layouts, retained = _wrapper_layouts(tensors, record, variables)
+        model, variables, record, built, layouts, retained = _wrapper_source(
+            config, tensors, directory, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len,
+            param_dtype=param_dtype, lazy=streaming)
     else:
-        if verified is None:
-            record = decoders.translate_config(config)
-            # translate_config refused every model_type but a registered family's name.
-            family = records.text(family, "model_type")
-        else:
-            record = verified.translate(config, tensors)
-            family = verify.CONVENTION
-        if max_seq_len is not None:
-            record["max_seq_len"] = max_seq_len
-        built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
-        model = models.build("causal_transformer", built)
-        variables = decoders.with_constants(decoders.translate_weights(
-            tensors, record, family, param_dtype=param_dtype, lazy=streaming), record, directory)
-        decoders._check_tree(variables, model)
-        # The bindings are what an adapter loader resolves source names
-        # through and what a quantized source is written back through, so a
-        # derived-export family binds too; `save` picks its writer by
-        # preserve_source_layout and quantization, not by whether bindings
-        # exist. A family whose tensors are rewritten before the path map
-        # reads them (Gemma 4's prepare) has no raw-name bindings.
-        entry = decoders._FAMILIES[family]
-        if entry.preserve_source_layout or entry.prepare_weights is dict:
-            bindings = []
-            for name, tensor in tensors.items():
-                binding = _language_layout(name, name, tensor, record, family, variables)
-                if binding is None:
-                    retained[name] = tensor
-                else:
-                    bindings.append(binding)
-            layouts = tuple(bindings)
+        model, variables, record, built, layouts, retained = _decoder_source(
+            config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
+            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
     processor = _source_processor(directory, config, record, model, gguf_path)
-    generation_path = directory / "generation_config.json"
-    generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
-    def policy_read() -> None:
-        """Refuse a generation_config.json that is not an object.
-
-        Loading for training or export does not opt into the source sampler;
-        active policy support is checked when the caller creates its task.
-        """
-        if not isinstance(generation_config, dict):
-            raise ValueError("generation_config.json must contain an object")
-
-    agreed("pretrained generation policy", policy_read)
+    generation_config = _generation_config(directory)
     return Pretrained(model, placed(variables), processor, config, directory, built, generation_config,
                       layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                       quantized_scale_dtype=scale_dtype, quantization_grid=grid,
