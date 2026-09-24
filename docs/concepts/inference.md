@@ -93,7 +93,26 @@ To reload the run later, Dew also needs the model description. A recipe's `RunCo
 
 ### A trained language model to text
 
-`LMObjective.pipeline` uses the policy and budget set in its `Samples`. If the training objective only knew token IDs, bind a processor:
+`LMObjective.policy` hands back the `TextGeneration` bound to the parameters you pass it, which is the same task the GRPO rollout samples with. This continues the decoder trained in [Train a decoder on TinyStories](language_models.md#train-a-decoder-on-tinystories), in the same session:
+
+```python
+import numpy as np
+
+from dew.inference import TextGeneration
+
+prompt = tokenizer.encode("Once upon a time")
+task = objective.policy(lm_state.params, Sampling(temperature=0.0))
+drawn = task([prompt], 8, key=jax.random.key(1))
+print(tokenizer.decode(drawn.tokens[0]), np.asarray(drawn.lengths))
+
+same = TextGeneration(model, lm_state.params, sampling=Sampling(temperature=0.0))
+print(np.array_equal(np.asarray(same([prompt], 8, key=jax.random.key(1)).tokens),
+                     np.asarray(drawn.tokens)))
+```
+
+This prints `Once upon a time, there was a little girl named Lily [8]` and `True`: the constructor and `policy` build the same task. `lengths` counts the 8 response actions, not the 4 prompt tokens the row also carries. `Generation` also returns `terminated`, and the `behavior_log_probs` and `raw_log_probs` a policy ratio needs.
+
+A task built by `Pretrained.text_generation()` carries the checkpoint's processor, so it accepts strings and `decode` returns text. Without a processor the task takes token rows or `ModelInputs`. `LMObjective.pipeline` uses the policy and budget set in its `Samples`; if the training objective only knew token IDs, bind a processor:
 
 ```python
 from dew.data import ByteTokenizer

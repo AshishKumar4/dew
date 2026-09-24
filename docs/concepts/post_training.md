@@ -2,7 +2,132 @@
 
 Post-training changes how a model behaves after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Proximal policy optimization (PPO) also learns a critic that estimates future rewards. Flow-GRPO scores samples from a rectified-flow model.
 
-Dew runs all of these objectives on the same `Trainer`. Their batches carry different kinds of supervision. Read [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for how models, objectives and the trainer fit together. The first full example below trains a tiny DPO model without downloading a tokenizer, a dataset or a pretrained checkpoint.
+Dew runs all of these objectives on the same `Trainer`. Their batches carry different kinds of supervision. Read [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for how models, objectives and the trainer fit together.
+
+## Continue a decoder with SFT, DPO and GRPO
+
+The three examples below continue the TinyStories decoder from [Train a decoder on TinyStories](language_models.md#train-a-decoder-on-tinystories), in the same Python session: they reuse its `model`, `lm_state`, `tokenizer` and imports. Each stage starts from `lm_state.params`, so you can run them in any order.
+
+### Supervised fine-tuning
+
+Fine-tune the decoder on a response to a prompt. Each token carries a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. `ChatMessages` produces this role column from chat templates when reading conversation data.
+
+```python
+import itertools
+
+import numpy as np
+
+from dew import Dataset
+from dew.data.chat import Role
+
+prompt = tokenizer.encode("Tom had a red ball.")
+response = tokenizer.encode(" He kicked it to his dog.")
+row = np.array(prompt + response, dtype=np.int32)
+roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
+sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
+sft_data = Dataset(
+    train=lambda partition: itertools.repeat(sft_batch),
+    val=None,
+    records=8,
+    batch=8,
+)
+sft_objective = LMObjective(
+    model,
+    seq_len=len(row) - 1,
+    pretrained=lm_state.params,
+    loss_role=Role.ASSISTANT,
+    ema_decay=None,
+)
+sft_state = Trainer(
+    sft_objective,
+    optax.adamw(1e-3),
+    key=jax.random.key(2),
+).fit(sft_data, steps=20, log_every=10)
+```
+
+The loss counts assistant targets after the next-token shift. Prompt tokens still provide context. For conversation files, `ChatMessages` also preserves tool calls, tool responses and tool schemas; [SFT](#sft-learn-from-assistant-answers) below describes the format.
+
+### Preference optimization
+
+Continue with a chosen and a rejected response to the same prompt. The masks restrict the loss to the response tokens.
+
+```python
+import json
+
+from dew.data import PreferencePairs
+from dew.objectives.rl import DPOObjective
+
+rejected = tokenizer.encode(" He kicked kicked kicked it.")
+pair = {"chosen": prompt + response, "rejected": prompt + rejected,
+        "chosen_mask": [0] * len(prompt) + [1] * len(response),
+        "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
+pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
+                        loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
+dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.params)
+dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
+    pairs, steps=10, log_every=5)
+```
+
+`DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width, and shorter pairs are padded to it; the objective scores one fewer position because of the next-token shift.
+
+### Reinforcement learning with a reward function
+
+This continues the same decoder with a reward for stories about a dog. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
+
+```python
+from dew.objectives.rl import GRPOObjective, SampledRollout
+
+prompt = tokenizer.encode("Once upon a time, there was a little")
+prompt_batch = {
+    "prompt": np.tile(np.array(prompt, dtype=np.int32), (8, 1)),
+    "prompt_length": np.full(8, len(prompt), dtype=np.int32),
+    "data_source": np.tile(
+        np.frombuffer(b"tinystories", dtype=np.uint8).astype(np.int32),
+        (8, 1),
+    ),
+    "ground_truth": np.tile(
+        np.frombuffer(b"dog", dtype=np.uint8).astype(np.int32),
+        (8, 1),
+    ),
+    "extra_info": np.zeros((8, 0), dtype=np.int32),
+}
+
+
+def reward(data_source, completion, ground_truth, extra_info):
+    return float(ground_truth in completion)
+
+
+rl_data = Dataset(
+    train=lambda partition: itertools.repeat(prompt_batch),
+    val=None,
+    records=8,
+    batch=8,
+)
+rl_objective = GRPOObjective(
+    model,
+    seq_len=len(prompt) + 7,
+    beta=0.01,
+    pretrained=lm_state.params,
+)
+rollout = SampledRollout(
+    rl_objective,
+    reward=reward,
+    groups=4,
+    max_new_tokens=8,
+    sampling=Sampling(temperature=1.0, top_k=40),
+    decode=tokenizer.decode,
+)
+rl_state = Trainer(
+    rl_objective,
+    optax.adamw(1e-4),
+    key=jax.random.key(3),
+    rollout=rollout,
+).fit(rl_data, steps=20, log_every=10)
+```
+
+Each prompt produces four responses, and `SampledRollout.decode` turns each one into the text the reward reads. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
+
+[`recipes/chain.py`](../../recipes/chain.py) connects SFT, DPO and GRPO stages from the command line. The sections below explain each objective's data and options in full, and the DPO section includes a complete example that downloads nothing.
 
 ## SFT: learn from assistant answers
 

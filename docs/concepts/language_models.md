@@ -1,45 +1,52 @@
 # Training language models
 
-This page assumes you have done the [first training run](../getting-started.md) and know how next-token prediction works. You do not need a pretrained model to run the first example. It uses a synthetic vocabulary of four tokens, so you can look at every input and output.
+This page assumes you have done the [first training run](../getting-started.md) and know how next-token prediction works. It trains a small decoder on real text first, then covers tokenization, the loss, loading published checkpoints and the other kinds of language model Dew trains.
 
-## Train a small decoder
+## Train a decoder on TinyStories
+
+This decoder trains on TinyStories, a corpus of short stories in simple English, with the GPT-2 tokenizer. Download the 22 MB validation file of TinyStories V2 and tokenize it into the `train.bin`, `val.bin` and `meta.json` that `TokenWindows` reads. The tool holds out the first 1% of the tokens for validation.
+
+```bash
+hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
+    --repo-type dataset --local-dir data
+python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+    --out data/tinystories --tokenizer gpt2
+```
+
+Each row holds 257 token IDs: the model receives the first 256 and predicts the following 256.
 
 ```python
-import itertools
-
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 
-from dew import Trainer
-from dew.data import Dataset
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew import Trainer, metrics, models
+from dew.data import HFTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
-row = np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], dtype=np.int32)
-tokens = np.tile(row, (8, 1))
-data = Dataset(train=lambda partition: itertools.repeat({"text": tokens}),
-               val=None, records=8, batch=8)
-model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
-                          num_heads=2, mlp_features=32, max_seq_len=16,
-                          dtype=jnp.float32, attention_impl="xla")
-objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, optax.adam(0.01), key=jax.random.key(0))
-state = trainer.fit(data, steps=30, log_every=15)
-prompt = jnp.array([[0, 1]], dtype=jnp.int32)
-result = generate(model, state.params, prompt, max_new_tokens=6,
-                  key=jax.random.key(1), sampling=Sampling(temperature=0.0))
-print("Generated token IDs:", np.asarray(result.tokens).tolist())
-np.testing.assert_array_equal(np.asarray(result.tokens[:, :2]), np.asarray(prompt))
+tokenizer = HFTokenizer("gpt2")
+data = TokenWindows(path="data/tinystories", seq_len=256,
+                    loading=Loading(workers=0)).load(batch=32)
+model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
+                     emb_features=256, num_layers=4, num_heads=4, max_seq_len=256,
+                     dtype=jnp.bfloat16)
+objective = LMObjective(model, seq_len=256)
+lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
+    data, steps=2000, log_every=500, eval_every=1000, metrics=(metrics.perplexity(),))
+continuation = generate(model, lm_state.params, [tokenizer.encode("Once upon a time")],
+                        max_new_tokens=40, key=jax.random.key(1),
+                        sampling=Sampling(temperature=0.0))
+print(tokenizer.decode(continuation.tokens[0]))
 ```
 
-`LMObjective` reads token rows of shape `(B, S + 1)`. It feeds the first `S` tokens to the model and scores the predictions against the next `S` tokens. Each row here has nine tokens, so `seq_len=8`. Token IDs must be integers inside the model's vocabulary.
+On one Colab L4 GPU the run takes about three minutes. The training loss falls from 2.75 at step 500 to 1.95 at step 2,000, and validation perplexity reaches 8.7. One run's greedy continuation reads:
 
-Causal attention stops a position from reading later tokens. The model has a hidden width of 16, two attention heads and a feed-forward width of 32. The example uses float32 and XLA attention so it also runs on CPU. These sizes are for learning the API. Do not use them to compare model quality or throughput.
+> Once upon a time, there was a little girl named Lily. She had a big, red ball. Lily loved to play with her ball. One day, she saw a big box. She wanted to open it.
 
-The training loss should go down as the decoder learns the repeating pattern. `result.tokens` holds the prompt followed by six generated token IDs. `Sampling(temperature=0.0)` picks the highest-scoring token at each step, so the behavior log-probability of each pick is zero. You still pass the key explicitly. The exact output can change with the library version and the initialization.
+`LMObjective` reads token rows of shape `(B, S + 1)`. It feeds the first `S` tokens to the model and scores the predictions against the next `S`, so `seq_len=256` here. Token IDs must be integers inside the model's vocabulary. `temperature=0` selects the highest-probability token at every step. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses the EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
+
+The [post-training guide](post_training.md) continues this decoder with SFT, DPO and GRPO, and [Generate and serve](inference.md#a-trained-language-model-to-text) draws from it.
 
 ## Tokenize real text
 
@@ -161,7 +168,43 @@ Loading works in three tiers.
 
 ## Diffusion language models and media inputs
 
-LLaDA and Dream predict masked tokens with bidirectional attention. They need a mask token ID and a masked-diffusion objective. Swapping out the autoregressive loss is not enough; the attention and the corruption process have to change too.
+Masked diffusion trains a bidirectional decoder to recover corrupted tokens. Unlike autoregressive training, each input row contains exactly `seq_len` tokens; there is no next-token shift, so windows of `seq_len=127`, which hold 128 IDs each, feed a 128-token objective. This continues from the [TinyStories run](#train-a-decoder-on-tinystories) above, reusing its token files and tokenizer. The mask takes the ID after the last GPT-2 token.
+
+```python
+from dew.diffusion.discrete import MDLM
+from dew.objectives.diffusion import MaskedDiffusionObjective
+
+masked_data = TokenWindows(path="data/tinystories", seq_len=127,
+                           loading=Loading(workers=0)).load(batch=64)
+mask_id = tokenizer.vocab_size
+process = MDLM(mask_id=mask_id)()
+masked_model = models.build(
+    "causal_transformer",
+    vocab_size=mask_id + 1,
+    emb_features=256,
+    num_layers=4,
+    num_heads=4,
+    max_seq_len=128,
+    causal=False,
+    dtype=jnp.bfloat16,
+)
+masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=128)
+masked_state = Trainer(
+    masked_objective,
+    optax.adamw(1e-3),
+    key=jax.random.key(4),
+).fit(masked_data, steps=4000, log_every=1000, eval_every=2000,
+      metrics=(metrics.perplexity(),))
+drawn = process.generate(masked_model, masked_state.averaged,
+                         [tokenizer.encode("Once upon a time")], 48, key=jax.random.key(5))
+print(tokenizer.decode(drawn.tokens[0]))
+```
+
+On the same L4 the 4,000 steps take about five minutes. The loss, MDLM's negative ELBO per token, falls from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reaches 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own, so it does not compare directly with the 8.7 of the autoregressive decoder. `process.generate` unmasks the 48 tokens after the prompt in 64 reverse steps; one run's draw reads:
+
+> Once upon a time, in a small town, there lived a little girl named Lily. Mia loved whistle. She had an key telling to try to sleep. One day, she always to see her favorite mom, dad unate to have lots of.
+
+LLaDA and Dream use this masked-token path from their released weights. They predict masked tokens with bidirectional attention and need a mask token ID and a masked-diffusion objective; swapping out the autoregressive loss is not enough, because the attention and the corruption process change too. Diffusion Gemma uses a different canvas and self-conditioning process, covered below.
 
 For these models, `load_pretrained(...).text_generation()`, `dew.pipeline(source_or_run)` and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration`. It runs Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`). It does not reproduce the source-specific remasking and block-generation recipes of LLaDA or Dream.
 
