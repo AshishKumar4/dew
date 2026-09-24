@@ -641,6 +641,7 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     cache first so it comes back through readahead in small folios, and the
     tensors are megabytes, so what stays is a sliver."""
     import os
+
     from dew.interop.safetensors_io import read_file, write_file
     model = decoder(vocab_size=256, emb_features=256, mlp_features=4096)
     fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
@@ -673,3 +674,17 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     assert _resident_pages(single) < single.nbytes // 4096
     np.testing.assert_array_equal(
         np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))
+
+
+def test_stream_refuses_a_node_it_cannot_update_in_place_by_its_path():
+    """stream writes each placed leaf back into its dict node; a FrozenDict
+    below the root is named, not handed to the placement as a leaf."""
+    from flax.core import freeze
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training.host import stream
+
+    replicated = NamedSharding(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), PartitionSpec())
+    tree = {"params": freeze({"dense": {"kernel": np.ones(2, np.float32)}})}
+    with pytest.raises(TypeError, match=r"params is a FrozenDict.*unfreeze"):
+        stream(tree, {"params": {"dense": {"kernel": replicated}}})
