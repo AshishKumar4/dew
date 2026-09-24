@@ -1,0 +1,99 @@
+---
+// Links for a tutorial notebook: Colab, live execution, source and download.
+import { Icon } from '@astrojs/starlight/components';
+
+interface Props {
+	notebook: {
+		source: string;
+		colab: string;
+		github: string;
+		download: string;
+		accelerator: 'CPU' | 'GPU';
+		live: boolean;
+	};
+}
+
+const { notebook } = Astro.props;
+const liveEndpoint = import.meta.env.PUBLIC_LIVE_ENDPOINT;
+const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs on a CPU';
+---
+
+<div class="notebook-bar not-content" data-notebook={notebook.source}>
+	<a class="nb-button primary" href={notebook.colab} target="_blank" rel="noopener">
+		<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" class="colab">
+			<path fill="#F9AB00" d="M4.5 8.1a4.9 4.9 0 0 0 0 7.8l1.7-1.7a2.5 2.5 0 0 1 0-4.4zm15 0-1.7 1.7a2.5 2.5 0 0 1 0 4.4l1.7 1.7a4.9 4.9 0 0 0 0-7.8z"></path>
+			<path fill="#E8710A" d="M12 7.1a4.9 4.9 0 1 0 0 9.8 4.9 4.9 0 0 0 0-9.8zm0 2.4a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5z"></path>
+		</svg>
+		Open in Colab
+	</a>
+	{
+		notebook.live && liveEndpoint && (
+			<button class="nb-button live" type="button" data-live-start hidden>
+				<span class="dot" aria-hidden="true" />
+				Run live
+			</button>
+		)
+	}
+	<a class="nb-button" href={notebook.github} target="_blank" rel="noopener">
+		<Icon name="github" size="1rem" />
+		View on GitHub
+	</a>
+	<a class="nb-button" href={notebook.download} download>
+		<Icon name="download" size="1rem" />
+		Download
+	</a>
+	<span class="runtime" title={runtime}>{notebook.accelerator}</span>
+</div>
+
+<style>
+	.notebook-bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem;
+		margin-top: 1.25rem;
+		padding-bottom: 1.25rem;
+		border-bottom: 1px solid var(--dew-rule);
+	}
+
+	.nb-button {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.45rem;
+		height: 2.1rem;
+		padding: 0 0.8rem;
+		border-radius: 0.45rem;
+		border: 1px solid var(--dew-rule);
+		background: var(--dew-surface);
+		color: var(--sl-color-white);
+		font: 500 0.8125rem/1 var(--__sl-font);
+		text-decoration: none;
+		cursor: pointer;
+	}
+
+	.nb-button:hover {
+		border-color: var(--sl-color-gray-4);
+	}
+
+	.nb-button.primary {
+		border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	}
+
+	.live .dot {
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 50%;
+		background: var(--dew-accent-fill);
+		box-shadow: 0 0 0 3px var(--dew-glow);
+	}
+
+	.runtime {
+		margin-inline-start: auto;
+		font: 600 0.6875rem/1 var(--__sl-font-mono);
+		letter-spacing: 0.06em;
+		color: var(--dew-muted);
+		border: 1px solid var(--dew-rule);
+		border-radius: 999px;
+		padding: 0.35rem 0.6rem;
+	}
+</style>

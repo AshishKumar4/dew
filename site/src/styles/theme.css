@@ -1,0 +1,237 @@
+/* Dew's colors and type, applied to Starlight's variables and shared with the landing page. */
+
+:root {
+	--dew-font-display: 'Source Serif 4 Variable', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+	--sl-font: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+	--sl-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+	--sl-line-height: 1.7;
+	--sl-content-width: 46rem;
+	--sl-sidebar-width: 17.5rem;
+
+	/* Dark, the default: ink with a teal cast. */
+	--sl-color-white: #eef6f4;
+	--sl-color-gray-1: #d8e5e2;
+	--sl-color-gray-2: #b2c6c2;
+	--sl-color-gray-3: #7e9894;
+	--sl-color-gray-4: #55706b;
+	--sl-color-gray-5: #243639;
+	--sl-color-gray-6: #111b1e;
+	--sl-color-black: #0a1113;
+
+	--sl-color-accent-low: #0b3531;
+	--sl-color-accent: #2fb8a8;
+	--sl-color-accent-high: #86e3d5;
+
+	--sl-color-bg-nav: #0a1113;
+	--sl-color-bg-sidebar: #0a1113;
+	--sl-color-bg-inline-code: #16252a;
+	--sl-color-hairline: #172427;
+	--sl-color-hairline-light: #1d2e31;
+	--sl-color-hairline-shade: #050a0b;
+	--sl-color-backdrop-overlay: hsla(190, 30%, 4%, 0.72);
+
+	--dew-surface: #0f191c;
+	--dew-surface-raised: #131f23;
+	--dew-rule: #1c2c30;
+	--dew-muted: #93aba7;
+	--dew-accent-text: #5fdcc9;
+	--dew-accent-fill: #12a394;
+	--dew-warn: #f2b45a;
+	--dew-error: #ff8a80;
+	--dew-output-bg: #0c1518;
+	--dew-glow: rgba(47, 184, 168, 0.14);
+}
+
+:root[data-theme='light'] {
+	--sl-color-white: #0d1a1c;
+	--sl-color-gray-1: #16282b;
+	--sl-color-gray-2: #2a3f42;
+	--sl-color-gray-3: #4c6662;
+	--sl-color-gray-4: #7d9793;
+	--sl-color-gray-5: #c9d9d5;
+	--sl-color-gray-6: #e7efed;
+	--sl-color-gray-7: #f3f7f6;
+	--sl-color-black: #fbfcfb;
+
+	--sl-color-accent-low: #d3f1ec;
+	--sl-color-accent: #0b7d71;
+	--sl-color-accent-high: #065249;
+
+	--sl-color-bg-nav: #fbfcfb;
+	--sl-color-bg-sidebar: #fbfcfb;
+	--sl-color-bg-inline-code: #ebf2f0;
+	--sl-color-hairline: #e3ecea;
+	--sl-color-hairline-light: #dce7e4;
+	--sl-color-hairline-shade: #d3e0dc;
+	--sl-color-backdrop-overlay: hsla(190, 20%, 30%, 0.5);
+
+	--dew-surface: #f2f6f5;
+	--dew-surface-raised: #ffffff;
+	--dew-rule: #dde7e4;
+	--dew-muted: #4d6763;
+	--dew-accent-text: #0b7d71;
+	--dew-accent-fill: #12a394;
+	--dew-warn: #8a5a00;
+	--dew-error: #b3261e;
+	--dew-output-bg: #f6f9f8;
+	--dew-glow: rgba(18, 163, 148, 0.1);
+}
+
+/* Type. Page titles set in the display serif; everything else in Inter. */
+
+body {
+	font-feature-settings: 'cv11', 'ss01', 'ss03';
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	text-rendering: optimizeLegibility;
+}
+
+h1#_top,
+.dew-display {
+	font-family: var(--dew-font-display);
+	font-optical-sizing: auto;
+	font-weight: 600;
+	letter-spacing: -0.015em;
+}
+
+.sl-markdown-content :is(h2, h3, h4) {
+	font-weight: 620;
+	letter-spacing: -0.01em;
+	color: var(--sl-color-white);
+}
+
+.sl-markdown-content h2 {
+	font-size: 1.625rem;
+	margin-top: 2.75rem;
+	padding-top: 0.25rem;
+}
+
+.sl-markdown-content h3 {
+	font-size: 1.25rem;
+	margin-top: 2rem;
+}
+
+.sl-markdown-content h4 {
+	font-size: 1.0625rem;
+}
+
+@media (min-width: 50em) {
+	:root {
+		--sl-text-h1: 2.75rem;
+	}
+	.sl-markdown-content h2 {
+		font-size: 1.75rem;
+	}
+}
+
+.sl-markdown-content a {
+	color: var(--dew-accent-text);
+	text-decoration-thickness: 1px;
+	text-underline-offset: 0.18em;
+	text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+}
+
+.sl-markdown-content a:hover {
+	text-decoration-color: currentColor;
+}
+
+.sl-markdown-content :not(pre) > code {
+	font-size: 0.85em;
+	padding: 0.1em 0.35em;
+	border-radius: 0.3em;
+	border: 1px solid var(--sl-color-hairline-light);
+}
+
+/* Tables: hairlines, no zebra, numbers in tabular figures. */
+
+.sl-markdown-content table {
+	display: table;
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.9rem;
+	font-variant-numeric: tabular-nums;
+}
+
+.sl-markdown-content :is(th, td) {
+	border: 0;
+	border-bottom: 1px solid var(--dew-rule);
+	padding: 0.55rem 0.9rem 0.55rem 0;
+	vertical-align: top;
+}
+
+.sl-markdown-content th {
+	color: var(--sl-color-white);
+	font-weight: 600;
+	border-bottom-color: var(--sl-color-gray-4);
+	background: transparent;
+}
+
+.sl-markdown-content tr:nth-child(2n) {
+	background: transparent;
+}
+
+/* The sidebar: quiet group labels, the current page marked with the accent. */
+
+.sidebar-content .group-label .large {
+	font-size: 0.75rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--sl-color-gray-3);
+}
+
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-white);
+	font-weight: 600;
+}
+
+:root[data-theme='light'] .sidebar-content a[aria-current='page'] {
+	color: var(--sl-color-accent-high);
+}
+
+/* Header and page chrome. */
+
+.header {
+	border-bottom: 1px solid var(--dew-rule);
+}
+
+header.header {
+	backdrop-filter: saturate(140%) blur(10px);
+	background: color-mix(in srgb, var(--sl-color-bg-nav) 88%, transparent);
+}
+
+.site-title img {
+	height: 1.6rem;
+	width: auto;
+}
+
+.site-title {
+	font-family: var(--dew-font-display);
+	font-weight: 600;
+	font-size: 1.35rem;
+	letter-spacing: -0.01em;
+	color: var(--sl-color-white);
+}
+
+/* Katex follows the text color in both themes. */
+.katex {
+	font-size: 1.05em;
+	color: var(--sl-color-white);
+}
+
+.katex-display {
+	overflow-x: auto;
+	overflow-y: hidden;
+	padding: 0.25rem 0;
+}
+
+::selection {
+	background: color-mix(in srgb, var(--sl-color-accent) 35%, transparent);
+}
+
+:focus-visible {
+	outline: 2px solid var(--dew-accent-text);
+	outline-offset: 2px;
+}

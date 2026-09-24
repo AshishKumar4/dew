@@ -1,0 +1,26 @@
+---
+// The page title, followed by the notebook bar on tutorial pages. Splash pages
+// (the landing page) set their own title.
+import NotebookBar from '../NotebookBar.astro';
+
+const { entry } = Astro.locals.starlightRoute;
+---
+
+{
+	entry.data.template !== 'splash' && (
+		<>
+			<h1 id="_top">{entry.data.title}</h1>
+			{entry.data.notebook && <NotebookBar notebook={entry.data.notebook} />}
+		</>
+	)
+}
+
+<style>
+	h1 {
+		margin-top: 1rem;
+		font-size: var(--sl-text-h1);
+		line-height: 1.12;
+		color: var(--sl-color-white);
+		text-wrap: balance;
+	}
+</style>
