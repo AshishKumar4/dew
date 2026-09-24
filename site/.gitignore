@@ -12,9 +12,5 @@ public/tutorials/
 # Built by `pnpm concepts:build`.
 dist-concepts/
 
-# Colab cells and logs written by particles/make_cell.py and training runs.
-particles/cells/
-particles/*.log
-
 # Concept C's frames, packed by concepts/replay/atlas.py from a trajectory.
 concepts/public/c/

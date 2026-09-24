@@ -169,9 +169,12 @@ for (const file of files) {
 			continue;
 		}
 		if (cell.cell_type !== 'code' || !text.trim()) continue;
-		// A cell tagged skip-execution is shown without output: its notebook says why.
+		// A cell tagged skip-execution is shown without output: its notebook says why. An install
+		// cell may be unexecuted too: tools/run_tutorials.py --full, which makes the committed
+		// outputs, skips it because Dew comes from the checkout.
 		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
-		if (cell.execution_count == null && !outputsPending && !skipped) {
+		const install = /^\s*[%!]pip\s/.test(text);
+		if (cell.execution_count == null && !outputsPending && !skipped && !install) {
 			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');
@@ -182,7 +185,7 @@ for (const file of files) {
 		outputs += (cell.outputs ?? []).length;
 		codeIndex += 1;
 		// The live kernel has Dew installed and no network, so it skips the install cells.
-		if (!/^\s*[%!]pip\s/.test(text)) liveCells.push({ id: codeIndex, code: text });
+		if (!install) liveCells.push({ id: codeIndex, code: text });
 		const block = [`<div class="nb-cell" data-cell="${codeIndex}">`, '', fence(text.replace(/\n+$/, ''))];
 		if (rendered) block.push('', rendered);
 		block.push('', '</div>');

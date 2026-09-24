@@ -1,8 +1,8 @@
 """Render "dew" in one of the site's fonts, in Chrome, and save its mask as a PNG.
 
-    uv run --no-project --with playwright==1.55.0 python particles/mask.py NAME FONT.woff2 [WEIGHT]
+    uv run --no-project --with playwright==1.55.0 python site/particles/mask.py NAME FONT.woff2 [WEIGHT]
 
-writes particles/masks/NAME.png: white glyphs on black, 1400x560, the word
+writes site/particles/masks/NAME.png: white glyphs on black, 1400x560, the word
 1240 pixels wide, as train_particles.py expects.
 """
 import base64
