@@ -16,7 +16,10 @@
 			"class_name": "Kernel",
 			"image": "./container/Dockerfile",
 			"instance_type": "standard-2",
-			"max_instances": 8
+			"max_instances": 8,
+			// A deploy replaces a running container only after its session could have
+			// reached the wall clock (WALL_SECONDS 1200, plus the Kernel's 15 s alarm).
+			"rollout_active_grace_period": 1215
 		}
 	],
 	"durable_objects": {

@@ -20,6 +20,7 @@ Messages to the page, each with the id of the cell they belong to:
     {"type": "clear"}
     {"type": "done", "status": "ok" | "error" | "aborted", "count": <int or null>}
 and, without an id: {"type": "ready"}, {"type": "restarted"}, {"type": "closing", "reason": <str>}.
+The reasons are "time", "idle", "unused" and "kernel-failed", when the kernel did not start.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ CPU_SECONDS = int(os.environ.get("DEW_LIVE_CPU_SECONDS", "900"))
 CONNECT_SECONDS = 60  # a container nobody connects to within a minute exits
 MAX_CODE = 100_000  # characters in one cell
 MAX_OUTPUT = 2_000_000  # characters of output from one cell; the rest is dropped
-MAX_MESSAGE = 900_000  # characters in one WebSocket message; Workers relay at most 1 MiB
+MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well under the relay's 32 MiB
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
 
@@ -89,8 +90,17 @@ def outputs_of(kind: str, content: dict[str, Any]) -> list[dict[str, Any]]:
             out["text"] = data["text/plain"][:MAX_MESSAGE]
         return [out] if len(out) > 1 else []
     if kind == "error":
-        return [{"type": "error", "ename": content["ename"], "evalue": content["evalue"][:MAX_MESSAGE // 4],
-                 "traceback": [line[:MAX_MESSAGE // 4] for line in content["traceback"][-40:]]}]
+        # The message as a whole stays within MAX_MESSAGE: the name, the value, then as much of
+        # the traceback's last 40 lines as fits, keeping the lines nearest the error.
+        ename, evalue = content["ename"][:200], content["evalue"][:MAX_MESSAGE // 10]
+        room = MAX_MESSAGE - len(ename) - len(evalue)
+        kept: list[str] = []
+        for line in reversed(content["traceback"][-40:]):
+            if room <= 0:
+                break
+            kept.append(line[:room])
+            room -= len(kept[-1])
+        return [{"type": "error", "ename": ename, "evalue": evalue, "traceback": kept[::-1]}]
     if kind == "clear_output":
         return [{"type": "clear"}]
     return []
@@ -110,13 +120,29 @@ class Session:
         self.socket: ServerConnection | None = None
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.closed = asyncio.Event()
+        self.close_reason = ""
+
 
     async def start_kernel(self) -> None:
-        await self.manager.start_kernel()
-        self.client = self.manager.client()
-        self.client.start_channels()
-        await self.client.wait_for_ready(timeout=60)
+        try:
+            await self.manager.start_kernel()
+            self.client = self.manager.client()
+            self.client.start_channels()
+            await self.client.wait_for_ready(timeout=60)
+        except Exception as error:  # noqa: BLE001 - any failure here ends the session
+            print(f"the kernel did not start: {error!r}", flush=True)
+            await self.close("kernel-failed")
+            return
         self.kernel_ready.set()
+
+    async def ready_or_closed(self) -> bool:
+        """Wait for the kernel; False when the session closed first, as when the kernel failed to start."""
+        ready = asyncio.ensure_future(self.kernel_ready.wait())
+        closed = asyncio.ensure_future(self.closed.wait())
+        await asyncio.wait({ready, closed}, return_when=asyncio.FIRST_COMPLETED)
+        ready.cancel()
+        closed.cancel()
+        return self.kernel_ready.is_set()
 
     async def send(self, message: dict[str, Any]) -> None:
         if self.socket is not None:
@@ -215,19 +241,24 @@ class Session:
         if self.closed.is_set():
             return
         self.closed.set()
+        self.close_reason = reason
         await self.send({"type": "closing", "reason": reason})
         if self.socket is not None:
             await self.socket.close(4000, reason)
 
     async def handle(self, socket: ServerConnection) -> None:
-        if self.socket is not None or self.closed.is_set():
+        if self.closed.is_set():
+            await socket.close(4000, self.close_reason or "closed")
+            return
+        if self.socket is not None:
             await socket.close(4009, "this container already has a session")
             return
         self.socket = socket
         self.last_request = time.monotonic()
         runner = asyncio.create_task(self.run_queue())
         try:
-            await self.kernel_ready.wait()
+            if not await self.ready_or_closed():
+                return
             await self.send({"type": "ready"})
             async for raw in socket:
                 self.last_request = time.monotonic()
@@ -273,7 +304,8 @@ async def main() -> None:
         watcher.cancel()
         await asyncio.sleep(0.5)
     await kernel
-    await session.manager.shutdown_kernel(now=True)
+    if session.kernel_ready.is_set():
+        await session.manager.shutdown_kernel(now=True)
 
 
 if __name__ == "__main__":

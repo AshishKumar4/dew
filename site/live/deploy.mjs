@@ -9,7 +9,7 @@
 // anything but a full SHA.
 
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,3 +29,11 @@ execFileSync('pnpm', ['exec', 'wrangler', 'deploy', '-c', path.join(here, 'wrang
 	stdio: 'inherit',
 	cwd: path.join(here, '..'),
 });
+
+// The landing page shows train.py's output recorded at one commit next to a button that
+// runs it on this kernel; if the library's numbers moved, the two would disagree.
+const recorded = JSON.parse(readFileSync(path.join(here, '..', 'src', 'data', 'capture.json'), 'utf8')).meta.dew;
+if (recorded !== commit) {
+	console.log(`live: the landing page's output was recorded at Dew ${recorded.slice(0, 8)}, the kernel now runs ${commit.slice(0, 8)}.`);
+	console.log('live: if train.py prints something new there, record it again with site/scripts/capture_snippets.py.');
+}

@@ -1,6 +1,7 @@
 // preview.dewml.dev: the built site for review before `pnpm run deploy`
 // puts it on dewml.dev. Deploy with `pnpm deploy:preview` after `pnpm build`.
-// Run it live stays on dewml.dev: live.dewml.dev accepts that origin only.
+// Run it live works here too: live.dewml.dev accepts this origin and its
+// Turnstile hostname (site/live/wrangler.jsonc).
 {
 	"$schema": "../../node_modules/wrangler/config-schema.json",
 	"name": "dewml-preview",

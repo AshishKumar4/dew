@@ -69,6 +69,12 @@ importers:
       '@cloudflare/workers-types':
         specifier: 5.20260922.1
         version: 5.20260922.1
+      esbuild:
+        specifier: 0.28.1
+        version: 0.28.1
+      miniflare:
+        specifier: 5.20260921.0-alpha
+        version: 5.20260921.0-alpha(@types/node@24.13.6)
       typescript:
         specifier: 6.0.3
         version: 6.0.3

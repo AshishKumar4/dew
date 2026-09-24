@@ -9,6 +9,7 @@ import { type Opened, type Refusal, coordinatorOf } from './coordinator';
 import { SESSION_HEADER } from './kernel';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
+import { visitorKey } from './visitor';
 
 export { Coordinator } from './coordinator';
 export { Kernel } from './kernel';
@@ -47,7 +48,7 @@ async function createSession(request: Request, env: Env, ip: string, cors: Heade
 		return reply({ error: 'turnstile', message: 'The bot check did not pass. Reload the page and try again.' }, 403, cors);
 	}
 	const now = Date.now();
-	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, ip), now);
+	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now);
 	if (!opened.ok) {
 		return reply({ error: opened.reason, message: REFUSALS[opened.reason], retryAfter: opened.retryAfter }, 429, cors, {
 			'Retry-After': String(opened.retryAfter),
@@ -90,7 +91,7 @@ export default {
 		if (!origin || !allowed.includes(origin)) return reply({ error: 'origin', message: 'Live kernels open only from dewml.dev.' }, 403, cors);
 
 		const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
-		const { success } = await env.REQUESTS.limit({ key: ip });
+		const { success } = await env.REQUESTS.limit({ key: visitorKey(ip) });
 		if (!success) return reply({ error: 'rate', message: 'Too many requests. Wait a minute.' }, 429, cors, { 'Retry-After': '60' });
 
 		if (url.pathname === '/v1/sessions' && request.method === 'POST') return createSession(request, env, ip, cors);
