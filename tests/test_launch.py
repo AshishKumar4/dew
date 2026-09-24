@@ -153,6 +153,27 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     assert not any(alive(pid) for pid in ranks)
 
 
+def test_a_failure_counts_only_the_ranks_it_stops(tmp_path):
+    """Rank 0 has already finished when rank 1 fails, and rank 2 still
+    runs: the launch stops one other rank, and says one."""
+    program = ("import os, sys, time\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "if rank == '0': sys.exit(0)\n"
+               "if rank == '1':\n"
+               "    time.sleep(2); sys.exit(3)\n"
+               "time.sleep(600)\n")
+    # Three ranks split no GPU count evenly; these ones use none.
+    launch = launcher("--processes-per-host", "3", "--port", "1", "--env", "JAX_PLATFORMS=cpu", "--",
+                      sys.executable, "-c", program)
+    try:
+        output, _ = launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    lines = output.decode().splitlines()
+    assert launch.returncode == 3
+    assert "rank 1 on localhost exited 3; stopping the other 1" in lines, lines
+
+
 @pytest.mark.parametrize(("gpus", "processes", "devices", "expected"), [
     (4, None, None, (4, 1)),
     (8, 2, None, (2, 4)),
