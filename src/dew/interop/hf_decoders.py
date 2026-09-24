@@ -65,7 +65,7 @@ from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
-from dew.nn.text_encoders import check_tree, checkpoint_dtype
+from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
 from dew.telemetry.instrumentation import dew_cache_dir
@@ -1668,8 +1668,11 @@ def translate_weights(
     """
     family = (_family_for_config(config) if model_type is None
               else _FAMILIES[model_type])
-    _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
-                  _tied_names(family, config, hf_tensors))
+    # A tied head and a depth's embedding and head are checked copies of
+    # tensors the tree already takes, so they are dropped here; any other
+    # second tensor for a filled leaf is refused where it is placed.
+    copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
+                                                 _tied_names(family, config, hf_tensors))}
 
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
@@ -1677,20 +1680,14 @@ def translate_weights(
     variables: LazyTree = {'params': params}
     for name, tensor in family.prepare_weights(hf_tensors).items():
         path = family.weight_path(name, config)
-        if path is None:
+        if path is None or name in copies:
             continue
         stored = np.asarray(tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
-        leaf = SourceLeaf((stored,), dtype, transposed=path[-1] == 'kernel' and stored.ndim == 2)
-        node = variables
-        for key in path[:-1]:
-            child = node.setdefault(key, {})
-            if not isinstance(child, dict):
-                _refuse(name, f"its path crosses the tensor already at {key!r}")
-            node = child
-        node[path[-1]] = leaf
+        insert(variables, path, SourceLeaf((stored,), dtype, transposed=path[-1] == 'kernel' and stored.ndim == 2),
+               name)
     _stack_experts(params)
     return variables if lazy else materialize(variables)
 

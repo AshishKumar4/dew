@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.text_encoders import ParamTree
+from dew.nn.text_encoders import ParamTree, insert
 
 
 class FlaxUpsample2D(nn.Module):
@@ -507,7 +507,7 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     return (*path, leaf)
 
 
-def translate_vae_weights(torch_tensors: ParamTree) -> dict:
+def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
     """Convert diffusers AutoencoderKL tensors into this module's param tree.
 
     Convolution kernels transpose from torch's [out, in, kh, kw] to linen's
@@ -515,7 +515,7 @@ def translate_vae_weights(torch_tensors: ParamTree) -> dict:
     and biases keep their layout. Every tensor maps, so an unknown name
     raises rather than loading half an autoencoder.
     """
-    params: dict = {}
+    params: ParamTree = {}
     for name, tensor in torch_tensors.items():
         if isinstance(tensor, dict):
             raise ValueError(f"{name} is a subtree; a diffusers VAE table is flat")
@@ -523,10 +523,7 @@ def translate_vae_weights(torch_tensors: ParamTree) -> dict:
         path = _vae_path(name, leaf.ndim)
         if path[-1] == "kernel":
             leaf = leaf.transpose(2, 3, 1, 0) if leaf.ndim == 4 else leaf.T
-        node = params
-        for entry in path[:-1]:
-            node = node.setdefault(entry, {})
-        node[path[-1]] = leaf
+        insert(params, path, leaf, name)
     return params
 
 

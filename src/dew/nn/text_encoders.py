@@ -566,25 +566,44 @@ def checkpoint_leaf(
     return leaf
 
 
-# One collection of a variables tree: the arrays `checkpoint_leaf` returns,
-# under the module names that read them. Shared by every translator that
-# builds one, here and in `nn.vision` and `interop.hf_decoders`.
-type ParamTree = dict[str, np.ndarray | ParamTree]
+type Tree[LeafT] = dict[str, LeafT | Tree[LeafT]]
+"""A variables collection as a translator builds it: leaves under the
+module names that read them."""
+
+# One collection of a variables tree: the arrays `checkpoint_leaf` returns.
+# Shared by every translator that builds one, here and in `nn.vision` and
+# `interop.hf_decoders`.
+type ParamTree = Tree[np.ndarray]
+
+
+def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: str) -> None:
+    """Put the checkpoint tensor `name`, translated to `leaf`, at `path`.
+
+    A path through a leaf already placed is refused, and so is a second
+    tensor at a placed path unless both are equal arrays: a tied tensor a
+    checkpoint stores under two names is one parameter, while two different
+    ones are two parameters, and keeping the last would drop the other
+    unnoticed. A lazy leaf is not read to compare, so a second one is refused
+    whatever it holds.
+    """
+    node = tree
+    for key in path[:-1]:
+        child = node.setdefault(key, {})
+        if not isinstance(child, dict):
+            raise ValueError(f"{name} crosses the tensor already at {key!r}")
+        node = child
+    held = node.setdefault(path[-1], leaf)
+    if held is not leaf and not (isinstance(held, np.ndarray) and isinstance(leaf, np.ndarray)
+                                 and np.array_equal(held, leaf)):
+        raise ValueError(f"{name} lands on {'/'.join(path)}, which another tensor already fills")
 
 
 def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
     params: ParamTree = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
-        if path is None:
-            continue
-        node = params
-        for key in path[:-1]:
-            child = node.setdefault(key, {})
-            if not isinstance(child, dict):
-                raise ValueError(f"{name} crosses the tensor already at {key!r}")
-            node = child
-        node[path[-1]] = checkpoint_leaf(path, tensor, param_dtype)
+        if path is not None:
+            insert(params, path, checkpoint_leaf(path, tensor, param_dtype), name)
     return params
 
 

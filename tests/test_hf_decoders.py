@@ -2924,6 +2924,18 @@ def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, save
     assert path is not None and path == _deepseek_v4_path(saved, config)
 
 
+def test_both_spellings_of_one_deepseek_v4_tensor_are_refused():
+    """The two spellings land on one leaf, so a checkpoint carrying both
+    with different values would load whichever came last."""
+    from dew.interop.hf_decoders import _load_shards
+
+    config = translate_config(fixture_config("deepseek-v4-tiny"))
+    tensors = dict(_load_shards(DEEPSEEK_V4))
+    tensors["model.embed_tokens.weight"] = tensors["embed.weight"] + 1
+
+    with pytest.raises(ValueError, match="model.embed_tokens.weight lands on params/embed_tokens"):
+        translate_weights(tensors, config)
+
 
 def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
     """Same collections, paths and shapes as a freshly initialised model,

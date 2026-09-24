@@ -352,6 +352,20 @@ def test_an_unfamiliar_tensor_name_is_refused():
     assert sorted(whole["vision_model"]) == ["class_embedding"]
 
 
+def test_two_different_tensors_for_one_parameter_are_refused():
+    """The text tower's prefix is optional, so a file can name one parameter
+    twice. Equal copies are one tied tensor and load; different ones are two
+    parameters, and keeping the last would drop the other unnoticed."""
+    name = "embeddings.token_embedding.weight"
+    table = np.arange(6, dtype=np.float32).reshape(3, 2)
+
+    tied = translate_weights({"text_model." + name: table, name: table.copy()})
+    np.testing.assert_array_equal(tied["token_embedding"]["embedding"], table)
+    with pytest.raises(ValueError, match="token_embedding"):
+        translate_weights({"text_model." + name: table, name: table + 1})
+
+
+
 def test_conv_kernels_land_in_linen_layout():
     """torch Conv2d holds [out, in, kh, kw] and nn.Conv [kh, kw, in, out]; a
     kernel handed over untransposed would convolve the wrong axes and only

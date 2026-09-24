@@ -45,7 +45,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
-from dew.nn.text_encoders import MLP, CLIPAttention, ParamTree, checkpoint_array, checkpoint_leaf
+from dew.nn.text_encoders import MLP, CLIPAttention, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
@@ -1394,16 +1394,9 @@ def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) 
     params: ParamTree = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
-        if path is None:
-            continue
-        node = params
-        for key in path[:-1]:
-            child = node.setdefault(key, {})
-            if not isinstance(child, dict):
-                raise ValueError(f"{name} crosses the tensor already at {key!r}")
-            node = child
-        storage = "float32" if path[0] == "constants" else param_dtype
-        node[path[-1]] = checkpoint_leaf(path, tensor, storage)
+        if path is not None:
+            storage = "float32" if path[0] == "constants" else param_dtype
+            insert(params, path, checkpoint_leaf(path, tensor, storage), name)
     return params
 
 
