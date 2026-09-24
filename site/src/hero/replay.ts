@@ -6,7 +6,7 @@
 // WebGL2 shader shows the frame at a fractional step, blending neighbours, so
 // scrolling or time can run the sampler forward and back.
 
-import { FULLSCREEN_VERTEX, createContext, createProgram, fitCanvas } from '../lib/gl';
+import { FULLSCREEN_VERTEX, createContext, createProgram, fitCanvas } from './gl';
 
 export interface TrajectoryMeta {
 	prompt: string;

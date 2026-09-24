@@ -1,9 +1,13 @@
 /* Dew's colors and type, applied to Starlight's variables and shared with the landing page. */
 
 :root {
-	--dew-font-display: var(--font-serif);
-	--sl-font: var(--font-inter);
-	--sl-font-mono: var(--font-mono);
+	/* One family for display and UI, and a mono for code. Weight and optical size
+	   set the hierarchy. The preview compares three families (fonts.mjs). */
+	--dew-font: var(--font-geist);
+	--dew-font-mono: var(--font-geist-mono);
+	--dew-font-display: var(--dew-font);
+	--sl-font: var(--dew-font);
+	--sl-font-mono: var(--dew-font-mono);
 	--sl-line-height: 1.7;
 	--sl-content-width: 46rem;
 	--sl-sidebar-width: 17.5rem;
@@ -77,21 +81,35 @@
 	--dew-glow: rgba(18, 163, 148, 0.1);
 }
 
-/* Type. Page titles set in the display serif; everything else in Inter. */
+:root[data-font='inter'] {
+	--dew-font: var(--font-inter);
+	--dew-font-mono: var(--font-mono);
+}
+
+:root[data-font='hanken'] {
+	--dew-font: var(--font-hanken);
+	--dew-font-mono: var(--font-mono);
+}
+
+/* Type: one sans family; titles are the same family, heavier and tighter. */
 
 body {
-	font-feature-settings: 'cv11', 'ss01', 'ss03';
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
 	text-rendering: optimizeLegibility;
+}
+
+:root[data-font='inter'] body {
+	/* Inter's single-storey a, open digits and round quotes. */
+	font-feature-settings: 'cv11', 'ss01', 'ss03';
 }
 
 h1#_top,
 .dew-display {
 	font-family: var(--dew-font-display);
 	font-optical-sizing: auto;
-	font-weight: 600;
-	letter-spacing: -0.015em;
+	font-weight: 620;
+	letter-spacing: -0.028em;
 }
 
 .sl-markdown-content :is(h2, h3, h4) {
@@ -209,9 +227,9 @@ header.header {
 
 .site-title {
 	font-family: var(--dew-font-display);
-	font-weight: 600;
-	font-size: 1.35rem;
-	letter-spacing: -0.01em;
+	font-weight: 640;
+	font-size: 1.3rem;
+	letter-spacing: -0.03em;
 	color: var(--sl-color-white);
 }
 

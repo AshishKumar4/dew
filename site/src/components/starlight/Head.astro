@@ -1,12 +1,24 @@
 ---
-// Starlight's head, plus the site's three font families. The text and title
-// faces are preloaded; code is rarely above the fold, and its size-adjusted
-// fallback keeps the layout still until JetBrains Mono arrives.
+// Starlight's head, plus the site's font families. The text face is
+// preloaded; the others load when a page uses them, behind size-adjusted
+// fallbacks that keep the layout still. The inline script applies the
+// preview's font choice (?font=inter or ?font=hanken, kept for the tab)
+// before the first paint.
 import Default from '@astrojs/starlight/components/Head.astro';
 import { Font } from 'astro:assets';
 ---
 
 <Default />
-<Font cssVariable="--font-inter" preload />
-<Font cssVariable="--font-serif" preload />
+<Font cssVariable="--font-geist" preload />
+<Font cssVariable="--font-geist-mono" />
+<Font cssVariable="--font-inter" />
+<Font cssVariable="--font-hanken" />
 <Font cssVariable="--font-mono" />
+<script is:inline>
+	(() => {
+		const asked = new URLSearchParams(location.search).get('font');
+		if (asked === 'geist' || asked === 'inter' || asked === 'hanken') sessionStorage.setItem('dew-font', asked);
+		const font = sessionStorage.getItem('dew-font');
+		if (font === 'inter' || font === 'hanken') document.documentElement.dataset.font = font;
+	})();
+</script>

@@ -216,8 +216,8 @@ const sections = [
 </Concept>
 
 <script>
-	import { Replay } from '../../c/replay';
-	import { prefersReducedMotion, runLoop } from '../../lib/gl';
+	import { Replay } from '../../../../src/hero/replay';
+	import { prefersReducedMotion, runLoop } from '../../../../src/hero/gl';
 
 	const reduced = prefersReducedMotion();
 	const ease = (x: number) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
