@@ -544,6 +544,25 @@ def test_a_lone_process_stopped_by_sigterm_checkpoints_and_resumes_where_it_stop
     resumed_where_it_stopped(tmp_path, run)
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly():
+    """Each rank's failure watch reads the pool's coordination service from
+    a daemon thread, inside jaxlib with the GIL released. A read still under
+    way when Python finalizes returns to a runtime that ends the thread with
+    pthread_exit, and the unwind through jaxlib's GIL guard aborted ranks
+    whose programs had run to their end: SIGABRT and "terminate called ..."
+    in the pool tests of two CI runs (ci/train-2, ci/commit-select). Every
+    watch here reads without a pause, so each rank ends mid-read."""
+    program = ("import dew.artifacts as artifacts\n"
+               "artifacts.FAILURE_POLL_SECONDS = 0\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n")
+    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    output = done.stdout + done.stderr
+    assert done.returncode == 0, output
+    assert "terminate called" not in output and "Fatal Python error" not in output, output
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_stalls_between_collectives_ends_the_pool():
     """Rank 1 stops before its fourth step without failing, as a rank blocked

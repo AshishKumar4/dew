@@ -7,13 +7,13 @@ cross jit, while optional captions and decoded text remain host metadata.
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import json
 import os
 import socket
 import sys
 import threading
-import time
 import types
 from collections.abc import Callable
 from typing import Literal, TypeVar, overload
@@ -392,6 +392,13 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     goes in before the backend opens: a process whose devices fail to open
     after the pool has formed would otherwise wait in that barrier for peers
     that wait for its devices.
+
+    The watch ends with the program, in an exit handler that runs before
+    jax's: jax registered its own when it was imported, and atexit runs the
+    last registered first. A watch still reading when Python finalizes would
+    come back from jaxlib, GIL released, to a runtime that ends its thread
+    with pthread_exit, and that unwind through jaxlib's GIL guard aborts a
+    process whose program ran to its end (SIGABRT, "terminate called ...").
     """
     previous = sys.excepthook
     client = _client()
@@ -409,14 +416,16 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
         # key alone raises every time no failure is there.
         return dict(client.key_value_dir_get(FAILURE_DIRECTORY)).get(FAILURE_KEY)
 
+    stop = threading.Event()
+
     def watch() -> None:
-        while True:
-            time.sleep(FAILURE_POLL_SECONDS)
+        while not stop.wait(FAILURE_POLL_SECONDS):
             try:
                 seen = published()
                 if seen is None:
                     continue
-                time.sleep(grace)
+                if stop.wait(grace):
+                    return
                 if published() != seen:  # an agreement heard and withdrew it
                     continue
             except jax.errors.JaxRuntimeError:  # the pool's coordination service is gone
@@ -427,5 +436,16 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
             sys.stderr.flush()
             os._exit(1)
 
+    watcher = threading.Thread(target=watch, name="dew-failure-watch", daemon=True)
+
+    def stop_watching() -> None:
+        stop.set()
+        # Every client leaves the pool's service in jax's handler, after this
+        # one, so the service still answers a read under way within
+        # milliseconds. The bound only keeps an exit from waiting on a service
+        # that stopped answering.
+        watcher.join(timeout=5.0)
+
     sys.excepthook = leave
-    threading.Thread(target=watch, name="dew-failure-watch", daemon=True).start()
+    watcher.start()
+    atexit.register(stop_watching)
