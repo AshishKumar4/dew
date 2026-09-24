@@ -416,6 +416,12 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     path.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
+    # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
+    # (check_layout in jax/_src/cudnn/fused_attention_stablehlo.py), so a
+    # key-padding mask broadcast over the queries, [B, 1, 1, K], is widened.
+    def spanning(x):
+        return None if x is None else jnp.broadcast_to(x, (*x.shape[:-2], q_len, kv_len))
+    mask, bias = spanning(mask), spanning(bias)
     q_pad, kv_pad = q_len % 2, kv_len % 2
     if q_pad or kv_pad:
         query = _pad_rows(query, q_pad)
