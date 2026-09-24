@@ -13,6 +13,10 @@ os.environ["XLA_FLAGS"] = (
 if os.environ["JAX_PLATFORMS"] == "cuda":
     # Exact state and gradient checks require repeatable CUDA reductions.
     os.environ["XLA_FLAGS"] += " --xla_gpu_deterministic_ops=true"
+    # Host callbacks (jax.debug.callback, io_callback) place their operands
+    # on a CPU device, so the CPU backend stays beside the GPU; jax.devices()
+    # is still the GPU's.
+    os.environ["JAX_PLATFORMS"] = "cuda,cpu"
 # Parity tests assert fp32 against references computed in fp32. Ampere and
 # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
 # 1e-2 between two correct implementations.
