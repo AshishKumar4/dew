@@ -31,11 +31,11 @@ from safetensors.numpy import load_file, save_file
 
 from dew import lora
 from dew.data import Dataset
+from dew.diffusion.process import DenoisingCondition
 from dew.inputs.diffusion import _text_features
 from dew.interop.pretrained import load_pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import LoRA
-from dew.nn.backbones.unet_condition import DenoisingCondition
 from dew.objectives.base import FROZEN, Step, freeze, merge, thaw
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
