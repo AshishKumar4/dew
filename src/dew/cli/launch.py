@@ -37,7 +37,7 @@ import tyro
 from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
-from dew.pool import COORDINATOR, LOCAL_DEVICES, PROCESS_COUNT, PROCESS_ID
+from dew.pool import COORDINATOR, LOCAL_DEVICES, PROCESS_COUNT, PROCESS_ID, Cluster, detected_cluster
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -72,15 +72,6 @@ class Process:
     @property
     def local(self) -> bool:
         return self.host in LOCAL_HOSTS
-
-
-@dataclasses.dataclass(frozen=True)
-class Cluster:
-    """A cluster jax's own detection found this process running in."""
-
-    name: str
-    process: int
-    count: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -353,17 +344,6 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
     assignments = "".join(f"{name}={shlex.quote(value)} " for name, value in env.items())
     run = f"exec env {assignments}{shlex.join(command)}" if env else f"exec {shlex.join(command)}"
     return f"cd {shlex.quote(cwd)} && {run}" if cwd else run
-
-
-def detected_cluster() -> Cluster | None:
-    """The cluster jax's own detection finds, in its order, leaving out the
-    opt-in mpi4py method as `jax.distributed.initialize` does."""
-    from jax._src import clusters
-
-    for kind in clusters.ClusterEnv._cluster_types:
-        if not kind.opt_in_only_method and kind.is_env_present():
-            return Cluster(kind.name, kind.get_process_id(), kind.get_process_count())
-    return None
 
 
 def _listed_gpus(argv: Sequence[str]) -> int:
