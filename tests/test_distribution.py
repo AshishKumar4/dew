@@ -698,6 +698,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
                "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
                "events = []\n"
                "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
+               "jax.config.update('jax_explain_cache_misses', True)\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process(compilation_cache_dir=sys.argv[1])\n"
                "import jax.numpy as jnp, numpy as np\n"
@@ -720,7 +721,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
                "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
                "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
                "     step.count('/jax/compilation_cache/cache_hits')]))\n")
-    runs = []
+    runs, logged = [], []
     for run in range(2):
         out = records / str(run)
         out.mkdir(parents=True)
@@ -728,9 +729,14 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
                       str(cache), str(out), devices=1, timeout=150)
         assert done.returncode == 0, done.stdout + done.stderr
         runs.append([json.loads(path.read_text()) for path in sorted(out.iterdir())])
+        # What each rank's jax said of the cache: the key it missed, the entry
+        # it wrote or could not, which says why a second run loads nothing.
+        logged += [f"run {run}: {line}" for line in (done.stdout + done.stderr).splitlines()
+                   if "cache" in line.lower()]
     # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
     compiled = runs[0][0][0]
-    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], runs
+    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], (
+        runs, "\n".join(logged))
 
 
 @pytest.mark.mesh(devices=2)
