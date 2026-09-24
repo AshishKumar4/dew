@@ -244,9 +244,9 @@ def reassociates(case) -> bool:
 
 
 def anchored(case) -> bool:
-    """Whether the fp64 anchor computes the case's step: a reassociating
-    decoder its record builds alone, not one inside a composite."""
-    return reassociates(case) and case.media is None
+    """Whether the fp64 anchor computes the case's step: every case whose
+    step reassociates, a decoder alone or inside a media composite."""
+    return reassociates(case)
 
 
 def stash():
@@ -427,6 +427,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     import jax.numpy as jnp
     import numpy as np
 
+    from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.base import Step, scalar_loss
     from dew.registry import models
     from dew.training.transaction import with_ema
@@ -438,7 +439,13 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
 
     wide = widened(state.params)
-    objective = bench.decoder_objective(case, models.build(case.architecture, **case.config, dtype=None))
+    if case.media is None:
+        model = models.build(case.architecture, **case.config, dtype=None)
+    else:
+        family, tower, projector, token = bench.media_values(case)
+        model = MultimodalTransformer(models.build("causal_transformer", **case.config, dtype=None),
+                                      tower, projector, family, token, dtype=None)
+    objective = bench.decoder_objective(case, model)
     # The reference DPO and GRPO hold is the objective's frozen EMA, as the
     # trainer's step hands it over.
     step = Step(step=state.step, key=state.key,
