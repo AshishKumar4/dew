@@ -336,7 +336,10 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
     trainer's copy is float32 and the server's bfloat16, so every live
     bfloat16 array of a served leaf's shape is the server's. A second copy is
     a model's worth of memory the run keeps for good (1.1 GiB on Qwen3-0.6B,
-    the headroom its single-turn run ran out of at update 19)."""
+    the headroom its single-turn run ran out of at update 19). The float32
+    arrays of those shapes are the trained parameters and adamw's two moments:
+    the loaded checkpoint stays on the host, where a device copy would be
+    2.2 GiB more."""
     import collections
 
     import jax
@@ -349,20 +352,18 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
 
     def counted(self, state, batch, key):
         packed = schedule(self, state, batch, key)
-        served = collections.Counter((array.shape, array.dtype) for array in jax.live_arrays()
-                                     if array.dtype == jax.numpy.bfloat16)
-        counts.append(served)
+        counts.append(collections.Counter((array.shape, array.dtype) for array in jax.live_arrays()))
         return packed
 
     monkeypatch.setattr(RolloutScheduler, "__call__", counted)
     example.main(example.Config(smoke=True, out=tmp_path))
     source = example.load_pretrained(str(example.SMOKE_MODEL), dtype="float32")
-    tree = collections.Counter((leaf.shape, jax.numpy.dtype(jax.numpy.bfloat16))
-                               for leaf in jax.tree.leaves(source.variables))
+    shapes = collections.Counter(leaf.shape for leaf in jax.tree.leaves(source.variables))
+    expected = {(shape, jax.numpy.dtype(dtype)): copies * number for shape, number in shapes.items()
+                for dtype, copies in ((jax.numpy.bfloat16, 1), (jax.numpy.float32, 3))}
     # The second call pushed update 1's weights before it returned.
     assert len(counts) == 2
-    assert all(counts[-1][key] == number for key, number in tree.items()), \
-        {str(key): (counts[-1][key], number) for key, number in tree.items() if counts[-1][key] != number}
+    assert {key: counts[-1][key] for key in expected} == expected
 
 
 def test_no_constant_answer_passes_a_quarter_of_a_train_rlvr_task():
