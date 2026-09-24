@@ -48,7 +48,15 @@ Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or under `$XDG_
 
 ## Use a GPU or TPU
 
-Install the JAX build for your operating system, driver, and accelerator by following the [official JAX installation guide](https://docs.jax.dev/en/latest/installation.html). Choose the backend before you import JAX. For example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU.
+The plain install brings the CPU build of JAX. For an accelerator, install the matching JAX build in the same environment:
+
+| Hardware | Command |
+|---|---|
+| NVIDIA GPU, CUDA 13 driver | `uv pip install -U "jax[cuda13]"` |
+| NVIDIA GPU, CUDA 12 driver | `uv pip install -U "jax[cuda12]"` |
+| Google TPU | `uv pip install -U "jax[tpu]"` |
+
+The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install `jax[cuda13]`, which matches the CUDA plugin Colab ships.
 
 On NVIDIA hardware, check that JAX lists a CUDA device before you run a GPU example. Dew can use cuDNN attention for the GPU shapes and dtypes that support it, but whether it is available depends on your JAX and CUDA install. A TPU needs its own runtime setup. [The TPU guide](tpu.md) describes Dew's provisioning commands. Creating a cloud resource can cost money, so it is not part of this quickstart.
 
@@ -124,12 +132,13 @@ Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`. TFDS writes `la
 
 ## Build the documentation
 
-From a checkout:
+The site at [dewml.dev](https://dewml.dev) is built from this repository: the prose in `docs/`, the notebooks in `tutorials/` with their recorded outputs, and an API reference generated from the docstrings in `src/dew`. Building it needs Node 22.12 or newer, [pnpm](https://pnpm.io) and uv:
 
 ```bash
-uv pip install mkdocs-material
-python -m mkdocs build --strict
-python -m mkdocs serve
+cd site
+pnpm install
+pnpm build
+pnpm preview
 ```
 
-Open the address that `mkdocs serve` prints. Building the docs does not run the accelerator examples or download model weights. Running the examples is a separate check.
+`pnpm build` fails on a broken link, a notebook that was not executed top to bottom, a public module without an API page, or a model family the supported-models page does not name. `pnpm dev` serves the site with live reload. Building it runs no model code and downloads no weights.
