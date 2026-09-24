@@ -47,6 +47,7 @@ from dew.objectives.base import (
     Metric,
     Objective,
     Step,
+    Variables,
     select,
 )
 from dew.records import JSON
@@ -516,12 +517,50 @@ class Trainer(Generic[Loss, Effects]):
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
+        template = self._with_drawn_tables(template, shardings, checkpoints.stored(resume),
+                                           initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=data_partition(self.device_mesh))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
+                           stored: Variables, initializer, key) -> TrainState:
+        """`template` with every Fourier table the checkpoint lacks drawn by
+        the fresh init, where `restore` keeps it (`is_fourier_table`).
+
+        A checkpoint written before the table became a variable trained
+        against the table init draws. Only those leaves are computed: the
+        rest of the initial state is dead code to the compiler.
+        """
+        from dew.checkpoints import absent
+        from dew.nn.blocks import is_fourier_table
+
+        drawn = [(field, path) for field in ("params", "ema")
+                 if getattr(template, field) is not None and stored.get(field) is not None
+                 for path in absent(getattr(template, field), stored[field]) if is_fourier_table(path)]
+        if not drawn:
+            return template
+
+        def leaf(tree, path):
+            for entry in path:
+                tree = tree[entry.key]
+            return tree
+
+        values = jax.jit(
+            lambda initializer, key: [leaf(getattr(self.initial_state(initializer, key), field), path)
+                                      for field, path in drawn],
+            out_shardings=[leaf(getattr(shardings, field), path) for field, path in drawn],
+        )(initializer, key)
+        filled = {(field, jax.tree_util.keystr(path)): value
+                  for (field, path), value in zip(drawn, values, strict=True)}
+        return dataclasses.replace(template, **{
+            field: jax.tree_util.tree_map_with_path(
+                lambda path, stub, field=field: filled.get((field, jax.tree_util.keystr(path)), stub),
+                getattr(template, field))
+            for field in {field for field, _ in drawn}})
 
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.

@@ -259,6 +259,19 @@ def _filled(template, restored: dict, step: int):
     return template.replace(**restored)
 
 
+def absent(expected, held) -> list[jax.tree_util.KeyPath]:
+    """The paths of `expected`'s leaves that `held` has no leaf at.
+
+    `held` is what a checkpoint stores (`Checkpoints.stored`, or a restored
+    tree): a model that gained a variable after the checkpoint was written
+    expects a leaf the checkpoint lacks, and `Checkpoints.restore` refuses
+    it unless the caller supplies it.
+    """
+    have = {jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(held)[0]}
+    return [path for path, _ in jax.tree_util.tree_flatten_with_path(expected)[0]
+            if jax.tree_util.keystr(path) not in have]
+
+
 class Checkpoints:
     """Holds the checkpoints of one run, in one directory.
 
@@ -477,6 +490,10 @@ class Checkpoints:
         leaves to restore; a leaf's sharding, when set, is where the array is
         placed, so a checkpoint written on one mesh restores onto whatever
         mesh this run is using. `None` restores every leaf as a host array.
+        A template leaf the checkpoint lacks is refused by name, unless the
+        template holds it as a concrete array, which is then restored as it
+        stands: that is how a caller supplies what an older checkpoint did
+        not store (`absent` finds those leaves).
 
         A step that is the local one every process holds is read from the
         local directory, onto the placement it was written with; any other
@@ -537,6 +554,16 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
+            lacking = [jax.tree_util.keystr(path) for path, leaf
+                       in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
+                       if isinstance(leaf, jax.ShapeDtypeStruct)]
+            if lacking:
+                raise ValueError(
+                    f"The checkpoint at {where} holds no {', '.join(lacking[:6])}"
+                    f"{f' or {len(lacking) - 6} more leaves' if len(lacking) > 6 else ''}, "
+                    f"which this run's state has: the checkpoint was written by a model "
+                    f"or objective without them. Restore it with the model it was "
+                    f"written with.")
         restored = dict(restored)
         table = restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)

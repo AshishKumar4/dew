@@ -176,7 +176,8 @@ class TextToImage:
                              replace(config.autoencoder, dtype=compute))
         params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
                                    param_dtype=param_dtype, parameter_roots=config.parameter_roots)
-        return cls.from_objective(config.build(variables=params), params)
+        objective = config.build(variables=params)
+        return cls.from_objective(objective, _with_drawn_tables(objective, params))
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool = True, mesh: MeshSpec | None = None,
@@ -604,7 +605,40 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     return params
 
 
+def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> Variables:
+    """`variables` with every Fourier table the objective's model draws and
+    the checkpoint lacks, drawn by the model's init (`is_fourier_table`).
 
+    A run written before the table became a variable trained against the
+    table init draws. Only those leaves are computed: the rest of the init
+    is dead code to the compiler.
+    """
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    from dew.checkpoints import absent
+    from dew.nn.blocks import is_fourier_table
+
+    towers = {name: variables[name] for name in ("encoders", "autoencoder") if name in variables}
+    towers.setdefault("encoders", {})
+    key = jax.random.key(0)
+    drawn = [path for path in absent(jax.eval_shape(objective.init, key, towers), variables)
+             if is_fourier_table(path)]
+    if not drawn:
+        return variables
+
+    def leaf(tree, path):
+        for entry in path:
+            tree = tree[entry.key]
+        return tree
+
+    mesh = mesh_of(variables)
+    values = jax.jit(lambda key, towers: [leaf(objective.init(key, towers), path) for path in drawn],
+                     out_shardings=None if mesh is None else
+                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))(key, towers)
+    flat = flatten_dict(variables, keep_empty_nodes=True)
+    flat.update({tuple(entry.key for entry in path): value
+                 for path, value in zip(drawn, values, strict=True)})
+    return unflatten_dict(flat)
 
 
 @functools.cache
