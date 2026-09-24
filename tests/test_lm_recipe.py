@@ -461,6 +461,47 @@ def test_an_unknown_objective_is_refused():
         recipe.LmRunConfig(data=TokenWindows(seq_len=64), objective="ctc")
 
 
+def test_masked_diffusion_trains_on_packed_documents(tmp_path):
+    """`--objective masked_diffusion` over data:packed-tokens: the packed
+    windows reach the objective with their packing, so a validation batch
+    scores its documents and weighs its padded tail at nothing. A batch that
+    lost its segment ids on the way would count the tail as text."""
+    from dew.data.dataset import DataPartition
+    from dew.interop import load_pretrained
+    from dew.objectives.base import Step
+
+    recipe = load_recipe()
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
+    directory = tmp_path / "tokens"
+    directory.mkdir()
+    for split, count in (("train", 400), ("val", 96)):
+        ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
+        ids[6::7] = 1  # every seventh id ends a document
+        (directory / f"{split}.bin").write_bytes(ids.tobytes())
+    (directory / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+        "data:packed-tokens", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
+        "--tokenizer", str(checkpoint), "--data.path", str(directory),
+        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--ema-decay", "None", "--sample-tokens", "0"])
+
+    state = recipe.main(config)
+
+    assert int(state.updates) == 2
+    original = load_pretrained(str(checkpoint), dtype="float32", attention_impl="xla")
+    objective = recipe.build_masked_objective(config, original.model, original.model_config, None)
+    batch = next(iter(config.data.load(batch=8).val(DataPartition())))
+    padding = np.asarray(batch["text_segment_ids"]) == 0
+    assert padding.any() and not padding.all()
+    scored = objective.evaluate(state.params, batch, Step(jnp.asarray(0), jax.random.key(0), None))
+    np.testing.assert_array_equal(np.asarray(scored.weights), ~padding)
+
+
 def test_the_masked_objective_is_reachable_by_name(tmp_path):
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)

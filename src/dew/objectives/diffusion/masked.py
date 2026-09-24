@@ -33,6 +33,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.objectives.lm.objective import _batch_text
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
@@ -48,7 +49,8 @@ TEXT_KEY = "text"
 class MaskedDiffusionObjective(Objective[Mean]):
     """Train a masked diffusion model on the MDLM negative ELBO.
 
-    The rows are `[B, seq_len]` token ids under `batch["text"]`.
+    The rows are `[B, seq_len]` token ids under `batch["text"]`; packed
+    windows carry `text_segment_ids` and `text_positions` beside them.
     """
 
     artifact = TextSamples
@@ -115,12 +117,13 @@ class MaskedDiffusionObjective(Objective[Mean]):
         return pretrained
 
     def loss(self, params, batch, step: Step):
-        tokens, losses, weights, counted, predicted = self._token_losses(params, batch, step.key, train=True)
-        nelbo = Mean(jnp.sum(losses * weights), jnp.asarray(tokens.size, jnp.float32))
+        tokens, losses, weights, counted, predicted, real = self._token_losses(
+            params, batch, step.key, train=True)
+        nelbo = Mean(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
             "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),
-            "masked_fraction": jnp.mean(counted),
+            "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
         })
 
     def evaluate(self, params, batch, step: Step) -> TokenScores:
@@ -128,10 +131,10 @@ class MaskedDiffusionObjective(Objective[Mean]):
 
         One noise level and one masking are drawn from the pass's key, as
         training draws them, with dropout off and the averaged weights when
-        the run keeps them. Every token counts and carries its weighted masked
-        cross entropy, zero where it was left visible, so `perplexity` over a
-        validation pass is exp of the ELBO bound per token, the number MDLM
-        reports."""
+        the run keeps them. Every real token counts and carries its weighted
+        masked cross entropy, zero where it was left visible, and a packed
+        window's padding weighs nothing, so `perplexity` over a validation
+        pass is exp of the ELBO bound per token, the number MDLM reports."""
         params = params if step.ema is None else step.ema
         losses, weights = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights)
@@ -143,8 +146,8 @@ class MaskedDiffusionObjective(Objective[Mean]):
         every validation batch from the host, and jax's eager shard_map
         refuses the chunked head's map over the data axis alone."""
         def scored(params, batch, key):
-            _, losses, weights, _, _ = self._token_losses(params, batch, key, train=False)
-            return losses * weights, jnp.ones_like(losses)
+            _, losses, weights, _, _, real = self._token_losses(params, batch, key, train=False)
+            return losses * weights, real.astype(losses.dtype)
 
         return jax.jit(scored)
 
@@ -153,24 +156,41 @@ class MaskedDiffusionObjective(Objective[Mean]):
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
-        and the argmax prediction.
+        the argmax prediction, and which slots hold real tokens.
+
+        A packed batch (data:packed-tokens) names each window's documents in
+        `text_segment_ids`, 0 for the padded tail, and their positions in
+        `text_positions`. Each document then attends to itself alone, in both
+        directions, with its own positions, and the tail is neither masked
+        nor scored: a packed window scores as its documents would one by one.
         """
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        prepared = _batch_text(batch)
+        unread = sorted(set(prepared.token_fields) - {"positions", "segment_ids"})
+        if unread or prepared.conditioning:
+            raise ValueError(
+                f"masked diffusion reads token ids and their packing; this batch also carries "
+                f"{unread + sorted(prepared.conditioning)}")
+        tokens = prepared.tokens
         if tokens.shape[-1] != self.seq_len:
             raise ValueError(
                 f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
+        segment_ids = prepared.token_fields.get("segment_ids")
+        real = jnp.ones(tokens.shape, bool) if segment_ids is None else segment_ids != 0
         time_key, mask_key, dropout_key = jax.random.split(key, 3)
         t = self.process.sample_t(time_key, tokens.shape[0])
         masked, is_masked = self.process.corrupt(mask_key, tokens, t)
+        is_masked = is_masked & real
+        masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+        hidden = self.model.apply(params, masked, train=train, positions=prepared.token_fields.get("positions"),
+                                  segment_ids=segment_ids, rngs={"dropout": dropout_key},
                                   method=type(self.model).hidden_states)
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
             softcap=self.model.final_logit_softcap, precision=self.model.precision)
         counted = is_masked.astype(losses.dtype)
-        return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted
+        return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
         denoise = self.process.denoiser(self.model, params)
