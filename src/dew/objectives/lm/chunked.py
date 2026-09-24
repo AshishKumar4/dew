@@ -399,7 +399,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         return _capped(jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows), cap, temperature)
 
-    spec = () if jax.sharding.get_abstract_mesh().empty else _token_spec(targets.shape)
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return head(hidden, table, targets, cap)
+    spec = _token_spec(targets.shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
         return head(hidden, table, targets, cap)
@@ -415,9 +418,9 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
             for entry in (*entries, *[None] * (2 - len(entries)))]
     held = P(*(entry if entry else None for entry in kept))
     group, widths = kept
-    size = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in group)
+    size = math.prod(mesh.shape[axis] for axis in group)
     split = bool(group) and (hidden.size // math.prod(
-        jax.sharding.get_abstract_mesh().shape[axis] for axis in axes) * size * hidden.dtype.itemsize
+        mesh.shape[axis] for axis in axes) * size * hidden.dtype.itemsize
         < table.size * table.dtype.itemsize)
 
     def local(hidden, table, targets, cap):
@@ -429,8 +432,25 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
             table = jax.lax.all_gather(table, group, axis=0, tiled=True)
         return head(hidden, table, targets, cap)
 
-    return jax.shard_map(local, in_specs=(P(*spec, None), held, spec, P()),
-                         out_specs=(spec, spec if predict else None, spec), axis_names=axes, check_vma=False)(
+    # The map holds every axis manual, those that split no token too: in a map
+    # that leaves axes automatic, JAX lowers a collective's reducer with its
+    # add wrapped in a sharding constraint, and XLA's CPU compiler, which
+    # widens a bf16 reduction to fp32 (AllReducePromotion), aborts on a
+    # reducer whose root is not the add. Under a bf16 policy the split head's
+    # states come back through such a reduction. The states and the head name
+    # the axes of one device on their first dimension, where they split
+    # nothing, so the transpose sums neither over them. An axis whose shards
+    # do not divide the tokens leaves both whole over it, as the tile loops
+    # compute them anyway, and the transpose sums the copies' shares.
+    alone = tuple(axis for axis in mesh.axis_names if mesh.shape[axis] == 1 and axis not in mesh.manual_axes)
+
+    def naming(entry):
+        return (*mesh_axes(entry), *alone) or None
+
+    return jax.shard_map(local, in_specs=(P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]),
+                                          spec, P()),
+                         out_specs=(spec, spec if predict else None, spec),
+                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
         hidden, table, targets, cap)
 
 
