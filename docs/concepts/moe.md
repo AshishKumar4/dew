@@ -55,6 +55,8 @@ Both dispatch modes run their expert projections through `moe.expert_projection`
 - input gradients keep their input's dtype;
 - the exact GELU rounds once.
 
+A model that names no `dtype` computes its experts in their stored dtype when that dtype is narrower than the stream (`moe.expert_compute_dtype`). An fp32 residual stream over bf16 expert kernels rounds each expert's input to bf16, multiplies bf16 by bf16 with fp32 accumulation, and returns bf16. The dense layers of such a model still promote to fp32. Widening the experts instead copied each layer's kernels to fp32, 14.35 GiB of live temporaries serving gpt-oss-20b on four RTX 3090s. The forward reads the kernels as stored; only a gradient, whose cross-device sums need fp32, widens them.
+
 Forward-mode and reverse-mode differentiation follow the same rules. `tests/test_moe_precision.py` checks this against float64 arithmetic on the rounded operands, and through three Adam steps of both dispatch modes in bf16. `tools/moe_exchange_probe.py` measures the exchange's working memory against the global path on CPU. It says nothing about throughput on several accelerators.
 
 GPT OSS's per-expert biases go through `moe.gather_expert_bias`. It accumulates the bias gradients at master or compute precision, then converts them back to the parameter dtype. Padding and idle experts add no bias gradient. The stored fused kernel and bias leaves, router choices, clipping limits and SwiGLU scaling are unchanged. `tests/test_moe_biased_exchange.py` checks the full router and experts against pinned transformers fixtures, and compares the forward pass, backward pass and optimizer updates of both dispatch modes.
