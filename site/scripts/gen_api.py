@@ -73,6 +73,21 @@ def slug(text: str) -> str:
     return re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
 
 
+class Slugger:
+    """Anchors for one page's headings in order, deduplicated as github-slugger does: `sample`, then `sample-1`."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, int] = {}
+
+    def __call__(self, text: str) -> str:
+        base = result = slug(text)
+        while result in self.seen:
+            self.seen[base] += 1
+            result = f"{base}-{self.seen[base]}"
+        self.seen[result] = 0
+        return result
+
+
 def page_slug(module: str) -> str:
     return f"api/{module}"
 
@@ -404,15 +419,18 @@ def main() -> None:
     linker = Linker()
     for path in PAGES:
         linker.add(path, f"/{page_slug(path)}/")
+        # The headings render_object writes, in page order, so the anchors match
+        # even when two names differ only in case, like `Sample` and `sample`.
+        anchor = Slugger()
         for entry in pages[path].entries:
             if home[entry.canonical] == path:
-                url = f"/{page_slug(path)}/#{slug(entry.name)}"
+                url = f"/{page_slug(path)}/#{anchor(entry.name)}"
                 linker.add(entry.canonical, url, entry.name)
                 linker.add(f"{path}.{entry.name}", url)
                 if entry.obj.is_class:
                     for name, member in entry.obj.members.items():
                         if not name.startswith("_") and not member.is_alias and member.is_function:
-                            method = f"/{page_slug(path)}/#{slug(f'{entry.name}.{name}')}"
+                            method = f"/{page_slug(path)}/#{anchor(f'{entry.name}.{name}')}"
                             linker.add(f"{entry.canonical}.{name}", method, f"{entry.name}.{name}")
                             linker.add(f"{path}.{entry.name}.{name}", method)
 
