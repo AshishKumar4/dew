@@ -1082,24 +1082,31 @@ def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch):
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("dispatch", ["exchange", "global"])
-def test_a_forward_reads_the_expert_kernels_as_stored(dispatch):
-    """Only a gradient needs the kernels in fp32, for its cross-device sums.
-    Widened for every forward, bf16 experts were copied to fp32 per layer:
-    14.35 GiB of live temporaries serving gpt-oss-20b over an expert axis of
-    four RTX 3090s. The residual stream here is fp32, which also widened
-    them through the projection's promotion. Read off the program JAX
-    traces, since XLA's CPU backend runs a bf16 dot in fp32 on its own."""
+@pytest.mark.parametrize("experts", ["gpt_oss", "mixture"])
+def test_a_forward_reads_the_expert_kernels_as_stored(experts, dispatch):
+    """bf16 expert kernels under an fp32 stream, as gpt-oss-20b is served over
+    an expert axis. The forward multiplies them as stored: the stream rounds
+    to bf16 and the products accumulate in fp32. Widened, by the dispatch for
+    its gradient sums or by the stream's promotion, each layer's experts were
+    copied to fp32: 14.35 GiB of live temporaries on four RTX 3090s. Read off
+    the program JAX traces, since XLA's CPU backend runs a bf16 dot in fp32
+    on its own."""
+    from dew.nn.gpt_oss import GptOssMLP
+
     width, hidden = 64, 96
-    model = CausalTransformer(vocab_size=128, emb_features=width, num_layers=2, num_heads=4,
-                              mlp_features=hidden, max_seq_len=32,
-                              mixture=Mixture(experts=8, top_k=2, dispatch=dispatch))
-    ids = jnp.zeros((4, 16), jnp.int32)
-    shapes = jax.eval_shape(model.init, jax.random.key(0), ids)
+    if experts == "gpt_oss":
+        module = GptOssMLP(width, hidden, 8, 2, dispatch=dispatch)
+    else:
+        module = SparseMLP(num_experts=8, top_k=2, hidden_features=hidden,
+                           out_features=width, dispatch=dispatch)
+    x = jnp.zeros((4, 16, width), jnp.float32)
+    shapes = jax.eval_shape(module.init, jax.random.key(0), x)
     variables = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), shapes)
     with jax.set_mesh(build_mesh(MeshSpec(expert=4, fsdp=2))), nn.logical_axis_rules(()):
-        program = str(jax.make_jaxpr(model.apply)(variables, ids))
+        program = str(jax.make_jaxpr(module.apply)(variables, x))
+    kernels = [f"{experts},{rows},{columns}" for experts in (8, 2)
+               for rows, columns in ((width, hidden), (hidden, width),
+                                     (width, 2 * hidden), (2 * hidden, width))]
     widened = [line for line in program.splitlines()
-               if any(f"f32[{shape}]" in line for shape in
-                      (f"8,{width},{hidden}", f"8,{hidden},{width}",
-                       f"2,{width},{hidden}", f"2,{hidden},{width}"))]
+               if any(f"f32[{shape}]" in line for shape in kernels)]
     assert not widened, widened[:3]

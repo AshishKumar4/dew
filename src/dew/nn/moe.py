@@ -491,8 +491,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       precision: PrecisionLike) -> jax.Array:
     """`grouped_matmul` under one precision contract for both dispatches.
 
-    The operands are cast to `dtype` (flax's promotion when None, except
-    that a 16-bit kernel is never widened: the stream rounds to it), every
+    The operands are cast to `dtype` (flax's promotion when None), every
     contraction accumulates in at least fp32 and rounds once to the compute
     dtype, so a width split over a mesh axis rounds no partial sum. The
     tangent is `dx @ Q(kernel) + Q(x) @ dkernel` with `Q` the rounded operand
@@ -510,16 +509,10 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     path on every expert/fsdp layout in tests/test_moe_precision.py.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    if dtype is None and jnp.finfo(kernel.dtype).bits == 16 and jnp.finfo(compute).bits > 16:
-        # A 16-bit kernel is never widened: with no compute dtype named, a
-        # wider stream multiplies in the kernel's dtype and accumulates in
-        # fp32, as the checkpoint's reference runs it. Promoted, gpt-oss-20b
-        # served over four RTX 3090s copied each layer's experts to fp32.
-        compute = kernel.dtype
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
     if chosen == 'pallas' and _local(x) and _local(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
-    return _projection(x, kernel, group_sizes, compute,
+    return _projection(x, kernel, group_sizes, dtype,
                        'xla' if chosen == 'pallas' else chosen, precision)
 
 
@@ -790,6 +783,12 @@ def expert_dispatch[Parameters](
         _dispatched, project, parameter_axes=parameter_axes, num_experts=num_experts,
         dispatch=dispatch, output_dtype=output_dtype, initializing=initializing,
         capacity=capacity)
+    if mesh.shape.get(STAGE_AXIS, 1) > 1:
+        # A pipeline's stages trace the dispatch inside their own manual
+        # axes, which a jvp rule traced outside them cannot hold; and a
+        # pipeline trains, so its forward has nothing to save by reading
+        # the kernels as stored.
+        return run(x, indices, _widened(parameters), input_weights)
     return _stored_primal(run, x, indices, parameters, input_weights)
 
 
@@ -803,6 +802,22 @@ def _stored_primal(run, x, indices, parameters, input_weights):
     the step, 14.35 GiB of live temporaries for gpt-oss-20b served over an
     expert axis of four RTX 3090s."""
     return run(x, indices, parameters, input_weights)
+
+
+def expert_compute_dtype(x: jax.Array, *parameters: jax.Array, dtype: Dtype | None) -> Dtype:
+    """The dtype an expert layer computes in: `dtype` when the model names
+    one, else flax's promotion of the stream and the parameters, except that
+    16-bit parameters are never widened. A wider stream then rounds to them
+    and every product accumulates in fp32, as a bf16 checkpoint's reference
+    runs it; promoted, each layer's experts were copied to fp32, 14.35 GiB
+    of live temporaries serving gpt-oss-20b over four RTX 3090s."""
+    compute = canonicalize_dtype(x, *parameters, dtype=dtype)
+    stored = {parameter.dtype for parameter in parameters}
+    if dtype is None and len(stored) == 1:
+        (kind,) = stored
+        if jnp.issubdtype(kind, jnp.floating) and jnp.finfo(kind).bits < jnp.finfo(compute).bits:
+            return kind
+    return compute
 
 
 def _stored_primal_jvp(run, primals, tangents):
@@ -1133,7 +1148,7 @@ class ExpertMLP(nn.Module):
         kernels = (self.gate_proj.kernel, self.up_proj.kernel, self.down_proj.kernel)
         # One compute dtype for all three projections, named rather than
         # inferred inside the dispatch, where the parameters may be widened.
-        compute = canonicalize_dtype(x, *kernels, dtype=self.dtype)
+        compute = expert_compute_dtype(x, *kernels, dtype=self.dtype)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
             tuple(EXPERT_AXES.values()), num_experts=self.num_experts, dispatch=self.dispatch,
