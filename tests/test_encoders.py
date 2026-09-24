@@ -12,6 +12,7 @@ import pytest
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, unit_range
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
+from dew.telemetry.instrumentation import compiled_flops
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
@@ -48,6 +49,41 @@ def test_an_empty_mask_row_contributes_nothing(rng):
     pooled = embed.apply(params, temb, TextContext(hidden, mask))
     assert jnp.all(jnp.isfinite(pooled))
     assert jnp.allclose(pooled[0], embed.apply(params, temb, None)[0], atol=1e-6)
+
+
+def test_the_text_conditioning_projects_each_row_once_not_each_token(rng):
+    """The text reaches the adaLN vector only as the masked mean of its
+    projected tokens. Projecting every token cost layout_parity's DiT (77
+    text tokens of 1024 features for 16 image tokens) most of its step's
+    matmul FLOPs, and a layout that splits no rows (tensor, sequence)
+    repeated all of it on every device: 2.63 times one device's FLOPs on
+    four 3090s. The vector is the same, a trained bias and an empty row
+    included, and a longer text adds only its pooling's few operations per
+    element, not a projection's."""
+    embed = ConditioningEmbed(emb_features=64, mlp_ratio=1)
+    hidden = jax.random.normal(rng, (3, 77, 32))
+    mask = jnp.array([[1] * 20 + [0] * 57, [0] * 77, [1] * 77])
+    temb = jnp.array([1.0, 2.0, 3.0])
+    params = embed.init(rng, temb, TextContext(hidden, mask))
+    projection = params["params"]["text_context_proj"]
+    projection["bias"] = projection["bias"] + 0.5
+
+    got = embed.apply(params, temb, TextContext(hidden, mask))
+    tokens = hidden @ projection["kernel"] + projection["bias"]
+    want = embed.apply(params, temb, None) + masked_mean(tokens, mask)
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+    def flops(length: int) -> float:
+        text = TextContext(jax.ShapeDtypeStruct((3, length, 32), jnp.float32),
+                           jax.ShapeDtypeStruct((3, length), jnp.int32))
+        # The compiled module's matmuls, a GPU's cuBLAS calls among them
+        # (compiled_flops): XLA's own cost analysis counts nothing for a GPU.
+        counted = compiled_flops(jax.jit(embed.apply).lower(params, temb, text).compile())
+        assert counted is not None
+        return counted
+
+    added = 3 * 231 * 32  # the elements of 231 more tokens of 3 rows
+    assert (flops(308) - flops(77)) / added < 8, (flops(77), flops(308))
 
 
 def test_padded_rows_do_not_move_the_conditioning_vector():
