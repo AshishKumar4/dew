@@ -299,7 +299,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
 
 
-def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view():
+def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view(without_deterministic_ops):
     """An unpacked, unpadded batch restricts no depth's view, so a depth runs
     the kernel its layer asked for rather than dropping to xla behind an
     all-true mask. Pinning cudnn proves it on a host without cudnn: the
