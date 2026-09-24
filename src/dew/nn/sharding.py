@@ -100,9 +100,17 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # norm, residual add, rotary rotation and the loss. It stays whole on the
 # tensor axis and keeps fsdp, because sharding it would put a collective
 # between every pair of sublayers, the cost tensor parallelism is arranged
-# to avoid. A width that holds fsdp composes the two axes and splits fsdp
-# times tensor ways; a width the residual took fsdp from first takes tensor
-# alone, through the pairs at the end.
+# to avoid. In a kernel that holds both, the residual width takes fsdp and
+# the Megatron width tensor alone, a split in two dimensions, as MaxText's
+# rules make it; the mlp and attention widths name tensor first and fsdp
+# second, and the heads take tensor through the pairs at the end. Split
+# over fsdp and tensor together while the residual width stayed whole, the
+# mlp's and o_proj's widths had GSPMD gather a block's activations over
+# fsdp and repeat their products on both devices of every pair: 1.21 times
+# one device's matmul FLOPs for layout_parity's dense decoder under
+# fsdp2_tensor2. A width no residual shares an array with, the vocabulary
+# of the embedding table, composes the two axes and splits fsdp times
+# tensor ways.
 #
 # The activation_ names place what a step computes rather than what it
 # stores, by the same table: rows over the batch axes, positions over the
@@ -110,9 +118,11 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # width (activation_embed) has no rule, so it stays whole.
 DEFAULT_RULES: LogicalAxisRules = (
     ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
-    ("mlp", (FSDP_AXIS, TENSOR_AXIS)),
+    ("mlp", TENSOR_AXIS),
+    ("mlp", FSDP_AXIS),
     ("modulation", FSDP_AXIS),
-    ("attention", (FSDP_AXIS, TENSOR_AXIS)),
+    ("attention", TENSOR_AXIS),
+    ("attention", FSDP_AXIS),
     # The gated delta net's projected width (keys, values and their gate),
     # placed like the attention's: the width over the model dimension.
     ("linear", FSDP_AXIS),
@@ -129,11 +139,9 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("exp", EXPERT_AXIS),
     # A projection from the residual width to the heads, q_proj's shape: the
     # rule above gave 'embed' fsdp, so the heads take the tensor axis by
-    # itself rather than fall back to replication. 'attention' has the same
-    # second choice for a table that gives 'embed' fsdp before it.
+    # itself rather than fall back to replication.
     ("heads", TENSOR_AXIS),
     ("kv", TENSOR_AXIS),
-    ("attention", TENSOR_AXIS),
     ("activation_batch", BATCH_AXES),
     ("activation_length", SEQUENCE_AXIS),
     ("activation_heads", TENSOR_AXIS),
@@ -298,21 +306,34 @@ def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
     names, on `mesh`: the rules and the mesh in context by default.
 
     A mesh axis of size 1 shards nothing, and a manual one belongs to the
-    `shard_map` in context, so both are dropped from the spec. A rule whose
-    axes do not divide its dimension evenly cannot split it, so that rule is
-    set aside for this array and the name takes its next rule, or none, and
-    the axis goes to the next dimension that names it. An odd vocabulary
-    shards the embedding on its width and keeps the table in the layout.
+    `shard_map` in context, so both are dropped from the rules before they
+    are read: such an axis claims no dimension, and a name whose rule named
+    only such axes takes its next rule. With no tensor axis, 'mlp' passes
+    its tensor rule to fsdp. A rule whose axes do not divide its dimension
+    evenly cannot split it, so that rule is set aside for this array and the
+    name takes its next rule, or none, and the axis goes to the next
+    dimension that names it. An odd vocabulary shards the embedding on its
+    width and keeps the table in the layout.
     """
     rules = axis_rules() if rules is None else rules
     mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh
-    left = list(rules)
+
+    def splitting(assignment: MeshAxes) -> tuple[str, ...]:
+        return tuple(axis for axis in mesh_axes(assignment)
+                     if axis not in mesh.manual_axes and mesh.shape.get(axis, 1) > 1)
+
+    # A rule of None keeps its name whole and stands; one whose axes all
+    # split nothing is dropped.
+    left: list[tuple[str, MeshAxes]] = []
+    for name, assignment in rules:
+        if assignment is None:
+            left.append((name, None))
+        elif used := splitting(assignment):
+            left.append((name, used[0] if len(used) == 1 else used))
     while True:
         mapped = spmd.logical_to_mesh_axes(axes, tuple(left))
         assert mapped is not None, "flax answers None for array_dim_names=None only"
-        assigned = [tuple(axis for axis in mesh_axes(assignment)
-                          if axis not in mesh.manual_axes and mesh.shape[axis] > 1)
-                    for assignment in mapped]
+        assigned = [mesh_axes(assignment) for assignment in mapped]
         blocked = {(name, assignment) for name, assignment, used, size
                    in zip(axes, mapped, assigned, shape, strict=True)
                    if size % math.prod(mesh.shape[axis] for axis in used)}
