@@ -109,25 +109,12 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="a device allocation shows on a GPU's allocator")
 def test_a_load_puts_nothing_on_a_device(source):
     """The weights come to the host as views of torch's storage; only the
-    caller's placement moves them, so a model larger than one GPU loads."""
-    import subprocess
-    import sys
-
-    script = """
-import sys, warnings
-import jax
-from dew.interop import load_pretrained
-warnings.simplefilter("ignore")
-load_pretrained(sys.argv[1], fallback="torchax", dtype="float32")
-print(jax.devices()[0].memory_stats()["peak_bytes_in_use"])
-"""
-    run = subprocess.run([sys.executable, "-c", script, str(source[0])], capture_output=True, text=True,
-                         env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
-    assert run.returncode == 0, run.stderr[-1500:]
-    assert int(run.stdout.split()[-1]) == 0
+    caller's placement moves them, so a model larger than one device loads.
+    Any transfer to a device during the load raises under the guard."""
+    with jax.transfer_guard_host_to_device("disallow"), pytest.warns(UserWarning, match="tier 3"):
+        load_pretrained(source[0], fallback="torchax", dtype="float32")
 
 
 @pytest.mark.mesh
