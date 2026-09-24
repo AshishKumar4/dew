@@ -436,31 +436,52 @@ def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp
     assert sorted(path.name for path in export.glob("model*")) == ["model.safetensors"]
 
 
-@pytest.mark.network
-def test_a_sharded_export_holds_one_shard_on_the_host(tmp_path):
-    """Qwen3-0.6B in bfloat16 saved in 200 MB shards, in a fresh process
-    (tools/benchmark_streaming_export.py): each host tensor is built as its
-    shard is written, so RSS over the save stays flat, where building the
-    whole export first raised it by 0.57 GB of the 1.11 GB of weights. A
-    synthetic decoder of the same family does not separate the two writers
-    on CPU, so the gate is the released checkpoint, read from the cache."""
+SYNTHETIC_CHECKPOINT = """
+import sys
+from pathlib import Path
+import jax, jax.numpy as jnp, numpy as np
+from dew.interop import load_pretrained
+from dew.interop.hf_decoders import save_pretrained_decoder
+
+source = load_pretrained(sys.argv[1], dtype="float32", attention_impl="reference")
+model = source.model.clone(num_layers=12, layer_types=("full_attention",) * 12, vocab_size=16000,
+                           emb_features=1024, num_heads=16, num_kv_heads=8, head_dim=64, mlp_features=3072)
+variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
+                         model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
+save_pretrained_decoder(model, variables, sys.argv[2])
+for asset in Path(sys.argv[1]).glob("tokenizer*"):
+    (Path(sys.argv[2]) / asset.name).write_bytes(asset.read_bytes())
+"""
+
+
+def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
+    """A 320 MB bfloat16 decoder written by one process, then loaded onto a
+    mesh and saved in 50 MB shards by a fresh one
+    (tools/benchmark_streaming_export.py), so no heap the writer freed is
+    there for the save to reuse. Each host tensor is built as its shard is
+    written, so RSS over the save rises by the shard's tensors, their
+    serialized bytes and one transient tensor, four shards at most
+    (measured 0.12-0.13 GB); building the whole export first rises by the
+    model (0.32 GB on this checkpoint, 0.57 GB of Qwen3-0.6B's 1.11)."""
     import os
     import subprocess
     import sys
 
-    from huggingface_hub import try_to_load_from_cache
-
-    repo, revision = "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
-    if not isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str) \
-            and os.environ.get("DEW_NETWORK_TESTS") != "1":
-        pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     root = Path(__file__).parents[1]
-    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"), repo, "200MB",
-                          str(tmp_path / "out"), revision], capture_output=True, text=True,
-                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    # One device, as a user's process has: the suite's simulated mesh would
+    # place every leaf eight times over.
+    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    written = subprocess.run([sys.executable, "-c", SYNTHETIC_CHECKPOINT, str(FIXTURES / "qwen3-tiny"),
+                              str(tmp_path / "source")], capture_output=True, text=True, env=env)
+    assert written.returncode == 0, written.stderr[-2000:]
+    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"),
+                          str(tmp_path / "source"), "50MB", str(tmp_path / "out")],
+                         capture_output=True, text=True, env=env)
     assert run.returncode == 0, run.stderr[-2000:]
     measured = json.loads(run.stdout.splitlines()[-1])
-    assert measured["rise_gb"] < 0.1 * measured["weights_gb"], measured
+    assert measured["shards"] > 4
+    assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
 
 
 def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, monkeypatch):

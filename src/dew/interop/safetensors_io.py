@@ -366,8 +366,9 @@ def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: i
     `LazyTensors` table builds each shard's tensors as that shard is written
     and the host holds one shard of them at a time. A dense decoder export
     and a source-layout `Pretrained.export` are such tables. A quantized
-    source's requantization, and the Gemma 4 and GLM-5-next exporters, build
-    their whole table first, and this writer then holds what it is given.
+    source's requantization, `save_pretrained_decoder` through the Gemma 4
+    and GLM-5-next exporters, and DiffusionGemma's export adapter build their
+    whole table first, and this writer then holds what it is given.
 
     An export replaces the one `directory` held without a moment at which a
     loader reads a mix of the two. Each shard takes a name no earlier export
@@ -375,7 +376,10 @@ def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: i
     unsharded, `model.safetensors`) is published last, in one rename, and
     commits the export. Only then are the files the old export named and
     this one does not removed, with shards an interrupted export of this
-    writer left unindexed. Any other file, a precision variant such as
+    writer left unindexed. transformers reads a local `model.safetensors`
+    before an index (modeling_utils.py:594-605, 5.16.1), so a crash while an
+    export changes between one file and shards can leave Dew and transformers
+    each reading a whole export, but not the same one. Any other file, a precision variant such as
     `model.fp16.safetensors` among them, is left as it is.
     """
     from huggingface_hub import split_state_dict_into_shards_factory
