@@ -285,7 +285,7 @@ def test_a_packed_batch_keeps_the_depths_inside_their_documents():
 
 def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
     """Segment ids and positions may ride the `ModelInputs` instead of the
-    batch's packing columns, and the depths' loss is the same either way."""
+    batch's packing columns, and the losses are the same number either way."""
     objective = LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.3)
     params = objective.init(jax.random.key(0))
     ids, segments, positions = packed_row()
@@ -295,9 +295,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
     _, by_columns = scalar_loss(objective, params, columns, step_at())
     _, by_inputs = scalar_loss(objective, params, carried, step_at())
 
-    assert float(by_inputs.metrics["ce"]) == pytest.approx(float(by_columns.metrics["ce"]), rel=1e-6)
-    assert float(by_inputs.metrics["mtp_ce"]) == pytest.approx(
-        float(by_columns.metrics["mtp_ce"]), rel=1e-6)
+    assert float(by_inputs.metrics["ce"]) == float(by_columns.metrics["ce"])
+    assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
 
 
 def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view():

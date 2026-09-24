@@ -260,17 +260,25 @@ def _leaf_paths(tree: Variables) -> set[tuple[str, ...]]:
             for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
 
 
-def _packing_of(segment_ids, positions) -> dict:
-    """Cut a packed batch's positions and segment ids to the input side of its rows.
+def _prepared(tokens: ModelInputs | jax.Array) -> ModelInputs:
+    """A batch's `text` as `ModelInputs`, bare ids cast to int32."""
+    return tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
 
-    Only a packed batch names these, and only a model that packs takes
-    them. An unpacked run calls the model without them.
+
+def _model_packing(prepared: ModelInputs, segment_ids, positions
+                   ) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
+    """The keywords the model reads beside the input ids of `prepared`'s rows.
+
+    They are the `ModelInputs` fields and a packed batch's positions and
+    segment ids columns, cut to the input side of the rows; the two may not
+    both name one. A plain row hands the model nothing.
     """
-    packing = {}
-    if positions is not None:
-        packing["positions"] = positions[:, :-1]
-    if segment_ids is not None:
-        packing["segment_ids"] = segment_ids[:, :-1]
+    packing = prepared.slice_tokens(stop=-1).kwargs()
+    for name, column in (("positions", positions), ("segment_ids", segment_ids)):
+        if column is not None:
+            if name in packing:
+                raise ValueError(f"{name} must come from either ModelInputs or the packing column")
+            packing[name] = column[:, :-1]
     return packing
 
 
@@ -705,15 +713,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         weights them from its scores (`dew.nn.moe.Routes`); the stack slices
         the record by layer however it runs.
         """
-        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
-        tokens = prepared.tokens
-        inputs, targets = self._rows(tokens)
-        packing = prepared.slice_tokens(stop=-1).kwargs()
-        if positions is not None and "positions" in packing:
-            raise ValueError("positions must come from either ModelInputs or the packing column")
-        if segment_ids is not None and "segment_ids" in packing:
-            raise ValueError("segment_ids must come from either ModelInputs or the packing column")
-        packing.update(_packing_of(segment_ids, positions))
+        prepared = _prepared(tokens)
+        inputs, targets = self._rows(prepared.tokens)
+        packing = _model_packing(prepared, segment_ids, positions)
         segment_ids = _documents(prepared, segment_ids)
         params = thaw(params)
         replay = {}
@@ -836,7 +838,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         if left_padding is None:
             return -self.token_scores(params, tokens).losses
-        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
+        prepared = _prepared(tokens)
         padding = jnp.asarray(left_padding, jnp.int32)
         if padding.shape != (prepared.tokens.shape[0],):
             raise ValueError("left_padding must have one count per token row")
@@ -914,19 +916,25 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return jnp.asarray(batch[ROLES_KEY])
 
-    def _query_weights(self, inputs, segment_ids, dtype):
+    def _query_weights(self, prepared: ModelInputs, segment_ids, dtype):
         """Mark with 1 every query whose indexer KL counts.
 
-        A query counts when its token is real and, in a packed batch, when
-        it sits inside a document.
+        A query counts when its token is real, neither the pad id nor a slot
+        the `ModelInputs` attention mask leaves out, and, in a packed batch,
+        when it sits inside a document.
         """
+        inputs = prepared.tokens[:, :-1]
         weights = (jnp.ones_like(inputs, dtype) if self.pad_id is None
                    else (inputs != self.pad_id).astype(dtype))
-        if segment_ids is not None:
-            weights = weights * (segment_ids[:, :-1] != 0).astype(dtype)
+        documents = _documents(prepared, segment_ids)
+        if documents is not None:
+            weights = weights * (documents[:, :-1] != 0).astype(dtype)
+        valid = prepared.token_fields.get("attention_mask")
+        if valid is not None:
+            weights = weights * valid[:, :-1].astype(dtype)
         return weights
 
-    def _indexer_term(self, sown, inputs, segment_ids) -> tuple[jax.Array, jax.Array]:
+    def _indexer_term(self, sown, prepared: ModelInputs, segment_ids) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
         the number of queries it counted.
 
@@ -938,7 +946,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             raise ValueError(
                 "no attention layer sowed an indexer KL, though the model's mla "
                 "mixer carries the indexer")
-        weights = self._query_weights(inputs, segment_ids, jnp.float32)
+        weights = self._query_weights(prepared, segment_ids, jnp.float32)
         total = jnp.sum(jnp.stack([
             jnp.sum(kl.astype(jnp.float32) * weights[:, :kl.shape[1]]) for kl in kls]))
         mass = jax.lax.stop_gradient(jnp.sum(weights))
@@ -950,14 +958,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         The main loss is never scored, since nothing it reaches moves.
         """
         assert self.indexer is not None
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-        inputs, _ = self._rows(tokens)
+        prepared = _prepared(batch[TEXT_KEY])
+        inputs, _ = self._rows(prepared.tokens)
         segment_ids, positions = _packing(batch)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=True, rngs={"dropout": step.key},
-            collections=collections, packing=_packing_of(segment_ids, positions))
-        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], inputs, segment_ids)
+            collections=collections, packing=_model_packing(prepared, segment_ids, positions))
+        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared, segment_ids)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
         qk = gathered.get("qk") if self.qk_stats else None
         if self.qk_stats:
@@ -1010,8 +1018,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
                      ) -> tuple[Mean | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from."""
-        tokens = batch[TEXT_KEY]
-        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
+        prepared = _prepared(batch[TEXT_KEY])
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
@@ -1046,8 +1053,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             # do, so one Mean carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
-            total, queries = self._indexer_term(kls, prepared.tokens[:, :-1],
-                                                _documents(prepared, segment_ids))
+            total, queries = self._indexer_term(kls, prepared, segment_ids)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Mean(prediction.total + self.indexer.weight * total, mass)
         statistics: Mean | LMStatistics = prediction
