@@ -15,6 +15,7 @@ from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder
+from dew.nn.blocks import torch_nearest_resize
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.objectives.base import Variables
@@ -36,7 +37,9 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
     Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model keyword
-    names. Spatial inputs stay present in both guidance branches.
+    names. Spatial inputs stay present in both guidance branches. The mask
+    shrinks to the latent grid by torch's nearest rule, as diffusers'
+    inpainting pipelines shrink it (`prepare_mask_latents`).
     """
     if autoencoder is None:
         raise ValueError("Masked-image conditioning requires an autoencoder")
@@ -45,7 +48,7 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
         raise ValueError("Image and mask geometry must match, with one mask channel")
     mask = (mask >= 0.5).astype(jnp.float32)
     latent = autoencoder.encode(params, pixels * (mask < 0.5), key)
-    mask = jax.image.resize(mask, (*latent.shape[:-1], 1), method="nearest")
+    mask = torch_nearest_resize(mask, *latent.shape[1:3])
     return {"mask": mask, "masked_image": latent}
 
 

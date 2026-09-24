@@ -61,6 +61,34 @@ def test_caption_dropout_keeps_mask_conditioned_gradients(saved_pipelines):
     run_check(saved_pipelines / "inpaint", "--case", "mask-dropout")
 
 
+def test_the_inpainting_mask_shrinks_to_the_latents_as_diffusers_shrinks_it():
+    """Diffusers' inpainting pipelines bring the pixel mask to the latent grid
+    with torch.nn.functional.interpolate's default 'nearest', which reads the
+    first pixel of each block. A mask edge inside a block decides the latent
+    cell from that pixel, not from the block's middle."""
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    from dew.inputs.diffusion import latent_image_conditions
+
+    class Eightfold:
+        """A VAE's geometry, which is all the mask reads of it."""
+
+        def encode(self, params, pixels, key):
+            batch, height, width, _ = pixels.shape
+            return jnp.zeros((batch, height // 8, width // 8, 4))
+
+    mask = np.zeros((1, 64, 64, 1), np.float32)
+    mask[:, 3:37, 5:45] = 1.0
+    pixels = np.zeros((1, 64, 64, 3), np.float32)
+
+    spatial = latent_image_conditions(Eightfold(), None, pixels, mask, None)
+    expected = torch.nn.functional.interpolate(torch.from_numpy(mask.transpose(0, 3, 1, 2)), size=(8, 8))
+
+    np.testing.assert_array_equal(np.asarray(spatial["mask"])[..., 0], expected.numpy()[:, 0])
+
+
 @pytest.mark.parametrize("case", ["sd1", "sd2", "sdxl-inpaint", "refiner"])
 def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
     with tarfile.open(ROOT / "tests/fixtures/native_unet_geometry.tar.xz") as archive:
