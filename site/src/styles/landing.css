@@ -208,7 +208,9 @@ html[data-has-hero][data-past-hero] header.header {
 	align-items: center;
 	gap: 0.6rem;
 	margin-top: 1.6rem;
-	max-width: 34rem;
+	/* As wide as the command on one line; where the screen is narrower, it wraps. */
+	width: fit-content;
+	max-width: 100%;
 	padding: 0.5rem 0.5rem 0.5rem 0.9rem;
 	border: 1px solid var(--dew-rule);
 	border-radius: 0.6rem;
@@ -221,10 +223,13 @@ html[data-has-hero][data-past-hero] header.header {
 
 .copy-command code {
 	flex: 1;
-	overflow-x: auto;
-	white-space: nowrap;
+	min-width: 0;
+	line-height: 1.55;
+	overflow-wrap: anywhere;
+	/* A wrapped command hangs under its first line, clear of the prompt. */
+	padding-left: 2ch;
+	text-indent: -2ch;
 	color: var(--sl-color-white);
-	scrollbar-width: none;
 }
 
 .copy-command .prompt {
