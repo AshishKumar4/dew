@@ -233,11 +233,17 @@ def strictly_lower_inverse(a):
     nilpotent A (verified against the loop at C=4 and C=64: they agree to
     4e-15). The series is summed by doubling, S <- S + A^(2^k) S and
     A <- A^2, which is log2(C) matmuls instead of C row updates.
+
+    The first doubling is written out, S = I + A, rather than as `A @ I`:
+    that product is A exactly, and XLA TPU rewrites a matmul against the
+    broadcast identity into a dilated convolution whose fusion with the add
+    fails register allocation on a v6e (`live_range_finder.cc:57 RET_CHECK`,
+    jax 0.11.2), at both matmul precisions.
     """
     chunk_size = a.shape[-1]
-    inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=a.dtype), a.shape)
-    power = a
-    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
+    inv = a + jnp.eye(chunk_size, dtype=a.dtype)
+    power = a @ a
+    for _ in range(max(1, math.ceil(math.log2(chunk_size))) - 1):
         inv = inv + power @ inv
         power = power @ power
     return inv
