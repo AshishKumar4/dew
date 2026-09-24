@@ -532,9 +532,26 @@ class CausalSelfAttention(nn.Module):
                 query, key, causal=causal, sliding_window=window,
                 mask=mask if documents is None else with_documents(mask, documents)))
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
-        if (append is not None and mask is cursor and S == 1 and sinks is None and not sowing
-                and self.attention_impl in ('auto', 'tpu') and append.store.kernel()):
+        plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
+        if (append is not None and plain_step and self.attention_impl in ('auto', 'tpu')
+                and append.store.kernel()):
             attention = self._paged(append, query)
+        elif plain_step:
+            # The cache is compact, so a decode query reads the filled slots
+            # before its own: a key count per row, which cuDNN takes as its
+            # padding lengths (`scaled_dot_product_attention`) and every other
+            # kernel builds `cursor` from again. With the mask built here,
+            # 'auto' went to xla's two dense dots over the whole cache: 1.00
+            # against cuDNN's 0.30 ms a layer at 128 rows on an RTX 4080.
+            # A row whose query is padding reads one key, so its (unused)
+            # output stays finite as the masked kernels leave it.
+            reads = jnp.maximum(jnp.asarray(positions).reshape(B, S)[:, 0] + 1, 1)
+            attention = checkpoint_name(scaled_dot_product_attention(
+                query, key, value, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl, causal=False,
+                softcap=self.attn_logit_softcap,
+                key_value_seq_lengths=reads.astype(jnp.int32)), 'context')
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.dtype, precision=self.precision,
