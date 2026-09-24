@@ -357,6 +357,26 @@ def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, bala
 
 
 @mesh_lane
+def test_a_pipeline_trains_an_exchange_dispatch():
+    """Experts traded over the expert axis inside two stages, against the same
+    exchange unpipelined: the dispatch's kernels, read as stored when nothing
+    differentiates them, are widened for a pipeline, whose stages trace the
+    dispatch inside their own manual axes."""
+    model = tiny(mixture={"experts": 4, "top_k": 2, "dispatch": "exchange"})
+    objective = LMObjective(model, SEQ_LEN)
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    batch = token_batch()
+
+    loss, _, grads = loss_and_grads(objective, MeshSpec(expert=2, fsdp=2), variables, batch)
+    piped, _, piped_grads = loss_and_grads(
+        objective, MeshSpec(expert=2, stage=2, microbatches=4), variables, batch)
+
+    assert abs(loss - piped) < 1e-5, (loss, piped)
+    difference = largest_difference(grads, piped_grads)
+    assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
+
+
+@mesh_lane
 def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     """Stages of two like layers scan inside the pipeline; the loss and the
     gradients hold to the plain loop's. Largest observed differences on

@@ -9,10 +9,16 @@ from collections.abc import Mapping
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.moe import Routes, chosen_experts, expert_dispatch, expert_projection, gather_expert_bias
+from dew.nn.moe import (
+    Routes,
+    chosen_experts,
+    expert_compute_dtype,
+    expert_dispatch,
+    expert_projection,
+    gather_expert_bias,
+)
 from dew.nn.sharding import LogicalAxes, logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
@@ -54,7 +60,7 @@ class GptOssExperts(nn.Module):
                                (self.num_local_experts, self.hidden_size))
         # Infer the shared compute dtype from every original operand, while
         # keeping master kernels uncast for the projection's derivative rule.
-        compute_dtype = canonicalize_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
+        compute_dtype = expert_compute_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         slots = expert_dispatch(
