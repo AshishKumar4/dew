@@ -723,8 +723,6 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
     assert tables == [((64, 16), False)], tables
 
 
-@pytest.mark.skipif(jax.default_backend() == "cpu",
-                    reason="a CPU dot runs the bf16 algorithm without rounding")
 def test_the_bf16_head_carries_its_logits_cotangent_in_fp32():
     """The bf16 algorithm rounds each operand to bf16, and the logits'
     cotangent was one of them: a 4-GPU run's gradients then moved past the
@@ -805,3 +803,18 @@ def test_a_pass_with_no_backward_never_holds_the_logits_whole():
 
     assert temporaries(None) <= temporaries((1024, 8192))
     assert temporaries(None) < 4096 * 32768 * 4 // 4
+
+
+def test_the_split_cotangent_reaches_its_products_in_bf16():
+    """The bf16 head's backward splits the fp32 logits' cotangent into a bf16
+    high half and the rest, and both reach the products as bf16 arrays, the
+    rest rounded as a GPU's bf16 algorithm rounds an fp32 operand: split as
+    fp32 they wrote twice the bytes and the products read twice the bytes,
+    10 ms of a 168 ms step at Qwen3-0.6B's head on an RTX 4080."""
+    cotangent = jnp.ones((16, 64), jnp.float32)
+    operand = jnp.ones((64, 8), jnp.float32)
+    program = jax.make_jaxpr(lambda c, m: chunked._cotangent_product('tv,vd->td', c, m, chunked.BF16))(
+        cotangent, operand)
+    dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
+    assert len(dots) == 2
+    assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots

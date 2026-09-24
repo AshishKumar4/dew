@@ -87,7 +87,20 @@ def _cotangent_product(subscripts: str, cotangent, operand, precision: jax.lax.P
         return product(cotangent)
     # A cast pair would be folded away under jit (`rounded_to`), and the rest with it.
     high = rounded_to(cotangent, jnp.bfloat16)
-    return product(high) + product(cotangent - high)
+    # The halves reach the products as bf16: the split writes half the
+    # bytes, and the products read half. The high half and the operand are
+    # bf16 values already; the rest is cast by round-to-nearest-even, the
+    # rounding a GPU's BF16_BF16_F32 applies to an fp32 operand, so on a GPU
+    # the products are unchanged. A CPU runs the algorithm unrounded, so
+    # there the cast is the rounding (2.2e-6 of the state gradient). A caller
+    # in a loop passes the operand already bf16.
+    operand = operand.astype(jnp.bfloat16)
+
+    def half(left):
+        return jnp.einsum(subscripts, left.astype(jnp.bfloat16), operand, precision=precision,
+                          preferred_element_type=jnp.float32)
+
+    return half(high) + half(cotangent - high)
 
 
 def _capped(logits, softcap, temperature: float = 1.0):
@@ -244,8 +257,12 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
 
     def columns(first, gradients, width):
         d_states, d_table, d_cap = gradients
-        matrix = rounded_operand(jax.lax.dynamic_slice_in_dim(
-            table, first, width, axis=0).astype(jnp.float32), operands)
+        stored = jax.lax.dynamic_slice_in_dim(table, first, width, axis=0)
+        matrix = rounded_operand(stored.astype(jnp.float32), operands)
+        # The state gradient's operand, cast to bf16 once per vocabulary tile
+        # rather than once per token tile inside `_cotangent_product`: the same
+        # values, as `matrix` is exact in bf16 under the bf16 algorithm.
+        product_matrix = stored.astype(jnp.bfloat16) if precision is BF16 else matrix
 
         def tokens(start, carry, size):
             d_states, d_matrix, d_cap = carry
@@ -268,7 +285,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             d_logits = ((token_loss + token_partition)[:, None] * probabilities
                         - token_loss[:, None] * selected)
             d_raw, cap_tile = pullback(d_logits)
-            states_tile = _cotangent_product('tv,vd->td', d_raw, matrix, precision)
+            states_tile = _cotangent_product('tv,vd->td', d_raw, product_matrix, precision)
             # The head's own gradient sums over every token in fp32 already
             # (`d_matrix`), and a split here costs as much again as the
             # states': Qwen3-0.6B's step 174.0 against 186.6 ms on an A100.
