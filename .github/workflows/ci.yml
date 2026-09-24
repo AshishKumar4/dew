@@ -40,7 +40,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[$EXTRAS]"
+        # pyright resolves every import in src/dew, the optional readers' included.
+        pip install -e ".[$EXTRAS,gguf,torchax]"
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
