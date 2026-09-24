@@ -271,24 +271,26 @@ def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
 
 
 def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
-    """Refuse a state that holds float64 or complex128 on a TPU mesh.
+    """Refuse parameters stored in float64 or complex128 on a TPU mesh.
 
     XLA's TPU backend has no 64-bit floats. It rewrites them into pairs of
     32-bit ones, which are not IEEE doubles (0.02 came back as
     0.01999999999999999 on a v6e), and the rewrite has no case for nextafter,
-    which a truncated normal initializer runs, or for ragged_dot, which a
-    routed mixture runs. A float64 state there is wrong in its last bits or
-    does not compile, and float64 is asked for exactly those bits."""
+    which a truncated normal initializer runs. Parameters stored in float64
+    ask for exactly the bits that rewrite loses, and their optimizer
+    moments and EMA copy follow them. Other state that x64 makes float64,
+    such as a dynamic loss scale's power of two, is exact in the pairs and
+    trains as it did."""
     if mesh.devices.flat[0].platform != "tpu":
         return
-    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state)
+    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state.params)
             if leaf.dtype in (jnp.float64, jnp.complex128)]
     if wide:
-        others = f" and {len(wide) - 1} more state leaves" if len(wide) > 1 else ""
+        others = f" and {len(wide) - 1} more parameters" if len(wide) > 1 else ""
         raise ValueError(
-            f"{wide[0]}{others} hold 64-bit floats, and a TPU has no float64: XLA rewrites it "
-            "into pairs of float32, which are not IEEE doubles and have no nextafter or "
-            "ragged_dot. Keep the state in float32 on a TPU, or train it on a CPU or a GPU.")
+            f"params{wide[0]}{others} are stored in 64-bit floats, and a TPU has no float64: XLA "
+            "rewrites it into pairs of float32, which are not IEEE doubles and have no "
+            "nextafter. Store the parameters in float32 on a TPU, or train them on a CPU or a GPU.")
 
 
 def recompute_more(objective) -> bool:
