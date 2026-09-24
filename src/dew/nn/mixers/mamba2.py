@@ -61,7 +61,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, logical_spec, sequence_shards
+from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, logical_spec, manual_map, sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -525,27 +525,18 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
 
 
 def _over_sequence(mix, shards: int, mixed, dt, segments, weights):
-    """Run `mix` (`_sequence_mix` under the sequence axis) in a `shard_map`
+    """Run `mix` (`_sequence_mix` under the sequence axis) in a `manual_map`
     that splits the rows and the sequence as the rule table places a
     `[batch, length, ...]` activation, with the weights whole on every
     shard. The layer's projections and its gated norm act token by token
-    and stay with GSPMD outside it. Every other axis goes manual too,
-    replicated, as `exchanged_heads_attention` takes them and for its
-    reasons: the SSD's Pallas kernel refuses to lower with an axis left to
-    the partitioner, and the pipeline vmaps its stages over the stage
-    axis."""
+    and stay with GSPMD outside it."""
     length = mixed.shape[1]
     if length % shards:
         raise ValueError(
             f"mamba2 splits the sequence of {length} tokens {shards} ways over the "
             "mesh's sequence axis, and it does not divide")
-    mesh = jax.sharding.get_abstract_mesh()
     tokens = logical_spec(("activation_batch", "activation_length"), mixed.shape[:2])
-    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
-    # Pallas kernels state no varying-manual-axes type for their outputs,
-    # as the attention exchange notes, so the check is off here too.
-    split = jax.shard_map(mix, in_specs=(tokens, tokens, tokens, P()), out_specs=tokens,
-                          axis_names=manual, check_vma=False)
+    split = manual_map(mix, (tokens, tokens, tokens, P()), tokens)
     return split(mixed, dt, segments, weights)
 
 
