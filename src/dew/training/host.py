@@ -102,12 +102,16 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     if held is not None:
         index(held)
 
-    def place_dict(node, target):
+    def place_dict(node, target, path=()):
         for name in list(node):
             child, wanted = node[name], target[name]
             if isinstance(child, dict):
-                place_dict(child, wanted)
+                place_dict(child, wanted, (*path, name))
                 continue
+            if isinstance(child, Mapping):
+                raise TypeError(
+                    f"{'/'.join(map(str, (*path, name)))} is a {type(child).__name__}, and stream updates "
+                    "dict nodes in place; pass a tree of dicts (flax.core.unfreeze for a FrozenDict)")
             landed = place_leaf(child, wanted)
             for holder, key in holders.get(id(child), ()):
                 holder[key] = landed
