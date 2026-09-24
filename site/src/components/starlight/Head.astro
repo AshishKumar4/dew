@@ -1,0 +1,12 @@
+---
+// Starlight's head, plus the site's three font families. The text and title
+// faces are preloaded; code is rarely above the fold, and its size-adjusted
+// fallback keeps the layout still until JetBrains Mono arrives.
+import Default from '@astrojs/starlight/components/Head.astro';
+import { Font } from 'astro:assets';
+---
+
+<Default />
+<Font cssVariable="--font-inter" preload />
+<Font cssVariable="--font-serif" preload />
+<Font cssVariable="--font-mono" />
