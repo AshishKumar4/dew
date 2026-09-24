@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from collections.abc import MutableMapping
 
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
@@ -12,25 +13,30 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
 
     Tests must run identically on any machine. The CPU lane is the default,
-    with MESH_DEVICES simulated devices. A JAX_PLATFORMS that names cuda,
-    alone or in a list, runs the same files on the GPU: its CUDA reductions
-    are made repeatable, since exact state and gradient checks require it,
+    with MESH_DEVICES simulated devices. A JAX_PLATFORMS that names an
+    accelerator, cuda or tpu, alone or in a list, runs the same files there,
     and the CPU backend stays beside it. Host callbacks (jax.debug.callback,
-    io_callback) place their operands on a CPU device, and a host layout
-    pairs every GPU with a CPU device of its process
+    io_callback) place their operands on a CPU device, float64 references run
+    there, since a TPU has no float64, and a host layout pairs every
+    accelerator device with a CPU device of its process
     (`dew.training.host.companion_mesh`), so that backend holds one device
-    per local GPU. jax.devices() is still the GPU's.
+    per local accelerator device. A cuda lane's reductions are made
+    repeatable, since exact state and gradient checks require it.
+    jax.devices() is still the accelerator's.
     """
     environ.setdefault("JAX_PLATFORMS", "cpu")
     platforms = environ["JAX_PLATFORMS"].split(",")
     flags = [environ.get("XLA_FLAGS", "")]
-    if "cuda" in platforms:
-        flags.append("--xla_gpu_deterministic_ops=true")
+    local = {"cuda": _local_gpus, "tpu": _local_tpus}
+    accelerator = next((name for name in platforms if name in local), None)
+    if accelerator is None:
+        flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
+    else:
+        if accelerator == "cuda":
+            flags.append("--xla_gpu_deterministic_ops=true")
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
-        flags.append(f"--xla_force_host_platform_device_count={_local_gpus(environ)}")
-    else:
-        flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
+        flags.append(f"--xla_force_host_platform_device_count={local[accelerator](environ)}")
     environ["XLA_FLAGS"] = " ".join(flags).strip()
 
 
@@ -41,6 +47,28 @@ def _local_gpus(environ: MutableMapping[str, str]) -> int:
         return len([device for device in visible.split(",") if device.strip()])
     listing = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, check=True)
     return len(listing.stdout.splitlines())
+
+
+# The TPU chips on this machine's PCI bus, as jax's own startup counts them,
+# and the TensorCores a chip of that generation shows as devices: two on v2
+# and v3, one since v4's megacore.
+_TPU_PROBE = ("from jax._src import hardware_utils as h\n"
+              "chips, version = h.num_available_tpu_chips_and_device_id()\n"
+              "print(chips, 2 if version in (h.TpuVersion.v2, h.TpuVersion.v3) else 1)\n")
+
+
+def _local_tpus(environ: MutableMapping[str, str]) -> int:
+    """The TPU devices this process will see, counted before any backend
+    opens: the chips TPU_VISIBLE_CHIPS names, else every one, times a
+    chip's devices. A child process asks jax, since importing it here would
+    fix its configuration before this function sets it."""
+    probe = subprocess.run([sys.executable, "-c", _TPU_PROBE], capture_output=True, text=True,
+                           check=True, env={**environ, "JAX_PLATFORMS": "cpu"})
+    chips, per_chip = (int(word) for word in probe.stdout.split())
+    visible = environ.get("TPU_VISIBLE_CHIPS")
+    if visible is not None:
+        chips = len([chip for chip in visible.split(",") if chip.strip()])
+    return chips * per_chip
 
 
 configure_lane(os.environ)

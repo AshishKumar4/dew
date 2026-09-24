@@ -23,3 +23,17 @@ def test_a_cuda_lane_repeats_its_reductions_and_pairs_a_cpu_device_with_each_gpu
     assert environ["XLA_FLAGS"].split() == [
         "--xla_dump_to=/tmp/dump", "--xla_gpu_deterministic_ops=true",
         "--xla_force_host_platform_device_count=2"]
+
+
+@pytest.mark.parametrize("platforms", ["tpu", "tpu,cpu"])
+def test_a_tpu_lane_keeps_a_cpu_device_beside_each_tpu_device(platforms):
+    """A TPU lane keeps the CPU backend, for host callbacks, for float64
+    references a TPU cannot compute and for a host layout, which pairs every
+    TPU device with a CPU device of its process: one per visible chip here,
+    whose generation this machine's PCI bus does not name."""
+    environ = {"JAX_PLATFORMS": platforms, "TPU_VISIBLE_CHIPS": "0,1,2,3",
+               "XLA_FLAGS": "--xla_dump_to=/tmp/dump"}
+    configure_lane(environ)
+    assert environ["JAX_PLATFORMS"] == "tpu,cpu"
+    assert environ["XLA_FLAGS"].split() == [
+        "--xla_dump_to=/tmp/dump", "--xla_force_host_platform_device_count=4"]
