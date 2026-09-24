@@ -10,6 +10,7 @@ benchmark runs its pure pieces, and its real entry point where the step
 compiles on CPU in seconds.
 """
 
+import ast
 import dataclasses
 import importlib.util
 import json
@@ -702,3 +703,21 @@ def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
     stronger = {"label": "torch, bf16 experts", "rate": 125.0}
     assert scoreboard.verdict({"dew": [dew], "reference": [weaker, stronger]}) == (
         "Dew (dew) LOSES to torch, bf16 experts: 0.880x")
+
+
+# ---------------------------------------------------------------------------
+# tools/lint_slop.py
+# ---------------------------------------------------------------------------
+
+def test_the_slop_gate_reports_a_broad_suppress_as_it_reports_an_empty_handler():
+    """`contextlib.suppress(Exception)` is `except Exception: pass` spelled as
+    a context manager, so SLOP006 reports both; suppressing a failure the
+    site names is the site's decision and is not reported. The tree holds no
+    broad suppress for the gate's own run to show this on."""
+    lint = load("lint_slop")
+    source = ("import contextlib, queue\n"
+              "with contextlib.suppress(Exception):\n    step()\n"
+              "with contextlib.suppress(queue.Empty):\n    step()\n"
+              "try:\n    step()\nexcept Exception:\n    pass\n")
+    module = lint.Module(Path("snippet.py"), "src/dew/snippet.py", source, ast.parse(source))
+    assert sorted(finding.line for finding in lint.swallowed(module)) == [2, 8]
