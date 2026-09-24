@@ -46,7 +46,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import MLP, CLIPAttention, ParamTree, checkpoint_array, checkpoint_leaf, insert
+from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
@@ -108,42 +108,6 @@ class TowerBase:
         return TowerGeometry()
 
 
-class SiglipEncoderLayer(nn.Module):
-    """Pre-norm full attention over pre-norm MLP, both residual.
-
-    The structure matches a CLIP encoder layer; the attention is shared and
-    the MLP carries the SigLIP activation.
-    """
-
-    hidden_size: int
-    num_heads: int
-    intermediate_size: int
-    hidden_act: str = "gelu_pytorch_tanh"
-    layer_norm_eps: float = 1e-6
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
-                                 dtype=self.dtype)
-        self.layer_norm1 = norm(name="layer_norm1")
-        self.self_attn = CLIPAttention(
-            self.hidden_size, self.num_heads, causal=False, dtype=self.dtype,
-            precision=self.precision, name="self_attn")
-        self.layer_norm2 = norm(name="layer_norm2")
-        self.mlp = MLP(self.hidden_size, self.intermediate_size,
-                       activation=self.hidden_act, dtype=self.dtype,
-                       precision=self.precision, name="mlp")
-
-    def __call__(self, hidden_states):
-        residual = hidden_states
-        hidden_states = self.self_attn(self.layer_norm1(hidden_states))
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.mlp(self.layer_norm2(hidden_states))
-        return residual + hidden_states
-
-
 class SiglipVisionTransformer(nn.Module):
     """The SigLIP vision trunk, param layout of `SiglipVisionConfig`.
 
@@ -181,10 +145,10 @@ class SiglipVisionTransformer(nn.Module):
         self.position_embedding = nn.Embed(patches, self.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
-            SiglipEncoderLayer(
-                self.hidden_size, self.num_heads, self.intermediate_size,
-                self.hidden_act, layer_norm_eps=self.layer_norm_eps,
-                dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
+            CLIPEncoderLayer(
+                self.hidden_size, self.num_heads, self.intermediate_size, causal=False,
+                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
+                activation=self.hidden_act, name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.post_layernorm = LayerNorm(
             epsilon=self.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
