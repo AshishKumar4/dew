@@ -1,6 +1,8 @@
 ---
 // The recorded output of the hero script, where it was recorded, and a button
 // that runs the same script on a live kernel.
+import { live } from '../../live.mjs';
+
 interface Props {
 	code: string;
 	stdout: string;
@@ -9,7 +11,7 @@ interface Props {
 }
 const { code, stdout, seconds, meta } = Astro.props;
 const lines = stdout.trimEnd().split('\n');
-const live = Boolean(import.meta.env.PUBLIC_LIVE_ENDPOINT && import.meta.env.PUBLIC_TURNSTILE_SITEKEY);
+const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 // The trainer's own report of how long the first step took, which is mostly compilation.
 const firstStep = Number(/first step after ([\d.]+) s/.exec(stdout)?.[1] ?? Number.NaN);
 const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
@@ -19,7 +21,7 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 	<div class="hero-output-bar">
 		<span class="hero-output-command"><span aria-hidden="true">$</span> python train.py</span>
 		{
-			live && (
+			liveEnabled && (
 				<button type="button" class="run-live" data-live-hero>
 					<span class="dot" aria-hidden="true" />
 					<span data-label>Run it live</span>

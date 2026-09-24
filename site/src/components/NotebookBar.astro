@@ -2,6 +2,7 @@
 // Links for a tutorial notebook: Colab, source and download, and for notebooks
 // that run on a CPU, a live kernel whose Run buttons appear on each cell.
 import { Icon } from '@astrojs/starlight/components';
+import { live } from '../live.mjs';
 
 interface Props {
 	notebook: {
@@ -15,7 +16,7 @@ interface Props {
 }
 
 const { notebook } = Astro.props;
-const liveConfigured = Boolean(import.meta.env.PUBLIC_LIVE_ENDPOINT && import.meta.env.PUBLIC_TURNSTILE_SITEKEY);
+const liveConfigured = Boolean(live.endpoint && live.turnstileSitekey);
 const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs on a CPU';
 ---
 

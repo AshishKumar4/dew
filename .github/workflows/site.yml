@@ -1,0 +1,94 @@
+# Builds dewml.dev on every change to what it is made of, and fails on a broken
+# link, a notebook without its outputs, a public module without an API page or
+# a registered model family the model list does not name. On main it deploys
+# the site, and rebuilds the live-execution image on the pushed Dew commit.
+#
+# Deploying needs the repository secret CLOUDFLARE_API_TOKEN, a token for the
+# account that holds dewml.dev with Workers Scripts, Containers and Workers
+# Routes edit rights. Without it the deploy jobs skip.
+
+name: Site
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+  pull_request:
+    branches: [ "main" ]
+    paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: site
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # the pages' last-updated dates come from git
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: site/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+        cache-dependency-path: site/pnpm-lock.yaml
+    - uses: astral-sh/setup-uv@v6
+    - run: pnpm install --frozen-lockfile
+    - run: pnpm build
+    - run: pnpm live:check
+    - uses: actions/upload-artifact@v4
+      if: github.event_name == 'push'
+      with:
+        name: site
+        path: site/dist
+        retention-days: 7
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    defaults:
+      run:
+        working-directory: site
+    steps:
+    - uses: actions/checkout@v4
+    - id: token
+      run: echo "present=${{ env.CLOUDFLARE_API_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+    - uses: pnpm/action-setup@v4
+      if: steps.token.outputs.present == 'true'
+      with:
+        package_json_file: site/package.json
+    - uses: actions/setup-node@v4
+      if: steps.token.outputs.present == 'true'
+      with:
+        node-version: 22
+        cache: pnpm
+        cache-dependency-path: site/pnpm-lock.yaml
+    - if: steps.token.outputs.present == 'true'
+      run: pnpm install --frozen-lockfile
+    - uses: actions/download-artifact@v4
+      if: steps.token.outputs.present == 'true'
+      with:
+        name: site
+        path: site/dist
+    - name: Deploy dewml.dev and the www redirect
+      if: steps.token.outputs.present == 'true'
+      run: pnpm run deploy
+    - name: Rebuild the live kernel on this commit
+      if: steps.token.outputs.present == 'true'
+      run: node live/deploy.mjs "$GITHUB_SHA"
