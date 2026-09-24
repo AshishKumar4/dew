@@ -67,20 +67,24 @@ async function writeImage(buffer, stem, name) {
 
 async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 	const html = [];
+	// Consecutive stream outputs form one block in the order they were written, as in a
+	// terminal: a training loop that prints its epochs to stdout and draws its progress bars
+	// on stderr reads as one log. A block with only stderr folds away, and so does an install
+	// cell's log (download bars, build steps).
 	let stream = null;
-	// An install cell's log (download bars, build steps) folds away like stderr.
 	const install = /^\s*[%!]pip\s/.test(joined(cell.source));
 	const flush = () => {
 		if (!stream) return;
 		const text = terminal(stream.text).replace(/\n+$/, '');
+		const stdout = terminal(stream.stdout).replace(/\n+$/, '');
+		if (stdout) record.stdout = (record.stdout ? `${record.stdout}\n` : '') + stdout;
 		if (text) {
-			if (stream.name === 'stdout') record.stdout = (record.stdout ? `${record.stdout}\n` : '') + text;
 			const body = `<pre class="nb-stream">${escapeHtml(text)}</pre>`;
 			html.push(
-				stream.name === 'stderr'
-					? `<details class="nb-output nb-stderr"><summary>stderr</summary>${body}</details>`
-					: install
-						? `<details class="nb-output nb-install"><summary>install log</summary>${body}</details>`
+				install
+					? `<details class="nb-output nb-install"><summary>install log</summary>${body}</details>`
+					: !stdout
+						? `<details class="nb-output nb-stderr"><summary>stderr</summary>${body}</details>`
 						: `<div class="nb-output nb-stdout">${body}</div>`,
 			);
 		}
@@ -89,9 +93,9 @@ async function renderOutputs(cell, stem, index, allowErrors, images, record) {
 	let figure = 0;
 	for (const output of cell.outputs ?? []) {
 		if (output.output_type === 'stream') {
-			if (stream && stream.name !== output.name) flush();
-			stream ??= { name: output.name, text: '' };
+			stream ??= { text: '', stdout: '' };
 			stream.text += joined(output.text);
+			if (output.name === 'stdout') stream.stdout += joined(output.text);
 			continue;
 		}
 		flush();
@@ -133,9 +137,6 @@ function fence(code) {
 // `node scripts/render-notebooks.mjs 02 05` renders only the notebooks whose names
 // start with those prefixes, for working on the site while a notebook is re-executed.
 const only = process.argv.slice(2);
-// DEW_OUTPUTS_PENDING=01,03 renders those notebooks without outputs, under a notice, for a deploy
-// made while they are being executed again. CI never sets it, so there a notebook without outputs fails.
-const pending = (process.env.DEW_OUTPUTS_PENDING ?? '').split(',').filter(Boolean);
 const files = (await readdir(notebooksDir))
 	.filter((name) => name.endsWith('.ipynb') && (only.length === 0 || only.some((prefix) => name.startsWith(prefix))))
 	.sort();
@@ -149,7 +150,6 @@ for (const file of files) {
 	const source = `tutorials/${file}`;
 	const slug = `tutorials/${stem}`;
 	const notebook = JSON.parse(await readFile(path.join(notebooksDir, file), 'utf8'));
-	const outputsPending = pending.some((prefix) => file.startsWith(prefix));
 	const accelerator = notebook.metadata?.accelerator === 'GPU' ? 'GPU' : 'CPU';
 	const cells = notebook.cells;
 	const firstMarkdown = cells.findIndex((cell) => cell.cell_type === 'markdown');
@@ -174,7 +174,7 @@ for (const file of files) {
 		// outputs, skips it because Dew comes from the checkout.
 		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
 		const install = /^\s*[%!]pip\s/.test(text);
-		if (cell.execution_count == null && !outputsPending && !skipped && !install) {
+		if (cell.execution_count == null && !skipped && !install) {
 			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');
@@ -191,15 +191,17 @@ for (const file of files) {
 		block.push('', '</div>');
 		parts.push(block.join('\n'));
 	}
-	if (outputsPending) {
-		parts.splice(
-			1,
-			0,
-			':::note[Outputs coming]\nThis notebook is running again against the current code, and its outputs will appear here when the run finishes. The code below is final. To run it now, open it in Colab.\n:::',
-		);
-	} else if (outputs === 0) {
-		throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
+	if (outputs === 0) throw new Error(`${source}: no recorded outputs; commit the notebook executed`);
+	// Where the outputs come from, as tools/run_tutorials.py --save records it.
+	// tools/check_tutorial_outputs.py reports in CI when the code the notebook imports changes after it.
+	const recorded = notebook.metadata?.dew?.outputs;
+	if (!/^[0-9a-f]{40}$/.test(recorded?.commit ?? '') || !recorded.date || !recorded.device || !recorded.jax) {
+		throw new Error(`${source}: no dew.outputs record (commit, date, device, jax) in its metadata; save it with tools/run_tutorials.py --save`);
 	}
+	const where = recorded.device === 'cpu' ? 'a CPU' : escapeHtml(recorded.device);
+	parts.push(
+		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
+	);
 
 	const live = accelerator === 'CPU';
 	if (live) {
