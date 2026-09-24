@@ -13,6 +13,7 @@ have to be the reference's.
 import dataclasses
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -274,6 +275,12 @@ def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str
             "    x.block_until_ready()\n")
 
 
+ONE_SLURM_TASK = {"SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "0",
+                  "SLURM_LOCALID": "0", "SLURM_STEP_NODELIST": "dew-no-such-host",
+                  "SLURM_STEP_NUM_NODES": "1"}
+"""What srun sets for a step of one task, on a node no container resolves."""
+
+
 @pytest.mark.mesh(devices=0)
 def test_one_slurm_task_joins_no_pool():
     """srun with one task sets SLURM_JOB_ID, and JAX's Slurm detection then
@@ -281,9 +288,7 @@ def test_one_slurm_task_joins_no_pool():
     container on the node need not resolve that name (the box's did not):
     the process waited 300 s to register and aborted. One task is no pool,
     so the process starts on its own."""
-    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
-           "SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
-           "SLURM_STEP_NODELIST": "dew-no-such-host", "SLURM_STEP_NUM_NODES": "1"}
+    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu"}
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
@@ -292,6 +297,29 @@ def test_one_slurm_task_joins_no_pool():
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "processes 1" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
+def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
+    """mpirun started inside a one-task allocation sets Open MPI's rank
+    variables beside Slurm's. JAX's detection reads Open MPI's first and
+    forms the pool mpirun started, so the one-task rule has to leave the
+    process to it, here a pool of one rank."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
+           "OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://127.0.0.1:34911",
+           "OMPI_COMM_WORLD_SIZE": "1", "OMPI_COMM_WORLD_RANK": "0",
+           "OMPI_COMM_WORLD_LOCAL_RANK": "0", "JAX_COORDINATOR_PORT": str(port)}
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "print('pool', jax.distributed.is_initialized())\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "pool True" in done.stdout, done.stdout
 
 
 @pytest.mark.mesh(devices=2)
