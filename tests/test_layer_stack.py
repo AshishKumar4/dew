@@ -570,7 +570,10 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
-    scanned = jax.jit(dataclasses.replace(loaded.model, scan_layers=True).apply)
-    for _ in range(3):
-        got = np.asarray(scanned(loaded.variables, tokens), np.float64)
+    scanned = dataclasses.replace(loaded.model, scan_layers=True)
+    # Each compilation drew the fault afresh, about 60% of the time, so the
+    # scan compiles eight times over: a regression shows in 99% of runs.
+    for _ in range(8):
+        jax.clear_caches()
+        got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
         assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
