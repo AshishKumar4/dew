@@ -425,7 +425,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     'default' keep the plain table. Both halves are checked against the
     reference's own functions at head_dim 128 and base 5e5: the YaRN table,
     the attention factor, and that the reference leaves the sliding entry
-    plain. Observed frequency difference 0.0 with 46 of 64 pairs moved."""
+    plain, with 46 of 64 pairs moved."""
     from transformers import Olmo3Config
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
@@ -441,10 +441,13 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
         reference, None, layer_type='full_attention')
     record = translate_config(released)['kinds']['full_attention']['yarn']
     scaling = YarnScaling(**record)
-    scaled = np.asarray(yarn_inv_freq(128, 5e5, scaling))
+    scaled = yarn_inv_freq(128, 5e5, scaling)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
 
-    assert np.max(np.abs(scaled - expected.numpy())) < 1e-7
+    # Both tables are built on the host (Dew's in NumPy, the reference's in
+    # torch on the CPU), so they agree bit for bit on every lane.
+    assert isinstance(scaled, np.ndarray)
+    np.testing.assert_array_equal(scaled, expected.numpy())
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
     assert np.sum(scaled != plain) >= 32
 

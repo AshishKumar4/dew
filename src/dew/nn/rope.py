@@ -7,13 +7,28 @@ inverse frequencies and multiplies the attention scale; the frequency ramp
 is the reference's `_compute_yarn_parameters` and the scale multiplier its
 `yarn_apply_mscale` (transformers 5.16.1, models/deepseek_v3), both with
 `dim` at the rope width, where DeepSeek points `config.head_dim`.
+
+The inverse-frequency tables are static configuration, so they are built on
+the host in NumPy float32, as transformers builds them in torch on the CPU,
+and are the same on every backend. The one transcendental, `theta ** x`, is
+rounded once from float64 (`_base_powers`); transformers' float32 `pow`
+agrees with that to within one ulp.
 """
 
 import dataclasses
 import math
 
-import jax
 import jax.numpy as jnp
+import numpy as np
+
+
+def _base_powers(theta: float, exponents: np.ndarray) -> np.ndarray:
+    """`theta ** exponents` correctly rounded to float32, whatever the backend.
+
+    The tables name their precision as `jnp.float32`, as Dew's other fp32
+    pins do, so a float64 twin that reads that name as float64
+    (tools/deepseek_v41_numerics.py `decided`) builds them in float64."""
+    return np.power(np.float64(theta), exponents.astype(np.float64)).astype(jnp.float32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,18 +68,18 @@ class RopeScaling:
                 "rope_scaling original_max_position_embeddings is the pretraining "
                 f"context, got {self.original_max_position_embeddings}")
 
-    def apply(self, inv_freq):
-        """Return the scaled inverse frequencies, the reference's arithmetic in fp32."""
+    def apply(self, inv_freq: np.ndarray) -> np.ndarray:
+        """Return the scaled inverse frequencies, the reference's arithmetic in float32 on the host."""
         old_context_len = float(self.original_max_position_embeddings)
         wavelen = 2 * math.pi / inv_freq
-        divided = jnp.where(wavelen > old_context_len / self.low_freq_factor,
-                            inv_freq / self.factor, inv_freq)
+        divided = np.where(wavelen > old_context_len / self.low_freq_factor,
+                           inv_freq / self.factor, inv_freq)
         smooth = ((old_context_len / wavelen - self.low_freq_factor)
                   / (self.high_freq_factor - self.low_freq_factor))
         smoothed = (1 - smooth) * divided / self.factor + smooth * divided
-        medium = jnp.logical_and(wavelen >= old_context_len / self.high_freq_factor,
-                                 wavelen <= old_context_len / self.low_freq_factor)
-        return jnp.where(medium, smoothed, divided)
+        medium = np.logical_and(wavelen >= old_context_len / self.high_freq_factor,
+                                wavelen <= old_context_len / self.low_freq_factor)
+        return np.where(medium, smoothed, divided).astype(jnp.float32)
 
 
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
@@ -103,12 +118,12 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
             f"'proportional' or 'default', got {partial_rotary_type!r}")
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor))
+    inv_freq = 1.0 / _base_powers(theta, np.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor)
     if rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
-        inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
+        inv_freq = np.concatenate([inv_freq, np.zeros((padding,), jnp.float32)])
     positions = jnp.asarray(positions, jnp.float32)
     if positions.ndim == 1:
         angles = positions[:, None] * inv_freq[None, :]
@@ -171,7 +186,7 @@ class YarnScaling:
     attention_factor: float | None = None
 
 
-def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
+def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> np.ndarray:
     """YaRN inverse frequencies over the rope width: `[head_dim // 2]`.
 
     Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
@@ -182,7 +197,7 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
     """
     dim = head_dim
     pairs = dim // 2
-    pos_freqs = theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
+    pos_freqs = _base_powers(theta, np.arange(0, dim, 2, dtype=jnp.float32) / dim)
     inv_extrapolation = 1.0 / pos_freqs
     inv_interpolation = 1.0 / (yarn.factor * pos_freqs)
 
@@ -201,8 +216,8 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
     if span == 0:
         # The reference nudges a degenerate bound to keep the division finite.
         span = 0.001
-    ramp = jnp.clip((jnp.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
-    return inv_interpolation * ramp + inv_extrapolation * (1 - ramp)
+    ramp = np.clip((np.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
+    return (inv_interpolation * ramp + inv_extrapolation * (1 - ramp)).astype(jnp.float32)
 
 def yarn_attention_factor(yarn: YarnScaling) -> float:
     """The cos/sin multiplier of `_compute_yarn_parameters`.
