@@ -40,7 +40,7 @@ DECODERS = {
     "gpt_oss": ("gpt-oss", "Mixture of experts"),
     "llama4_text": ("Llama 4, text", "Mixture of experts"),
     "glm4_moe": ("GLM 4 MoE", "Mixture of experts"),
-    "glm_moe_dsa": ("GLM MoE with sparse attention", "Mixture of experts"),
+    "glm_moe_dsa": ("GLM-5.3", "Mixture of experts"),
     "deepseek_v2": ("DeepSeek V2", "Mixture of experts"),
     "deepseek_v3": ("DeepSeek V3", "Mixture of experts"),
     "deepseek_v32": ("DeepSeek V3.2", "Mixture of experts"),
@@ -49,7 +49,7 @@ DECODERS = {
     "kimi_k2": ("Kimi K2", "Mixture of experts"),
     "kimi_k25": ("Kimi K2.5, text", "Mixture of experts"),
     "qwen3_next": ("Qwen3-Next", "Hybrid and linear attention"),
-    "glm5_next_text": ("GLM 5 Next, text", "Hybrid and linear attention"),
+    "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
     "kimi_k3": ("Kimi K3, text", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
@@ -64,6 +64,7 @@ WRAPPERS = {
     "gemma4": ("Gemma 4", "Images, video, audio"),
     "qwen3_5": ("Qwen 3.5", "Images, video"),
     "llama4": ("Llama 4", "Images"),
+    "deepseek_v41": ("DeepSeek V4.1", "Images"),
 }
 PIPELINES = {
     "StableDiffusionPipeline": ("Stable Diffusion", "Text to image"),
@@ -79,6 +80,12 @@ PIPELINES = {
     "FlaxStableDiffusionImg2ImgPipeline": ("Stable Diffusion, Flax weights", "Image to image"),
     "FlaxStableDiffusionInpaintPipeline": ("Stable Diffusion, Flax weights", "Inpainting"),
     "FlaxStableDiffusionXLPipeline": ("Stable Diffusion XL, Flax weights", "Text to image"),
+}
+# Where a released checkpoint's config.json names a different model_type than the
+# decoder's own, the one a reader will find in config.json, and the file whose
+# loader dispatches on it (checked, so the two cannot drift apart).
+CHECKPOINT_TYPES = {
+    "diffusion_gemma_text": ("diffusion_gemma", "src/dew/interop/diffusion_gemma.py"),
 }
 # Families checked against a released checkpoint at full size, with the checkpoint.
 FULL_SIZE = {
@@ -130,8 +137,8 @@ def family_call(tree: ast.Module, element: ast.expr) -> tuple[ast.Call, dict[str
     raise SystemExit(f"gen_models: cannot find the definition of {element.id}")
 
 
-def decoder_families() -> list[tuple[str, str]]:
-    """(model_type, transformers architecture) for every entry of `_FAMILY_ENTRIES`."""
+def decoder_families() -> list[tuple[str, str, bool]]:
+    """(model_type, transformers architecture, has a multimodal wrapper) for every entry of `_FAMILY_ENTRIES`."""
     tree = module_tree("src/dew/interop/hf_decoders.py")
     families = []
     for element in assigned(tree, "_FAMILY_ENTRIES").elts:
@@ -139,12 +146,14 @@ def decoder_families() -> list[tuple[str, str]]:
         types = [e.value if isinstance(e, ast.Constant) else names[e.id] for e in call.args[0].elts]
         architecture = next(arg.value for arg in call.args[1:] if isinstance(arg, ast.Constant)
                             and isinstance(arg.value, str) and arg.value[0].isupper())
-        families += [(model_type, architecture) for model_type in types]
+        wrapped = any(keyword.arg == "wrapper" for keyword in call.keywords)
+        families += [(model_type, architecture, wrapped) for model_type in types]
     return families
 
 
 def wrappers() -> list[str]:
-    """The multimodal model_types that load: the branches of `translate_wrapper_config`, in source order."""
+    """The multimodal model_types that load, in source order: the explicit branches of
+    `translate_wrapper_config`, then the decoder families that register a `wrapper`."""
     tree = module_tree("src/dew/interop/hf_decoders.py")
     translator = next((node for node in tree.body
                        if isinstance(node, ast.FunctionDef) and node.name == "translate_wrapper_config"), None)
@@ -155,7 +164,9 @@ def wrappers() -> list[str]:
         if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "model_type"
         and isinstance(node.ops[0], ast.Eq) and isinstance(node.comparators[0], ast.Constant)
     ]
-    return [node.comparators[0].value for node in sorted(branches, key=lambda node: node.lineno)]
+    explicit = [node.comparators[0].value for node in sorted(branches, key=lambda node: node.lineno)]
+    bundled = [model_type for model_type, _, wrapped in decoder_families() if wrapped and model_type not in explicit]
+    return explicit + bundled
 
 
 def pipelines() -> list[str]:
@@ -197,16 +208,19 @@ def main() -> None:
     wrapped = wrappers()
     pipes = pipelines()
     native = native_models()
-    problems = (check("decoder model_type", [t for t, _ in decoders], DECODERS)
+    problems = (check("decoder model_type", [t for t, _, _ in decoders], DECODERS)
                 + check("multimodal model_type", wrapped, WRAPPERS)
                 + check("diffusers pipeline", pipes, PIPELINES))
+    for text_type, (checkpoint_type, loader) in CHECKPOINT_TYPES.items():
+        if f'"{checkpoint_type}"' not in (REPO / loader).read_text():
+            problems.append(f"{loader} no longer dispatches on {checkpoint_type!r}, the checkpoint type of {text_type!r}")
     if problems:
         print("gen_models: the model list and the code disagree:", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         raise SystemExit(1)
 
-    architecture = dict(decoders)
+    architecture = {model_type: arch for model_type, arch, _ in decoders}
     groups: dict[str, list[str]] = {}
     for model_type, (_, group) in DECODERS.items():
         groups.setdefault(group, []).append(model_type)
@@ -222,7 +236,8 @@ def main() -> None:
                 continue
             seen.add(name)
             checked = FULL_SIZE.get(model_type, "A fixture shaped like the release")
-            rows.append([name, ", ".join(f"`{t}`" for t in same), f"`{architecture[model_type]}`", checked])
+            shown = [f"`{CHECKPOINT_TYPES[t][0]}` (text config `{t}`)" if t in CHECKPOINT_TYPES else f"`{t}`" for t in same]
+            rows.append([name, ", ".join(shown), f"`{architecture[model_type]}`", checked])
         sections += [f"## {group}", "", table(["Family", "`model_type`", "Architecture", "Checked with"], rows), ""]
     sections += ["## Multimodal checkpoints", "",
                  "These load the whole checkpoint: the text decoder listed above, the media towers and the "
