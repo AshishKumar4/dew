@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 import pytest
@@ -29,9 +30,10 @@ from dew.nn.dit import TextContext
 FIXTURE = Path(__file__).parent / "fixtures" / "flaxdiff"
 
 # The largest difference measured against FlaxDiff's output (of order 0.1)
-# is 7.5e-9 on CPU at fp32. Each FlaxDiff choice the port makes moves the
-# output by at least 5.6e-4 when it is dropped: the SiLU before ada_proj,
-# the pooling over every position, and either other Fourier table.
+# is 7.5e-9 on CPU and 1.5e-8 on an RTX 4080, at fp32. Each FlaxDiff choice
+# the port makes moves the output by at least 5.6e-4 when it is dropped: the
+# SiLU before ada_proj, the pooling over every position, and either other
+# Fourier table.
 TOLERANCE = 1e-6
 
 
@@ -60,11 +62,27 @@ def test_simple_udit_computes_what_flaxdiff_computed(reference):
 
 
 def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
-    """jax 0.5.0 changed the stream FlaxDiff drew its table from."""
+    """jax 0.5.0 changed the stream FlaxDiff 0.2 drew its table from,
+    jax.random.normal at PRNGKey(42) times 16. The table is that draw under
+    the run's stream, on the backend that computes it: every backend draws
+    the same bits, but the normal transform rounds its last bit its own way
+    (a GPU's table differs from the CPU's by an ulp in one entry). So the
+    table is held exactly to this backend's draw of each stream, and
+    FlaxDiff's recorded table, drawn on the CPU that wrote the fixture, to
+    the stream it came from."""
     model_config, _, data = reference
     features = model_config["emb_features"]
-    np.testing.assert_array_equal(fourier_table(features, "0.5.3"), data["fourier_table"])
-    assert not np.allclose(fourier_table(features, "0.4.31"), data["fourier_table"])
+
+    def drawn(partitionable):
+        with jax.threefry_partitionable(partitionable):
+            draw = jax.random.normal(jax.random.PRNGKey(42), (features // 2,), dtype=jnp.float32)
+        return np.asarray(draw * 16)
+
+    streams = {False: drawn(False), True: drawn(True)}
+    for version, partitionable in (("0.4.31", False), ("0.5.0", True), ("0.5.3", True), ("0.10.1", True)):
+        np.testing.assert_array_equal(fourier_table(features, version), streams[partitionable])
+    recorded = data["fourier_table"]
+    assert np.abs(recorded - streams[True]).max() < np.abs(recorded - streams[False]).max()
 
 
 def test_a_checkpoint_publishes_the_averaged_weights_of_its_last_state(reference, tmp_path):
