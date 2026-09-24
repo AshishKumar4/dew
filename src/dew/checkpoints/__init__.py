@@ -190,6 +190,19 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     return mine[0]
 
 
+def _written_in_place(tree: Mapping[str, StateLeaf]) -> bool:
+    """Whether orbax writes an array of `tree` from the array's own buffer.
+
+    Orbax copies each array to host memory before its async write and holds
+    the copy until the write lands. An array already in pinned host memory,
+    as a host layout keeps the optimizer state and the EMA copy, stays
+    where it is (`np.asarray` of it is a view), so the caller's buffer is
+    what the write reads, and the step after a save donates that buffer: a
+    GPU refuses ("Donation requested for buffer with external reference")."""
+    return any(isinstance(leaf, jax.Array) and leaf.sharding.memory_kind == "pinned_host"
+               for leaf in jax.tree.leaves(tree))
+
+
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Return where each array leaf of `tree` sits, by path, as the string of its
     sharding; a local checkpoint restores onto this placement and no other."""
@@ -409,26 +422,42 @@ class Checkpoints:
         refused, since no reader could be matched to it.
         A write that fails surfaces from `wait`, which is deliberately
         unguarded: a checkpoint that did not land is data loss.
+
+        A state with arrays in pinned host memory is written before this
+        returns (`_written_in_place`): the write reads those arrays' own
+        buffers, which the next step donates. Handing orbax a copy instead
+        would keep the next step waiting only for the copy, but hold a
+        second copy of that state in pinned host memory until the write
+        lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
+        7B parameters, on hosts that keep the state there for want of room.
         """
+        state_tree = self._item(state, saved, share)
+        persistent = self._open()
         with region("checkpoint.submit"):
-            self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved, share)),
-                              metrics=metrics, force=True)
+            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True)
+        if _written_in_place(state_tree):
+            with region("checkpoint.write_in_place"):
+                persistent.wait_until_finished()
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
                    share: DataPartition | None = None) -> None:
         """Write `state` under `step` to this process's local directory,
-        asynchronously, in place of the local step before it. The placement
-        rides along; a resume onto another one raises before reading shards
-        from directories that do not hold them."""
+        asynchronously, in place of the local step before it, and as `save`
+        does, a state with arrays in pinned host memory before it returns.
+        The placement rides along; a resume onto another one raises before
+        reading shards from directories that do not hold them."""
         state_tree = self._item(state, saved, share)
         written = placement(state_tree)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
+        local = self._open_local()
         with region("checkpoint.submit_local"):
-            self._open_local().save(
-                step, args=ocp.args.PyTreeSave(state_tree), force=True,
-                custom_metadata={'processes': jax.process_count(), 'placement': written})
+            local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
+                       custom_metadata={'processes': jax.process_count(), 'placement': written})
+        if _written_in_place(state_tree):
+            with region("checkpoint.write_in_place"):
+                local.wait_until_finished()
 
     @staticmethod
     def _item(state: TrainState, saved: bytes | None,
