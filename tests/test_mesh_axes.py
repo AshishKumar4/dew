@@ -24,7 +24,7 @@ from dew.nn.blocks import Upsample
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
-from dew.registry import models
+from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import batch_shardings, shard_batch
 
@@ -461,7 +461,8 @@ def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_vocabulary_split_head_keeps_its_table_where_it_is():
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_a_vocabulary_split_head_keeps_its_table_where_it_is(dtype):
     """fsdp splits the tied table's vocabulary over the devices that split
     the tokens. The loss gathered the table whole onto every device and
     reduce-scattered its gradient, twice the table's bytes a step, where the
@@ -469,10 +470,15 @@ def test_a_vocabulary_split_head_keeps_its_table_where_it_is():
     now scores every token against its own rows, and the table and its
     gradient stay where they are: what moves is the other weights' shards and
     the tokens', well under the table's bytes. Measured in bytes, since the
-    GPU compiler combines collectives into buffers of its own."""
-    model = models.build(
-        "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1,
-        num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+    GPU compiler combines collectives into buffers of its own.
+
+    Under a bf16 policy the states' gradient comes back reduce-scattered in
+    bf16, which XLA's CPU compiler widens to fp32: it aborted there ("Invalid
+    binary instruction opcode copy") on the reducer JAX lowers inside a map
+    that leaves axes automatic."""
+    model = models.build("causal_transformer", **with_precision("causal_transformer", {
+        "vocab_size": 4096, "emb_features": 32, "num_layers": 1, "num_heads": 4, "num_kv_heads": 2,
+        "mlp_features": 64, "max_seq_len": SEQ_LEN}, dtype=dtype, attention_impl="xla"))
     table = 4096 * 32 * 4
     moved = collective_bytes(MeshSpec(fsdp=4), model, {"all-gather", "reduce-scatter", "all-reduce"})
 
