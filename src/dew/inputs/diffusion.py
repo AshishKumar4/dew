@@ -452,7 +452,15 @@ def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
 @dataclass(frozen=True)
 class CLIPImageTransform:
     """Runs the published CLIP preprocessing as JAX arithmetic over uint8 NHWC
-    pixels."""
+    pixels.
+
+    The reference is the PIL image processor: `CLIPImageProcessor` as
+    transformers 4 ran it, which the safety fixtures were generated with
+    (tools/diffusers_pipeline_reference.py), and which transformers 5 ships
+    as `CLIPImageProcessorPil`. Transformers 5's `CLIPImageProcessor`
+    resamples through torchvision instead and lands up to one uint8 level
+    away.
+    """
     size: int | tuple[int, int]
     crop: tuple[int, int]
     mean: tuple[float, ...]
