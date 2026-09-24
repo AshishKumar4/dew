@@ -21,7 +21,6 @@ from .schedules import (
     LinearNoiseScheduler,
     NoiseScheduler,
     SqrtContinuousNoiseScheduler,
-    compute_resolution_shift,
     cosine_beta_schedule,
     exp_beta_schedule,
     expand,
@@ -49,5 +48,5 @@ __all__ = ["ConsistencyBoundary", "ContinuousNoiseScheduler", "CosineContinuousN
            "KarrasPredictionTransform", "KarrasVENoiseScheduler", "LinearNoiseScheduler", "MinSNR",
            "NoiseScheduler", "PredictionTransform", "Process", "ScheduleWeighting", "SourceLimitedPrediction",
            "SqrtContinuousNoiseScheduler", "VPredictionTransform", "Weighting", "broadcast_rates",
-           "compute_resolution_shift", "cosine_beta_schedule", "discrete", "exp_beta_schedule", "expand",
-           "linear_beta_schedule", "presets"]
+           "cosine_beta_schedule", "discrete", "exp_beta_schedule", "expand", "linear_beta_schedule",
+           "presets"]

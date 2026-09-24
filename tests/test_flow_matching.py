@@ -7,14 +7,12 @@ end-to-end run proving the objective actually learns a distribution.
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import pytest
 from flax import linen as nn
 
 from dew.diffusion import FlowMatchPredictionTransform, Process, broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.diffusion.schedules.flow import compute_resolution_shift
 from dew.sampling import DDIM, Euler, sample
 
 STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
@@ -68,13 +66,6 @@ def test_resolution_shift_is_monotonic_and_fixes_endpoints(shift):
         assert jnp.all(shifted >= t - 1e-7)
     else:
         assert jnp.all(shifted <= t + 1e-7)
-
-
-def test_resolution_shift_grows_with_sequence_length():
-    shifts = [compute_resolution_shift(n) for n in (256, 1024, 4096)]
-    assert shifts == sorted(shifts)
-    assert shifts[0] == pytest.approx(np.exp(0.5))
-    assert shifts[-1] == pytest.approx(np.exp(1.15))
 
 
 def test_timestep_conditioning_is_scaled_to_the_embedding_range():

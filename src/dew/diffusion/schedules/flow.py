@@ -1,24 +1,9 @@
 """Rectified flow schedules: the linear path and its resolution shift."""
 
-import math
-
 import jax
 import jax.numpy as jnp
 
 from .continuous import ContinuousNoiseScheduler
-
-
-def compute_resolution_shift(sequence_length, base_seq_len=256, max_seq_len=4096,
-                             base_shift=0.5, max_shift=1.15) -> float:
-    """Flux-style resolution dependent timestep shift.
-
-    Longer token sequences carry more redundancy, so the trajectory has to
-    spend more of its budget at high noise for the global structure to settle.
-    mu is interpolated linearly in sequence length and the shift is exp(mu).
-    """
-    slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    mu = base_shift + slope * (sequence_length - base_seq_len)
-    return math.exp(mu)
 
 
 class FlowMatchingScheduler(ContinuousNoiseScheduler):

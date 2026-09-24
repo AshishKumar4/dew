@@ -10,7 +10,7 @@ from .cosine import (
 )
 from .discrete import DiscreteNoiseScheduler
 from .exp import ExpNoiseScheduler, exp_beta_schedule
-from .flow import FlowMatchingScheduler, compute_resolution_shift
+from .flow import FlowMatchingScheduler
 from .karras import EDMNoiseScheduler, KarrasVENoiseScheduler
 from .linear import LinearNoiseScheduler, linear_beta_schedule
 from .sqrt import SqrtContinuousNoiseScheduler
@@ -19,5 +19,4 @@ __all__ = ["ContinuousNoiseScheduler", "CosineContinuousNoiseScheduler", "Cosine
            "CosineNoiseScheduler", "DiscreteNoiseScheduler", "EDMNoiseScheduler", "ExpNoiseScheduler",
            "FlowMatchingScheduler", "GeneralizedNoiseScheduler", "KarrasVENoiseScheduler",
            "LinearNoiseScheduler", "NoiseScheduler", "SqrtContinuousNoiseScheduler",
-           "compute_resolution_shift", "cosine_beta_schedule", "exp_beta_schedule", "expand",
-           "linear_beta_schedule"]
+           "cosine_beta_schedule", "exp_beta_schedule", "expand", "linear_beta_schedule"]
