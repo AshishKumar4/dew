@@ -61,7 +61,10 @@ import tyro
 from jax.sharding import Mesh
 
 from dew import models  # naming a registry fills it
+from dew.data import preferences
+from dew.data.chat import ROLES_KEY, Role
 from dew.diffusion import presets
+from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
@@ -75,8 +78,10 @@ from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
+from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
+from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
@@ -181,8 +186,14 @@ class Case:
     """For language models, the vocabulary slices the loss scores a batch in;
     None is the objective's own default."""
     objective: dict[str, object] = field(default_factory=dict)
-    """For language models, further `LMObjective` keywords, such as the
-    balance terms `aux_loss_alpha` and `balance_rate`."""
+    """For language models, further keywords of the decoder's objective, such
+    as LMObjective's balance terms `aux_loss_alpha` and `balance_rate`."""
+    decoder_objective: Literal["lm", "sft", "dpo", "grpo", "mdlm"] = "lm"
+    """For language models, what the decoder trains: next-token cross entropy
+    ("lm"), the same over the assistant's turns only ("sft"), DPO over
+    preference pairs ("dpo"), GRPO's clipped surrogate over rollouts
+    ("grpo"), or masked diffusion's negative ELBO over a bidirectional
+    decoder ("mdlm", MDLM's process)."""
     fsdp_min_param_size: int = 2 ** 16
 
     @property
@@ -197,8 +208,10 @@ class Case:
     def packs_documents(self) -> bool:
         """Whether --packed-documents means anything for this case: a plain
         token window packs, a canvas row is the objective's own fixed
-        geometry, and a media row is what a processor emitted."""
-        return self.is_lm and self.canvas is None and self.media is None
+        geometry, a media row is what a processor emitted, and pairs,
+        rollouts and a masked-diffusion row have their own columns."""
+        return (self.is_lm and self.canvas is None and self.media is None
+                and self.decoder_objective in ("lm", "sft"))
 
     @property
     def sample_shape(self) -> tuple[int, ...]:
@@ -592,11 +605,25 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
     return [apply(case) for case in cases]
 
 
-def lm_objective(case: Case, model) -> LMObjective:
-    """Next-token cross entropy over the case's rows, with its own head
-    chunking where it names one and its further objective keywords."""
-    chunks = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    return LMObjective(model, case.seq_len, **chunks, **case.objective)
+def decoder_objective(case: Case, model) -> Objective:
+    """What the case's decoder trains over its rows (`Case.decoder_objective`),
+    with its own head chunking where it names one and its further objective
+    keywords. Masked diffusion corrupts to the vocabulary's last id, which
+    `global_batch` never draws."""
+    chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
+    keywords = {**chunks, **case.objective}
+    match case.decoder_objective:
+        case "lm":
+            return LMObjective(model, case.seq_len, **keywords)
+        case "sft":
+            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT, **keywords)
+        case "dpo":
+            return DPOObjective(model, case.seq_len, **keywords)
+        case "grpo":
+            return GRPOObjective(model, case.seq_len, **keywords)
+        case "mdlm":
+            vocab = _count(case.config, "vocab_size", case.architecture)
+            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
 
 
 def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
@@ -633,9 +660,9 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
             dtype=resolve_dtype(dtype))
-        objective = lm_objective(case, model)
+        objective = decoder_objective(case, model)
     elif case.is_lm:
-        objective = lm_objective(case, built(case.architecture, case.config))
+        objective = decoder_objective(case, built(case.architecture, case.config))
     elif case.predictor is not None:
         model = built(case.architecture, case.config)
         patch = case.config.get("patch_size", 16)
@@ -725,12 +752,47 @@ def global_batch(case: Case) -> Batch:
         if not isinstance(vocab, int):
             raise ValueError(f"{case.architecture}'s vocab_size is {vocab!r}, not an int")
         width = case.seq_len + 1
+        prompt = width // 2
+        match case.decoder_objective:
+            case "mdlm":
+                # Rows of seq_len tokens, none of them the mask id, the
+                # vocabulary's last.
+                return {"text": rng.integers(0, vocab - 1, size=(case.batch_size, case.seq_len))
+                        .astype(np.int32)}
+            case "dpo":
+                # Pairs that share their prompt; the completions after it count.
+                pairs = rng.integers(0, vocab, size=(case.batch_size, 2, width)).astype(np.int32)
+                pairs[:, 1, :prompt] = pairs[:, 0, :prompt]
+                completion = np.zeros(pairs.shape, np.int32)
+                completion[:, :, prompt:] = 1
+                return {preferences.IDS_KEY: pairs, preferences.MASK_KEY: completion}
+            case "grpo":
+                # One rollout a row, a prompt and the response the mask counts:
+                # each row's advantage on its response tokens, and the
+                # sampler's likelihood near a fresh model's, so the ratios stay
+                # inside the clip and every token moves the gradient.
+                response = np.zeros((case.batch_size, width), np.float32)
+                response[:, prompt:] = 1
+                behavior = (rng.normal(-np.log(vocab), 0.05, size=response.shape) * response).astype(np.float32)
+                return {
+                    sessions.IDS_KEY: rng.integers(0, vocab, size=response.shape).astype(np.int32),
+                    sessions.SEGMENT_IDS_KEY: np.ones(response.shape, np.int32),
+                    sessions.POSITIONS_KEY: np.tile(np.arange(width, dtype=np.int32), (case.batch_size, 1)),
+                    sessions.RESPONSE_MASK_KEY: response,
+                    sessions.ADVANTAGES_KEY: (rng.normal(size=(case.batch_size, 1)) * response).astype(np.float32),
+                    sessions.BEHAVIOR_LOG_PROBS_KEY: behavior,
+                }
         # A canvas row's target masks are read off the pad id, so a drawn zero
         # would move the objective's own target support with the seed. Every
         # other row takes it as an ordinary token.
         lowest = 1 if case.canvas is not None else 0
         tokens = rng.integers(lowest, vocab, size=(case.batch_size, width)).astype(np.int32)
         batch["text"] = tokens if case.media is None else media_row(case, tokens, rng)
+        if case.decoder_objective == "sft":
+            # A user's turn, then the assistant's, which alone the loss counts.
+            roles = np.full((case.batch_size, width), Role.USER, np.int8)
+            roles[:, prompt:] = Role.ASSISTANT
+            batch[ROLES_KEY] = roles
         if case.packed_documents:
             # Equal documents tiling the row. A packed row from the loader is
             # ragged and can end in padding; what the mask and the kernel cost
