@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 
@@ -25,6 +26,11 @@ PROCESS_COUNT = "DEW_PROCESS_COUNT"
 """How many processes the pool holds; `prepare_process` passes it to jax."""
 PROCESS_ID = "DEW_PROCESS_ID"
 """This process's rank in the pool; `prepare_process` passes it to jax."""
+PREEMPTED_EXIT = 128 + signal.SIGTERM
+"""The exit status of a run stopped at a preemption, SIGTERM's as a shell
+reports it: a scheduler reads a stopped job rather than a finished one, and
+Kubernetes' pod failure policy can ignore it by this code. `Trainer.fit`
+ends with it, and `dew launch` reads a rank's as that rank's preemption."""
 
 
 @dataclasses.dataclass(frozen=True)

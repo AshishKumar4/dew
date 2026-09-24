@@ -74,6 +74,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
+from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Transaction, compact_qk, with_ema
@@ -794,6 +795,12 @@ class Trainer(Generic[Loss, Effects]):
         data position are written. Every `checkpoints.local_every` steps they
         are written to the local directory as well.
 
+        A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops
+        the run at the next step every process agrees on: that step's state
+        and data position are written, the final validation is skipped, and
+        fit raises `Preempted`, which ends the program with 143 unless caught.
+        Run again, fit resumes there.
+
         Previews are generated only when `preview=True` and a tracker
         receives them; scalar reporting never triggers preview work.
         """
@@ -807,6 +814,8 @@ class Trainer(Generic[Loss, Effects]):
         other = 0.0
         current = 0
         first_step = None
+        preempted: int | None = None
+        notice: PreemptionNotice | None = None
         process_zero = jax.process_index() == 0
         profiler = self._own_profile_window()
         outer = telemetry_profile.active_profile()
@@ -866,6 +875,7 @@ class Trainer(Generic[Loss, Effects]):
                           f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
 
             agreed("training announcement", announce)
+            notice = PreemptionNotice()
             while current < steps:
                 assert train is not None
                 # The window's capture opens before this iteration's first
@@ -935,6 +945,15 @@ class Trainer(Generic[Loss, Effects]):
                             and current % local_every == 0 and current < steps):
                         other += self._saved_local_checkpoint(
                             checkpoints, current, state, position)
+                    # Asked at every step on every process, as JAX's agreement
+                    # needs; the last step ends the run on its own.
+                    if current < steps and notice.reached(current):
+                        if checkpoints is not None and last_saved != current:
+                            other += self._saved_checkpoint(checkpoints, current, state, position,
+                                                            book, interval_steps)
+                            last_saved = current
+                        preempted = current
+                        break
                 # The step row is complete once its scope exits; closing the
                 # window here keeps the last iteration inside the capture.
                 if tracing and profile is not None:
@@ -945,11 +964,24 @@ class Trainer(Generic[Loss, Effects]):
                         self._stop_trace(traced, loss, profile, profiler, step=current)
 
 
+            if notice is not None:
+                notice.close()
             paused = time.perf_counter()
             if train is not None:
                 train.close()
                 train = None
             other += time.perf_counter() - paused
+            if preempted is not None:
+                stopped_at = preempted
+
+                def announce_preemption() -> None:
+                    if process_zero:
+                        print(f"Preempted at step {stopped_at}: " + (
+                            f"its checkpoint and data position go to {checkpoints.directory}, "
+                            "where the next run resumes" if checkpoints is not None
+                            else "the trainer has no checkpointer, so nothing is written"))
+
+                agreed("preemption announcement", announce_preemption)
             if tracing and profile is not None:
                 tracing = False
                 # The window outlived the run, and a trace left running takes the
@@ -962,7 +994,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The last step has to land before the wall time is read.
                 loss.block_until_ready()
             paused = time.perf_counter()
-            if eval_every:
+            if eval_every and preempted is None:
                 self._evaluate(state, shardings, dataset, metrics, preview, mesh)
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends
@@ -978,6 +1010,8 @@ class Trainer(Generic[Loss, Effects]):
         finally:
             paused = time.perf_counter()
             primary = sys.exception()
+            if notice is not None:
+                notice.close()
             close = (train.close if train is not None else
                      source.close if isinstance(source, Closeable) else None)
             stop_trace: Callable[[], None] | None = None
@@ -992,9 +1026,11 @@ class Trainer(Generic[Loss, Effects]):
             source = train = close = stop_trace = None
             other += time.perf_counter() - paused
             error = self._reported_outcome(error, started, first_step, other, current,
-                                           process_zero=process_zero)
+                                           process_zero=process_zero, preempted=preempted is not None)
             if primary is None and error is not None:
                 raise error
+        if preempted is not None:
+            raise Preempted(preempted)
         return state
 
     def _check_validation_is_read(self, eval_every: int | None,
@@ -1225,7 +1261,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _reported_outcome(self, error: BaseException | None, started: float,
                           first_step: float | None, other: float, step: int, *,
-                          process_zero: bool) -> BaseException | None:
+                          process_zero: bool, preempted: bool) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
 
         Every rank reaches the cleanup agreement, so a rank that failed alone
@@ -1251,7 +1287,7 @@ class Trainer(Generic[Loss, Effects]):
             except BaseException as failure:
                 error = failure
         try:
-            self._report(FitEnded.outcome(time.perf_counter() - started, error), step)
+            self._report(FitEnded.outcome(time.perf_counter() - started, error, preempted=preempted), step)
         except BaseException as failure:
             if error is None:
                 error = failure
