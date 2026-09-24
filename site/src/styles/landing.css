@@ -30,10 +30,8 @@ html[data-has-hero] header.header {
 }
 
 html[data-has-hero][data-past-hero] header.header {
-	background-color: color-mix(in srgb, var(--sl-color-bg-nav) 94%, transparent);
+	background-color: var(--sl-color-bg-nav);
 	border-bottom-color: var(--sl-color-hairline-shade);
-	backdrop-filter: blur(12px);
-	-webkit-backdrop-filter: blur(12px);
 }
 
 /* The hero. */
