@@ -1874,10 +1874,20 @@ def mode_step_fits(args) -> dict:
     """Each process's own headroom for a step, and the pool's answer: process
     0 has room, process 1 is short, and a process that reads no memory
     decides nothing."""
-    from dew.training.trainer import fits_everywhere
+    from types import SimpleNamespace
 
+    import jax
+
+    from dew.training.distributed import MeshSpec, build_mesh
+    from dew.training.trainer import fits_everywhere, step_fits
+
+    # A step over a mesh that spans both processes: each may read only its
+    # own devices' memory, which a CPU device does not report.
+    step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
+        output_size_in_bytes=100, alias_size_in_bytes=0, temp_size_in_bytes=100))
+    whole = step_fits(step, build_mesh(MeshSpec(fsdp=jax.device_count())))
     tight = [10, -1][args.process_id]
-    return {"tight": fits_everywhere(tight),
+    return {"whole_mesh": whole, "tight": fits_everywhere(tight),
             "roomy": fits_everywhere(abs(tight)),
             "one_unknown": fits_everywhere([5, None][args.process_id]),
             "unknown": fits_everywhere(None)}
