@@ -1288,35 +1288,6 @@ class Qwen35Projector(ProjectorBase):
                                      out_hidden_size=self.out_width)
 
 
-def merge_soft_tokens(token_embeds: jax.typing.ArrayLike, soft_tokens: jax.typing.ArrayLike,
-                      image_mask: jax.typing.ArrayLike) -> jax.Array:
-    """Token embeddings with one image's soft tokens at its image positions.
-
-    `token_embeds` is [B, S, H], `soft_tokens` [B, T, H], and `image_mask`
-    [B, S] marks the T positions of each row that carry image features. Every
-    row must mark exactly T positions; the counts the reference checks in
-    get_placeholder_mask are what is enforced here.
-    """
-    token_embeds = jnp.asarray(token_embeds)
-    soft_tokens = jnp.asarray(soft_tokens)
-    mask = jnp.asarray(image_mask)
-    batch, length, _ = token_embeds.shape
-    tokens = soft_tokens.shape[1]
-    if (soft_tokens.shape[0], mask.shape) != (batch, (batch, length)):
-        raise ValueError(
-            f"soft tokens of {soft_tokens.shape} and a mask of {mask.shape} do not "
-            f"cover token embeddings of {token_embeds.shape}")
-    counts = mask.sum(axis=1)
-    if bool((counts != tokens).any()):
-        raise ValueError(
-            f"each row must mark {tokens} image positions, got {counts.tolist()}")
-    order = jnp.where(mask, jnp.cumsum(mask, axis=1, dtype=jnp.int32) - 1, 0)
-    chosen = soft_tokens[jnp.arange(batch)[:, None], order]
-    return jnp.where(mask[..., None], chosen, token_embeds)
-
-
-
-
 def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
     params: ParamTree = {}
     for name, tensor in hf_tensors.items():

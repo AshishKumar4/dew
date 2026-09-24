@@ -129,18 +129,6 @@ def test_llama4_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) < 1e-4
 
 
-def test_merge_soft_tokens_places_one_image():
-    """Two soft tokens land on the two marked positions in order, the rest of
-    the row passes through, and a row marking any other count names it."""
-    token_embeds = np.zeros((1, 5, 2), np.float32)
-    soft_tokens = np.array([[[1.0, 2.0], [3.0, 4.0]]], np.float32)
-    mask = np.array([[False, True, False, True, False]])
-    assert np.asarray(V.merge_soft_tokens(token_embeds, soft_tokens, mask)).tolist() == [
-        [[0.0, 0.0], [1.0, 2.0], [0.0, 0.0], [3.0, 4.0], [0.0, 0.0]]]
-    with pytest.raises(ValueError, match="image positions"):
-        V.merge_soft_tokens(token_embeds, soft_tokens, np.ones((1, 5), bool))
-
-
 @pytest.mark.parametrize("record", [{"kind": "clip"}, {"kind": "mlp"}, {}])
 def test_an_unknown_tower_or_projector_kind_is_refused(record):
     """A kind neither registry holds names itself with the known names."""
