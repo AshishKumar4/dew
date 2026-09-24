@@ -23,6 +23,10 @@ least the reference's own distance from the same step computed in fp64, so
 any reassociation of fp32 sums is held to fp32's own rounding of the step,
 while a defect lands orders of magnitude past it.
 
+A layout also has to split one device's work rather than repeat it: its
+devices' FLOPs together, over the reference's, are at most `flops_bound`, an
+even split and a pipeline's bubble, else the layout is REDUNDANT.
+
 An objective that draws noise per row (a DiT's diffusion, a DiffusionGemma
 canvas's masks) draws other noise for permuted or pooled rows, so neither is
 a reassociation of its step. Its floor is data parallelism over every device
@@ -80,6 +84,14 @@ sys.path.insert(0, str(REPO / "tools"))
 
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
+FLOPS_SLACK = 1.05
+"""How far past an even split of one device's FLOPs a layout may compute:
+the elementwise work sharding adds, such as collectives' local sums and the
+update of parameters a layout keeps whole on several devices. On 4x RTX 3090
+every layout of the zoo that repeats no matmul measured within 1.6% of an
+even split (the DiT's fsdp2_sequence2 1.016), and a repeated matmul path 8%
+and more (the DiT's text projection under fsdp2_tensor2 9%, the dense
+decoder's head under fsdp2_tensor2 18%)."""
 
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
@@ -514,6 +526,15 @@ def rounding_limit(dtype: str) -> float:
     return float(jnp.finfo(dtype).eps) ** 0.5
 
 
+def flops_bound(fields: Mapping[str, int]) -> float:
+    """The FLOPs a layout's devices may compute together over one device's:
+    an even split, and a pipeline of S stages and M microbatches holds each
+    stage's work for M + S - 1 microbatches' time (GPipe's bubble), times
+    FLOPS_SLACK."""
+    stages, microbatches = fields.get("stage", 1), fields.get("microbatches", 1)
+    return (microbatches + stages - 1) / microbatches * FLOPS_SLACK
+
+
 def widest_floor(floors: dict[str, float], dtype: str) -> str:
     """The leaf with the widest floor, refused past `rounding_limit`: a floor
     that wide passes any layout at its leaf, and where the floor is data
@@ -643,6 +664,9 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                 if compiled["flops_per_device"] and judge.flops_per_device:
                     # Above one when devices compute what one device need not.
                     row["flops_ratio"] = compiled["flops_per_device"] * devices / judge.flops_per_device
+                    row["flops_bound"] = flops_bound(LAYOUTS[name])
+                    if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
+                        row["status"] = "REDUNDANT"
             except Exception as error:  # a failing layout is a row of the matrix
                 row.update(status="error", error=f"{type(error).__name__}: {error}"[:2000],
                            traceback=traceback.format_exc()[-4000:])
@@ -652,7 +676,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             speak(f"[{model}/{name}] {row['status']} "
                   + (f"leaf {row['worst_ratio']:.2f} of bound at {row['worst_leaf']}, "
                      f"loss {row['loss_error']:.1e} of {row['loss_bound']:.1e}, "
-                     f"flops x{row.get('flops_ratio', float('nan')):.2f}"
+                     f"flops x{row.get('flops_ratio', float('nan')):.2f} of x{row.get('flops_bound', float('nan')):.2f}"
                      if "worst_ratio" in row else row["error"][:300]))
     return rows
 

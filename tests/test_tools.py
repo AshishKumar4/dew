@@ -322,6 +322,22 @@ def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_
     assert errors["scale"] == pytest.approx(2e-9 / (tool.rounding_limit("float32") * 10), rel=1e-6)
 
 
+def test_layout_parity_holds_a_layouts_flops_to_an_even_split_and_a_pipelines_bubble():
+    """A layout splits one device's work over its devices, and a pipeline of
+    S stages and M microbatches adds its bubble of S - 1 microbatches; past
+    that it repeats work. On 4x RTX 3090 the DiT computed 2.63 times one
+    device's FLOPs under tensor4, projecting its text on every device, while
+    the 128-expert decoder's four-stage pipeline computed 1.75 of its bubble's
+    1.75 and the dense decoder's fsdp2_tensor2 1.18, its head repeated."""
+    tool = load("layout_parity")
+
+    assert tool.flops_bound(tool.LAYOUTS["tensor4"]) < 2.63
+    assert tool.flops_bound(tool.LAYOUTS["fsdp2_tensor2"]) < 1.18
+    assert tool.flops_bound(tool.LAYOUTS["fsdp2_sequence2"]) > 1.016
+    assert tool.flops_bound(tool.LAYOUTS["stage4"]) > 1.749
+    assert tool.flops_bound(tool.LAYOUTS["stage2_fsdp2"]) < 1.33
+
+
 def test_layout_parity_reads_a_prepared_reference_and_computes_none(tmp_path, monkeypatch):
     """A run of layouts holds every device of its job, and its reference
     side (one device's step, the permutation floor, the fp64 anchor) left
