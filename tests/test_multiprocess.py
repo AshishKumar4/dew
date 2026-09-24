@@ -1345,4 +1345,5 @@ def test_a_step_fits_only_where_it_fits_every_process(tmp_path):
     the same program, under the same remat."""
     reports = run_pool("step_fits", tmp_path, 2)
     for report in reports:
-        assert report == {"tight": False, "roomy": True, "one_unknown": True, "unknown": True}
+        assert report == {"whole_mesh": True, "tight": False, "roomy": True,
+                          "one_unknown": True, "unknown": True}
