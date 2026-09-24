@@ -147,13 +147,83 @@ def test_collecting_augmenters_preserves_reference_imports():
         "from transformers import MixtralForCausalLM",
         "print('ok')",
     ])
+    _fresh_process(script)
+
+
+def _fresh_process(script, *args):
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True, text=True, env=env, cwd=REPO_ROOT,
-    )
+    result = subprocess.run([sys.executable, "-c", script, *map(str, args)],
+                            capture_output=True, text=True, env=env, cwd=REPO_ROOT)
     assert result.returncode == 0 and result.stdout.strip().splitlines()[-1:] == ["ok"], (
         result.stdout + result.stderr)
+
+
+# The images a loader's reader threads decode together, first import of cv2
+# included: cv2's import is not safe to share out, since one that fails in one
+# thread leaves the others a half-built module (`module 'cv2' has no attribute
+# 'INTER_AREA'`). What the loader promises is that OpenCV is in place before
+# its readers start, in the process that opens it and in a spawned worker.
+_READERS = "\n".join([
+    "import dataclasses, io, sys",
+    "import numpy as np",
+    "from PIL import Image",
+    "from dew.data import DataPartition, Loading",
+    "from dew.data.images import ImageDataset",
+    "buffer = io.BytesIO()",
+    "Image.fromarray(np.arange(40 * 40 * 3, dtype=np.uint8).reshape(40, 40, 3)).save(",
+    "    buffer, format='PNG')",
+    "PNG = buffer.getvalue()",
+    "",
+    "@dataclasses.dataclass(frozen=True)",
+    "class Pngs(ImageDataset):",
+    "    def source(self, split=None):",
+    "        return [PNG] * 64",
+    "    def record(self, element, rng):",
+    "        return element, 'a picture', None",
+    "",
+    "SPEC = Pngs(image_size=16, val_batches=0, augmentation='none',",
+    "            loading=Loading(workers=0, threads=32, read_buffer=64))",
+])
+
+
+def test_opening_an_image_loader_imports_opencv_before_its_readers_start():
+    _fresh_process("\n".join([
+        _READERS,
+        "assert 'cv2' not in sys.modules",
+        "data = SPEC.load(batch=32)",
+        "assert 'cv2' in sys.modules",
+        "batch = next(iter(data.train(DataPartition())))",
+        "assert batch['image'].shape == (32, 16, 16, 3)",
+        "print('ok')",
+    ]))
+
+
+def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
+    """Grain unpickles the transform in each spawned worker before the
+    worker's own reader threads run."""
+    pickled = tmp_path / "transform.pkl"
+    _fresh_process("\n".join([
+        _READERS,
+        "import pickle",
+        "from dew.data.images import ImageTransform",
+        "with open(sys.argv[1], 'wb') as handle:",
+        "    pickle.dump(ImageTransform(SPEC), handle)",
+        "print('ok')",
+    ]), pickled)
+    _fresh_process("\n".join([
+        _READERS,
+        "import pickle",
+        "from concurrent.futures import ThreadPoolExecutor",
+        "assert 'cv2' not in sys.modules",
+        "with open(sys.argv[1], 'rb') as handle:",
+        "    transform = pickle.load(handle)",
+        "assert 'cv2' in sys.modules",
+        "with ThreadPoolExecutor(32) as pool:",
+        "    records = list(pool.map(lambda seed: transform.random_map(PNG, np.random.default_rng(seed)),",
+        "                            range(64)))",
+        "assert all(record['image'].shape == (16, 16, 3) for record in records)",
+        "print('ok')",
+    ]), pickled)
 
 
 # ---------------------------------------------------------------------------------

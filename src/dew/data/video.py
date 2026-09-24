@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Mapping
 
 import grain.python as pygrain
 import numpy as np
@@ -32,6 +33,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .images import import_opencv
 from .processors import AutoAudioProcessor
 
 
@@ -47,11 +49,21 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
 
 
 class AudioVideoTransform(pygrain.RandomMapTransform):
-    """Reads one clip per record: its frames, their audio, and its caption."""
+    """Reads one clip per record: its frames, their audio, and its caption.
+
+    It is built where its loader opens and unpickled where a spawned worker
+    starts, both before any reader thread runs, and both import OpenCV
+    (`dew.data.images.import_opencv`).
+    """
 
     def __init__(self, spec: VideoDataset):
+        import_opencv()
         self.spec = spec
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        import_opencv()
+        self.__dict__.update(state)
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         # moviepy is imported on the first record, so importing this module needs no `av` extra.
