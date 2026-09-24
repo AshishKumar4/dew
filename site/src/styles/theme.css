@@ -256,6 +256,18 @@ header.header {
 
 /* Tutorial pages: each code cell with its recorded outputs. */
 
+.sl-markdown-content .nb-provenance {
+	margin-top: 2.5rem;
+	padding-top: 1rem;
+	border-top: 1px solid var(--dew-rule);
+	font-size: var(--sl-text-sm);
+	color: var(--dew-muted);
+}
+
+.sl-markdown-content .nb-provenance a {
+	color: inherit;
+}
+
 .sl-markdown-content .nb-cell {
 	margin-top: 1.5rem;
 }
