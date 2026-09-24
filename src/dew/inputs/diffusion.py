@@ -510,7 +510,10 @@ class CLIPImageTransform:
             crop_h, crop_w = self.crop
             pad_h, pad_w = max(0, crop_h - pixels.shape[1]), max(0, crop_w - pixels.shape[2])
             if pad_h or pad_w:
-                pixels = jnp.pad(pixels, ((0, 0), (pad_h // 2, pad_h - pad_h // 2), (pad_w // 2, pad_w - pad_w // 2), (0, 0)))
+                # transformers' center_crop puts the odd pad row on top and the
+                # odd pad column on the left, ceil((crop - side) / 2).
+                pixels = jnp.pad(pixels, ((0, 0), (pad_h - pad_h // 2, pad_h // 2),
+                                          (pad_w - pad_w // 2, pad_w // 2), (0, 0)))
             top, left = (pixels.shape[1] - crop_h) // 2, (pixels.shape[2] - crop_w) // 2
             pixels = pixels[:, top:top + crop_h, left:left + crop_w]
         pixels = pixels * self.rescale

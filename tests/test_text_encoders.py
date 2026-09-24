@@ -269,18 +269,24 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
 
 
-@pytest.mark.parametrize("height, width", [(440, 440), (320, 360), (360, 320)])
-def test_clip_image_transform_matches_the_reference_processor(height, width):
+SAFETY_CROP = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}}
+SMALL_CROP = {"crop_size": {"height": 8, "width": 8}, "do_resize": False}
+
+
+@pytest.mark.parametrize("config, height, width", [
+    (SAFETY_CROP, 440, 440), (SAFETY_CROP, 320, 360), (SAFETY_CROP, 360, 320),
+    (SMALL_CROP, 5, 6), (SMALL_CROP, 7, 9)])
+def test_clip_image_transform_matches_the_reference_processor(config, height, width):
     """The safety checker's preprocessing, against the PIL processor it
     follows (`CLIPImageTransform` says why that one). The shorter side
     resizes to exactly `shortest_edge` and the longer to
     int(size * long / short), so an image whose side the size does not
-    divide still fills the crop."""
+    divide still fills the crop. An image smaller than the crop sits in it
+    with an odd pad row above it and an odd pad column to its left."""
     from transformers import CLIPImageProcessorPil
 
     from dew.inputs.diffusion import CLIPImageTransform
 
-    config = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}, "resample": 3}
     pixels = np.random.RandomState(0).randint(0, 256, (1, height, width, 3), dtype=np.uint8)
 
     expected = CLIPImageProcessorPil(**config)(list(pixels), return_tensors="np")["pixel_values"]
