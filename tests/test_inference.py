@@ -9,6 +9,8 @@ trainer has just written.
 
 import dataclasses
 import json
+import shutil
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -46,10 +48,11 @@ def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint=
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
-def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
-    """Two training steps of the tiny conditional DiT, its checkpoint and its
-    `run.json` in `directory`, as the recipe leaves them: the objective is
-    the config's own build."""
+def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
+    """`steps` training steps of the tiny conditional DiT, its checkpoint and
+    its `run.json` in `directory`, as the recipe leaves them: the objective is
+    the config's own build. A directory that already holds the run resumes
+    it to `steps`."""
     config = run_config(directory, preset, encoder, checkpoint)
     objective = config.build()
     encoder = objective.inputs.conditions["textcontext"].encoder
@@ -78,7 +81,7 @@ def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="s
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                       checkpoints=checkpoints)
     state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
-                        steps=2, log_every=100, checkpoint_every=2)
+                        steps=steps, log_every=100, checkpoint_every=steps)
     checkpoints.wait()
     config.save(str(directory))
     return objective, state
@@ -138,6 +141,45 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5
     assert type(pipe.process.prediction) is FlowMatchPredictionTransform
     assert pipe.process.sampling is None
+
+
+def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_it_did(
+        tmp_path, monkeypatch):
+    """A checkpoint written before FourierEmbedding's table became a variable
+    lacks it. Loading or resuming the run takes the table from the model's
+    init, which draws the one the run trained against, so the run samples
+    and trains on bit for bit as it did, on the suite's 8-device mesh too,
+    where each device's batch is smaller than the table."""
+    from dew.nn.blocks import FourierEmbedding
+
+    tables = []
+
+    def drawn_in_setup(self):  # FourierEmbedding.setup before the table was a variable
+        drawn = np.random.RandomState(42).normal(size=(self.features // 2,))
+        tables.append(drawn.astype(np.float32) * self.scale)
+        self.frequencies = SimpleNamespace(value=jnp.asarray(drawn, dtype=jnp.float32) * self.scale)
+
+    old, resumed_before = tmp_path / "old", tmp_path / "resumed-before"
+    with monkeypatch.context() as before:
+        before.setattr(FourierEmbedding, "setup", drawn_in_setup)
+        make_run(old)
+        shutil.copytree(old, resumed_before)
+        sampled = TextToImage.from_run(str(old))(["a", "b"], seed=4).host().images
+        _, trained = make_run(resumed_before, steps=3)
+    assert "constants" not in Checkpoints(str(old)).stored()["params"]
+
+    pipe = TextToImage.from_run(str(old))
+    table = pipe.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
+    np.testing.assert_array_equal(np.asarray(table), tables[0])
+    np.testing.assert_array_equal(pipe(["a", "b"], seed=4).host().images, sampled)
+
+    _, resumed = make_run(old, steps=3)
+    np.testing.assert_array_equal(
+        np.asarray(resumed.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]),
+        tables[0])
+    for expected, actual in zip(jax.tree.leaves(trained.params["params"]),
+                                jax.tree.leaves(resumed.params["params"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):

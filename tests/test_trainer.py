@@ -445,6 +445,24 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     assert json.loads(position)["index"] == 3
 
 
+class AffineWithOffset(nn.Module):
+    """`Affine` once it has gained a variable its earlier checkpoints lack."""
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(x) + self.variable("constants", "offset", jnp.zeros, (2,)).value
+
+
+def test_a_checkpoint_without_a_leaf_the_model_now_has_is_refused_by_name(tmp_path):
+    """A resume cannot hand back a state with a leaf the checkpoint never
+    stored, so it refuses and names the leaf."""
+    make_trainer(tmp_path).fit(Data(), steps=2, log_every=1)
+    grown = Regression()
+    grown.model = AffineWithOffset()
+    with pytest.raises(ValueError, match=r"holds no .*\['params'\]\['constants'\]\['offset'\]"):
+        make_trainer(tmp_path, objective=grown).place()
+
+
 def test_a_resumed_run_continues_the_data_where_it_stopped(tmp_path):
     """A run killed at step 2 and resumed to 4 lands where an uninterrupted
     four-step run lands: the batches after the checkpoint are neither
