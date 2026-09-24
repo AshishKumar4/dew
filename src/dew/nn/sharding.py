@@ -144,6 +144,13 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("kv", TENSOR_AXIS),
     ("activation_batch", BATCH_AXES),
     ("activation_length", SEQUENCE_AXIS),
+    # The positions of a stretch of per-token work that splits no width the
+    # tensor axis splits, which every tensor shard would otherwise compute
+    # whole (`SPREAD`): over the tensor axis beside the sequence axis, as
+    # Megatron's sequence parallelism splits the positions of its norms;
+    # over the sequence axis alone where the tensor axis cannot divide them.
+    ("activation_spread", (SEQUENCE_AXIS, TENSOR_AXIS)),
+    ("activation_spread", SEQUENCE_AXIS),
     ("activation_heads", TENSOR_AXIS),
     ("activation_kv", TENSOR_AXIS),
     ("activation_mlp", TENSOR_AXIS),
@@ -166,6 +173,12 @@ KV_HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_kv
 """A `[batch, length, kv_heads, head_dim]` key or value. Grouped heads the
 tensor axis does not divide are computed whole on every tensor shard, the
 way Megatron repeats them."""
+SPREAD: LogicalAxes = ("activation_batch", "activation_spread", None)
+"""A `[batch, length, width]` activation whose per-token work splits no
+tensor width, multi-head latent attention's down-projections and their
+latents: its positions split over the tensor axis too, so each tensor shard
+computes its own tokens, and the result is gathered back into `RESIDUAL`'s
+placement for the work that splits a width."""
 MLP_HIDDEN: LogicalAxes = ("activation_batch", "activation_length", "activation_mlp")
 """A `[batch, length, hidden]` feed-forward activation."""
 LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_vocab")

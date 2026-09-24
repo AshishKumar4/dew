@@ -46,7 +46,7 @@ from dew.nn.attention import (
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import RESIDUAL, SPREAD, constrain, logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 
@@ -458,16 +458,23 @@ class MultiHeadLatentAttention(nn.Module):
             q_resid = None
             queries = self.q_proj(x)
         else:
-            q_resid = self.q_a_layernorm(self.q_a_proj(x))
-            queries = self.q_b_proj(q_resid)
+            q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, SPREAD))), SPREAD)
+            queries = self.q_b_proj(constrain(q_resid, RESIDUAL))
         queries = checkpoint_name(queries, 'q_proj')
         return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid
 
     def _latents(self, x):
-        """The normed KV latent and the raw decoupled rope head."""
-        compressed = self.kv_a_proj_with_mqa(x)
+        """The normed KV latent and the raw decoupled rope head.
+
+        The tensor axis splits the heads, not the latents, so the
+        down-projections (and `_queries`' own) run on each tensor shard's
+        share of the tokens (`SPREAD`), a slice of a residual every shard
+        holds whole, and the latents are gathered for the head-split
+        up-projections: at DeepSeek-V3's shape every shard computing them
+        whole was 13% more work a device under tensor=8."""
+        compressed = constrain(self.kv_a_proj_with_mqa(constrain(x, SPREAD)), SPREAD)
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
-        return self.kv_a_layernorm(latent), rot
+        return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
     def _rotate(self, part, freqs_cos, freqs_sin):
         if self.rope_interleave:
