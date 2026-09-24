@@ -47,7 +47,7 @@ GROUPS: list[tuple[str, list[str]]] = [
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
                                 "dew.diffusion.presets", "dew.diffusion.discrete", "dew.sampling",
                                 "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.decoding"]),
-    ("Inference and interop", ["dew.inference", "dew.inference.tasks", "dew.interop"]),
+    ("Inference and interop", ["dew.inference", "dew.inference.tasks", "dew.interop", "dew.interop.flaxdiff"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),
