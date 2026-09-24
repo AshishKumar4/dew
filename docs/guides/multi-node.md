@@ -196,7 +196,7 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
 
 `tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes. It also checks that a failing process stops the pool, including a rank whose loader fails in the middle of `fit` and one that stalls without failing, that a pool refuses a checkpoint directory its processes do not share, that two pools started together take a port each, and that a pool's second run loads on every process the step its first run compiled. On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
-`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf against the reference's own deviation when the batch's sums are reordered.
+`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf against the reference's own deviation when the batch's sums are reordered, and the devices' FLOPs against one device's split evenly. A layout Dew refuses by design raises `dew.nn.sharding.LayoutRefused` with the reason and a layout that runs, such as a stage axis over a DiT; the tool lists those rows apart and exits nonzero only on a mismatch, repeated work or another error. `--prepare` computes each model's one-device reference into a `--references` directory in a job of one device, so a run of layouts on every device computes none.
 
 ## What has and has not been run
 
