@@ -255,11 +255,12 @@ def reference_model(case: Case, directory: Path):
 
     factory = transformers.AutoModelForCausalLM
     if case.reference_class is not None:
-        from transformers.conversion_mapping import (
-            get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
-        )
-
         from importlib import import_module
+
+        from transformers.conversion_mapping import (
+            get_checkpoint_conversion_mapping,
+            register_checkpoint_conversion_mapping,
+        )
         factory = getattr(import_module(case.reference_module), case.reference_class)
         model_type = json.loads((directory / "config.json").read_text())["model_type"]
         conversion = get_checkpoint_conversion_mapping(case.conversion_type or factory.config_class.model_type)
@@ -317,6 +318,7 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
     import torch
     from transformers.conversion_mapping import get_checkpoint_conversion_mapping
     from transformers.core_model_loading import WeightConverter, dot_natural_key
+
     from tools.hf_reference_b import glm5_next_mtp
 
     model, _ = reference_model(case, directory)
@@ -420,6 +422,82 @@ def moved(trip: RoundTrip) -> dict[str, float]:
     return distances
 
 
+def _bare(name: str) -> str:
+    """`name` without the nesting prefixes the two sides disagree on.
+
+    The reversal keys a gradient the way the module tree is named, which
+    is not always how the release spells the same tensor: DeepSeek V4
+    holds its stack at `layers.N.*` with no `model.`, and Kimi K2.5's
+    `model.language_model.X` is the source's `language_model.model.X`.
+    Only those prefixes move, so both sides are indexed with them
+    stripped and a collision is raised rather than guessed at.
+    """
+    parts = name.split('.')
+    while parts[:1] in (['model'], ['language_model']):
+        parts.pop(0)
+    return '.'.join(parts)
+
+def _indexed(named):
+    """`named` by bare name, refusing two that share one."""
+    held: dict[str, tuple[str, object]] = {}
+    for name, value in named:
+        key = _bare(name)
+        if key in held:
+            raise ValueError(f'{name!r} and {held[key][0]!r} share the bare name {key!r}')
+        held[key] = (name, value)
+    return held
+
+
+def _reference_gradients(trip: RoundTrip):
+    """The reference's gradients of the same loss: `upstream` by module
+    name, `converted` by the release's own tensor names through
+    transformers' reversal (and the release spellings DeepSeek V4 and Kimi
+    K2.5 use), and the prefixes an MTP depth owns, which are not compared.
+    The reference is checked to hold a gradient for every parameter the
+    trunk loss reaches and none for the ones it does not."""
+    import torch
+
+    model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture)
+    model.train(False)
+    model.set_attn_implementation("eager")
+    labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
+    model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
+    from transformers.core_model_loading import revert_weight_conversion
+
+    parameters = dict(model.named_parameters())
+    prediction_prefixes = _prediction_prefixes(model.config)
+    text_half = _text_half_prefixes(model)
+    excluded = {name for name in parameters
+                if '.indexer.' in name or name.startswith(prediction_prefixes)
+                or (text_half and not name.startswith(text_half))}
+    unexpected_missing = {name for name, parameter in parameters.items()
+                          if parameter.requires_grad and parameter.grad is None and name not in excluded}
+    unexpected_present = {name for name in excluded if parameters[name].grad is not None}
+    if unexpected_missing or unexpected_present:
+        raise ValueError(f'reference gradient participation differs: missing {sorted(unexpected_missing)}, '
+                         f'excluded but present {sorted(unexpected_present)}')
+    upstream = {name: parameter.grad for name, parameter in parameters.items()
+                if parameter.grad is not None}
+    # The inverse converter processes every supplied upstream name, including
+    # unmatched pass-throughs (core_model_loading.py:1833-1860). Check its
+    # scalar count as well, so a rename collision cannot silently drop data.
+    converted = revert_weight_conversion(model, upstream)
+    if sum(value.numel() for value in upstream.values()) != sum(value.numel() for value in converted.values()):
+        raise ValueError('reference gradient conversion lost or duplicated scalar entries')
+
+    # The reversal writes the checkpoint spelling of the model_type it was
+    # handed, which is not always the release's own: DeepSeek V4 names the
+    # block's halves `attn`/`ffn`, and Kimi K2.5's repo holds its text
+    # stack at `layers.N` where the reversal writes `blocks.N`.
+    if model.config.model_type == 'deepseek_v4':
+        from tools.deepseek_v4_reference import deepseek_v4_source_name
+        converted = {deepseek_v4_source_name(name): value for name, value in converted.items()}
+    elif model.config.model_type == 'kimi_k25':
+        converted = {name.replace('.blocks.', '.layers.'): value
+                     for name, value in converted.items()}
+    return upstream, converted, prediction_prefixes
+
+
 def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     """The two implementations' gradients of the mean next-token cross
     entropy over the source checkpoint, per source tensor, as
@@ -462,71 +540,10 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
             jax.nn.log_softmax(logits[:, :-1], axis=-1), ids[:, 1:, None], axis=-1))
 
     grads = {"params": jax.grad(loss)(source.variables["params"])}
-    model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture)
-    model.train(False)
-    model.set_attn_implementation("eager")
-    labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
-    model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
-    from transformers.core_model_loading import revert_weight_conversion
-
-    parameters = dict(model.named_parameters())
-    prediction_prefixes = _prediction_prefixes(model.config)
-    text_half = _text_half_prefixes(model)
-    excluded = {name for name in parameters
-                if '.indexer.' in name or name.startswith(prediction_prefixes)
-                or (text_half and not name.startswith(text_half))}
-    unexpected_missing = {name for name, parameter in parameters.items()
-                          if parameter.requires_grad and parameter.grad is None and name not in excluded}
-    unexpected_present = {name for name in excluded if parameters[name].grad is not None}
-    if unexpected_missing or unexpected_present:
-        raise ValueError(f'reference gradient participation differs: missing {sorted(unexpected_missing)}, '
-                         f'excluded but present {sorted(unexpected_present)}')
-    upstream = {name: parameter.grad for name, parameter in parameters.items()
-                if parameter.grad is not None}
-    # The inverse converter processes every supplied upstream name, including
-    # unmatched pass-throughs (core_model_loading.py:1833-1860). Check its
-    # scalar count as well, so a rename collision cannot silently drop data.
-    converted = revert_weight_conversion(model, upstream)
-    if sum(value.numel() for value in upstream.values()) != sum(value.numel() for value in converted.values()):
-        raise ValueError('reference gradient conversion lost or duplicated scalar entries')
-
-    def bare(name: str) -> str:
-        """`name` without the nesting prefixes the two sides disagree on.
-
-        The reversal keys a gradient the way the module tree is named, which
-        is not always how the release spells the same tensor: DeepSeek V4
-        holds its stack at `layers.N.*` with no `model.`, and Kimi K2.5's
-        `model.language_model.X` is the source's `language_model.model.X`.
-        Only those prefixes move, so both sides are indexed with them
-        stripped and a collision is raised rather than guessed at.
-        """
-        parts = name.split('.')
-        while parts[:1] in (['model'], ['language_model']):
-            parts.pop(0)
-        return '.'.join(parts)
-
-    def indexed(named):
-        held: dict[str, tuple[str, object]] = {}
-        for name, value in named:
-            key = bare(name)
-            if key in held:
-                raise ValueError(f'{name!r} and {held[key][0]!r} share the bare name {key!r}')
-            held[key] = (name, value)
-        return held
-
-    # The reversal writes the checkpoint spelling of the model_type it was
-    # handed, which is not always the release's own: DeepSeek V4 names the
-    # block's halves `attn`/`ffn`, and Kimi K2.5's repo holds its text
-    # stack at `layers.N` where the reversal writes `blocks.N`.
-    if model.config.model_type == 'deepseek_v4':
-        from tools.deepseek_v4_reference import deepseek_v4_source_name
-        converted = {deepseek_v4_source_name(name): value for name, value in converted.items()}
-    elif model.config.model_type == 'kimi_k25':
-        converted = {name.replace('.blocks.', '.layers.'): value
-                     for name, value in converted.items()}
+    upstream, converted, prediction_prefixes = _reference_gradients(trip)
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
     # exclude their declared source prefix as well as independent MTP paths.
-    layouts = indexed(
+    layouts = _indexed(
         (layout.name, layout) for layout in source.weight_layouts
         if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]
         and not layout.paths[0][1].startswith('mtp_')
@@ -539,8 +556,8 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     # does, that name stands; what the reversal built rather than passed
     # through, a fused expert kernel split apart, keeps the name it was
     # built under.
-    named = {id(grad): name for name, grad in upstream.items() if bare(name) in layouts}
-    reference = indexed((named.get(id(value), name), value)
+    named = {id(grad): name for name, grad in upstream.items() if _bare(name) in layouts}
+    reference = _indexed((named.get(id(value), name), value)
                         for name, value in converted.items())
     if set(reference) != set(layouts):
         raise ValueError(f'gradient source/layout bijection differs: '
@@ -573,6 +590,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     """
     import torch
     from transformers.core_model_loading import revert_weight_conversion
+
     from dew.objectives.base import Step, scalar_loss
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
 
