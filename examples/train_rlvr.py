@@ -107,11 +107,31 @@ def _uniform(low: int, high: int) -> Callable[[random.Random], tuple[int, int]]:
     return lambda draw: (draw.randint(low, high), draw.randint(low, high))
 
 
+def _digits(most: int) -> Callable[[random.Random], tuple[int, int]]:
+    """a and b each with 1..most decimal digits, the count uniform, then
+    uniform among the numbers of that many digits. A product's digits and bits
+    spread over a wider range than with a and b uniform in 1..99, where
+    print(18) passed 14.7% of the digit-sum cases and print(6) 23.6% of the
+    popcount ones."""
+    def one(draw: random.Random) -> int:
+        digits = draw.randint(1, most)
+        return draw.randint(10 ** (digits - 1), 10 ** digits - 1)
+    return lambda draw: (one(draw), one(draw))
+
+
 def _shared_factor(draw: random.Random) -> tuple[int, int]:
-    """a and b with a common factor from 1..12. Uniform in 1..99 they were
-    coprime 61% of the time, so print(1) passed that share of the cases."""
-    factor = draw.randint(1, 12)
-    return factor * draw.randint(1, 20), factor * draw.randint(1, 20)
+    """a and b with a common factor from 1..30, redrawn while their gcd is
+    min(a, b) or |a - b|. Uniform in 1..99 they were coprime 61% of the time,
+    so print(1) passed that share of the cases; with a shared factor alone,
+    print(min(a, b)) passed 28% (one cofactor divides the other) and
+    print(abs(a - b)) a quarter (the cofactors are consecutive multiples of
+    their gcd). A gcd is at most min(a, b), so no other echo of a and b
+    can print it."""
+    while True:
+        factor = draw.randint(1, 30)
+        a, b = factor * draw.randint(2, 20), factor * draw.randint(2, 20)
+        if math.gcd(a, b) not in (min(a, b), abs(a - b)):
+            return a, b
 
 
 def _divisor_at_most(draw: random.Random) -> tuple[int, int]:
@@ -121,25 +141,34 @@ def _divisor_at_most(draw: random.Random) -> tuple[int, int]:
     return draw.randint(b, 150), b
 
 
+def _index_and_modulus(draw: random.Random) -> tuple[int, int]:
+    """a from 10..90 and b from 10..999. Both uniform in 1..40, print(1)
+    passed 17.2% of the cases."""
+    return draw.randint(10, 90), draw.randint(10, 999)
+
+
 # (what to print, how to compute it from a and b, how to draw a and b).
 # Qwen3-0.6B solved the one-line arithmetic of an earlier set on 74% of its
-# first draws and on every draw by update 6, which leaves a curve no signal;
-# these need a loop, a number-theory fact or a careful edge case.
+# first draws and on every draw by update 6, which leaves a curve no signal.
+# Each of these takes more than one step, and each draws a and b so that no
+# program that ignores the task, a constant or a, b, min(a, b), max(a, b),
+# a + b, a * b or |a - b|, passes a tenth of its cases.
 TASKS = (
     ("the sum of all integers from min(a, b) to max(a, b) inclusive",
      lambda a, b: sum(range(min(a, b), max(a, b) + 1)), _uniform(-30, 30)),
     ("the number of multiples of b between 1 and a inclusive (both are positive)",
      lambda a, b: a // b, _divisor_at_most),
-    ("the sum of the decimal digits of a times b", lambda a, b: sum(map(int, str(abs(a * b)))), _uniform(1, 99)),
+    ("the sum of the decimal digits of the product a * b",
+     lambda a, b: sum(map(int, str(abs(a * b)))), _digits(6)),
     ("the greatest common divisor of a and b (both are positive)", math.gcd, _shared_factor),
     ("the number of primes p with min(a, b) <= p <= max(a, b)",
      lambda a, b: sum(all(p % d for d in range(2, int(p ** 0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)),
-     _uniform(1, 99)),
+     _uniform(1, 300)),
     ("the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
-     lambda a, b: _fibonacci(a) % b, _uniform(1, 40)),
-    ("the number of 1 bits in the binary form of a times b (both are positive)",
-     lambda a, b: bin(a * b).count("1"), _uniform(1, 99)),
-    ("the integer whose decimal digits are those of a times b in reverse order, without leading zeros",
+     lambda a, b: _fibonacci(a) % b, _index_and_modulus),
+    ("the number of 1 bits in the binary form of the product a * b (both are positive)",
+     lambda a, b: bin(a * b).count("1"), _digits(8)),
+    ("the integer whose decimal digits are those of the product a * b in reverse order, without leading zeros",
      lambda a, b: int(str(a * b)[::-1]), _uniform(1, 99)),
 )
 
