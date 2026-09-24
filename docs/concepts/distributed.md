@@ -92,6 +92,8 @@ Cached autoregressive generation needs `sequence=1`. A mesh that trains with seq
 
 `scan_layers=True` groups compatible consecutive decoder layers into a Flax scan. The stored variables stay per layer. Scanning can cut compile time, but it adds stacking and loop overhead. It does not promise a flat compile time or faster steps. Measure it at the model size and on the backend you plan to use.
 
+`init` draws each run of two or more like layers under the same scan, whatever `scan_layers` says, so its program holds one draw per run rather than one per layer. Those layers get new values at a given seed, from the same distribution, and the draw depends on `bank_layers`, which splits the runs. Runs recorded with a Dew version that initialized layer by layer start from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
+
 `MeshSpec(stage=N, microbatches=M)` turns on the GPipe-style pipeline. The layer pattern must repeat across stages and split evenly between them. Embeddings, the output head and other operations outside the layer stack are not split across pipeline stages. Only a decoder's layer stack pipelines: the trainer refuses a stage axis under a model that runs no pipeline, such as a DiT, because every stage would compute the whole step. Microbatch m takes rows m, m + M, m + 2M and so on, so each microbatch keeps its rows on the batch shards that hold them.
 
 The stored master parameters are replicated over the stage axis, and each step builds a view that is partitioned by stage. Count that copy and its communication when you estimate memory savings. Some mixed layer patterns and KV-sharing configurations cannot use this pipeline. Cached decoding also needs `stage=1`.
