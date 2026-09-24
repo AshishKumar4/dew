@@ -141,7 +141,9 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
         np.testing.assert_array_equal(np.asarray(state.params["buffers"][name]), buffer)
     layer = "gpt_neox.layers.0"
     assert moved[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
-    assert moved[f"{layer}.mlp.dense_4h_to_h.weight"].sharding.spec == P(None, ("fsdp", "tensor"))
+    # The row-parallel projection, [embed, mlp] in torch: the residual width
+    # takes fsdp and the 4h width the tensor axis (8a6ff3e8's Megatron 2-D).
+    assert moved[f"{layer}.mlp.dense_4h_to_h.weight"].sharding.spec == P("fsdp", "tensor")
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
