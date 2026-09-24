@@ -1,12 +1,12 @@
 """Generate the supported-models page from the registries in Dew's source.
 
 The families come from the code, not from a list kept by hand: the decoder
-table `_FAMILY_ENTRIES` and the multimodal wrappers in
+table `_FAMILY_ENTRIES` and the branches of `translate_wrapper_config` in
 `dew/interop/hf_decoders.py`, the diffusers pipelines in
 `dew/interop/pretrained.py`, and the classes registered with `@models(...)`.
-LABELS below only gives each one a readable name and a group. The build fails
-when the code registers a family that LABELS does not name, or when LABELS
-names one the code no longer has.
+DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
+a group. The build fails when the code registers a family those tables do not
+name, or when they name one the code no longer has.
 """
 
 from __future__ import annotations
@@ -122,21 +122,18 @@ def decoder_families() -> list[tuple[str, str]]:
 
 
 def wrappers() -> list[str]:
-    """The multimodal model_types that load: listed in `_WRAPPERS` and translated by `translate_wrapper_config`.
-
-    A type in `_WRAPPERS` that the translator has no branch for is refused at load time, so it is not listed.
-    """
+    """The multimodal model_types that load: the branches of `translate_wrapper_config`, in source order."""
     tree = module_tree("src/dew/interop/hf_decoders.py")
-    registered = list(ast.literal_eval(assigned(tree, "_WRAPPERS")))
-    translator = next(node for node in tree.body
-                      if isinstance(node, ast.FunctionDef) and node.name == "translate_wrapper_config")
-    translated = {
-        node.comparators[0].value
-        for node in ast.walk(translator)
+    translator = next((node for node in tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == "translate_wrapper_config"), None)
+    if translator is None:
+        raise SystemExit("gen_models: translate_wrapper_config is gone from the source; update scripts/gen_models.py")
+    branches = [
+        node for node in ast.walk(translator)
         if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "model_type"
         and isinstance(node.ops[0], ast.Eq) and isinstance(node.comparators[0], ast.Constant)
-    }
-    return [model_type for model_type in registered if model_type in translated]
+    ]
+    return [node.comparators[0].value for node in sorted(branches, key=lambda node: node.lineno)]
 
 
 def pipelines() -> list[str]:

@@ -3,8 +3,10 @@
 // Opening a session renders a Turnstile check, asks the Worker for a session,
 // and connects its WebSocket; the protocol is described in site/live/container/server.py.
 
-const ENDPOINT = import.meta.env.PUBLIC_LIVE_ENDPOINT as string | undefined;
-const SITEKEY = import.meta.env.PUBLIC_TURNSTILE_SITEKEY as string | undefined;
+import { live } from '../live.mjs';
+
+const ENDPOINT = live.endpoint;
+const SITEKEY = live.turnstileSitekey;
 
 export const liveEnabled = Boolean(ENDPOINT && SITEKEY);
 
