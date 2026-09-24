@@ -12,6 +12,7 @@ the reference the pool is compared with.
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +23,10 @@ BATCH = 8
 TINY_SHARD = 256
 
 
-def packed_batch() -> dict[str, np.ndarray]:
+def packed_batch(seed: int = 0) -> dict[str, np.ndarray]:
     """Two documents a row, the boundary moving from row to row, and the tail
     of the last row padding (segment 0)."""
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(seed)
     text = rng.integers(1, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)
     segments = np.ones((BATCH, SEQ_LEN + 1), np.int32)
     positions = np.zeros((BATCH, SEQ_LEN + 1), np.int32)
@@ -46,14 +47,17 @@ def fsdp_group_processes(mesh) -> list[list[int]]:
 
 
 class Losses:
-    """The tracker the fit reports to: the loss of every step, in order."""
+    """The tracker the fit reports to: the loss of every step, in order, and
+    the step each was logged at."""
 
     def __init__(self):
         self.losses: list[float] = []
+        self.steps: list[int] = []
 
     def log(self, scalars, step):
         if "train/loss" in scalars:
             self.losses.append(float(scalars["train/loss"]))
+            self.steps.append(int(step))
 
     def artifact(self, value, step):
         pass
@@ -67,6 +71,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--fail-at", type=int, default=None,
                         help="process 1's loader raises when asked for this batch (0-based)")
+    parser.add_argument("--checkpoints", type=Path, default=None,
+                        help="the run's checkpoint directory, resumed from when it holds one")
+    parser.add_argument("--step-seconds", type=float, default=0.0,
+                        help="how long the loader takes over each batch, to slow the run down")
+    parser.add_argument("--vary", action="store_true",
+                        help="a new packed batch every step, from a stream a checkpoint can put back")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -77,6 +87,7 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
+    from dew.checkpoints import Checkpoints
     from dew.data import Dataset
     from dew.objectives.lm import LMObjective
     from dew.registry import models
@@ -95,15 +106,41 @@ def main() -> None:
             if read == args.fail_at and jax.process_index() == 1:
                 raise RuntimeError(f"injected failure reading batch {read}")
             read += 1
+            time.sleep(args.step_seconds)
             yield mine
+
+    class Stream:
+        """A partition's share of a new packed batch at every step, drawn from
+        the step's index, and where it stands, so a resumed run reads on."""
+
+        def __init__(self, partition):
+            self.partition, self.read = partition, 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            time.sleep(args.step_seconds)
+            rows = self.partition.rows(BATCH)
+            batch = packed_batch(self.read)
+            self.read += 1
+            return {name: leaf[self.partition.index * rows:(self.partition.index + 1) * rows]
+                    for name, leaf in batch.items()}
+
+        def get_state(self) -> bytes:
+            return str(self.read).encode()
+
+        def set_state(self, state: bytes) -> None:
+            self.read = int(state)
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     losses = Losses()
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
-                      checkpoints=None, tracker=losses)
-    trainer.fit(Dataset(train=share, val=None, records=None, batch=BATCH),
+                      checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
+                      tracker=losses)
+    trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
                 steps=args.steps, log_every=1)
 
     # A leaf whose second dimension the sequence axis splits, placed from the
@@ -123,6 +160,7 @@ def main() -> None:
             "partition": {"count": partition.count, "readers": partition.readers},
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
             "losses": losses.losses,
+            "loss_steps": losses.steps,
         }))
 
 

@@ -93,6 +93,27 @@ def test_a_rank_printing_bytes_that_are_not_utf8_still_finishes():
     assert "[0] \ufffd\ufffd" in output.decode()
 
 
+def test_a_signalled_pool_gets_a_checkpoints_grace_and_a_second_signal_ends_it(tmp_path):
+    """A stop signal gives the ranks the time a training run needs to reach
+    the step they agree on and checkpoint it; a JAX rank takes SIGTERM as a
+    preemption notice and runs on meanwhile. These ranks ignore SIGTERM as
+    such a rank does: they still run past the 10 s a failed peer's pool
+    gets, which cut every preemption checkpoint off, and a second signal
+    ends them at once."""
+    program = "import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" + WAITING_RANK
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path))
+    ranks = started_ranks(tmp_path, 2)
+    launch.send_signal(signal.SIGTERM)
+    time.sleep(15)
+    assert launch.poll() is None and all(alive(pid) for pid in ranks)
+    again = time.monotonic()
+    launch.send_signal(signal.SIGTERM)
+    assert launch.wait(timeout=30) == 128 + signal.SIGTERM
+    assert time.monotonic() - again < 5
+    assert not any(alive(pid) for pid in ranks)
+
+
 def test_a_rank_killed_by_a_signal_exits_the_launch_128_plus_it():
     """The OOM killer's SIGKILL reads as 137, the shell's convention, which
     wrappers test for; Python's -9 would reach the shell as 247."""
