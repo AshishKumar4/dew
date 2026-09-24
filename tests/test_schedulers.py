@@ -295,14 +295,40 @@ def test_the_schedule_weight_is_the_default():
 def test_preset_weights_the_training_schedule_with_min_snr(preset):
     """min_snr_gamma on a preset is the MinSNR weighting of its process; left
     unset, the process keeps the schedule's own weight."""
-    assert preset(min_snr_gamma=5.0)().weighting == MinSNR(5.0)
-    assert preset()().weighting == ScheduleWeighting()
+    fields = {"regime": "pixel"} if preset is presets.EDM else {}
+    assert preset(min_snr_gamma=5.0, **fields)().weighting == MinSNR(5.0)
+    assert preset(**fields)().weighting == ScheduleWeighting()
+
+
+@pytest.mark.parametrize("regime, P_mean, P_std", [("pixel", -1.2, 1.2), ("latent", -0.4, 1.0)])
+def test_edm_draws_the_sigmas_of_the_space_it_denoises(regime, P_mean, P_std):
+    """Pixels train on Karras et al. 2022's log-normal sigmas and latents on
+    EDM2's; sigmas stated outright win, and a preset that names neither
+    builds nothing rather than picking one."""
+    schedule = presets.EDM(regime=regime)().schedule
+    assert isinstance(schedule, EDMNoiseScheduler)
+    assert (schedule.P_mean, schedule.P_std) == (P_mean, P_std)
+    stated = presets.EDM(regime=regime, P_mean=-0.8, P_std=1.1)().schedule
+    assert isinstance(stated, EDMNoiseScheduler) and (stated.P_mean, stated.P_std) == (-0.8, 1.1)
+    recorded = presets.EDM(P_mean=-0.4, P_std=1.0)().schedule
+    assert isinstance(recorded, EDMNoiseScheduler) and (recorded.P_mean, recorded.P_std) == (-0.4, 1.0)
+    with pytest.raises(ValueError, match="regime='pixel'"):
+        presets.EDM()()
+
+
+def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with():
+    from dew.objectives.diffusion.config import DiffusionRunConfig, StableDiffusionAutoencoder
+
+    assert DiffusionRunConfig().preset == presets.EDM(regime="pixel")
+    assert DiffusionRunConfig(autoencoder=StableDiffusionAutoencoder()).preset == presets.EDM(regime="latent")
+    stated = presets.EDM(P_mean=-0.4, P_std=1.0)
+    assert DiffusionRunConfig(preset=stated).preset == stated
 
 
 def test_edm_preset_samples_on_the_karras_grid():
     """Training draws log-normal sigmas; inference walks the rho-spaced grid
     with the same sigma range and sigma_data."""
-    process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7)()
+    process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7, regime="pixel")()
     assert isinstance(process.schedule, EDMNoiseScheduler)
     assert isinstance(process.sampler_schedule, KarrasVENoiseScheduler)
     # Eq. 5 at rho 5: the endpoints are the preset's sigma range and the

@@ -105,7 +105,7 @@ def train():
     )
     objective = DiffusionObjective(
         model,
-        EDM()(),
+        EDM(regime="pixel")(),
         InputSpec(Field("image", (64, 64, 3))),
     )
     trainer = Trainer(
@@ -152,7 +152,7 @@ trainer = Trainer(
 Set `ema_decay` when you construct the objective. A value closer to 1 averages weights over more updates:
 
 ```python
-process = EDM()()
+process = EDM(regime="pixel")()
 objective = DiffusionObjective(
     model,
     process,
@@ -1058,7 +1058,7 @@ config = DiffusionRunConfig(
         loading=Loading(workers=0, threads=1, read_buffer=2),
     ),
     trainer=TrainerConfig(checkpoint_dir=str(run), batch_size=16, steps=20, keep=1),
-    preset=presets.EDM(),
+    preset=presets.EDM(regime="pixel"),
     text=None,
 )
 

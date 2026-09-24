@@ -19,7 +19,7 @@ The process gives the rest of the code three things. `process.noise(key, shape)`
 
 ## Presets
 
-A preset is a frozen dataclass of the numbers that define a published convention, and calling it builds the process: `EDM()` is the configuration and `EDM()()` the `Process`. A run's `run.json` stores the preset's fields, so sampling always rebuilds the convention the model was trained with.
+A preset is a frozen dataclass of the numbers that define a published convention, and calling it builds the process: `EDM(regime="pixel")` is the configuration and `EDM(regime="pixel")()` the `Process`. EDM's regime chooses the training noise levels, Karras et al. 2022's for pixels or EDM2's for latents; a preset that names neither refuses to build, and a run config fills it from whether the run has an autoencoder. A run's `run.json` stores the preset's fields, so sampling always rebuilds the convention the model was trained with.
 
 | Preset | Convention |
 |---|---|

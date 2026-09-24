@@ -190,11 +190,13 @@ class Process:
 @dataclass(frozen=True)
 class EDM:
     sigma_min: float = 0.002; sigma_max: float = 80.0; rho: float = 7.0
-    sigma_data: float = 0.5; P_mean: float = -0.4; P_std: float = 1.0
+    sigma_data: float = 0.5
+    regime: Literal["pixel", "latent"] | None = None  # Karras 2022's or EDM2's training sigmas
+    P_mean: float | None = None; P_std: float | None = None  # stated, they override the regime's
     min_snr_gamma: float | None = None
     def __call__(self) -> Process: ...
 
-process = presets.EDM(sigma_data=0.5)()
+process = presets.EDM(sigma_data=0.5, regime="pixel")()
 ```
 
 `get_diffusion_preset` and its 3-tuple go. min-SNR no longer needs the schedule to hold the transform (`schedules/common.py:28-31, 55-58`). The preset dataclass is what the run manifest stores and the pipeline rebuilds, which is what the bug fixed in `a65d447` needed.
@@ -278,7 +280,7 @@ text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperatu
 
 ```python
 # diffusion
-process = presets.EDM()()
+process = presets.EDM(regime="pixel")()
 inputs = InputSpec(sample=Field("image", (128, 128, 3)),
                    conditions={"textcontext": Condition(encoders.CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
 objective = DiffusionObjective(models.SimpleDiT(patch_size=4, emb_features=512, num_layers=12, num_heads=8),

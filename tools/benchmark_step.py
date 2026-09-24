@@ -681,7 +681,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
-        process = presets.EDM()()
+        process = presets.EDM(regime="pixel")()
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
