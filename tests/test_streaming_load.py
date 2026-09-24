@@ -73,3 +73,39 @@ def test_a_stacked_transposed_leaf_reads_any_block_as_the_whole_leaf_holds_it():
     for index in [(slice(1, 3), slice(None), slice(2, 4)), (slice(0, 1), slice(1, 3), slice(None)),
                   (slice(None), slice(3, 4), slice(0, 6))]:
         np.testing.assert_array_equal(leaf.read(index), whole[index])
+
+
+@pytest.mark.mesh
+def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
+    """Each shard a `HostSource` reads is on its device and released before
+    the next is read, so the host never holds two of a leaf's shards; a
+    placement that read every shard first would hold all eight."""
+    import gc
+    import weakref
+
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training.host import place_leaf
+
+    class Recorded:
+        def __init__(self, value: np.ndarray):
+            self.value, self.shape, self.ndim = value, value.shape, value.ndim
+            self.held: list[weakref.ref] = []
+            self.most = 0
+
+        def read(self, index):
+            gc.collect()
+            self.held = [ref for ref in self.held if ref() is not None]
+            self.most = max(self.most, len(self.held) + 1)
+            part = np.array(self.value[index])
+            self.held.append(weakref.ref(part))
+            return part
+
+        def release(self):
+            pass
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ("fsdp",))
+    source = Recorded(np.arange(jax.device_count() * 256, dtype=np.float32).reshape(jax.device_count(), 256))
+    placed = place_leaf(source, NamedSharding(mesh, PartitionSpec("fsdp")))
+    np.testing.assert_array_equal(np.asarray(placed), source.value)
+    assert source.most == 1
