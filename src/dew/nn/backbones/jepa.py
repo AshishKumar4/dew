@@ -13,7 +13,7 @@ position is carried entirely by the 2D sincos embedding that travels with
 each token.
 """
 
-from typing import Literal, Sequence
+from typing import ClassVar, Literal, Sequence
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -153,6 +153,9 @@ class JepaEncoder(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
+    stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack
+    """The layers between the patches and the norm: `TokenStack` over one
+    image's tokens, `FactorizedTokenStack` over a clip's frames."""
 
     def setup(self):
         self.embed = PatchSequenceEmbed(
@@ -162,7 +165,7 @@ class JepaEncoder(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
         )
-        self.stack = TokenStack(
+        self.stack = self.stack_type(
             features=self.emb_features, num_layers=self.num_layers,
             num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
             ssm_attention_ratio=self.ssm_attention_ratio,
@@ -182,49 +185,14 @@ class JepaEncoder(nn.Module):
 
 
 @models("jepa_video_encoder")
-class JepaVideoEncoder(nn.Module):
+class JepaVideoEncoder(JepaEncoder):
     """Factorized spatial-temporal encoder over (B, T, H, W, C).
 
     token_idx selects a tubelet: the same patch positions in every frame, so
     the factorized layout survives masking untouched.
     """
-    patch_size: int = 16
-    emb_features: int = 384
-    num_layers: int = 12
-    num_heads: int = 6
-    mlp_ratio: int = 4
-    ssm_attention_ratio: str = "all-attn"
-    ssm_state_dim: int = 64
-    bidirectional_ssm: bool = True
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
-
-    def setup(self):
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
-        self.stack = FactorizedTokenStack(
-            features=self.emb_features, num_layers=self.num_layers,
-            num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
-            ssm_attention_ratio=self.ssm_attention_ratio,
-            ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
-        )
-        self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
+    stack_type = FactorizedTokenStack
 
     def __call__(self, x, token_idx=None, train: bool = False):
         B, T, H, W, C = x.shape
