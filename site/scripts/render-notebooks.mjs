@@ -212,7 +212,16 @@ for (const file of files) {
 		},
 		parts.join('\n\n'),
 	);
-	listing.push({ slug, number: stem.slice(0, 2), label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0] });
+	// The numbers the Settings cell assigns at the top level (`STEPS = 6000`), before any smoke-test override,
+	// so other pages can quote a notebook's own settings.
+	const settingsCell = cells.find((cell) => cell.cell_type === 'code' && /^STEPS = /m.test(joined(cell.source)));
+	const settings = Object.fromEntries(
+		[...(settingsCell ? joined(settingsCell.source) : '').matchAll(/^([A-Z][A-Z0-9_]*) = ([0-9][0-9_.e+-]*)\s*$/gm)].map((match) => [
+			match[1],
+			Number(match[2].replace(/_/g, '')),
+		]),
+	);
+	listing.push({ slug, number: stem.slice(0, 2), label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0], settings });
 	notebookOutputs[stem] = outputsByCell;
 }
 
