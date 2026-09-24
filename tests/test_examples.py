@@ -10,6 +10,7 @@ import importlib.util
 import itertools
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -205,6 +206,30 @@ def test_train_rlvr_starts_its_engine_with_that_engines_own_build_tools_first(tm
     with pytest.raises(RuntimeError, match="exited with 3"):
         example.launch_engine(config, tmp_path / "served")
     assert found.read_text().strip() == str(environment / "ninja")
+
+
+def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
+    """Outside --smoke the run is the documented one: bf16, four loader
+    workers, the persistent cache, and a process pool when a cluster started
+    the run. On one machine it runs alone. The committed tiny Gemma 4 and the
+    vocabulary its ids were written against stand in for the Hub checkpoint,
+    one directory as a published checkpoint is."""
+    fixtures = REPO_ROOT / "tests/fixtures/hf"
+    model = tmp_path / "model"
+    shutil.copytree(fixtures / "gemma4-ple", model)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(fixtures / "diffusion-gemma-workflow" / name, model / name)
+    example = load_example("sft_gemma4")
+    chat = example.write_conversations(example.SMOKE_CONVERSATIONS, tmp_path)
+
+    finished = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "examples/sft_gemma4.py"), "--model", str(model),
+         "--dataset", str(chat), "--sequence-length", "15", "--batch-size", "2",
+         "--accumulation", "2", "--steps", "2", "--out", str(tmp_path / "run")],
+        cwd=REPO_ROOT, env=single_device(), capture_output=True, text=True, timeout=900)
+
+    assert finished.returncode == 0, finished.stderr[-3000:]
+    assert (tmp_path / "run" / "export" / "model.safetensors").is_file()
 
 
 @pytest.mark.parametrize("new_tokens", [1, 128])

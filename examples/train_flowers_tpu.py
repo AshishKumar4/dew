@@ -149,7 +149,6 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
                               batch_size=config.batch_size, steps=config.steps,
                               log_every=50, eval_every=2000, checkpoint_every=2000,
-                              mesh=MeshSpec(fsdp=jax.device_count()),
                               profile=ProfileWindow(str(config.out / "profile"), steps=5,
                                                     warmup=20),
                               multi_host=True))
@@ -178,6 +177,11 @@ def main(config: Config) -> Path:
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+    if not config.smoke:
+        # Only now: counting devices opens the backend, which has to come
+        # after the slice's processes join, and a pool's count is every
+        # host's devices.
+        run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     objective = run.build()
     data = run.data.load(batch=run.trainer.batch_size, tokenize=objective.inputs.tokenize)

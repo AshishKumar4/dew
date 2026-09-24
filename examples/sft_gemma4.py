@@ -91,12 +91,13 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
         sample_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
                           clip_grads=1.0),
+        # A smoke run stays out of any process pool; a real run joins one
+        # when a cluster started it and runs alone otherwise.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
                               batch_size=config.batch_size, steps=config.steps,
                               accumulation=config.accumulation, log_every=1 if smoke else 20,
                               eval_every=config.steps, checkpoint_every=config.steps,
-                              mesh=MeshSpec(fsdp=jax.device_count()),
-                              multi_host=not smoke,
+                              multi_host=False if smoke else None,
                               compilation_cache_dir=None if smoke else
                               TrainerConfig().compilation_cache_dir))
 
@@ -114,6 +115,9 @@ def main(config: Config) -> Path:
     run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+    # Only now: counting devices opens the backend, which has to come after
+    # the pool forms, and a pool's count is every process's devices.
+    run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     source = load_pretrained(config.model, dtype=run.model.dtype,
                              attention_impl=run.model.attention_impl,
