@@ -91,7 +91,6 @@ class VideoDiT(nn.Module):
             precision=self.precision,
         )
 
-    @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         B, T, H, W, C = x.shape
 
