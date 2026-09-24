@@ -261,6 +261,27 @@ def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
     return remat
 
 
+def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
+    """Refuse a state that holds float64 or complex128 on a TPU mesh.
+
+    XLA's TPU backend has no 64-bit floats. It rewrites them into pairs of
+    32-bit ones, which are not IEEE doubles (0.02 came back as
+    0.01999999999999999 on a v6e), and the rewrite has no case for nextafter,
+    which a truncated normal initializer runs, or for ragged_dot, which a
+    routed mixture runs. A float64 state there is wrong in its last bits or
+    does not compile, and float64 is asked for exactly those bits."""
+    if mesh.devices.flat[0].platform != "tpu":
+        return
+    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state)
+            if leaf.dtype in (jnp.float64, jnp.complex128)]
+    if wide:
+        others = f" and {len(wide) - 1} more state leaves" if len(wide) > 1 else ""
+        raise ValueError(
+            f"{wide[0]}{others} hold 64-bit floats, and a TPU has no float64: XLA rewrites it "
+            "into pairs of float32, which are not IEEE doubles and have no nextafter or "
+            "ragged_dot. Keep the state in float32 on a TPU, or train it on a CPU or a GPU.")
+
+
 def recompute_more(objective) -> bool:
     """Move the objective's model one rung up its remat ladder, and say
     whether there was a rung to move to."""
@@ -499,6 +520,7 @@ class Trainer(Generic[Loss, Effects]):
             from dew.training.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
         abstract = jax.eval_shape(self.initial_state, initializer, key)
+        refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
         self.layout.check(abstract.params, shardings.params, self.device_mesh)
         checkpoints = self.checkpoints
