@@ -1,0 +1,102 @@
+---
+// Starlight's header with the site's top-level sections between the title and search.
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import SocialIcons from 'virtual:starlight/components/SocialIcons';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import { sections, sectionOf } from '../../nav.mjs';
+
+const current = sectionOf(Astro.url.pathname);
+---
+
+<div class="header">
+	<div class="title-wrapper sl-flex">
+		<SiteTitle />
+		<nav class="sections sl-hidden md:sl-flex" aria-label="Sections">
+			{
+				sections.map((section) => (
+					<a href={section.href} aria-current={section.key === current ? 'true' : undefined}>
+						{section.label}
+					</a>
+				))
+			}
+		</nav>
+	</div>
+	<div class="sl-flex print:hidden">
+		<Search />
+	</div>
+	<div class="sl-hidden md:sl-flex print:hidden right-group">
+		<div class="sl-flex social-icons">
+			<SocialIcons />
+		</div>
+		<ThemeSelect />
+	</div>
+</div>
+
+<style>
+	.header {
+		display: flex;
+		gap: var(--sl-nav-gap);
+		justify-content: space-between;
+		align-items: center;
+		height: 100%;
+		border: 0;
+	}
+
+	.title-wrapper {
+		overflow: clip;
+		padding: 0.25rem;
+		margin: -0.25rem;
+		min-width: 0;
+		align-items: center;
+		gap: 1.75rem;
+	}
+
+	.sections {
+		gap: 0.25rem;
+		align-items: center;
+	}
+
+	.sections a {
+		color: var(--sl-color-gray-2);
+		text-decoration: none;
+		font-size: 0.875rem;
+		font-weight: 500;
+		padding: 0.35rem 0.6rem;
+		border-radius: 0.4rem;
+		white-space: nowrap;
+	}
+
+	.sections a:hover {
+		color: var(--sl-color-white);
+		background: var(--sl-color-gray-6);
+	}
+
+	.sections a[aria-current='true'] {
+		color: var(--sl-color-white);
+		background: var(--sl-color-gray-6);
+	}
+
+	.right-group,
+	.social-icons {
+		gap: 1rem;
+		align-items: center;
+	}
+
+	.social-icons::after {
+		content: '';
+		height: 2rem;
+		border-inline-end: 1px solid var(--sl-color-gray-5);
+	}
+
+	@media (min-width: 50rem) {
+		.header {
+			display: grid;
+			grid-template-columns: auto 1fr auto;
+			align-content: center;
+		}
+		.header > :nth-child(2) {
+			justify-content: flex-end;
+		}
+	}
+</style>
