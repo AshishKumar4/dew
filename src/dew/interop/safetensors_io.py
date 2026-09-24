@@ -11,7 +11,6 @@ The names on disk are the module names in the tree.
 
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 from typing import Callable, Collection, Mapping
@@ -199,16 +198,6 @@ def _tensor_offsets(path: str, header: object) -> dict[str, int]:
     return offsets
 
 
-def _header(filename: str) -> dict:
-    """A safetensors file's header table, read without touching its data."""
-    with open(filename, "rb") as stream:
-        length = int.from_bytes(stream.read(8), "little")
-        header = json.loads(stream.read(length))
-    if not isinstance(header, dict):
-        raise ValueError(f"{filename} is not a safetensors file: its header is not a table")
-    return header
-
-
 WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
 """The weights file stems of a diffusers model and a transformers model."""
 
@@ -283,32 +272,6 @@ def read_weights(folder) -> dict[str, np.ndarray]:
             owner[name] = shard
             tensors[name] = value
     return tensors
-
-
-def layer_bytes(directory) -> int:
-    """How many bytes a checkpoint's numbered layers hold, from the headers alone.
-
-    A host-streamed run keeps every layer of its stacks in pinned host
-    memory, and the pool that memory comes from is sized by a process
-    limit that must be set before the JAX backend starts. This reads only
-    the headers of the shards `directory` holds, so a launcher can size the
-    limit before importing anything that starts a backend. The weights are
-    the files `weight_files` selects, in `directory` and
-    in each component directory of a pipeline; layers are the tensors named
-    under `layers.<n>.`, as Hugging Face layouts name them.
-    """
-    directory = Path(directory)
-    shards: list[Path] = []
-    for root in (directory, *sorted(child for child in directory.iterdir() if child.is_dir())):
-        shards.extend(root / name for name in weight_files(_listing(root), "", _json_reader(root)))
-    total = 0
-    for shard in shards:
-        for name, entry in _header(os.fspath(shard)).items():
-            if name == "__metadata__" or not re.search(r"\.layers\.\d+\.", name):
-                continue
-            offsets = entry["data_offsets"]
-            total += int(offsets[1]) - int(offsets[0])
-    return total
 
 
 def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
