@@ -548,15 +548,17 @@ def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_
 
 CT_FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "compressed_tensors.npz"
 """tools/compressed_tensors_reference.py's output: compressed-tensors 0.17.1's
-own compressors and decompressors on eight weight schemes."""
+own compressors and decompressors on nine weight schemes."""
 
 CT_SCHEMES = ["pack_int4_group_sym", "pack_int4_group_asym", "pack_int4_actorder", "pack_int8_channel",
-              "fp8_tensor", "fp8_channel", "fp8_block", "int8_channel"]
+              "fp8_tensor", "fp8_channel", "fp8_block", "int8_channel", "nvfp4"]
 
 
-def ct_case(label: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, dict]:
+def ct_case(label: str) -> tuple[dict[str, np.ndarray], dict[str, dict[str, np.ndarray]],
+                                 dict[str, np.ndarray], dict]:
     """One scheme's stored tensors, its requantized tensors (under the module
-    name `m`), the trained weight and the quantization_config."""
+    name `m`) for the trained weight held in bfloat16 and in float32, those
+    trained weights, and the quantization_config."""
     fixture = np.load(CT_FIXTURE)
     meta = json.loads(bytes(fixture["dtypes"]).decode())[label]
     views = {"bfloat16": ml_dtypes.bfloat16, "float8_e4m3fn": ml_dtypes.float8_e4m3fn}
@@ -569,9 +571,10 @@ def ct_case(label: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], n
     parts = [key.split("/", 1)[1] for key in fixture.files if key.startswith(f"{label}/")
              and key.count("/") == 1 and not key.endswith(("dequantized", "trained"))]
     stored = {f"m.{part}": read(f"{label}/{part}", part) for part in parts}
-    requantized = {f"m.{key.rsplit('/', 1)[1]}": read(key, key.rsplit("/", 1)[1]) for key in fixture.files
-                   if key.startswith(f"{label}/requantized/")}
-    trained = fixture[f"{label}/trained"].view(ml_dtypes.bfloat16)
+    requantized = {kind: {f"m.{key.rsplit('/', 1)[1]}": read(key, key.rsplit("/", 1)[1]) for key in fixture.files
+                          if key.startswith(f"{label}/{kind}/")} for kind in ("requantized", "requantized32")}
+    trained = {"requantized": fixture[f"{label}/trained"].view(ml_dtypes.bfloat16),
+               "requantized32": fixture[f"{label}/trained32"]}
     weights = {**meta["weights"], "dynamic": False}
     config = {"quantization_config": {"quant_method": "compressed-tensors", "format": meta["format"],
                                       "config_groups": {"group_0": {"targets": ["Linear"], "weights": weights}}}}
@@ -582,25 +585,27 @@ def ct_case(label: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], n
 def test_a_compressed_tensors_weight_decodes_and_saves_as_the_library_does(label):
     """Decoded as compressed-tensors' own `decompress` returns it, bit for bit,
     and a trained weight, some of it past the code range, writes back the
-    bytes the library's compressor writes against the same scales."""
+    bytes the library's compressor writes against the same scales, whether the
+    model holds it in bfloat16 or, fine-tuned in float32, in float32."""
     stored, requantized, trained, config = ct_case(label)
     codec = codecs.source_quantization(config, grid=stored)
     assert codec is not None and codec.names(stored) == ("m.weight",)
     np.testing.assert_array_equal(codec.decode(stored, "m.weight"),
                                   np.load(CT_FIXTURE)[f"{label}/dequantized"])
-    written = codec.requantize({"m.weight": trained}, ("m.weight",))
-    assert set(written) == set(requantized)
-    for name, value in requantized.items():
-        assert written[name].dtype == value.dtype, name
-        np.testing.assert_array_equal(written[name].view(np.uint8), value.view(np.uint8), err_msg=name)
+    for kind, weight in trained.items():
+        written = codec.requantize({"m.weight": weight}, ("m.weight",))
+        assert set(written) == set(requantized[kind]), kind
+        for name, value in requantized[kind].items():
+            assert written[name].dtype == value.dtype, (kind, name)
+            np.testing.assert_array_equal(written[name].view(np.uint8), value.view(np.uint8), err_msg=f"{kind} {name}")
 
 
 @pytest.mark.parametrize("change, message", [
-    ({"format": "nvfp4-pack-quantized"}, "compressed-tensors format 'nvfp4-pack-quantized'"),
+    ({"format": "marlin-24"}, "compressed-tensors format 'marlin-24'"),
     ({"kv_cache_scheme": {"num_bits": 8}}, "kv_cache_scheme"),
     ({"config_groups": {"g": {"weights": {"num_bits": 4, "type": "int", "strategy": "group", "group_size": 32},
                               "input_activations": {"num_bits": 8, "type": "float", "dynamic": False}}}},
-     "input_activations are static"),
+     "input_activations have dynamic=False"),
 ])
 def test_a_compressed_tensors_config_this_loader_cannot_read_is_refused_by_name(change, message):
     _, _, _, config = ct_case("pack_int4_group_sym")
