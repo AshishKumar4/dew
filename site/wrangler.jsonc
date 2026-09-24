@@ -1,0 +1,16 @@
+// dewml.dev: the built site, served as static assets with no Worker code.
+// Deploy with `pnpm run deploy` after `pnpm build`.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "dewml-site",
+	"account_id": "f44999d1ddda7012e9a87729eba250f1",
+	"compatibility_date": "2026-09-20",
+	"assets": {
+		"directory": "./dist",
+		"html_handling": "auto-trailing-slash",
+		"not_found_handling": "404-page"
+	},
+	"routes": [{ "pattern": "dewml.dev", "custom_domain": true }],
+	"workers_dev": false,
+	"preview_urls": false
+}
