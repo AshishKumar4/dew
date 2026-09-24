@@ -301,6 +301,24 @@ def test_one_slurm_task_joins_no_pool():
 
 
 @pytest.mark.mesh(devices=0)
+def test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins():
+    """srun started one task a node on nodes of four GPUs, not through dew
+    launch. jax gives each Slurm task the one GPU at its SLURM_LOCALID, so
+    the run would train on one GPU of four and nothing would say so; the
+    process refuses before it joins, naming the task count."""
+    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
+           "SLURM_NTASKS": "2", "SLURM_STEP_TASKS_PER_NODE": "1(x2)", "SLURM_NODEID": "0",
+           "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+    env.pop("JAX_PLATFORMS", None)
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode != 0, done.stdout
+    assert "--ntasks-per-node=4" in done.stderr, done.stderr
+
+
+@pytest.mark.mesh(devices=0)
 def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
     """mpirun started inside a one-task allocation sets Open MPI's rank
     variables beside Slurm's. JAX's detection reads Open MPI's first and
