@@ -733,13 +733,17 @@ class Trainer(Generic[Loss, Effects]):
                 if step_fits(self.executable, mesh) or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
+        # The program compiled above, not the jit: a call through the jit
+        # traces and compiles its own, without the step's compiler options,
+        # which was 25 s of an A100's cold start.
+        executable = self.executable
 
         def run(current, batch):
             with self._traced_on(mesh):
                 if current.accumulation is None and self.accumulation > 1 and self.step is None:
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
-                return jitted(current, batch)
+                return executable(current, batch)
         return run
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
