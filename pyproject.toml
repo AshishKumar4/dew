@@ -17,7 +17,7 @@ dependencies = [
     # to a release floor once one ships.
     "flax @ https://github.com/google/flax/archive/4f42ed069731c83ef27fccb0cc42647684f80109.tar.gz",
     # 0.11.2 with the multi-process cache-key fix (AshishKumar4/jax branch
-    # v0.11.2-cache-key-pool-fingerprints, reported as jax-ml/jax#ISSUE): 0.11.2
+    # v0.11.2-cache-key-pool-fingerprints, reported as jax-ml/jax#40940): 0.11.2
     # keys an executable by the compiling process's topology fingerprint, which
     # differs between GPUs with and without NVLink, so a pool across both kinds
     # loaded a step on some processes and compiled it on others, whose sharded
