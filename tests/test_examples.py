@@ -373,20 +373,33 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
     assert {key: counted["live"].get(key, 0) for key in expected} == expected
 
 
-def test_no_constant_answer_passes_a_quarter_of_a_train_rlvr_task():
-    """A policy that prints one number whatever the input earns that number's
-    share of a task's cases. With a and b uniform in 1..99, print(1) passed
-    61% of the gcd cases and print(0) 49% of the multiples ones, a reward for
-    guessing that the policy learns. Over 16,000 records every task's most
-    common answer covers under a quarter of its cases."""
+def test_no_trivial_program_passes_a_tenth_of_a_train_rlvr_task():
+    """A policy that prints what the task doesn't compute earns that
+    program's share of a task's cases: a constant, or a, b, min(a, b),
+    max(a, b), a + b, a * b or |a - b|. With a and b uniform in 1..99,
+    print(1) passed 61% of the gcd cases and print(0) 49% of the multiples
+    ones, and with a shared factor alone print(min(a, b)) or
+    print(abs(a - b)) passed a quarter of the gcd cases: a reward for
+    guessing that the policy learns. Over 16,000 records no such program
+    passes a tenth of any task's cases."""
     import collections
     import json
 
     example = load_example("train_rlvr")
-    answers = collections.defaultdict(collections.Counter)
+    trivial = {"a": lambda a, b: a, "b": lambda a, b: b, "min(a, b)": min, "max(a, b)": max,
+               "a + b": lambda a, b: a + b, "a * b": lambda a, b: a * b, "abs(a - b)": lambda a, b: abs(a - b)}
+    cases = collections.Counter()
+    passed = collections.defaultdict(collections.Counter)
     for row in map(json.loads, example.records(16_000, seed=0)):
+        task = row["prompt"][0]["content"].split(" and prints ", 1)[1][:60]
         for case in json.loads(row["ground_truth"]):
-            answers[row["prompt"][0]["content"].split(" and prints ", 1)[1][:60]][case["stdout"]] += 1
-    shares = {task: counts.most_common(1)[0][1] / sum(counts.values()) for task, counts in answers.items()}
-    assert len(shares) == len(example.TASKS)
-    assert max(shares.values()) < 0.25, {task: round(share, 3) for task, share in shares.items()}
+            a, b = map(int, case["stdin"].split())
+            cases[task] += 1
+            passed[task][f"print({case['stdout']})"] += 1
+            passed[task].update(f"print({name})" for name, program in trivial.items()
+                                if str(program(a, b)) == case["stdout"])
+    best = {task: max((count / cases[task], program) for program, count in programs.items())
+            for task, programs in passed.items()}
+    assert len(best) == len(example.TASKS)
+    assert all(share < 0.1 for share, _ in best.values()), \
+        {task: (round(share, 3), program) for task, (share, program) in best.items()}
