@@ -14,10 +14,20 @@ still run, and the script exits nonzero if any failed.
 run's outputs in place of the old ones and its install cells unexecuted; that
 is how the committed outputs are made, by copying DIR over tutorials/. A cell
 the run did not reach is saved with no output, and the site build refuses it.
+A notebook that ran through also gets `dew.outputs` in its metadata: the last
+commit that changed src/dew in this checkout (so the record survives a rebase
+of a branch that leaves the library alone), the date, the device and the JAX
+version. The site prints it under the notebook's outputs. It assumes the
+interpreter running this script has Dew installed from this checkout.
+
+`--imports FILE` writes, for each notebook that ran through, the Dew modules
+its kernel had imported by the end. tools/check_tutorial_outputs.py compares
+them with each notebook's recorded commit, to catch outputs made before a
+change to the code they ran.
 
     python tools/run_tutorials.py                 # every notebook, smoke size
     python tools/run_tutorials.py 02 04           # the ones whose names start so
-    python tools/run_tutorials.py --workdir /tmp/tutorials
+    python tools/run_tutorials.py --workdir /tmp/tutorials --imports /tmp/imports.json
     python tools/run_tutorials.py --full --save /tmp/executed --timeout 14400
 """
 
@@ -28,6 +38,7 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -39,6 +50,18 @@ from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernel
 from nbformat.v4.rwbase import split_lines
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Run in each kernel after the notebook's last cell: what it imported from Dew, and where it ran.
+PROBE_MARK = "dew-tutorial-probe "
+PROBE = f"""\
+import json as _json, sys as _sys
+import jax as _jax
+print({PROBE_MARK!r} + _json.dumps({{
+    "modules": sorted(name for name in _sys.modules if name == "dew" or name.startswith("dew.")),
+    "jax": _jax.__version__,
+    "device": _jax.devices()[0].device_kind,
+}}))
+"""
 
 
 def is_install(cell) -> bool:
@@ -55,9 +78,19 @@ def smoke_copy(path: Path) -> nbformat.NotebookNode:
     return notebook
 
 
-def committed_form(path: Path, executed: nbformat.NotebookNode) -> str:
-    """The notebook at `path` in the repository's own JSON, with the outputs of `executed`, matched by cell id."""
+def committed_form(path: Path, executed: nbformat.NotebookNode, record: dict | None) -> str:
+    """The notebook at `path` in the repository's own JSON, with the outputs of `executed`, matched by cell id.
+
+    `record` describes the run for the notebook's metadata; without one (the run failed) an
+    earlier run's record is dropped, since it no longer describes the outputs.
+    """
     notebook = json.loads(path.read_text())
+    dew = notebook["metadata"].pop("dew", {})
+    dew.pop("outputs", None)
+    if record is not None:
+        dew["outputs"] = record
+    if dew:
+        notebook["metadata"]["dew"] = dew
     runs = {cell["id"]: cell for cell in split_lines(copy.deepcopy(executed)).cells if cell["cell_type"] == "code"}
     for cell in notebook["cells"]:
         if cell["cell_type"] != "code":
@@ -83,18 +116,38 @@ def this_python_kernel(directory: Path) -> str:
     return name
 
 
-def execute(path: Path, workdir: Path, timeout: int, save: Path | None, kernel: str) -> float:
+def library_commit() -> str:
+    """The last commit that changed src/dew in this checkout, which the saved outputs come from."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    if git("status", "--porcelain", "--", "src/dew"):
+        raise SystemExit("src/dew has uncommitted changes, so no commit describes the outputs; commit them before --save")
+    return git("log", "-1", "--format=%H", "--", "src/dew")
+
+
+def execute(path: Path, workdir: Path, timeout: int, kernel: str):
+    """Run one notebook. Returns the executed copy, what the probe found (None when a cell failed),
+    the seconds it took and the error that stopped it, if one did."""
     notebook = smoke_copy(path)
+    notebook.cells.append(nbformat.v4.new_code_cell(PROBE))
     client = NotebookClient(notebook, timeout=timeout, kernel_name=kernel,
                             resources={"metadata": {"path": str(workdir)}})
     started = time.monotonic()
+    error = None
     try:
         client.execute()
-    finally:
-        # A notebook that fails is saved too, with the outputs up to the failing cell.
-        if save:
-            (save / path.name).write_text(committed_form(path, notebook))
-    return time.monotonic() - started
+    except (CellExecutionError, CellTimeoutError, DeadKernelError) as caught:
+        error = caught
+    seconds = time.monotonic() - started
+    probe_cell = notebook.cells.pop()
+    if error is not None:
+        return notebook, None, seconds, error
+    for output in probe_cell.outputs:
+        for line in output.get("text", "").splitlines():
+            if line.startswith(PROBE_MARK):
+                return notebook, json.loads(line[len(PROBE_MARK):]), seconds, None
+    raise SystemExit(f"{path.name}: the probe after the last cell printed nothing: {probe_cell.outputs}")
 
 
 def main() -> int:
@@ -104,6 +157,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=1800, help="seconds one cell may take")
     parser.add_argument("--full", action="store_true", help="run at the committed sizes, on the accelerator JAX finds")
     parser.add_argument("--save", type=Path, help="write each notebook, with this run's outputs, to this directory")
+    parser.add_argument("--imports", type=Path, help="write the Dew modules each notebook imported, as JSON, to this file")
     options = parser.parse_args()
 
     notebooks = sorted((ROOT / "tutorials").glob("*.ipynb"))
@@ -123,16 +177,25 @@ def main() -> int:
         os.environ.setdefault("MPLBACKEND", "Agg")
 
     kernel = this_python_kernel(workdir / ".jupyter")
+    commit = library_commit() if options.save else None
+    imports = {}
     failed = []
     for path in notebooks:
         print(f"{path.name}: running in {workdir}", flush=True)
-        try:
-            seconds = execute(path, workdir, options.timeout, options.save, kernel)
-        except (CellExecutionError, CellTimeoutError, DeadKernelError) as error:
+        executed, probe, seconds, error = execute(path, workdir, options.timeout, kernel)
+        if options.save:
+            # A notebook that fails is saved too, with the outputs up to the failing cell.
+            record = None if probe is None else {
+                "commit": commit, "date": time.strftime("%Y-%m-%d"), "device": probe["device"], "jax": probe["jax"]}
+            (options.save / path.name).write_text(committed_form(path, executed, record))
+        if error is not None:
             failed.append(path.name)
             print(f"{path.name}: FAILED\n{error}", flush=True)
             continue
+        imports[path.name] = probe["modules"]
         print(f"{path.name}: ok in {seconds:.0f} s", flush=True)
+    if options.imports:
+        options.imports.write_text(json.dumps(imports, indent=1) + "\n")
     if failed:
         print(f"{len(failed)} of {len(notebooks)} notebooks failed: {', '.join(failed)}", file=sys.stderr)
         return 1
