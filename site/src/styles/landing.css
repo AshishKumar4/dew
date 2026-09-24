@@ -332,7 +332,8 @@ html[data-has-hero][data-past-hero] header.header {
 	overflow: auto;
 	font: 0.78rem/1.65 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
-	white-space: pre;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 .hero-output-text .line:last-child {
@@ -422,7 +423,8 @@ html[data-has-hero][data-past-hero] header.header {
 	overflow: auto;
 	font: 0.78rem/1.65 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
-	white-space: pre;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 /* Tutorials. */
@@ -515,6 +517,12 @@ html[data-has-hero][data-past-hero] header.header {
 @media (min-width: 62rem) {
 	.run-grid {
 		grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+		align-items: start;
+	}
+	/* The output stays beside the code as you read down the script. */
+	.run-grid .hero-output {
+		position: sticky;
+		top: calc(var(--sl-nav-height) + 1.5rem);
 	}
 	.shown-grid {
 		grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
