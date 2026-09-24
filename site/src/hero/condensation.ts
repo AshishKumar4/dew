@@ -399,8 +399,9 @@ const PALETTES: Record<Theme, Palette> = {
 			[0.02, -0.08, -0.2],
 			[-0.12, -0.05, -0.06],
 		],
-		lens: 1.0,
-		rim: 0.5,
+		// Against a bright pane a drop reads by its darker lens and rim.
+		lens: 0.86,
+		rim: 0.66,
 		spec: [0.5, 0.55, 0.55],
 		bounce: [0.04, 0.12, 0.11],
 		fog: [0.64, 0.665, 0.665],
