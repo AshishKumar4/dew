@@ -6,4 +6,5 @@ dist/
 src/content/docs/
 src/generated/
 src/assets/repo/
+public/repo/
 public/tutorials/
