@@ -276,11 +276,19 @@ def test_a_qwen3_fp8_config_is_read_by_the_codec_and_translates(name):
 
 def test_a_format_the_codec_cannot_read_is_still_refused_on_the_same_config():
     config = fixture_config("qwen3-8b-fp8")
-    config["quantization_config"] = {**config["quantization_config"], "quant_method": "awq"}
+    config["quantization_config"] = {**config["quantization_config"], "quant_method": "bitsandbytes"}
 
-    with pytest.raises(ValueError, match="quant_method 'awq'"):
+    with pytest.raises(ValueError, match="quant_method 'bitsandbytes'"):
         codecs.source_quantization(config)
 
+
+
+def test_an_integer_format_without_its_code_width_is_refused_by_name():
+    config = fixture_config("qwen3-8b-fp8")
+    config["quantization_config"] = {"quant_method": "awq", "group_size": 128, "version": "gemm"}
+
+    with pytest.raises(ValueError, match="awq quantization_config has no bits"):
+        codecs.source_quantization(config)
 
 @pytest.mark.parametrize("name, inert", [
     ("qwen2.5-0.5b", {"use_mrope"}),

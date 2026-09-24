@@ -892,7 +892,10 @@ def gptq(bits: int, *, v1: bool, grid: Mapping[str, np.ndarray] | None = None) -
 def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[int, int]:
     """The `bits` and `group_size` an AWQ or GPTQ config declares, refusing what
     this loader does not decode."""
-    bits, group = records.integer(quantization.get('bits'), f'{method} bits'), quantization.get('group_size')
+    if 'bits' not in quantization:
+        raise ValueError(f"{method} quantization_config has no bits, the code width its weights are packed "
+                         "at; the checkpoint's config.json is incomplete")
+    bits, group = records.integer(quantization['bits'], f'{method} bits'), quantization.get('group_size')
     if method == 'awq':
         if quantization.get('version', 'gemm') != 'gemm' or quantization.get('zero_point', True) is not True:
             raise ValueError(f"awq version {quantization.get('version')!r} with zero_point "
