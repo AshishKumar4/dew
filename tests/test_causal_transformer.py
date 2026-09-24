@@ -1145,3 +1145,35 @@ def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
     model = tiny(initializer_range=0.02, residual_multiplier=0.22, **extra)
     with pytest.raises(ValueError, match="lm-engine's dense and routed blocks"):
         model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+    """A decode step's keys are the cache's filled slots, a count per row, so
+    they reach cuDNN as its padding lengths rather than as a materialized mask:
+    that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
+    cache on an RTX 4080 (1.00 against cuDNN's 0.30 ms a layer at 128 rows),
+    and a small model to cuDNN's bias variant, which reads it per head. The
+    steps still decode what the full pass computes."""
+    from dew.nn.attention import cudnn_runs
+
+    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    full = model.apply(params, ids)
+    prompt, rest = ids[:, :4], ids[:, 4:]
+    incremental = decode_logits(model, params, prompt, rest)
+    np.testing.assert_allclose(np.asarray(incremental, np.float32),
+                               np.asarray(full[:, 3:], np.float32), atol=0.05)
+
+    cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
+    step = jax.jit(lambda cache, token: model.apply({**params, 'cache': cache}, token,
+                                                    decode=True, mutable=['cache']))
+    text = step.lower(cache, ids[:, :1]).compile().as_text()
+    fused = [line for line in text.splitlines() if 'custom_call_target="__cudnn$fmha' in line]
+    if not cudnn_runs(jnp.zeros((1, 1, 4, 32), jnp.bfloat16)):
+        assert not fused
+        return
+    # The filled slots travel as lengths: no [rows, 1, 1, capacity] mask
+    # rides in as a bias the kernel reads for every head.
+    assert fused and not [line for line in fused if "Bias" in line], fused[:1]
