@@ -218,7 +218,8 @@ def tensor_bandwidth(mesh: Mesh, size: int = 1 << 28) -> float:
 
 def _slice(device) -> int:
     """The slice a device sits on; one outside any process pool, such as a
-    lone CPU process's, carries no slice_index and sits on the one there is."""
+    lone CPU process's, carries no slice_index and sits on the one there is.
+    jax's Device declares no such field, so it is read at this boundary."""
     return device.slice_index if hasattr(device, "slice_index") else 0
 
 

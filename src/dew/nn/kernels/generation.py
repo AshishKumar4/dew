@@ -21,12 +21,20 @@ TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v
 BF16_GPU = 80
 
 
+def _compute_capability() -> str | None:
+    """The first device's compute capability, '8.9' for an sm89 card. jax's
+    Device declares no such field, and a CUDA device carries it, so it is
+    read at this boundary; a device without one gives None."""
+    return getattr(jax.devices()[0], 'compute_capability', None)
+
+
 def device_generation() -> str:
     """The default device's hardware generation: 'sm89' for a GPU of compute
     capability 8.9, 'v6e' for a TPU v6e, and the platform's name otherwise."""
     device = jax.devices()[0]
-    if device.platform == 'gpu' and getattr(device, 'compute_capability', None):
-        return 'sm' + device.compute_capability.replace('.', '')
+    capability = _compute_capability() if device.platform == 'gpu' else None
+    if capability:
+        return 'sm' + capability.replace('.', '')
     if device.platform == 'tpu':
         kind = device.device_kind or 'tpu'
         return TPU_GENERATIONS.get(kind, kind)
