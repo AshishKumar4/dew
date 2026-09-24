@@ -486,3 +486,32 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
         assert np.all(np.isfinite(np.asarray(mine))), name
         ours, reference = root_mean_square(mine, want), root_mean_square(theirs, want)
         assert ours <= 2 * reference, (name, ours, reference, largest(mine, theirs))
+
+
+def test_the_kernel_indexes_its_blocks_in_int32_under_x64(reference):
+    """Mosaic cannot return an int64 from an index map ("failed to legalize
+    operation 'func.return'"), and under x64 a Python int traces as one: a
+    process that enabled x64 could not compile the kernel on a TPU. Read off
+    the traced index maps, forward and backward, since only a TPU compiles
+    Mosaic."""
+    operands = scan_operands(reference, 128)
+    with jax.enable_x64(True):
+        program = jax.make_jaxpr(jax.vjp(lambda *o: ssd_chunk_scan(*o, "tpu"), *operands)[1])(
+            tuple(jnp.zeros_like(t) for t in ssd_chunk_scan(*operands, "tpu")))
+        forward = jax.make_jaxpr(lambda *o: ssd_chunk_scan(*o, "tpu"))(*operands)
+    widths = set()
+    for text in (program, forward):
+        for equation in _pallas_calls(text.jaxpr):
+            for mapping in equation.params["grid_mapping"].block_mappings:
+                widths |= {str(aval.dtype) for aval in mapping.index_map_jaxpr.out_avals}
+    assert widths == {"int32"}, widths
+
+
+def _pallas_calls(jaxpr):
+    for equation in jaxpr.eqns:
+        if equation.primitive.name == "pallas_call":
+            yield equation
+        for value in equation.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns"):
+                yield from _pallas_calls(inner)
