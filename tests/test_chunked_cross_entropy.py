@@ -130,6 +130,17 @@ def test_a_flat_head_predicts_the_first_column():
     assert jnp.array_equal(predicted, reference(hidden, flat, targets)[1])
 
 
+def test_the_prediction_is_the_int32_column_under_x64():
+    """jax_enable_x64 widens argmax to int64, while the tile loop carries its
+    best column as int32; the prediction is still the reference's argmax,
+    as int32 columns."""
+    with jax.enable_x64(True):
+        hidden, head, targets = inputs()
+        _, predicted, _ = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4)
+        assert predicted.dtype == jnp.int32
+        assert jnp.array_equal(predicted, reference(hidden, head, targets)[1])
+
+
 # --- the mutations, each one a loss that would still train ------------------
 
 def mutating_chunk_terms(monkeypatch, mutate):
