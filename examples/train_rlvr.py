@@ -364,8 +364,8 @@ def main(config: Config) -> dict:
     config.out.mkdir(parents=True, exist_ok=True)
     tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
     width = rollout_width(config)
-    # The server rounds its cache up to a power-of-two shape bucket, and an
-    # engine refuses a context past the export's; the model's context covers both.
+    # The server rounds its cache up to whole 64-slot tiles, and an engine
+    # refuses a context past the export's; the next shape bucket covers both.
     context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
     source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
                              param_dtype="float32", max_seq_len=context)
