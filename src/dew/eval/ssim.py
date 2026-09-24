@@ -51,11 +51,24 @@ def _ssim_single_channel(
         )
         return out[0, 0]  # (H', W')
 
-    mu_x, mu_y = filt(x), filt(y)
+    # Variance and covariance do not move under a shift, so each plane is
+    # centred on its own mean first. E[x^2] - E[x]^2 then subtracts small
+    # numbers instead of two near-equal large ones. Over the raw planes a
+    # flat region at value c cancels to c^2 (S - S^2), S being the window's
+    # sum as a backend rounds it, which 1 / c2 below turns into 1e-4 of
+    # SSIM. Centred, the residue is (c - mean)^2 (S - S^2): exactly zero
+    # for a constant plane, and smaller for any region nearer the plane's
+    # mean than zero. The shift is exact because the window sums to one, so
+    # filtering a centred plane and adding the mean back is the plane's own
+    # local mean, which the luminance term reads.
+    x_mean, y_mean = jnp.mean(x), jnp.mean(y)
+    x, y = x - x_mean, y - y_mean
+    nu_x, nu_y = filt(x), filt(y)
+    sigma_x2 = filt(x**2) - nu_x**2
+    sigma_y2 = filt(y**2) - nu_y**2
+    sigma_xy = filt(x * y) - nu_x * nu_y
+    mu_x, mu_y = nu_x + x_mean, nu_y + y_mean
     mu_x2, mu_y2, mu_xy = mu_x**2, mu_y**2, mu_x * mu_y
-    sigma_x2 = filt(x**2) - mu_x2
-    sigma_y2 = filt(y**2) - mu_y2
-    sigma_xy = filt(x * y) - mu_xy
 
     c1 = (_K1 * data_range) ** 2
     c2 = (_K2 * data_range) ** 2
