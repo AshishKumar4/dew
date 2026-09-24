@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.precision import head_product, rounded_operand, rounds_to_bf16
+from dew.nn.precision import head_product, rounded_operand, rounded_to, rounds_to_bf16
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -65,6 +65,28 @@ def _operand_dtype(precision: jax.lax.PrecisionLike):
     """The dtype the head's operands take: bf16 under the bf16 algorithm, fp32
     otherwise."""
     return jnp.bfloat16 if precision is BF16 else jnp.float32
+
+
+def _cotangent_product(subscripts: str, cotangent, operand, precision: jax.lax.PrecisionLike):
+    """`cotangent` times an operand that holds the forward's values, in fp32.
+
+    Under the bf16 algorithm the product would round the fp32 cotangent to
+    bf16, and that rounding moved a 4-GPU run's gradients past the layout
+    parity bound: 1.75 of it on a dense model's final norm, 5758 of it on an
+    MoE's expert kernels, against 0.47 and 0.41 with the cotangent kept in
+    fp32. So it enters as a bf16 high half and the bf16 rest, two products
+    whose sum carries it to about 2^-17 of its size; the operand is exact in
+    bf16 already.
+    """
+    def product(left):
+        return jnp.einsum(subscripts, left, operand, precision=precision,
+                          preferred_element_type=jnp.float32)
+
+    if precision is not BF16:
+        return product(cotangent)
+    # A cast pair would be folded away under jit (`rounded_to`), and the rest with it.
+    high = rounded_to(cotangent, jnp.bfloat16)
+    return product(high) + product(cotangent - high)
 
 
 def _capped(logits, softcap, temperature: float = 1.0):
@@ -232,10 +254,9 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
-            def project(states, matrix, cap):
-                return _capped(_tile_logits(states, matrix, precision), cap, temperature)
-
-            logits, pullback = jax.vjp(project, states, matrix, softcap)
+            logits, pullback = jax.vjp(
+                lambda raw, cap: _capped(raw, cap, temperature),
+                _tile_logits(states, matrix, precision), softcap)
             # log Z is the whole row's, so a tile's share of the softmax needs
             # no renormalisation, and a target outside the tile one-hots to
             # zero rather than to a wrapped column.
@@ -245,7 +266,13 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
                 dtype=jnp.float32)
             d_logits = ((token_loss + token_partition)[:, None] * probabilities
                         - token_loss[:, None] * selected)
-            states_tile, matrix_tile, cap_tile = pullback(d_logits)
+            d_raw, cap_tile = pullback(d_logits)
+            states_tile = _cotangent_product('tv,vd->td', d_raw, matrix, precision)
+            # The head's own gradient sums over every token in fp32 already
+            # (`d_matrix`), and a split here costs as much again as the
+            # states': Qwen3-0.6B's step 174.0 against 186.6 ms on an A100.
+            matrix_tile = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
+                                     preferred_element_type=jnp.float32)
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size)
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, prior + states_tile, start, axis=0)
