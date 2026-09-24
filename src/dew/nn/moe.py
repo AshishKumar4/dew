@@ -815,7 +815,10 @@ def expert_compute_dtype(x: jax.Array, *parameters: jax.Array, dtype: Dtype | No
     stored = {parameter.dtype for parameter in parameters}
     if dtype is None and len(stored) == 1:
         (kind,) = stored
-        if jnp.issubdtype(kind, jnp.floating) and jnp.finfo(kind).bits < jnp.finfo(compute).bits:
+        # Narrower than the stream, not than the promotion: a bf16 stream over
+        # fp16 experts promotes to fp32, and fp16 would overflow its values.
+        if (jnp.issubdtype(kind, jnp.floating) and jnp.issubdtype(x.dtype, jnp.floating)
+                and jnp.finfo(kind).bits < jnp.finfo(x.dtype).bits):
             return kind
     return compute
 

@@ -1110,3 +1110,19 @@ def test_a_forward_reads_the_expert_kernels_as_stored(experts, dispatch):
     widened = [line for line in program.splitlines()
                if any(f"f32[{shape}]" in line for shape in kernels)]
     assert not widened, widened[:3]
+
+
+def test_experts_keep_a_stored_dtype_only_when_narrower_than_the_stream():
+    """fp32 over bf16 experts computes in bf16, as stored; bf16 over fp16
+    experts promotes to fp32, since fp16 would overflow bf16 values past
+    65504; one dtype throughout keeps it."""
+    from dew.nn.moe import expert_compute_dtype
+
+    def compute(stream, experts):
+        return expert_compute_dtype(jnp.zeros(2, stream), jnp.zeros(2, experts), dtype=None)
+
+    assert compute(jnp.float32, jnp.bfloat16) == jnp.bfloat16
+    assert compute(jnp.bfloat16, jnp.float16) == jnp.float32
+    assert compute(jnp.bfloat16, jnp.bfloat16) == jnp.bfloat16
+    assert expert_compute_dtype(jnp.zeros(2, jnp.float32), jnp.zeros(2, jnp.bfloat16),
+                                dtype=jnp.float32) == jnp.float32
