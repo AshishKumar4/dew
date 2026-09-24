@@ -15,12 +15,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import jax
-from jax._src.clusters import OmpiCluster, SlurmCluster
 from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
-from dew.pool import PROCESS_COUNT, PROCESS_ID
+from dew.pool import PROCESS_COUNT, PROCESS_ID, detected_cluster
 from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
@@ -102,9 +101,9 @@ def prepare_process(wandb: Wandb | None = None,
 
     # The cluster JAX's detection would take, in its own order: Open MPI's
     # ranks when mpirun started them, then Slurm's tasks.
-    one_task = (multi_host is None and PROCESS_COUNT not in os.environ
-                and not OmpiCluster.is_env_present() and SlurmCluster.is_env_present()
-                and SlurmCluster.get_process_count() == 1)
+    cluster = None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
+    one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
+                and cluster.count == 1)
     if multi_host is not False and not one_task:
         try:
             if PROCESS_COUNT in os.environ:
