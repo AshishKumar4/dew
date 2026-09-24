@@ -33,6 +33,7 @@ from dew.data.sources.text import (
     TokenRecords,
     TokenWindowSource,
 )
+from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
 from dew.objectives.base import scalar_loss
@@ -799,13 +800,21 @@ def _attention_mask(batch, monkeypatch):
     """The mask the backbone hands the attention kernel for this batch.
 
     Recorded at the kernel call, which is the only place the mask has to be
-    right; rebuilding it from the segment ids here would test the test.
+    right; rebuilding it from the batch's segment ids here would test the
+    test. The call hands the kernel a causal flag, a window, a mask and the
+    documents' segment ids, which the fused kernels read natively, so the
+    mask is what the kernel's own helpers make of those arguments.
     """
     seen = []
     kernel = attention_kind.scaled_dot_product_attention
 
     def recording_kernel(query, key, value, **kwargs):
-        seen.append(kwargs.get("mask"))
+        mask, documents = kwargs.get("mask"), kwargs.get("segment_ids")
+        if documents is not None:
+            mask = attention.with_documents(mask, documents)
+        seen.append(attention.combined_attention_mask(
+            query.shape[1], key.shape[1], kwargs.get("causal", False),
+            kwargs.get("sliding_window"), mask))
         return kernel(query, key, value, **kwargs)
 
     tokens = jnp.asarray(batch["text"][:, :-1], jnp.int32)
