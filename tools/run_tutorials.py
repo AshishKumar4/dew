@@ -15,9 +15,9 @@ run's outputs in place of the old ones and its install cells unexecuted; that
 is how the committed outputs are made, by copying DIR over tutorials/. A cell
 the run did not reach is saved with no output, and the site build refuses it.
 A notebook that ran through also gets `dew.outputs` in its metadata: the last
-commit that changed src/dew in this checkout (so the record survives a rebase
-of a branch that leaves the library alone), the date, the device and the JAX
-version. The site prints it under the notebook's outputs. It assumes the
+commit that changed src/dew or pyproject.toml in this checkout (so the record
+survives a rebase of a branch that leaves the library and its dependencies
+alone), the date, the device and the JAX version. The site prints it under the notebook's outputs. It assumes the
 interpreter running this script has Dew installed from this checkout.
 
 `--imports FILE` writes, for each notebook that ran through, the Dew modules
@@ -116,14 +116,18 @@ def this_python_kernel(directory: Path) -> str:
     return name
 
 
+LIBRARY = ("src/dew", "pyproject.toml")  # the code and the pinned dependencies the outputs come from
+
+
 def library_commit() -> str:
-    """The last commit that changed src/dew in this checkout, which the saved outputs come from."""
+    """The last commit that changed the library or its dependencies in this checkout, which the saved outputs come from."""
     def git(*args: str) -> str:
         return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True).stdout.strip()
 
-    if git("status", "--porcelain", "--", "src/dew"):
-        raise SystemExit("src/dew has uncommitted changes, so no commit describes the outputs; commit them before --save")
-    return git("log", "-1", "--format=%H", "--", "src/dew")
+    if git("status", "--porcelain", "--", *LIBRARY):
+        raise SystemExit(f"{' or '.join(LIBRARY)} has uncommitted changes, so no commit describes the outputs; "
+                         "commit them before --save")
+    return git("log", "-1", "--format=%H", "--", *LIBRARY)
 
 
 def execute(path: Path, workdir: Path, timeout: int, kernel: str):
