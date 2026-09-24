@@ -516,6 +516,10 @@ def main() -> None:
                for label, modules in GROUPS]
     (GENERATED / "api.json").write_text(json.dumps(sidebar, indent=1) + "\n")
     (GENERATED / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
+    # What each registry holds, for pages that count or list registered components.
+    (GENERATED / "registries.json").write_text(json.dumps(
+        {name: [{"name": key, "object": path} for key, path in sorted(entries)] for name, entries in sorted(registered.items())},
+        indent=1) + "\n")
     count = sum(1 for path in PAGES for entry in pages[path].entries if home[entry.canonical] == path)
     print(f"gen_api: {len(PAGES)} pages, {count} objects documented")
 
