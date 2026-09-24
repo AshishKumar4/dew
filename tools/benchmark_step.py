@@ -626,12 +626,14 @@ def decoder_objective(case: Case, model) -> Objective:
             return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
 
 
-def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
+def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool = False) -> Objective:
     """The objective a recipe would train for this case.
 
     The model goes through the same precision function the recipes use, so the
     dtype and the attention kernel land in the nested unet attention configs
-    too, and a row of this table is a row a real run would produce.
+    too, and a row of this table is a row a real run would produce. With
+    `widened` every model is built with no dtype of its own instead, so it
+    computes in its variables' dtype: layout_parity's fp64 step.
 
     A composite takes built values rather than a flat record, so its trunk
     goes through the policy and the wrapper takes it, the way the pretrained
@@ -639,10 +641,12 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
     dew.interop.diffusion_gemma.build).
     """
     dtype = case.dtype
-    if dtype is None:
+    if dtype is None and not widened:
         raise ValueError(f"{case.label} names no dtype; build_cases gives it the run's --dtype")
 
     def built(architecture: str, config: Mapping[str, object]):
+        if widened:
+            return models.build(architecture, **config, dtype=None)
         return models.build(architecture, **with_precision(
             architecture, config, dtype=dtype, attention_impl=attention_impl))
 
@@ -659,7 +663,7 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
         # The decoder carries the attention kernel; the wrapper reads none.
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=resolve_dtype(dtype))
+            dtype=None if widened else resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
         objective = decoder_objective(case, built(case.architecture, case.config))
