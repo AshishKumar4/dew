@@ -128,18 +128,20 @@ class Decoder(nn.Module):
         return store.decode(query, lengths, None), store.read()
 
 
-def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds():
+@pytest.mark.parametrize("tokens", [32, 48])
+def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens):
     """Run in Pallas' TPU interpreter over a bfloat16 pool, the kernel reads
     each row's pages through its table and attends its first `lengths`
     slots as softmax attention over the gathered cache does, to bfloat16
-    rounding."""
+    rounding: over two pages a row, and over three, which it attends in one
+    block of three."""
     from jax.experimental.pallas import tpu as pltpu
 
-    rows, tokens, heads, width = 2, 32, 2, 128
+    rows, heads, width = 2, 2, 128
     key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width), jnp.bfloat16)
                   for seed in (0, 1))
     query = jax.random.normal(jax.random.key(2), (rows, 2 * heads, width), jnp.bfloat16)
-    lengths = jnp.array([32, 19], jnp.int32)
+    lengths = jnp.array([tokens, 19], jnp.int32)
     module = Decoder(KVCache(page_size=16))
     with pltpu.force_tpu_interpret_mode():
         variables = module.init(jax.random.key(0), key, value, query, lengths)
@@ -149,6 +151,15 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds():
     scores = jnp.where(jnp.arange(tokens)[None, None] < lengths[:, None, None], scores, -jnp.inf)
     expected = jnp.einsum("bhk,bkhd->bhd", jax.nn.softmax(scores, axis=-1), values)
     np.testing.assert_allclose(attended.astype(jnp.float32), expected, atol=3e-2, rtol=3e-2)
+
+
+def test_the_tpu_paged_kernel_takes_the_largest_block_of_pages_that_divides_a_row():
+    """The kernel needs its block to divide a row's pages. The largest such
+    block up to 8 keeps a row of three pages in one block, where the gcd
+    with 8 split it into three."""
+    from dew.nn.kv_cache import _pages_per_block
+
+    assert [_pages_per_block(pages) for pages in (1, 2, 3, 6, 8, 12, 16, 24)] == [1, 2, 3, 6, 8, 6, 8, 8]
 
 
 def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():

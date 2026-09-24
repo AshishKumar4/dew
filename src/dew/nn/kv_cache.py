@@ -371,7 +371,15 @@ class KVStore:
         scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
         table = self._get(TABLE)
         return paged_attention(scaled, self._get("cached_key"), self._get("cached_value"), lengths, table,
-                               attn_logits_soft_cap=softcap, pages_per_compute_block=math.gcd(table.shape[1], 8))
+                               attn_logits_soft_cap=softcap, pages_per_compute_block=_pages_per_block(table.shape[1]))
+
+
+def _pages_per_block(pages: int) -> int:
+    """How many of a row's `pages` the TPU paged kernel attends in one block:
+    the largest divisor of `pages` up to 8, since the kernel needs the block
+    to divide a row's pages. The gcd with 8 gave a row of three pages, a
+    capacity of 384 at 128 a page, one-page blocks."""
+    return max(block for block in range(1, 9) if pages % block == 0)
 
 
 @dataclasses.dataclass(frozen=True)
