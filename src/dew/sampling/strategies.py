@@ -23,6 +23,7 @@ from jax import lax
 from jax.experimental import checkify
 
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
+from dew.nn.scatter import DROPPED
 from dew.objectives.base import Variables
 from dew.objectives.likelihood import token_log_probs
 from dew.sampling.decoding import StepState
@@ -793,7 +794,7 @@ def _recorded(block_size: int, step: StepState, emitted: jax.Array, behavior: ja
         committed = committed.commit(emitted[:, at], keep[:, at])
     committed = dataclasses.replace(
         committed, active=active & ~terminated & (step.step + count < budget))
-    landing = jnp.where(keep, step.step[:, None] + slots, budget)
+    landing = jnp.where(keep, step.step[:, None] + slots, DROPPED)
     return keep, committed, _Emitted(
         out.tokens.at[index, landing].set(emitted, mode="drop"),
         out.valid.at[index, landing].set(True, mode="drop"),

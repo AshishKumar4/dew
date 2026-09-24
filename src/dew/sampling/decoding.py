@@ -34,6 +34,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.nn.scatter import DROPPED
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -98,6 +99,7 @@ class StepState:
         """The state after `drawn` rows appended `tokens` at their next slot."""
         rows = jnp.arange(self.rows)
         slot = self.prompt_width + self.step
+        slot = jnp.where(slot < self.tokens.shape[1], slot, DROPPED)
         return dataclasses.replace(
             self,
             tokens=self.tokens.at[rows, slot].set(jnp.where(drawn, tokens, 0), mode="drop"),
@@ -135,14 +137,14 @@ def _windows(tokens: jax.Array, size: int) -> jax.Array:
 def _present(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
     """Which vocabulary entries each row's valid tokens contain."""
     rows = jnp.arange(tokens.shape[0])[:, None]
-    slots = jnp.where(valid, tokens, vocab)
+    slots = jnp.where(valid & (tokens < vocab), tokens, DROPPED)
     return jnp.zeros((tokens.shape[0], vocab), bool).at[rows, slots].set(True, mode="drop")
 
 
 def _counts(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
     """How often each vocabulary entry appears among a row's valid tokens."""
     rows = jnp.arange(tokens.shape[0])[:, None]
-    slots = jnp.where(valid, tokens, vocab)
+    slots = jnp.where(valid & (tokens < vocab), tokens, DROPPED)
     return jnp.zeros((tokens.shape[0], vocab), jnp.float32).at[rows, slots].add(1.0, mode="drop")
 
 
@@ -539,7 +541,7 @@ def _ngram_ban(logits: jax.Array, table: jax.Array, table_lengths: jax.Array,
     matched = jnp.all(windows[..., :-1] == prefix[:, None, :], axis=-1) & inside
     matched = matched & (lengths >= size - 1)[:, None]
     rows = jnp.arange(logits.shape[0])[:, None]
-    slots = jnp.where(matched, windows[..., -1], logits.shape[-1])
+    slots = jnp.where(matched & (windows[..., -1] < logits.shape[-1]), windows[..., -1], DROPPED)
     banned = jnp.zeros(logits.shape, bool).at[rows, slots].set(True, mode="drop")
     return jnp.where(banned, FILTER, logits)
 
@@ -571,6 +573,7 @@ class SequenceBias:
         added = jnp.where(matched, self.bias[None, :], 0.0)
         rows = jnp.arange(logits.shape[0])[:, None]
         last = jnp.broadcast_to(self.sequences[None, :, -1], added.shape)
+        last = jnp.where(last < logits.shape[-1], last, DROPPED)
         return logits + jnp.zeros(logits.shape, jnp.float32).at[rows, last].add(added, mode="drop")
 
 

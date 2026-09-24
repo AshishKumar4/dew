@@ -107,6 +107,7 @@ from dew.nn.kv_cache import (
     is_paged,
     leaf_name,
 )
+from dew.nn.scatter import DROPPED
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes, logical_spec
 from dew.objectives.base import Variables
 from dew.sampling import decoding
@@ -222,7 +223,7 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
 
     The slots fall into `groups` equal groups in order, and so do the
     incoming rows; `rows` counts from the start of each row's own group,
-    and a row at the group's size is dropped. Mapped over the groups, the
+    and a row at the group's size is dropped (`dew.nn.scatter.DROPPED`). Mapped over the groups, the
     group is a batch dimension of the scatter, which GSPMD splits wherever
     the slots split, with no collective (`dew.nn.kv_cache.write_cache`).
 
@@ -235,6 +236,7 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
                    else slice(None) for axis in range(1, incoming.ndim))
 
     def place(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
+        rows = jnp.where(rows < resident.shape[0], rows, DROPPED)
         return resident.at[(rows, *window)].set(incoming, mode="drop")
 
     return jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (resident, incoming, rows))

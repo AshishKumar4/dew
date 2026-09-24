@@ -12,6 +12,8 @@ read, and `sparse_latent_attention` attends it without that mask.
 import jax
 import jax.numpy as jnp
 
+from dew.nn.scatter import DROPPED
+
 
 def top_k_selection(scores, keep, top_k: int):
     """The `top_k` highest-scoring keys of each query among those `keep`
@@ -38,9 +40,9 @@ def selection_mask(indices, total: int):
     the attention takes: a key is visible to a query iff one of the query's
     indices names it, so out-of-range entries drop out."""
     batch, length, _ = indices.shape
-    # A negative index would wrap around in jnp; sending it past the end
-    # lets the scatter drop it, as it drops any index at or past `total`.
-    slots = jnp.where(indices >= 0, indices, total)
+    # A negative index would wrap around in jnp, and one at or past `total`
+    # names no key; both go to `DROPPED`, which the scatter drops.
+    slots = jnp.where((indices >= 0) & (indices < total), indices, DROPPED)
     return jnp.zeros((batch, length, total), jnp.bool_).at[
         jnp.arange(batch)[:, None, None], jnp.arange(length)[None, :, None], slots
     ].set(True, mode='drop')
