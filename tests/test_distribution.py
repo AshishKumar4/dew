@@ -419,6 +419,28 @@ def test_a_rank_that_raises_between_collectives_stops_the_pool():
     assert time.monotonic() - started < 120, done.stdout + done.stderr
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_stopped_pool_ends_its_ranks_without_aborts():
+    """Rank 3 fails and the launch stops ranks 0 to 2, which wait. A JAX
+    process takes SIGTERM as a preemption notice and runs on, so each is
+    SIGKILLed after the grace. Rank 0's process holds the pool's coordination
+    service: killed first, it left the others to abort in XLA's error
+    polling, with "Check failure" stack traces that read as crashes of their
+    own (DistSequence's land7 run, stopped by its timeout). Stopped last, it
+    leaves no rank to abort."""
+    program = ("import os, time\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "if os.environ['DEW_PROCESS_ID'] == '3':\n"
+               "    raise RuntimeError('rank 3 fails')\n"
+               "time.sleep(600)\n")
+    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    output = done.stdout + done.stderr
+    assert done.returncode == 1, output
+    assert "rank 3 on localhost exited 1; stopping the other 3" in done.stdout, output
+    assert "Terminating process" not in output and "Check failure" not in output, output
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_stalls_between_collectives_ends_the_pool():
     """Rank 1 stops before its fourth step without failing, as a rank blocked
