@@ -57,7 +57,7 @@ step 25: loss 0.0306
 step 50: loss 0.0102
 step 75: loss 0.0067
 step 100: loss 0.0051
-Goodput: first step after 2.12 s, 34.9% of the wall time in steps
+Goodput: first step after 1.99 s, 31.6% of the wall time in steps
 dew trains jax models. dew trains jax model
 ```
 
