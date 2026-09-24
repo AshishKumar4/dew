@@ -217,7 +217,7 @@ def next_token_loss(model, variables, ids):
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_scanned_init_is_the_plain_init(shape):
-    """`init` runs the plain loop whatever `scan_layers` says, so the tree
+    """`init` draws the same way whatever `scan_layers` says, so the tree
     holds the same leaves with the same values, and the scanned model reads
     a checkpoint of the plain one leaf for leaf."""
     build = SHAPES[shape][0]
@@ -486,3 +486,4 @@ def test_the_init_program_draws_a_run_of_like_layers_once():
         return text.count("call @_threefry")
 
     assert draws(2) == draws(6) > 0
+
