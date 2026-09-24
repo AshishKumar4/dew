@@ -1242,6 +1242,29 @@ def test_an_sm80_step_compiles_its_dots_to_cublas():
     assert "__triton_gemm" not in trainer.executable.as_text()
 
 
+def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
+    """Compiling reads the parameters', optimizer state's and key's shapes
+    and shardings, not their values, so a run compiles its step ahead of
+    time, into the persistent cache, before it holds them on devices; the
+    trainer's own settings (the window, the scaler) stay values. The loss's
+    shape once folded the step into the key eagerly, which a key known only
+    by its shape cannot do (74761deb)."""
+    trainer, _, _ = held_lm_trainer()
+    state, shardings, _ = trainer.place()
+
+    def shape(leaf, sharding):
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+
+    abstract = dataclasses.replace(
+        state, params=jax.tree.map(shape, state.params, shardings.params),
+        opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
+        key=shape(state.key, shardings.key))
+
+    trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+
+    assert trainer.executable is not None
+
+
 def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
     """The step's first call runs the program `compile` built. Through the
     jit it traced and compiled a second one, without the step's compiler
