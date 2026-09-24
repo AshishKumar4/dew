@@ -477,6 +477,21 @@ def main() -> None:
         text = "---\n" + json.dumps(frontmatter, indent=1) + "\n---\n\n" + "\n".join(body).rstrip() + "\n"
         (CONTENT / f"{path}.md").write_text(text)
 
+    # The overview page is docs/reference/core-api.md, which sync-docs wrote;
+    # it ends with every module, grouped as in the sidebar.
+    overview = SITE / "src/content/docs/api.md"
+    if not overview.exists():
+        raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
+    index = ["", "## All modules", "",
+             "Each module below has a page generated from its docstrings. A name a module re-exports links to "
+             "the page of the module that defines it.", ""]
+    for label, modules in GROUPS:
+        index += [f"### {label}", "", "| Module | Summary |", "|---|---|"]
+        index += [f"| [`{module}`](/{page_slug(module)}/) | {escape(first_sentence(pages[module].module))} |"
+                  for module in modules]
+        index.append("")
+    overview.write_text(overview.read_text().rstrip() + "\n" + "\n".join(index).rstrip() + "\n")
+
     GENERATED.mkdir(parents=True, exist_ok=True)
     sidebar = [{"label": label, "collapsed": True,
                 "items": [{"label": module, "slug": page_slug(module)} for module in modules]}

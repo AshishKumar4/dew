@@ -1,6 +1,6 @@
 # Core API reference
 
-This page describes the interfaces the tutorials use. It does not list every public module. For a complete example, read [your first training run](../getting-started.md).
+This page describes the interfaces the tutorials use and the contracts between them. Every public module also has its own page, generated from its docstrings; the list is at the [end of this page](#all-modules). For a complete example, read [your first training run](../getting-started.md).
 
 ## Objective
 

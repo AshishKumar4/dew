@@ -235,7 +235,7 @@ The Triton forward takes it (0.35 against xla's 1.01 ms at S=2048, head
 dimension 256), but the VJP raises `NotImplementedError: logits_soft_cap
 unsupported`. tokamax also applies the cap after adding the bias, while Gemma
 applies it before (1.4e-2 apart on CPU with a bias, identical without one).
-The second is attention sinks: no tokamax implementation takes them.
+The second is attention sinks, which no tokamax implementation takes.
 
 I added no Dew route for this kernel. A forward-only kernel cannot serve
 training, and the only backward tiling that works is reachable through

@@ -98,7 +98,7 @@ A space maps dotted paths into the run record to the values a trial can take. `o
 
 A finished trial is written to the ledger before it is reported. If a sweep is interrupted, rerunning the same call continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker you pass receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
-The example below continues the previous one: it reuses `objective`, `data`, `metrics` and `jax` from it.
+The example below continues the previous one and reuses `objective`, `data`, `metrics` and `jax` from it.
 
 ```python
 from dew import LocalTracker, evaluate
