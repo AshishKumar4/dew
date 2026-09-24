@@ -1,0 +1,41 @@
+# Runs every tutorial notebook top to bottom at smoke size on a CPU, so a
+# change to the library cannot break a notebook without failing a check.
+# Each notebook's Settings cell holds its own smoke sizes (DEW_TUTORIAL_SMOKE).
+
+name: Tutorials
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", ".github/workflows/tutorials.yml" ]
+  pull_request:
+    branches: [ "main" ]
+    paths: [ "src/dew/**", "tutorials/**", "pyproject.toml", "tools/run_tutorials.py", ".github/workflows/tutorials.yml" ]
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install Dew and the notebooks' dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[streaming,interop,plots]" nbclient nbformat ipykernel
+    - name: Cache the datasets and checkpoints the notebooks download
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface
+        key: tutorials-hf-v1
+    - name: Run the tutorials
+      run: python tools/run_tutorials.py --workdir "$RUNNER_TEMP/tutorials"
