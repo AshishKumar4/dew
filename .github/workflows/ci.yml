@@ -61,7 +61,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.14", "3.12"]
+        # A ci/** branch runs the compatibility floor alone, 13 jobs with
+        # lint, so two branch runs fit GitHub's 20 concurrent jobs; main
+        # runs both Pythons.
+        python-version: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ci/') && '["3.12"]' || '["3.14", "3.12"]') }}
         # pytest-split cuts the collected order into chunks of equal time by
         # tests/test_durations.json, which tools/ci_durations.py rewrites from
         # a run's reports. Contiguous chunks keep a module's tests, and the
