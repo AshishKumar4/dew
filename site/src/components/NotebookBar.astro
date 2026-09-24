@@ -1,5 +1,6 @@
 ---
-// Links for a tutorial notebook: Colab, live execution, source and download.
+// Links for a tutorial notebook: Colab, source and download, and for notebooks
+// that run on a CPU, a live kernel whose Run buttons appear on each cell.
 import { Icon } from '@astrojs/starlight/components';
 
 interface Props {
@@ -14,7 +15,7 @@ interface Props {
 }
 
 const { notebook } = Astro.props;
-const liveEndpoint = import.meta.env.PUBLIC_LIVE_ENDPOINT;
+const liveConfigured = Boolean(import.meta.env.PUBLIC_LIVE_ENDPOINT && import.meta.env.PUBLIC_TURNSTILE_SITEKEY);
 const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs on a CPU';
 ---
 
@@ -27,10 +28,10 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		Open in Colab
 	</a>
 	{
-		notebook.live && liveEndpoint && (
-			<button class="nb-button live" type="button" data-live-start hidden>
+		notebook.live && liveConfigured && (
+			<button class="nb-button live" type="button" data-live-start>
 				<span class="dot" aria-hidden="true" />
-				Run live
+				<span data-label>Run live</span>
 			</button>
 		)
 	}
@@ -43,7 +44,127 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		Download
 	</a>
 	<span class="runtime" title={runtime}>{notebook.accelerator}</span>
+	{
+		notebook.live && liveConfigured && (
+			<div class="live-bar" data-live-bar hidden>
+				<p class="live-status" data-live-status aria-live="polite" />
+				<div class="live-actions" data-live-actions hidden>
+					<button class="nb-button" type="button" data-live-all>
+						Run all
+					</button>
+					<button class="nb-button" type="button" data-live-interrupt>
+						Interrupt
+					</button>
+					<button class="nb-button" type="button" data-live-restart>
+						Restart
+					</button>
+				</div>
+				<div class="turnstile-holder" data-turnstile />
+			</div>
+		)
+	}
 </div>
+
+<script>
+	import { type LiveSession as Session, LiveSession, renderOutput } from '../scripts/live';
+
+	const bar = document.querySelector<HTMLElement>('.notebook-bar');
+	const start = bar?.querySelector<HTMLButtonElement>('[data-live-start]');
+	const source = document.querySelector<HTMLScriptElement>('script[data-notebook-cells]');
+	if (bar && start && source) {
+		const cells: { id: number; code: string }[] = JSON.parse(source.textContent ?? '[]');
+		const liveBar = bar.querySelector<HTMLElement>('[data-live-bar]')!;
+		const status = bar.querySelector<HTMLElement>('[data-live-status]')!;
+		const actions = bar.querySelector<HTMLElement>('[data-live-actions]')!;
+		const label = start.querySelector<HTMLElement>('[data-label]')!;
+		let session: Session | undefined;
+		let queue: Promise<unknown> = Promise.resolve();
+
+		const say = (text: string) => (status.textContent = text);
+
+		async function runCell(id: number): Promise<boolean> {
+			const cell = cells.find((entry) => entry.id === id);
+			const block = document.querySelector<HTMLElement>(`.nb-cell[data-cell="${id}"]`);
+			if (!session || !cell || !block) return false;
+			const button = block.querySelector<HTMLButtonElement>('.nb-run');
+			let output = block.querySelector<HTMLElement>('.nb-live');
+			if (!output) {
+				output = document.createElement('div');
+				output.className = 'nb-live';
+				block.querySelector('.expressive-code')?.after(output);
+			}
+			const body = document.createElement('div');
+			body.className = 'nb-live-body';
+			const head = document.createElement('div');
+			head.className = 'nb-live-head';
+			head.textContent = 'Running…';
+			output.replaceChildren(head, body);
+			block.classList.add('nb-ran-live');
+			if (button) button.disabled = true;
+			const done = await session.run(cell.code, (out) => renderOutput(body, out));
+			head.textContent =
+				done.status === 'ok' ? `Live [${done.count ?? ' '}]` : done.status === 'error' ? `Live [${done.count ?? ' '}], raised an error` : 'Stopped';
+			if (button) button.disabled = false;
+			return done.status === 'ok';
+		}
+
+		function enqueue(id: number): Promise<boolean> {
+			const run = queue.then(() => runCell(id));
+			queue = run.catch(() => false);
+			return run;
+		}
+
+		function addRunButtons(): void {
+			for (const cell of cells) {
+				const block = document.querySelector<HTMLElement>(`.nb-cell[data-cell="${cell.id}"]`);
+				if (!block || block.querySelector('.nb-run')) continue;
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.className = 'nb-run';
+				button.textContent = 'Run';
+				button.setAttribute('aria-label', `Run cell ${cell.id} on the live kernel`);
+				button.addEventListener('click', () => enqueue(cell.id));
+				block.prepend(button);
+			}
+		}
+
+		start.addEventListener('click', async () => {
+			if (session) return;
+			start.disabled = true;
+			liveBar.hidden = false;
+			try {
+				session = await LiveSession.open(liveBar.querySelector('[data-turnstile]')!, say);
+				session.onClose = (message) => {
+					say(`${message} Press Run live to start a new one.`);
+					session = undefined;
+					actions.hidden = true;
+					start.disabled = false;
+					label.textContent = 'Run live';
+					for (const button of document.querySelectorAll<HTMLButtonElement>('.nb-run')) button.remove();
+				};
+				say('Connected to a live kernel: one vCPU and JAX on the CPU, with no network access. It stops after 5 idle minutes or 20 minutes in all. Run the cells in order.');
+				label.textContent = 'Live';
+				actions.hidden = false;
+				addRunButtons();
+			} catch (error) {
+				say(error instanceof Error ? error.message : String(error));
+				start.disabled = false;
+			}
+		});
+
+		bar.querySelector('[data-live-all]')!.addEventListener('click', async () => {
+			for (const cell of cells) {
+				if (!(await enqueue(cell.id))) break;
+			}
+		});
+		bar.querySelector('[data-live-interrupt]')!.addEventListener('click', () => session?.interrupt());
+		bar.querySelector('[data-live-restart]')!.addEventListener('click', () => {
+			session?.restart();
+			say('Restarted the kernel. Run the cells again from the top.');
+		});
+		addEventListener('pagehide', () => session?.close());
+	}
+</script>
 
 <style>
 	.notebook-bar {
@@ -75,6 +196,11 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		border-color: var(--sl-color-gray-4);
 	}
 
+	.nb-button:disabled {
+		cursor: default;
+		opacity: 0.7;
+	}
+
 	.nb-button.primary {
 		border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
 	}
@@ -95,5 +221,38 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		border: 1px solid var(--dew-rule);
 		border-radius: 999px;
 		padding: 0.35rem 0.6rem;
+	}
+
+	.live-bar {
+		flex-basis: 100%;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 1rem;
+		padding: 0.75rem 0.9rem;
+		border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 45%, var(--dew-rule));
+		border-radius: 0.5rem;
+		background: var(--dew-surface);
+	}
+
+	.live-bar[hidden] {
+		display: none;
+	}
+
+	.live-status {
+		flex: 1 1 20rem;
+		margin: 0;
+		font-size: 0.85rem;
+		line-height: 1.5;
+		color: var(--sl-color-gray-2);
+	}
+
+	.live-actions {
+		display: flex;
+		gap: 0.4rem;
+	}
+
+	.live-actions[hidden] {
+		display: none;
 	}
 </style>

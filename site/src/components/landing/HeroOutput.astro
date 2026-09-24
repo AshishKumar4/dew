@@ -1,26 +1,28 @@
 ---
-// The recorded output of the hero script, and where it was recorded.
+// The recorded output of the hero script, where it was recorded, and a button
+// that runs the same script on a live kernel.
 interface Props {
+	code: string;
 	stdout: string;
 	seconds: number;
 	meta: { where: string; jax: string; dew: string; date: string; vcpus: number };
 }
-const { stdout, seconds, meta } = Astro.props;
+const { code, stdout, seconds, meta } = Astro.props;
 const lines = stdout.trimEnd().split('\n');
-const liveEndpoint = import.meta.env.PUBLIC_LIVE_ENDPOINT;
+const live = Boolean(import.meta.env.PUBLIC_LIVE_ENDPOINT && import.meta.env.PUBLIC_TURNSTILE_SITEKEY);
 // The trainer's own report of how long the first step took, which is mostly compilation.
 const firstStep = Number(/first step after ([\d.]+) s/.exec(stdout)?.[1] ?? Number.NaN);
 const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 ---
 
-<div class="hero-output" data-hero-output>
+<div class="hero-output" data-hero-output data-code={code}>
 	<div class="hero-output-bar">
 		<span class="hero-output-command"><span aria-hidden="true">$</span> python train.py</span>
 		{
-			liveEndpoint && (
-				<button type="button" class="run-live" data-live-hero hidden>
+			live && (
+				<button type="button" class="run-live" data-live-hero>
 					<span class="dot" aria-hidden="true" />
-					Run it live
+					<span data-label>Run it live</span>
 				</button>
 			)
 		}
@@ -31,4 +33,61 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, on {meta.date}. The
 		script took {Math.round(seconds)} s{compiling ? ', most of it compiling' : ''}.
 	</p>
+	<div class="turnstile-holder" data-turnstile></div>
 </div>
+
+<script>
+	import { LiveSession, terminalText } from '../../scripts/live';
+
+	const panel = document.querySelector<HTMLElement>('[data-hero-output]');
+	const button = panel?.querySelector<HTMLButtonElement>('[data-live-hero]');
+	if (panel && button) {
+		const output = panel.querySelector<HTMLElement>('[data-output]')!;
+		const meta = panel.querySelector<HTMLElement>('[data-output-meta]')!;
+		const label = button.querySelector<HTMLElement>('[data-label]')!;
+		const holder = panel.querySelector<HTMLElement>('[data-turnstile]')!;
+
+		button.addEventListener('click', async () => {
+			button.disabled = true;
+			panel.dataset.state = 'running';
+			label.textContent = 'Running';
+			const status = (text: string) => (meta.textContent = text);
+			let session: LiveSession | undefined;
+			try {
+				session = await LiveSession.open(holder, status);
+				status('Running train.py on a live kernel: one vCPU of a Cloudflare container, JAX on the CPU.');
+				output.replaceChildren();
+				const started = performance.now();
+				let raw = '';
+				const done = await session.run(panel.dataset.code ?? '', (out) => {
+					if (out.type === 'stream') raw += out.text;
+					else if (out.type === 'error') raw += `\n${out.ename}: ${out.evalue}\n`;
+					else if (out.type === 'display' && out.text) raw += `${out.text}\n`;
+					const lines = terminalText(raw).split('\n');
+					output.replaceChildren(
+						...lines.map((line) => {
+							const span = document.createElement('span');
+							span.className = 'line streamed';
+							span.textContent = `${line}\n`;
+							return span;
+						}),
+					);
+					output.scrollTop = output.scrollHeight;
+				});
+				const seconds = Math.round((performance.now() - started) / 1000);
+				status(
+					done.status === 'ok'
+						? `Ran live just now on one vCPU of a Cloudflare container in ${seconds} s, most of it compiling. Each run trains from scratch, so the numbers can differ slightly from the recorded ones.`
+						: 'The live run stopped before it finished. The output above is what it printed.',
+				);
+			} catch (error) {
+				status(error instanceof Error ? error.message : String(error));
+			} finally {
+				session?.close();
+				panel.dataset.state = 'done';
+				label.textContent = 'Run it again';
+				button.disabled = false;
+			}
+		});
+	}
+</script>

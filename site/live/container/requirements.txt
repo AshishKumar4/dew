@@ -1,0 +1,16 @@
+# The kernel and the relay in server.py.
+ipykernel==7.3.0
+jupyter_client==8.10.0
+websockets==17.1
+matplotlib==3.11.2
+# Dew's largest dependencies, installed in their own layer so that a new Dew
+# commit rebuilds and uploads only a small one. Dew's own pins still apply:
+# its install upgrades any of these it does not accept.
+jaxlib==0.11.2
+scipy==1.18.1
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+tensorstore==0.1.85
+transformers==5.17.0
+tokenizers==0.23.2
+pillow==12.3.0

@@ -27,6 +27,6 @@ if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero snip
 	</div>
 	<div class="hero-demo">
 		<Code code={heroCode.trimEnd()} lang="python" title="train.py" />
-		<HeroOutput stdout={hero.stdout} meta={capture.meta} seconds={hero.seconds} />
+		<HeroOutput code={heroCode} stdout={hero.stdout} meta={capture.meta} seconds={hero.seconds} />
 	</div>
 </section>
