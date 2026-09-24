@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
+from ..conv import Conv
 from .vae import FlaxDecoder, FlaxEncoder
 
 
@@ -46,9 +47,9 @@ class AutoencoderKL(nn.Module):
         self.decoder = FlaxDecoder(out_channels=self.image_channels, block_out_channels=self.channels,
             layers_per_block=self.blocks_per_level, norm_num_groups=self.norm_groups, dtype=jnp.dtype(self.dtype))
         if self.quantize:
-            self.quant_conv = nn.Conv(2 * self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
+            self.quant_conv = Conv(2 * self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
         if self.post_quantize:
-            self.post_quant_conv = nn.Conv(self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
+            self.post_quant_conv = Conv(self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
 
     def encode(self, image, key=None):
         moments = self.encoder(image)

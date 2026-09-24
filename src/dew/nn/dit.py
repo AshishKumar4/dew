@@ -20,6 +20,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
+from .conv import Conv
 from .precision import fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
@@ -106,11 +107,11 @@ class PatchEmbedding(nn.Module):
         batch, height, width, _ = x.shape
         assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
-        x = nn.Conv(features=self.embedding_dim,
-                    kernel_size=(self.patch_size, self.patch_size),
-                    strides=(self.patch_size, self.patch_size),
-                    dtype=self.dtype,
-                    precision=self.precision)(x)
+        x = Conv(features=self.embedding_dim,
+                 kernel_size=(self.patch_size, self.patch_size),
+                 strides=(self.patch_size, self.patch_size),
+                 dtype=self.dtype,
+                 precision=self.precision)(x)
         return jnp.reshape(x, (batch, -1, self.embedding_dim))
 
 

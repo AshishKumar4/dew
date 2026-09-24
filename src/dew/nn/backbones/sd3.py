@@ -29,6 +29,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.conv import Conv
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -313,8 +314,8 @@ class SD3Transformer(nn.Module):
                              f"{patch}x{patch} patches")
         if conditioning.pooled is None:
             raise ValueError("SD3 conditioning needs the pooled text vector")
-        image = nn.Conv(self.features, (patch, patch), strides=(patch, patch), padding="VALID",
-                        dtype=self.dtype, precision=self.precision, name="pos_embed_proj")(x)
+        image = Conv(self.features, (patch, patch), strides=(patch, patch), padding="VALID",
+                     dtype=self.dtype, precision=self.precision, name="pos_embed_proj")(x)
         image = image.reshape(image.shape[0], rows * columns, self.features)
         image = image + self.position(rows, columns).astype(image.dtype)
 

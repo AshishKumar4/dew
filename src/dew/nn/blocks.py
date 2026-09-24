@@ -10,6 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm
+from .conv import Conv
 from .sharding import logical_axes
 
 
@@ -99,8 +100,8 @@ class Upsample(nn.Module):
     def __call__(self, x):
         B, H, W, C = x.shape
         out = jax.image.resize(x, (B, H * self.scale, W * self.scale, C), method="nearest")
-        return nn.Conv(features=self.features, kernel_size=(3, 3), strides=(1, 1),
-                       dtype=self.dtype, precision=self.precision)(out)
+        return Conv(features=self.features, kernel_size=(3, 3), strides=(1, 1),
+                    dtype=self.dtype, precision=self.precision)(out)
 
 
 class Downsample(nn.Module):
@@ -111,8 +112,8 @@ class Downsample(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        return nn.Conv(features=self.features, kernel_size=(3, 3), strides=(2, 2),
-                       dtype=self.dtype, precision=self.precision)(x)
+        return Conv(features=self.features, kernel_size=(3, 3), strides=(2, 2),
+                    dtype=self.dtype, precision=self.precision)(x)
 
 
 @logical_axes({}, heuristic=(("conv1",), ("conv2",), ("residual_conv",), ("temb_projection",)))
@@ -140,7 +141,7 @@ class ResidualBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
-        conv = partial(nn.Conv, features=self.features, kernel_size=self.kernel_size,
+        conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.activation(self.norm1(x)))
 

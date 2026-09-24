@@ -17,6 +17,7 @@ from dew.registry import models
 
 from ..attention import LayerNorm, TransformerBlock
 from ..blocks import FourierEmbedding, TimeProjection
+from ..conv import Conv
 from ..dit import (
     ROPE_THETA,
     ConditioningEmbed,
@@ -137,12 +138,12 @@ class UViT(nn.Module):
         )
 
         if self.add_residualblock_output:
-            self.final_conv1 = nn.Conv(
+            self.final_conv1 = Conv(
                 features=64, kernel_size=(3, 3), strides=(1, 1),
                 dtype=self.dtype, precision=self.precision, name="final_conv1"
             )
             self.final_norm_conv = norm(name="final_norm_conv")
-            self.final_conv2 = nn.Conv(
+            self.final_conv2 = Conv(
                 features=self.output_channels, kernel_size=(3, 3), strides=(1, 1),
                 dtype=jnp.float32,
                 precision=self.precision, name="final_conv2"

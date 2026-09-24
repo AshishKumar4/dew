@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .conv import Conv
 from .sharding import logical_axes
 
 
@@ -210,7 +211,7 @@ class SpatialFusionConv(nn.Module):
         # y_2d: [B, H_P, W_P, F], SSM output reshaped to a row-major grid
         out = y_2d
         for dil in self.dilations:
-            dw = nn.Conv(
+            dw = Conv(
                 features=self.features,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 strides=(1, 1),

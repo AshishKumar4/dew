@@ -30,6 +30,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm, scaled_dot_product_attention
 from .blocks import torch_nearest_resize
+from .conv import Conv
 from .sharding import logical_axes
 
 
@@ -60,13 +61,13 @@ def _padding(kind: str, kernel: int):
 
 def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
           padding: str = "same", bias: bool = False, dtype: Dtype | None = None,
-          precision: PrecisionLike = None, name: str) -> nn.Conv:
+          precision: PrecisionLike = None, name: str) -> Conv:
     """Build a square convolution with timm's fan-out initializer.
 
     The initializer's gain counts the groups, because a depthwise kernel's
     fan-out is its own group's alone.
     """
-    return nn.Conv(
+    return Conv(
         features, (kernel, kernel), strides=(stride, stride),
         padding=_padding(padding, kernel), feature_group_count=groups,
         use_bias=bias, dtype=dtype, precision=precision,

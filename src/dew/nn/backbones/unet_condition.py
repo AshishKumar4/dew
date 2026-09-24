@@ -12,6 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
+from dew.nn.conv import Conv
 from dew.registry import models
 
 
@@ -148,8 +149,8 @@ class _SpatialAttention(nn.Module):
             x = x.reshape(batch, height * width, channels)
             x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="input")(x)
         else:
-            x = nn.Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
-                        precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
+            x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
+                     precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
         for index in range(self.stage.depth):
             x = _Transformer(self.stage, self.dropout, self.dtype, self.precision,
                              self.attention_impl, approximate_gelu=self.approximate_gelu,
@@ -158,8 +159,8 @@ class _SpatialAttention(nn.Module):
             x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
             x = x.reshape(batch, height, width, channels)
         else:
-            x = nn.Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,
-                        name="output")(x.reshape(batch, height, width, channels))
+            x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,
+                     name="output")(x.reshape(batch, height, width, channels))
         x = residual + x
         return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
 
@@ -211,8 +212,8 @@ class _Level(nn.Module):
                 height, width = upsample_shape
                 x = torch_nearest_resize(x, height, width)
             stride = (2, 2) if self.direction == "down" else (1, 1)
-            x = nn.Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
-                        dtype=self.dtype, precision=self.precision, name="resize")(x)
+            x = Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
+                     dtype=self.dtype, precision=self.precision, name="resize")(x)
             outputs.append(x)
         return x, tuple(outputs)
 
@@ -262,7 +263,7 @@ class UNet2DCondition(nn.Module):
                                   shift=self.frequency_shift, cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
             time = time + _TimeMLP(first * 4, self.dtype, self.precision, name="additional_time")(extra)
-        x = nn.Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)
+        x = Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)
         skips = [x]
         for index, stage in enumerate(self.stages):
             x, outputs = _Level(stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
@@ -293,4 +294,4 @@ class UNet2DCondition(nn.Module):
                           name=f"up_{index}")(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
         x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype,
                                   name="output_norm")(x))
-        return nn.Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)
+        return Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)
