@@ -7,15 +7,10 @@ import numpy as np
 import optax
 import pytest
 
-from dew.objectives.base import scalar_loss
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-
 from dew.artifacts import Representations
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step
+from dew.objectives.base import Step, merge, scalar_loss
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
@@ -312,6 +307,22 @@ def test_no_gradient_reaches_the_target_branch(mask, rng):
     assert all(float(jnp.max(jnp.abs(g))) == 0.0 for g in jax.tree.leaves(grads))
 
 
+def test_the_targets_come_from_the_ema_encoder(mask, rng):
+    """The target branch reads the trainer's EMA copy of the context
+    encoder: the same live parameters score differently against another EMA
+    tree. The zero-gradient test above cannot tell, since a loss that never
+    read the EMA tree has a zero gradient there as well."""
+    objective = make_objective(mask)
+    params = objective.init(rng)
+    batch = {"image": images()}
+    moved = {"params": {"context_encoder": jax.tree.map(
+        lambda p: p + 0.1, params["params"]["context_encoder"])}}
+
+    same = float(scalar_loss(objective, params, batch, step_with(params))[0])
+    other = float(scalar_loss(objective, params, batch, step_with(merge(params, moved)))[0])
+    assert abs(other - same) > 1e-2 * same
+
+
 # --- collapse telemetry ----------------------------------------------------
 
 def test_representation_std_detects_collapse():
@@ -402,6 +413,7 @@ def test_target_encoder_tracks_the_context_encoder(mask):
     assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
 
 
+@pytest.mark.mesh(devices=2)
 def test_jepa_trains_under_fsdp(mask):
     """Where the two halves of the trainer meet: an objective that owns a
     multi-encoder parameter tree, run through the sharded, donating train step.
@@ -446,8 +458,6 @@ def test_evaluation_reads_the_ema_encoder(mask):
     ema = {"params": {"context_encoder": jax.tree.map(
         lambda p: p + 0.1, params["params"]["context_encoder"])}}
     batch = {"image": images(), "label": jnp.zeros((4,), jnp.int32)}
-    from dew.objectives.base import merge
-
     live = objective.evaluate(params, batch, step_with(params))
     averaged = objective.evaluate(params, batch, step_with(merge(params, ema)))
     assert not np.allclose(live.features, averaged.features)

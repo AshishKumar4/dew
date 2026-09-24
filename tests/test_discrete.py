@@ -156,6 +156,30 @@ def test_unmasking_never_emits_the_mask_id(rng):
     assert not jnp.any(out == MASK)
 
 
+def test_a_revealed_token_is_never_drawn_again(rng):
+    """MDLM carries a revealed token over: a reverse step draws only where
+    the row is still masked. The model here scores every token alike, so a
+    step that drew at every position would change five revealed tokens in
+    six."""
+    class Flat(nn.Module):
+        @nn.compact
+        def __call__(self, tokens):
+            return jnp.zeros((*tokens.shape, VOCAB))
+
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    model = Flat()
+    denoise = process.denoiser(model, model.init(rng, jnp.zeros((1, 8), jnp.int32)))
+    t, s, done = jnp.full((200,), 1.0), jnp.full((200,), 0.5), jnp.zeros((200,))
+    x = process.noise(rng, (200, 8))
+    half, _ = Unmask().step(x, t, s, *denoise(x, t), (), jax.random.fold_in(rng, 1), process, denoise)
+    revealed = np.asarray(half != MASK)
+    assert 0.3 < revealed.mean() < 0.7
+    final, _ = Unmask().step(half, s, done, *denoise(half, s), (), jax.random.fold_in(rng, 2),
+                             process, denoise)
+    assert not jnp.any(final == MASK)
+    np.testing.assert_array_equal(np.asarray(final)[revealed], np.asarray(half)[revealed])
+
+
 def test_unmask_refuses_a_gaussian_process(rng):
     process = Process(CosineNoiseScheduler(10), EpsilonPredictionTransform())
     x = jnp.zeros((2, 4))
@@ -200,6 +224,37 @@ def test_full_attention_has_no_cache(rng):
 def test_the_masked_objective_refuses_a_causal_model():
     with pytest.raises(ValueError, match="causal=False"):
         MaskedDiffusionObjective(transformer(causal=True), MDLM(mask_id=MASK)(), 8)
+
+
+def test_the_loss_is_the_nelbo_of_the_row_the_model_saw(rng, monkeypatch):
+    """At fixed times and a fixed corruption, the loss is the cross entropy
+    of each masked token under the model's logits for the corrupted row,
+    weighted by 1/t and averaged over every position of the batch.
+    Evaluation reports each position's term, zero where the token stayed
+    visible, under the averaged weights it is handed, so a validation pass's
+    perplexity is exp of this bound per token."""
+    model = transformer(causal=False)
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=MASK)(), 8)
+    params = objective.init(rng)
+    rows = jnp.array([[1, 2, 3, 4, 5, 1, 2, 3], [3, 2, 1, 0, 4, 5, 1, 2]])
+    times = jnp.array([0.25, 0.5])
+    hidden = jnp.array([[1, 0, 0, 1, 0, 0, 1, 0], [0, 1, 1, 0, 0, 0, 0, 1]], bool)
+    monkeypatch.setattr(DiscreteProcess, "sample_t", lambda self, key, n: times)
+    monkeypatch.setattr(DiscreteProcess, "corrupt",
+                        lambda self, key, tokens, t: (jnp.where(hidden, MASK, tokens), hidden))
+
+    def terms(variables):
+        log_probs = jax.nn.log_softmax(model.apply(variables, jnp.where(hidden, MASK, rows)), axis=-1)
+        cross_entropy = -jnp.take_along_axis(log_probs, rows[..., None], axis=-1)[..., 0]
+        return jnp.where(hidden, cross_entropy / times[:, None], 0.0)
+
+    loss, _ = scalar_loss(objective, params, {"text": rows}, Step(jnp.asarray(0), rng, None))
+    np.testing.assert_allclose(loss, terms(params).sum() / rows.size, rtol=1e-5)
+
+    averaged = jax.tree.map(lambda leaf: 1.5 * leaf, params)
+    scored = objective.evaluate(params, {"text": rows}, Step(jnp.asarray(0), rng, averaged))
+    np.testing.assert_allclose(scored.losses, terms(averaged), rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(scored.weights, 1.0)
 
 
 ############################################################################################################
