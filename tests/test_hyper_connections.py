@@ -21,6 +21,7 @@ from dew.nn.hyper_connections import (
     collapse_streams,
     expand_streams,
     mix_streams,
+    sinkhorn,
 )
 
 BOUND = 1e-4
@@ -163,6 +164,22 @@ def test_the_weighted_head_matches_the_oracle_and_the_mean_head_is_the_mean(case
     assert scaled(collapse_streams(jnp.asarray(streams, jnp.float32), None), streams.mean(2)) < BOUND
     first = jnp.asarray(streams[:, :, 0], jnp.float32)
     assert np.array_equal(expand_streams(first, H), np.repeat(np.asarray(first)[:, :, None], H, axis=2))
+
+
+def test_sinkhorn_compiles_its_repeats_as_one_loop():
+    """Sinkhorn's repeats lower to a loop, so the gradient program, and the
+    time XLA takes to compile it, does not grow with the iteration count:
+    unrolled, 20 repeats took an L4 71 s to compile for one site's gradient,
+    where the loop takes 0.5 s."""
+    comb = jnp.full((2, 4, 4), 0.25, jnp.float32)
+
+    def program(iters):
+        gradient = jax.grad(lambda comb: jnp.sum(sinkhorn(comb, iters, 1e-6) ** 2))
+        return jax.jit(gradient).lower(comb).as_text()
+
+    twenty, forty = program(20), program(40)
+    assert "stablehlo.while" in twenty
+    assert twenty.count("stablehlo.divide") == forty.count("stablehlo.divide")
 
 
 def test_the_record_refuses_what_the_references_cannot_build():

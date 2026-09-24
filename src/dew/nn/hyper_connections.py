@@ -109,13 +109,17 @@ def sinkhorn(comb, iters: int, eps: float):
     """Normalise `[..., H, H]` alternately `iters` times, the columns first.
 
     Each division carries `eps` in its denominator
-    (modeling_glm5_next.py:287-290).
+    (modeling_glm5_next.py:287-290). The repeats run as one loop, which XLA
+    compiles once: unrolled, 20 of them took an L4's compiler 71 s for one
+    site's gradient, where the loop takes 0.5 s.
     """
     comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
-    for _ in range(iters - 1):
+
+    def normalized(_, comb):
         comb = comb / (jnp.sum(comb, axis=-1, keepdims=True) + eps)
-        comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
-    return comb
+        return comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
+
+    return jax.lax.fori_loop(0, iters - 1, normalized, comb)
 
 
 def mix_streams(post, comb, output, streams):
