@@ -8,6 +8,7 @@ tree, the logits, the decode path, the loss and the gradients to the plain
 loop's, with the largest observed difference written beside each bound.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     reference = np.load(directory / "logits.npy")
 
-    
+
     plain = np.asarray(model.apply(variables, ids))
     logits = np.asarray(scanned.apply(variables, ids))
 
@@ -557,3 +558,19 @@ def test_the_layers_of_a_run_draw_their_own_weights():
                for index in range(4)]
     assert all(not np.array_equal(kernels[i], kernels[j])
                for i in range(4) for j in range(i + 1, 4))
+
+
+def test_a_scanned_glm5_next_computes_its_unrolled_forward():
+    """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
+    hyper-connections) scan as one run under `scan_layers`. The scanned
+    forward is the unrolled one's, call after call. On XLA:CPU it was off by
+    8.7, 10.1 or NaN depending on the process, exact without jit and on a
+    GPU: the compiled program is identical across processes, so the bad
+    values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
+    loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
+    tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
+    unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
+    scanned = jax.jit(dataclasses.replace(loaded.model, scan_layers=True).apply)
+    for _ in range(3):
+        got = np.asarray(scanned(loaded.variables, tokens), np.float64)
+        assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
