@@ -605,7 +605,7 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
     return [apply(case) for case in cases]
 
 
-def decoder_objective(case: Case, model) -> Objective:
+def decoder_objective(case: Case, model) -> LMObjective | DPOObjective | GRPOObjective | MaskedDiffusionObjective:
     """What the case's decoder trains over its rows (`Case.decoder_objective`),
     with its own head chunking where it names one and its further objective
     keywords. Masked diffusion corrupts to the vocabulary's last id, which
@@ -640,13 +640,13 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
     loader assembles the same two models (dew.interop.pretrained and
     dew.interop.diffusion_gemma.build).
     """
-    dtype = case.dtype
-    if dtype is None and not widened:
+    if case.dtype is None and not widened:
         raise ValueError(f"{case.label} names no dtype; build_cases gives it the run's --dtype")
+    dtype = None if widened else case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        if widened:
-            return models.build(architecture, **config, dtype=None)
+        if dtype is None:
+            return models.build(architecture, **{**config, "dtype": None})
         return models.build(architecture, **with_precision(
             architecture, config, dtype=dtype, attention_impl=attention_impl))
 
@@ -663,7 +663,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         # The decoder carries the attention kernel; the wrapper reads none.
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=None if widened else resolve_dtype(dtype))
+            dtype=resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
         objective = decoder_objective(case, built(case.architecture, case.config))
