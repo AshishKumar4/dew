@@ -5,6 +5,7 @@ import capture from '../data/capture.json';
 import objectiveCode from '../data/objective.py?raw';
 import models from '../generated/models.json';
 import outputs from '../generated/notebook-outputs.json';
+import registries from '../generated/registries.json';
 import tutorials from '../generated/tutorial-cards.json';
 import MeshDiagram from '../components/landing/MeshDiagram.astro';
 import '../styles/landing.css';
@@ -23,6 +24,8 @@ const shakespeare = cell('05-train-a-language-model', 'cell-20').stdout ?? '';
 const samplers = cell('04-samplers-and-schedules', 'cell-15').images[2];
 
 const families = models.groups.reduce((sum, group) => sum + group.families.length, 0);
+// The solvers registered for continuous diffusion and flows, counted from the code.
+const solvers = registries.samplers.filter((entry) => entry.object.startsWith('dew.sampling.')).length;
 
 const workloads = [
 	{
@@ -35,7 +38,7 @@ const workloads = [
 	},
 	{
 		title: 'Image and video diffusion',
-		text: 'Diffusion, flow matching and latent diffusion on DiT, U-Net and MMDiT backbones, with 17 solvers and classifier-free guidance.',
+		text: `Diffusion, flow matching and latent diffusion on DiT, U-Net and MMDiT backbones, with ${solvers} solvers and classifier-free guidance.`,
 		links: [
 			['Train a diffusion model', '/tutorials/02-train-a-diffusion-model/'],
 			['Processes and solvers', '/concepts/diffusion/'],

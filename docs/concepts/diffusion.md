@@ -42,6 +42,8 @@ The first group of solvers are the classic integrators: `DDPM`, `DDIM`, `Euler`,
 - `DPMSolverSinglestep`, `DPMSolverSDE`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral) and `TCD`.
 - `Consistency`, used with the `ConsistencyBoundary` prediction transform, for latent consistency models.
 
+`FlowSDE` is Flow-GRPO's Euler-Maruyama solver on a rectified-flow process.
+
 `MultiStepDPM` and `DPMSolverMultistep` are different things despite the names. `DPMSolverSDE` is the solver of `DPMSolverSDEScheduler`, not one of the SDE algorithms of `DPMSolverMultistep`: each interval takes two ancestral steps, and both draw noise from one keyed Brownian bridge over the schedule's positive sigma range, so the two draws are nested increments of a single path.
 
 `DDPM(variance="large")` uses the wider published posterior variance, the beta of the variance-preserving forward step. That beta is zero wherever alpha is one, so DDPM refuses a variance-exploding grid instead of sampling it without noise. Neither variance adds noise on the step whose own time is the schedule's zero.
