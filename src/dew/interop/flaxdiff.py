@@ -72,21 +72,15 @@ class SimpleUDiTFields(TypedDict):
 
 def read_checkpoint(directory: str | os.PathLike) -> dict:
     """One FlaxDiff checkpoint step, the directory holding `default/`, as the
-    nested dict of host arrays FlaxDiff saved.
+    nested dict of host arrays FlaxDiff saved there with orbax.
 
-    FlaxDiff's 2024 runs wrote orbax's aggregate msgpack file
-    (`default/checkpoint`); later ones wrote OCDBT.
+    FlaxDiff's 2024 runs saved orbax's older aggregate file
+    (`default/checkpoint`), which this does not read: no model of those runs
+    has a loader.
     """
-    saved = Path(directory) / "default"
-    aggregate = saved / "checkpoint"
-    if aggregate.is_file():
-        from flax.serialization import msgpack_restore
+    import orbax.checkpoint as ocp
 
-        restored = msgpack_restore(aggregate.read_bytes())
-    else:
-        import orbax.checkpoint as ocp
-
-        restored = ocp.PyTreeCheckpointer().restore(saved.resolve())
+    restored = ocp.PyTreeCheckpointer().restore((Path(directory) / "default").resolve())
     if not isinstance(restored, dict) or "state" not in restored:
         raise ValueError(f"{directory} is not a FlaxDiff checkpoint step: it holds no 'state'")
     return restored
