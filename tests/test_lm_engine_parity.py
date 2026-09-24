@@ -11,6 +11,7 @@ the logits by 0.8% to 300% when it is switched off, so these tolerances leave
 no room for a missing one.
 """
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -133,8 +134,17 @@ def objective(model, tokens):
     return loss
 
 
+@contextlib.contextmanager
+def float64():
+    """float64 on the host's CPU device, which the test lanes keep beside an
+    accelerator (conftest): a TPU compiles no float64 program ("While
+    rewriting computation to not contain X64")."""
+    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+        yield
+
+
 def test_rigel_shaped_hybrid_matches_lm_engine_forward_losses_and_gradients(reference):
-    with jax.enable_x64(True):
+    with float64():
         model = hybrid()
         tokens = jnp.asarray(reference["tokens"], jnp.int32)
         params = tree(leaves(reference, "param:"))
@@ -167,7 +177,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
         optimizer="adamw", optimizer_opts={"b1": 0.9, "b2": 0.95, "eps": 1e-10},
         schedule=Power(peak=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
         weight_decay=0.1, param_groups=groups)
-    with jax.enable_x64(True):
+    with float64():
         solver = build_optimizer(config, steps=3)
         params = tree(params0)
         state = solver.init(params)
