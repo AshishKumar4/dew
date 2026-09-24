@@ -252,3 +252,49 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
 
     custom = SimpleNamespace(model=decoder.model.clone(remat='save_qkv_proj'))
     assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
+
+
+def test_the_headroom_is_the_tightest_devices_free_memory_less_what_the_step_adds():
+    """Outputs that alias the donated state take no new memory; the rest of
+    the outputs and the temporaries do. A device or an executable that
+    reports no memory leaves the answer unknown."""
+    from types import SimpleNamespace
+
+    from dew.training.trainer import step_headroom
+
+    step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
+        output_size_in_bytes=100, alias_size_in_bytes=40, temp_size_in_bytes=50))
+
+    def device(in_use):
+        return SimpleNamespace(memory_stats=lambda: {'bytes_limit': 1000, 'bytes_in_use': in_use})
+
+    assert step_headroom(step, [device(800), device(850)]) == 150 - 110
+    assert step_headroom(step, [device(800), SimpleNamespace(memory_stats=lambda: None)]) is None
+    assert step_headroom(SimpleNamespace(memory_analysis=lambda: None), [device(800)]) is None
+
+
+def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
+    """The first compile leaves no headroom, so the trainer compiles the step
+    again under 'minimal', which fits, and stops there."""
+    import optax
+
+    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer, trainer as trainer_module
+
+    headrooms = iter([-1, 0])
+    compiled = []
+
+    def headroom(executable, devices):
+        compiled.append(executable)
+        return next(headrooms)
+
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
+    assert len(compiled) == 2
+    assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
+    assert trainer_module.remat_record(trainer.objective.model.remat) == 'minimal'

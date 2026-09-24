@@ -110,7 +110,10 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     local.close()
     entries = records(tmp_path / 'tracking')
     assert int(state.step) == 2
-    assert [e['type'] for e in entries] == ['FitStarted', 'CheckpointRequested', 'FitEnded']
+    assert [e['type'] for e in entries] == ['FitStarted', 'StepCompiled', 'CheckpointRequested',
+                                            'FitEnded']
+    # The regression model has no remat, and no rung was climbed.
+    assert entries[1]['value']['remat'] is None
     assert entries[-1]['value']['status'] == 'completed'
 
 
@@ -245,7 +248,8 @@ def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkey
             for point in client.get_metric_history(run, 'train/loss')] == [(1, True), (2, True)]
     assert client.get_run(run).info.status == 'FINISHED'
     assert ({file.path for file in client.list_artifacts(run, 'records')}
-            == {'records/FitStarted-0.json', 'records/FitEnded-2.json'})
+            == {'records/FitStarted-0.json', 'records/StepCompiled-0.json',
+                'records/FitEnded-2.json'})
     artifacts = client.get_run(run).info.artifact_uri
     outcome = mlflow.artifacts.load_dict(f'{artifacts}/records/FitEnded-2.json')
     assert outcome['step'] == 2 and outcome['value']['status'] == 'completed'

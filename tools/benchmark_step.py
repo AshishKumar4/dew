@@ -82,6 +82,7 @@ from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.runtime import prepare_process
+from dew.training.trainer import remat_record
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trace_window import kernel_category, length, overlap, union, window_split
@@ -992,6 +993,9 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "params": parameter_count(state.params),
             "measured_steps": config.steps,
             "compile_seconds": round(compile_seconds, 2),
+            # The rung the trainer compiled the step under, the model's own
+            # or a stronger one where the step did not fit.
+            "remat": remat_record(getattr(getattr(trainer.objective, "model", None), "remat", None)),
             "ms_per_step": round(step_time * 1e3, 3),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
