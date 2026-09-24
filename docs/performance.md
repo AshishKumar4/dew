@@ -128,8 +128,8 @@ scalars. (`bfloat16` matmul precision would change the numerics of the fp32
 head, and the precision rule refuses it in any case.)
 
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
-from the first class-1 row is on main (`src/dew/training/trainer.py:150`,
-called at `:770`). The class-5 row about `objective.py:141` no longer matches
+from the first class-1 row is on main (`src/dew/training/trainer.py`, called
+from `Trainer.fit`). The class-5 row about `objective.py:141` no longer matches
 the code. The diffusion objective encodes the unconditional prompt once, when
 it is built, and each step only casts that stored encoding to the batch's
 dtypes (`blank_conditions`, `src/dew/objectives/diffusion/objective.py:142-149`,
