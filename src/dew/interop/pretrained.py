@@ -2053,8 +2053,8 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
     model = AutoencoderKL(
         channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
         image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
-        norm_groups=config["norm_num_groups"], quantize=config.get("use_quant_conv", True),
-        post_quantize=config.get("use_post_quant_conv", True), dtype=compute)
+        norm_groups=config["norm_num_groups"], quantize=diffusion.flag(config, "use_quant_conv", default=True),
+        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True), dtype=compute)
     tensors = diffusion.component_tensors(directory, "vae")
     params, layouts = diffusion.record_layouts(
         "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),

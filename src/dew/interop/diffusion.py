@@ -56,6 +56,18 @@ class UNetFields(TypedDict):
     attention_impl: str
 
 
+def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
+    """One boolean diffusers config field, read as diffusers reads it: a
+    missing field is the class's default, and a null one is False, since
+    diffusers only tests the value's truth (a null `flip_sin_to_cos` embeds
+    sin first although the default is True). SDXL's UNets store
+    `upcast_attention: null`."""
+    if name not in config:
+        return default
+    value = config[name]
+    return False if value is None else records.boolean(value, name)
+
+
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                 attention_impl="auto") -> UNetFields:
     """Read a Diffusers UNet config into the fields `UNet2DCondition` takes.
@@ -106,7 +118,9 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         "conv_in_kernel": 3, "conv_out_kernel": 3,
     }
     for name, expected in fixed.items():
-        if name in config and config[name] != expected:
+        # A null flag is False to diffusers, the value the UNet computes.
+        value = flag(config, name, default=expected) if isinstance(expected, bool) else config.get(name, expected)
+        if value != expected:
             raise ValueError(f"Native UNet cannot honor active {name}={config[name]!r}")
     if config.get("time_embedding_dim") not in (None, widths[0] * 4):
         raise ValueError("Native UNet requires a time embedding four times its first width")
@@ -127,10 +141,10 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
                      for width, head, depth, attended, cross_only in zip(widths, heads, depths, cross, only_cross, strict=True)),
         in_channels=records.integer(config["in_channels"], "in_channels"), out_channels=records.integer(config["out_channels"], "out_channels"),
         blocks_per_level=records.integer(config.get("layers_per_block", 2), "layers_per_block"),
-        linear_projection=records.boolean(config.get("use_linear_projection", False), "use_linear_projection"),
+        linear_projection=flag(config, "use_linear_projection", default=False),
         additional_time_features=records.integer(config["addition_time_embed_dim"], "addition_time_embed_dim") if addition else 0,
         middle_attention=middle is not None, frequency_shift=records.number(config.get("freq_shift", 0), "freq_shift"),
-        cosine_first=records.boolean(config.get("flip_sin_to_cos", True), "flip_sin_to_cos"),
+        cosine_first=flag(config, "flip_sin_to_cos", default=True),
         dropout=records.number(config.get("dropout", 0), "dropout"), norm_groups=groups, norm_epsilon=epsilon,
         attention_norm_epsilon=1e-5 if flax_semantics else 1e-6, approximate_gelu=flax_semantics,
         dtype=resolve_dtype(dtype), attention_impl=attention_impl)
