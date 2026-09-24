@@ -26,14 +26,15 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
+from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, RematPolicy
 from dew.nn.kernels.generation import device_generation
-from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
 from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
@@ -48,6 +49,7 @@ from dew.objectives.base import (
     Step,
     select,
 )
+from dew.records import JSON
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
@@ -58,6 +60,7 @@ from dew.telemetry.records import (
     FitStarted,
     ProfileWindow as ProfileWindowRecord,
     Record,
+    StepCompiled,
 )
 from dew.training.distributed import (
     DevicePrefetchIterator,
@@ -213,29 +216,60 @@ DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
-def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
-    """Whether the compiled step's temporaries and new outputs fit the free
-    memory of each of `mesh`'s devices, where the backend reports it. The
-    arguments, the state and the batch, are already resident and counted in
-    use; the donated state's buffers are reused for the outputs that alias
-    them."""
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | None:
+    """The bytes the tightest of `devices` has free once the compiled step's
+    temporaries and new outputs are placed, None where the executable or a
+    device reports no memory. The arguments, the state and the batch, are
+    already resident and counted in use; the donated state's buffers are
+    reused for the outputs that alias them."""
     stats = executable.memory_analysis()
-    memory = [device.memory_stats() or {} for device in mesh.devices.flat]
+    memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
-        return True
+        return None
     needed = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
-    return needed <= min(m['bytes_limit'] - m['bytes_in_use'] for m in memory)
+    return min(m['bytes_limit'] - m['bytes_in_use'] for m in memory) - needed
+
+
+def fits_everywhere(headroom: int | None) -> bool:
+    """Whether every process's headroom is non-negative, the same answer on
+    every process. A process reads only its own devices' memory, so the pool
+    takes the minimum; one that reports none decides nothing."""
+    if jax.process_count() == 1:
+        return headroom is None or headroom >= 0
+    # float32 because a pool without x64 gathers no wider type; its sign is
+    # exact, which is all the answer reads.
+    gathered = multihost_utils.process_allgather(
+        np.asarray(np.inf if headroom is None else headroom, np.float32))
+    return bool(np.min(gathered) >= 0)
+
+
+def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
+    """Whether the compiled step fits the free memory of every device of
+    `mesh`, agreed across the processes that hold them."""
+    local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
+    return fits_everywhere(step_headroom(executable, local))
+
+
+def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
+    """A model's remat as a record reads it: a policy by its name in
+    `REMAT_POLICIES` where it has one, else its two lists."""
+    if isinstance(remat, RematPolicy):
+        names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
+        return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
+    return remat
 
 
 def recompute_more(objective) -> bool:
     """Move the objective's model one rung up its remat ladder, and say
     whether there was a rung to move to."""
     model = getattr(objective, 'model', None)
+    if model is None:
+        return False
     current = getattr(model, 'remat', ...)
     ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
               else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
     current = 'dots' if current is True else current
-    if current not in ladder or current == ladder[-1]:
+    if current not in ladder[:-1]:
         return False
     stronger = ladder[ladder.index(current) + 1]
     print(colored(f"the step does not fit the devices under remat {current!r}; "
@@ -1081,8 +1115,12 @@ class Trainer(Generic[Loss, Effects]):
         """
         shapes = batch_shapes(batch)
         if shapes not in compiled:
+            began = time.perf_counter()
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+            model = getattr(self.objective, 'model', None)
+            self._report(StepCompiled(time.perf_counter() - began,
+                                      remat_record(getattr(model, 'remat', None))), int(state.step))
         return compiled[shapes]
 
     def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],

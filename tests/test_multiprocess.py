@@ -1337,3 +1337,12 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
     assert "NotADirectoryError" in reports[0]["failed"]
     assert "profiling window start" in reports[1]["failed"]
     assert all(report["recovered"] == 2 for report in reports)
+
+@pytest.mark.distributed
+def test_a_step_fits_only_where_it_fits_every_process(tmp_path):
+    """Each process reads only its own devices' memory, so one process short
+    of room refuses the step for the whole pool; every process has to compile
+    the same program, under the same remat."""
+    reports = run_pool("step_fits", tmp_path, 2)
+    for report in reports:
+        assert report == {"tight": False, "roomy": True, "one_unknown": True, "unknown": True}

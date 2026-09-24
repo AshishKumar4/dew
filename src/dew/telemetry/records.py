@@ -77,6 +77,15 @@ class FitStarted:
 
 
 @dataclasses.dataclass(frozen=True)
+class StepCompiled:
+    """A training step compiled for a new batch shape, and the remat it
+    compiled under, which is the model's own or a stronger rung the trainer
+    moved to because the step did not fit."""
+    seconds: float
+    remat: JSON
+
+
+@dataclasses.dataclass(frozen=True)
 class CheckpointRequested:
     """Async save submitted, NOT proof of a durable checkpoint."""
     directory: str
@@ -114,7 +123,7 @@ class TrialFinished:
     value: float
 
 
-type Record = (RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
+type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileWindow | FitEnded
                | TrialFinished)
 # A PEP 695 alias holds its union in `__value__`; `get_args` of the alias
 # itself is empty, and these are the classes `isinstance` is given.

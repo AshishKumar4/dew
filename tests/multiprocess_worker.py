@@ -1870,7 +1870,20 @@ def mode_host_training(args) -> dict:
     return reports
 
 
-MODES = {"host_training": mode_host_training,
+def mode_step_fits(args) -> dict:
+    """Each process's own headroom for a step, and the pool's answer: process
+    0 has room, process 1 is short, and a process that reads no memory
+    decides nothing."""
+    from dew.training.trainer import fits_everywhere
+
+    tight = [10, -1][args.process_id]
+    return {"tight": fits_everywhere(tight),
+            "roomy": fits_everywhere(abs(tight)),
+            "one_unknown": fits_everywhere([5, None][args.process_id]),
+            "unknown": fits_everywhere(None)}
+
+
+MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit,
