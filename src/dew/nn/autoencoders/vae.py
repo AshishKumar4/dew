@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.conv import Conv
 from dew.nn.text_encoders import ParamTree, insert
 
 
@@ -27,7 +28,7 @@ class FlaxUpsample2D(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.conv = nn.Conv(
+        self.conv = Conv(
             self.in_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -52,7 +53,7 @@ class FlaxDownsample2D(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.conv = nn.Conv(
+        self.conv = Conv(
             self.in_channels,
             kernel_size=(3, 3),
             strides=(2, 2),
@@ -84,7 +85,7 @@ class FlaxResnetBlock2D(nn.Module):
         out_channels = self.in_channels if self.out_channels is None else self.out_channels
 
         self.norm1 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv1 = nn.Conv(
+        self.conv1 = Conv(
             out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -94,7 +95,7 @@ class FlaxResnetBlock2D(nn.Module):
 
         self.norm2 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
         self.dropout_layer = nn.Dropout(self.dropout)
-        self.conv2 = nn.Conv(
+        self.conv2 = Conv(
             out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -106,7 +107,7 @@ class FlaxResnetBlock2D(nn.Module):
 
         self.conv_shortcut = None
         if use_nin_shortcut:
-            self.conv_shortcut = nn.Conv(
+            self.conv_shortcut = Conv(
                 out_channels,
                 kernel_size=(1, 1),
                 strides=(1, 1),
@@ -358,7 +359,7 @@ class FlaxEncoder(nn.Module):
 
     def setup(self):
         block_out_channels = self.block_out_channels
-        self.conv_in = nn.Conv(
+        self.conv_in = Conv(
             block_out_channels[0],
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -387,7 +388,7 @@ class FlaxEncoder(nn.Module):
 
         conv_out_channels = 2 * self.out_channels if self.double_z else self.out_channels
         self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv_out = nn.Conv(
+        self.conv_out = Conv(
             conv_out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -420,7 +421,7 @@ class FlaxDecoder(nn.Module):
 
     def setup(self):
         block_out_channels = self.block_out_channels
-        self.conv_in = nn.Conv(
+        self.conv_in = Conv(
             block_out_channels[-1],
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -449,7 +450,7 @@ class FlaxDecoder(nn.Module):
             for i, channels in enumerate(reversed_block_out_channels)]
 
         self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv_out = nn.Conv(
+        self.conv_out = Conv(
             self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),

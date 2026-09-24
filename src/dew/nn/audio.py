@@ -23,6 +23,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.registry import from_record, towers
 
 from .attention import LayerNorm, RMSNorm
+from .conv import Conv
 from .sharding import logical_axes
 from .text_encoders import ParamTree, checkpoint_array, insert
 from .vision import TowerBase, TowerGeometry
@@ -199,9 +200,9 @@ class AudioSubsampleLayer(nn.Module):
         if not self.cumulative:
             x = x * mask[:, :, None, None]
         padding = ((0, self.kernel[0] - 1), (1, 1)) if self.cumulative else ((1, 1), (1, 1))
-        x = nn.Conv(self.features, self.kernel, strides=self.stride, padding=padding,
-                    use_bias=False, dtype=self.dtype, precision=self.precision,
-                    kernel_init=nn.initializers.normal(self.initializer_range), name="conv")(x)
+        x = Conv(self.features, self.kernel, strides=self.stride, padding=padding,
+                 use_bias=False, dtype=self.dtype, precision=self.precision,
+                 kernel_init=nn.initializers.normal(self.initializer_range), name="conv")(x)
         if self.cumulative:
             x = CumulativeGroupNorm(self.norm_eps, name="norm")(x)
         else:
@@ -424,9 +425,9 @@ class AudioLightConv(nn.Module):
         x = linear(self.width * 2, "linear_start", x)
         first, gate = jnp.split(x, 2, axis=-1)
         x = first * jax.nn.sigmoid(gate)
-        x = nn.Conv(self.width, (self.kernel_size,), padding=((self.kernel_size - 1, 0),),
-                    feature_group_count=self.width, use_bias=False, dtype=self.dtype,
-                    precision=self.precision, kernel_init=nn.initializers.normal(self.initializer_range), name="depthwise_conv1d")(x)
+        x = Conv(self.width, (self.kernel_size,), padding=((self.kernel_size - 1, 0),),
+                 feature_group_count=self.width, use_bias=False, dtype=self.dtype,
+                 precision=self.precision, kernel_init=nn.initializers.normal(self.initializer_range), name="depthwise_conv1d")(x)
         x = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="conv_norm")(_clip(x, self.clipping))
         return residual + linear(self.width, "linear_end", _activation(x, self.activation))
 

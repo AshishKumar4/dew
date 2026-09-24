@@ -40,6 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.conv import Conv
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -248,7 +249,7 @@ class CLIPVisionTransformer(nn.Module):
         self.class_embedding = self.param(
             "class_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
             (self.hidden_size,))
-        self.patch_embedding = nn.Conv(
+        self.patch_embedding = Conv(
             self.hidden_size, (self.patch_size, self.patch_size),
             strides=(self.patch_size, self.patch_size), padding="VALID",
             use_bias=False, dtype=self.dtype, precision=self.precision,

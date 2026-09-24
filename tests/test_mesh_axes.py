@@ -20,6 +20,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.blocks import Upsample
+from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -451,6 +453,57 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
     terms = x.shape[0] * x.shape[2]
     magnitude = jax.grad(loss, argnums=1)(np.abs(x), taps, np.abs(cotangent))
     np.testing.assert_array_less(np.abs(split - alone), terms * np.finfo(np.float32).eps * magnitude)
+
+
+CONV_LAYOUTS = {
+    # The UNet's upsampling 3x3 convolution with its input's batch split over
+    # data and its output's image rows over sequence, the batch whole: the
+    # placement a sequence-parallel layer after it gives a batch too small
+    # for the data axis.
+    "upsample": (Upsample(features=16, scale=2), MeshSpec(sequence=2), P("data"),
+                 P(None, "sequence")),
+    # The SSM DiT's depthwise fusion convolutions with only their batch split,
+    # over fsdp beside a tensor axis they do not use: a hybrid mesh's plain
+    # data-parallel layout.
+    "depthwise": (SpatialFusionConv(features=8), MeshSpec(fsdp=2, tensor=2),
+                  P(("data", "fsdp")), None),
+}
+
+
+@pytest.mark.parametrize("name", sorted(CONV_LAYOUTS))
+def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
+    """The kernel's gradient is one device's. XLA's partitioner doubled it in
+    both layouts: it scales a convolution's kernel gradient by a power of two
+    in several layouts where a mesh axis holds the convolution's input or
+    output replicated (openxla/xla#49382). The UNets, the VAEs, the patch
+    embeddings and the depthwise towers build on `dew.nn.conv.Conv`, which
+    places the input and output over every mesh axis."""
+    block, spec, rows, outputs = CONV_LAYOUTS[name]
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(4, 8, 8, 8)).astype(np.float32)
+    params = block.init(jax.random.key(0), x)["params"]
+    shape = jax.eval_shape(block.apply, {"params": params}, x).shape
+    cotangent = rng.normal(size=shape).astype(np.float32)
+
+    def loss(params, x, cotangent, constrained):
+        out = block.apply({"params": params}, x)
+        if constrained and outputs is not None:
+            out = jax.lax.with_sharding_constraint(out, outputs)
+        return jnp.sum(out * cotangent)
+
+    alone = jax.grad(loss)(params, x, cotangent, False)
+    mesh = build_mesh(spec, jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        split = jax.jit(jax.grad(loss), static_argnums=3)(
+            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, True)
+
+    # Each kernel entry's and bias entry's gradient sums one product per row
+    # and output position, bounded as the taps' above.
+    terms = shape[0] * shape[1] * shape[2]
+    magnitude = jax.grad(loss)(params, np.abs(x), np.abs(cotangent), False)
+    for got, want, size in zip(jax.tree.leaves(split), jax.tree.leaves(alone),
+                               jax.tree.leaves(magnitude), strict=True):
+        np.testing.assert_array_less(np.abs(got - want), terms * np.finfo(np.float32).eps * size)
 
 
 def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():

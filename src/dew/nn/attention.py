@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .conv import Conv
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names, rounded_to
@@ -1944,7 +1945,7 @@ class TransformerBlock(nn.Module):
                                        use_bias=False, precision=self.precision,
                                        dtype=self.dtype, name='project_in')(x)
             else:
-                projected_x = nn.Conv(
+                projected_x = Conv(
                     features=inner_dim, kernel_size=(1, 1),
                     strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
                     precision=self.precision, name='project_in_conv',
@@ -1976,7 +1977,7 @@ class TransformerBlock(nn.Module):
                                        dtype=self.dtype, use_bias=False,
                                        name='project_out')(projected_x)
             else:
-                projected_x = nn.Conv(
+                projected_x = Conv(
                     features=C, kernel_size=(1, 1),
                     strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
                     precision=self.precision, name='project_out_conv',

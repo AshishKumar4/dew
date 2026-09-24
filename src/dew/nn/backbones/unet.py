@@ -13,6 +13,7 @@ from dew.registry import models
 
 from ..attention import RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
+from ..conv import Conv
 from ..sharding import logical_axes
 
 
@@ -39,7 +40,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
             "attention_configs names one stage per feature depth; got "
             f"{len(attention_configs)} stages for {len(feature_depths)} depths")
 
-    conv = partial(nn.Conv, kernel_size=(3, 3), strides=(1, 1),
+    conv = partial(Conv, kernel_size=(3, 3), strides=(1, 1),
                    dtype=model.dtype, precision=model.precision)
     residual = partial(ResidualBlock, kernel_size=(3, 3), activation=model.activation,
                        norm_groups=model.norm_groups, dtype=model.dtype,

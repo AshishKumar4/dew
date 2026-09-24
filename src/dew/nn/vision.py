@@ -45,6 +45,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.conv import Conv
 from dew.nn.text_encoders import MLP, CLIPAttention, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
@@ -172,7 +173,7 @@ class SiglipVisionTransformer(nn.Module):
         patches = (self.image_size // self.patch_size) ** 2
         # torch Conv2d carries a bias unless told otherwise; the CLIP tower's
         # convolution is the bias-free exception, not the rule.
-        self.patch_embedding = nn.Conv(
+        self.patch_embedding = Conv(
             self.hidden_size, (self.patch_size, self.patch_size),
             strides=(self.patch_size, self.patch_size), padding="VALID",
             use_bias=True, dtype=self.dtype, precision=self.precision,

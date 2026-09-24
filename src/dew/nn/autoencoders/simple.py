@@ -5,6 +5,7 @@ import jax
 from flax.typing import Dtype, PrecisionLike
 from jax import numpy as jnp
 
+from ..conv import Conv
 from .api import AutoEncoder
 
 
@@ -29,7 +30,7 @@ class SimpleEncoder(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         for i, features in enumerate(self.feature_depths):
-            x = nn.Conv(
+            x = Conv(
                 features=features,
                 kernel_size=(3, 3),
                 strides=(2, 2),
@@ -42,7 +43,7 @@ class SimpleEncoder(nn.Module):
                 x = nn.GroupNorm(_group_count(features, self.norm_groups), dtype=self.dtype,
                                  name=f"down_norm_{i}")(x)
             x = self.activation(x)
-        return nn.Conv(
+        return Conv(
             features=self.latent_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
@@ -68,7 +69,7 @@ class SimpleDecoder(nn.Module):
         for i, features in enumerate(self.feature_depths):
             B, H, W, C = z.shape
             z = jax.image.resize(z, (B, H * 2, W * 2, C), method="nearest")
-            z = nn.Conv(
+            z = Conv(
                 features=features,
                 kernel_size=(3, 3),
                 strides=(1, 1),
@@ -81,7 +82,7 @@ class SimpleDecoder(nn.Module):
                 z = nn.GroupNorm(_group_count(features, self.norm_groups), dtype=self.dtype,
                                  name=f"up_norm_{i}")(z)
             z = self.activation(z)
-        return nn.Conv(
+        return Conv(
             features=self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),

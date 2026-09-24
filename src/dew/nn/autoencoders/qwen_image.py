@@ -37,6 +37,7 @@ from dew import records
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
+from ..conv import Conv
 from .api import ModuleAutoEncoder
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
@@ -63,10 +64,10 @@ class _RMSNorm(nn.Module):
         return normalized * math.sqrt(self.features) * gamma.reshape(-1).astype(self.dtype)
 
 
-def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Conv:
+def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> Conv:
     """The source's padded "causal" convolution, which is a 2D one on a frame."""
     pad = kernel // 2
-    return nn.Conv(features, (kernel, kernel), padding=((pad, pad), (pad, pad)), dtype=dtype, name=name)
+    return Conv(features, (kernel, kernel), padding=((pad, pad), (pad, pad)), dtype=dtype, name=name)
 
 
 class _TimeConv(nn.Module):
