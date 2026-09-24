@@ -325,29 +325,26 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     return core.astype(dtype), state.astype(dtype)
 
 
-def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
-    """One-token-at-a-time form, the decode path.
+def recurrent_delta_rule(query, key, value, g, beta, state=None):
+    """One token at a time, the decode path, in fp32 as a lax.scan over the
+    time axis so the state rides the scan the way it rides the decode cache.
 
-    `torch_recurrent_gated_delta_rule` (modeling_qwen3_next.py:456-506)
-    verbatim, in fp32, as a lax.scan over the time axis so the state rides
-    the scan the same way it rides the decode cache.
+    `g` is the log decay per key dimension, `[B, S, H, Dk]`, which is
+    `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
+    gated delta rule decays per head, one decay over every key dimension.
     """
     dtype = query.dtype
     query, key, value, g, beta = (
         x.astype(jnp.float32) for x in (query, key, value, g, beta))
     query = query * (key.shape[-1] ** -0.5)
 
-    def one_token(carry, step):
-        s = carry
-        q_t, k_t, v_t = step['q'], step['k'], step['v']
-        g_t = jnp.exp(step['g'])                    # [B, H]
-        beta_t = step['beta']                        # [B, H]
-        s = s * g_t[..., None, None]                 # [B, H, Dk, Dv]
+    def one_token(s, step):
+        q_t, k_t, v_t, g_t, beta_t = (step[name] for name in ('q', 'k', 'v', 'g', 'beta'))
+        s = s * jnp.exp(g_t)[..., :, None]                 # rows decay per key dimension
         kv_mem = jnp.sum(s * k_t[..., :, None], axis=-2)   # [B, H, Dv]
         delta = (v_t - kv_mem) * beta_t[..., None]        # [B, H, Dv]
         s = s + k_t[..., :, None] * delta[..., None, :]    # [B, H, Dk, Dv]
-        out = jnp.sum(s * q_t[..., :, None], axis=-2)      # [B, H, Dv]
-        return s, out
+        return s, jnp.sum(s * q_t[..., :, None], axis=-2)  # [B, H, Dv]
     # The scan stacks along the first axis, so the operands go time-major.
     if state is None:
         state = jnp.zeros((query.shape[0], query.shape[-2], key.shape[-1],
@@ -357,6 +354,12 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
         {name: jnp.moveaxis(x, 1, 0) for name, x in
          (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta))})
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
+
+
+def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
+    """`torch_recurrent_gated_delta_rule` (modeling_qwen3_next.py:456-506):
+    the delta rule with one log decay per head, `g` `[B, S, H]`."""
+    return recurrent_delta_rule(query, key, value, g[..., None], beta, state)
 
 
 # The projected width of the keys, values and the gate is the delta net's own
