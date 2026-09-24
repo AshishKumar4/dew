@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, LogicalAxes, batch_axes, logical_axes, logical_spec, mesh_axes
+from .sharding import EXPERT_AXIS, STAGE_AXIS, LogicalAxes, batch_axes, logical_axes, logical_spec, mesh_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -770,6 +770,11 @@ def expert_dispatch[Parameters](
     tokens = logical_spec((*positions_axes, 'activation_embed'), x.shape)
     routing = logical_spec((*positions_axes, None), indices.shape)
     manual = {axis for entry in tokens for axis in mesh_axes(entry)}
+    # A pipeline vmaps its stages with spmd_axis_name=stage, and a vmapped
+    # shard_map can split the new dimension only over an axis it holds
+    # manual; the operands, which name no stage, are replicated over it.
+    if STAGE_AXIS in mesh.axis_names and STAGE_AXIS not in mesh.manual_axes:
+        manual.add(STAGE_AXIS)
     stored = []
     for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
         kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
