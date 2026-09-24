@@ -380,15 +380,17 @@ def apart(ours, reference, truth, wide=None) -> dict[str, float]:
 def vision_bundle(directory: Path) -> Path:
     """The fixture with its vision half in `directory` as the release ships a
     bundle: vision_config inside config.json, one safetensors file."""
-    from safetensors.numpy import load_file, save_file
+    from safetensors.numpy import load_file
+
+    from dew.interop.safetensors_io import write_file
 
     for name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json"):
         shutil.copy(TINY / name, directory / name)
     config = json.loads((TINY / "config.json").read_text())
     config["vision_config"] = json.loads((TINY / "vision_config.json").read_text())
     (directory / "config.json").write_text(json.dumps(config))
-    save_file({**load_file(TINY / "model.safetensors"), **load_file(TINY / "vision.safetensors")},
-              directory / "model.safetensors")
+    write_file({**load_file(TINY / "model.safetensors"), **load_file(TINY / "vision.safetensors")},
+               directory / "model.safetensors", {"format": "pt"})
     return directory
 
 
