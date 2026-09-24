@@ -328,6 +328,24 @@ def test_a_slurm_placement_that_leaves_gpus_idle_is_refused(variables, arguments
     assert "--ntasks-per-node=4" in done.stderr, done.stderr
 
 
+@pytest.mark.parametrize("arguments", [
+    ("--processes-per-host", "2", "--devices-per-process", "1"),
+    ("--devices-per-process", "2"),
+], ids=["processes-and-devices", "devices"])
+def test_a_pool_that_asks_for_more_gpus_than_the_host_shows_is_refused(arguments):
+    """A host that shows one GPU, as CUDA_VISIBLE_DEVICES says here in place
+    of a machine's own: a pool naming two GPUs is refused before any rank
+    starts, with both counts. Unchecked, rank 1 took a GPU 1 that did not
+    exist (Accuracy's one-A100 lane)."""
+    env = {name: value for name, value in ENV.items()
+           if not name.startswith(("SLURM_", "OMPI_"))}
+    done = launched("--dry-run", *arguments, "--", "python", "train.py",
+                    env={**env, "JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": "0"})
+    assert done.returncode != 0, done.stdout
+    assert "needs 2 GPUs on localhost, which shows 1" in done.stderr, done.stderr
+    assert "JAX_COORDINATOR_ADDRESS" not in done.stdout, done.stdout
+
+
 def fake_srun(tmp_path: Path) -> dict:
     """An allocation's environment whose `srun` records its arguments and
     the variables it would hand its tasks, in place of Slurm's: four GPUs
