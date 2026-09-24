@@ -334,8 +334,50 @@ FAMILIES = {
     "llama4": ("llama4-native-tiny", "llama4-native-tiny", 6.76e-6, 5.4e-8, 1.22e-5),
     # Images and audio through the same prompt; the checkpoint and its
     # processor are the audio fixture's, the references sit beside them.
-    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny", 1.95e-6, 2.39e-7, 6.41e-5),
+    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny", 1.95e-6, 2.39e-7, 2.31e-5),
 }
+ORDER_MARGIN = 3
+"""How many of the reference's own CUDA-vs-CPU spreads Dew's post-SGD logits
+may move by on another fp32 reduction order. The spread comes from the
+gradient, not the updated forward: Gemma 3n's vision tower scales each block
+by a per-channel layer-scale gamma, whose gradient sums over every spatial
+position with heavy cancellation, so the summation order moves those
+gradients by 2-4e-5 relative (stages_1.blocks_0's alone moves the updated
+logits 9.5e-5), while the updated forward itself moves 2.9e-6 across
+backends. The reference moves 7.5e-5 between its CPU and CUDA runs
+(post_sgd_spread.json, written by tools/multimodal_reference.py
+gemma3n-spread, TF32 off). The margin is chosen, not derived: Dew's XLA
+order moves the logits 1.68e-4 from Dew's CPU run, 2.2 spreads, measured on
+an RTX 4080 and an A100 (which agree to 2e-6); a TPU's order is unmeasured."""
+
+
+def _post_sgd_bound(family: str, directory: Path) -> float:
+    """The post-SGD logit bound: 1e-4 where the reference's order spread is
+    below the implementation error, else Dew's CPU error against the
+    reference plus ORDER_MARGIN of the reference's CUDA-vs-CPU spread."""
+    spread = directory / "post_sgd_spread.json"
+    if not spread.is_file():
+        return 1e-4
+    return FAMILIES[family][4] + ORDER_MARGIN * json.loads(spread.read_text())["cuda_vs_cpu"]
+
+
+def _one_layer_negated(gradient):
+    """The gradient with the first decoder layer's subtree negated: a sign
+    slip in one layer's backward that leaves every shape alone."""
+    def walk(node):
+        if not isinstance(node, dict):
+            return node, False
+        if "layers_0" in node:
+            return {**node, "layers_0": jax.tree.map(jnp.negative, node["layers_0"])}, True
+        out, found = {}, False
+        for key, value in node.items():
+            out[key], hit = walk(value) if not found else (value, False)
+            found = found or hit
+        return out, found
+
+    negated, found = walk(gradient)
+    assert found, "no layers_0 subtree in the gradient"
+    return negated
 
 
 def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
@@ -468,14 +510,16 @@ def test_source_processor_forward_and_cached_generation_match_reference(family_s
 def test_source_backward_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
     """Loss, pixel gradient and all-parameter SGD against the reference backward.
 
-    Recorded errors are in FAMILIES. The trained model exports under the
+    Recorded errors are in FAMILIES; the post-SGD logits are held to
+    `_post_sgd_bound`, which must still fail one layer's gradient with its
+    sign flipped. The trained model exports under the
     source's tensor names and reloads to the reference's updated logits; every
     non-parameter collection (Gemma4's standardization and clipping buffers)
     survives training bitwise. Qwen3.5's root tie_word_embeddings=False
     overrides its nested text flag: tying the head keeps the initial logits
     but misses this update by 0.00167.
     """
-    _, loaded, inputs, directory = family_source
+    family, loaded, inputs, directory = family_source
     objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
                             pretrained=loaded.variables, ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
@@ -494,13 +538,21 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
                                atol=1e-5, rtol=1e-4)
     optimizer = optax.sgd(expected["learning_rate"])
     params = loaded.variables["params"]
-    updates, _ = optimizer.update(gradient, optimizer.init(params), params)
-    updated = {**loaded.variables, "params": optax.apply_updates(params, updates)}
-    loaded.save(tmp_path, variables=updated)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    np.testing.assert_allclose(np.asarray(output)[valid], np.load(directory / "updated_logits.npy")[valid], atol=1e-4, rtol=0)
+    reference = np.load(directory / "updated_logits.npy")[valid]
+    bound = _post_sgd_bound(family, directory)
+
+    def trained(gradient, destination):
+        updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+        loaded.save(destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)})
+        restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+        return restored, np.asarray(restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs()))[valid]
+
+    restored, output = trained(gradient, tmp_path / "trained")
+    np.testing.assert_allclose(output, reference, atol=bound, rtol=0)
+    # The bound still catches one layer's gradient with its sign flipped.
+    _, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
+    assert np.max(np.abs(slipped - reference)) > bound
     for collection, tree in restored.variables.items():
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree),

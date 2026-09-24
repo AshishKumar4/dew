@@ -12,6 +12,7 @@ batch alignment.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImagePr
 
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
+LEARNING_RATE = 1e-4
 
 
 def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str) -> GemmaTokenizer:
@@ -94,6 +96,37 @@ def _row_slices(encoded: dict, model) -> list[dict]:
     return singles
 
 
+def _encode(processor, images: np.ndarray, prompts: list[str], audio: list[np.ndarray] | None) -> dict:
+    """The padded batch encoding: one image in the first row, two in the second."""
+    rows = [[images[0]], [images[1], images[2]]]
+    media: dict[str, object] = {} if audio is None else {"audio": list(audio)}
+    encoded = processor(text=prompts, images=rows, padding=True, truncation=False, return_tensors="pt", **media)
+    # The fp32 reference widens bfloat16 processor pixels exactly.
+    encoded["pixel_values"] = encoded["pixel_values"].float()
+    return encoded
+
+
+def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """The summed next-token loss over every row, its backward, and one SGD
+    step of learning rate LEARNING_RATE on every parameter, in place; returns
+    the loss and the pixel inputs, which hold their gradients."""
+    targets = int((valid[:, :-1] & valid[:, 1:]).sum())
+    loss = torch.zeros((), device=model.device)
+    pixel_inputs = []
+    for single in singles:
+        pixels = single["pixel_values"].clone().requires_grad_(True)
+        pixel_inputs.append(pixels)
+        predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
+        loss = loss + torch.nn.functional.cross_entropy(
+            predictions, single["input_ids"][0, 1:], reduction="sum") / targets
+    loss.backward()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.add_(parameter.grad, alpha=-LEARNING_RATE)
+    return loss.cpu(), pixel_inputs
+
+
 def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
                             audio: list[np.ndarray] | None = None) -> None:
     """Actual wrapper forward, cached continuation, pixel gradient and SGD output.
@@ -101,18 +134,12 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
     The padded batch encoding is what Dew consumes; every reference quantity
     comes from the reference model over one row of it at a time.
     """
-    rows = [[images[0]], [images[1], images[2]]]
-    media: dict[str, object] = {} if audio is None else {"audio": list(audio)}
-    encoded = processor(text=prompts, images=rows, padding=True, truncation=False, return_tensors="pt", **media)
-    # The fp32 reference widens bfloat16 processor pixels exactly.
-    encoded["pixel_values"] = encoded["pixel_values"].float()
+    encoded = _encode(processor, images, prompts, audio)
     valid = encoded["attention_mask"].bool()
     vocab_size = model.config.get_text_config().vocab_size
     logits = torch.zeros((*encoded["input_ids"].shape, vocab_size))
     updated = torch.zeros_like(logits)
-    targets = int((valid[:, :-1] & valid[:, 1:]).sum())
-    loss = torch.zeros(())
-    continuation, pixel_inputs = [], []
+    continuation = []
     singles = _row_slices(encoded, model)
     for row, single in enumerate(singles):
         with torch.no_grad():
@@ -120,21 +147,13 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
             generated = model.generate(**single, max_new_tokens=3, do_sample=False,
                                        eos_token_id=None, use_cache=True, return_dict_in_generate=False)
             continuation.append(generated[0, single["input_ids"].shape[1]:])
-        pixels = single["pixel_values"].clone().requires_grad_(True)
-        pixel_inputs.append(pixels)
-        predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
-        loss = loss + torch.nn.functional.cross_entropy(
-            predictions, single["input_ids"][0, 1:], reduction="sum") / targets
-    loss.backward()
+    loss, pixel_inputs = _sgd_step(model, singles, valid)
     np.save(destination / "pixel_gradient.npy", torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
     with torch.no_grad():
-        for parameter in model.parameters():
-            if parameter.grad is not None:
-                parameter.add_(parameter.grad, alpha=-1e-4)
         for row, single in enumerate(singles):
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
     np.save(destination / "updated_logits.npy", updated.numpy())
-    (destination / "training.json").write_text(json.dumps({"loss": float(loss.detach()), "learning_rate": 1e-4}) + "\n")
+    (destination / "training.json").write_text(json.dumps({"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
 
     np.save(destination / "raw_images.npy", images)
     np.save(destination / "logits.npy", logits.numpy())
@@ -168,6 +187,40 @@ def write_gemma3n_native() -> None:
     prompts = ["listen <audio> <image> ok", "say <image> <audio> again <image> ok"]
     _write_forward_backward(model, processor, destination, images, prompts, audio=audio)
 
+
+
+def gemma3n_post_sgd_spread() -> None:
+    """How far fp32 reduction order alone moves Gemma 3n's post-SGD logits:
+    the reference's own step on CUDA (TF32 off) against the same step on the
+    CPU, which is what wrote updated_logits.npy. Run in a venv whose torch
+    has CUDA; writes post_sgd_spread.json beside the references.
+    """
+    from transformers import Gemma3nForConditionalGeneration
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    source, destination = ROOT / "gemma-3n-audio-tiny", ROOT / "gemma3n-native-tiny"
+    processor = AutoProcessor.from_pretrained(source, local_files_only=True)
+    audio = [np.load(source / "waveform_0.npy"), np.load(source / "waveform_1.npy")]
+    images = np.random.default_rng(2604).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
+    prompts = ["listen <audio> <image> ok", "say <image> <audio> again <image> ok"]
+    encoded = _encode(processor, images, prompts, audio)
+    valid = encoded["attention_mask"].bool()
+    updated = {}
+    for device in ("cpu", "cuda"):
+        model = Gemma3nForConditionalGeneration.from_pretrained(
+            source, attn_implementation="eager").float().eval().to(device)
+        singles = [{name: value.to(device) for name, value in single.items()}
+                   for single in _row_slices(encoded, model)]
+        _sgd_step(model, singles, valid)
+        with torch.no_grad():
+            updated[device] = torch.cat([model(**single, use_cache=False).logits[0].cpu() for single in singles])
+    recorded = torch.from_numpy(np.load(destination / "updated_logits.npy"))[valid]
+    report = {"torch": torch.__version__, "device": torch.cuda.get_device_name(),
+              "cuda_vs_cpu": float((updated["cuda"] - updated["cpu"]).abs().max()),
+              "cpu_vs_recorded": float((updated["cpu"] - recorded).abs().max())}
+    (destination / "post_sgd_spread.json").write_text(json.dumps(report) + "\n")
+    print(report)
 
 
 def write_gemma3_native() -> None:
@@ -310,6 +363,9 @@ def write_qwen35_native() -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["gemma3n-spread"]:
+        gemma3n_post_sgd_spread()
+        sys.exit()
     write_gemma3_native()
     write_gemma3n_native()
     write_gemma4_native()
