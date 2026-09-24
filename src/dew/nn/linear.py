@@ -88,7 +88,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     gradient over every device of the mesh, the ones that hold the same rows
     included, so a batch split over part of the mesh (fsdp beside a tensor
     axis the conv's input does not use) doubled the taps' gradient (jax
-    0.11.2). The products are what a depthwise conv computes anyway.
+    0.11.2, https://github.com/openxla/xla/issues/49382). The products are
+    what a depthwise conv computes anyway.
     """
     _, K = kernel.shape
     length = x.shape[-1]
