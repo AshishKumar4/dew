@@ -659,9 +659,9 @@ def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = T
     repos also carry torch, TensorFlow and Flax copies of the same weights,
     and a pipeline's encoders their fp16 variants, which are never fetched.
     """
-    from dew.interop.hf_decoders import _snapshot
+    from dew.interop.sources import snapshot
 
-    return _snapshot(name_or_dir, revision, weights=weights)
+    return snapshot(name_or_dir, revision, weights=weights)
 
 
 def _read_config(directory: Path) -> Mapping[str, object]:

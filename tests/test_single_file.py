@@ -161,7 +161,7 @@ def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit
     snapshot holds the configs and a file without its VAE: the VAE comes from
     the repo at the snapshot's commit, fetched and linked by `weight_files`'
     rule, so the fp16 variant beside it stays behind."""
-    from dew.interop import hf_decoders
+    from dew.interop import sources
 
     metadata = _without_vae(tmp_path, vae_weights=False)
     hub = tmp_path / "hub-weights"
@@ -174,8 +174,8 @@ def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit
         asked.append((name, revision, weights))
         return metadata if weights is False else hub
 
-    monkeypatch.setattr(hf_decoders, "_snapshot", snapshot)
-    monkeypatch.setattr(hf_decoders, "repo_file", lambda name, directory, filename: metadata / filename)
+    monkeypatch.setattr(sources, "snapshot", snapshot)
+    monkeypatch.setattr(sources, "repo_file", lambda name, directory, filename: metadata / filename)
     loaded = load_pretrained("org/sd-tiny", single_file="sd.safetensors", dtype="float32", param_dtype="auto")
     assert asked == [("org/sd-tiny", None, False), ("org/sd-tiny", metadata.name, ("vae",))]
     assert loaded.revision == metadata.name

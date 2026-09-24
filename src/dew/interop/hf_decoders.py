@@ -22,7 +22,6 @@ raises a ValueError naming it.
 
 import dataclasses
 import json
-import logging
 import operator
 import os
 from dataclasses import asdict, dataclass, field
@@ -48,8 +47,8 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop import mamba2, pickles
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, read_weights, weight_files
+from dew.interop import mamba2
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
@@ -69,7 +68,6 @@ from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
-from dew.telemetry.instrumentation import dew_cache_dir
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -1721,173 +1719,6 @@ def translate_denoiser_weights(
             "params": translate_sc_weights(sc, param_dtype=param_dtype)
         },
     }
-
-
-def _load_shards(directory: Path) -> dict[str, np.ndarray]:
-    """Read a checkpoint directory's weights, mapped in their stored dtype:
-    the shards its index names, or its one model.safetensors. A directory
-    with transformers' PyTorch pickles instead reads their safetensors
-    conversion (`pickles.converted`)."""
-    files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-    def read(name: str) -> records.JSON:
-        return json.loads((directory / name).read_text())
-
-    if weight_files(files, "", read):
-        return read_weights(directory)
-    pickled = weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX)
-    if not pickled:
-        raise FileNotFoundError(_missing_weights(str(directory), files))
-    return read_weights(pickles.converted(directory, pickled))
-
-
-_PICKLES = (".bin", ".pt", ".pth")
-
-_log = logging.getLogger(__name__)
-
-
-def _missing_weights(source: str, files: Collection[str]) -> str:
-    """Say what a source without safetensors weights or transformers'
-    PyTorch pickles ships instead, and what loads."""
-    gguf = sorted(name for name in files if name.endswith(".gguf"))
-    pickled = sorted(name for name in files if "/" not in name and name.endswith(_PICKLES))
-    if pickled:
-        return (f"{source} ships PyTorch pickles ({', '.join(pickled[:3])}) but no pytorch_model.bin or "
-                "pytorch_model.bin.index.json, the names Dew converts; save the state dict under one of "
-                f"those, or convert the repo to safetensors at {pickles.CONVERT_SPACE}")
-    if gguf:
-        return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
-                f"load_pretrained(..., gguf_file={gguf[0]!r})")
-    return f"{source} has no model.safetensors or model.safetensors.index.json"
-
-
-_CONVERSION_TITLE = "Adding `safetensors` variant of this model"
-
-
-def _conversion_revision(name: str, commit: str) -> str | None:
-    """Return SFconvertbot's open safetensors pull request on `commit`, or None.
-
-    transformers' rule (safetensors_conversion.py, `previous_pr` and
-    `get_conversion_pr_reference`): an open pull request by SFconvertbot
-    under this title whose parent is the commit being loaded. Only looked
-    up; nothing is converted or opened.
-    """
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    for discussion in api.get_repo_discussions(name, author="SFconvertbot",
-                                               discussion_type="pull_request",
-                                               discussion_status="open"):
-        if discussion.title != _CONVERSION_TITLE or discussion.git_reference is None:
-            continue
-        commits = api.list_repo_commits(name, revision=discussion.git_reference)
-        if len(commits) > 1 and commits[1].commit_id == commit:
-            return discussion.git_reference
-    return None
-
-
-_METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
-"""Configs, indexes, tokenizer and chat-template files: everything a load reads but weights."""
-
-
-def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
-    """The local path of `filename` in a directory, or `filename` downloaded
-    from the repo at the snapshot's commit.
-
-    `directory` is the snapshot the metadata fetch resolved, named by its
-    commit, so the file comes from that commit even if the branch moves. A
-    missing file is refused, naming the files of its kind that are there.
-    """
-    suffix = Path(filename).suffix
-    if os.path.isdir(name_or_dir):
-        path = directory / filename
-        if not path.is_file():
-            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}"))
-            raise FileNotFoundError(f"{path} does not exist; the {suffix} files in {directory} are {present}")
-        return path
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
-
-    try:
-        return Path(hf_hub_download(str(name_or_dir), filename, revision=directory.name))
-    except EntryNotFoundError as error:
-        present = sorted(name for name in _repo_files(str(name_or_dir), directory) if name.endswith(suffix))
-        raise FileNotFoundError(f"{name_or_dir} at {directory.name} has no {filename!r}; "
-                                f"its {suffix} files are {present}") from error
-
-
-def _repo_files(name: str, directory: Path) -> set[str]:
-    """Every file of the snapshot's commit, by repo-relative name.
-
-    A dry run lists the Hub tree the metadata fetch has just cached. Offline
-    it cannot: without a cached tree it raises DryRunError, and with one it
-    raises LocalEntryNotFoundError for the first listed file that was never
-    downloaded. The cache is then all a load can read anyway, so the
-    snapshot directory's own files are the listing.
-    """
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import DryRunError, LocalEntryNotFoundError
-
-    try:
-        return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
-    except (DryRunError, LocalEntryNotFoundError):
-        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-
-def _snapshot(name_or_dir: str, revision: str | None, *,
-              weights: bool | tuple[str, ...] = True) -> Path:
-    """Resolve a snapshot with the root's (True), no (False) or the named
-    components' weights.
-
-    A local directory is returned as it is. From the Hub the metadata comes
-    first, then `weight_files` picks, from the commit's listing and the
-    indexes just fetched, the exact files that hold the weights, and only
-    those download, at the commit the first fetch resolved. Other formats of
-    the same weights beside them (Mistral's consolidated.safetensors,
-    diffusers' fp16 variants and root single-file checkpoints) stay on the
-    Hub. A commit with only transformers' PyTorch pickles resolves to
-    SFconvertbot's safetensors pull request on it where one is open, and
-    otherwise downloads the pickles, which `_load_shards` converts.
-    """
-    if os.path.isdir(name_or_dir):
-        return Path(name_or_dir)
-    from huggingface_hub import snapshot_download
-
-    directory = Path(snapshot_download(name_or_dir, revision=revision,
-                                       allow_patterns=_METADATA_PATTERNS))
-    if weights is False:
-        return directory
-    files = _repo_files(name_or_dir, directory)
-
-    def read(name: str) -> records.JSON:
-        return json.loads((directory / name).read_text())
-
-    selected = [name for folder in (("",) if weights is True else weights)
-                for name in weight_files(files, folder, read)]
-    if weights is True and not selected:
-        from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
-
-        selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
-        if not selected:
-            raise FileNotFoundError(_missing_weights(f"{name_or_dir} at {directory.name}", files))
-        # The conversion a lookup found is recorded, so the same load offline
-        # reads the conversion it cached rather than pickles it never fetched.
-        record = Path(dew_cache_dir()) / "conversions" / name_or_dir / directory.name
-        try:
-            conversion = _conversion_revision(name_or_dir, directory.name)
-        except (HfHubHTTPError, OfflineModeIsEnabled):
-            conversion = record.read_text() if record.is_file() else None
-        else:
-            if conversion is not None:
-                record.parent.mkdir(parents=True, exist_ok=True)
-                record.write_text(conversion)
-        if conversion is not None:
-            _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
-                         "that commit at revision %s", name_or_dir, directory.name, conversion)
-            return _snapshot(name_or_dir, conversion)
-    if selected:
-        snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
-    return directory
 
 
 class ExportTokenizer(Protocol):

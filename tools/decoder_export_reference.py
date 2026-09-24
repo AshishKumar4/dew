@@ -122,9 +122,9 @@ class RoundTrip:
 
 def source_tensors(directory: Path) -> dict[str, np.ndarray]:
     """The checkpoint's own tensor table, as the loader reads it."""
-    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.sources import load_shards
 
-    return _load_shards(directory)
+    return load_shards(directory)
 
 
 def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndarray:

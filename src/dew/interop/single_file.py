@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew.interop import hf_decoders as decoders
+from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
 from dew.telemetry.instrumentation import dew_cache_dir
@@ -158,7 +158,7 @@ def _configs(repo: str) -> Path:
     from huggingface_hub.errors import GatedRepoError
 
     try:
-        return decoders._snapshot(repo, None, weights=False)
+        return sources.snapshot(repo, None, weights=False)
     except GatedRepoError as error:
         raise PermissionError(
             f"this checkpoint's configs come from {repo}, which is gated on the Hub: accept its license at "
@@ -175,7 +175,7 @@ def _metadata(configs: Path) -> list[Path]:
     name the repo's shards instead."""
     return sorted(path for path in configs.rglob("*") if path.is_file()
                   and not path.name.endswith(".safetensors.index.json")
-                  and any(fnmatch.fnmatch(path.name, pattern) for pattern in decoders._METADATA_PATTERNS))
+                  and any(fnmatch.fnmatch(path.name, pattern) for pattern in sources.METADATA_PATTERNS))
 
 
 def _link(source: Path, destination: Path) -> None:
@@ -279,7 +279,7 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
             # The Hub snapshot and the local directory are both read by
             # `weight_files`' rule, so a precision variant or non-EMA copy
             # beside the weights is neither fetched nor linked.
-            weights = configs if hub is None else decoders._snapshot(*hub, weights=tuple(missing))
+            weights = configs if hub is None else sources.snapshot(*hub, weights=tuple(missing))
             empty = []
             for name in missing:
                 selected = folder_weights(weights / name)

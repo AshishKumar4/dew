@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.interop import hf_decoders, load_pretrained
+from dew.interop import hf_decoders, load_pretrained, sources
 
 torch = pytest.importorskip("torch")
 
@@ -77,7 +77,7 @@ def test_sharded_pickles_read_through_their_index_in_their_stored_dtype(tmp_path
         "model.embed_tokens.weight": "pytorch_model-00001-of-00002.bin",
         "model.norm.weight": "pytorch_model-00002-of-00002.bin"}}))
 
-    tensors = hf_decoders._load_shards(tmp_path)
+    tensors = sources.load_shards(tmp_path)
 
     assert sorted(tensors) == ["model.embed_tokens.weight", "model.norm.weight"]
     assert tensors["model.embed_tokens.weight"].dtype == ml_dtypes.bfloat16

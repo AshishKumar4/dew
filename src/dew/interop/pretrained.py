@@ -34,7 +34,7 @@ from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
-from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
+from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.generation_config import (
     audit_masked,
@@ -173,6 +173,15 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
         raise ValueError("the tokenizer padding_side must be left or right")
     return (0 if pad_id is None else records.integer(pad_id, "pad_token_id"),
             "left" if side == "left" else "right")
+
+
+def _row_start(reference: HostProcessor) -> int | None:
+    """Return the id the tokenizer starts a sequence with, or None, read at the
+    boundary `_row_padding` reads its padding at: off the tokenizer a
+    processor wraps, or the tokenizer itself."""
+    tokenizer = getattr(reference, "tokenizer", reference)
+    bos = getattr(tokenizer, "bos_token_id", None)
+    return None if bos is None else records.integer(bos, "bos_token_id")
 
 
 @dataclass(frozen=True)
@@ -615,11 +624,8 @@ class Processor:
 
     @property
     def bos_id(self) -> int | None:
-        """The id the source's tokenizer starts a sequence with, or None, read
-        off the tokenizer a processor wraps as `_row_padding` reads its padding."""
-        tokenizer = getattr(self.reference, "tokenizer", self.reference)
-        bos = getattr(tokenizer, "bos_token_id", None)
-        return None if bos is None else records.integer(bos, "bos_token_id")
+        """The id the source's tokenizer starts a sequence with, or None."""
+        return _row_start(self.reference)
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the same processor and tokenizer used by this source."""
@@ -1339,7 +1345,7 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
 
     compute = resolve_dtype(dtype)
     resolve_dtype(param_dtype)
-    directory = decoders._snapshot(checkpoint, revision, weights=False)
+    directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
     denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
@@ -1350,7 +1356,7 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
     if params is None:
         # snapshot_download returns a commit directory. Keep both fetches on
         # that commit even when the requested Hub branch moves between them.
-        directory = decoders._snapshot(checkpoint, directory.name,
+        directory = sources.snapshot(checkpoint, directory.name,
                                        weights=denoiser.text.components(index))
     vae = AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
     encoder, _, _ = denoiser.text.build(
@@ -1670,14 +1676,14 @@ def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat1
     """Load Qwen-Image's text conditioning, or bind supplied parameters using metadata only."""
     compute = resolve_dtype(dtype)
     resolve_dtype(param_dtype)
-    directory = decoders._snapshot(checkpoint, revision, weights=False)
+    directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
     denoiser = _transformer_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     if not isinstance(denoiser.text, _QwenImageText):
         raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
     if params is None:
-        directory = decoders._snapshot(checkpoint, directory.name, weights=("text_encoder",))
+        directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
     encoder, _, _ = _qwen_image_conditioning(
         directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
         param_dtype=param_dtype, attention_impl=attention_impl, params=params)
@@ -1893,7 +1899,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         # component the file lacks come from the repo at that commit.
         configs = directory if (directory / "model_index.json").is_file() else None
         hub = None if configs is None or commit is None else (str(name_or_dir), commit)
-        with original.unpacked(decoders.repo_file(name_or_dir, directory, single_file), configs, hub) as (
+        with original.unpacked(sources.repo_file(name_or_dir, directory, single_file), configs, hub) as (
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
@@ -1901,7 +1907,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
             index = json.load(handle)
         # The metadata fetch returns its commit directory, so the weights
         # come from that commit even if the requested branch moves.
-        return pipeline(decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
+        return pipeline(sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
             name for name in index if _present(index, name))))
     return None
 
@@ -1915,9 +1921,9 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
         return gguf.read(gguf_path)
     if not (directory / "config.json").is_file():
         # A GGUF repo often ships none, and says which argument reads it.
-        files = (decoders._repo_files(str(name_or_dir), directory) if commit is not None else
+        files = (sources.repo_files(str(name_or_dir), directory) if commit is not None else
                  {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()})
-        shipped = decoders._missing_weights(str(name_or_dir), files)
+        shipped = sources.missing_weights(str(name_or_dir), files)
         raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
@@ -2104,7 +2110,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if storage is None:
             raise ValueError("param_dtype must select floating parameter storage")
         param_dtype = storage
-    directory = decoders._snapshot(str(name_or_dir), revision, weights=False)
+    directory = sources.snapshot(str(name_or_dir), revision, weights=False)
     # A Hub snapshot directory is named by its commit.
     commit = None if os.path.isdir(name_or_dir) else directory.name
     if fallback is not None:
@@ -2116,7 +2122,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                                 attention_impl=attention_impl, param_dtype=param_dtype)
     if pipeline is not None:
         return replace(pipeline, variables=placed(pipeline.variables))
-    gguf_path = None if gguf_file is None else decoders.repo_file(name_or_dir, directory, gguf_file)
+    gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
     config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
@@ -2130,8 +2136,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders._FAMILIES
                 and family != "diffusion_gemma" and "text_config" not in config else None)
     if tensors is None:
-        directory = decoders._snapshot(str(name_or_dir), directory.name)
-        tensors = decoders._load_shards(directory)
+        directory = sources.snapshot(str(name_or_dir), directory.name)
+        tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if param_dtype == AUTO:
