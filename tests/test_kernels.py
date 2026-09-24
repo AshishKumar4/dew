@@ -231,6 +231,8 @@ def test_an_explicit_cudnn_call_is_refused_under_deterministic_ops(monkeypatch):
         cudnn_shape(*qkv((1, 8, 2, 64)))
 
 
+@pytest.mark.skipif(jax.default_backend() != 'gpu',
+                    reason="jax traces a cudnn call only where cuDNN is installed")
 def test_an_explicit_cudnn_call_stands_without_the_flag(without_deterministic_ops):
     """The refusal belongs to the flag, not to the implementation: the same
     call traces to its output shape when the run asked for nothing."""
