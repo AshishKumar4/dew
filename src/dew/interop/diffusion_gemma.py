@@ -11,6 +11,7 @@ from collections.abc import Mapping
 
 import numpy as np
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.diffusion.block import BlockProcess
@@ -169,7 +170,7 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
     The decoder half goes through `export_decoder_weights` and is renamed under
     the reference's `model.decoder.` and `model.encoder.` prefixes.
     """
-    from dew.interop.hf_decoders import _flatten, export_decoder_weights
+    from dew.interop.hf_decoders import export_decoder_weights
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 
     if not isinstance(model, DiffusionGemma):
@@ -184,7 +185,7 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
         tensors[target] = tensor
         if name.endswith(".layer_scalar"):
             tensors[target.replace("model.decoder.", "model.encoder.language_model.")] = tensor
-    for name, leaf in _flatten(params["self_conditioning"]).items():
+    for name, leaf in flatten_dict(params["self_conditioning"], sep=".").items():
         module, kind = name.split(".")
         tensors[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
@@ -192,7 +193,7 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
         for collection in ("params", "constants"):
             tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
-            for name, raw in _flatten(tower).items():
+            for name, raw in flatten_dict(tower, sep=".").items():
                 parts = name.split(".")
                 if tuple(parts) in inverse:
                     target = inverse[tuple(parts)]

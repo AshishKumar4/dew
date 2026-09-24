@@ -13,15 +13,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.traverse_util import flatten_dict
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import (
-    _FAMILIES,
-    _flatten,
-    _wrapper_sources,
-    translate_config,
-    translate_wrapper_config,
-)
+from dew.interop.hf_decoders import _FAMILIES, _wrapper_sources, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -60,7 +55,7 @@ def released_tree(fields) -> set[tuple[str, ...]]:
     """Every leaf path of the released geometry, traced without allocating it."""
     model = models.build("causal_transformer", **fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    return {tuple(name.split(".")) for name in _flatten(dict(shapes))}
+    return set(flatten_dict(dict(shapes)))
 
 
 @pytest.mark.parametrize("kind", ["dense", "moe"])

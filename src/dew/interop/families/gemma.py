@@ -14,6 +14,7 @@ import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
+from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.hf_decoders import (
@@ -24,7 +25,6 @@ from dew.interop.hf_decoders import (
     _dew_path,
     _fixed_fields,
     _fixed_mixture,
-    _flatten,
     _hf_activation,
     _hf_name,
     _kinds,
@@ -470,7 +470,8 @@ def _gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, obj
     constants = variables.get('constants', {})
     if not isinstance(params, Mapping) or not isinstance(constants, Mapping):
         raise ValueError('params and constants must contain native variable trees')
-    flat, fixed = dict(_flatten(params)), _flatten(constants)
+    flat: dict[str, object] = dict(flatten_dict(dict(params), sep='.'))
+    fixed = flatten_dict(dict(constants), sep='.')
     scalar_names = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
     if set(fixed) - scalar_names:
         raise ValueError(f'unrepresented Gemma4 constants: {sorted(set(fixed) - scalar_names)}')
