@@ -317,3 +317,17 @@ def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
     assert rounded.dtype == source
     assert jnp.array_equal(rounded, x.astype(target).astype(source), equal_nan=True)
     assert not jnp.array_equal(rounded, x)
+
+
+def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():
+    """A bf16 value computed in fp32 and cast down is held as bf16 where it is
+    already the operand dtype: without the barrier, XLA's GPU excess precision
+    fuses the fp32 producer into its consumer and the cast rounds nothing."""
+    from dew.nn.precision import rounded_operand
+    x = jnp.asarray([1 + 2**-10, -3 - 2**-9, 7 + 2**-7], jnp.float32)
+
+    def held(x):
+        narrow = (x * 1.0).astype(jnp.bfloat16)
+        return rounded_operand(narrow, jnp.bfloat16).astype(jnp.float32) * 1.0
+
+    assert jnp.array_equal(jax.jit(held)(x), x.astype(jnp.bfloat16).astype(jnp.float32))
