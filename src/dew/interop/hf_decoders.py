@@ -41,6 +41,7 @@ from typing import (
     runtime_checkable,
 )
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
@@ -48,7 +49,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop import mamba2, pickles
-from dew.interop.safetensors_io import read_weights, weight_files
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, read_weights, weight_files
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
@@ -1922,8 +1923,10 @@ def save_export_assets(
 
 def save_pretrained_decoder(model, variables, directory, *,
                             tokenizer: str | ExportTokenizer | None = None,
-                            generation_config: Mapping[str, object] | None = None) -> None:
-    """Write a decoder back out in the HF layout: config.json, model.safetensors.
+                            generation_config: Mapping[str, object] | None = None,
+                            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+    """Write a decoder back out in the HF layout: config.json and its weights,
+    in shards of at most `max_shard_size` with their index once they exceed it.
 
     Derive the config from native computation and encode all variable
     collections through the matching family. Source-bound exports instead
@@ -1946,12 +1949,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     _refuse_lossy_export(model, config)
     hf_tensors = export_decoder_weights(model, variables, config)
 
-    save_hf_layout(hf_tensors, config, directory)
+    save_hf_layout(hf_tensors, config, directory, max_shard_size)
     save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+                           config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Encode whole native variables as canonical model.* / lm_head.* tensors.
 
     The family owns collection packing and any fused tensor geometry. A
@@ -1978,7 +1981,7 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
 
 def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+                           config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
         raise ValueError(
             'per-layer input embeddings, KV sharing and the values norm have '
@@ -1999,17 +2002,28 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
-    tensors: dict[str, np.ndarray] = {}
+    # Each tensor comes to the host when it is read, so a sharded writer
+    # holds one shard of the export, not all of it.
+    sources: dict[str, tuple[jax.Array | np.ndarray, bool]] = {}
+    specs: dict[str, jax.ShapeDtypeStruct] = {}
     for name, value in flatten_dict(dict(params), sep='.').items():
         target = family.export_path(name, config)
         if target is not None:
-            # A kernel is transposed on a device, one at a time, and copied to
-            # the host contiguous: numpy copies a transposed bfloat16 kernel at
-            # 0.15 GiB/s on the RTX 3090 box's CPU, where the round trip over
-            # PCIe moves several GiB/s.
-            tensors[target] = (np.asarray(jnp.asarray(value).T) if name.endswith('.kernel')
-                               else np.ascontiguousarray(np.asarray(value)))
-    return tensors
+            if not isinstance(value, (jax.Array, np.ndarray)):
+                raise TypeError(f'{name} is a {type(value).__name__}, not an array')
+            kernel = name.endswith('.kernel')
+            sources[target] = (value, kernel)
+            specs[target] = jax.ShapeDtypeStruct(value.shape[::-1] if kernel else value.shape, value.dtype)
+
+    def build(target: str) -> np.ndarray:
+        # A kernel is transposed on its device and copied to the host
+        # contiguous: numpy copies a transposed bfloat16 kernel at 0.15 GiB/s
+        # on the RTX 3090 box's CPU, where the round trip over PCIe moves
+        # several GiB/s.
+        value, kernel = sources[target]
+        return np.asarray(jnp.asarray(value).T) if kernel else np.ascontiguousarray(np.asarray(value))
+
+    return LazyTensors(specs, build)
 
 
 def _export_config(model) -> Mapping[str, object]:
@@ -2230,7 +2244,7 @@ class DecoderFamily:
     weight_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None] = _dew_path
     export_path: Callable[[str, Mapping[str, object]], str | None] = _hf_name
     export_weights: Callable[[CausalTransformer, Mapping[str, object], Mapping[str, object]],
-                             dict[str, np.ndarray]] = _dense_decoder_weights
+                             Mapping[str, np.ndarray]] = _dense_decoder_weights
     """Whole-variable encoder; dense families retain their export_path loop."""
     sandwich_norms: bool = False
     prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict

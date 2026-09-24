@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
-from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file
+from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file, write_index
 from dew.telemetry.instrumentation import dew_cache_dir
 
 if TYPE_CHECKING:
@@ -76,10 +76,7 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
         write_file(tensors, target / output, {"format": "pt"})
         weight_map.update(dict.fromkeys(tensors, output))
     if len(shards) > 1:
-        index = target / "model.safetensors.index.json"
-        temporary = index.with_name(f".{index.name}.tmp")
-        temporary.write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
-        os.replace(temporary, index)
+        write_index(target, weight_map)
     return target
 
 
