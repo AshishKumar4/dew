@@ -36,6 +36,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
@@ -1041,8 +1042,10 @@ class Pretrained:
                 "no quantized tensors to write back in it")
         return quantization
 
-    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
-        """Write `export`'s tensors, the source's own config.json, as published, and its tokenizer assets."""
+    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
+             max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write `export`'s tensors, in shards of at most `max_shard_size`, the
+        source's own config.json, as published, and its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
@@ -1051,7 +1054,7 @@ class Pretrained:
             self._quantization()
             diffusion.save_source(self, values, destination)
             return
-        save_hf_layout(self.export(values), dict(self.config), destination)
+        save_hf_layout(self.export(values), dict(self.config), destination, max_shard_size)
         decoders.save_export_assets(destination, tokenizer=self.processor,
                                     generation_config=dict(self.generation_config))
 

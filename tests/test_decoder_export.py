@@ -407,6 +407,54 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     assert again.processor.decode(rows) == source.processor.decode(rows)
 
 
+def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp_path):
+    """Past `max_shard_size` the weights go out as numbered shards and their
+    index, which transformers and Dew both read back to the same logits; a
+    later export that fits one file removes the shards, so no loader reads
+    stale weights beside it."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    source = load_pretrained(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    expected = np.asarray(source.model.apply(source.variables, ids))
+    export = tmp_path / "export"
+    source.save(export, max_shard_size=64 * 1024)
+
+    shards = sorted(path.name for path in export.glob("model-*.safetensors"))
+    assert len(shards) > 1 and not (export / "model.safetensors").exists()
+    index = json.loads((export / "model.safetensors.index.json").read_text())
+    assert sorted(set(index["weight_map"].values())) == shards
+    reference = AutoModelForCausalLM.from_pretrained(export, dtype=torch.float32, attn_implementation="eager")
+    with torch.no_grad():
+        theirs = reference(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
+    np.testing.assert_allclose(theirs, expected, atol=LOGITS, rtol=0)
+    again = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    np.testing.assert_allclose(np.asarray(again.model.apply(again.variables, ids)), expected, atol=LOGITS, rtol=0)
+
+    source.save(export)
+    assert sorted(path.name for path in export.glob("model*")) == ["model.safetensors"]
+
+
+def test_a_sharded_export_holds_one_shard_on_the_host(tmp_path):
+    """The export builds each host tensor as its shard is written, so the
+    host's traced peak during the save stays near its largest shard (the
+    embedding, 64 KB) plus the writer's own, where building the whole table
+    first peaks near the model's size."""
+    import tracemalloc
+
+    source = load_pretrained(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    total = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(source.variables["params"]))
+    shard = total // 16
+    tracemalloc.start()
+    source.save(tmp_path / "export", max_shard_size=shard)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    largest = max(path.stat().st_size for path in (tmp_path / "export").glob("model-*.safetensors"))
+    # Measured on qwen3-tiny's 362 KB: 154 KB streamed, 317 KB before.
+    assert peak < total / 2, (peak, total, largest)
+
+
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
     """The source config describes real FP8 bytes after a training update."""
     import torch

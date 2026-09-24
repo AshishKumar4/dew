@@ -10,8 +10,10 @@ The names on disk are the module names in the tree.
 """
 
 import json
+import math
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Callable, Collection, Mapping
 
@@ -24,7 +26,11 @@ from dew.records import JSON
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
+INDEX_FILE = "model.safetensors.index.json"
 CONFIG_FILE = "config.json"
+MAX_SHARD_SIZE = "5GB"
+"""The shard size an export writes at most, as huggingface_hub's splitter
+reads it; a tensor larger than that takes a shard of its own."""
 
 # Use the format tag, not a NumPy conversion through safetensors: its NumPy
 # FP8 conversion looks for np.float8_e4m3fn, which NumPy does not expose.
@@ -312,6 +318,68 @@ def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     return tensors, metadata
 
 
+class LazyTensors(Mapping[str, np.ndarray]):
+    """Named host tensors, each built only when it is read.
+
+    `specs` gives every tensor's shape and dtype up front, which is all a
+    shard plan needs; `build(name)` makes the tensor. A writer that reads one
+    shard's tensors at a time holds one shard on the host, not the model.
+    """
+
+    def __init__(self, specs: Mapping[str, jax.ShapeDtypeStruct], build: Callable[[str], np.ndarray]):
+        self.specs = specs
+        self._build = build
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        if name not in self.specs:
+            raise KeyError(name)
+        return self._build(name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.specs)
+
+    def __len__(self) -> int:
+        return len(self.specs)
+
+
+def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None) -> None:
+    """Publish `model.safetensors.index.json` naming each tensor's shard file."""
+    index = directory / INDEX_FILE
+    temporary = index.with_name(f".{index.name}.tmp")
+    metadata = {} if total_size is None else {"total_size": total_size}
+    temporary.write_text(json.dumps({"metadata": metadata, "weight_map": dict(weight_map)}, indent=2))
+    os.replace(temporary, index)
+
+
+def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+    """Write `tensors` as `model.safetensors`, or as numbered shards and their
+    index when they exceed `max_shard_size`, reading one shard's tensors at a
+    time.
+
+    huggingface_hub's splitter plans the shards from sizes alone, so a
+    `LazyTensors` table is built shard by shard and the host holds at most one
+    shard. Weight files an earlier export left in `directory` that this one
+    does not write are removed, since a loader would read them beside it.
+    """
+    from huggingface_hub import split_state_dict_into_shards_factory
+
+    folder = Path(directory)
+    specs = (tensors.specs if isinstance(tensors, LazyTensors)
+             else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
+    split = split_state_dict_into_shards_factory(
+        dict(specs), get_storage_size=lambda spec: math.prod(spec.shape) * np.dtype(spec.dtype).itemsize,
+        filename_pattern="model{suffix}.safetensors", max_shard_size=max_shard_size)
+    for filename, names in split.filename_to_tensors.items():
+        _publish(lambda names=names: {name: _host_array(tensors[name]) for name in names},
+                 folder / filename, {"format": "pt"})
+    written = set(split.filename_to_tensors) | ({INDEX_FILE} if split.is_sharded else set())
+    for stale in [*folder.glob("model*.safetensors"), folder / INDEX_FILE]:
+        if stale.name not in written:
+            stale.unlink(missing_ok=True)
+    if split.is_sharded:
+        write_index(folder, split.tensor_to_filename, split.metadata["total_size"])
+
+
 def write_file(
     tensors: Mapping[str, np.ndarray], path, metadata: Mapping[str, str]
 ) -> None:
@@ -319,14 +387,20 @@ def write_file(
     _publish(lambda: dict(tensors), path, metadata)
 
 
-def save_hf_layout(params, config: Mapping[str, object], directory) -> None:
-    """Write model.safetensors and config.json into `directory`.
+def save_hf_layout(params, config: Mapping[str, object], directory,
+                   max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+    """Write the weights (`save_sharded`) and config.json into `directory`.
 
-    That pair is what a Hugging Face style loader looks for. The config is
-    written as given. Dew does not translate its own config vocabulary into
-    anyone else's.
+    That is what a Hugging Face style loader looks for. `params` is a flat
+    table of named tensors, or a tree whose '/'-joined paths name them. The
+    config is written as given. Dew does not translate its own config
+    vocabulary into anyone else's.
     """
     os.makedirs(directory, exist_ok=True)
-    save_params(params, os.path.join(directory, WEIGHTS_FILE))
+    if not isinstance(params, LazyTensors):
+        # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
+        leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+        params = {_leaf_name(path): leaf for path, leaf in leaves}
+    save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)
