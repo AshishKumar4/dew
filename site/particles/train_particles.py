@@ -1,86 +1,49 @@
-"""Train the particle model of dewml.dev's hero with Dew, on a CPU.
+"""Train the particle model of dewml.dev's hero with Dew.
 
-One model per font: render the word with mask.py (python particles/mask.py
-NAME FONT.woff2), write a Colab cell with the mask embedded (python
-particles/make_cell.py NAME 30000), run it on a CPU runtime (colab exec -s
-<session> -f particles/cells/NAME-30000.py > NAME.log), and unpack the log
-into public/hero/particles/ with python particles/extract.py NAME NAME.log.
-30,000 steps take about 15 minutes on the 2 vCPUs of a Colab CPU runtime.
+    python site/particles/train_particles.py NAME --out DIR [--steps 30000]
 
-The data are 2D points drawn uniformly from the glyphs of "dew" in the site's
-font (MASK_PNG, embedded below by make_cell.py). The model is a small
-MLP that predicts the rectified-flow velocity v = eps - x0 at a point
-x_t = (1 - t) x0 + t eps, trained by Dew's Trainer through a custom Objective,
-with an exponential moving average of the weights. Afterwards the script
-samples 16,384 points with Euler steps from t = 1 to t = 0, measures how many
-land inside the letters, and prints the averaged weights for the browser.
+The data are 2D points drawn uniformly from the glyphs of "dew" in one of the
+site's fonts: site/particles/masks/NAME.png, which mask.py renders. The model
+is a small MLP that predicts the rectified-flow velocity v = eps - x0 at a
+point x_t = (1 - t) x0 + t eps, trained by Dew's Trainer through a custom
+Objective, with an exponential moving average of the weights. Afterwards the
+script samples 16,384 points with Euler steps from t = 1 to t = 0, as the
+browser does, and measures how many land inside the letters.
+
+It writes three files to DIR: NAME.json (the layer shapes, the sampler grid
+and how the model was trained), NAME.bin (the averaged weights as float32,
+each Dense kernel [in, out] and then its bias, the order the shader reads
+them) and NAME-samples.png (the samples, to check by eye). The page loads the
+first two from site/public/hero/particles/.
 """
 
-import base64
-import io
-import itertools
+import argparse
 import json
 import os
 import subprocess
-import sys
 import time
+from pathlib import Path
 
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "dew-ml @ git+https://github.com/AshishKumar4/dew"], check=True)
-os.environ["JAX_PLATFORMS"] = "cpu"
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from PIL import Image
 
-import flax.linen as nn  # noqa: E402
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import numpy as np  # noqa: E402
-import optax  # noqa: E402
-from PIL import Image  # noqa: E402
+from dew import Aux, Dataset, EMASpec, Field, InputSpec, Objective, Trainer
 
-from dew import Aux, Dataset, EMASpec, Field, InputSpec, Objective, Trainer  # noqa: E402
-
-MASK_PNG = "__MASK_PNG__"
-STEPS = int(os.environ.get("PARTICLE_STEPS", "30000"))
+HERE = Path(__file__).resolve().parent
 BATCH = 4096
 WIDTH = 128
 POSITION_FREQS = 6  # Fourier features of the position: sin and cos of 2^k pi x, k < 6
 TIME_FREQS = 8
 SAMPLE_STEPS = 64
+SAMPLES = 16384
 SEED = 0
-
-# --- The data: points inside the glyphs, scaled so the word spans [-1.8, 1.8] across.
-mask = np.asarray(Image.open(io.BytesIO(base64.b64decode(MASK_PNG))).convert("L")) > 127
-ys, xs = np.nonzero(mask)
-height, width = mask.shape
-scale = 3.6 / (xs.max() - xs.min())
-cx, cy = (xs.max() + xs.min()) / 2, (ys.max() + ys.min()) / 2
+LAYERS = ["hidden_0", "hidden_1", "hidden_2", "out"]
 
 
-def to_model(px, py):
-    return np.stack([(px - cx) * scale, -(py - cy) * scale], axis=-1).astype(np.float32)
-
-
-def inside(points):
-    """Whether each model-space point falls on a glyph pixel."""
-    px = np.round(points[:, 0] / scale + cx).astype(int)
-    py = np.round(-points[:, 1] / scale + cy).astype(int)
-    ok = (px >= 0) & (px < width) & (py >= 0) & (py < height)
-    result = np.zeros(len(points), bool)
-    result[ok] = mask[py[ok], px[ok]]
-    return result
-
-
-rng = np.random.default_rng(SEED)
-jitter = rng.random((len(xs), 2)) - 0.5  # spread each pixel's point over its square
-points = to_model(xs + jitter[:, 0], ys + jitter[:, 1])
-print(f"{len(points):,} glyph pixels; x in [{points[:, 0].min():.2f}, {points[:, 0].max():.2f}],"
-      f" y in [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}]")
-
-
-def batches():
-    while True:
-        yield {"x": points[rng.integers(0, len(points), BATCH)]}
-
-
-# --- The model: Fourier features of x, a sinusoidal embedding of t, three hidden layers.
 def features(x, t):
     k = (2.0 ** jnp.arange(POSITION_FREQS)) * jnp.pi
     xk = x[..., :, None] * k  # [B, 2, F]
@@ -91,6 +54,8 @@ def features(x, t):
 
 
 class Velocity(nn.Module):
+    """Fourier features of x and a sinusoidal embedding of t, then three hidden layers."""
+
     width: int = WIDTH
 
     @nn.compact
@@ -121,74 +86,98 @@ class RectifiedFlow(Objective):
         return loss, Aux(metrics={"mse": loss})
 
 
-model = Velocity()
-objective = RectifiedFlow(model)
-schedule = optax.warmup_cosine_decay_schedule(0.0, 2e-3, min(500, STEPS // 10), STEPS, 2e-5)
-trainer = Trainer(objective, optax.adamw(schedule, weight_decay=1e-5), key=jax.random.key(SEED))
-data = Dataset(train=lambda partition: batches(), val=None, records=len(points), batch=BATCH)
-started = time.time()
-state = trainer.fit(data, steps=STEPS, log_every=STEPS // 10)
-train_seconds = time.time() - started
-params = state.averaged["params"]
-count = sum(int(np.prod(x.shape)) for x in jax.tree_util.tree_leaves(params))
-print(f"trained {STEPS} steps in {train_seconds:.0f} s; {count:,} parameters")
+def dew_commit() -> str | None:
+    """The Dew commit this runs on: $DEW_COMMIT, else the checkout's HEAD."""
+    if os.environ.get("DEW_COMMIT"):
+        return os.environ["DEW_COMMIT"]
+    done = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE, capture_output=True, text=True)
+    return done.stdout.strip() if done.returncode == 0 else None
 
 
-# --- Sample as the browser will: Euler, t from 1 to 0 on a grid denser near 0.
-@jax.jit
-def sample(key):
-    grid = jnp.linspace(1.0, 0.0, SAMPLE_STEPS + 1) ** 1.5
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("name", help="the mask site/particles/masks/NAME.png, and the name of the files written")
+    parser.add_argument("--out", type=Path, required=True, help="where NAME.json, NAME.bin and NAME-samples.png go")
+    parser.add_argument("--steps", type=int, default=30000)
+    options = parser.parse_args()
+    steps = options.steps
 
-    def step(x, pair):
-        t, t_next = pair
-        v = model.apply({"params": params}, x, jnp.full((x.shape[0],), t))
-        return x + (t_next - t) * v, None
+    # The data: points inside the glyphs, scaled so the word spans [-1.8, 1.8] across.
+    mask = np.asarray(Image.open(HERE / "masks" / f"{options.name}.png").convert("L")) > 127
+    ys, xs = np.nonzero(mask)
+    height, width = mask.shape
+    scale = 3.6 / (xs.max() - xs.min())
+    cx, cy = (xs.max() + xs.min()) / 2, (ys.max() + ys.min()) / 2
+    rng = np.random.default_rng(SEED)
+    jitter = rng.random((len(xs), 2)) - 0.5  # spread each pixel's point over its square
+    points = np.stack([(xs + jitter[:, 0] - cx) * scale, -(ys + jitter[:, 1] - cy) * scale], axis=-1).astype(np.float32)
+    print(f"{len(points):,} glyph pixels; x in [{points[:, 0].min():.2f}, {points[:, 0].max():.2f}],"
+          f" y in [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}]; {jax.devices()}")
 
-    x = jax.random.normal(key, (16384, 2))
-    x, _ = jax.lax.scan(step, x, (grid[:-1], grid[1:]))
-    return x
+    def batches():
+        while True:
+            yield {"x": points[rng.integers(0, len(points), BATCH)]}
+
+    model = Velocity()
+    schedule = optax.warmup_cosine_decay_schedule(0.0, 2e-3, min(500, steps // 10), steps, 2e-5)
+    trainer = Trainer(RectifiedFlow(model), optax.adamw(schedule, weight_decay=1e-5), key=jax.random.key(SEED))
+    data = Dataset(train=lambda partition: batches(), val=None, records=len(points), batch=BATCH)
+    started = time.time()
+    state = trainer.fit(data, steps=steps, log_every=max(1, steps // 10))
+    train_seconds = time.time() - started
+    params = state.averaged["params"]
+    count = sum(int(np.prod(x.shape)) for x in jax.tree_util.tree_leaves(params))
+    print(f"trained {steps} steps in {train_seconds:.0f} s; {count:,} parameters")
+
+    # Sample as the browser does: Euler, t from 1 to 0 on a grid denser near 0.
+    @jax.jit
+    def sample(key):
+        grid = jnp.linspace(1.0, 0.0, SAMPLE_STEPS + 1) ** 1.5
+
+        def step(x, pair):
+            t, t_next = pair
+            v = model.apply({"params": params}, x, jnp.full((x.shape[0],), t))
+            return x + (t_next - t) * v, None
+
+        x, _ = jax.lax.scan(step, jax.random.normal(key, (SAMPLES, 2)), (grid[:-1], grid[1:]))
+        return x
+
+    samples = np.asarray(sample(jax.random.key(1)))
+    px = np.round(samples[:, 0] / scale + cx).astype(int)
+    py = np.round(-samples[:, 1] / scale + cy).astype(int)
+    on_canvas = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    inside = np.zeros(len(samples), bool)
+    inside[on_canvas] = mask[py[on_canvas], px[on_canvas]]
+    precision = float(inside.mean())
+    print(f"{precision:.1%} of {SAMPLES:,} samples land inside the letters")
+
+    options.out.mkdir(parents=True, exist_ok=True)
+    picture = np.zeros((height, width), np.uint8)
+    picture[np.clip(py, 0, height - 1), np.clip(px, 0, width - 1)] = 255
+    Image.fromarray(picture).save(options.out / f"{options.name}-samples.png")
+    arrays = [np.asarray(params[name][part], np.float32).ravel() for name in LAYERS for part in ("kernel", "bias")]
+    (options.out / f"{options.name}.bin").write_bytes(np.concatenate(arrays).astype("<f4").tobytes())
+    manifest = {
+        "layers": [{"name": name, "in": int(params[name]["kernel"].shape[0]), "out": int(params[name]["kernel"].shape[1])}
+                   for name in LAYERS],
+        "position_freqs": POSITION_FREQS,
+        "time_freqs": TIME_FREQS,
+        "activation": "silu",
+        "parameters": count,
+        "train_steps": steps,
+        "batch": BATCH,
+        "train_seconds": round(train_seconds),
+        "samples_inside": round(precision, 4),
+        "sample_steps": SAMPLE_STEPS,
+        "sample_grid": "t_k = (1 - k / steps) ** 1.5",
+        "data": {"mask": f"{options.name}.png", "points": int(len(points)), "scale": float(scale)},
+        "dew_commit": dew_commit(),
+        "jax": jax.__version__,
+        "device": str(jax.devices()[0].device_kind),
+    }
+    (options.out / f"{options.name}.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print("wrote", *(options.out / f"{options.name}{suffix}" for suffix in (".json", ".bin", "-samples.png")))
 
 
-samples = np.asarray(sample(jax.random.key(1)))
-precision = float(inside(samples).mean())
-print(f"{precision:.1%} of 16,384 samples land inside the letters")
-
-# A picture of the samples, to check by eye.
-canvas = np.zeros((height, width), np.uint8)
-px = np.clip(np.round(samples[:, 0] / scale + cx).astype(int), 0, width - 1)
-py = np.clip(np.round(-samples[:, 1] / scale + cy).astype(int), 0, height - 1)
-canvas[py, px] = 255
-buffer = io.BytesIO()
-Image.fromarray(canvas).save(buffer, format="PNG")
-
-# The weights, in the order the shader reads them: each Dense kernel [in, out] then its bias.
-layers = ["hidden_0", "hidden_1", "hidden_2", "out"]
-arrays = []
-for name in layers:
-    arrays.append(np.asarray(params[name]["kernel"], np.float32))
-    arrays.append(np.asarray(params[name]["bias"], np.float32))
-flat = np.concatenate([a.ravel() for a in arrays])
-from importlib.metadata import distribution  # noqa: E402
-
-commit = json.loads(distribution("dew-ml").read_text("direct_url.json"))["vcs_info"]["commit_id"]
-manifest = {
-    "layers": [{"name": name, "in": int(params[name]["kernel"].shape[0]), "out": int(params[name]["kernel"].shape[1])}
-               for name in layers],
-    "position_freqs": POSITION_FREQS,
-    "time_freqs": TIME_FREQS,
-    "activation": "silu",
-    "parameters": count,
-    "train_steps": STEPS,
-    "batch": BATCH,
-    "train_seconds": round(train_seconds),
-    "samples_inside": round(precision, 4),
-    "sample_steps": SAMPLE_STEPS,
-    "sample_grid": "t_k = (1 - k / steps) ** 1.5",
-    "data": {"points": int(len(points)), "scale": float(scale)},
-    "dew_commit": commit,
-    "jax": jax.__version__,
-    "cpu": os.cpu_count(),
-}
-print("MANIFEST_JSON" + json.dumps(manifest))
-print("WEIGHTS_B64" + base64.b64encode(flat.astype("<f4").tobytes()).decode())
-print("SAMPLES_PNG_B64" + base64.b64encode(buffer.getvalue()).decode())
+if __name__ == "__main__":
+    main()

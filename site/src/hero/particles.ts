@@ -18,8 +18,8 @@ export interface Manifest {
 	train_steps: number;
 	train_seconds: number;
 	samples_inside: number;
-	dew_commit: string;
-	cpu: number;
+	dew_commit: string | null;
+	device: string;
 }
 
 const DURATION = 2.4; // seconds from noise to the word
