@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from etils import epath
+from flax.core import FrozenDict
 
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -136,16 +137,31 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
 
     The sharding is the one the trainer gives a train state's parameters under
     `layout`; `dew.training.host.stream` places the leaves, updating the
-    dict nodes of `variables` in place.
+    dict nodes of `variables` in place. A task holds its variables frozen, and
+    a frozen node can't be updated, so frozen nodes are first rebuilt as
+    dicts over the same leaves.
     """
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
     from dew.training.host import stream
 
+    variables = _updatable(variables)
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(device_mesh, variables)
     chosen_layout.check(variables, shardings, device_mesh)
     return stream(variables, shardings)
+
+
+def _updatable(tree: Variables) -> Variables:
+    """`tree` with each frozen node rebuilt as a dict over the same children;
+    its dict nodes stay the same objects, so `stream` still updates them."""
+    if isinstance(tree, FrozenDict):
+        tree = dict(tree)
+    if isinstance(tree, dict):
+        for name, child in tree.items():
+            if isinstance(child, Mapping):
+                tree[name] = _updatable(child)
+    return tree
 
 
 class RunTokenizer(Protocol):

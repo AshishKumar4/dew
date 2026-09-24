@@ -230,6 +230,23 @@ def test_a_prompt_batch_carries_validity_only_where_it_padded():
                                   [[True, True], [False, True]])
 
 
+@pytest.mark.mesh(devices=1)
+def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
+    """A task holds its variables frozen. Placed on a mesh and bound back,
+    they draw what the task drew before: `stream`, which updates a tree's
+    dict nodes in place, took the frozen tree's nodes for leaves and refused
+    them."""
+    from dew.inference.pipeline import place
+    from dew.training import Layout, MeshSpec
+
+    model = decoder()
+    task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), sampling=SAMPLING)
+    placed = task.bind(place(task.variables, MeshSpec(), Layout(min_shard=1)))
+    assert {len(leaf.sharding.device_set) for leaf in jax.tree.leaves(placed.variables)} == {jax.device_count()}
+    rows = [[1, 2, 3], [4, 5, 6]]
+    assert_same_generation(placed(rows, 5, key=jax.random.key(1)).host(), task(rows, 5, key=jax.random.key(1)).host())
+
+
 @pytest.mark.mesh
 def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same_canvases():
     """Placed under the trainer's layout, a canvas task shards its weights,
