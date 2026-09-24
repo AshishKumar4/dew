@@ -115,8 +115,18 @@ def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=Fa
             np.testing.assert_allclose(got, want, rtol=tolerance, atol=tolerance * .1)
 
 
+# XLA's TPU backend rewrites a program's 64-bit types into pairs of 32-bit
+# ones: its float64 is no IEEE double, and the rewrite has no case for
+# ragged_dot, which a routed mixture runs.
+ON_TPU = jax.default_backend() == "tpu"
+
+
 def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None):
     objective = DenseObjective(parameter_kind, loss_kind)
+    if ON_TPU and "64" in parameter_kind:
+        with pytest.raises(ValueError, match="a TPU has no float64"):
+            Trainer(objective, optax.adam(.01), key=jax.random.PRNGKey(17)).place()
+        return
     if ema_decay is not None:
         objective.ema = EMASpec(optax.constant_schedule(ema_decay))
     optimizer = optax.adam(.01)
@@ -285,6 +295,7 @@ def test_unit_decay_preserves_mixed_frozen_leaves_bitwise():
             assert np.asarray(got).tobytes() == np.asarray(want).tobytes()
 
 
+@pytest.mark.skipif(ON_TPU, reason="a TPU's float64 is a pair of float32s, not an IEEE double")
 def test_router_bias_direction_keeps_large_integer_count_differences():
     from dew.nn.moe import load_balance_update
     with jax.enable_x64():
@@ -292,6 +303,7 @@ def test_router_bias_direction_keeps_large_integer_count_differences():
         np.testing.assert_array_equal(load_balance_update(counts, .02), [.02, -.02])
 
 
+@pytest.mark.skipif(ON_TPU, reason="XLA's TPU rewrite of 64-bit types has no case for ragged_dot")
 @pytest.mark.parametrize("bias_dtype", [jnp.bfloat16, jnp.float32, jnp.float64])
 def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dtype):
     from dew.nn.backbones.causal_transformer import CausalTransformer
