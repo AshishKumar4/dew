@@ -24,6 +24,9 @@ function reply(body: unknown, status: number, headers: HeadersInit, extra: Heade
 	return Response.json(body, { status, headers: { ...Object.fromEntries(new Headers(headers)), ...Object.fromEntries(new Headers(extra)) } });
 }
 
+/** The origins the page is served from, and the hostnames its Turnstile widget runs on. */
+const listed = (value: string): string[] => value.split(/\s+/).filter(Boolean);
+
 async function passesTurnstile(env: Env, token: string, ip: string): Promise<boolean> {
 	const form = new FormData();
 	form.append('secret', env.TURNSTILE_SECRET);
@@ -32,7 +35,7 @@ async function passesTurnstile(env: Env, token: string, ip: string): Promise<boo
 	const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
 	if (!response.ok) return false;
 	const outcome = await response.json<{ success: boolean; hostname?: string; action?: string }>();
-	return outcome.success && outcome.hostname === env.TURNSTILE_HOSTNAME && outcome.action === 'live-session';
+	return outcome.success && listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
 }
 
 async function createSession(request: Request, env: Env, ip: string, cors: HeadersInit): Promise<Response> {
@@ -75,15 +78,16 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 		const origin = request.headers.get('Origin');
+		const allowed = listed(env.ALLOWED_ORIGINS);
 		const cors: HeadersInit = {
-			'Access-Control-Allow-Origin': env.ALLOWED_ORIGIN,
+			'Access-Control-Allow-Origin': origin && allowed.includes(origin) ? origin : allowed[0],
 			'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 			'Access-Control-Allow-Headers': 'Content-Type',
 			'Access-Control-Max-Age': '86400',
 			Vary: 'Origin',
 		};
 		if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-		if (origin !== env.ALLOWED_ORIGIN) return reply({ error: 'origin', message: 'Live kernels open only from dewml.dev.' }, 403, cors);
+		if (!origin || !allowed.includes(origin)) return reply({ error: 'origin', message: 'Live kernels open only from dewml.dev.' }, 403, cors);
 
 		const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
 		const { success } = await env.REQUESTS.limit({ key: ip });

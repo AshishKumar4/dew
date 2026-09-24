@@ -1,0 +1,21 @@
+// preview.dewml.dev: the built site for review before `pnpm run deploy`
+// puts it on dewml.dev. Deploy with `pnpm deploy:preview` after `pnpm build`.
+// Run it live stays on dewml.dev: live.dewml.dev accepts that origin only.
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "dewml-preview",
+	"account_id": "f44999d1ddda7012e9a87729eba250f1",
+	"main": "worker.js",
+	"compatibility_date": "2026-09-20",
+	"assets": {
+		"directory": "../../dist",
+		"binding": "ASSETS",
+		"html_handling": "auto-trailing-slash",
+		"not_found_handling": "404-page",
+		// The Worker adds the noindex header to every response, pages included.
+		"run_worker_first": true
+	},
+	"routes": [{ "pattern": "preview.dewml.dev", "custom_domain": true }],
+	"workers_dev": false,
+	"preview_urls": false
+}

@@ -29,8 +29,9 @@
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
 	"vars": {
-		"ALLOWED_ORIGIN": "https://dewml.dev",
-		"TURNSTILE_HOSTNAME": "dewml.dev",
+		// Space-separated: the site, and its preview for review before a deploy.
+		"ALLOWED_ORIGINS": "https://dewml.dev https://preview.dewml.dev",
+		"TURNSTILE_HOSTNAMES": "dewml.dev preview.dewml.dev",
 		// Session-seconds a UTC day may use; 40 hours caps the monthly bill.
 		"BUDGET_SECONDS": "144000",
 		"MAX_SESSIONS": "8",
