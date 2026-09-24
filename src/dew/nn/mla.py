@@ -534,48 +534,8 @@ class MultiHeadLatentAttention(nn.Module):
             queries, [self.qk_nope_head_dim], axis=-1)
         latent, rot = self._latents(x, place)
         if decode:
-            if segment_ids is not None:
-                raise ValueError("decode accepts row validity, not packed segment_ids")
-            # The cache hands out the slots first, because the rope heads
-            # rotate at absolute positions: the queries at this step's slots
-            # and the appended latents at theirs, while the cached ones keep
-            # the angles of the slots they were written at.
-            if self.sparse:
-                # The cache is shaped by the expansion; its values are
-                # recomputed after rotation below, so only shapes flow here.
-                shape_key, shape_value = self._expand(latent, rot)
-                index_keys = self.indexer.keys(x) if self.indexed else None
-                positions, append = open_mla_cache(
-                    self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
-                    self.max_seq_len, valid=valid)
-                q_rot, rot, freqs_cos, freqs_sin = self._rotated(
-                    q_rot, rot,
-                    positions if logical_positions is None else logical_positions)
-                if index_keys is not None:
-                    index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
-                key, value, index_full = append(
-                    *self._expand(latent, rot), index_keys)
-                index_scores = None
-                if self.indexed:
-                    assert q_resid is not None
-                    index_scores = self.indexer.scores(
-                        x, q_resid, index_full, freqs_cos, freqs_sin)
-                keep = causal_attention_mask(
-                    positions, key.shape[1],
-                    key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
-                mask = selection_mask(self._select(index_scores, keep, kv_store),
-                                      key.shape[1])[:, None]
-            else:
-                positions, append = open_mla_cache(
-                    self, ("cached_latent", "cached_rot"), latent, rot, None,
-                    self.max_seq_len, valid=valid)
-                q_rot, rot, _, _ = self._rotated(
-                    q_rot, rot,
-                    positions if logical_positions is None else logical_positions)
-                latent, rot, _ = append(latent, rot, None)
-                key, value = self._expand(latent, rot)
-                mask = causal_attention_mask(
-                    positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+            q_rot, key, value, mask = self._decode_step(
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store)
             causal = False
         else:
             if positions is None:
@@ -652,6 +612,55 @@ class MultiHeadLatentAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=implementation, causal=causal, mask=mask)
         return self._output(attention, x)
+
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store):
+        """One decode step's rotated query heads, its keys and values with the
+        cache's joined, and the mask over them: the expanded keys and the
+        indexer's selection under the sparse layout, or the latents expanded
+        after the append under the dense one."""
+        if segment_ids is not None:
+            raise ValueError("decode accepts row validity, not packed segment_ids")
+        # The cache hands out the slots first, because the rope heads
+        # rotate at absolute positions: the queries at this step's slots
+        # and the appended latents at theirs, while the cached ones keep
+        # the angles of the slots they were written at.
+        if self.sparse:
+            # The cache is shaped by the expansion; its values are
+            # recomputed after rotation below, so only shapes flow here.
+            shape_key, shape_value = self._expand(latent, rot)
+            index_keys = self.indexer.keys(x) if self.indexed else None
+            positions, append = open_mla_cache(
+                self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
+                self.max_seq_len, valid=valid)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            if index_keys is not None:
+                index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
+            key, value, index_full = append(
+                *self._expand(latent, rot), index_keys)
+            index_scores = None
+            if self.indexed:
+                assert q_resid is not None
+                index_scores = self.indexer.scores(
+                    x, q_resid, index_full, freqs_cos, freqs_sin)
+            keep = causal_attention_mask(
+                positions, key.shape[1],
+                key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+            mask = selection_mask(self._select(index_scores, keep, kv_store),
+                                  key.shape[1])[:, None]
+        else:
+            positions, append = open_mla_cache(
+                self, ("cached_latent", "cached_rot"), latent, rot, None,
+                self.max_seq_len, valid=valid)
+            q_rot, rot, _, _ = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            latent, rot, _ = append(latent, rot, None)
+            key, value = self._expand(latent, rot)
+            mask = causal_attention_mask(
+                positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+        return q_rot, key, value, mask
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")
