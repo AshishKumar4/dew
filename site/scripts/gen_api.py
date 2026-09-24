@@ -5,6 +5,7 @@ Every object is documented in full on one page, its home: the page whose
 module is the longest prefix of the object's own path. Other pages that export
 it list it with a link. The build fails when
 
+- a module declares `__all__` but has no page of its own,
 - a module's `__all__` exports a name that no page documents, or
 - a docs page, the README, an example, a recipe or a tutorial imports a name
   from Dew that no page documents,
@@ -35,18 +36,19 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization",
                   "dew.training.runtime"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
-                    "dew.objectives.jepa", "dew.objectives.rl", "dew.objectives.rl.harbor",
-                    "dew.objectives.rl.scheduler"]),
+                    "dew.objectives.jepa", "dew.objectives.rl", "dew.objectives.rl.flow",
+                    "dew.objectives.rl.harbor", "dew.objectives.rl.scheduler"]),
     ("Data", ["dew.data", "dew.data.chat", "dew.data.images"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
-                "dew.nn.backbones.flux", "dew.nn.backbones.sd3", "dew.nn.diffusion_gemma", "dew.nn.gemma3n",
+                "dew.nn.backbones.flux", "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3",
+                "dew.nn.diffusion_gemma", "dew.nn.gemma3n",
                 "dew.nn.autoencoders", "dew.nn.kernels", "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
                                 "dew.diffusion.presets", "dew.diffusion.discrete", "dew.sampling",
-                                "dew.sampling.decoding"]),
+                                "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.decoding"]),
     ("Inference and interop", ["dew.inference", "dew.inference.tasks", "dew.interop"]),
-    ("Conditions and evaluation", ["dew.inputs", "dew.eval", "dew.eval.harness"]),
+    ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),
 ]
@@ -434,11 +436,14 @@ def main() -> None:
                             linker.add(f"{entry.canonical}.{name}", method, f"{entry.name}.{name}")
                             linker.add(f"{path}.{entry.name}.{name}", method)
 
-    # Coverage: every exported name and every name the docs import is documented.
+    # Coverage: every module that declares __all__ has a page, and every exported
+    # name and every name the docs import is documented.
     problems = []
     for module in iter_modules(package):
         if module.exports is None:
             continue
+        if module.path not in pages:
+            problems.append(f"{module.path} declares __all__ but has no API page; add it to GROUPS")
         for entry in public_entries(module):
             if entry.canonical not in home:
                 problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
