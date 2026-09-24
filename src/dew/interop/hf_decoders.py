@@ -307,6 +307,7 @@ class MixtureFields(TypedDict, total=False):
     shared_gate: bool
     implementation: str
     dispatch: str
+    capacity_factor: float | None
     hash_layers: tuple[int, ...] | None
     latent_features: int | None
     latent_norm: bool
