@@ -473,6 +473,7 @@ def test_a_pool_publishes_its_sharded_policy_once_and_every_process_hears_a_fail
 
 
 @pytest.mark.distributed
+@pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("publication", ["safetensors", "nccl"])
 def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp_path, replicas, publication):
     """Only process 0 writes or sends a publication, so only its host holds
