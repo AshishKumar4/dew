@@ -11,6 +11,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import resource
+import signal
+import threading
+import types
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -20,6 +24,7 @@ from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
 from dew.pool import (
+    PREEMPTED_EXIT,
     PROCESS_COUNT,
     PROCESS_ID,
     detected_cluster,
@@ -191,6 +196,65 @@ def cuda_plugin() -> bool:
     return (importlib.util.find_spec("jax_plugins") is not None
             and any(importlib.util.find_spec(f"jax_plugins.xla_cuda{major}") is not None
                     for major in (12, 13)))
+
+
+class Preempted(SystemExit):
+    """`Trainer.fit` stopped at a preemption notice, at `step`, and wrote that
+    step's checkpoint and data position. Uncaught, it ends the program with
+    `PREEMPTED_EXIT` and no traceback, the way SIGTERM itself would have; the
+    same program run again resumes from the checkpoint."""
+
+    def __init__(self, step: int):
+        super().__init__(PREEMPTED_EXIT)
+        self.step = step
+
+
+class PreemptionNotice:
+    """Whether a preemption notice reached the run, asked once a step, from
+    its creation until `close`.
+
+    A scheduler stops a job with SIGTERM and SIGKILLs it a grace period later:
+    Slurm's KillWait, Kubernetes' termination grace period, a spot VM's
+    notice. In a pool, JAX's preemption service takes the SIGTERM (XLA's
+    notifier replaces the handler, so the process runs on), shares the notice
+    through the coordination service, and `reached_preemption_sync_point`
+    agrees one step on every process, where the checkpoint is whole. A process
+    outside any pool has no such service, and the notice is SIGTERM itself,
+    caught until `close`. A pool whose preemption service is off
+    (jax_enable_preemption_service) gets no notice, and SIGTERM ends it as it
+    always did.
+    """
+
+    def __init__(self):
+        self._pool = global_state.client is not None
+        self._signalled = False
+        self._previous: Callable[[int, types.FrameType | None], object] | int | None = None
+        self._installed = False
+        # Only the main thread may set a handler; a fit run on another thread
+        # keeps the default, as before.
+        if not self._pool and threading.current_thread() is threading.main_thread():
+            self._previous = signal.signal(signal.SIGTERM, self._caught)
+            self._installed = True
+
+    def close(self) -> None:
+        """Put back the SIGTERM handler this notice replaced."""
+        if self._installed:
+            # A handler set outside Python reads back as None, and the
+            # default stands in for it.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL if self._previous is None else self._previous)
+            self._installed = False
+
+    def _caught(self, _signum: int, _frame: types.FrameType | None) -> None:
+        self._signalled = True
+
+    def reached(self, step: int) -> bool:
+        """Whether to stop at `step`: in a pool, whether every process agreed
+        on it; alone, whether SIGTERM arrived."""
+        if not self._pool:
+            return self._signalled
+        if global_state.preemption_sync_manager is None:
+            return False
+        return multihost_utils.reached_preemption_sync_point(step)
 
 
 def run_timestamp() -> str:

@@ -18,7 +18,6 @@ target is named.
 from __future__ import annotations
 
 import collections
-import contextlib
 import dataclasses
 import os
 import re
@@ -41,6 +40,7 @@ from dew.cli.tpu import reach
 from dew.pool import (
     COORDINATOR,
     LOCAL_DEVICES,
+    PREEMPTED_EXIT,
     PROCESS_COUNT,
     PROCESS_ID,
     Cluster,
@@ -58,6 +58,17 @@ VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 POLL_SECONDS = 0.2
 TAIL_LINES = 20
+FAILURE_GRACE = 10.0
+"""Seconds the other ranks of a pool whose rank failed get between SIGTERM and
+SIGKILL. They wait in a collective for the failed rank, so none reaches a
+preemption checkpoint, and it is the SIGKILL that stops a JAX rank."""
+PREEMPTION_GRACE = 300.0
+"""Seconds the ranks of a pool the launcher was signalled to stop get between
+SIGTERM and SIGKILL: time for `Trainer.fit` to reach the step every rank
+agrees on and write its checkpoint and data position. A scheduler's own
+grace, often shorter, still ends the pool, and a second signal stops it at
+once."""
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 """Lines of a failed rank's output printed again once the pool has stopped."""
 MEGASCALE_PORT = "8081"
 """The port slices of a multislice run meet on, the one Ray's TPU support uses."""
@@ -406,23 +417,25 @@ def _relay(rank: int, stream: TextIO, tail: collections.deque[str]) -> None:
         emit(f"[{rank}] {text}")
 
 
-def _stop(running: Sequence[subprocess.Popen]) -> None:
-    """SIGTERM every process group still alive, and SIGKILL those still alive
-    10 s later, rank 0 last.
+def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.Event) -> None:
+    """SIGTERM every process group still alive, give them `grace` seconds to
+    exit, or until `forced` is set, and SIGKILL those still alive, rank 0
+    last.
 
     A JAX process of a pool takes SIGTERM as a preemption notice
-    (jax_enable_preemption_service) and runs on, so there the SIGKILL is what
-    stops each rank. Rank 0's process holds the pool's coordination service,
-    and a rank that outlives it aborts in XLA's error polling, with a Check
-    failure that reads as a crash of its own.
+    (jax_enable_preemption_service): `Trainer.fit` checkpoints at the step
+    every rank agrees on and exits, and any other program runs on, so the
+    SIGKILL is what stops it. Rank 0's process holds the pool's coordination
+    service, and a rank that outlives it aborts in XLA's error polling, with
+    a Check failure that reads as a crash of its own.
     """
     for child in running:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
-    deadline = time.monotonic() + 10
-    for child in running:
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            child.wait(timeout=max(0.0, deadline - time.monotonic()))
+    deadline = time.monotonic() + grace
+    while (not forced.is_set() and time.monotonic() < deadline
+           and any(child.poll() is None for child in running)):
+        time.sleep(POLL_SECONDS)
     for child in (*running[1:], *running[:1]):
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
@@ -439,6 +452,13 @@ class Stopped(BaseException):
 
 def _raise_stopped(signum: int, _frame: types.FrameType | None) -> None:
     raise Stopped(signum)
+
+
+def _escalate(forced: threading.Event) -> None:
+    """Make every stop signal from here set `forced`, which ends a stop's
+    grace, instead of raising into the launcher."""
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, lambda _signum, _frame: forced.set())
 
 
 def _exit_text(code: int) -> str:
@@ -459,15 +479,17 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     Every rank runs in a session of its own, so no signal meant for the
     launcher's terminal or process group reaches it. The launcher stops the
     pool itself on SIGINT, SIGTERM (a scheduler's cancel) and SIGHUP (its
-    terminal or ssh session closing), and returns 128 plus the signal, as a
-    shell reports it. Any other exception stops the pool before it
-    propagates.
+    terminal or ssh session closing), giving the ranks PREEMPTION_GRACE to
+    checkpoint where a training run agrees, or until a second signal, and
+    returns 128 plus the signal, as a shell reports it. A rank that exits
+    with PREEMPTED_EXIT stopped at such a checkpoint, and the others get the
+    same grace. Any other exception stops the pool before it propagates.
     """
     running: list[subprocess.Popen] = []
     relays: list[threading.Thread] = []
     tails = [collections.deque[str](maxlen=TAIL_LINES) for _ in processes]
-    handlers = {signum: signal.signal(signum, _raise_stopped)
-                for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    handlers = {signum: signal.signal(signum, _raise_stopped) for signum in STOP_SIGNALS}
+    forced = threading.Event()
     try:
         for process in processes:
             child = subprocess.Popen(
@@ -497,9 +519,14 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             if failed is not None:
                 rank, code = failed
                 others = sum(1 for other, returned in enumerate(codes) if other != rank and returned is None)
-                emit(f"rank {rank} on {processes[rank].host} {_exit_text(code)}"
+                # A rank preempted at the step the pool agreed on leaves the
+                # others writing the same checkpoint.
+                preempted = code == PREEMPTED_EXIT
+                emit(f"rank {rank} on {processes[rank].host} "
+                     + ("stopped at a preemption checkpoint" if preempted else _exit_text(code))
                      + (f"; stopping the other {others}" if others else ""))
-                _stop(running)
+                _escalate(forced)
+                _stop(running, PREEMPTION_GRACE if preempted else FAILURE_GRACE, forced)
                 for relay in relays:
                     relay.join(timeout=5)
                 emit(f"last lines of rank {rank}:")
@@ -512,10 +539,14 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 return 0
             time.sleep(POLL_SECONDS)
     except BaseException as error:
-        # A second signal while the pool stops would leave it half stopped.
-        for signum in handlers:
-            signal.signal(signum, signal.SIG_IGN)
-        _stop(running)
+        # From here a signal cuts the stop's grace short, rather than raising
+        # into it and leaving the pool half stopped.
+        _escalate(forced)
+        if isinstance(error, Stopped) and running:
+            emit(f"stopping the pool on {signal.Signals(error.code - 128).name}: a training run "
+                 f"checkpoints at the step its ranks agree on, within {PREEMPTION_GRACE:.0f} s; "
+                 "signal again to stop it now")
+        _stop(running, PREEMPTION_GRACE if isinstance(error, Stopped) else FAILURE_GRACE, forced)
         if isinstance(error, Stopped):
             return error.code
         raise

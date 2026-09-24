@@ -80,6 +80,12 @@ with tempfile.TemporaryDirectory(prefix="dew-checkpoint-") as directory:
 
 The script checks the checkpoint directory and the continued run before the temporary directory is deleted. To keep a run, replace the temporary directory with a persistent path of its own and pass that path on later calls. Do not reuse the directory of an unrelated experiment.
 
+## A preempted run resumes where it stopped
+
+A scheduler stops a job with SIGTERM and kills it a grace period later: Slurm's `KillWait`, Kubernetes' termination grace period, a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on (JAX's `reached_preemption_sync_point` in a pool, the signal itself in a lone process), writes that step's state and data position, skips the final validation, and raises `dew.training.Preempted`. Uncaught, it ends the program with exit status 143, SIGTERM's, so the scheduler sees a stopped job rather than a finished one; a Kubernetes pod failure policy can ignore that code. The same command run again resumes from the checkpoint, and with deterministic ops its losses are the uninterrupted run's to the bit.
+
+The save has to fit in the scheduler's grace: a step and one checkpoint write. `dew launch` gives a pool it was told to stop 300 seconds before it kills the ranks, and a second signal kills them at once.
+
 ## What a checkpoint does not save
 
 `Checkpoints` does not write `run.json`. Recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. A checkpoint also does not save your source code, package versions, tokenizer files, dataset revision, or the state of any external service. Record those in your experiment metadata.

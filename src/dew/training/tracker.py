@@ -34,6 +34,7 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
+from dew.pool import PREEMPTED_EXIT
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
 
 if TYPE_CHECKING:
@@ -216,7 +217,10 @@ class WandbTracker(_OwnedTracker):
                           "reporting/record": json.dumps(json_value(value), allow_nan=False),
                           "reporting/type": type(value).__name__})
             if isinstance(value, FitEnded):
-                self._exit_code = int(value.status != "completed")
+                if value.status == "preempted":
+                    # W&B keeps a preempting run resumable under its id.
+                    self.run.mark_preempting()
+                self._exit_code = {"completed": 0, "preempted": PREEMPTED_EXIT}.get(value.status, 1)
             return
         self.run.log({**self.render(value), "train/step": step})
 
@@ -229,7 +233,8 @@ class WandbTracker(_OwnedTracker):
             run.finish(exit_code=self._exit_code)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc is not None:
+        # A fit that ended preempted raises Preempted, and keeps its code.
+        if exc is not None and self._exit_code == 0:
             self._exit_code = 1
         super().__exit__(exc_type, exc, tb)
 
@@ -433,7 +438,7 @@ class MLflowTracker(_OwnedTracker):
             client.log_dict(run, {'step': step, 'value': json_value(value)},
                             f'records/{type(value).__name__}-{step}.json')
             if isinstance(value, FitEnded):
-                self._status = 'FINISHED' if value.status == 'completed' else 'FAILED'
+                self._status = {'completed': 'FINISHED', 'preempted': 'KILLED'}.get(value.status, 'FAILED')
             return
         with tempfile.TemporaryDirectory() as directory:
             for path in _write_preview(value, Path(directory) / f'preview-{step}'):
@@ -449,7 +454,8 @@ class MLflowTracker(_OwnedTracker):
             client.set_terminated(run, self._status)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc is not None:
+        # A fit that ended preempted raises Preempted, and keeps its status.
+        if exc is not None and self._status == 'FINISHED':
             self._status = 'FAILED'
         super().__exit__(exc_type, exc, tb)
 

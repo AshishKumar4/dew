@@ -100,15 +100,17 @@ class ProfileWindow:
 
 @dataclasses.dataclass(frozen=True)
 class FitEnded:
-    status: Literal['completed', 'failed', 'interrupted']
+    status: Literal['completed', 'preempted', 'failed', 'interrupted']
     seconds: float
     error: str | None = None
     traceback: str | None = None
 
     @classmethod
-    def outcome(cls, seconds: float, error: BaseException | None) -> FitEnded:
+    def outcome(cls, seconds: float, error: BaseException | None, *, preempted: bool = False) -> FitEnded:
+        """A run's end: an error, else stopped at a preemption notice with
+        its checkpoint written, else completed."""
         if error is None:
-            return cls('completed', seconds)
+            return cls('preempted' if preempted else 'completed', seconds)
         return cls('interrupted' if isinstance(error, KeyboardInterrupt) else 'failed', seconds,
                    f'{type(error).__name__}: {error}', ''.join(traceback.format_exception(error)))
 
