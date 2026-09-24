@@ -70,7 +70,7 @@ def write_moe() -> None:
         output, _ = block(hidden)
     arrays = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()}
     arrays.update(hidden=hidden.numpy(), output=output.numpy())
-    np.savez(FIXTURES / "moe.npz", allow_pickle=False, **arrays)
+    np.savez(FIXTURES / "moe.npz", **arrays)
 
 
 def write_mxfp4() -> None:

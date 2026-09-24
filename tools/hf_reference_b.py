@@ -995,7 +995,7 @@ def write_llama4_blocks(directory: Path) -> None:
             arrays.update({f"self_attn.{tensor_name}": tensor.detach().numpy()
                            for tensor_name, tensor in attention.named_parameters()})
         assert attention.layer_idx == layer_index
-    np.savez(directory / "attention.npz", allow_pickle=False, **arrays)
+    np.savez(directory / "attention.npz", **arrays)
 
     moe = Llama4TextMoe(config).eval()
     scatter_weights(moe, seed=43)
@@ -1004,7 +1004,7 @@ def write_llama4_blocks(directory: Path) -> None:
     arrays = {"hidden": hidden.numpy(), "output": output.numpy()}
     arrays.update({f"feed_forward.{tensor_name}": tensor.detach().numpy()
                    for tensor_name, tensor in moe.named_parameters()})
-    np.savez(directory / "moe.npz", allow_pickle=False, **arrays)
+    np.savez(directory / "moe.npz", **arrays)
     print(f"{directory}: attention and moe blocks, {sorted(p.name for p in directory.iterdir())}")
 
 
@@ -1053,7 +1053,7 @@ def write_gemma4_moe_block(directory: Path) -> None:
                    "post_feedforward_layernorm_1", "post_feedforward_layernorm_2"):
         arrays.update({f"{prefix}.{tensor_name}": tensor.detach().numpy()
                        for tensor_name, tensor in getattr(layer, prefix).named_parameters()})
-    np.savez(directory / "moe.npz", allow_pickle=False, **arrays)
+    np.savez(directory / "moe.npz", **arrays)
     print(f"{directory}: moe block, {sorted(arrays)}")
 
 
@@ -1118,7 +1118,7 @@ def write_gemma3n_blocks(directory: Path) -> None:
         arrays["mlp_output"] = mlp(activated).numpy()
     arrays.update({f"mlp.{name}": tensor.detach().numpy()
                    for name, tensor in mlp.named_parameters()})
-    np.savez(directory / "blocks.npz", allow_pickle=False, **arrays)
+    np.savez(directory / "blocks.npz", **arrays)
     print(f"{directory}: altup, laurel and sparse mlp blocks, {sorted(arrays)}")
 
 

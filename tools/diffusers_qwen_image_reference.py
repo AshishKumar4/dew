@@ -354,7 +354,7 @@ def main(destination: str) -> None:
                            "height": HEIGHT, "width": WIDTH,
                            "default_steps": defaults["num_inference_steps"].default,
                            "true_cfg": defaults["true_cfg_scale"].default}}
-    np.savez_compressed(root / "qwen_image.npz", allow_pickle=False, **arrays)
+    np.savez_compressed(root / "qwen_image.npz", **arrays)
     (root / "qwen_image.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")

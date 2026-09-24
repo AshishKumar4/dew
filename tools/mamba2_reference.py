@@ -106,7 +106,7 @@ def write_ssd() -> None:
     arrays = scan_fixture(generator)
     layer, geometry = layer_fixture(generator)
     arrays.update(layer)
-    np.savez(SSD / "ssd.npz", allow_pickle=False, **{name: tensor.detach().numpy() for name, tensor in arrays.items()})
+    np.savez(SSD / "ssd.npz", **{name: tensor.detach().numpy() for name, tensor in arrays.items()})
     (SSD / "config.json").write_text(json.dumps(geometry, indent=2) + "\n")
     print(f"{SSD / 'ssd.npz'}: {(SSD / 'ssd.npz').stat().st_size / 1e3:.0f} kB")
 

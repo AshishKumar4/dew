@@ -255,7 +255,7 @@ def main(destination: str) -> None:
                           "default_steps": defaults["num_inference_steps"].default,
                           "default_guidance": defaults["guidance_scale"].default,
                           "true_cfg": defaults["true_cfg_scale"].default}
-    np.savez_compressed(root / "flux_transformer.npz", allow_pickle=False, **arrays)
+    np.savez_compressed(root / "flux_transformer.npz", **arrays)
     (root / "flux_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")

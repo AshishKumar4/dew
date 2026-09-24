@@ -40,7 +40,7 @@ def main() -> None:
     corrected.backward()
     assert current.grad is not None
     output = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/behavior.npz"
-    np.savez(output, allow_pickle=False, revision=np.asarray(REVISION), cap=np.asarray(cap),
+    np.savez(output, revision=np.asarray(REVISION), cap=np.asarray(cap),
              old=old.numpy(), behavior=behavior.numpy(), current=current.detach().numpy(),
              advantages=advantage.numpy(), mask=mask.numpy(), weights=weights.numpy(),
              corrected=corrected.detach().numpy(), plain=plain.detach().numpy(),
