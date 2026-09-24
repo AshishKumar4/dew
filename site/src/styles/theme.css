@@ -295,6 +295,18 @@ header.header {
 	background: #fff;
 }
 
+.nb-output.nb-install summary {
+	padding: 0.35rem 1rem;
+	cursor: pointer;
+	font: 600 0.72rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+	list-style-position: inside;
+}
+
+.nb-output.nb-install pre {
+	color: var(--dew-muted);
+}
+
 .nb-output.nb-stderr summary {
 	padding: 0.35rem 1rem;
 	cursor: pointer;
