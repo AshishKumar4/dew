@@ -499,17 +499,21 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         Every auxiliary term below is off until its argument is set; the
         rest trade memory against time.
 
-        `head_chunks` is how many vocabulary slices the loss scores a batch
-        in, so the `[tokens, vocab]` logits are never built whole. Four
-        costs 2.2% of the step and saves 1.2 GiB of peak memory at
-        vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md). The saving
-        grows with the vocabulary, and one is the full pass.
-
         `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
-        `tile`). None keeps the whole fp32 logits for the backward, the
-        fastest head where they fit; a trainer whose compiled step does not
-        fit the devices moves it to the generation's tile
-        (`chunked.chunked_tile`) before it recomputes any block.
+        `tile`). None, the default, keeps the whole fp32 logits for the
+        backward, the fastest head where they fit: on one A100, a Qwen3-0.6B
+        step at 4 x 1024 tokens took 142 ms against 163 ms tiled, for 5.3 GiB
+        more peak. A trainer whose compiled step does not fit the devices
+        moves it to the generation's tile (`chunked.chunked_tile`) before it
+        recomputes any block. A pass with no backward (evaluation, scoring)
+        runs the tiled forward either way, so it never holds the logits
+        whole.
+
+        `head_chunks` is how many vocabulary slices a tiled head scores in:
+        four costs 2.2% of the step and saves 1.2 GiB of peak memory at
+        vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one is
+        the full pass. It also slices the forward that an evaluation or a
+        scoring pass runs.
 
         `pretrained` is a variables dict to start from instead of a fresh
         init, as `dew.interop.load_pretrained(...).variables` returns for a
@@ -584,7 +588,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.pad_id = pad_id
         self.head_chunks = head_chunks
         # A config gives a pair as a list; the head's tile is a static argument.
-        self.head_tile = None if head_tile is None else tuple(head_tile)
+        self.head_tile = None if head_tile is None else (int(head_tile[0]), int(head_tile[1]))
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
