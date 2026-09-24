@@ -93,10 +93,10 @@ class Launch:
 
     dew launch --tpu my-v5e-16 --cwd dew -- python recipes/lm/train.py
 
-    Without --hosts, --hostfile or --tpu it runs the program in place inside a
-    Slurm step, under mpirun, on a Cloud TPU VM or in a Kubernetes job; starts
-    it with srun inside a Slurm allocation; and otherwise runs one process per
-    GPU on this machine.
+    Without --hosts, --hostfile or --tpu it runs the program in place where a
+    cluster already started several ranks (a Slurm step, mpirun, a TPU pod
+    worker, a Kubernetes job); starts it with srun inside a Slurm
+    allocation; and otherwise runs one process per GPU on this machine.
     """
 
     command: Positional[tuple[str, ...]]
