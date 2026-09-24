@@ -29,6 +29,8 @@ from test_quantized import decode_e4m3fn, fetch
 from dew.interop import codecs, load_pretrained
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
 
+FIXTURES = Path(__file__).parent / "fixtures" / "hf"
+
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "compressed_tensors_mxfp4.npz"
 
 STORED = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
@@ -446,3 +448,95 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(r
     np.testing.assert_array_equal(again[partner].astype(np.float32)[moved], scale.astype(np.float32)[moved] / 2)
     kept = np.repeat(np.repeat(~moved, block if layout == "blocks" else 1, axis=0), block, axis=1)
     np.testing.assert_array_equal(again[name].view(np.uint8)[kept], weight.view(np.uint8)[kept])
+
+
+# --------------------------------------------------------------------------
+# AWQ and GPTQ integer groups
+# --------------------------------------------------------------------------
+
+def test_an_awq_word_holds_its_columns_in_awq_order():
+    """Nibble j of an AWQ gemm word is column AWQ_ORDER[j], and the weight is
+    (code - zero) * scale taken in fp16, transposed to torch's [out, in]."""
+    word = np.array([[sum((j + 1) << (4 * j) for j in range(8))]], np.uint32).view(np.int32)
+    zeros = np.array([[sum(1 << (4 * j) for j in range(8))]], np.uint32).view(np.int32)
+    tensors = {"m.qweight": word, "m.qzeros": zeros, "m.scales": np.full((1, 8), 0.1, np.float16)}
+    decoded = codecs.awq(4, 1).decode(tensors, "m.weight")
+    codes = np.empty(8)
+    codes[list(codecs.AWQ_ORDER)] = np.arange(1, 9)
+    expected = ((codes - 1).astype(np.float32) * np.float32(np.float16(0.1))).astype(np.float16)
+    np.testing.assert_array_equal(decoded, expected.astype(np.float32)[:, None])
+
+
+def test_a_gptq_v1_zero_is_one_above_what_it_stores_and_its_groups_follow_g_idx():
+    """GPTQ packs eight inputs per word down each column; a v1 ('gptq')
+    checkpoint stores each zero one below itself, and g_idx puts each input
+    in its group, which act-order permutes."""
+    codes = np.array([[(i + c) % 16 for c in range(8)] for i in range(16)])  # [in, out]
+    stored_zeros = np.stack([np.arange(8), 14 - np.arange(8)])  # [groups, out]
+    scales = np.array([[0.5] * 8, [0.25] * 8], np.float16)
+    groups = np.array([1, 0] * 8, np.int32)
+    tensors = {"m.qweight": codecs._words(codes.T, 4).T, "m.qzeros": codecs._words(stored_zeros, 4),
+               "m.scales": scales, "m.g_idx": groups}
+    for v1, offset in ((True, 1), (False, 0)):
+        decoded = codecs.gptq(4, v1=v1).decode(tensors, "m.weight")
+        expected = (codes - (stored_zeros[groups] + offset)) * scales[groups].astype(np.float32)
+        np.testing.assert_array_equal(decoded, expected.T, err_msg=f"v1={v1}")
+
+
+def integer_checkpoint(directory: Path, method: str) -> dict[str, np.ndarray]:
+    """qwen3-tiny's Linear weights as a 4-bit AWQ or GPTQ checkpoint in the
+    libraries' layout, groups of 16 inputs with per-group min/max grids."""
+    source = read_weights(FIXTURES / "qwen3-tiny")
+    stored: dict[str, np.ndarray] = {}
+    for name, weight in source.items():
+        if not re.search(r"(q|k|v|o|gate|up|down)_proj\.weight$", name):
+            stored[name] = weight
+            continue
+        w = np.asarray(weight, np.float32).T  # [in, out]
+        grouped = w.reshape(-1, 16, w.shape[1])
+        low, high = grouped.min(axis=1), grouped.max(axis=1)
+        scales = ((high - low) / 15).astype(np.float16)
+        zeros = np.clip(np.round(-low / scales.astype(np.float32)), 0, 15).astype(np.int32)
+        codes = np.clip(np.round(grouped / scales[:, None] + zeros[:, None]), 0, 15).astype(np.int32)
+        codes = codes.reshape(w.shape)
+        stem = name.removesuffix(".weight")
+        if method == "awq":
+            order = list(codecs.AWQ_ORDER)
+            def pack(values):
+                return codecs._words(values.reshape(values.shape[0], -1, 8)[..., order].reshape(values.shape), 4)
+            stored |= {stem + ".qweight": pack(codes), stem + ".qzeros": pack(zeros), stem + ".scales": scales}
+        else:
+            stored |= {stem + ".qweight": codecs._words(codes.T, 4).T, stem + ".qzeros": codecs._words(zeros - 1, 4),
+                       stem + ".scales": scales, stem + ".g_idx": (np.arange(w.shape[0]) // 16).astype(np.int32)}
+    config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
+    config["quantization_config"] = ({"quant_method": "awq", "bits": 4, "group_size": 16, "version": "gemm",
+                                      "zero_point": True} if method == "awq" else
+                                     {"quant_method": "gptq", "bits": 4, "group_size": 16, "sym": False,
+                                      "desc_act": False})
+    save_hf_layout(stored, config, directory)
+    for asset in (FIXTURES / "qwen3-tiny").glob("*.json"):
+        if asset.name != "config.json":
+            (directory / asset.name).write_bytes(asset.read_bytes())
+    return stored
+
+
+@pytest.mark.parametrize("method", ["awq", "gptq"])
+def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_its_grid(tmp_path, method):
+    """Loaded, an AWQ or GPTQ checkpoint runs on (code - zero) * scale; saved
+    untrained it writes every stored tensor back byte for byte. A trained
+    value its source grid cannot hold is refused: AutoAWQ's packing would
+    spill it into the neighbouring codes and gptqmodel's would clamp it."""
+    stored = integer_checkpoint(tmp_path / "source", method)
+    loaded = load_pretrained(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded.save(tmp_path / "export")
+    written = read_weights(tmp_path / "export")
+    assert set(written) == set(stored)
+    for name, value in stored.items():
+        assert written[name].dtype == value.dtype, name
+        np.testing.assert_array_equal(written[name], value, err_msg=name)
+
+    variables = jax.tree.map(np.array, loaded.variables)
+    kernel = variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel[0, 0] = 1e3
+    with pytest.raises(ValueError, match=r"q_proj\.weight: 1 trained values fall outside the source's 4-bit grid"):
+        loaded.save(tmp_path / "trained", variables=variables)

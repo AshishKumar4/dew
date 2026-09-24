@@ -929,6 +929,9 @@ class Pretrained:
     """The dtype a quantized source stored its scales in, where its format
     leaves that to the checkpoint (DeepSeek-V4's `.scale`: float8_e8m0fnu,
     float32 in the Base releases), so `save` writes them back in it."""
+    quantization_grid: Mapping[str, np.ndarray] = field(default_factory=dict, repr=False)
+    """The scales and zeros an integer format (AWQ, GPTQ) encodes a saved
+    weight against, as the source stored them."""
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
@@ -1053,7 +1056,8 @@ class Pretrained:
 
     def _quantization(self) -> SourceQuantization | None:
         """The config's quantization format, refused when the loader recorded no tensors to write back in it."""
-        quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype)
+        quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype,
+                                           grid=self.quantization_grid)
         if quantization is not None and not self.quantized_tensors:
             raise ValueError(
                 "this source's config declares a quantization_config and the loader recorded "
@@ -2512,6 +2516,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     quantization = source_quantization(config)
     quantized_tensors, scale_dtype = ((), None) if quantization is None else (
         quantization.names(tensors), quantization.scale_dtype(tensors))
+    grid = {part: tensors[part] for name in quantized_tensors
+            for part in (quantization.grid(name) if quantization is not None else ())}
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()
         if param_dtype != "float32":
@@ -2595,6 +2601,6 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     agreed("pretrained generation policy", policy_read)
     return Pretrained(model, placed(variables), processor, config, directory, built, generation_config,
                       layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                      quantized_scale_dtype=scale_dtype,
+                      quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                       # The weights' commit: a pickle repo's may be its conversion's.
                       revision=None if commit is None else directory.name)
