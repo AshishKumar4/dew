@@ -369,9 +369,16 @@ def test_neutral_beam_controls_preserve_the_search(task):
 
 def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draws(roomy):
     """A 100-token and a 120-token prompt both pad to 128, so the second call
-    reuses the first's executable, and the padding changes nothing: both
-    results are what generation at the exact width and the model's own cache
-    produces, token for token and likelihood for likelihood."""
+    reuses the first's executable, and both draw what generation at the exact
+    width draws, token for token.
+
+    The likelihoods agree to fp32 rounding, not bit for bit: the padded
+    width is a different attention reduction (128 keys against 100 or 120,
+    the extra ones masked to zero weight), which a GPU kernel may tile and
+    sum in another order. Re-associating a sum of n fp32 terms moves it by
+    about sqrt(n) eps relative to its magnitude, 11 eps at n = 128, and the
+    bound allows 16 eps of each log probability (measured on CUDA: 1 ulp).
+    """
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, seed=0,
                              sampling=roomy.sampling) for width in (100, 120)}
     compiled = text._compiled(None)
@@ -380,8 +387,9 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
         drawn = roomy(ramp(width), 8, seed=0)
         assert drawn.tokens.shape == (1, width + 8)
         np.testing.assert_array_equal(drawn.tokens, reference.tokens)
-        np.testing.assert_array_equal(drawn.raw_log_probs, reference.raw_log_probs)
-        np.testing.assert_array_equal(drawn.behavior_log_probs, reference.behavior_log_probs)
+        for field in ("raw_log_probs", "behavior_log_probs"):
+            np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
+                                       rtol=16 * np.finfo(np.float32).eps, atol=0, err_msg=field)
     assert compiled._cache_size() - traced == 1
 
 
