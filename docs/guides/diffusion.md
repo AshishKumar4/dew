@@ -54,23 +54,7 @@ The DiT cuts each 8×8 image into 4×4 patches, which gives four spatial tokens.
 
 The objective samples noise and noise levels and computes the flow-matching loss. Its `steps=4` sets the number of sampling steps for evaluation previews, not the number of optimizer updates. `trainer.fit(..., steps=3)` sets the training target.
 
-`Euler()` is the numerical solver that generates the preview. A different solver, noise schedule or prediction transform samples differently, so pick a process and solver that work together. Dew also has DDPM, DDIM, Heun, RK4 and Euler ancestral, plus solvers that follow the Diffusers schedulers:
-
-- `DPMSolverMultistep` covers every algorithm, order and second-order form of `DPMSolverMultistepScheduler`, and the EDM scheduler's update over the EDM process.
-- `DPMSolverSinglestep`, `DPMSolverSDE`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral) and `TCD`.
-- `Consistency`, used with the `ConsistencyBoundary` prediction transform, for latent consistency models.
-
-Each of these reproduces the Diffusers 0.34.0 trajectories recorded by `tools/diffusers_reference.py`. `MultiStepDPM` has a similar name but is a different thing: a finite-difference integrator in sigma, not a Diffusers scheduler.
-
-`DPMSolverSDE` is the solver of `DPMSolverSDEScheduler`. It is not one of the SDE algorithms of `DPMSolverMultistep`. Each interval takes two ancestral steps from its own start. Both steps draw noise from one keyed dyadic Brownian bridge over the schedule's positive sigma range, so the two draws are correlated as nested increments of a single path.
-
-`DDPM(variance="large")` uses the wider published posterior variance, which is the beta of the variance-preserving forward step. That beta is zero wherever alpha is one, so DDPM refuses a variance-exploding grid instead of sampling it without noise. Neither variance adds noise on the step whose own time is the schedule's zero.
-
-Source clipping and dynamic thresholding live in `SourceLimitedPrediction`. They are part of the process's prediction conversion, not part of a solver, so a solver that reads the clean prediction twice sees the limited value both times.
-
-DPM-Solver++ 2M without any lowering of order at the end is `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. By default `lower_order_final=True`, which follows Diffusers: in a walk of fewer than 15 steps, the last step is first order and the one before it at most second order. A solver's `init` takes `(x_T, times, process, key=key)` with a concrete time grid, so an invalid pair of endpoints fails before the compiled loop starts. `key` is the root key of the walk; only `DPMSolverSDE` reads it, for its Brownian state.
-
-`CFG(scale, interval=..., rescale=...)` applies guidance to the model's raw outputs, and then the process converts the guided output once. Published pipelines run their scheduler in the same order, so a nonlinear conversion never sees the two branches separately. `rescale` is Diffusers' `guidance_rescale`, the standard-deviation correction of Lin et al. 2023. `rescale=0` gives the plain guided output.
+`Euler()` is the numerical solver that generates the preview. A different solver, noise schedule or prediction transform samples differently, so pick a process and solver that work together. [Diffusion processes and solvers](../concepts/diffusion.md) lists the presets and solvers and explains classifier-free guidance.
 
 ## Inspect the preview
 
@@ -84,4 +68,4 @@ For text conditioning, `InputSpec.conditions` maps a model keyword argument to a
 
 With an autoencoder configured, training runs on latent tensors instead of pixels. Set the denoising model's channel count and spatial shape to match the encoder output, and keep the encoder's scaling convention. Loading a VAE does not load the weights of an external diffusion transformer.
 
-Use [training recipes](../recipes.md) for runs on real datasets. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the checkpoints that load.
+Use [training recipes](../recipes.md) for runs on real datasets. [Supported models](../models.md) lists the published checkpoints that load.
