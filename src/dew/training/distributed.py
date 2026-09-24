@@ -10,7 +10,9 @@ import json
 import logging
 import math
 import queue
+import statistics
 import threading
+import time
 from collections.abc import Callable, Mapping
 from typing import Iterator
 
@@ -176,6 +178,42 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
                         axis_types=(AxisType.Auto,) * 6)
         return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
     return Mesh(hybrid_devices(spec, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
+
+
+def tensor_bandwidth(mesh: Mesh, size: int = 1 << 28) -> float:
+    """What one device receives a second in an all-gather over `mesh`'s
+    tensor axis of a `size`-byte result, with every tensor group gathering
+    at once as a step's do: (T - 1) / T of the result over the median of five
+    gathers, after two that warm the collective. Every process takes the
+    pool's lowest figure, so every process decides from the same number and
+    compiles the same program; the slowest group bounds the step anyway.
+
+    `dew.nn.sharding.down_projection` reads it to decide whether a
+    down-projection of the residual runs on each tensor shard's own tokens.
+    The default result, 256 MiB, of which a device receives at least half,
+    is the size of the collectives that decision prices where it matters
+    (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
+    past the sizes where a collective's latency counts: on 4x RTX 3090 an
+    NVLink pair's all-gather moved 8.2 GB/s a device at 4 MiB and 31.0 at
+    128 MiB."""
+    tensor = mesh.shape[TENSOR_AXIS]
+    count = size // 4 // tensor * tensor
+    sharding = NamedSharding(mesh, P(TENSOR_AXIS))
+    source = jax.make_array_from_callback(
+        (count,), sharding, lambda index: np.zeros(sharding.shard_shape((count,)), np.float32))
+    gather = jax.jit(jax.shard_map(
+        lambda shard: jax.lax.all_gather(shard, TENSOR_AXIS, tiled=True), mesh=mesh,
+        in_specs=P(TENSOR_AXIS), out_specs=P(), axis_names={TENSOR_AXIS}, check_vma=False))
+    seconds = []
+    for attempt in range(7):
+        began = time.perf_counter()
+        jax.block_until_ready(gather(source))
+        if attempt >= 2:
+            seconds.append(time.perf_counter() - began)
+    received = (tensor - 1) / tensor * count * 4 / statistics.median(seconds)
+    if jax.process_count() == 1:
+        return received
+    return float(np.min(multihost_utils.process_allgather(np.asarray(received, np.float32))))
 
 
 def _slice(device) -> int:

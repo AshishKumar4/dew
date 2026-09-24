@@ -194,7 +194,7 @@ def zoo() -> dict[str, Any]:
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": mamba, "attention": {}}}
     window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
-    mla = {**dense, "mixer": {"kind": "mla", "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+    mla = {**dense, "mixer": {"kind": "mla", "q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}
     mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
     rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),

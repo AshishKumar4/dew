@@ -663,6 +663,27 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
               "one leaf every": [True, 28], "one leaf first": [None, 28]}}, done.stdout
 
 
+@pytest.mark.mesh(devices=4)
+def test_every_process_of_a_pool_takes_the_same_tensor_bandwidth():
+    """A tensor axis over two processes' devices. Each process times its own
+    part of the gathers, and processes that placed the step from different
+    figures could compile different programs and hang in their collectives,
+    so every process takes the pool's one figure."""
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.prepare_process()\n"
+               "import jax\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "from dew.training.distributed import tensor_bandwidth\n"
+               "mesh = build_mesh(MeshSpec(tensor=jax.device_count()))\n"
+               "print('measured', jax.process_index(), repr(tensor_bandwidth(mesh)), flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=2, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    figures = dict(line.split("] measured ", 1)[1].split(" ", 1)
+                   for line in done.stdout.splitlines() if "] measured " in line)
+    assert sorted(figures) == ["0", "1"], done.stdout
+    assert figures["0"] == figures["1"] and float(figures["0"]) > 0, figures
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_fails_in_a_gather_group_ends_the_gather_at_that_groups_agreement():
     """Rank 1's host copy of the second of four groups fails. Both ranks

@@ -55,7 +55,7 @@ from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
-from .sharding import logical_axes
+from .sharding import RESIDUAL, constrain, down_projection, logical_axes
 from .sparse_selection import selection_mask
 
 
@@ -305,11 +305,15 @@ class KPoolSparseAttention(nn.Module):
         row_valid = jnp.ones((batch, length), bool) if valid is None else valid
         # The projections carry the names a remat policy saves or offloads
         # (causal_transformer.RESIDUALS); kv_b_proj is the fused K/V one.
-        q_resid = self.q_a_layernorm(self.q_a_proj(x))
-        query = checkpoint_name(self.q_b_proj(q_resid), 'q_proj').reshape(
+        # The latents project the residual down where `down_projection` places
+        # them: on each tensor shard's own tokens where the link pays for
+        # gathering them back for the head-split up-projections.
+        place = down_projection(x, self.q_lora_rank + self.kv_lora_rank)
+        q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
+        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
             batch, length, self.num_heads, self.qk_nope_head_dim)
-        latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))
-        kv = checkpoint_name(self.kv_b_proj(latent), 'kv_proj').reshape(
+        latent = constrain(self.kv_a_layernorm(self.kv_a_proj_with_mqa(constrain(x, place))), place)
+        kv = checkpoint_name(self.kv_b_proj(constrain(latent, RESIDUAL)), 'kv_proj').reshape(
             batch, length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         key, value = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
         packed = self.indexer.packed(x, row_valid)

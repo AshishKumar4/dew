@@ -71,7 +71,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
@@ -756,14 +756,18 @@ class DeepseekV4Attention(nn.Module):
         rows = jnp.arange(length)
         cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn)
 
-        q_resid = self.q_a_norm(self.q_a_proj(x))
-        query = checkpoint_name(self.q_b_proj(q_resid), 'q_proj').reshape(
+        # The query latent and the shared key head project the residual down,
+        # where `down_projection` places them: on each tensor shard's own
+        # tokens where the link pays for gathering them back.
+        place = down_projection(x, self.q_lora_rank + self.head_dim)
+        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
+        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
             batch, length, self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
         query = rotate_trailing(query, cos, sin)
         # V4.1's window cache keeps FP8, RoPE included (v41:700-707)
-        keys = self._window_keys(x, cos, sin)
+        keys = self._window_keys(x, cos, sin, place)
 
         # The sliding window over the row's own positions: key j at or before
         # query i and within the window, its own position included
@@ -797,8 +801,11 @@ class DeepseekV4Attention(nn.Module):
         output = self._attend(query, keys, allowed, cos, sin)
         return output if valid is None else jnp.where(valid[..., None], output, 0)
 
-    def _window_keys(self, x, cos, sin):
-        keys = rotate_trailing(checkpoint_name(self.kv_norm(self.kv_proj(x)), 'kv_proj'), cos, sin)
+    def _window_keys(self, x, cos, sin, place: LogicalAxes):
+        """The shared key head, projected where `place` puts it and gathered
+        for the query heads the tensor axis splits."""
+        projected = constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place)
+        keys = constrain(rotate_trailing(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
         return fake_quant_fp8(keys, 32) if self.kv_qat else keys
 
     def _attend(self, query, keys, allowed, cos, sin):
@@ -857,7 +864,8 @@ class DSparkAttention(DeepseekV4Attention):
                                                     store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
-                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn)), slots)
+                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn),
+                        down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
         elif main is None:
@@ -865,14 +873,17 @@ class DSparkAttention(DeepseekV4Attention):
                              f"from kv_store[{DRAFT_CONTEXT!r}]")
         else:
             main_keys = self._window_keys(main, *rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
-                                                            self.rope_theta, self.yarn))
+                                                            self.rope_theta, self.yarn),
+                                          down_projection(main, self.head_dim))
             last = jnp.full((batch,), main.shape[1] - 1)
         length = x.shape[1]
         if length == 0:
             return x
         positions = last[:, None] + 1 + jnp.arange(length)
         cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn)
-        query = self.q_b_proj(self.q_a_norm(self.q_a_proj(x))).reshape(
+        place = down_projection(x, self.q_lora_rank + self.head_dim)
+        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
+        query = self.q_b_proj(constrain(q_resid, RESIDUAL)).reshape(
             batch, length, self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
@@ -882,7 +893,7 @@ class DSparkAttention(DeepseekV4Attention):
         allowed = jnp.concatenate([
             jnp.broadcast_to(window[:, None], (batch, length, main_keys.shape[1])),
             jnp.ones((batch, length, length), bool)], axis=-1)
-        keys = jnp.concatenate([main_keys, self._window_keys(x, cos, sin)], axis=1)
+        keys = jnp.concatenate([main_keys, self._window_keys(x, cos, sin, place)], axis=1)
         return self._attend(query, keys, allowed, cos, sin)
 
 

@@ -78,11 +78,15 @@ class FitStarted:
 
 @dataclasses.dataclass(frozen=True)
 class StepCompiled:
-    """A training step compiled for a new batch shape, and the remat it
-    compiled under, which is the model's own or a stronger rung the trainer
-    moved to because the step did not fit."""
+    """A training step compiled for a new batch shape, the remat it compiled
+    under, which is the model's own or a stronger rung the trainer moved to
+    because the step did not fit, and the tensor axis's placement: the
+    bandwidth its all-gather measured (None where the axis splits nothing)
+    and whether a down-projection ran on each tensor shard's own tokens."""
     seconds: float
     remat: JSON
+    tensor_bytes_per_second: float | None
+    tensor_spread: bool
 
 
 @dataclasses.dataclass(frozen=True)

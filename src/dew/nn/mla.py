@@ -46,7 +46,7 @@ from dew.nn.attention import (
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
-from dew.nn.sharding import RESIDUAL, SPREAD, constrain, logical_axes
+from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 
@@ -448,8 +448,9 @@ class MultiHeadLatentAttention(nn.Module):
             return 1.0
         return yarn_query_scale(self.yarn)
 
-    def _queries(self, x):
-        """`[B, S, H, nope+rope]` queries and the residual the indexer reads."""
+    def _queries(self, x, place: LogicalAxes):
+        """`[B, S, H, nope+rope]` queries and the residual the indexer reads,
+        the query latent computed where `place` puts it."""
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
@@ -458,21 +459,21 @@ class MultiHeadLatentAttention(nn.Module):
             q_resid = None
             queries = self.q_proj(x)
         else:
-            q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, SPREAD))), SPREAD)
+            q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
             queries = self.q_b_proj(constrain(q_resid, RESIDUAL))
         queries = checkpoint_name(queries, 'q_proj')
         return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid
 
-    def _latents(self, x):
+    def _latents(self, x, place: LogicalAxes):
         """The normed KV latent and the raw decoupled rope head.
 
-        The tensor axis splits the heads, not the latents, so the
-        down-projections (and `_queries`' own) run on each tensor shard's
-        share of the tokens (`SPREAD`), a slice of a residual every shard
-        holds whole, and the latents are gathered for the head-split
-        up-projections: at DeepSeek-V3's shape every shard computing them
-        whole was 13% more work a device under tensor=8."""
-        compressed = constrain(self.kv_a_proj_with_mqa(constrain(x, SPREAD)), SPREAD)
+        The tensor axis splits the heads, not the latents, so every tensor
+        shard computing the down-projections (and `_queries`' own) over every
+        token was 13% more work a device at DeepSeek-V3's shape under
+        tensor=8. Where `place` is `SPREAD` they run on each shard's own
+        tokens, a slice of a residual every shard holds whole, and the
+        latents are gathered for the head-split up-projections."""
+        compressed = constrain(self.kv_a_proj_with_mqa(constrain(x, place)), place)
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
         return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
@@ -519,12 +520,16 @@ class MultiHeadLatentAttention(nn.Module):
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
         logical_positions = positions
-        queries, q_resid = self._queries(x)
+        # The down-projections run where `down_projection` places them: on each
+        # tensor shard's own tokens where the link pays for gathering the
+        # latents back, which one residual gradient serves for both.
+        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
+        queries, q_resid = self._queries(x, place)
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
-        latent, rot = self._latents(x)
+        latent, rot = self._latents(x, place)
         if decode:
             if segment_ids is not None:
                 raise ValueError("decode accepts row validity, not packed segment_ids")
