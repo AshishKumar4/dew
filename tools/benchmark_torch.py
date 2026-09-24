@@ -807,7 +807,8 @@ def unet_flops(model, case):
     return dict(matmul=6 * sum(macs), attention=0, tokens=case.batch_size * case.image_size ** 2)
 
 
-def main():
+def _arguments() -> argparse.Namespace:
+    """The benchmark's command line."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--model', required=True, choices=['causal_transformer', 'simple_dit', 'unet'])
     ap.add_argument('--size', default='small', choices=['small', 'large'])
@@ -832,7 +833,38 @@ def main():
                     help='LM vocabulary ablation; the matched preset is 50304')
     ap.add_argument('--json-out', default=None)
     ap.add_argument('--seed', type=int, default=0)
-    args = ap.parse_args()
+    return ap.parse_args()
+
+
+def _timed(step, warmup: int, steps: int):
+    """Run `warmup` untimed steps, then `steps` timed ones: the warmup's
+    wall seconds, the timed loop's wall seconds, each step's CUDA-event
+    milliseconds, the gaps between consecutive steps (whether the host kept
+    the device fed), and the last step's outputs."""
+    t0 = time.perf_counter()
+    for _ in range(warmup):
+        loss, aux, finite = step()
+    torch.cuda.synchronize()
+    warmup_s = time.perf_counter() - t0
+    torch.cuda.reset_peak_memory_stats()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+    t0 = time.perf_counter()
+    for i in range(steps):
+        starts[i].record()
+        loss, aux, finite = step()
+        ends[i].record()
+    torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    per_step = np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
+    # Gaps between consecutive steps show whether the host kept the device fed
+    gaps = np.array([ends[i].elapsed_time(starts[i + 1]) for i in range(steps - 1)])
+    return warmup_s, wall, per_step, gaps, (loss, aux, finite)
+
+
+def main():
+    args = _arguments()
 
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = not args.no_tf32
@@ -886,25 +918,7 @@ def main():
         finite = torch.isfinite(loss)
         return loss, aux, finite
 
-    t0 = time.perf_counter()
-    for _ in range(args.warmup):
-        loss, aux, finite = step()
-    torch.cuda.synchronize()
-    warmup_s = time.perf_counter() - t0
-    torch.cuda.reset_peak_memory_stats()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.steps)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.steps)]
-    t0 = time.perf_counter()
-    for i in range(args.steps):
-        starts[i].record()
-        loss, aux, finite = step()
-        ends[i].record()
-    torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
-    per_step = np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
-    # Gaps between consecutive steps show whether the host kept the device fed
-    gaps = np.array([ends[i].elapsed_time(starts[i + 1]) for i in range(args.steps - 1)])
+    warmup_s, wall, per_step, gaps, (loss, aux, finite) = _timed(step, args.warmup, args.steps)
 
     flops = unet_flops(model, case) if case.model == 'unet' else analytic_flops(case)
     total_flops = flops['matmul'] + flops['attention']
