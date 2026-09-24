@@ -1,4 +1,4 @@
-// The site's font families, shared by astro.config.mjs and astro.concepts.mjs.
+// The site's font families, for astro.config.mjs.
 import { readFileSync } from 'node:fs';
 import { fontProviders } from 'astro/config';
 
