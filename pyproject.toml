@@ -132,6 +132,9 @@ interop = ["safetensors"]
 # once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
 # transformers' own model for an unregistered decoder (dew.interop.verify).
 torch = ["torch"]
+# Original-format single-file diffusion checkpoints (load_pretrained(..., single_file=)):
+# diffusers' own key maps, which are written in torch, convert them once.
+diffusers = ["diffusers>=0.34.0", "torch"]
 # GGUF files (load_pretrained(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.
