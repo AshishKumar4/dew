@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_chunked_cross_entropy import equations
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
@@ -35,6 +36,7 @@ from dew.eval import (
     structural_similarity as ssim,
 )
 from dew.eval.fid import frechet_distance
+from dew.eval.inception import InceptionV3
 from dew.registry import metrics as registry
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
@@ -411,6 +413,27 @@ def test_ssim_matches_the_filtered_equations_of_wang_et_al(rng, data_range):
     expected = [np.mean([_reference_ssim(x64[n, ..., c], y64[n, ..., c], data_range)
                          for c in range(3)]) for n in range(4)]
     assert np.abs(got - expected).max() < 1e-5, f"{got} against {expected}"
+
+
+def test_every_contraction_in_ssim_and_the_extractor_asks_for_the_highest_precision():
+    """A contraction that names no precision runs at the process default, and
+    a TPU's DEFAULT is one bf16 pass, which moves SSIM's variances and the
+    extractor's features off their fp32 references. The suite itself runs
+    at 'highest' (conftest), so this traces both where the process default
+    is DEFAULT and finds every convolution and dot asking for HIGHEST; a
+    CPU computes the same values at either."""
+    extractor = InceptionV3(channel_divisor=16)
+    pixels = jax.ShapeDtypeStruct((1, 299, 299, 3), jnp.float32)
+    frames = jax.ShapeDtypeStruct((2, 16, 16, 3), jnp.float32)
+    variables = jax.eval_shape(extractor.init, jax.random.key(0), pixels)
+    with jax.default_matmul_precision("default"):
+        graphs = {"ssim": jax.make_jaxpr(lambda x, y: ssim(x, y, 2.0))(frames, frames),
+                  "extractor": jax.make_jaxpr(extractor.apply)(variables, pixels)}
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    for name, graph in graphs.items():
+        precisions = [equation.params["precision"] for equation in equations(graph)
+                      if equation.primitive.name in ("conv_general_dilated", "dot_general")]
+        assert precisions and all(p == highest for p in precisions), (name, set(precisions))
 
 
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
