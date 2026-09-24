@@ -82,7 +82,8 @@ def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
     """Four tensor shards beside two fsdp: the mlp's hidden width, the query
     and grouped key-value heads, the attention width o_proj reads and the
     vocabulary take the tensor axis, and the residual width the blocks pass
-    between themselves does not."""
+    between themselves does not: in each projection it takes fsdp, a split
+    in two dimensions."""
     mesh = build_mesh(MeshSpec(fsdp=2, tensor=4))
     layout = Layout(min_shard=TINY_SHARD)
     specs = jax.tree.map(
@@ -92,16 +93,41 @@ def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
     assert attention["q_proj"]["kernel"] == P("fsdp", "tensor")
     assert attention["k_proj"]["kernel"] == P("fsdp", "tensor")
     assert attention["v_proj"]["kernel"] == P("fsdp", "tensor")
-    assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, ("fsdp", "tensor"))
-    assert specs["layers_0"]["mlp"]["down_proj"]["kernel"] == P(("fsdp", "tensor"))
+    assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P("fsdp", "tensor")
+    assert specs["layers_0"]["mlp"]["down_proj"]["kernel"] == P("tensor", "fsdp")
     assert specs["embed_tokens"]["embedding"] == P(("fsdp", "tensor"))
     # o_proj reads the heads the q/k/v projections split and writes the
     # residual stream: Megatron's row-parallel side, the attention's twin of
     # down_proj. The final norm is embed alone.
-    assert attention["o_proj"]["kernel"] == P(("fsdp", "tensor"))
+    assert attention["o_proj"]["kernel"] == P("tensor", "fsdp")
     assert specs["norm"]["scale"] == P()
     layout.check(variables()["params"],
                  layout.shardings(mesh, variables())["params"], mesh)
+
+
+def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
+    """Two fsdp shards beside two tensor shards split every matmul of the
+    step, so their devices together compute one device's FLOPs. With the
+    mlp's and o_proj's widths split over fsdp and tensor at once, the
+    residual width left whole, GSPMD gathered a block's activations over
+    fsdp and repeated those products on both devices of each pair: 1.21
+    times one device's matmul FLOPs on layout_parity's dense decoder."""
+    from dew.telemetry.instrumentation import compiled_flops
+
+    def flops(mesh: MeshSpec, devices) -> float:
+        trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD), checkpoints=None,
+                          tracker=None)
+        trainer.device_mesh = build_mesh(mesh, devices)
+        state, _, _ = trainer.place()
+        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
+        assert trainer.executable is not None
+        counted = compiled_flops(trainer.executable)
+        assert counted is not None
+        return counted * len(devices)
+
+    one = flops(MeshSpec(), jax.devices()[:1])
+    assert flops(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
 
 
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
