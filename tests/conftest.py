@@ -1,22 +1,49 @@
 import os
+import subprocess
+from collections.abc import MutableMapping
 
-# Tests must run identically on any machine; JAX_PLATFORMS=cuda runs the same
-# files on a GPU.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-# Enough simulated devices to exercise a 4x2 data/fsdp mesh. Must be set before
-# jax initialises its backend. A test marked `mesh` needs this many devices, or
-# its `devices=`; a run with fewer, such as one GPU, reports it as skipped with both counts.
+# Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
+# `mesh` needs this many devices, or its `devices=`; a run with fewer, such
+# as one GPU, reports it as skipped with both counts.
 MESH_DEVICES = 8
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + f" --xla_force_host_platform_device_count={MESH_DEVICES}"
-).strip()
-if os.environ["JAX_PLATFORMS"] == "cuda":
-    # Exact state and gradient checks require repeatable CUDA reductions.
-    os.environ["XLA_FLAGS"] += " --xla_gpu_deterministic_ops=true"
-    # Host callbacks (jax.debug.callback, io_callback) place their operands
-    # on a CPU device, so the CPU backend stays beside the GPU; jax.devices()
-    # is still the GPU's.
-    os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+
+
+def configure_lane(environ: MutableMapping[str, str]) -> None:
+    """Set the environment a lane runs the suite under, before jax opens a backend.
+
+    Tests must run identically on any machine. The CPU lane is the default,
+    with MESH_DEVICES simulated devices. A JAX_PLATFORMS that names cuda,
+    alone or in a list, runs the same files on the GPU: its CUDA reductions
+    are made repeatable, since exact state and gradient checks require it,
+    and the CPU backend stays beside it. Host callbacks (jax.debug.callback,
+    io_callback) place their operands on a CPU device, and a host layout
+    pairs every GPU with a CPU device of its process
+    (`dew.training.host.companion_mesh`), so that backend holds one device
+    per local GPU. jax.devices() is still the GPU's.
+    """
+    environ.setdefault("JAX_PLATFORMS", "cpu")
+    platforms = environ["JAX_PLATFORMS"].split(",")
+    flags = [environ.get("XLA_FLAGS", "")]
+    if "cuda" in platforms:
+        flags.append("--xla_gpu_deterministic_ops=true")
+        if "cpu" not in platforms:
+            environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
+        flags.append(f"--xla_force_host_platform_device_count={_local_gpus(environ)}")
+    else:
+        flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
+    environ["XLA_FLAGS"] = " ".join(flags).strip()
+
+
+def _local_gpus(environ: MutableMapping[str, str]) -> int:
+    """The GPUs this process will see, counted before any backend opens."""
+    visible = environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return len([device for device in visible.split(",") if device.strip()])
+    listing = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, check=True)
+    return len(listing.stdout.splitlines())
+
+
+configure_lane(os.environ)
 # Parity tests assert fp32 against references computed in fp32. Ampere and
 # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
 # 1e-2 between two correct implementations.
