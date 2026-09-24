@@ -107,21 +107,25 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
 
 
 @on_gpu
+@pytest.mark.parametrize("as_mask", [False, True], ids=["lengths", "mask"])
 @pytest.mark.parametrize("q_len, kv_len, causal", [
     (1024, 1024 + 77, False),  # the image queries of a joint call over padded text
     (77, 77, True),            # its text queries, causal over the text alone
+    (78, 78, True),            # an even length, which the kernel takes unpadded
 ])
-def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal,
+def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask,
                                                      without_deterministic_ops):
     """cuDNN reads the lengths as its padding mask, odd lengths included:
     within two bf16 ulps of the output scale of the xla kernel, forward and
     backward, as `test_cudnn_trains_odd_lengths_and_agrees_with_xla` bounds
-    the unpadded call."""
+    the unpadded call. The same keys ended by a `[B, 1, 1, K]` mask, the
+    shape CLIP's text tower builds, agree the same way: the mask broadcasts
+    over the queries on the cudnn path as it does on xla."""
     query, _, _ = qkv((2, q_len, 4, 64))
     _, key, value = qkv((2, kv_len, 4, 64), seed=1)
     lengths = jnp.asarray([kv_len, kv_len - 40], jnp.int32)
-    fused = key_length_call('cudnn', query, key, value, lengths, causal=causal)
-    reference = key_length_call('xla', query, key, value, lengths, causal=causal)
+    fused = key_length_call('cudnn', query, key, value, lengths, causal=causal, as_mask=as_mask)
+    reference = key_length_call('xla', query, key, value, lengths, causal=causal, as_mask=as_mask)
     for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
