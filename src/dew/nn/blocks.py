@@ -75,19 +75,32 @@ class TokenEmbedding(nn.Embed):
 
 class FourierEmbedding(nn.Module):
     """Random Fourier features of a scalar per example: `[B]` to `[B, features]`,
-    sines then cosines of the input against fixed Gaussian frequencies."""
+    sines then cosines of the input against fixed Gaussian frequencies.
+
+    The frequencies, already multiplied by `scale`, are the `constants`
+    variable `frequencies`, so a checkpoint carries the table its weights
+    learned against and a restore never redraws it. `init` draws it from
+    numpy's RandomState(42), which gives the same table on every jax version.
+    A checkpoint converted from elsewhere brings its own table: FlaxDiff drew
+    its with `jax.random.normal`, whose stream changed in jax 0.5.0.
+    """
     features: int
     scale: int = 16
 
     def setup(self):
-        # Fixed frequencies via numpy so they are identical across jax versions
-        # (jax 0.5.0 changed the default PRNG, which changed these).
-        freqs = np.random.RandomState(42).normal(size=(self.features // 2,))
-        self.freqs = jnp.asarray(freqs, dtype=jnp.float32) * self.scale
+        self.frequencies = self.variable(
+            "constants", "frequencies",
+            lambda: jnp.asarray(np.random.RandomState(42).normal(size=(self.features // 2,)),
+                                dtype=jnp.float32) * self.scale)
 
     def __call__(self, x):
         x = jax.lax.convert_element_type(x, jnp.float32)
-        emb = x[:, None] * (2 * jnp.pi * self.freqs)[None, :]
+        # 2 pi times the table is one rounded vector, as it was when the table
+        # was a trace-time constant. Without the barrier XLA folds the 2 pi
+        # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
+        # sin/cos arguments round differently.
+        angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
+        emb = x[:, None] * angular[None, :]
         return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
 
 

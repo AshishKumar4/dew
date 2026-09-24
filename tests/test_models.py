@@ -303,8 +303,9 @@ def test_video_dit_temporal_mixing(rng):
 def test_unet3d_inflation_reproduces_2d_unet(rng):
     """A UNet3D inflated from a 2D Unet checkpoint must reproduce the 2D model
     frame by frame exactly - the temporal blocks are zero-initialized, so
-    training starts from the pretrained image model and only learns motion."""
-    from dew.nn.backbones.unet3d import UNet3D, inflate_unet_params
+    training starts from the pretrained image model and only learns motion.
+    The checkpoint's Fourier table comes along with its weights."""
+    from dew.nn.backbones.unet3d import UNet3D, inflate_unet_variables
 
     config = dict(
         emb_features=64,
@@ -321,13 +322,16 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     temb = jnp.ones((2,))
     textcontext = text()
 
-    params_2d = model_2d.init(rng, x[:, 0], temb, textcontext)
-    params_3d = model_3d.init(jax.random.PRNGKey(7), x, temb, textcontext)
-    inflated = {"params": inflate_unet_params(params_2d["params"], params_3d["params"])}
+    variables_2d = model_2d.init(rng, x[:, 0], temb, textcontext)
+    # A converted checkpoint carries a table no fresh init draws.
+    variables_2d = {**variables_2d,
+                    "constants": jax.tree.map(lambda table: table * 1.5, variables_2d["constants"])}
+    variables_3d = model_3d.init(jax.random.PRNGKey(7), x, temb, textcontext)
+    inflated = inflate_unet_variables(variables_2d, variables_3d)
 
     out_3d = model_3d.apply(inflated, x, temb, textcontext)
     frames_2d = jnp.stack(
-        [model_2d.apply(params_2d, x[:, t], temb, textcontext) for t in range(3)], axis=1)
+        [model_2d.apply(variables_2d, x[:, t], temb, textcontext) for t in range(3)], axis=1)
     assert jnp.max(jnp.abs(out_3d - frames_2d)) < 1e-5, "inflated UNet3D does not match the 2D model"
 
 

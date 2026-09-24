@@ -221,8 +221,14 @@ def dew_side(args, images, total, attention):
 
     model = models.build("simple_dit", with_precision("simple_dit", MODEL, dtype=args.dtype,
                                                       attention_impl=attention))
-    # The npz holds flaxdiff's whole variables dict, {"params": ...}.
-    initial = {**load_tree(args.init), "encoders": {}}
+    # The npz holds flaxdiff's whole variables dict, {"params": ...}. flaxdiff
+    # keeps its Fourier table out of that dict, and its main branch draws it
+    # from numpy's RandomState(42) (commit 63f2427), as Dew's init does, so
+    # Dew's own init supplies it. FlaxDiff 0.2 drew it from jax.random instead
+    # (see FourierEmbedding).
+    constants = jax.tree.map(np.asarray, model.init(
+        jax.random.key(0), jnp.zeros((1, *images.shape[1:])), jnp.zeros((1,)))["constants"])
+    initial = {**load_tree(args.init), "constants": constants, "encoders": {}}
     objective = FixedDraws(model, EDM()(), InputSpec(sample=Field("image", images.shape[1:])),
                            ema_decay=args.ema, guidance=None, pretrained=initial)
     optimizer, schedule = solver(args, total)
