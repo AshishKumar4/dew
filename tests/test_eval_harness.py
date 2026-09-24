@@ -210,6 +210,20 @@ def test_generate_until_cuts_the_answer_at_the_first_stop_string(adapter):
     assert len(cut) < len(full)
 
 
+def test_generate_until_reads_each_request_as_lm_evals_own_model_does():
+    """A budget named `max_new_tokens`, `do_sample=False` beside a
+    temperature, which is greedy, and a context longer than the window less
+    the budget, which keeps its last ids: each answers what `HFLM` answers
+    on the same weights, the EOS token's text among the stop strings."""
+    ours, theirs = _pair(32)
+    for context, controls in (("the ", {"until": [], "max_new_tokens": 6}),
+                              ("the ", {"until": [], "max_gen_toks": 6, "do_sample": False,
+                                        "temperature": 0.7}),
+                              (_text(60), {"until": [], "max_gen_toks": 6})):
+        request = [instance(context, controls, request_type="generate_until")]
+        assert ours.generate_until(request) == theirs.generate_until(request), controls
+
+
 def test_the_adapter_refuses_a_task_it_cannot_score(run):
     """It scores next-token likelihoods, so it takes the task that has them,
     and it needs the processor that turns the harness's text into tokens."""
