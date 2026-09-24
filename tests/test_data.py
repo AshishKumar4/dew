@@ -6,12 +6,14 @@ which is the point of several of these tests. Anything that genuinely
 requires an optional dependency skips.
 """
 
+import atexit
 import dataclasses
 import inspect
 import itertools
 import json
 import os
 import sys
+import time
 
 import cv2
 import grain.python as pygrain
@@ -879,6 +881,52 @@ def test_the_close_budget_is_the_sources_worker_count():
     assert stream.stop_seconds == loading.stop_seconds > 5.0
     stream.close()
     assert stream.stop_seconds is None
+
+
+_LINGERING: list[float] = []
+
+
+def _linger(seconds: float) -> None:
+    """Make this process take `seconds` longer to exit, once."""
+    if not _LINGERING:
+        _LINGERING.append(seconds)
+        atexit.register(time.sleep, seconds)
+
+
+@dataclasses.dataclass(frozen=True)
+class Lingering(Augmenting):
+    """Augmenting's records from worker processes that each take `seconds`
+    to exit once stopped, as a worker finishing a slow batch does."""
+
+    seconds: float = 2.0
+
+    def record(self, element, rng):
+        _linger(self.seconds)
+        return super().record(element, rng)
+
+
+@pytest.mark.slow
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound():
+    """grain stops a stream's worker processes one after another, each
+    finishing the batch in its hands before it exits, and kills a worker
+    that has not exited within 25 s. Four workers taking 2 s each keep a
+    close over 8 s: slow, but bounded by grain itself, so the close must not
+    call it a hang. sft_gemma4's four workers took 5.1 to 7.4 s to stop, past
+    a budget of 2 s and 1 s a worker."""
+    from dew.training import MeshSpec, build_mesh
+    from dew.training.distributed import DevicePrefetchIterator
+
+    loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
+    data = Lingering(length=64, image_size=8, seed=3, val_batches=None, loading=loading)
+    stream = data.load(batch=4).train(DataPartition())
+    prefetch = DevicePrefetchIterator(stream, build_mesh(MeshSpec(), jax.devices()[:1]))
+    # grain interleaves its workers' batches in turn: one batch from each
+    # means every worker has read a record and lingers.
+    for _ in range(loading.workers):
+        next(prefetch)
+    began = time.perf_counter()
+    prefetch.close()
+    assert time.perf_counter() - began > loading.workers * data.seconds
 
 
 def test_augmentation_really_moves_the_pixels():
