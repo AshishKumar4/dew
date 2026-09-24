@@ -295,9 +295,11 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
 
 
 
-def make_lm_run(directory, *, mesh=None, ema_decay=0.9):
+def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     """Two training steps of a tiny byte-level decoder, its checkpoint and the
-    `run.json` the LM recipe writes: the resolved model, tokenizer and budget."""
+    `run.json` the LM recipe writes: the resolved model, tokenizer and budget.
+    `max_seq_len` is the model's window, which training at 9 ids does not
+    reach."""
     import json
 
     from dew.objectives.lm import LMObjective, Samples
@@ -305,7 +307,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9):
     from dew.training import MeshSpec
 
     fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                  mlp_features=32, max_seq_len=16)
+                  mlp_features=32, max_seq_len=max_seq_len)
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))

@@ -255,13 +255,16 @@ def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
 
 
 @pytest.mark.network
-def test_a_real_task_suite_runs_against_the_run(run):
-    """One tiny suite end to end. lm_eval 0.4 ships no task whose data is in
-    the package, so hellaswag's four documents come from the Hub."""
+def test_a_real_task_suite_runs_against_a_run(tmp_path):
+    """One tiny suite end to end, over a run whose 512-id window holds
+    hellaswag's endings; the module's 16-id run refuses them, as HFLM would.
+    lm_eval 0.4 ships no task whose data is in the package, so hellaswag's
+    four documents come from the Hub."""
     import lm_eval
 
+    make_lm_run(tmp_path, max_seq_len=512)
     results = lm_eval.simple_evaluate(
-        model=DewLM(TextGeneration.from_run(str(run)), batch_size=4),
+        model=DewLM(TextGeneration.from_run(str(tmp_path)), batch_size=4),
         tasks=["hellaswag"], limit=4, bootstrap_iters=0)
     scores = results["results"]["hellaswag"]
     assert 0.0 <= scores["acc,none"] <= 1.0
