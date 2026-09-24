@@ -9,8 +9,8 @@
 	--rule: rgba(178, 198, 194, 0.14);
 	--accent: #5fdcc9;
 	--accent-fill: #2fb8a8;
-	--display: var(--font-serif);
-	--sans: var(--font-inter);
+	--display: var(--font-geist);
+	--sans: var(--font-geist);
 	--mono: var(--font-mono);
 	color-scheme: dark;
 }

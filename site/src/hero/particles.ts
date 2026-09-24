@@ -1,4 +1,4 @@
-// Concept B: a model that runs on the visitor's GPU.
+// One of the landing page's two heroes: a model that runs on the visitor's GPU.
 //
 // A small velocity network, trained with Dew by rectified flow on points drawn
 // from the letters of "dew", moves a cloud of Gaussian noise into the word.
@@ -7,7 +7,7 @@
 // and each particle takes one Euler step from t = 1 toward t = 0. The pointer
 // puts noise back into the particles it passes, and the network brings them home.
 
-import { FULLSCREEN_VERTEX, createContext, createProgram, fitCanvas, prefersReducedMotion, runLoop, type Program } from '../lib/gl';
+import { FULLSCREEN_VERTEX, createContext, createProgram, fitCanvas, prefersReducedMotion, runLoop, type Program } from './gl';
 
 export interface Manifest {
 	layers: { name: string; in: number; out: number }[];
@@ -20,10 +20,6 @@ export interface Manifest {
 	samples_inside: number;
 	dew_commit: string;
 	cpu: number;
-}
-
-export interface Readout {
-	(step: number, t: number): void;
 }
 
 const DURATION = 2.4; // seconds from noise to the word
@@ -210,6 +206,10 @@ void main() {
 const DRAW_FRAGMENT = `#version 300 es
 precision highp float;
 in float vS;
+uniform vec3 uSettled;
+uniform vec3 uNoisy;
+uniform vec2 uAlpha;     // opacity of a noisy and of a settled particle
+uniform float uHighlight;
 out vec4 outColor;
 void main() {
 	vec2 c = gl_PointCoord * 2.0 - 1.0;
@@ -219,22 +219,40 @@ void main() {
 	float body = smoothstep(1.0, 0.45, r2);
 	vec2 h = c - vec2(-0.32, -0.32);
 	float highlight = exp(-dot(h, h) * 10.0);
-	vec3 settled = vec3(0.46, 0.90, 0.84);
-	vec3 noisy = vec3(0.26, 0.52, 0.70);
 	float wet = smoothstep(0.8, 0.0, vS);
-	vec3 color = mix(noisy, settled, wet);
-	float alpha = body * mix(0.5, 0.72, wet);
-	outColor = vec4(color * alpha + vec3(0.85, 1.0, 1.0) * highlight * 0.45 * wet * body, alpha);
+	vec3 color = mix(uNoisy, uSettled, wet);
+	float alpha = body * mix(uAlpha.x, uAlpha.y, wet);
+	outColor = vec4(color * alpha + vec3(0.85, 1.0, 1.0) * highlight * uHighlight * wet * body, alpha);
 }`;
 
+export type Theme = 'dark' | 'light';
+
+type Color = [number, number, number];
+
+interface Palette {
+	/** The page's background, which the canvas clears to. */
+	background: Color;
+	settled: Color;
+	noisy: Color;
+	alpha: [number, number];
+	highlight: number;
+}
+
+const PALETTES: Record<Theme, Palette> = {
+	// #0a1113 and #fbfcfb, Starlight's --sl-color-black in each theme (src/styles/theme.css).
+	dark: { background: [0.039, 0.067, 0.075], settled: [0.46, 0.9, 0.84], noisy: [0.26, 0.52, 0.7], alpha: [0.5, 0.72], highlight: 0.45 },
+	light: { background: [0.984, 0.988, 0.984], settled: [0.03, 0.47, 0.42], noisy: [0.3, 0.5, 0.64], alpha: [0.55, 0.9], highlight: 0.3 },
+};
+
 export interface ParticleField {
+	setTheme(theme: Theme): void;
 	stop(): void;
 	resample(): void;
 }
 
 function placementFor(width: number, height: number): { cx: number; cy: number; width: number } {
 	if (width < height) return { cx: 0.5, cy: 0.66, width: 0.84 };
-	return { cx: 0.62, cy: 0.6, width: 0.54 };
+	return { cx: 0.66, cy: 0.68, width: 0.5 };
 }
 
 /**
@@ -246,11 +264,12 @@ export function startParticles(
 	canvas: HTMLCanvasElement,
 	manifest: Manifest,
 	weights: Float32Array,
-	readout: Readout,
+	theme: Theme,
 ): ParticleField | null {
 	const context = createContext(canvas, true);
 	if (!context) return null;
 	const { gl } = context;
+	let palette = PALETTES[theme];
 
 	const reduced = prefersReducedMotion();
 	const count = Math.min(window.innerWidth, window.innerHeight) < 600 ? 8192 : 16384;
@@ -306,7 +325,6 @@ export function startParticles(
 	let pointer: { x: number; y: number } | null = null;
 	let activeUntil = 0; // a pointer's noise keeps the flow running until the particles settle again
 	let clock = 0;
-	let lastStep = -1;
 
 	const seedNoise = () => {
 		const state = new Float32Array(count * 4);
@@ -321,7 +339,6 @@ export function startParticles(
 		gl.bindTexture(gl.TEXTURE_2D, states[current].texture);
 		gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, ROW, rows, gl.RGBA, gl.FLOAT, state);
 		progress = 1;
-		lastStep = -1;
 	};
 
 	const step = (ds: number) => {
@@ -359,7 +376,7 @@ export function startParticles(
 		fitCanvas(canvas, 2);
 		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 		gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-		gl.clearColor(0.027, 0.051, 0.059, 1);
+		gl.clearColor(...palette.background, 1);
 		gl.clear(gl.COLOR_BUFFER_BIT);
 		gl.enable(gl.BLEND);
 		gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -367,6 +384,10 @@ export function startParticles(
 		gl.activeTexture(gl.TEXTURE0);
 		gl.bindTexture(gl.TEXTURE_2D, states[current].texture);
 		gl.uniform1i(draw.uniform('uState'), 0);
+		gl.uniform3fv(draw.uniform('uSettled'), palette.settled);
+		gl.uniform3fv(draw.uniform('uNoisy'), palette.noisy);
+		gl.uniform2fv(draw.uniform('uAlpha'), palette.alpha);
+		gl.uniform1f(draw.uniform('uHighlight'), palette.highlight);
 		const [sx, sy, ox, oy] = view();
 		gl.uniform4f(draw.uniform('uView'), sx, sy, ox, oy);
 		// Points about as wide as the gaps between settled particles.
@@ -378,14 +399,6 @@ export function startParticles(
 		gl.drawArrays(gl.POINTS, 0, count);
 		gl.bindVertexArray(null);
 		gl.disable(gl.BLEND);
-	};
-
-	const report = () => {
-		const index = Math.round((1 - progress) * manifest.sample_steps);
-		if (index !== lastStep) {
-			lastStep = index;
-			readout(index, Math.pow(progress, GRID_POWER));
-		}
 	};
 
 	const onPointer = (event: PointerEvent) => {
@@ -402,13 +415,16 @@ export function startParticles(
 	const settleAll = () => {
 		for (let i = 0; i < manifest.sample_steps; i++) step(1 / manifest.sample_steps);
 		progress = 0;
-		report();
 		render();
 	};
 
 	if (reduced) {
 		settleAll();
 		return {
+			setTheme(next) {
+				palette = PALETTES[next];
+				render();
+			},
 			stop() {},
 			resample() {
 				seedNoise();
@@ -426,10 +442,12 @@ export function startParticles(
 			progress = Math.max(0, progress - ds);
 			step(ds);
 		}
-		report();
 		render();
 	});
 	return {
+		setTheme(next) {
+			palette = PALETTES[next];
+		},
 		stop() {
 			stopLoop();
 			hero.removeEventListener('pointermove', onPointer);

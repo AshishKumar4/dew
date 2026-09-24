@@ -1,4 +1,4 @@
-// A small WebGL2 toolkit for the landing-page prototypes: programs, float
+// A small WebGL2 toolkit for the landing page: programs, float
 // render targets, a fullscreen triangle, and a frame loop that sleeps when the
 // canvas is off screen or the tab is hidden.
 

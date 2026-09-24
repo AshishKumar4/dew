@@ -1,4 +1,4 @@
-// Concept A: condensation on a pane of glass.
+// One of the landing page's two heroes: condensation on a pane of glass.
 //
 // The pane holds a field of droplets that spell the wordmark, x0. Every pixel
 // follows the forward and reverse process of a cosine-schedule diffusion model,
@@ -23,17 +23,12 @@ import {
 	prefersReducedMotion,
 	runLoop,
 	type Target,
-} from '../lib/gl';
+} from './gl';
 
-export const STEPS = 64;
 const DURATION = 2.9; // seconds from t = 1 to t = 0 at the base rate; pixels run 0.62 to 2.1 times as fast
 const SLOWEST = 0.62; // the slowest pixel's rate, relative to the base rate
 const SIM_SCALE = 2; // CSS pixels per simulated pixel
 const TIME_SCALE = 4; // simulated pixels per time-field cell
-
-export interface Readout {
-	(step: number, sigma: number): void;
-}
 
 const T_UPDATE = `#version 300 es
 precision highp float;
@@ -106,6 +101,18 @@ uniform sampler2D uT;
 uniform vec2 uSim;
 uniform vec2 uRes;
 uniform float uTime;
+// The palette, one per color theme (see PALETTES).
+uniform vec3 uBase;
+uniform vec3 uRise;
+uniform vec3 uLights[4];
+uniform float uLens;
+uniform float uRim;
+uniform vec3 uSpec;
+uniform vec3 uBounce;
+uniform vec3 uFog;
+uniform float uFogKeep;
+uniform float uVignette;
+uniform float uGamma;
 out vec4 outColor;
 
 vec3 light(vec2 q, vec2 c, float r, vec3 color) {
@@ -113,14 +120,14 @@ vec3 light(vec2 q, vec2 c, float r, vec3 color) {
 	return color * exp(-dot(d, d) / (r * r));
 }
 
-// What lies behind the glass: dark water-blue, with soft lights far away.
+// What lies behind the glass: a wash of color, with soft lights far away.
 vec3 scene(vec2 q) {
 	float aspect = uRes.x / uRes.y;
-	vec3 col = vec3(0.012, 0.022, 0.026) + vec3(0.010, 0.022, 0.024) * q.y;
-	col += light(q, vec2(aspect * 0.62 + 0.04 * sin(uTime * 0.05), 0.60), 0.36, vec3(0.05, 0.30, 0.28));
-	col += light(q, vec2(aspect * 0.36, 0.86 + 0.02 * cos(uTime * 0.04)), 0.28, vec3(0.03, 0.17, 0.21));
-	col += light(q, vec2(aspect * 0.93, 0.26), 0.20, vec3(0.26, 0.17, 0.07));
-	col += light(q, vec2(aspect * 0.12, 0.12), 0.34, vec3(0.02, 0.08, 0.09));
+	vec3 col = uBase + uRise * q.y;
+	col += light(q, vec2(aspect * 0.62 + 0.04 * sin(uTime * 0.05), 0.60), 0.36, uLights[0]);
+	col += light(q, vec2(aspect * 0.36, 0.86 + 0.02 * cos(uTime * 0.04)), 0.28, uLights[1]);
+	col += light(q, vec2(aspect * 0.93, 0.26), 0.20, uLights[2]);
+	col += light(q, vec2(aspect * 0.12, 0.12), 0.34, uLights[3]);
 	return col;
 }
 
@@ -142,25 +149,25 @@ void main() {
 	// A drop is a small lens: it shows the lights behind it, magnified and bent.
 	vec3 behind = scene(q);
 	vec3 lens = scene(q - n.xy * (0.10 + 0.14 * clamp(h, 0.0, 1.0)));
-	vec3 col = mix(behind, lens * 1.25 + 0.01, body);
+	vec3 col = mix(behind, lens * uLens + 0.01, body);
 
 	// Its edge turns steep and goes dark; its top catches the light.
 	float steep = 1.0 - n.z;
-	col *= 1.0 - 0.62 * smoothstep(0.12, 0.55, steep) * body;
+	col *= 1.0 - uRim * smoothstep(0.12, 0.55, steep) * body;
 	vec3 toLight = normalize(vec3(-0.5, 0.62, 0.62));
 	vec3 halfway = normalize(toLight + vec3(0.0, 0.0, 1.0));
 	float spec = pow(max(dot(n, halfway), 0.0), 64.0);
-	col += vec3(0.80, 0.96, 1.0) * spec * (0.12 + 0.88 * body);
+	col += uSpec * spec * (0.12 + 0.88 * body);
 	vec3 bounce = normalize(vec3(0.45, -0.55, 0.7));
-	col += vec3(0.20, 0.55, 0.52) * pow(max(dot(n, normalize(bounce + vec3(0.0, 0.0, 1.0))), 0.0), 18.0) * body * 0.25;
+	col += uBounce * pow(max(dot(n, normalize(bounce + vec3(0.0, 0.0, 1.0))), 0.0), 18.0) * body * 0.25;
 
 	// Fog: microscopic drops scatter the light, whiter and flatter the higher the noise.
-	vec3 fog = behind * 0.55 + vec3(0.070, 0.088, 0.092) + spec * 0.05;
+	vec3 fog = behind * uFogKeep + uFog + spec * 0.05;
 	col = mix(col, fog, clamp(pow(sigma, 1.3) * 0.92, 0.0, 1.0));
 
 	vec2 v = vUv - 0.5;
-	col *= 1.0 - 0.35 * dot(v, v);
-	outColor = vec4(pow(col, vec3(1.0 / 1.08)), 1.0);
+	col *= 1.0 - uVignette * dot(v, v);
+	outColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / uGamma)), 1.0);
 }`;
 
 /** A seeded random number generator (mulberry32). */
@@ -186,7 +193,7 @@ interface Layout {
 
 function layoutFor(width: number, height: number): Layout {
 	if (width < height) return { cx: 0.5, cy: 0.66, width: 0.86, quiet: [0, 0, 1, 0.5] };
-	return { cx: 0.6, cy: 0.6, width: 0.58, quiet: [0, 0, 0.46, 0.46] };
+	return { cx: 0.66, cy: 0.68, width: 0.5, quiet: [0, 0, 0.52, 0.56] };
 }
 
 /** Distance from each inside pixel to the nearest outside pixel (a 3-4 chamfer transform). */
@@ -345,20 +352,82 @@ function dropField(w: number, h: number, word: string, family: string, seed: num
 	return field;
 }
 
+type Color = [number, number, number];
+
+interface Palette {
+	/** The scene behind the glass: a base color, what it gains toward the top, and four soft lights. */
+	base: Color;
+	rise: Color;
+	lights: [Color, Color, Color, Color];
+	/** How much a drop brightens what it shows, and how dark its steep rim turns. */
+	lens: number;
+	rim: number;
+	spec: Color;
+	bounce: Color;
+	/** Fog: its own color, and how much of the scene shows through it. */
+	fog: Color;
+	fogKeep: number;
+	vignette: number;
+	gamma: number;
+}
+
+const PALETTES: Record<Theme, Palette> = {
+	dark: {
+		base: [0.012, 0.022, 0.026],
+		rise: [0.01, 0.022, 0.024],
+		lights: [
+			[0.05, 0.3, 0.28],
+			[0.03, 0.17, 0.21],
+			[0.26, 0.17, 0.07],
+			[0.02, 0.08, 0.09],
+		],
+		lens: 1.25,
+		rim: 0.62,
+		spec: [0.8, 0.96, 1.0],
+		bounce: [0.2, 0.55, 0.52],
+		fog: [0.07, 0.088, 0.092],
+		fogKeep: 0.55,
+		vignette: 0.35,
+		gamma: 1.08,
+	},
+	light: {
+		base: [0.9, 0.94, 0.935],
+		rise: [0.05, 0.04, 0.045],
+		lights: [
+			[-0.34, -0.1, -0.14],
+			[-0.2, -0.1, -0.03],
+			[0.02, -0.08, -0.2],
+			[-0.12, -0.05, -0.06],
+		],
+		lens: 1.0,
+		rim: 0.5,
+		spec: [0.5, 0.55, 0.55],
+		bounce: [0.04, 0.12, 0.11],
+		fog: [0.64, 0.665, 0.665],
+		fogKeep: 0.34,
+		vignette: 0.08,
+		gamma: 1.0,
+	},
+};
+
+export type Theme = 'dark' | 'light';
+
 export interface Condensation {
+	setTheme(theme: Theme): void;
 	stop(): void;
 }
 
 /**
- * Run the condensation on `canvas`, filling `hero`. Returns null when the
- * browser lacks WebGL2 with float render targets; the page then shows its static frame.
+ * Run the condensation on `canvas`, filling `hero`, with the drops spelling
+ * `word` in the CSS font `family`, which must have loaded. Returns null when
+ * the browser lacks WebGL2 with float render targets.
  */
-export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, word: string, readout: Readout): Condensation | null {
+export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, word: string, family: string, theme: Theme): Condensation | null {
 	const context = createContext(canvas);
 	if (!context) return null;
 	const { gl } = context;
 	const reduced = prefersReducedMotion();
-	const family = getComputedStyle(document.documentElement).getPropertyValue('--font-serif').trim() || 'serif';
+	let palette = PALETTES[theme];
 
 	const vao = gl.createVertexArray()!;
 	const tUpdate = createProgram(gl, FULLSCREEN_VERTEX, T_UPDATE);
@@ -425,7 +494,6 @@ export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, 
 	let elapsed = 0;
 	let started = false;
 	let noiseClock = 0;
-	let lastStep = -1;
 	let resizeTimer = 0;
 	const onResize = () => {
 		clearTimeout(resizeTimer);
@@ -441,13 +509,6 @@ export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, 
 		started = true;
 		elapsed = reduced ? DURATION : elapsed + dt;
 		noiseClock += dt;
-		// The readout follows the slowest clock, so it reaches the last step when the whole pane has cleared.
-		const global = Math.max(0, 1 - (elapsed * SLOWEST) / DURATION);
-		const step = Math.min(STEPS, Math.floor((1 - global) * STEPS));
-		if (step !== lastStep) {
-			lastStep = step;
-			readout(step, Math.sin((Math.PI / 2) * global));
-		}
 		const heroRect = hero.getBoundingClientRect();
 		const scrollFog = Math.min(1, Math.max(0, -heroRect.top / (0.9 * heroRect.height)));
 
@@ -486,12 +547,27 @@ export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, 
 		gl.uniform2f(render.uniform('uSim'), simW, simH);
 		gl.uniform2f(render.uniform('uRes'), canvas.width, canvas.height);
 		gl.uniform1f(render.uniform('uTime'), seconds);
+		gl.uniform3fv(render.uniform('uBase'), palette.base);
+		gl.uniform3fv(render.uniform('uRise'), palette.rise);
+		gl.uniform3fv(render.uniform('uLights'), palette.lights.flat());
+		gl.uniform1f(render.uniform('uLens'), palette.lens);
+		gl.uniform1f(render.uniform('uRim'), palette.rim);
+		gl.uniform3fv(render.uniform('uSpec'), palette.spec);
+		gl.uniform3fv(render.uniform('uBounce'), palette.bounce);
+		gl.uniform3fv(render.uniform('uFog'), palette.fog);
+		gl.uniform1f(render.uniform('uFogKeep'), palette.fogKeep);
+		gl.uniform1f(render.uniform('uVignette'), palette.vignette);
+		gl.uniform1f(render.uniform('uGamma'), palette.gamma);
 		drawFullscreen(gl, vao, null);
 	};
 
 	if (reduced) {
 		frame(0, 0);
 		return {
+			setTheme(next) {
+				palette = PALETTES[next];
+				frame(0, 0);
+			},
 			stop() {
 				removeEventListener('resize', onResize);
 			},
@@ -499,6 +575,9 @@ export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, 
 	}
 	const stopLoop = runLoop(canvas, frame);
 	return {
+		setTheme(next) {
+			palette = PALETTES[next];
+		},
 		stop() {
 			stopLoop();
 			removeEventListener('resize', onResize);

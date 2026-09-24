@@ -1,6 +1,7 @@
 ---
-// The recorded output of the hero script, where it was recorded, and a button
-// that runs the same script on a live kernel.
+// The recorded output of the landing page's script, where it was recorded, and
+// a button that runs the same script on a live kernel. The live client loads
+// when the button is pressed.
 import { live } from '../../live.mjs';
 
 interface Props {
@@ -12,9 +13,6 @@ interface Props {
 const { code, stdout, seconds, meta } = Astro.props;
 const lines = stdout.trimEnd().split('\n');
 const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
-// The trainer's own report of how long the first step took, which is mostly compilation.
-const firstStep = Number(/first step after ([\d.]+) s/.exec(stdout)?.[1] ?? Number.NaN);
-const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 ---
 
 <div class="hero-output" data-hero-output data-code={code}>
@@ -31,15 +29,15 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 	</div>
 	<pre class="hero-output-text" data-output>{lines.map((line) => <span class="line">{line}{'\n'}</span>)}</pre>
 	<p class="hero-output-meta" data-output-meta>
-		Recorded on {meta.where} with {meta.vcpus} vCPUs, using JAX {meta.jax} and Dew at{' '}
-		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, on {meta.date}. The
-		script took {Math.round(seconds)} s{compiling ? ', most of it compiling' : ''}.
+		Recorded on {meta.where}, {meta.vcpus} vCPUs, JAX {meta.jax}, Dew{' '}
+		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, {meta.date},{' '}
+		{Math.round(seconds)} s.
 	</p>
 	<div class="turnstile-holder" data-turnstile></div>
 </div>
 
 <script>
-	import { LiveSession, terminalText } from '../../scripts/live';
+	import type { LiveSession } from '../../scripts/live';
 
 	const panel = document.querySelector<HTMLElement>('[data-hero-output]');
 	const button = panel?.querySelector<HTMLButtonElement>('[data-live-hero]');
@@ -56,6 +54,7 @@ const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
 			const status = (text: string) => (meta.textContent = text);
 			let session: LiveSession | undefined;
 			try {
+				const { LiveSession, terminalText } = await import('../../scripts/live');
 				session = await LiveSession.open(holder, status);
 				status('Running train.py on a live kernel: one vCPU of a Cloudflare container, JAX on the CPU.');
 				output.replaceChildren();

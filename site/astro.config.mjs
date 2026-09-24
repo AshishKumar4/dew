@@ -54,10 +54,10 @@ export default defineConfig({
 				useStarlightUiThemeColors: true,
 				styleOverrides: {
 					borderRadius: '0.5rem',
-					codeFontFamily: 'var(--font-mono)',
+					codeFontFamily: 'var(--dew-font-mono)',
 					codeFontSize: '0.8125rem',
 					codeLineHeight: '1.65',
-					uiFontFamily: 'var(--font-inter)',
+					uiFontFamily: 'var(--dew-font)',
 				},
 				defaultProps: { wrap: false },
 			},

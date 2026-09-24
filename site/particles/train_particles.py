@@ -1,15 +1,14 @@
-"""Train the particle model of dewml.dev's concept B with Dew, on a CPU.
+"""Train the particle model of dewml.dev's hero with Dew, on a CPU.
 
-To reproduce concept-b's model.json and model.bin: render the mask with
-mask.py (it reads the font from the built concepts page), write a Colab cell
-with the mask embedded (python make_cell.py 30000), run it on a CPU runtime
-(colab exec -s <session> -f train_cell_30000.py > train.log), and unpack the
-log into concepts/public/b/ with python extract.py train.log. The published
-weights took 30,000 steps in 861 s on the 2 vCPUs of a Colab CPU runtime,
-with Dew at ef3185ad.
+One model per font: render the word with mask.py (python particles/mask.py
+NAME FONT.woff2), write a Colab cell with the mask embedded (python
+particles/make_cell.py NAME 30000), run it on a CPU runtime (colab exec -s
+<session> -f particles/cells/NAME-30000.py > NAME.log), and unpack the log
+into public/hero/particles/ with python particles/extract.py NAME NAME.log.
+30,000 steps take about 15 minutes on the 2 vCPUs of a Colab CPU runtime.
 
 The data are 2D points drawn uniformly from the glyphs of "dew" in the site's
-display serif (MASK_PNG, embedded below by make_cell.py). The model is a small
+font (MASK_PNG, embedded below by make_cell.py). The model is a small
 MLP that predicts the rectified-flow velocity v = eps - x0 at a point
 x_t = (1 - t) x0 + t eps, trained by Dew's Trainer through a custom Objective,
 with an exponential moving average of the weights. Afterwards the script

@@ -175,7 +175,8 @@ for (const file of files) {
 			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');
-		const record = { images: [] };
+		// What the landing page can quote: the cell's code, its stdout and its images.
+		const record = { source: text, images: [] };
 		const rendered = await renderOutputs(cell, stem, index, allowErrors, images, record);
 		outputsByCell[cell.id ?? `cell-${index}`] = record;
 		outputs += (cell.outputs ?? []).length;
