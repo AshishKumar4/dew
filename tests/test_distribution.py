@@ -323,6 +323,29 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
+    """`dew launch` without --devices-per-process gives its one process every
+    local device. Inside a Slurm step, JAX's detection would still place it:
+    it pins a process it finds in Slurm's variables to the GPU at the step's
+    SLURM_LOCALID, one device of the launcher's several. A process dew launch
+    started takes its placement from the launcher."""
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("a cluster pins device ids on GPU; the CPU backend takes none")
+    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "print('local devices', jax.local_device_count())\n")
+    done = finished(subprocess.Popen(
+        [sys.executable, "-m", "dew.cli.main", "launch", "--", sys.executable, "-c", program],
+        cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"local devices {jax.local_device_count()}" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_whose_backend_fails_to_open_after_joining_ends_the_pool():
     """Rank 1 joins the pool and then cannot open its backend, as a GPU with
     no memory left fails to, while rank 0 waits two minutes for its devices'
