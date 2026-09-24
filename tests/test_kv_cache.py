@@ -129,13 +129,16 @@ class Decoder(nn.Module):
 
 
 @pytest.mark.parametrize("tokens", [32, 48])
-def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens):
+def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens, monkeypatch):
     """Run in Pallas' TPU interpreter over a bfloat16 pool, the kernel reads
     each row's pages through its table and attends its first `lengths`
     slots as softmax attention over the gathered cache does, to bfloat16
-    rounding: over two pages a row, and over three, which it attends in one
-    block of three."""
+    rounding: over two pages a row, and over three. The kernel's block of
+    pages has to divide a row's pages, and a larger block is fewer grid
+    steps: a row of three pages runs as one block of three, where the gcd
+    of its pages with 8 split it into three blocks of one."""
     from jax.experimental.pallas import tpu as pltpu
+    from jax.experimental.pallas.ops.tpu import paged_attention as kernels
 
     # The interpreter runs its kernel through io_callback, which places on a
     # CPU device, so the call runs there even on a GPU host.
@@ -143,6 +146,14 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens):
         host = jax.devices("cpu")[0]
     except RuntimeError:
         pytest.skip("the TPU interpreter needs the cpu platform (JAX_PLATFORMS=cuda,cpu)")
+    blocks = []
+    kernel = kernels.paged_attention
+
+    def recorded(*args, pages_per_compute_block, **kwargs):
+        blocks.append(pages_per_compute_block)
+        return kernel(*args, pages_per_compute_block=pages_per_compute_block, **kwargs)
+
+    monkeypatch.setattr(kernels, "paged_attention", recorded)
     rows, heads, width = 2, 2, 128
     with jax.default_device(host), pltpu.force_tpu_interpret_mode():
         key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width),
@@ -157,15 +168,7 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens):
     scores = jnp.where(jnp.arange(tokens)[None, None] < lengths[:, None, None], scores, -jnp.inf)
     expected = jnp.einsum("bhk,bkhd->bhd", jax.nn.softmax(scores, axis=-1), values)
     np.testing.assert_allclose(attended.astype(jnp.float32), expected, atol=3e-2, rtol=3e-2)
-
-
-def test_the_tpu_paged_kernel_takes_the_largest_block_of_pages_that_divides_a_row():
-    """The kernel needs its block to divide a row's pages. The largest such
-    block up to 8 keeps a row of three pages in one block, where the gcd
-    with 8 split it into three."""
-    from dew.nn.kv_cache import _pages_per_block
-
-    assert [_pages_per_block(pages) for pages in (1, 2, 3, 6, 8, 12, 16, 24)] == [1, 2, 3, 6, 8, 6, 8, 8]
+    assert set(blocks) == {tokens // 16}, blocks
 
 
 def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():

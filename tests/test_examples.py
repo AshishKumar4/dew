@@ -188,6 +188,25 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert json.loads((export / "generation_config.json").read_text())["tokenizer_name"]
 
 
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
+def test_train_rlvr_starts_its_engine_with_that_engines_own_build_tools_first(tmp_path, backend):
+    """An engine compiles kernels with the build tools of its own
+    environment (vLLM runs its venv's ninja), which need not be on the
+    trainer's PATH. The engine starts with its executable's directory first
+    on PATH. The stand-in engine records the ninja it finds, then exits."""
+    example = load_example("train_rlvr")
+    environment = tmp_path / "engine-env" / "bin"
+    environment.mkdir(parents=True)
+    found = tmp_path / "ninja-found"
+    for tool, body in ((backend, f'command -v ninja > "{found}"\nexit 3\n'), ("ninja", "exit 0\n")):
+        (environment / tool).write_text("#!/bin/sh\n" + body)
+        (environment / tool).chmod(0o755)
+    config = example.Config(backend=backend, out=tmp_path, **{backend: str(environment / backend)})
+    with pytest.raises(RuntimeError, match="exited with 3"):
+        example.launch_engine(config, tmp_path / "served")
+    assert found.read_text().strip() == str(environment / "ninja")
+
+
 @pytest.mark.parametrize("new_tokens", [1, 128])
 def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_full_budget(tmp_path, new_tokens):
     """SGLang 0.5.20 refuses an input of `context - 6` ids or more
