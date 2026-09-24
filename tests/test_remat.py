@@ -278,15 +278,17 @@ def test_the_headroom_is_the_tightest_devices_free_memory_less_what_the_step_add
 
 
 def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
-    """The first compile leaves no headroom, so the trainer compiles the step
-    again under 'minimal', which fits, and stops there."""
+    """The first compile leaves no headroom, so the trainer tiles the head;
+    the second leaves none either, so it compiles the step again under
+    'minimal', which fits, and stops there. A memory-tight step takes the
+    tiled head before any block is recomputed."""
     import optax
 
     from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer, trainer as trainer_module
 
-    headrooms = iter([-1, 0])
+    headrooms = iter([-1, -1, 0])
     compiled = []
 
     def headroom(executable, devices):
@@ -299,9 +301,12 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
     trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert len(compiled) == 2
+    assert len(compiled) == 3
+    assert trainer.objective.head_tile is not None
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
     assert trainer_module.remat_record(trainer.objective.model.remat) == 'minimal'
+
+
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 def test_a_gated_product_keeps_only_its_16_bit_inputs_for_the_backward(activation):
     """The product runs in fp32. Differentiated as written it kept five fp32

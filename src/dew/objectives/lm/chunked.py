@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import head_product, rounded_operand, rounded_to, rounds_to_bf16
 from dew.nn.sharding import logical_spec, mesh_axes
 
@@ -303,6 +304,73 @@ _bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7, 
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
+def _whole_head_terms(hidden, table, targets, softcap, precision, predict, temperature):
+    """The whole `[tokens, vocab]` logits in fp32 and what `_forward` returns
+    of them: losses, the top-1 column (None unless `predict`), log Z."""
+    operands = _operand_dtype(precision)
+    flat = hidden.reshape(-1, table.shape[1]).astype(operands)
+    labels = targets.reshape(-1)
+    raw = _tile_logits(flat, table.astype(operands), precision)
+    logits = _capped(raw, softcap, temperature)
+    log_z = jax.nn.logsumexp(logits, axis=-1)
+    picked = jnp.take_along_axis(logits, labels[:, None], axis=-1)[:, 0]
+    best = (jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(targets.shape)
+            if predict else None)
+    return raw, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
+
+
+def _whole_head_impl(hidden, table, targets, softcap, precision, predict, temperature):
+    return _whole_head_terms(hidden, table, targets, softcap, precision, predict, temperature)[1]
+
+
+def _whole_head_fwd(hidden, table, targets, softcap, precision, predict, temperature):
+    raw, outputs = _whole_head_terms(hidden, table, targets, softcap, precision, predict,
+                                     temperature)
+    # The fp32 logits before the cap are kept, so the backward multiplies
+    # nothing it did not have to: the state and head products alone.
+    return outputs, (hidden, table, targets, raw, outputs[2], softcap)
+
+
+def _whole_head_bwd(precision, predict, temperature, residuals, cotangents):
+    """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
+    logits: the logits' cotangent stays fp32 into the state product
+    (`_cotangent_product`), and the head's accumulates in fp32 once."""
+    del predict
+    hidden, table, targets, raw, log_z, softcap = residuals
+    loss_cotangent, _, partition_cotangent = cotangents
+    operands = _operand_dtype(precision)
+    features = table.shape[1]
+    states = rounded_operand(hidden.reshape(-1, features).astype(jnp.float32), operands)
+    matrix = rounded_operand(table.astype(jnp.float32), operands)
+    d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
+    logits, pullback = jax.vjp(lambda raw, cap: _capped(raw, cap, temperature), raw, softcap)
+    probabilities = jnp.exp(logits - log_z.reshape(-1)[:, None])
+    selected = jax.nn.one_hot(targets.reshape(-1), table.shape[0], dtype=jnp.float32)
+    d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
+                            - d_loss[:, None] * selected)
+    d_states = _cotangent_product('tv,vd->td', d_raw, matrix, precision)
+    d_table = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
+                         preferred_element_type=jnp.float32)
+    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
+            None, d_cap)
+
+
+_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(4, 5, 6))
+_whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
+
+
+HEAD_TILE_BY_GENERATION: dict[str, tuple[int, int]] = {'sm80': (4096, 8192)}
+"""The chunked head's `(tokens, columns)` tile where it was measured to beat
+the default: on one A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide,
+4096 tokens, bf16) forward and backward took 48.7 ms at 4096 x 8192 and
+60.2 ms at 1024 x 8192, at 0.46 and 0.21 GiB of temporaries."""
+
+
+def chunked_tile() -> tuple[int, int]:
+    """The chunked head's tile on this process's hardware generation."""
+    return HEAD_TILE_BY_GENERATION.get(device_generation(), (1024, 8192))
+
+
 def _token_spec(shape: tuple[int, ...]) -> P:
     """How the loss splits `[batch, length, ...]` targets over the mesh in
     context: rows and positions where the rule table puts the hidden's, then
@@ -327,7 +395,7 @@ def _token_spec(shape: tuple[int, ...]) -> P:
 def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           softcap: float | None = None,
                           precision: PrecisionLike = None,
-                          tile: tuple[int, int] = (1024, 8192),
+                          tile: tuple[int, int] | None = (1024, 8192),
                           vocab_major: bool = False,
                           predict: bool = True, temperature: float = 1.0):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
@@ -359,7 +427,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     block: the forward walks tokens in the first, the backward walks both and
     holds nothing wider, so it is the only knob on the backward's
     temporaries. The default is measured; a tile wider than the input is one
-    tile. `temperature` divides the capped logits (`head_logits`), which
+    tile. A `tile` of None keeps the whole fp32 logits for the backward
+    instead of recomputing them, which is faster wherever they fit: on one
+    A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
+    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`). `temperature` divides the capped logits (`head_logits`), which
     scores the draws of a sampler at that temperature.
 
     On a mesh every device scores its own tokens (`_token_spec`): the token
@@ -379,16 +450,19 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     if hidden.shape[:-1] != targets.shape:
         raise ValueError(
             f"{targets.shape} targets for {hidden.shape[:-1]} hidden states")
-    if len(tile) != 2 or min(tile) < 1:
+    if tile is not None and (len(tile) != 2 or min(tile) < 1):
         raise ValueError(f"{tile} is not a positive (tokens, columns) tile")
 
     # A traced cap keeps `final_logit_softcap` differentiable; the head is
     # held vocabulary-major so a column tile is a row slice.
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
+    product = BF16 if rounds_to_bf16(hidden.dtype, precision) else precision
+
     def head(hidden, table, targets, cap):
-        return _bounded_head(hidden, table, targets, chunks, tile, cap,
-                             BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
+        if tile is None:
+            return _whole_head(hidden, table, targets, cap, product, predict, float(temperature))
+        return _bounded_head(hidden, table, targets, chunks, tile, cap, product,
                              predict, float(temperature))
 
     def column_logits(states, rows, cap):
