@@ -363,3 +363,22 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
     assert len(counts) == 2
     assert all(counts[-1][key] == number for key, number in tree.items()), \
         {str(key): (counts[-1][key], number) for key, number in tree.items() if counts[-1][key] != number}
+
+
+def test_no_constant_answer_passes_a_quarter_of_a_train_rlvr_task():
+    """A policy that prints one number whatever the input earns that number's
+    share of a task's cases. With a and b uniform in 1..99, print(1) passed
+    61% of the gcd cases and print(0) 49% of the multiples ones, a reward for
+    guessing that the policy learns. Over 16,000 records every task's most
+    common answer covers under a quarter of its cases."""
+    import collections
+    import json
+
+    example = load_example("train_rlvr")
+    answers = collections.defaultdict(collections.Counter)
+    for row in map(json.loads, example.records(16_000, seed=0)):
+        for case in json.loads(row["ground_truth"]):
+            answers[row["prompt"][0]["content"].split(" and prints ", 1)[1][:60]][case["stdout"]] += 1
+    shares = {task: counts.most_common(1)[0][1] / sum(counts.values()) for task, counts in answers.items()}
+    assert len(shares) == len(example.TASKS)
+    assert max(shares.values()) < 0.25, {task: round(share, 3) for task, share in shares.items()}
