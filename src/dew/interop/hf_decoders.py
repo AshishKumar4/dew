@@ -94,14 +94,6 @@ def _hf_activation(activation: GatedActivation) -> str:
 
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
-# A multimodal repo's config.json is a wrapper whose model_type names the
-# whole model and whose text_config holds the decoder. Its own weights live
-# under model.language_model.*, next to vision and audio towers this has no
-# counterpart for, so the wrapper raises a ValueError naming its model_type.
-# A wrapper whose own model_type is a registered family (kimi_k25) is not
-# one of these: its translator reads the nested config and its tensor map
-# reads the nesting, so its text half loads and the towers are retained.
-_WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n', 'qwen3_5', 'llama4')
 
 # The gated delta net's own geometry, the config's names and the mixer kind's.
 _LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
@@ -874,8 +866,11 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family, refusing computation with no counterpart."""
 
     model_type = hf_config.get('model_type')
-    if model_type in _WRAPPERS or (model_type not in _FAMILIES
-                                   and 'text_config' in hf_config):
+    # A multimodal repo's config.json is a wrapper whose model_type names the
+    # whole model and whose text_config holds the decoder;
+    # translate_wrapper_config reads the wrappers that load. A wrapper whose
+    # own model_type is a registered family (kimi_k25) is read here instead.
+    if model_type not in _FAMILIES and 'text_config' in hf_config:
         # google/gemma-4-E2B is one of these. The decoder is real and its
         # text_config translates, but the repo is a multimodal model whose
         # weights sit under model.language_model.* beside vision and audio
