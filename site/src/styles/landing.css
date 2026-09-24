@@ -30,7 +30,7 @@ html[data-has-hero] header.header {
 }
 
 html[data-has-hero][data-past-hero] header.header {
-	background-color: color-mix(in srgb, var(--sl-color-bg-nav) 88%, transparent);
+	background-color: color-mix(in srgb, var(--sl-color-bg-nav) 94%, transparent);
 	border-bottom-color: var(--sl-color-hairline-shade);
 	backdrop-filter: blur(12px);
 	-webkit-backdrop-filter: blur(12px);
@@ -87,30 +87,31 @@ html[data-has-hero][data-past-hero] header.header {
 	opacity: 1;
 }
 
-/* The still frames: one per hero, theme and orientation (public/hero/stills/). */
-.hero[data-pick='condensation'] .hero-still {
+/* The still frames: one per hero, theme and orientation (public/hero/stills/),
+   fetched only when the hero falls back to one. */
+.hero[data-mode='still'][data-pick='condensation'] .hero-still {
 	background-image: url('/hero/stills/condensation-dark-wide.webp');
 }
-.hero[data-pick='particles'] .hero-still {
+.hero[data-mode='still'][data-pick='particles'] .hero-still {
 	background-image: url('/hero/stills/particles-dark-wide.webp');
 }
-:root[data-theme='light'] .hero[data-pick='condensation'] .hero-still {
+:root[data-theme='light'] .hero[data-mode='still'][data-pick='condensation'] .hero-still {
 	background-image: url('/hero/stills/condensation-light-wide.webp');
 }
-:root[data-theme='light'] .hero[data-pick='particles'] .hero-still {
+:root[data-theme='light'] .hero[data-mode='still'][data-pick='particles'] .hero-still {
 	background-image: url('/hero/stills/particles-light-wide.webp');
 }
 @media (orientation: portrait) {
-	.hero[data-pick='condensation'] .hero-still {
+	.hero[data-mode='still'][data-pick='condensation'] .hero-still {
 		background-image: url('/hero/stills/condensation-dark-tall.webp');
 	}
-	.hero[data-pick='particles'] .hero-still {
+	.hero[data-mode='still'][data-pick='particles'] .hero-still {
 		background-image: url('/hero/stills/particles-dark-tall.webp');
 	}
-	:root[data-theme='light'] .hero[data-pick='condensation'] .hero-still {
+	:root[data-theme='light'] .hero[data-mode='still'][data-pick='condensation'] .hero-still {
 		background-image: url('/hero/stills/condensation-light-tall.webp');
 	}
-	:root[data-theme='light'] .hero[data-pick='particles'] .hero-still {
+	:root[data-theme='light'] .hero[data-mode='still'][data-pick='particles'] .hero-still {
 		background-image: url('/hero/stills/particles-light-tall.webp');
 	}
 }

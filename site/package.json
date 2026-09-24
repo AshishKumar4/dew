@@ -14,6 +14,7 @@
 		"preview": "astro preview",
 		"check": "astro check",
 		"deploy": "wrangler deploy && wrangler deploy -c deploy/www/wrangler.jsonc",
+		"deploy:preview": "wrangler deploy -c deploy/preview/wrangler.jsonc",
 		"live:deploy": "node live/deploy.mjs",
 		"live:check": "tsc -p live/tsconfig.json",
 		"concepts:dev": "astro dev --config astro.concepts.mjs --port 4400",
