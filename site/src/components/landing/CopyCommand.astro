@@ -3,11 +3,13 @@ interface Props {
 	command: string;
 }
 const { command } = Astro.props;
+// Where a narrow screen may wrap the command besides its spaces: after a path's
+// slashes, not inside "https://".
+const parts = command.split(/(?<=[^/]\/)(?=[^/])/);
 ---
 
 <div class="copy-command">
-	<span class="prompt" aria-hidden="true">$</span>
-	<code>{command}</code>
+	<code><span class="prompt" aria-hidden="true">$ </span>{parts.map((part, index) => (index > 0 ? [<wbr />, part] : part))}</code>
 	<button type="button" data-copy={command} aria-label="Copy the install command">
 		<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
 			><path
