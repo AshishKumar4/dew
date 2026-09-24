@@ -1178,3 +1178,41 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
 def test_accumulation_must_be_positive():
     with pytest.raises(ValueError, match="accumulation"):
         make_trainer(accumulation=0)
+
+
+@pytest.mark.parametrize("generation,flags,ssd,off", [
+    ("sm80", "", False, True), ("sm80", "", True, False),
+    ("sm80", "--xla_gpu_enable_triton_gemm=true", False, False),
+    ("sm89", "", False, False), ("v6e", "", False, False)])
+def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
+        monkeypatch, generation, flags, ssd, off):
+    """sm80 compiles a training step with XLA's Triton GEMM fusions off,
+    except for a model with an SSD mixer, whose scan lost 7.7% without them,
+    and except where the run set the flag itself."""
+    from types import SimpleNamespace
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.mixers.mamba2 import Mamba2Mixer
+    from dew.training import trainer as module
+
+    monkeypatch.setattr(module, "device_generation", lambda: generation)
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    decoder = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
+                                mlp_features=16, max_seq_len=8,
+                                mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=8, n_groups=1) if ssd else None)
+    options = module.step_compiler_options(SimpleNamespace(model=decoder))
+    assert options == ({"xla_gpu_enable_triton_gemm": False} if off else None)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+def test_an_sm80_step_compiles_its_dots_to_cublas():
+    """On sm80 the compiled training step holds no Triton GEMM fusion: every
+    dot is a cuBLAS call. Elsewhere XLA keeps its default."""
+    from dew.nn.kernels.generation import device_generation
+    from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS
+
+    trainer, _, _ = held_lm_trainer()
+    state, _, _ = trainer.place()
+    trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
+    triton = "__triton_gemm" in trainer.executable.as_text()
+    assert triton == (device_generation() not in TRITON_GEMM_OFF_GENERATIONS)

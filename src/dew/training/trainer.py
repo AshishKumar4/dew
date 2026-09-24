@@ -32,6 +32,8 @@ from termcolor import colored
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
+from dew.nn.kernels.generation import device_generation
+from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
@@ -47,6 +49,7 @@ from dew.objectives.base import (
     select,
 )
 from dew.telemetry import profile as telemetry_profile
+from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
@@ -181,6 +184,25 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     steps = wall - (wall if first_step is None else first_step) - other
     numbers["goodput/step_fraction"] = max(steps, 0.0) / wall if wall > 0 else 0.0
     return numbers
+
+
+def step_compiler_options(objective) -> dict[str, bool] | None:
+    """XLA options for this objective's training step on this device: Triton
+    GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
+    the model has no SSD mixer, unless the run set the flag itself."""
+    if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
+            or xla_flag('xla_gpu_enable_triton_gemm') is not None):
+        return None
+    model = getattr(objective, 'model', None)
+    if model is None or _has_ssd_mixer(model):
+        return None
+    return {'xla_gpu_enable_triton_gemm': False}
+
+
+def _has_ssd_mixer(model) -> bool:
+    mixers = [getattr(model, 'mixer', None)]
+    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
+    return any(isinstance(mixer, Mamba2Mixer) for mixer in mixers)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -631,7 +653,7 @@ class Trainer(Generic[Loss, Effects]):
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             self.program = jitted.lower(prepared, batch)
-            self.executable = self.program.compile()
+            self.executable = self.program.compile(step_compiler_options(self.objective))
             self.flops_per_step = compiled_flops(self.executable)
 
         def run(current, batch):
