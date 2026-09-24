@@ -1220,3 +1220,21 @@ def test_an_sm80_step_compiles_its_dots_to_cublas():
     state, _, _ = trainer.place()
     trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
     assert "__triton_gemm" not in trainer.executable.as_text()
+
+
+def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
+    """The step's first call runs the program `compile` built. Through the
+    jit it traced and compiled a second one, without the step's compiler
+    options: 25 s of an A100's cold start, and a step that ran with Triton
+    GEMM on where it was off."""
+    from dew.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective: {'xla_embed_ir_in_executable': False})
+    trainer, _, _ = held_lm_trainer()
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.zeros((8, 5), jnp.int32)}
+    step = trainer.compile(state, batch)
+    with caplog.at_level("WARNING"), jax.log_compiles():
+        jax.block_until_ready(step(state, batch))
+    assert not [record for record in caplog.records if "jit(step)" in record.getMessage()]
