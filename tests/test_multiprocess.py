@@ -433,10 +433,10 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     """
     steps = 20
     pool = run_pool("pipeline", tmp_path / "pool", 2, fsdp_size=2, stage_size=2,
-                    microbatches=4, steps=steps)
+                    microbatches=2, steps=steps)
 
     piped, piped_state = worker.pipeline_losses(
-        worker.pipeline_trainer(2, 4, 2), worker.token_batch(), steps)
+        worker.pipeline_trainer(2, 2, 2), worker.token_batch(), steps)
     whole, whole_state = worker.pipeline_losses(
         worker.pipeline_trainer(1, None, 4), worker.token_batch(), steps)
 
