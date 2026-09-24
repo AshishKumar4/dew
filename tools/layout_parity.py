@@ -142,7 +142,17 @@ def zoo() -> dict[str, Any]:
     a sequence split two ways reads it from one neighbour, four ways through
     the exchange), Mamba-2 alone, and packed rows of three documents whose
     boundaries fall inside the shards, in the dense decoder and in Rigel's
-    three Mamba-2 layers to one windowed layer."""
+    three Mamba-2 layers to one windowed layer.
+
+    The dense, MoE, hybrid and MLA decoders also train every other objective
+    a decoder takes: SFT over the assistant's turns (`_sft`), DPO over pairs
+    (`_dpo`), GRPO over rollouts with a KL to the frozen reference (`_grpo`)
+    and, made bidirectional, masked diffusion (`_mdlm`), which the hybrid's
+    Mamba-2 refuses on one device (its recurrence runs one way). The other families
+    train their own: a conditional UNet and an MMDiT (SD3's) denoise latents,
+    a JEPA encoder predicts its masked patches' features, and a decoder reads
+    an image through a vision tower (`multimodal`), each with heads and
+    tokens every layout above divides."""
     from benchmark_step import Case
 
     dense = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
@@ -175,6 +185,16 @@ def zoo() -> dict[str, Any]:
     dit = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
            "output_channels": 4}
     lm = {"batch_size": 8, "seq_len": 32, "fsdp_min_param_size": 256}
+    decoders = {"dense": dense, "moe": moe, "hybrid": hybrid, "mla": mla}
+    trained = {f"{name}_{kind}": Case("causal_transformer", config, decoder_objective=kind,
+                                      objective={"beta": 0.01} if kind == "grpo" else {}, **lm)
+               for name, config in decoders.items() for kind in ("sft", "dpo", "grpo")}
+    # Mamba-2's recurrence has no bidirectional mode, which the hybrid's
+    # model refuses on one device; masked diffusion takes the others.
+    diffused = {f"{name}_mdlm": Case("causal_transformer", {**config, "causal": False},
+                                     decoder_objective="mdlm", **lm)
+                for name, config in decoders.items() if name != "hybrid"}
+    images = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "moe": Case("causal_transformer", moe, **lm),
@@ -189,14 +209,43 @@ def zoo() -> dict[str, Any]:
                     fsdp_min_param_size=256),
         "dgemma": Case("diffusion_gemma", dgemma, canvas={"prompt_length": 16, "canvas_size": 8},
                        batch_size=8, seq_len=31, fsdp_min_param_size=256),
+        **trained,
+        **diffused,
+        "unet": Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 4},
+                                                      {"features": 64, "heads": 4}],
+                                           "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
+                     image_size=16, **images),
+        "mmdit": Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2, "heads": 4,
+                                          "head_dim": 8, "joint_attention_dim": 16,
+                                          "caption_projection_dim": 32, "pooled_projection_dim": 32,
+                                          "sample_size": 16, "pos_embed_max_size": 8},
+                      image_size=16, **images),
+        "jepa": Case("jepa_encoder", {"patch_size": 4, "emb_features": 32, "num_layers": 2, "num_heads": 4,
+                                      "mlp_ratio": 2},
+                     predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
+                                "num_layers": 1, "num_heads": 4, "mlp_ratio": 2},
+                     batch_size=8, image_size=16, fsdp_min_param_size=256),
+        "multimodal": Case("multimodal_transformer", dense, media={
+            "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
+            "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+                      "num_heads": 4, "image_size": 16, "patch_size": 8},
+            "projector": {"kind": "gemma", "vision_width": 32, "text_width": 64, "patches_per_side": 2,
+                          "tokens_per_side": 2}}, **lm),
     }
 
 
 def reassociates(case) -> bool:
     """Whether reordering or pooling the batch's rows only reassociates the
-    step's sums: a next-token loss draws nothing per row, a diffusion
-    objective draws its noise by row."""
-    return case.is_lm and case.canvas is None
+    step's sums: a next-token loss draws nothing per row (SFT, DPO and GRPO
+    among them), a diffusion objective or a masked-diffusion decoder draws
+    its noise by row, and JEPA its masks."""
+    return case.is_lm and case.canvas is None and case.decoder_objective != "mdlm"
+
+
+def anchored(case) -> bool:
+    """Whether the fp64 anchor computes the case's step: a reassociating
+    decoder its record builds alone, not one inside a composite."""
+    return reassociates(case) and case.media is None
 
 
 def stash():
@@ -611,7 +660,7 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
             case, reference = model_case(model, dtype, mixture, objective)
             batch = bench.global_batch(case)
             judge = references.reference(reference, batch, steps)
-            if anchor and reassociates(reference):
+            if anchor and anchored(reference):
                 references.anchor(reference, batch)
         except Exception as error:  # the other models' references are still worth keeping
             whole = False
@@ -648,7 +697,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     reference, batch, ref_gradient, ref_losses[0]))
             else:
                 floors, loss_floor = judge.floors, judge.loss_floor
-            if anchor and reassociates(reference):
+            if anchor and anchored(reference):
                 rounding = leaf_errors(agreed(f"anchor of {model}", lambda: references.anchor(reference, batch)),
                                        ref_gradient, dtype)
                 farthest = max(rounding, key=rounding.__getitem__)
