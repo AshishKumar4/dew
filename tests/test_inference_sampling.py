@@ -375,9 +375,11 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     The likelihoods agree to fp32 rounding, not bit for bit: the padded
     width is a different attention reduction (128 keys against 100 or 120,
     the extra ones masked to zero weight), which a GPU kernel may tile and
-    sum in another order. Re-associating a sum of n fp32 terms moves it by
-    about sqrt(n) eps relative to its magnitude, 11 eps at n = 128, and the
-    bound allows 16 eps of each log probability (measured on CUDA: 1 ulp).
+    sum in another order (measured on CUDA: 1 ulp). log_softmax rounds in
+    the logits' absolute scale, so the bound is 16 fp32 eps of the row's
+    largest |logit|: sqrt(128) eps, 11, rounded up. Padding the model did
+    attend to, the bug the masking prevents, moves the same log
+    probabilities by 0.07 or more, four orders above the bound.
     """
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, seed=0,
                              sampling=roomy.sampling) for width in (100, 120)}
@@ -387,9 +389,19 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
         drawn = roomy(ramp(width), 8, seed=0)
         assert drawn.tokens.shape == (1, width + 8)
         np.testing.assert_array_equal(drawn.tokens, reference.tokens)
+        tokens = np.asarray(reference.tokens)
+        logits = roomy.model.apply(roomy.variables, jnp.asarray(tokens))
+        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
         for field in ("raw_log_probs", "behavior_log_probs"):
             np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
-                                       rtol=16 * np.finfo(np.float32).eps, atol=0, err_msg=field)
+                                       rtol=0, atol=bound, err_msg=field)
+        attended = jnp.concatenate([jnp.zeros((1, 128 - width), jnp.int32), jnp.asarray(tokens)], axis=1)
+        unmasked = roomy.model.apply(roomy.variables, attended)[:, 128 - width:]
+        drawn_ids = jnp.asarray(tokens[:, width:, None])
+        moved = jnp.max(jnp.abs(
+            jnp.take_along_axis(jax.nn.log_softmax(logits[:, width - 1:-1]), drawn_ids, axis=-1)
+            - jnp.take_along_axis(jax.nn.log_softmax(unmasked[:, width - 1:-1]), drawn_ids, axis=-1)))
+        assert float(moved) > 1e3 * bound, (float(moved), bound)
     assert compiled._cache_size() - traced == 1
 
 
