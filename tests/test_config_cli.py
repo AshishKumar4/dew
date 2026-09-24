@@ -207,3 +207,12 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     assert int(state.step) == 2
     assert recipe.JepaRunConfig.load(str(tmp_path / "run")) == config
     assert (tmp_path / "run" / "2").is_dir()
+
+
+def test_a_jepa_run_without_probes_schedules_no_validation_pass():
+    """A JEPA validation pass scores the frozen-encoder probes, so a run that
+    names no probe classes yet schedules passes is refused where it is
+    configured, not at its first pass."""
+    recipe = load_recipe("jepa")
+    with pytest.raises(ValueError, match="probe_classes"):
+        recipe.JepaRunConfig()
