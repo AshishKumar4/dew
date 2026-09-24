@@ -395,3 +395,6 @@ class MultimodalTransformer(nn.Module):
         """Allocate the nested language cache without evaluating media."""
         self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
+
+
+__all__ = ["MultimodalTransformer"]
