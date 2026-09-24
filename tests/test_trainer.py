@@ -10,6 +10,7 @@ tracker, and what a failure does to the run.
 import dataclasses
 import json
 import os
+import re
 
 import jax
 import jax.numpy as jnp
@@ -992,6 +993,25 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     np.testing.assert_allclose(w, .64, rtol=1e-6)
     np.testing.assert_allclose(ema, .77, rtol=1e-6)
     assert int(state.microstep) == 2 * accum
+
+
+@pytest.mark.parametrize("dynamic_scale", [False, True])
+def test_a_one_microbatch_step_commits_without_a_conditional(dynamic_scale):
+    """A GPU conditional whose branch holds a collective, as fsdp's global
+    gradient norm is, reads its predicate on the host: the host waited in
+    every step until the device reached the commit, and the device idled
+    through the next step's host work. The Flowers DiT stepped in 32.5 ms on
+    four RTX 3090s under fsdp=4, 15.9 of them host idle, against flaxdiff's
+    22.4. A window of one microbatch commits by selects, so its compiled
+    step holds no conditional, whatever the device."""
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(.1))
+    trainer = Trainer(ScaledObjective(), optimizer, key=jax.random.key(0), dynamic_scale=dynamic_scale)
+    state = trainer.initial_state()
+    trainer.compile(state, {"scale": jnp.ones((jax.device_count(),), jnp.float32)})
+    assert trainer.executable is not None
+    # The instruction, not the word: an executable compiled here carries its
+    # stack frames, this test's name among them.
+    assert not re.search(r"\sconditional\(", trainer.executable.as_text())
 
 
 def test_mixed_precision_trains_through_fit():
