@@ -448,3 +448,91 @@ header.header {
 .sl-markdown-content dl.api-fields dd > p {
 	margin: 0.25rem 0 0;
 }
+
+/* Live execution on tutorial pages: a Run button on each cell, and the live
+   output in place of the recorded one once the cell has run. */
+
+.sl-markdown-content .nb-cell {
+	position: relative;
+}
+
+.nb-run {
+	position: absolute;
+	z-index: 2;
+	top: 0.45rem;
+	right: 3.1rem;
+	height: 1.7rem;
+	padding: 0 0.7rem;
+	border-radius: 0.35rem;
+	border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 55%, var(--dew-rule));
+	background: var(--dew-surface-raised);
+	color: var(--sl-color-white);
+	font: 600 0.75rem var(--__sl-font);
+	cursor: pointer;
+}
+
+.nb-run:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.sl-markdown-content .nb-cell.nb-ran-live > .nb-output {
+	display: none;
+}
+
+.nb-live {
+	border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 45%, var(--dew-rule));
+	border-top: 0;
+	border-radius: 0 0 0.5rem 0.5rem;
+	background: var(--dew-output-bg);
+}
+
+.sl-markdown-content .nb-cell.nb-ran-live .expressive-code figure {
+	border-bottom-left-radius: 0;
+	border-bottom-right-radius: 0;
+}
+
+.nb-live-head {
+	padding: 0.35rem 1rem;
+	border-bottom: 1px solid var(--dew-rule);
+	font: 600 0.72rem var(--__sl-font-mono);
+	color: var(--dew-accent-text);
+}
+
+.sl-markdown-content .nb-live-body pre {
+	margin: 0;
+	padding: 0.6rem 1rem;
+	border: 0;
+	background: transparent;
+	font: 0.78rem/1.6 var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 28rem;
+	overflow: auto;
+}
+
+.sl-markdown-content .nb-live-body pre.nb-stderr-live {
+	color: var(--dew-muted);
+}
+
+.sl-markdown-content .nb-live-body pre.nb-error {
+	color: var(--dew-error);
+}
+
+.sl-markdown-content .nb-live-body pre.nb-result {
+	color: var(--sl-color-white);
+}
+
+.nb-live-body img {
+	display: block;
+	max-width: 100%;
+	height: auto;
+	margin: 0.6rem auto;
+	background: #fff;
+	border-radius: 0.3rem;
+}
+
+.turnstile-holder:empty {
+	display: none;
+}

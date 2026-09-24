@@ -171,7 +171,8 @@ for (const file of files) {
 		outputsByCell[cell.id ?? `cell-${index}`] = record;
 		outputs += (cell.outputs ?? []).length;
 		codeIndex += 1;
-		liveCells.push({ id: codeIndex, code: text });
+		// The live kernel has Dew installed and no network, so it skips the install cells.
+		if (!/^\s*[%!]pip\s/.test(text)) liveCells.push({ id: codeIndex, code: text });
 		const block = [`<div class="nb-cell" data-cell="${codeIndex}">`, '', fence(text.replace(/\n+$/, ''))];
 		if (rendered) block.push('', rendered);
 		block.push('', '</div>');

@@ -1,0 +1,44 @@
+// live.dewml.dev: the "Run live" buttons on dewml.dev. The Worker checks the
+// visitor with Turnstile, the Coordinator enforces the limits below, and each
+// session gets its own Kernel container. Deploy with `pnpm live:deploy`, which
+// pins the container to one Dew commit; see deploy.mjs.
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "dewml-live",
+	"account_id": "f44999d1ddda7012e9a87729eba250f1",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-20",
+	"routes": [{ "pattern": "live.dewml.dev", "custom_domain": true }],
+	"workers_dev": false,
+	"preview_urls": false,
+	"containers": [
+		{
+			"class_name": "Kernel",
+			"image": "./container/Dockerfile",
+			"instance_type": "standard-2",
+			"max_instances": 8
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "KERNEL", "class_name": "Kernel" },
+			{ "name": "COORDINATOR", "class_name": "Coordinator" }
+		]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] }],
+	// Requests to the API per visitor IP; sessions have their own limits below.
+	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
+	"vars": {
+		"ALLOWED_ORIGIN": "https://dewml.dev",
+		"TURNSTILE_HOSTNAME": "dewml.dev",
+		// Session-seconds a UTC day may use; 40 hours caps the monthly bill.
+		"BUDGET_SECONDS": "144000",
+		"MAX_SESSIONS": "8",
+		"WALL_SECONDS": "1200",
+		"IDLE_SECONDS": "300",
+		"CPU_SECONDS": "900",
+		"IP_WINDOW_SECONDS": "600",
+		"IP_STARTS": "3"
+	},
+	"observability": { "enabled": true }
+}
