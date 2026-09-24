@@ -65,6 +65,8 @@ profile = ["xprof>=2.23.2,<3"]
 test = [
     "pytest",
     "pytest-xdist",
+    # CI's shards: splits the suite by tests/test_durations.json.
+    "pytest-split>=0.11",
     "safetensors",
     "torch",
     # A published scheduler's beta sigma grid is an inverse incomplete beta,

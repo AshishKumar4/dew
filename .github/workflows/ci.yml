@@ -1,58 +1,102 @@
-# Installs dew-ml, checks for syntax errors and undefined names, type checks
-# src/dew, runs the CPU test lane. For more information see:
+# Installs dew-ml, checks for syntax errors and undefined names, lints and type
+# checks src/dew, and runs the CPU test lane split into shards, each its own
+# check. For more information see:
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    # ci/** is where a branch goes for its own run before it lands.
+    branches: [ "main", "ci/**" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same ref makes the older run's verdict moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision
+
 jobs:
-  test:
-
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.14", "3.12"]
-
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        # The compatibility floor, which pyright checks syntax against.
+        python-version: "3.12"
+        cache: pip
+        cache-dependency-path: pyproject.toml
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flake8
+        pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[test,av,tfds,metrics,plots,inference-clients,vision]"
+        pip install -e ".[$EXTRAS]"
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
     - name: Lint
       run: |
-        pip install uv
-        uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples
-        python tools/lint_slop.py
-    - name: Type check the Python 3.12 compatibility floor
-      if: matrix.python-version == '3.12'
+        uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples recipes
+        JAX_PLATFORMS=cpu python tools/lint_slop.py
+    - name: Type check
+      run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
+
+  test:
+    runs-on: ubuntu-latest
+    # A shard's share is about eleven minutes; a hung test fails its shard
+    # instead of holding a runner for the default six hours.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14", "3.12"]
+        # pytest-split balances the shards on tests/test_durations.json;
+        # tools/ci_durations.py rewrites it from a run's reports.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    name: test (${{ matrix.python-version }}, ${{ matrix.shard }}/12)
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+        cache-dependency-path: pyproject.toml
+    - name: Install dependencies
       run: |
-        # Check minimum syntax against its matching standard library.
-        # Both interpreters run the runtime tests below.
-        pip install uv
-        uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[$EXTRAS]"
+    # conftest.py persists XLA's compilations under ~/.cache/dew/xla; every
+    # run restores the latest one main saved for this shard.
+    - name: Restore the compilation cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/dew/xla
+        key: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-${{ github.run_id }}
+        restore-keys: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-
     - name: Test with pytest
       run: |
-        /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv --capture=tee-sys -ra --junitxml=pytest-report.xml
+        /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv \
+          --capture=tee-sys -ra --junitxml=pytest-report.xml \
+          --splits 12 --group ${{ matrix.shard }} --splitting-algorithm least_duration \
+          --durations-path tests/test_durations.json
+    - name: Save the compilation cache
+      if: always() && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/dew/xla
+        key: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-${{ github.run_id }}
     - name: Annotate failures
       if: always()
       run: |
@@ -79,5 +123,5 @@ jobs:
       if: always() && hashFiles('pytest-report.xml') != ''
       uses: actions/upload-artifact@v4
       with:
-        name: pytest-report-${{ matrix.python-version }}
+        name: pytest-report-${{ matrix.python-version }}-${{ matrix.shard }}
         path: pytest-report.xml
