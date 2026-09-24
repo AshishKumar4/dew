@@ -47,7 +47,7 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install -e ".[tfds]" "jax[cuda12]"
+uv pip install -e ".[tfds,cuda12]"
 ```
 
 Prepare the dataset once in a separate environment. TensorFlow is needed for this TFDS builder, but not for reading the prepared data during training.
@@ -1418,17 +1418,17 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-Install the JAX build for your hardware:
+Add the extra for your hardware; its accelerator build of JAX matches the JAX Dew pins:
 
-| Hardware | JAX package |
+| Hardware | Install |
 |---|---|
-| CPU | Included in the base installation |
-| NVIDIA GPU | `uv pip install -U "jax[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
-| Google TPU | `uv pip install -U "jax[tpu]"` |
+| CPU | `uv pip install -e .` |
+| NVIDIA GPU | `uv pip install -e ".[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
+| Google TPU | `uv pip install -e ".[tpu]"` |
 
-See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements and other platforms.
+Installing from the repository without a checkout works the same way: `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Don't add `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]` to the install: Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)), and pip can't combine PyPI's jax extras with it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
-The optional extras are `av`, `eval-harness`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+The optional extras are `av`, `cuda12`, `cuda13`, `eval-harness`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 
