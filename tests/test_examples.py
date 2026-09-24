@@ -27,26 +27,28 @@ from dew.interop import load_params
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def smoke(name, out, *arguments, offline=True):
-    """One example's `--smoke` run, in its own process, on one CPU device.
-
-    The environment is the one the docstrings tell a reader to use, minus
-    the suite's eight simulated devices: a smoke run is a single-device run,
-    and `HF_HUB_OFFLINE` keeps a fixture path from becoming a download. A
-    harness suite reads its documents from the Hub, so that one run asks for
-    the network and carries the marker. No smoke reaches a paid endpoint, so
-    none is handed the caller's OpenAI key.
+def single_device(offline=True) -> dict[str, str]:
+    """The environment of a smoke run: the one the docstrings tell a reader to
+    use, minus the suite's eight simulated devices, since a smoke run is a
+    single-device run. `HF_HUB_OFFLINE` keeps a fixture path from becoming a
+    download. A harness suite reads its documents from the Hub, so that one
+    run asks for the network and carries the marker. No smoke reaches a paid
+    endpoint, so none is handed the caller's OpenAI key.
     """
-    environment = {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
-                   "PYTHONPATH": str(REPO_ROOT / "src"),
-                   "JAX_PLATFORMS": "cpu",
-                   "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
-                   "HF_HUB_OFFLINE": "1" if offline else "0",
-                   "TOKENIZERS_PARALLELISM": "false"}
+    return {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+            "HF_HUB_OFFLINE": "1" if offline else "0",
+            "TOKENIZERS_PARALLELISM": "false"}
+
+
+def smoke(name, out, *arguments, offline=True):
+    """One example's `--smoke` run, in its own process, on one CPU device (`single_device`)."""
     finished = subprocess.run(
         [sys.executable, str(REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
          "--out", str(out), *arguments],
-        cwd=REPO_ROOT, env=environment, capture_output=True, text=True, timeout=900)
+        cwd=REPO_ROOT, env=single_device(offline), capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, (
         f"{name} --smoke exited {finished.returncode}\n"
         f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
@@ -330,7 +332,7 @@ def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
     assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
 
 
-def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp_path, monkeypatch):
+def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp_path):
     """The native backend pushes the policy into Dew's own server every
     update. After a push the device holds the served weights once: the
     trainer's copy is float32 and the server's bfloat16, so every live
@@ -339,31 +341,36 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
     the headroom its single-turn run ran out of at update 19). The float32
     arrays of those shapes are the trained parameters and adamw's two moments:
     the loaded checkpoint stays on the host, where a device copy would be
-    2.2 GiB more."""
-    import collections
-
-    import jax
-
-    from dew.objectives.rl import RolloutScheduler
-
-    example = load_example("train_rlvr")
-    counts = []
-    schedule = RolloutScheduler.__call__
-
-    def counted(self, state, batch, key):
-        packed = schedule(self, state, batch, key)
-        counts.append(collections.Counter((array.shape, array.dtype) for array in jax.live_arrays()))
-        return packed
-
-    monkeypatch.setattr(RolloutScheduler, "__call__", counted)
-    example.main(example.Config(smoke=True, out=tmp_path))
-    source = example.load_pretrained(str(example.SMOKE_MODEL), dtype="float32")
-    shapes = collections.Counter(leaf.shape for leaf in jax.tree.leaves(source.variables))
-    expected = {(shape, jax.numpy.dtype(dtype)): copies * number for shape, number in shapes.items()
-                for dtype, copies in ((jax.numpy.bfloat16, 1), (jax.numpy.float32, 3))}
+    2.2 GiB more. The run is a smoke run's, on one device in its own process,
+    which counts the live arrays after each push."""
+    program = ("import collections, importlib.util, json, sys\n"
+               "from pathlib import Path\n"
+               "import jax\n"
+               "from dew.objectives.rl import RolloutScheduler\n"
+               "spec = importlib.util.spec_from_file_location('train_rlvr', 'examples/train_rlvr.py')\n"
+               "example = importlib.util.module_from_spec(spec)\n"
+               "sys.modules[spec.name] = example\n"
+               "spec.loader.exec_module(example)\n"
+               "counts = []\n"
+               "schedule = RolloutScheduler.__call__\n"
+               "def counted(self, state, batch, key):\n"
+               "    packed = schedule(self, state, batch, key)\n"
+               "    counts.append(collections.Counter(f'{array.shape} {array.dtype}' for array in jax.live_arrays()))\n"
+               "    return packed\n"
+               "RolloutScheduler.__call__ = counted\n"
+               "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
+               "source = example.load_pretrained(str(example.SMOKE_MODEL), dtype='float32')\n"
+               "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
+               "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n")
+    finished = subprocess.run([sys.executable, "-c", program, str(tmp_path)], cwd=REPO_ROOT, env=single_device(),
+                              capture_output=True, text=True, timeout=900)
+    assert finished.returncode == 0, finished.stdout + finished.stderr
+    counted = json.loads(finished.stdout.rsplit("counts ", 1)[1])
+    expected = {f"{shape} {dtype}": copies * number for shape, number in counted["shapes"].items()
+                for dtype, copies in (("bfloat16", 1), ("float32", 3))}
     # The second call pushed update 1's weights before it returned.
-    assert len(counts) == 2
-    assert {key: counts[-1][key] for key in expected} == expected
+    assert counted["updates"] == 2
+    assert {key: counted["live"].get(key, 0) for key in expected} == expected
 
 
 def test_no_constant_answer_passes_a_quarter_of_a_train_rlvr_task():
