@@ -341,6 +341,9 @@ FAILURE_KEY = FAILURE_DIRECTORY + "published"
 FAILURE_GRACE_SECONDS = 60.0
 """How long a published failure may go unheard before every process ends."""
 
+FAILURE_POLL_SECONDS = 5.0
+"""How often a pool's failure watch reads the coordination service."""
+
 
 def _client():
     """The jax.distributed client, through orbax's public accessor for it."""
@@ -408,7 +411,7 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
 
     def watch() -> None:
         while True:
-            time.sleep(5.0)
+            time.sleep(FAILURE_POLL_SECONDS)
             try:
                 seen = published()
                 if seen is None:
