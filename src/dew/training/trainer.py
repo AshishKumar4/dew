@@ -298,10 +298,10 @@ def recompute_more(objective) -> bool:
     rung to move to. A head that keeps its whole logits for the backward
     moves to the generation's tile first (`LMObjective.head_tile`); then the
     model's remat climbs."""
-    if objective.tile_head():
-        print(colored("the step does not fit the devices with the whole logits kept; "
-                      "compiling it again with the head tiled", "yellow"),
-              file=sys.stderr)
+    moved = objective.tile_head()
+    if moved is not None:
+        print(colored(f"the step does not fit the devices with the whole logits kept; "
+                      f"compiling it again with {moved}", "yellow"), file=sys.stderr)
         return True
     model = getattr(objective, 'model', None)
     if model is None:

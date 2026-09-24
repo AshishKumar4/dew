@@ -305,12 +305,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             return value, jnp.asarray(True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
-    def tile_head(self) -> bool:
+    def tile_head(self) -> str | None:
         """Move a head that holds its whole logits for the backward to a
-        bounded tile, and say whether it moved: the fit ladder's first rung
-        (`dew.training.trainer.recompute_more`). An objective with no such
-        head has nothing to move."""
-        return False
+        bounded tile and say what it moved to, or None when there was nothing
+        to move: the fit ladder's first rung
+        (`dew.training.trainer.recompute_more`), which logs it. An objective
+        with no such head has nothing to move."""
+        return None
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Nonparameter replacements from accepted-window observations."""
