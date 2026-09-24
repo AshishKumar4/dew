@@ -418,3 +418,15 @@ def test_a_gpu_older_than_sm80_multiplies_bf16_without_the_bf16_algorithm(monkey
     for requested in ('auto', 'xla'):
         chosen = resolve_implementation(requested, query, query)
         assert (chosen == 'reference') == (not runs)
+
+
+def test_the_sm75_route_applies_on_a_gpu_backend_only(monkeypatch):
+    """A GPU older than sm80 sends bf16 attention to the reference path, since
+    its dot rejects BF16_BF16_F32. The route belongs to the backend that runs
+    the call: the same generation read while the call traces for another
+    backend keeps xla."""
+    from dew.nn.attention import resolve_implementation
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: 'sm75')
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'cpu')
+    query = jnp.zeros((1, 16, 2, 64), jnp.bfloat16)
+    assert resolve_implementation('xla', query, query) == 'xla'
