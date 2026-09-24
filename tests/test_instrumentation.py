@@ -24,6 +24,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import (
     compiled_flops,
+    default_compilation_cache_dir,
     enable_compilation_cache,
     hlo_flops,
     model_flops_utilization,
@@ -436,6 +437,22 @@ def test_compilation_cache_directory_is_configured(tmp_path):
     enable_compilation_cache(path)
     assert os.path.isdir(path)
     assert jax.config.jax_compilation_cache_dir == path
+
+
+def test_the_default_compilation_cache_is_the_directory_jax_is_configured_with(tmp_path, monkeypatch):
+    """One cache a machine: with JAX pointed at a directory, as
+    JAX_COMPILATION_CACHE_DIR points it, Dew's default is that directory, and
+    only without one a directory of Dew's own. The test suite's cache landed
+    in a second directory beside the one the box's GPU jobs share."""
+    previous = jax.config.jax_compilation_cache_dir
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    try:
+        jax.config.update("jax_compilation_cache_dir", str(tmp_path / "jax"))
+        assert default_compilation_cache_dir() == str(tmp_path / "jax")
+        jax.config.update("jax_compilation_cache_dir", None)
+        assert default_compilation_cache_dir().startswith(str(tmp_path / "xdg"))
+    finally:
+        jax.config.update("jax_compilation_cache_dir", previous)
 
 
 def _fake_converter():
