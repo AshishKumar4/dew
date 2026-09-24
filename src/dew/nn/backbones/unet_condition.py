@@ -13,6 +13,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
+from dew.nn.sharding import HEADS, constrain, logical_axes
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -67,11 +68,20 @@ class _TimeMLP(nn.Module):
         return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(nn.silu(x))
 
 
+@logical_axes({(sublayer, projection): ("embed", "heads", "head_dim")
+               for sublayer in ("self_attention", "cross_attention") for projection in ("q", "k", "v")}
+              | {(sublayer, "output"): ("heads", "head_dim", "embed")
+                 for sublayer in ("self_attention", "cross_attention")})
 class _Attention(nn.Module):
     """Attend over `[B, S, features]` tokens, against `context` when given.
 
     The head width is `features // heads`. The projections carry no bias,
-    which is what the SD checkpoints hold.
+    which is what the SD checkpoints hold. Under a tensor axis each shard
+    computes its heads, as Megatron splits an attention: the query, key and
+    value projections by their output heads and the output projection by
+    its input heads. Left whole, every tensor shard projected the whole text
+    context into keys and values (4 times one device's FLOPs for those
+    projections at tensor=4).
     """
 
     features: int
@@ -86,12 +96,12 @@ class _Attention(nn.Module):
         context = x if context is None else context
         depth = self.features // self.heads
         def project(value, name):
-            return nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
-                                   precision=self.precision, name=name)(value)
+            return constrain(nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
+                                             precision=self.precision, name=name)(value), HEADS)
         attended = scaled_dot_product_attention(project(x, "q"), project(context, "k"), project(context, "v"),
             dtype=self.dtype, precision=self.precision, implementation=self.attention_impl)
         output = nn.DenseGeneral(self.features, axis=(-2, -1), dtype=self.dtype,
-                                 precision=self.precision, name="output")(attended)
+                                 precision=self.precision, name="output")(constrain(attended, HEADS))
         return nn.Dropout(self.dropout)(output, deterministic=not train) if self.dropout else output
 
 
