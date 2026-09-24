@@ -17,6 +17,19 @@ import '../styles/landing.css';
 const hero = capture.snippets.hero;
 if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero snippet did not exit cleanly');
 
+// docs/key-concepts.md opens with the same program and quotes its output, so the two
+// pages cannot drift apart: its first Python block is hero.py, and the text block
+// after it is what capture.json recorded.
+{
+	const page = readFileSync(path.join(process.cwd(), '..', 'docs', 'key-concepts.md'), 'utf8');
+	const program = /```python\n([\s\S]*?)\n```/.exec(page);
+	const printed = program && /```text\n([\s\S]*?)\n```/.exec(page.slice(program.index + program[0].length));
+	if (program?.[1] !== heroCode.trimEnd()) throw new Error('docs/key-concepts.md: its first Python block differs from src/data/hero.py');
+	if (printed?.[1] !== hero.stdout.trimEnd()) {
+		throw new Error('docs/key-concepts.md: its output block differs from src/data/capture.json; paste what scripts/capture_snippets.py recorded');
+	}
+}
+
 // Cells from the tutorials, with what they printed on their last complete run.
 const shown = [
 	{ label: 'Language models', notebook: '05-train-a-language-model', cell: 'cell-20' },

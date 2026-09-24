@@ -49,19 +49,19 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-On the two vCPUs of a Colab runtime it prints:
+On four cores of a workstation CPU it prints:
 
 ```text
 Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 25: loss 0.0336
-step 50: loss 0.0107
-step 75: loss 0.0070
-step 100: loss 0.0053
-Goodput: first step after 6.81 s, 23.4% of the wall time in steps
+step 25: loss 0.0306
+step 50: loss 0.0102
+step 75: loss 0.0067
+step 100: loss 0.0051
+Goodput: first step after 2.14 s, 28.4% of the wall time in steps
 dew trains jax models. dew trains jax model
 ```
 
-Each row holds 65 byte ids: `LMObjective(seq_len=64)` feeds the first 64 to the model and predicts the 64 that follow, one position later. The loss falls from 0.034 at step 25 to 0.005 at step 100, and the model continues the prompt with the sentence it learned. `records` is the number of training examples and `batch` the global batch size. `generate` returns the prompt followed by the new tokens, and `temperature=0` picks the most likely token at every step.
+Each row holds 65 byte ids: `LMObjective(seq_len=64)` feeds the first 64 to the model and predicts the 64 that follow, one position later. The loss falls from 0.031 at step 25 to 0.005 at step 100, and the model continues the prompt with the sentence it learned. `records` is the number of training examples and `batch` the global batch size. `generate` returns the prompt followed by the new tokens, and `temperature=0` picks the most likely token at every step.
 
 ## Models are plain Flax modules
 
@@ -83,7 +83,7 @@ The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` f
 
 ## The trainer runs the loop
 
-`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` initializes the variables on the devices, compiles one training step, and runs it until the step counter reaches `steps`. Along the way it updates the moving average, logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when you pass `checkpoints=Checkpoints(directory)`.
+`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` initializes the variables on the devices, compiles one training step, and runs it until the step counter reaches `steps`. Along the way it updates the moving average, logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the `Trainer` was given `checkpoints=Checkpoints(directory)`.
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
 

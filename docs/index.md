@@ -33,6 +33,6 @@ The pages come in four kinds. Tutorials teach a complete workflow from start to 
 
 ## Project status
 
-Dew is research software and has not reached 1.0. Checkpoint formats and the API can change between versions. I have tested it on CPU, on pools of local processes, on single GPUs and on one host with four GPUs. It has not run on two physical nodes. Each guide lists the known limits next to the workflow they affect, and [Train on several nodes](guides/multi-node.md#what-has-and-has-not-been-run) keeps the full list of what has and has not been run.
+Dew is research software and has not reached 1.0. Checkpoint formats and the API can change between versions. I have tested it on CPU, on pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip. It has not run on two physical nodes. Each guide lists the known limits next to the workflow they affect, and [Train on several nodes](guides/multi-node.md#what-has-and-has-not-been-run) keeps the full list of what has and has not been run.
 
 [Papers and attribution](references.md) links the papers and upstream code behind the models and methods. The repository also holds design history and research notes for contributors; you do not need them to use Dew.

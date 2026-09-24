@@ -1,16 +1,19 @@
 """Run the landing page's code on a CPU and record what it prints.
 
-The landing page shows src/data/hero.py and src/data/objective.py next to the
-output in src/data/capture.json, so the output must come from running exactly
-those files. Run this after changing either, in an environment with Dew
-installed, and commit the JSON it writes:
+The landing page shows src/data/hero.py next to the output in
+src/data/capture.json, so the output must come from running exactly that
+file. Run this after changing it, in an environment with Dew installed, and
+commit the JSON it writes:
 
     python site/scripts/capture_snippets.py
 
 `--where` names the machine for the caption, for example "the CPU of a Colab
 runtime". The page reads the commit of the installed Dew from pip's record of
 a git install, so install Dew from GitHub or a local clone with `pip install
-"dew-ml @ git+..."`, not an editable install.
+"dew-ml @ git+..."`, not an editable install. Record at the commit the live
+kernel runs (site/live/container/dew-commit, which deploy.mjs writes), so
+that Run it live prints what the page shows; docs/key-concepts.md quotes the
+same output, and the build fails until it matches.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from importlib.metadata import distribution, version
 from pathlib import Path
 
 DATA = Path(__file__).resolve().parents[1] / "src/data"
-SNIPPETS = ("hero", "objective")
+SNIPPETS = ("hero",)
 
 
 def installed_commit() -> str:
@@ -50,8 +53,9 @@ def main() -> None:
             raise SystemExit(f"{name}.py exited {done.returncode}:\n{done.stderr}")
         snippets[name] = {"returncode": 0, "seconds": round(time.monotonic() - started, 1), "stdout": done.stdout}
     capture = {
-        "about": "What site/src/data/hero.py and objective.py printed, written by site/scripts/capture_snippets.py.",
-        "meta": {"where": options.where, "vcpus": os.cpu_count(), "python": platform.python_version(),
+        "about": "What site/src/data/hero.py printed, written by site/scripts/capture_snippets.py.",
+        # The CPUs this process may run on, which taskset narrows; os.cpu_count() is the machine's.
+        "meta": {"where": options.where, "vcpus": len(os.sched_getaffinity(0)), "python": platform.python_version(),
                  "jax": version("jax"), "flax": version("flax"), "optax": version("optax"),
                  "dew": installed_commit(), "date": time.strftime("%Y-%m-%d")},
         "snippets": snippets,

@@ -29,7 +29,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 	</div>
 	<pre class="hero-output-text" data-output>{lines.map((line) => <span class="line">{line}{'\n'}</span>)}</pre>
 	<p class="hero-output-meta" data-output-meta>
-		Recorded on {meta.where}, {meta.vcpus} vCPUs, JAX {meta.jax}, Dew{' '}
+		Recorded on {meta.where} ({meta.vcpus} {meta.vcpus === 1 ? 'core' : 'cores'}), JAX {meta.jax}, Dew{' '}
 		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, {meta.date},{' '}
 		{Math.round(seconds)} s.
 	</p>
