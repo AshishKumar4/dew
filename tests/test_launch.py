@@ -15,13 +15,12 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import outside_any_cluster
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# The launches below stand in for Slurm, Open MPI or a plain host. On a Cloud
-# TPU VM, jax's detection reads the VM's metadata and finds a TPU cluster
-# ahead of any of them; TPU_SKIP_MDS_QUERY is jax's own switch for a host
-# that is not one.
-ENV = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "TPU_SKIP_MDS_QUERY": "1"}
+# The launches below stand in for Slurm, Open MPI or a plain host with
+# variables of their own, on a machine in no cluster of its own.
+ENV = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src")}
 
 
 def test_training_does_not_import_the_command_line():
@@ -301,8 +300,7 @@ def test_where_the_launch_runs_follows_jax_detection_and_names_win(variables, ar
     step starts srun; named hosts win over any cluster around them; a
     one-task step, as a scheduler's GPU wrapper runs, leaves its GPUs to a
     pool of the launcher's own."""
-    env = {name: value for name, value in ENV.items()
-           if not name.startswith(("SLURM_", "OMPI_")) and name != "JAX_PLATFORMS"}
+    env = {name: value for name, value in ENV.items() if name != "JAX_PLATFORMS"}
     done = launched("--dry-run", *arguments, "--", "python", "train.py",
                     env={**env, **variables})
     assert done.returncode == 0, done.stderr
@@ -321,8 +319,7 @@ def test_a_slurm_placement_that_leaves_gpus_idle_is_refused(variables, arguments
     rest idle, silently: `sbatch --ntasks-per-node 1 --gpus-per-node 4`
     would use one GPU of four. An allocation the launcher starts srun in,
     and a step already running, are refused, naming the task count."""
-    env = {name: value for name, value in ENV.items()
-           if not name.startswith(("SLURM_", "OMPI_")) and name != "JAX_PLATFORMS"}
+    env = {name: value for name, value in ENV.items() if name != "JAX_PLATFORMS"}
     done = launched("--dry-run", *arguments, "--", "python", "train.py", env={**env, **variables})
     assert done.returncode != 0, done.stdout
     assert "--ntasks-per-node=4" in done.stderr, done.stderr
@@ -391,8 +388,7 @@ def fake_srun(tmp_path: Path) -> dict:
                     f"printf '%s\\n' \"$@\" > {tmp_path}/argv\n"
                     f"printf '%s' \"$XLA_FLAGS\" > {tmp_path}/env\n")
     srun.chmod(0o755)
-    env = {name: value for name, value in ENV.items() if not name.startswith("SLURM_")}
-    return {**env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_JOB_ID": "77",
+    return {**ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_JOB_ID": "77",
             "JAX_PLATFORMS": "cuda", "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
 
 
