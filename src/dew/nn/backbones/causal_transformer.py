@@ -73,6 +73,8 @@ from ..sharding import (
     LayoutRefused,
     constrain,
     logical_axes,
+    logical_spec,
+    mesh_axes,
     microbatches,
     pipeline_stages,
 )
@@ -2847,6 +2849,22 @@ class CausalTransformer(nn.Module):
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
+            # Microbatch m takes rows m, m + count, ... (`_microbatched`), a share
+            # of every device's block of rows only where the count divides a
+            # block. Where it does not, a microbatch misses some devices, and
+            # the devices that hold none of its rows compute another's again:
+            # 1.43 times one device's FLOPs for a stage x fsdp step of 8 rows in
+            # 4 microbatches over 4 row shards, where the bubble accounts for 1.25.
+            row_axes = mesh_axes(logical_spec(RESIDUAL[:1], (rows,))[0])
+            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in row_axes)
+            if (rows // shards) % count_microbatches:
+                raise LayoutRefused(
+                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(row_axes)}, "
+                    f"{rows // shards} rows a device, which {count_microbatches} microbatches "
+                    f"do not divide, so the devices that hold none of a microbatch's rows would "
+                    f"compute another's again; use a microbatch count that divides "
+                    f"{rows // shards}, or a batch that is a multiple of "
+                    f"{count_microbatches * shards} rows")
             view = StackView(
                 scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),

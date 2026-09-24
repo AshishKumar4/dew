@@ -934,16 +934,16 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
 
 @pytest.mark.mesh
 def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
-    """A pipelined step cuts its batch into microbatches, which the decoder
-    checks when it traces, so a stage a later compile would refuse is
-    refused before the run reads: two stages over four devices and six
-    microbatches hold batches of twelve, and stages of eight and sixteen
-    are not ones."""
+    """A pipelined step cuts each device's rows into microbatches, which the
+    decoder checks when it traces, so a stage a later compile would refuse
+    is refused before the run reads: two stages beside four row shards and
+    six microbatches hold batches of twenty-four, six rows a device, and
+    stages of eight and sixteen are not ones."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       mesh=MeshSpec(stage=2, microbatches=6),
                       layout=Layout(min_shard=1, tolerance=1.0))
 
-    with pytest.raises(ValueError, match=r"\[8, 16\].*multiple of 12"):
+    with pytest.raises(ValueError, match=r"\[8, 16\].*multiple of 24"):
         trainer.fit(ramped(indexed_data(256, 24), Ramp(start=8, increment=8, samples=16)),
                     steps=2, log_every=100)
 
