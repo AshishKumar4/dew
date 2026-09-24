@@ -214,15 +214,17 @@ DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
 def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
-    """Whether the compiled step's arguments, outputs and temporaries fit
-    the memory of each of `mesh`'s devices, where the backend reports it."""
+    """Whether the compiled step's temporaries and new outputs fit the free
+    memory of each of `mesh`'s devices, where the backend reports it. The
+    arguments, the state and the batch, are already resident and counted in
+    use; the donated state's buffers are reused for the outputs that alias
+    them."""
     stats = executable.memory_analysis()
-    limits = [(device.memory_stats() or {}).get('bytes_limit') for device in mesh.devices.flat]
-    if stats is None or not all(limits):
+    memory = [device.memory_stats() or {} for device in mesh.devices.flat]
+    if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return True
-    needed = (stats.argument_size_in_bytes + stats.output_size_in_bytes
-              - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
-    return needed <= min(limits)
+    needed = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
+    return needed <= min(m['bytes_limit'] - m['bytes_in_use'] for m in memory)
 
 
 def recompute_more(objective) -> bool:
