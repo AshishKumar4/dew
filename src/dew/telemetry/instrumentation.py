@@ -413,11 +413,18 @@ def dew_cache_dir() -> str:
 def default_compilation_cache_dir() -> str:
     """Where compiled executables go unless a run names somewhere else.
 
-    Python minors have separate defaults: JAX 0.11.1 can label Python 3.14
-    stdlib-zstd data as zlib in its cache key. Sharing it with an older
-    interpreter can therefore read bytes using the wrong codec. Explicit
-    paths passed to enable_compilation_cache remain unchanged.
+    The directory JAX is configured with (`jax_compilation_cache_dir`, which
+    JAX_COMPILATION_CACHE_DIR sets) when there is one, so a machine keeps one
+    cache for every entry point. Otherwise Python minors have separate
+    defaults: jax 0.11.2 compresses with Python 3.14's stdlib zstd but names
+    the codec "zlib" in the key, which says "zstandard" only for the
+    zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
+    older interpreter sharing the directory would read those bytes with the
+    wrong codec. Explicit paths passed to enable_compilation_cache remain
+    unchanged.
     """
+    if jax.config.jax_compilation_cache_dir:
+        return jax.config.jax_compilation_cache_dir
     return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
