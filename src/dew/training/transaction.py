@@ -428,7 +428,17 @@ class Transaction:
                     gradient = jax.lax.cond(pending.replay_required, replay, lambda _: pending.gradient, None)
             else:
                 gradient = pending.gradient
-            if not host or FROZEN not in state.params:
+            if not host:
+                # The commit compiles as the host-master step's does, over values
+                # already computed: without the barrier XLA fuses the gradient's
+                # producers into the optimizer's arithmetic, which then rounds
+                # otherwise than the host's compiled commit on the same platform.
+                # One barrier a leaf, so each leaf's update can start as soon as
+                # its own gradient is ready.
+                aux, pending, gradient = jax.tree.map(
+                    jax.lax.optimization_barrier, (realized.aux, pending, gradient))
+                return finish(state, batch, aux, pending, gradient)
+            if FROZEN not in state.params:
                 return finish(state, batch, realized.aux, pending, gradient)
             held = state.params[FROZEN]
             moving = {name: tree for name, tree in state.params.items() if name != FROZEN}
