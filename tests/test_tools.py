@@ -322,6 +322,40 @@ def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_
     assert errors["scale"] == pytest.approx(2e-9 / (tool.rounding_limit("float32") * 10), rel=1e-6)
 
 
+def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
+    """A run's exit status is its verdict. A layout Dew refuses by design
+    (LayoutRefused: a stage axis over a model with no pipeline) is a row with
+    its reason that passes the run; any other error fails it, as a mismatch
+    does. DistSequence's land7 run exited 1 on its refusals alone."""
+    tool = load("layout_parity")
+    from dew.nn.sharding import LayoutRefused
+
+    gradient = {"['w']": np.array([1.0, -2.0, 3.0])}
+    reference = tool.Reference(losses=[2.0, 1.5], gradient=gradient, flops_per_device=4e9,
+                               floors={"['w']": 1e-6}, loss_floor=1e-6)
+    monkeypatch.setattr(tool, "computed_reference", lambda *arguments: reference)
+    outcomes = {"stage4": LayoutRefused("the stage axis of 4 holds a pipeline's stages"),
+                "tensor4": ValueError("a shape mismatch"),
+                "fsdp4": ([2.0, 1.5], gradient,
+                          {"flops_per_device": 4e9 / jax.device_count(), "mesh": {"fsdp": 4}})}
+
+    def trained(case, fields, batch, *, steps, one_device=False):
+        outcome = outcomes[next(name for name, named in tool.LAYOUTS.items() if named == fields)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(tool, "trained", trained)
+    rows = tool.run(["dense"], ["stage4", "tensor4", "fsdp4"], dtype="float32", steps=2, anchor=False,
+                    mixture={}, objective={}, references=tool.References(),
+                    speak=lambda line: None, keep=lambda rows: None)
+
+    assert [row["status"] for row in rows] == ["refused", "error", "works"]
+    assert rows[0]["reason"] == "the stage axis of 4 holds a pipeline's stages"
+    assert tool.verdict([rows[0], rows[2]]) == 0
+    assert tool.verdict(rows) == 1
+
+
 def test_layout_parity_holds_a_layouts_flops_to_an_even_split_and_a_pipelines_bubble():
     """A layout splits one device's work over its devices, and a pipeline of
     S stages and M microbatches adds its bubble of S - 1 microbatches; past
