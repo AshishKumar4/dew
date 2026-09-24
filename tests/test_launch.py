@@ -157,7 +157,8 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     (4, None, None, (4, 1)),
     (8, 2, None, (2, 4)),
     (8, None, 2, (4, 2)),
-    (1, None, None, (1, 1)),
+    (1, None, None, (1, None)),
+    (4, 1, None, (1, None)),
     (2, 4, None, (4, None)),
     (0, 4, None, (4, None)),
 ])
@@ -165,7 +166,9 @@ def test_a_pool_splits_the_gpus_of_a_host_between_its_processes(monkeypatch, gpu
                                                                  devices, expected):
     """Unset, a host runs one process per GPU; a process count alone gets
     an even share each, and more processes than GPUs share them all; a CPU
-    pool leaves devices alone."""
+    pool leaves devices alone. The launcher names GPUs only where it splits
+    them: one process a host holds every GPU and names none, and
+    prepare_process keeps a cluster's detection from narrowing it."""
     from dew.cli import launch
 
     monkeypatch.setattr(launch, "gpu_count", lambda host, visible: gpus)
