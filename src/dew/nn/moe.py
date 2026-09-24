@@ -491,7 +491,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       precision: PrecisionLike) -> jax.Array:
     """`grouped_matmul` under one precision contract for both dispatches.
 
-    The operands are cast to `dtype` (flax's promotion when None), every
+    The operands are cast to `dtype` (flax's promotion when None, except
+    that a 16-bit kernel is never widened: the stream rounds to it), every
     contraction accumulates in at least fp32 and rounds once to the compute
     dtype, so a width split over a mesh axis rounds no partial sum. The
     tangent is `dx @ Q(kernel) + Q(x) @ dkernel` with `Q` the rounded operand
@@ -509,10 +510,16 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     path on every expert/fsdp layout in tests/test_moe_precision.py.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
+    if dtype is None and jnp.finfo(kernel.dtype).bits == 16 and jnp.finfo(compute).bits > 16:
+        # A 16-bit kernel is never widened: with no compute dtype named, a
+        # wider stream multiplies in the kernel's dtype and accumulates in
+        # fp32, as the checkpoint's reference runs it. Promoted, gpt-oss-20b
+        # served over four RTX 3090s copied each layer's experts to fp32.
+        compute = kernel.dtype
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
     if chosen == 'pallas' and _local(x) and _local(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
-    return _projection(x, kernel, group_sizes, dtype,
+    return _projection(x, kernel, group_sizes, compute,
                        'xla' if chosen == 'pallas' else chosen, precision)
 
 
@@ -779,7 +786,63 @@ def expert_dispatch[Parameters](
         # A dropped slot takes the sentinel id past the last expert, which
         # no group counts and no bucket sends.
         indices = jnp.where(positions < capacity, indices, num_experts)
-    parameters = _widened(parameters)
+    run = functools.partial(
+        _dispatched, project, parameter_axes=parameter_axes, num_experts=num_experts,
+        dispatch=dispatch, output_dtype=output_dtype, initializing=initializing,
+        capacity=capacity)
+    return _stored_primal(run, x, indices, parameters, input_weights)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _stored_primal(run, x, indices, parameters, input_weights):
+    """`run` over the parameters as stored, and differentiated over them at
+    least fp32 (`_widened`), so a gradient summed across devices or over
+    the exchange's rounds meets the master dtype once, after the sum. A
+    forward that nothing differentiates, serving above all, reads the
+    stored kernels: widened, every layer's experts were copied to fp32 in
+    the step, 14.35 GiB of live temporaries for gpt-oss-20b served over an
+    expert axis of four RTX 3090s."""
+    return run(x, indices, parameters, input_weights)
+
+
+def _stored_primal_jvp(run, primals, tangents):
+    x, indices, parameters, input_weights = primals
+    dx, _, dparameters, dweights = tangents
+    # Only the live tangents are differentiated; a symbolic zero stays a
+    # closed-over primal, since jax 0.11.2 cannot transpose a zero tangent
+    # through `_projection`'s barrier.
+    leaves, tree = jax.tree.flatten((x, parameters, input_weights))
+    directions = jax.tree.leaves((dx, dparameters, dweights),
+                                 is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+    live = [index for index, direction in enumerate(directions)
+            if not isinstance(direction, SymbolicZero)]
+
+    def forward(*values):
+        current = list(leaves)
+        for index, value in zip(live, values, strict=True):
+            current[index] = value
+        x, parameters, input_weights = jax.tree.unflatten(tree, current)
+        return run(x, indices, _widened(parameters), input_weights)
+
+    if not live:
+        output = forward()
+        return output, SymbolicZero(jax.typeof(output))
+    return jax.jvp(forward, tuple(leaves[index] for index in live),
+                   tuple(directions[index] for index in live))
+
+
+_stored_primal.defjvp(_stored_primal_jvp, symbolic_zeros=True)
+
+
+def _dispatched[Parameters](
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        x: jax.Array, indices: jax.Array, parameters: Parameters,
+        input_weights: jax.Array | None, *, parameter_axes: Sequence[LogicalAxes],
+        num_experts: int, dispatch: str, output_dtype: Dtype, initializing: bool,
+        capacity: int | None) -> jax.Array:
+    """`expert_dispatch` past its checks, over the parameters it is given."""
+    mesh = jax.sharding.get_abstract_mesh()
+    shards = mesh.shape.get(EXPERT_AXIS, 1)
     exchanging = dispatch == 'exchange' and not initializing and x.size > 0
     if not exchanging and (initializing or mesh.empty):
         return _sorted_locally(project, x, indices, parameters, input_weights,
