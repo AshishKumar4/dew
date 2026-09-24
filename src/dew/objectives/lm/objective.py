@@ -260,26 +260,21 @@ def _leaf_paths(tree: Variables) -> set[tuple[str, ...]]:
             for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
 
 
-def _prepared(tokens: ModelInputs | jax.Array) -> ModelInputs:
-    """A batch's `text` as `ModelInputs`, bare ids cast to int32."""
-    return tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
+def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = None,
+              positions: jax.Array | None = None) -> ModelInputs:
+    """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
-
-def _model_packing(prepared: ModelInputs, segment_ids, positions
-                   ) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
-    """The keywords the model reads beside the input ids of `prepared`'s rows.
-
-    They are the `ModelInputs` fields and a packed batch's positions and
-    segment ids columns, cut to the input side of the rows; the two may not
-    both name one. A plain row hands the model nothing.
+    A packed batch names each row's `segment_ids` and `positions` either in
+    columns beside the ids or in its `ModelInputs`; a field named both ways
+    is refused. Everything after reads the packing off what this returns.
     """
-    packing = prepared.slice_tokens(stop=-1).kwargs()
-    for name, column in (("positions", positions), ("segment_ids", segment_ids)):
-        if column is not None:
-            if name in packing:
-                raise ValueError(f"{name} must come from either ModelInputs or the packing column")
-            packing[name] = column[:, :-1]
-    return packing
+    prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
+    columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids))
+               if column is not None}
+    for name in columns:
+        if name in prepared.token_fields:
+            raise ValueError(f"{name} must come from either ModelInputs or the packing column")
+    return dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns}) if columns else prepared
 
 
 def prompt_batch(prompt) -> jax.Array:
@@ -327,20 +322,14 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     return restored, valid
 
 
-def _packing(batch):
-    """Read a packed batch's `segment_ids` and `positions`, None on a plain one."""
+def _batch_text(batch) -> ModelInputs:
+    """The batch's `text` rows as `_prepared` gives them, a packed batch's
+    `text_segment_ids` and `text_positions` columns folded in."""
     segment_ids = batch.get("text_segment_ids")
     positions = batch.get("text_positions")
-    return (None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32),
-            None if positions is None else jnp.asarray(positions, jnp.int32))
-
-
-def _documents(prepared: ModelInputs, segment_ids: jax.Array | None) -> jax.Array | None:
-    """A packed row's segment ids, from the packing column or else the `ModelInputs`.
-
-    `token_scores` refuses a batch that names them in both places.
-    """
-    return prepared.token_fields.get("segment_ids") if segment_ids is None else segment_ids
+    return _prepared(batch[TEXT_KEY],
+                     None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32),
+                     None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
 # The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
@@ -713,10 +702,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         weights them from its scores (`dew.nn.moe.Routes`); the stack slices
         the record by layer however it runs.
         """
-        prepared = _prepared(tokens)
+        prepared = _prepared(tokens, segment_ids, positions)
         inputs, targets = self._rows(prepared.tokens)
-        packing = _model_packing(prepared, segment_ids, positions)
-        segment_ids = _documents(prepared, segment_ids)
+        packing = prepared.slice_tokens(stop=-1).kwargs()
         params = thaw(params)
         replay = {}
         if routes is not None:
@@ -741,8 +729,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision, predict=self.token_accuracy)
-        valid = prepared.token_fields.get("attention_mask")
-        weights = self._row_weights(prepared, targets, segment_ids, roles, losses.dtype)
+        weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
@@ -768,16 +755,16 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
-                    targets, segment_ids, valid, roles, losses.dtype, depth)))
+                    prepared, targets, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
 
-    def _row_weights(self, prepared, targets, segment_ids, roles, dtype):
+    def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.
 
         A supplied validity mask drops the transitions across padding, and
         `loss_role` keeps one role's targets alone.
         """
-        weights = self._target_weights(targets, segment_ids, dtype)
+        weights = self._target_weights(prepared, targets, dtype)
         valid = prepared.token_fields.get("attention_mask")
         if valid is not None:
             weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
@@ -791,7 +778,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 weights = weights * (roles[:, 1:] == int(self.loss_role))
         return weights
 
-    def _depth_weights(self, targets, segment_ids, valid, roles, dtype, depth: int):
+    def _depth_weights(self, prepared, targets, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores.
 
         Depth d's state at p scores the target d further out, so the same
@@ -799,7 +786,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         target's. A padded row admits the target only when every position
         from the state to it is real.
         """
-        weights = self._target_weights(targets[:, depth:], segment_ids, dtype, depth)
+        weights = self._target_weights(prepared, targets[:, depth:], dtype, depth)
+        valid = prepared.token_fields.get("attention_mask")
         if valid is not None:
             span = targets.shape[1] - depth
             admitted = jnp.ones((targets.shape[0], span), dtype=bool)
@@ -881,7 +869,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
 
-    def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
+    def _target_weights(self, prepared, targets, dtype, depth: int = 0):
         """Mark with 1 every target that counts.
 
         A target counts when it is not padding and, in a packed batch,
@@ -890,6 +878,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         weights = (jnp.ones_like(targets, dtype) if self.pad_id is None
                    else (targets != self.pad_id).astype(dtype))
+        segment_ids = prepared.token_fields.get("segment_ids")
         if segment_ids is not None:
             # A target counts only inside a document. The first token of the
             # next packed document, the padding after the last one (segment 0,
@@ -916,7 +905,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return jnp.asarray(batch[ROLES_KEY])
 
-    def _query_weights(self, prepared: ModelInputs, segment_ids, dtype):
+    def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark with 1 every query whose indexer KL counts.
 
         A query counts when its token is real, neither the pad id nor a slot
@@ -926,7 +915,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         inputs = prepared.tokens[:, :-1]
         weights = (jnp.ones_like(inputs, dtype) if self.pad_id is None
                    else (inputs != self.pad_id).astype(dtype))
-        documents = _documents(prepared, segment_ids)
+        documents = prepared.token_fields.get("segment_ids")
         if documents is not None:
             weights = weights * (documents[:, :-1] != 0).astype(dtype)
         valid = prepared.token_fields.get("attention_mask")
@@ -934,7 +923,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             weights = weights * valid[:, :-1].astype(dtype)
         return weights
 
-    def _indexer_term(self, sown, prepared: ModelInputs, segment_ids) -> tuple[jax.Array, jax.Array]:
+    def _indexer_term(self, sown, prepared: ModelInputs) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
         the number of queries it counted.
 
@@ -946,7 +935,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             raise ValueError(
                 "no attention layer sowed an indexer KL, though the model's mla "
                 "mixer carries the indexer")
-        weights = self._query_weights(prepared, segment_ids, jnp.float32)
+        weights = self._query_weights(prepared, jnp.float32)
         total = jnp.sum(jnp.stack([
             jnp.sum(kl.astype(jnp.float32) * weights[:, :kl.shape[1]]) for kl in kls]))
         mass = jax.lax.stop_gradient(jnp.sum(weights))
@@ -958,14 +947,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         The main loss is never scored, since nothing it reaches moves.
         """
         assert self.indexer is not None
-        prepared = _prepared(batch[TEXT_KEY])
+        prepared = _batch_text(batch)
         inputs, _ = self._rows(prepared.tokens)
-        segment_ids, positions = _packing(batch)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=True, rngs={"dropout": step.key},
-            collections=collections, packing=_model_packing(prepared, segment_ids, positions))
-        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared, segment_ids)
+            collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
+        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
         qk = gathered.get("qk") if self.qk_stats else None
         if self.qk_stats:
@@ -1018,13 +1006,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
                      ) -> tuple[Mean | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from."""
-        prepared = _prepared(batch[TEXT_KEY])
-        segment_ids, positions = _packing(batch)
+        prepared = _batch_text(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
             params, prepared, train=train, rngs={"dropout": step.key} if train else None,
-            segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
@@ -1053,7 +1039,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             # do, so one Mean carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
-            total, queries = self._indexer_term(kls, prepared, segment_ids)
+            total, queries = self._indexer_term(kls, prepared)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Mean(prediction.total + self.indexer.weight * total, mass)
         statistics: Mean | LMStatistics = prediction
@@ -1148,10 +1134,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present."""
         params = params if step.ema is None else step.ema
-        tokens = batch[TEXT_KEY]
-        segment_ids, positions = _packing(batch)
-        losses, weights = self._scored(params, tokens, segment_ids, positions,
-                                       self._batch_roles(batch))
+        losses, weights = self._scored(params, _batch_text(batch), self._batch_roles(batch))
         return TokenScores(losses=losses, weights=weights)
 
     def preview(self, params, batch, step: Step, *, scored=None):
@@ -1189,9 +1172,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     @functools.cached_property
     def _scored(self):
         """Compile the teacher-forced scores once per objective."""
-        def scored(params, tokens, segment_ids, positions, roles):
-            scores = self.token_scores(params, tokens, segment_ids=segment_ids,
-                                       positions=positions, roles=roles)
+        def scored(params, prepared, roles):
+            scores = self.token_scores(params, prepared, roles=roles)
             return scores.losses, scores.weights
 
         return jax.jit(scored)
