@@ -1000,7 +1000,8 @@ class DEIS:
 
 class UniPCState(NamedTuple):
     """`UniPC`'s state: the output history, the sample its last predictor
-    left from, and that predictor's order, which its corrector takes."""
+    left from, and that predictor's order, which its corrector takes: 0
+    before the first predictor, when there is nothing to correct."""
 
     history: Multistep
     last_x: jax.Array
@@ -1081,7 +1082,7 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
-        return UniPCState(_multistep(x, times, self.order), x, jnp.ones((), jnp.int32))
+        return UniPCState(_multistep(x, times, self.order), x, jnp.zeros((), jnp.int32))
 
     def _b_h(self, hh):
         return hh if self.solver_type == "bh1" else jnp.expm1(hh)
@@ -1089,10 +1090,10 @@ class UniPC:
     def _corrected(self, x, state: UniPCState, m_here, alpha_here, sigma_here, lambda_here):
         """`x` corrected with the UniC of the last predictor's own order.
 
-        The first step has no predictor to correct, and `disable_corrector`
-        names the step indices whose predictor output is left as it is. The
-        corrector reads the history as it stood before this point's output
-        was pushed onto it.
+        The first step has no predictor to correct (the state's order is 0
+        until one runs), and `disable_corrector` names the step indices whose
+        predictor output is left as it is. The corrector reads the history as
+        it stood before this point's output was pushed onto it.
         """
         history = state.history
         taken, lambdas = history.taken, history.lambdas
@@ -1118,8 +1119,7 @@ class UniPC:
 
         disabled = reduce(jnp.logical_or, [taken - 1 == index for index in self.disable_corrector],
                           jnp.zeros((), bool))
-        use_corrector = jnp.logical_and(taken > 0, jnp.logical_not(disabled))
-        branch = jnp.where(use_corrector, state.last_order, 0)
+        branch = jnp.where(disabled, 0, state.last_order)
         return lax.switch(branch, [lambda _: x] + [
             (lambda p: lambda _: corrected(p))(p) for p in range(1, self.order + 1)], None)
 
