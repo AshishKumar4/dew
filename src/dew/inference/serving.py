@@ -18,8 +18,8 @@ row's decode token share a forward is not expressible: the step runs the
 prompts as one forward at their own width and the decode trip as another,
 and both live in one program. An iteration that admits nothing compiles to
 the decode trip alone. The admission forward is sized `admission` rows at a
-`SHAPE_BUCKETS` prompt width, so a server compiles one program per prompt
-bucket plus the decode-only one.
+`SHAPE_BUCKETS` prompt width capped at the capacity, so a server compiles one
+program per prompt bucket up to its capacity plus the decode-only one.
 
 The server is built from a task, `Server.from_task(task, slots=, capacity=)`,
 so `dew.pipeline` stays the one way to load weights and a processor. Every

@@ -302,6 +302,22 @@ def test_a_sampling_call_does_not_encode_the_tasks_own_unconditional_prompt(monk
     assert np.shape(calls[1]["input_ids"]) == (1, TOKENS)
 
 
+def test_uint8_pixels_reach_the_sampler_as_training_normalizes_them():
+    """An img2img or inpainting call's uint8 image normalizes exactly as
+    training reads the same pixels through `unit_range`: subtracting 127.5
+    and then dividing, where dividing and then subtracting 1 differs in
+    float32 on 128 of the 256 levels, by up to 6e-8."""
+    from dew.inputs import unit_range
+    from dew.sampling import TextToImage
+
+    objective = make_objective()
+    pipe = TextToImage.from_objective(objective, objective.init(jax.random.PRNGKey(0)))
+    levels = np.resize(np.arange(256, dtype=np.uint8), (2, RES, RES, 3))
+    supplied = pipe._supplied(2, pipe.latent_shape, image=levels, image_latents=None, mask=None,
+                              noise=None, initial=None)
+    np.testing.assert_array_equal(supplied["image"], np.asarray(unit_range(levels)))
+
+
 def test_the_compiled_step_carries_no_autoencoder_constants():
     """T19, the VAE half: the autoencoder weights arrive through
     `params["autoencoder"]`, so the loss's jaxpr has no constant of the

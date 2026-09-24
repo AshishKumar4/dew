@@ -19,7 +19,7 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
-from dew.inputs import InputSpec
+from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
@@ -425,7 +425,7 @@ class TextToImage:
         samples: dict[str, np.ndarray] = {}
         if image is not None:
             pixels = _image_rows(image, rows, self.inputs.sample.shape, "image")
-            samples["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
+            samples["image"] = np.asarray(unit_range(pixels)) if pixels.dtype == np.uint8 else pixels
         for name, value in (("image_latents", image_latents), ("noise", noise), ("initial", initial)):
             if value is not None:
                 samples[name] = _image_rows(value, rows, shape, name)
