@@ -19,7 +19,15 @@ from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
-from dew.pool import PROCESS_COUNT, PROCESS_ID, detected_cluster
+from dew.pool import (
+    PROCESS_COUNT,
+    PROCESS_ID,
+    detected_cluster,
+    local_gpu_count,
+    refuse_idle_gpus,
+    runs_on_gpu,
+    slurm_tasks_here,
+)
 from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
@@ -68,6 +76,9 @@ def prepare_process(wandb: Wandb | None = None,
     or mpirun started its ranks there, which JAX's detection reads before
     Slurm's: JAX would still start a pool of that one task, at a coordinator
     named after the node, which a container on the node need not resolve.
+    A Slurm step of several tasks with fewer on this node than the GPUs its
+    task sees is refused: JAX gives each task the GPU at its SLURM_LOCALID,
+    and the others would sit idle.
 
     xla_flags reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
@@ -104,6 +115,12 @@ def prepare_process(wandb: Wandb | None = None,
     cluster = None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
     one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
                 and cluster.count == 1)
+    tasks = slurm_tasks_here()
+    if (cluster is not None and cluster.name == "slurm" and cluster.count > 1 and tasks is not None
+            and runs_on_gpu(os.environ)):
+        # Before joining: a pool whose ranks see GPUs they will not use
+        # trains on fewer than it was given, and nothing reports it.
+        refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
     if multi_host is not False and not one_task:
         try:
             if PROCESS_COUNT in os.environ:
