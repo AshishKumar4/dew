@@ -279,13 +279,15 @@ def read_weights(folder) -> dict[str, np.ndarray]:
     return tensors
 
 
-def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     """Return a file's flat tensor table, names as stored, and its header metadata.
 
     One read-only memory map backs every array, so the tensors stay file
     backed after the reader closes and arrive in their stored dtype -
     bfloat16 and the FP8 formats included, and F4 as its `PACKED_F4` byte
-    view. Anything that wants float32 asks for it.
+    view. Anything that wants float32 asks for it. `copy_on_write` maps the
+    file privately instead: the arrays are writable, and a page is copied
+    only when written, never back to the file.
     """
     filename = os.fspath(path)
     tensors: dict[str, np.ndarray] = {}
@@ -294,7 +296,7 @@ def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
         with open(filename, "rb") as stream:
             length = int.from_bytes(stream.read(8), "little")
             header = json.loads(stream.read(length))
-        mapping = np.memmap(filename, mode="r", dtype=np.uint8)
+        mapping = np.memmap(filename, mode="c" if copy_on_write else "r", dtype=np.uint8)
         metadata = reader.metadata() or {}
         offsets = _tensor_offsets(filename, header)
         names = reader.keys()
