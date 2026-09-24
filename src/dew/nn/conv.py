@@ -13,7 +13,8 @@ out right whenever the input and the output were split over every mesh axis
 or over none, and a 1x1 convolution and every dot_general came out right in
 every layout we tried. The input and bias gradients were right throughout.
 
-`Conv` exists only to work around that bug. When XLA partitions the kernel
+`Conv` exists only to work around that bug, reported as
+https://github.com/openxla/xla/issues/49382. When XLA partitions the kernel
 gradient correctly, this module goes and every model uses `flax.linen.Conv`
 again.
 """
