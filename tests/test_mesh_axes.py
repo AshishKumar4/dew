@@ -130,6 +130,40 @@ def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
     assert flops(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
 
 
+
+def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
+    """Multi-head latent attention compresses the residual into a query
+    latent and a key-value latent before the head-split up-projections. The
+    tensor axis splits the heads, not those latents, so every tensor shard
+    computed both down-projections over every token: at DeepSeek-V3's shape
+    (hidden 7168, latents 1536 and 512 + 64, 4096 tokens) 13.3% more work a
+    device than an even split under tensor=8, 5.7% under tensor=4. Four
+    tensor shards compute one device's matmul FLOPs. (The latents' kernels
+    ride fsdp, so with no fsdp axis they stay whole on every device: a sixth
+    of this toy's weights, a thousandth of V3's.)"""
+    from dew.telemetry.instrumentation import compiled_flops
+
+    model = models.build(
+        "causal_transformer", vocab_size=VOCAB, emb_features=64, num_layers=1, num_heads=4,
+        mlp_features=64, max_seq_len=SEQ_LEN,
+        mixer={"kind": "mla", "q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+               "qk_rope_head_dim": 8, "v_head_dim": 16})
+
+    def flops(mesh: MeshSpec, devices) -> float:
+        trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
+                          checkpoints=None, tracker=None)
+        trainer.device_mesh = build_mesh(mesh, devices)
+        state, _, _ = trainer.place()
+        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
+        assert trainer.executable is not None
+        counted = compiled_flops(trainer.executable)
+        assert counted is not None
+        return counted * len(devices)
+
+    one = flops(MeshSpec(), jax.devices()[:1])
+    assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
+
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
     """Tensor parallelism alone, no fsdp: every attention and mlp projection
     names the tensor axis, so the default tolerance holds with nothing but
