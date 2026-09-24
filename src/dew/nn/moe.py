@@ -42,7 +42,7 @@ from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
-from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
+from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
 from .precision import rounded_operand, rounded_to
 from .sharding import (
     EXPERT_AXIS,
@@ -456,20 +456,8 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
             implementation=TOKAMAX_KERNEL_BY_GENERATION.get(device_generation(), 'xla'))
-    # A 16-bit product is exact at any precision, and XLA's TPU ragged-dot
-    # kernel refuses 16-bit operands at HIGHEST ("Bad lhs type"), so they
-    # multiply at DEFAULT: the same products, summed in the preferred type.
-    if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
-        precision = jax.lax.Precision.DEFAULT
-    # XLA's TPU kernel writes values into the rows past the groups, where
-    # other backends write zeros, and its lhs cotangent is the same kernel.
-    # Those rows are zeroed going in and coming out, so neither the output
-    # nor a dropped row's gradient carries them.
-    grouped = jnp.arange(tokens.shape[0])[:, None] < jnp.sum(group_sizes)
-    out = jax.lax.ragged_dot(
-        jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
-        preferred_element_type=preferred_element_type)
-    return jnp.where(grouped, out, 0)
+    return xla_ragged_dot(tokens, kernel, group_sizes, precision=precision,
+                          preferred_element_type=preferred_element_type)
 
 
 def _local(value: jax.Array) -> bool:
@@ -559,12 +547,12 @@ def _projection_jvp(dtype: Dtype | None, implementation: str, precision: Precisi
     terms = []
     if 'x' in held:
         matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-        terms.append(jax.lax.ragged_dot(
+        terms.append(xla_ragged_dot(
             held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
     if 'kernel' in held:
         inputs = jnp.asarray(rounded_operand(x, output.dtype))
-        terms.append(jax.lax.ragged_dot(
+        terms.append(xla_ragged_dot(
             inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
     total = terms[0] if len(terms) == 1 else terms[0] + terms[1]

@@ -86,12 +86,34 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     return branches, fallback
 
 
+def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
+                   precision: PrecisionLike = None,
+                   preferred_element_type: Dtype | None = None) -> jax.Array:
+    """`jax.lax.ragged_dot` as every backend runs it alike.
+
+    A 16-bit product is exact at any precision, and XLA's TPU ragged-dot
+    kernel refuses 16-bit operands at HIGHEST ("Bad lhs type"), so they
+    multiply at DEFAULT: the same products, summed in the preferred type.
+    XLA's TPU kernel writes values into the rows past the groups, where
+    other backends write zeros, and its lhs cotangent is the same kernel.
+    Those rows are zeroed going in and coming out, so neither the output
+    nor a dropped row's gradient carries them.
+    """
+    if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
+        precision = jax.lax.Precision.DEFAULT
+    grouped = jnp.arange(tokens.shape[0])[:, None] < jnp.sum(group_sizes)
+    out = jax.lax.ragged_dot(
+        jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
+        preferred_element_type=preferred_element_type)
+    return jnp.where(grouped, out, 0)
+
+
 def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
     def kernel(inputs, matrix, sizes, *, interpret):
         return _gmm(inputs, matrix, sizes, out_dtype, trans_rhs=False, interpret=interpret)
 
     def fallback(inputs, matrix, sizes):
-        return jax.lax.ragged_dot(inputs, matrix, sizes, preferred_element_type=out_dtype)
+        return xla_ragged_dot(inputs, matrix, sizes, preferred_element_type=out_dtype)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
     return jax.lax.platform_dependent(inputs, matrix, sizes, default=default, **branches)
@@ -103,9 +125,9 @@ def _backward(inputs, matrix, sizes, cotangent, work, interpret_on_cpu):
                 _tgmm(inputs, cotangent, sizes, work, interpret=interpret))
 
     def fallback(inputs, matrix, sizes, cotangent):
-        d_inputs = jax.lax.ragged_dot(cotangent, jnp.swapaxes(matrix, 1, 2), sizes,
-                                      preferred_element_type=work)
-        _, pullback = jax.vjp(lambda matrix: jax.lax.ragged_dot(
+        d_inputs = xla_ragged_dot(cotangent, jnp.swapaxes(matrix, 1, 2), sizes,
+                                  preferred_element_type=work)
+        _, pullback = jax.vjp(lambda matrix: xla_ragged_dot(
             inputs, matrix, sizes, preferred_element_type=work), matrix.astype(work))
         return d_inputs, pullback(cotangent.astype(work))[0]
 
