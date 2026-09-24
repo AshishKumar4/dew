@@ -252,7 +252,7 @@ def write_deepseek_v2(directory: Path) -> None:
         "router_weights": weights.to(torch.float32).numpy(),
         "router_indices": indices.to(torch.int32).numpy(),
     }
-    np.savez(directory / "deepseek_v2.npz", allow_pickle=False, **arrays)
+    np.savez(directory / "deepseek_v2.npz", **arrays)
     print(f"deepseek_v2.npz: {len(arrays)} arrays, indices[:4]="
           f"{arrays['router_indices'][:4].tolist()}")
 

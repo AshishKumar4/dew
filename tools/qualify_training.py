@@ -128,7 +128,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
             reference_arrays["gradient/" + layout.name] = layout.export(
                 {"params": gradients}
             )
-        np.savez(run / "reference.npz", allow_pickle=False, **reference_arrays)
+        np.savez(run / "reference.npz", **reference_arrays)
     started = time.perf_counter()
     state = trainer.fit(
         data, steps=STEPS, log_every=1, checkpoint_every=CHECKPOINT_STEP

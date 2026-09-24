@@ -117,7 +117,7 @@ def main(destination: str) -> None:
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
     arrays = build(root)
-    np.savez_compressed(root / "qwen_image_vae.npz", allow_pickle=False, **arrays)
+    np.savez_compressed(root / "qwen_image_vae.npz", **arrays)
     record = {"diffusers": diffusers.__version__, "commit": DIFFUSERS_COMMIT, "config": CONFIG,
               "batch": BATCH, "height": HEIGHT, "width": WIDTH, "seed": SEED}
     (root / "qwen_image_vae.json").write_text(json.dumps(record, indent=1) + "\n")

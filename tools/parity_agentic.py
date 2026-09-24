@@ -192,7 +192,7 @@ def main() -> None:
     assert current.grad is not None
     out.update(per_rollout_loss=per_rollout.detach().numpy(), per_rollout_grad=current.grad.numpy())
 
-    np.savez(OUTPUT, allow_pickle=False, verl_revision=np.asarray(VERL_REVISION),
+    np.savez(OUTPUT, verl_revision=np.asarray(VERL_REVISION),
              lightning_revision=np.asarray(LIGHTNING_REVISION), torch_version=np.asarray(torch.__version__),
              old=OLD, behavior=BEHAVIOR, current=CURRENT, mask=MASK, advantages=ADVANTAGES,
              rollouts=np.asarray(ROLLOUTS), epsilon_low=np.float32(EPSILON_LOW),
