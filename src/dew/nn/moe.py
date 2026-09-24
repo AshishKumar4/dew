@@ -634,14 +634,23 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
     activate = gates[activation]
 
-    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
+    # Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
+    # differentiated as written it keeps five fp32 copies of the MLP's width
+    # per token. An unrolled stack lets XLA fuse them away; a scanned one
+    # stores them: on a TPU v6e a scanned 12-layer 512-wide decoder's step
+    # took 10.51 ms with them and 9.06 ms without, and 1.33x the memory.
+    @functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
+    def rounded_product(gate: jax.Array, up: jax.Array) -> jax.Array:
         dtype = jnp.result_type(gate, up)
-        if jnp.finfo(dtype).bits >= 32:
-            return activate(gate) * up
         gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
         up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
         activated = rounded_to(activate(gate_fp32), gate.dtype)
         return rounded_to(activated * up_fp32, dtype).astype(dtype)
+
+    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
+        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
+            return activate(gate) * up
+        return rounded_product(gate, up)
 
     return product
 
