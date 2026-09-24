@@ -13,6 +13,7 @@ import itertools
 import json
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -36,7 +37,7 @@ from dew.data import (
     images,
     video,
 )
-from dew.data.dataset import Forwarding, _batches, hold_out, train_stream, validation_pass
+from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
@@ -906,13 +907,13 @@ class Lingering(Augmenting):
 
 
 @pytest.mark.slow
-def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound():
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capsys):
     """grain stops a stream's worker processes one after another, each
     finishing the batch in its hands before it exits, and kills a worker
     that has not exited within 25 s. Four workers taking 2 s each keep a
     close over 8 s: slow, but bounded by grain itself, so the close must not
-    call it a hang. sft_gemma4's four workers took 5.1 to 7.4 s to stop, past
-    a budget of 2 s and 1 s a worker."""
+    call it a hang, and says what it waits for. sft_gemma4's four workers
+    took 5.1 to 7.4 s to stop, past a budget of 2 s and 1 s a worker."""
     from dew.training import MeshSpec, build_mesh
     from dew.training.distributed import DevicePrefetchIterator
 
@@ -927,6 +928,30 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound():
     began = time.perf_counter()
     prefetch.close()
     assert time.perf_counter() - began > loading.workers * data.seconds
+    assert "waiting for 4 grain workers to stop" in capsys.readouterr().err
+
+
+def test_a_stop_closes_grain_when_no_thread_can_announce_it(monkeypatch):
+    """At interpreter shutdown no thread starts, so neither does the timer
+    that announces a long stop; the stop closes grain's pipeline all the
+    same, or its workers would outlive the run."""
+    def refused(timer):
+        raise RuntimeError("can't create new thread at interpreter shutdown")
+
+    monkeypatch.setattr(threading.Timer, "start", refused)
+    closed = []
+
+    class Reads:
+        def __next__(self):
+            return {"text": np.zeros((1, 2), np.int32)}
+
+        def close(self):
+            closed.append(True)
+
+    stream = GlobalStream(lambda offset: Reads(), 1, "one order", Loading(workers=2))
+    next(stream)
+    stream.close()
+    assert closed == [True]
 
 
 def test_augmentation_really_moves_the_pixels():

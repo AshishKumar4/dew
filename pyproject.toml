@@ -37,7 +37,9 @@ dependencies = [
     "opencv-python-headless",
     "einops",
     "tqdm",
-    "grain",
+    # dew.data.dataset reads grain's private _PROCESS_KILL_TIMEOUT_S for its
+    # close budget; 0.2.18 is the release that was tested.
+    "grain>=0.2.18,<0.3",
     "termcolor",
     "tyro",
     "typing_extensions>=4.14",
@@ -203,6 +205,10 @@ split-on-trailing-comma = false
 # A stalled url loader says so on stdout instead of inventing a batch;
 # tests/test_online_loader.py asserts that line. Its other diagnostics log.
 "src/dew/data/online_loader.py" = ["T201"]
+# A stop of grain's workers that runs past a few seconds says on stderr what it
+# waits for, so a long close does not read as a hang; tests/test_data.py
+# asserts that line.
+"src/dew/data/dataset.py" = ["T201"]
 # Four modules import at the bottom on purpose. The mixer hub imports each
 # kind module after the base class those modules subclass; `mla` imports the
 # hub back after the indexer name and cache `dsa_kpool` reads, so either

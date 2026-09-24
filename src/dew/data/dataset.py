@@ -23,12 +23,14 @@ anything to what a checkpoint holds.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import functools
 import itertools
 import json
 import math
 import sys
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
 
@@ -259,6 +261,21 @@ class Forwarding:
             source.close()
 
 
+_QUIET_STOP_SECONDS = 5.0
+"""How long a stop of grain's workers runs before it says what it waits for
+(`Loading.announced_stop`)."""
+
+
+def _grain_kill_seconds() -> int:
+    """How long grain waits for a stopped worker process to exit before it
+    kills it: its own `_PROCESS_KILL_TIMEOUT_S`. The name is private, so it is
+    read where a grain-backed stream needs it, and a grain release that moves
+    it breaks only grain-backed loading."""
+    from grain._src.python.dataset.transformations import process_prefetch
+
+    return process_prefetch._PROCESS_KILL_TIMEOUT_S
+
+
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """Says how fast records are read, in grain's four throughput knobs.
@@ -282,12 +299,50 @@ class Loading:
 
     @property
     def stop_seconds(self) -> float:
-        """How long a stop of this many workers is allowed to take.
+        """How long a stop of this many workers may take before it counts as
+        a hang: grain's own bound.
 
-        Grain joins its worker processes one at a time, ~0.5 s each idle and
-        up to a batch's work each busy.
+        The stop waits out the batch being read. Grain then stops the worker
+        processes one after another, each finishing the batch in its hands
+        before it exits, and kills a worker that has not exited within
+        `_grain_kill_seconds`, which is grain's own, so an upgrade that changes
+        it moves the budget with it; the read gets that long too. Slow stops
+        are ordinary: sft_gemma4's four workers took 5.1 to 7.4 s on 12 vCPUs.
         """
-        return 2.0 + 1.0 * self.workers
+        return float(_grain_kill_seconds() * (1 + self.workers))
+
+    @contextlib.contextmanager
+    def announced_stop(self) -> Iterator[None]:
+        """Stop the workers inside, saying once on stderr what the stop waits
+        for if it runs past `_QUIET_STOP_SECONDS`, so that a long one does not
+        read as a hang."""
+        announcer = self._announcer()
+        try:
+            yield
+        finally:
+            if announcer is not None:
+                announcer.cancel()
+                announcer.join()
+
+    def _announcer(self) -> threading.Timer | None:
+        """A started timer that prints what a stop of these workers waits for
+        once `_QUIET_STOP_SECONDS` pass. None with no workers, and None where
+        no thread can start (at interpreter shutdown, or at the process's
+        thread limit), since the stop must run with or without its line."""
+        if not self.workers:
+            return None
+        line = (f"waiting for {self.workers} grain workers to stop, "
+                f"up to {self.workers * _grain_kill_seconds()} s")
+        timer = threading.Timer(_QUIET_STOP_SECONDS, print, (line,),
+                                {"file": sys.stderr, "flush": True})
+        timer.daemon = True
+        try:
+            timer.start()
+        except RuntimeError as refused:
+            print(f"stopping {self.workers} grain workers without a progress line: {refused}",
+                  file=sys.stderr, flush=True)
+            return None
+        return timer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,7 +502,7 @@ class Dataset:
                 return GlobalStream(
                     lambda offset: _shared(endless, rows=rows, partition=partition,
                                            loading=loading, offset=offset),
-                    batch, order, loading.stop_seconds)
+                    batch, order, loading)
         else:
             def training(partition: DataPartition) -> Iterator[Batch]:
                 return _shared(train, rows=partition.rows(batch), partition=partition,
@@ -964,13 +1019,14 @@ class GlobalStream:
     """
 
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str, stop_seconds: float):
+                 batch: int, order: str, loading: Loading):
         self._open = open_at
         self._batch = batch
         self._order = order
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
-        self.stop_seconds = stop_seconds
+        self._loading = loading
+        self.stop_seconds = loading.stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
         return self
@@ -1011,7 +1067,8 @@ class GlobalStream:
     def close(self) -> None:
         reads, self._reads = self._reads, None
         if reads is not None:
-            reads.close()
+            with self._loading.announced_stop():
+                reads.close()
 
 
 class PhasedStream:
@@ -1316,7 +1373,7 @@ def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str,
             return _batches(records(), rows=rows, partition=partition, loading=loading,
                             offset=offset)
 
-        return GlobalStream(open_at, batch, order, loading.stop_seconds)
+        return GlobalStream(open_at, batch, order, loading)
 
     return stream
 
