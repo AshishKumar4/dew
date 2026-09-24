@@ -1,7 +1,7 @@
 import os
 import subprocess
 import sys
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
 # `mesh` needs this many devices, or its `devices=`; a run with fewer, such
@@ -69,6 +69,21 @@ def _local_tpus(environ: MutableMapping[str, str]) -> int:
     if visible is not None:
         chips = len([chip for chip in visible.split(",") if chip.strip()])
     return chips * per_chip
+
+
+def outside_any_cluster(environ: Mapping[str, str]) -> dict[str, str]:
+    """`environ` as a process on a machine in no cluster jax detects sees it,
+    for a program the test places itself or a launch that stands in for a
+    cluster with variables of its own: no Slurm or Open MPI variables, no
+    Cloud TPU VM worker list, no Kubernetes pod, and TPU_SKIP_MDS_QUERY,
+    jax's switch for a host whose metadata names no TPU cluster (the
+    variables `jax._src.clusters` reads). A Colab TPU VM otherwise shows
+    jax a TPU cluster of one process ahead of any of them."""
+    kept = {name: value for name, value in environ.items()
+            if not name.startswith(("SLURM_", "OMPI_"))
+            and name not in ("TPU_WORKER_HOSTNAMES", "TPU_PROCESS_ADDRESSES",
+                             "TPU_PROCESS_ADDRESSES_PATH", "KUBERNETES_SERVICE_HOST")}
+    return {**kept, "TPU_SKIP_MDS_QUERY": "1"}
 
 
 configure_lane(os.environ)
