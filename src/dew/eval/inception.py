@@ -77,12 +77,15 @@ class BasicConv2d(nn.Module):
     def __call__(self, x):
         # Every width in the network reaches a convolution through here, so
         # the divisor is applied once, at the only place a filter count is
-        # declared. The norm below takes its shape from the input.
+        # declared, and so is the precision: pytorch-fid's features are fp32
+        # convolutions, and a TPU's DEFAULT is one bf16 pass. The norm below
+        # takes its shape from the input.
         x = nn.Conv(features=max(self.out_channels // self.channel_divisor, 1),
                     kernel_size=self.kernel_size,
                     strides=self.strides,
                     padding=self.padding,
-                    use_bias=False)(x)
+                    use_bias=False,
+                    precision=jax.lax.Precision.HIGHEST)(x)
         x = nn.BatchNorm(use_running_average=True, epsilon=0.001)(x)
         return jax.nn.relu(x)
 

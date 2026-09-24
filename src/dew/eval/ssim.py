@@ -43,11 +43,14 @@ def _ssim_single_channel(
 
     def filt(img: jnp.ndarray) -> jnp.ndarray:
         img = img[None, None]  # (1, 1, H, W)
+        # HIGHEST whatever the process default: a TPU's DEFAULT is one bf16
+        # pass, which moves the variances below off the reference's fp64.
         out = jax.lax.conv_general_dilated(
             img, window_2d,
             window_strides=(1, 1),
             padding="VALID",
             dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            precision=jax.lax.Precision.HIGHEST,
         )
         return out[0, 0]  # (H', W')
 
