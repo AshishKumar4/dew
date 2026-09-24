@@ -24,7 +24,7 @@ from .attention_sinks import attention_with_sinks
 from .conv import Conv
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import precision_names, rounded_to
+from .precision import at_default_precision, precision_names, rounded_to
 from .rope import apply_rotary
 from .sharding import (
     HEADS,
@@ -1478,6 +1478,23 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     takes no such argument, so the calls that fall through to it run on a TPU
     and nowhere else.
     """
+    if jnp.finfo(query.dtype).bits == 16 and not interpret:
+        # Mosaic multiplies 16-bit operands at the default precision only.
+        # Their products are exact and accumulate in fp32; splash's fp32 P·V
+        # takes one bf16 pass, as at any default-precision run
+        # (`at_default_precision`).
+        return at_default_precision(lambda query, key, value, bias, sinks: _tpu_kernels(
+            query, key, value, bias, mask, causal, sliding_window, softcap=softcap,
+            sinks=sinks, segment_ids=segment_ids, interpret=interpret))(
+                query, key, value, bias, sinks)
+    return _tpu_kernels(query, key, value, bias, mask, causal, sliding_window,
+                        softcap=softcap, sinks=sinks, segment_ids=segment_ids,
+                        interpret=interpret)
+
+
+def _tpu_kernels(query, key, value, bias, mask, causal, sliding_window, *,
+                 softcap, sinks, segment_ids, interpret: bool):
+    """`tpu_attention` at whatever matmul precision is configured."""
     q_len, kv_len = query.shape[-3], key.shape[-3]
     descriptor = None
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
