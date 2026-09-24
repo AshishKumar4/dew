@@ -257,6 +257,42 @@ def test_the_loss_is_the_nelbo_of_the_row_the_model_saw(rng, monkeypatch):
     np.testing.assert_array_equal(scored.weights, 1.0)
 
 
+def test_a_packed_window_scores_as_its_documents_would_one_by_one(rng, monkeypatch):
+    """Two documents and a padded tail in one window, against each document
+    alone in a window of its own: every masked token scores the same, since
+    a document attends only to itself, in both directions, from its own
+    positions. The tail is never masked or counted, so the loss is the bound
+    per real token."""
+    objective = MaskedDiffusionObjective(transformer(causal=False), MDLM(mask_id=MASK)(), 8)
+    params = objective.init(rng)
+    first, second = [1, 2, 3], [4, 5]
+    packed = {"text": jnp.array([first + second + [0] * 3]),
+              "text_segment_ids": jnp.array([[1, 1, 1, 2, 2, 0, 0, 0]]),
+              "text_positions": jnp.array([[0, 1, 2, 0, 1, 0, 0, 0]])}
+    alone = {"text": jnp.array([first + [0] * 5, second + [0] * 6]),
+             "text_segment_ids": jnp.array([[1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0]]),
+             "text_positions": jnp.array([[0, 1, 2, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0]])}
+    # One noise level, and a masking that hides one token of each document
+    # and every padded slot, which the objective has to leave out.
+    hidden = {1: jnp.array([[0, 1, 0, 1, 0, 1, 1, 1]], bool),
+              2: jnp.array([[0, 1, 0, 1, 1, 1, 1, 1], [1, 0, 1, 1, 1, 1, 1, 1]], bool)}
+    monkeypatch.setattr(DiscreteProcess, "sample_t", lambda self, key, n: jnp.full((n,), 0.5))
+    monkeypatch.setattr(DiscreteProcess, "corrupt", lambda self, key, tokens, t: (
+        jnp.where(hidden[tokens.shape[0]], MASK, tokens), hidden[tokens.shape[0]]))
+    step = Step(jnp.asarray(0), rng, None)
+
+    together = objective.evaluate(params, packed, step)
+    apart = objective.evaluate(params, alone, step)
+
+    np.testing.assert_allclose(together.losses[0, :3], apart.losses[0, :3], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(together.losses[0, 3:5], apart.losses[1, :2], rtol=1e-5, atol=1e-6)
+    assert float(together.losses[0, 1]) > 0 and float(together.losses[0, 3]) > 0
+    np.testing.assert_array_equal(together.losses[0, 5:], 0.0)
+    np.testing.assert_array_equal(together.weights, [[1, 1, 1, 1, 1, 0, 0, 0]])
+    loss, _ = scalar_loss(objective, params, packed, step)
+    np.testing.assert_allclose(loss, together.losses.sum() / 5, rtol=1e-5)
+
+
 ############################################################################################################
 # A masked diffusion LM trains on the LM data path with no trainer change
 ############################################################################################################
