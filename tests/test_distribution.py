@@ -13,9 +13,12 @@ have to be the reference's.
 import dataclasses
 import json
 import os
+import re
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -439,6 +442,106 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
     assert done.returncode == 1, output
     assert "rank 3 on localhost exited 1; stopping the other 3" in done.stdout, output
     assert "Terminating process" not in output and "Check failure" not in output, output
+
+
+def stopped_by_sigterm(process: subprocess.Popen, after: str, timeout: float = 300) -> tuple[int, str]:
+    """SIGTERM `process` once its output shows `after`, as a scheduler stops
+    a job, and return its exit code and everything it printed."""
+    assert process.stdout is not None and process.stderr is not None
+    lines: list[str] = []
+
+    def read(stream) -> None:
+        # Extended a line at a time, so the loop below sees each as it comes.
+        lines.extend(stream)
+
+    readers = [threading.Thread(target=read, args=(stream,), daemon=True)
+               for stream in (process.stdout, process.stderr)]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout
+    while not any(after in line for line in lines):
+        assert process.poll() is None and time.monotonic() < deadline, "".join(lines)
+        time.sleep(0.1)
+    process.send_signal(signal.SIGTERM)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        pytest.fail(f"still running {timeout}s after SIGTERM\n{''.join(lines)}")
+    for reader in readers:
+        reader.join(timeout=30)
+    return process.returncode, "".join(lines)
+
+
+def resumed_where_it_stopped(tmp_path: Path, run) -> None:
+    """Train the worker's varying stream for eight steps uninterrupted; again,
+    SIGTERMed after its second step; and once more from its checkpoints.
+    `run(arguments, stop)` runs the worker with `arguments` and returns its
+    exit code and output, SIGTERMed after the second step when `stop`."""
+    steps, checkpoints = 8, tmp_path / "checkpoints"
+    worker = ["--steps", str(steps), "--vary"]
+    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], False)
+    assert code == 0, output
+    code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints", str(checkpoints),
+                        "--step-seconds", "1"], True)
+    assert code == 128 + signal.SIGTERM, output
+    assert "Terminating process" not in output and "Check failure" not in output, output
+    stopped = re.search(r"Preempted at step (\d+)", output)
+    assert stopped is not None, output
+    at = int(stopped[1])
+    assert 2 <= at < steps, output
+    code, output = run([*worker, "--out", str(tmp_path / "resumed.json"), "--checkpoints", str(checkpoints)],
+                       False)
+    assert code == 0, output
+    whole, resumed = (json.loads((tmp_path / name).read_text()) for name in ("whole.json", "resumed.json"))
+    # The state, the key and the data position all came back: every loss
+    # after the stop is the uninterrupted run's, to the bit.
+    assert resumed["loss_steps"] == list(range(at + 1, steps + 1)), output
+    assert resumed["losses"] == whole["losses"][at:], output
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_pool_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_path):
+    """A scheduler stops a job with SIGTERM and SIGKILLs it a grace later:
+    Slurm's KillWait, Kubernetes' termination grace, a spot VM's notice.
+    JAX's preemption service takes the signal in every rank of a pool, so the
+    ranks ran on until the SIGKILL, and everything since the last checkpoint
+    was lost. The fit now stops at the step the ranks agree on, writes that
+    step's state and data position, and exits with SIGTERM's code; run
+    again, it resumes there."""
+    def run(arguments: list[str], stop: bool) -> tuple[int, str]:
+        pool = start("--processes-per-host", "2", "--", sys.executable, str(WORKER),
+                     "--mesh", json.dumps({"fsdp": 2}), *arguments, devices=1)
+        if stop:
+            return stopped_by_sigterm(pool, "] step 2: loss")
+        done = finished(pool, timeout=300)
+        return done.returncode, done.stdout + done.stderr
+
+    resumed_where_it_stopped(tmp_path, run)
+
+
+@pytest.mark.mesh(devices=1)
+def test_a_lone_process_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_path):
+    """A process in no pool has no preemption service: SIGTERM's default
+    ended it where it stood. The fit catches it and stops as a pool does."""
+    # Neither Slurm's variables nor Open MPI's around the test make a pool of it.
+    env = {name: value for name, value in os.environ.items() if not name.startswith(("SLURM_", "OMPI_"))}
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    # Each line as it is printed, as `dew launch` has its ranks write: a piped
+    # stdout holds the step lines until exit, and the signal would come after
+    # the fit had ended.
+    env["PYTHONUNBUFFERED"] = "1"
+
+    def run(arguments: list[str], stop: bool) -> tuple[int, str]:
+        process = subprocess.Popen([sys.executable, str(WORKER), "--mesh", "{}", *arguments],
+                                   cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        if stop:
+            return stopped_by_sigterm(process, "step 2: loss")
+        done = finished(process, timeout=300)
+        return done.returncode, done.stdout + done.stderr
+
+    resumed_where_it_stopped(tmp_path, run)
 
 
 @pytest.mark.mesh(devices=2)
