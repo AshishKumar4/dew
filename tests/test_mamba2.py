@@ -34,9 +34,9 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, ModelInputs
-from dew.nn.mixers import mixer_from_record
 from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd, segment_sum
 from dew.objectives.lm import LMObjective
+from dew.registry import mixers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
@@ -318,11 +318,11 @@ def test_padded_packed_rows_reset_at_each_document():
 def test_the_kind_builds_from_the_configs_fields():
     record = {"kind": "mamba2", "num_heads": 4, "head_dim": 6, "state_size": 5, "n_groups": 2,
               "conv_kernel": 4, "chunk_size": 8}
-    mixer = mixer_from_record(record)
+    mixer = mixers.from_record(record)
     assert isinstance(mixer, Mamba2Mixer)
     assert mixer.n_groups == 2 and mixer.chunk_size == 8
     with pytest.raises(ValueError):
-        mixer_from_record({**record, "linear_num_heads": 4})
+        mixers.from_record({**record, "linear_num_heads": 4})
 
 
 def tiny_lm(**overrides) -> CausalTransformer:

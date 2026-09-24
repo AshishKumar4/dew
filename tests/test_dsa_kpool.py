@@ -32,7 +32,7 @@ from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttenti
 
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixers import MixerContext, mixer_from_record, mixers
+from dew.nn.mixers import MixerContext, mixers
 from tools.hf_reference import scatter_weights
 
 BOUND = 1e-4
@@ -258,7 +258,7 @@ def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
 
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():
     record = {"kind": "kpool_sparse_attention", **SETTINGS}
-    mixer = mixer_from_record(record)
+    mixer = mixers.from_record(record)
     assert isinstance(mixer, KPoolSparseAttentionMixer)
     assert mixers["kpool_sparse_attention"] is KPoolSparseAttentionMixer
     assert (mixer.index_topk, mixer.index_kpool, mixer.q_lora_rank) == (4, 2, 8)
@@ -270,7 +270,7 @@ def test_the_kind_builds_from_the_configs_fields_and_is_nope():
     assert (built.max_seq_len, built.norm_eps, built.scale_after_cast) == (16, 1e-5, True)
 
     with pytest.raises(ValueError, match="qk_rope_head_dim"):
-        mixer_from_record({**record, "qk_rope_head_dim": 8})
+        mixers.from_record({**record, "qk_rope_head_dim": 8})
     with pytest.raises(ValueError, match="causal"):
         mixer.build(MixerContext(emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8,
                                  max_seq_len=16, causal=False))

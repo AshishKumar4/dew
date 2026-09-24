@@ -21,7 +21,7 @@ from dew.interop.pretrained import load_pretrained
 from dew.nn import vision as V
 from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
-from dew.registry import models, with_precision
+from dew.registry import models, projectors, towers, with_precision
 from dew.training import Layout, MeshSpec, build_mesh
 from dew.training.optim import muon_weight_dimension_numbers
 
@@ -35,8 +35,8 @@ def bundle():
     variables = translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
     # Match the fp32 reference arithmetic on GPU as well as CPU.
     precision = jax.lax.Precision.HIGHEST
-    tower = V.tower_from_record(record["tower"]).build().clone(precision=precision)
-    projector = V.projector_from_record(record["projector"]).build().clone(precision=precision)
+    tower = towers.from_record(record["tower"]).build().clone(precision=precision)
+    projector = projectors.from_record(record["projector"]).build().clone(precision=precision)
     decoder = models.build("causal_transformer", **with_precision(
         "causal_transformer", record["text"], dtype="float32", attention_impl="reference"))
     decoder = decoder.clone(precision=precision)
@@ -278,7 +278,7 @@ def test_image_only_released_config_builds_the_actual_encoder():
     config = json.loads((FIXTURE.parent / "gemma-3n-e2b" / "config.json").read_text())
     config["audio_config"] = None
     record = translate_wrapper_config(config)
-    tower = V.tower_from_record(record["tower"]).build()
+    tower = towers.from_record(record["tower"]).build()
     output, _ = jax.eval_shape(tower.init_with_output, jax.random.key(0),
                                jax.ShapeDtypeStruct((1, 3, 768, 768), jnp.float32))
     assert output.shape == (1, 256, 2048)

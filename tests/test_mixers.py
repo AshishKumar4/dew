@@ -78,7 +78,9 @@ def test_mixer_records_and_values_compute_the_same_logits():
 
 
 def test_an_unknown_mixer_kind_is_refused():
-    with pytest.raises(KeyError, match="no mixer named 'nope'"):
+    """A record naming no registered kind is a bad config, refused as a
+    tower or projector record is."""
+    with pytest.raises(ValueError, match="got 'nope'"):
         tiny(mixer={"kind": "nope"})
 
 
@@ -149,7 +151,7 @@ def test_a_kind_selects_the_mixer_its_layers_run():
 def test_invalid_kind_mixer_records_are_refused():
     with pytest.raises(ValueError, match="kind's mixer"):
         LayerKind(mixer="test_scale")
-    with pytest.raises(KeyError, match="no mixer named 'nope'"):
+    with pytest.raises(ValueError, match="got 'nope'"):
         LayerKind(mixer={"kind": "nope"})
 
 

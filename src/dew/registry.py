@@ -155,6 +155,21 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         member = self[name]
         return member(**self._declared_fields(name, member, {**record, **fields}))
 
+    def from_record(self, record: Mapping[str, object]) -> Built:
+        """Construct the member a `{"kind": ..., **fields}` record names.
+
+        A config writes a mixer, a tower or a projector this way where code
+        passes the value `build` makes, so the two meet here. A record that
+        names no registered kind raises ValueError, with the known ones.
+        """
+        fields = dict(record)
+        kind = fields.pop("kind", None)
+        if not isinstance(kind, str) or kind not in self._members:
+            raise ValueError(
+                f"a {self.kind} record names its kind, one of "
+                f"{', '.join(sorted(self._members))}; got {kind!r}")
+        return self.build(kind, fields)
+
     def _declared_fields(self, name: str, member: Callable[..., Built],
                          fields: Mapping[str, object]) -> Mapping[str, object]:
         """Return `fields` as the member declares them, or raise naming what it
@@ -485,7 +500,7 @@ projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector",
 schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", record="kind")
 
 # Core records nest their fields under a name; model component records inline
-# their fields beside a kind discriminator read by the component's constructor.
+# their fields beside the kind discriminator `Registry.from_record` reads.
 REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors, schedules)
 

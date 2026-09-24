@@ -20,7 +20,7 @@ from dew.data.audio import AudioProcessor
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
-from dew.registry import models, with_precision
+from dew.registry import models, projectors, with_precision
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 HIGHEST = jax.lax.Precision.HIGHEST
@@ -53,7 +53,7 @@ class _Wrapper:
                 self.audio.hidden_size, text_config["emb_features"], vocab_size=record["vocab_size"],
                 vocab_offset=record["vocab_offset"], norm_eps=self.audio.rms_norm_eps, precision=HIGHEST)
             self.projector_variables = {"params": V.translate_gemma3n_projector_weights(embed_audio)}
-            self.vision = V.projector_from_record(V.translate_gemma3n_projector_config(
+            self.vision = projectors.from_record(V.translate_gemma3n_projector_config(
                 self.config, text_config["emb_features"])).build().clone(precision=HIGHEST)
             self.vision_variables = {"params": V.translate_gemma3n_projector_weights(
                 _component(tensors, "model.embed_vision."))}

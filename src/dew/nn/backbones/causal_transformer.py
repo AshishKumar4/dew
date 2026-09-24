@@ -35,7 +35,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.registry import from_record, models
+from dew.registry import from_record, mixers, models
 
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, sources
@@ -60,7 +60,7 @@ from ..hyper_connections import (
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
 from ..kv_cache import KVCache, is_paged
-from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
+from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
@@ -119,7 +119,7 @@ class LayerKind:
         # A kind's mixer and ramp arrive as values from code and as records
         # from a config, like the model's own; anything else is neither.
         if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
+            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"a kind's mixer is a mixer value, its record, or None, "
@@ -1749,7 +1749,7 @@ class CausalTransformer(nn.Module):
         # same `mixers.build` a value is constructed with, so an unknown kind
         # or field raises either way. Anything else is neither.
         if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
+            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")

@@ -30,8 +30,7 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_config, translate_wrapper_config, translate_wrapper_weights
-from dew.nn import vision as V
-from dew.registry import models, with_precision
+from dew.registry import models, projectors, towers, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -169,10 +168,10 @@ def test_wrapper_tower_and_projector_match_the_reference():
         pixels = wrapper_pixels(directory, record)
         tower_ref = np.load(directory / "tower_ref.npy")
         projector_ref = np.load(directory / "projector_ref.npy")
-        tower = V.tower_from_record(record["tower"]).build()
+        tower = towers.from_record(record["tower"]).build()
         assert np.max(np.abs(np.asarray(
             tower.apply(variables["tower"], pixels)) - tower_ref)) < tolerance
-        projector = V.projector_from_record(record["projector"]).build()
+        projector = projectors.from_record(record["projector"]).build()
         assert np.max(np.abs(np.asarray(
             projector.apply(variables["projector"], tower_ref))
             - projector_ref)) < tolerance
@@ -217,9 +216,9 @@ def _multimodal_logits(name, image_id, shift=0):
         load_file(str(directory / "model.safetensors")), record)
     pixels = wrapper_pixels(directory, record)
     ids = np.load(directory / "input_ids.npy")
-    tower = V.tower_from_record(record["tower"]).build()
+    tower = towers.from_record(record["tower"]).build()
     features = tower.apply(variables["tower"], pixels)
-    projector = V.projector_from_record(record["projector"]).build()
+    projector = projectors.from_record(record["projector"]).build()
     soft = projector.apply(variables["projector"], features)
     length = ids.shape[1]
     positions = (np.stack([np.where(row == image_id)[0] for row in ids]) + shift) % length
