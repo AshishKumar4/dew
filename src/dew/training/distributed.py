@@ -11,7 +11,7 @@ import logging
 import math
 import queue
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Iterator
 
 import jax
@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.artifacts import agreed, broadcast_from_process_zero
+from dew.artifacts import agreed, broadcast_from_process_zero, stop_at_exit
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
@@ -645,6 +645,7 @@ class DevicePrefetchIterator:
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
+        self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
         # particular, an interrupt during restoration must unwind through
         # this iterator's close, never the caller's untransferred-source path.
@@ -668,6 +669,15 @@ class DevicePrefetchIterator:
                             error.add_note(f"Source cancellation failed: {failure!r}")
                         self._prefetch()
                     raise
+                # A worker still placing a batch when Python finalizes would abort the process.
+                self._withdraw_exit = stop_at_exit(self._thread, self._cancel, timeout=5.0)
+
+    def _cancel(self) -> None:
+        """Ask the worker to stop between batches, and a stoppable source to stop its own work."""
+        first = not self._stop.is_set()
+        self._stop.set()
+        if first and isinstance(self._iterator, Stoppable):
+            self._iterator.request_stop()
 
     def _prefetch(self):
         """Read, place and enqueue batches until the source drains or a stop.
@@ -757,12 +767,9 @@ class DevicePrefetchIterator:
             timeout = 5.0 if seconds is None else float(seconds)
         if timeout < 0:
             raise ValueError("close timeout must be nonnegative")
-        first_stop = not self._stop.is_set()
-        self._stop.set()
         error = None
         try:
-            if first_stop and isinstance(self._iterator, Stoppable):
-                self._iterator.request_stop()
+            self._cancel()
         except BaseException as failure:
             error = failure
         self._discard()
@@ -771,6 +778,9 @@ class DevicePrefetchIterator:
             self._thread.join(timeout)
         self._discard()
         self._error = None  # Unconsumed speculative errors are discarded too.
+        if not self._thread.is_alive() and self._withdraw_exit is not None:
+            self._withdraw_exit()
+            self._withdraw_exit = None
         failure = None
         if self._thread.is_alive():
             failure = TimeoutError(

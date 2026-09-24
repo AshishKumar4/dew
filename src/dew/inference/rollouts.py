@@ -42,7 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.artifacts import agreed, collective_host
+from dew.artifacts import agreed, collective_host, stop_at_exit
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
@@ -149,7 +149,8 @@ class NativeRolloutServer:
     Submissions and weight loads are serialized with the server's steps by
     one lock; a load lands between two steps. The server's own sampling
     policy and transforms decide the draws, and a draw keeps both the raw
-    and the behavior likelihood the server records.
+    and the behavior likelihood the server records. A program that ends
+    without `close` stops the stepping at exit, after the step under way.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
@@ -161,6 +162,8 @@ class NativeRolloutServer:
         self._failure: BaseException | None = None
         self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
         self._thread.start()
+        # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a poll's.
+        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=60.0)
 
     @property
     def sampling(self) -> Sampling:
@@ -217,11 +220,15 @@ class NativeRolloutServer:
                         future.set_exception(failure)
                 self._outstanding.clear()
 
-    def close(self) -> None:
+    def _stop(self) -> None:
         with self._lock:
             self._closed = True
             self._lock.notify()
+
+    def close(self) -> None:
+        self._stop()
         self._thread.join()
+        self._withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
         for future in list(self._outstanding):
             if not future.done():
