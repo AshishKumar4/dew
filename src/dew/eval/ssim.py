@@ -75,7 +75,13 @@ def _ssim_single_channel(
 
     numerator = (2 * mu_xy + c1) * (2 * sigma_xy + c2)
     denominator = (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
-    return jnp.mean(numerator / denominator)
+    ssim_map = numerator / denominator
+    # A one-pass fp32 mean of near-equal values rounds every partial sum the
+    # same way (7.8e-6 off at 64x64 on CPU XLA). The second pass sums what
+    # the first left over, which is small, and lands within 1e-7 of the
+    # map's float64 mean.
+    first = jnp.mean(ssim_map)
+    return first + jnp.mean(ssim_map - first)
 
 
 def structural_similarity(

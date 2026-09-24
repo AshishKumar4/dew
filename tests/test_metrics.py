@@ -355,18 +355,26 @@ def test_ssim_falls_as_noise_grows(rng):
     assert float(small) > float(large)
 
 
-def test_ssim_matches_the_closed_form_on_constant_images():
+@pytest.mark.parametrize("size", [16, 64])
+def test_ssim_matches_the_closed_form_on_constant_images(size):
     """Constant images have zero local variance, which collapses SSIM to
     (2 mu_x mu_y + C1) / (mu_x^2 + mu_y^2 + C1), and the variance has to come
     out zero in fp32 whatever order a backend sums the window in. Taken as
     E[x^2] - E[x]^2 over the raw planes it cancels to a few ulp, which 1 / C2
-    turns into 1e-4 of SSIM: 6e-5 on CPU, 1.25e-4 on a TPU at HIGHEST."""
+    turns into 1e-4 of SSIM: 6e-5 on CPU, 1.25e-4 on a TPU at HIGHEST.
+    The score is then the mean of a map of near-equal values, where a
+    one-pass fp32 sum rounds every partial sum the same way: 7.8e-6 off at
+    64x64 on CPU XLA. The closed form itself, evaluated in fp32, rounds
+    eight times (the plane mean and filter, 2 mu_x mu_y + C1, mu_y^2, the
+    sum, + C1, the two products by C2, the division), and one float32 step
+    at each moves the score up to 6.25e-7, so the bound is 6.3e-7: the
+    one-pass mean fails it by 13x and the raw-plane cancellation by 100x."""
     data_range = 1.0
-    x = jnp.full((1, 16, 16, 1), 0.5)
-    y = jnp.full((1, 16, 16, 1), 0.7)
+    x = jnp.full((1, size, size, 1), 0.5)
+    y = jnp.full((1, size, size, 1), 0.7)
     c1 = (0.01 * data_range) ** 2
     expected = (2 * 0.5 * 0.7 + c1) / (0.5**2 + 0.7**2 + c1)
-    assert float(ssim(x, y, data_range=data_range)) == pytest.approx(expected, rel=1e-6)
+    assert float(ssim(x, y, data_range=data_range)) == pytest.approx(expected, rel=6.3e-7)
 
 
 def _reference_ssim(x, y, data_range):
