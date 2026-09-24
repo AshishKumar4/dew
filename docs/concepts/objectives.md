@@ -17,6 +17,11 @@ An objective that continues from a checkpoint, or keeps a frozen tower next to t
 Two public methods describe the held arrays. `held_variables()` reports what the objective starts from. `init(key, variables=None)` initializes from what the caller passes. `Objective.initializer` combines them into one value a JIT accepts: `Partial(self.init)` when `held_variables()` is `None`, and `Partial(self.init, variables=held)` otherwise. `jax.tree_util.Partial` is a pytree whose bound arguments are its children, so the held tree arrives as data. An objective that builds its whole tree from the key only needs `init`. Here is one that holds weights:
 
 ```python
+import jax.numpy as jnp
+
+from dew import Objective
+
+
 class Continued(Objective):
     def __init__(self, model, pretrained=None):
         self.model, self.pretrained = model, pretrained
