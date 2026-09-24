@@ -108,14 +108,16 @@ def twin_close(twin, name: str):
     assert apart <= FACTOR * TWIN * rounding(name), f"{name}: the float64 twin is {apart:.3e} from the truth"
 
 
-def loss_close(value, prefix: str, unit: float = 1.0):
+def loss_close(value, prefix: str):
     """The loss within reach of the logits' rule: it is the mean of each
     position's cross entropy, whose gradient in that position's logits has
     norm at most sqrt(2), so logits RMS `r` from the float64 truth move it at
     most sqrt(2 V) r, and the rule holds the logits to FACTOR times the
-    reference's own `r`, in `unit`s of it (TWIN for a float64 twin's loss);
-    one spacing of the loss, in its own dtype, covers its own sum."""
+    reference's own `r`, in units of it that the loss's own dtype sets (TWIN
+    for a float64 twin's loss); one spacing of the loss, in its own dtype,
+    covers its own sum."""
     value = np.asarray(value)
+    unit = TWIN if value.dtype == np.float64 else 1.0
     logits = np.load(TINY / "reference.npz")[f"{prefix}logits"]
     bound = np.sqrt(2 * logits.shape[-1]) * FACTOR * rounding(f"{prefix}logits") * unit + np.spacing(value)
     assert abs(float(value) - float(TRUTH[f"{prefix}loss"])) <= bound, f"{prefix}loss"
@@ -316,7 +318,7 @@ def test_the_quantization_aware_loss_and_gradient_match_the_reference(source):
         lambda model, variables: updated(model, variables, ids, reference["learning_rate"]),
         loaded.model, loaded.variables)
     loss_close(value, "qat_")
-    loss_close(twin_value, "qat_", TWIN)
+    loss_close(twin_value, "qat_")
     close(logits, reference, "qat_updated_logits")
     twin_close(twin_logits, "qat_updated_logits")
 
@@ -345,7 +347,7 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     (value, gradient), (twin_value, _), _ = decided(
         lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
     loss_close(value, "")
-    loss_close(twin_value, "", TWIN)
+    loss_close(twin_value, "")
     indexer = [np.max(np.abs(leaf)) for path, leaf in flatten_dict(gradient, sep=".").items() if ".indexer." in f".{path}."]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
