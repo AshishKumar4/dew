@@ -169,7 +169,9 @@ for (const file of files) {
 			continue;
 		}
 		if (cell.cell_type !== 'code' || !text.trim()) continue;
-		if (cell.execution_count == null && !outputsPending) {
+		// A cell tagged skip-execution is shown without output: its notebook says why.
+		const skipped = (cell.metadata?.tags ?? []).includes('skip-execution');
+		if (cell.execution_count == null && !outputsPending && !skipped) {
 			throw new Error(`${source}: code cell ${index} was never executed; commit the notebook executed top to bottom`);
 		}
 		const allowErrors = (cell.metadata?.tags ?? []).includes('raises-exception');

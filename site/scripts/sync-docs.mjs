@@ -12,6 +12,7 @@ import {
 	generatedRoot,
 	lastUpdated,
 	pageFile,
+	publicRepoRoot,
 	repoRoot,
 	rewriteMarkdown,
 	siteRoot,
@@ -22,6 +23,7 @@ import {
 await rm(contentRoot, { recursive: true, force: true });
 await rm(generatedRoot, { recursive: true, force: true });
 await rm(path.join(siteRoot, 'src/assets/repo'), { recursive: true, force: true });
+await rm(publicRepoRoot, { recursive: true, force: true });
 
 let count = 0;
 for (const page of pages) {

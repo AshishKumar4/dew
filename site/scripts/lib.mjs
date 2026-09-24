@@ -17,6 +17,7 @@ export const repoRoot = path.resolve(siteRoot, '..');
 export const contentRoot = path.join(siteRoot, 'src/content/docs');
 export const generatedRoot = path.join(siteRoot, 'src/generated');
 const assetRoot = path.join(siteRoot, 'src/assets/repo');
+export const publicRepoRoot = path.join(siteRoot, 'public/repo');
 
 const slugBySource = new Map(pages.filter((page) => page.source).map((page) => [page.source, page.slug]));
 // Every notebook in tutorials/ has a page, so a link to the .ipynb file resolves to it.
@@ -50,7 +51,7 @@ const IMAGE = /\.(png|jpe?g|gif|svg|webp|avif)$/i;
  * for a page written to `pagePath` (absolute, inside the collection).
  * Throws on a target that does not exist or a docs page missing from the manifest.
  */
-export async function rewriteTarget(target, sourcePath, pagePath) {
+export async function rewriteTarget(target, sourcePath, pagePath, { html = false } = {}) {
 	if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('#') || target.startsWith('//')) return target;
 	const [rawPath, hash] = target.split('#', 2);
 	if (rawPath === '') return target;
@@ -63,10 +64,12 @@ export async function rewriteTarget(target, sourcePath, pagePath) {
 	if (resolved.startsWith('..')) throw new Error(`${sourcePath}: link leaves the repository: ${target}`);
 	if (!existsSync(path.join(repoRoot, resolved))) throw new Error(`${sourcePath}: broken link: ${target} (no ${resolved})`);
 	if (IMAGE.test(resolved)) {
-		const copy = path.join(assetRoot, resolved);
+		// Markdown images go through Astro's image pipeline; an <img> in raw HTML is
+		// served as a static file, since Astro leaves raw HTML alone.
+		const copy = path.join(html ? publicRepoRoot : assetRoot, resolved);
 		await mkdir(path.dirname(copy), { recursive: true });
 		await copyFile(path.join(repoRoot, resolved), copy);
-		return path.relative(path.dirname(pagePath), copy).split(path.sep).join('/');
+		return html ? `/repo/${resolved}` : path.relative(path.dirname(pagePath), copy).split(path.sep).join('/');
 	}
 	if (resolved.startsWith('docs/') && resolved.endsWith('.md') && !repositoryOnly.some((prefix) => resolved.startsWith(prefix))) {
 		throw new Error(`${sourcePath}: ${target} is a docs page that is not in src/manifest.mjs`);
@@ -96,13 +99,13 @@ export async function rewriteMarkdown(markdown, sourcePath, pagePath) {
 	visit(tree, 'html', (node) => {
 		const { start } = node.position;
 		for (const match of node.value.matchAll(/\b(src|href)="([^"]+)"/g)) {
-			edits.push({ from: start.offset + match.index + match[1].length + 2, to: start.offset + match.index + match[0].length - 1, url: match[2] });
+			edits.push({ from: start.offset + match.index + match[1].length + 2, to: start.offset + match.index + match[0].length - 1, url: match[2], html: true });
 		}
 	});
 	edits.sort((a, b) => b.from - a.from);
 	let out = markdown;
 	for (const edit of edits) {
-		const url = await rewriteTarget(edit.url, sourcePath, pagePath);
+		const url = await rewriteTarget(edit.url, sourcePath, pagePath, { html: edit.html });
 		out = out.slice(0, edit.from) + url + out.slice(edit.to);
 	}
 	return out;
