@@ -13,10 +13,13 @@ jax's cluster detection when it is asked.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
+
+_log = logging.getLogger(__name__)
 
 COORDINATOR = "JAX_COORDINATOR_ADDRESS"
 """host:port of process 0's coordinator service, which jax reads itself."""
@@ -62,15 +65,20 @@ def runs_on_gpu(env: Mapping[str, str]) -> bool:
     return not platforms or any(name in platforms for name in ("cuda", "gpu"))
 
 
-def listed_gpus(argv: Sequence[str]) -> int:
+def listed_gpus(argv: Sequence[str]) -> int | None:
     """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
-    indented; none when it fails or nvidia-smi is not there."""
+    indented; None when they could not be counted: nvidia-smi missing, or
+    failing, or not answering within a minute, as over ssh a host whose
+    non-interactive PATH lacks it, or that cannot be reached, gives. None is
+    not zero GPUs, and every check that reads a count skips on it."""
     try:
         found = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-    except FileNotFoundError:
-        return 0
+    except (OSError, subprocess.TimeoutExpired) as failure:
+        _log.debug("%s could not list GPUs: %s", " ".join(argv), failure)
+        return None
     if found.returncode != 0:
-        return 0
+        _log.debug("%s exited %d: %s", " ".join(argv), found.returncode, found.stderr.strip()[-300:])
+        return None
     return sum(line.startswith("GPU ") for line in found.stdout.splitlines())
 
 
@@ -79,9 +87,10 @@ def visible_gpus(visible: str) -> int:
     return sum(1 for device in visible.split(",") if device.strip())
 
 
-def local_gpu_count() -> int:
+def local_gpu_count() -> int | None:
     """GPUs this process may use: CUDA_VISIBLE_DEVICES when it is set,
-    since jax numbers only those, else every GPU nvidia-smi lists."""
+    since jax numbers only those, else every GPU nvidia-smi lists, None when
+    it cannot list them."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     return listed_gpus(("nvidia-smi", "-L")) if visible is None else visible_gpus(visible)
 
@@ -100,12 +109,13 @@ def slurm_tasks_here() -> int | None:
     return nodes[int(os.environ.get("SLURM_NODEID", "0"))]
 
 
-def refuse_idle_gpus(tasks: int, gpus: int, where: str) -> None:
+def refuse_idle_gpus(tasks: int, gpus: int | None, where: str) -> None:
     """Refuse a Slurm placement of `tasks` tasks on a node of `gpus` GPUs
     that leaves some idle: jax gives each Slurm task the one GPU at its
     SLURM_LOCALID, so a node running fewer tasks than it has GPUs trains on
-    that many, and nothing reports the rest."""
-    if 0 < tasks < gpus:
+    that many, and nothing reports the rest. A node whose GPUs could not be
+    counted (None) is not refused."""
+    if gpus is not None and 0 < tasks < gpus:
         raise ValueError(
             f"{where} runs {tasks} task{'s' if tasks > 1 else ''} on a node of {gpus} GPUs, and jax "
             f"gives each Slurm task only the GPU at its SLURM_LOCALID, so {gpus - tasks} would sit "

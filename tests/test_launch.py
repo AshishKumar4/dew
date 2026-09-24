@@ -426,8 +426,8 @@ def test_a_bare_launch_runs_one_process_per_gpu_of_this_machine():
     from dew.pool import local_gpu_count
 
     gpus = local_gpu_count()
-    if gpus < 2:
-        pytest.skip(f"needs two GPUs; this machine has {gpus}")
+    if gpus is None or gpus < 2:
+        pytest.skip(f"needs two GPUs; this machine shows {gpus}")
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
