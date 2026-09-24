@@ -296,7 +296,9 @@ class CharTable(ConditionEncoder[str, TextContext]):
         return TextContext(hidden=hidden, mask=jnp.asarray(tokens["attention_mask"]))
 
     def captions(self, tokens) -> tuple[str, ...]:
-        return tuple("".join(chr(97 + (int(i) - 2) % 26) for i in row[row > 1])
+        # Each id inverts to the lowest code point that wraps to it, which is
+        # the character itself below `vocab - 2`: all of ASCII by default.
+        return tuple("".join(chr(int(i) - 2) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
     def to_json(self) -> dict:
