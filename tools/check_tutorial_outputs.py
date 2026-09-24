@@ -1,25 +1,32 @@
-"""Fail when a tutorial's outputs are older than a change to the Dew code the tutorial imports.
+"""Report tutorials whose outputs are older than a change to the Dew code they import.
 
 Each executed notebook records in its metadata, under `dew.outputs.commit`, the
 last commit that had changed src/dew when its outputs were made
 (`tools/run_tutorials.py --save` writes it). `tools/run_tutorials.py --imports
 FILE` records which of Dew's modules each notebook's kernel had imported by
-the end of a run. This script fails when a commit after the recorded one
-changed the file of any of those modules, and names the commits and files, so
-outputs that may no longer match the code are caught instead of trusted.
+the end of a run. A notebook is stale when a commit after the recorded one
+changed the file of any of those modules; the script names the commits and
+files, so outputs that may no longer match the code are flagged instead of
+trusted. It also flags a notebook with no recorded commit, with a commit that
+is not in this checkout's history (it needs the full history: CI checks out
+with fetch-depth 0), or without recorded imports, which happens when the
+notebook failed.
 
-It also fails when a notebook has no recorded commit, when that commit is not
-in this checkout's history (it needs the full history: CI checks out with
-fetch-depth 0), or when the run recorded no imports for the notebook, which
-happens when the notebook failed.
+It exits 1 when it flags anything. With --report it exits 0 and, under GitHub
+Actions, turns each flag into a warning and writes a table to the job summary:
+the Tutorials workflow reports stale outputs this way, since the notebooks
+import about 190 of Dew's files and nearly every change to the library makes
+their outputs stale. The outputs are refreshed by a daily full run; the smoke
+run is what fails when a notebook breaks.
 
     python tools/run_tutorials.py --imports /tmp/imports.json
-    python tools/check_tutorial_outputs.py /tmp/imports.json
+    python tools/check_tutorial_outputs.py /tmp/imports.json [--report]
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -61,23 +68,32 @@ def verdict(path: Path, imports: dict[str, list[str]]) -> tuple[str, list[str]]:
 
 
 def main() -> int:
+    report = "--report" in sys.argv[2:]
     source = Path(sys.argv[1])
+    imports = json.loads(source.read_text()) if source.is_file() else {}
     if not source.is_file():
         print(f"{source} does not exist: tools/run_tutorials.py --imports did not finish", file=sys.stderr)
-        return 1
-    imports = json.loads(source.read_text())
-    failed = 0
+    actions = report and os.environ.get("GITHUB_ACTIONS") == "true"
+    rows = []
+    flagged = 0
     for path in sorted((ROOT / "tutorials").glob("*.ipynb")):
         label, lines = verdict(path, imports)
         print(f"{path.name}: {label}")
         for line in lines:
             print(f"    {line}")
-        failed += label != "current"
-    if failed:
-        print(f"{failed} notebooks failed the check. Execute them again with tools/run_tutorials.py --full --save "
+        if label != "current":
+            flagged += 1
+            if actions:
+                print(f"::warning title=Tutorial outputs::{path.name}: {label}, {lines[0]}")
+        rows.append(f"| {path.name} | {label} | {lines[0] if lines else ''} |")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if actions and summary:
+        with open(summary, "a") as out:
+            out.write("### Tutorial outputs\n\n| Notebook | Outputs | Why |\n|---|---|---|\n" + "\n".join(rows) + "\n")
+    if flagged:
+        print(f"{flagged} notebooks flagged. Execute them again with tools/run_tutorials.py --full --save "
               f"and commit the result.", file=sys.stderr)
-        return 1
-    return 0
+    return 0 if report or not flagged else 1
 
 
 if __name__ == "__main__":

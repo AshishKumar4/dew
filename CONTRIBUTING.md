@@ -73,6 +73,7 @@ These constructions are banned in prose, docstrings, comments and commit message
 - Identify download and hardware requirements. Do not claim that an unexercised runtime path works.
 - Test observable runtime behavior. Do not add assertions about prose, source spelling, documentation structure, or generated API-index snapshots.
 - The site at [dewml.dev](https://dewml.dev) is built from `docs/`, `tutorials/` and the docstrings in `src/dew`; [Install Dew](docs/installation.md#build-the-documentation) says how to build it. A new docs page goes into `site/src/manifest.mjs`, a new module that declares `__all__` into `GROUPS` in `site/scripts/gen_api.py`, and a notebook is committed executed top to bottom, with its smoke sizes in its Settings cell. The build fails on anything it cannot place.
+- A notebook's outputs come from `python tools/run_tutorials.py --full --save DIR` on a GPU, with Dew installed from the checkout; copy `DIR` over `tutorials/` and commit. That records the Dew commit, date, device and JAX version in each notebook's metadata, and its page prints them. A full run of every tutorial is queued once a day on the shared Colab runtime at the head of `main`. The Tutorials workflow runs each notebook at smoke size, and fails when one breaks; it also reports, without failing, the notebooks whose outputs are older than a change to the Dew code they import (`tools/check_tutorial_outputs.py`).
 
 ## Before a merge
 
