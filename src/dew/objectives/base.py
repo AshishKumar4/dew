@@ -305,6 +305,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             return value, jnp.asarray(True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
+    def tile_head(self) -> bool:
+        """Move a head that holds its whole logits for the backward to a
+        bounded tile, and say whether it moved: the fit ladder's first rung
+        (`dew.training.trainer.recompute_more`). An objective with no such
+        head has nothing to move."""
+        return False
+
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Nonparameter replacements from accepted-window observations."""
         raise TypeError("deferred effects require Objective.apply_effects")

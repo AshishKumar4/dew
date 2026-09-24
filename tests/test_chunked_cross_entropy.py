@@ -769,9 +769,14 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
 
     (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
     assert jnp.array_equal(tiled[1], whole[1])
+    # The two take log Z in a different order, so a probability can move by
+    # an fp32 ulp; where the head's gradient multiplies bf16 operands, that
+    # ulp can flip the cotangent's bf16 rounding, one bf16 ulp of an entry
+    # (2^-8 relative). fp32 compute keeps fp32's order-of-summation bound.
+    bound = 2e-6 if dtype == jnp.float32 else 2.0**-8
     for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
-        assert jnp.abs(have - want).max() <= 2e-6 * jnp.abs(want).max() + 1e-7
+        assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
 
 
 def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
