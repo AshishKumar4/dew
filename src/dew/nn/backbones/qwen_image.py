@@ -41,7 +41,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
-from .causal_transformer import GatedMLP
+from .decoder_block import GatedMLP
 from .flux import apply_rotary
 from .sd3 import _layer_norm
 

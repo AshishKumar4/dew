@@ -61,7 +61,7 @@ from flax.linen.module import Interceptor
 
 from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
-from dew.nn.backbones.causal_transformer import group_layers
+from dew.nn.backbones.layer_plan import group_layers
 from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select
 
 PEFT_CONFIG = "adapter_config.json"

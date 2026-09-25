@@ -33,7 +33,8 @@ from termcolor import colored
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
-from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, RematPolicy
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
 from dew.nn.sharding import (
     STAGE_AXIS,

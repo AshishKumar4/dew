@@ -14,7 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import Router, deepseek_v2_aux_loss
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import TEXT_KEY, LMObjective

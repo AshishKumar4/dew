@@ -456,7 +456,7 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (causal_transformer.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)

@@ -307,7 +307,7 @@ class KPoolSparseAttention(nn.Module):
                 raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
         row_valid = jnp.ones((batch, length), bool) if valid is None else valid
         # The projections carry the names a remat policy saves or offloads
-        # (causal_transformer.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
         # The latents project the residual down where `down_projection` places
         # them: on each tensor shard's own tokens where the link pays for
         # gathering them back for the head-split up-projections.

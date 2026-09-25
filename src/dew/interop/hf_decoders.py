@@ -54,7 +54,9 @@ if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture, RematPolicy
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer

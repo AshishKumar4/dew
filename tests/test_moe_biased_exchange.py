@@ -194,7 +194,8 @@ def test_biased_mlp_matches_transformers_outputs_and_every_parameter_gradient(sk
 def test_decoder_mixture_can_select_biased_expert_exchange():
     from dataclasses import replace
 
-    from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
 
     mixture = Mixture(experts=4, top_k=2)
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,

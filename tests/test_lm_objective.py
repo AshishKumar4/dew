@@ -833,7 +833,8 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     """The term is the coefficient times each router's squared logsumexp of
     its gate logits, averaged over the positions it routed and summed over
     routers, beside the cross entropy and not inside its token mean."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
     tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
@@ -863,7 +864,8 @@ def test_router_z_loss_refuses_routers_that_sow_no_log_partition():
     """gpt-oss's router scores its experts through its own Dense and sows
     nothing, so a z-loss over it would add nothing; it raises instead, as the
     balance loss does."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
                               max_seq_len=8, mlp='swigluoai', mlp_features=16,
                               mixture=Mixture(experts=4, top_k=2))

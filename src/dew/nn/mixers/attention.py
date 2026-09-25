@@ -358,7 +358,7 @@ class CausalSelfAttention(nn.Module):
         B, S, _ = x.shape
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
-        # policy saves or offloads (causal_transformer.RESIDUALS).
+        # policy saves or offloads (decoder_block.RESIDUALS).
         projected = checkpoint_name(self.q_proj(x), 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3

@@ -185,7 +185,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     The policy saves nothing, so the backward pass holds the arguments: the
     input, the weight and the bias. Recomputing the reductions rather than
     naming them leaves the residuals to the policy that recomputes this
-    block (`causal_transformer.RESIDUALS`).
+    block (`decoder_block.RESIDUALS`).
 
     The wrapped function takes arrays first and static arguments last. A
     caller passes its parameters as plain arrays, so no flax lifting sits
