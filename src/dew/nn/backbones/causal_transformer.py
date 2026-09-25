@@ -2315,139 +2315,21 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
-        providers = set(sharing.values())
-
-        def provides(index: int, layer_type: str) -> bool:
-            mixer = kinds[layer_type].mixer or mixer_spec
-            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
-                                          and mixer.publishes(index in sharing))
-
-        specs = tuple(
-            LayerSpec(
-                layer_type=layer_type,
-                kind=kinds[layer_type],
-                routed=index in sparse,
-                hash_routed=index in hashed,
-                width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
-                       else widths[index]),
-                sparsity=0.0 if sparsity is None else sparsity[index],
-                kv_shared=index in sharing,
-                provider=index if provides(index, layer_type) else None,
-                residual_site=(None if self.attention_residuals is None
-                               else self.attention_residuals.site(index)),
-                engram=(None if self.engram is None or index not in self.engram.layer_ids
-                        else self.engram.layer_ids.index(index)),
-                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
-                                 else self.dspark.target_layers.index(index)))
-            for index, layer_type in enumerate(types))
+        specs = self._layer_specs(types, kinds, mixer_spec, (sparse, hashed, sharing, widths, sparsity))
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar)
 
-        def block(index: int, name: str) -> DecoderBlock:
-            spec = specs[index]
-            return DecoderBlock(
-                mixer=(spec.kind.mixer or mixer_spec).build(
-                    self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
-                feedforward=(
-                    functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
-                    if spec.hash_routed and routed is not None else
-                    routed
-                    if spec.routed and routed is not None else
-                    None
-                    if spec.width == 0 else
-                    functools.partial(gated_mlp, hidden_features=spec.width,
-                                      activation_sparsity=spec.sparsity)),
-                hash_routed=spec.hash_routed,
-                residual_multiplier=self.residual_multiplier,
-                routed=spec.routed,
-                media_routed=(spec.routed and not spec.hash_routed
-                              and self.mixture is not None and self.mixture.media_bias),
-                engram=None if spec.engram is None or self.engram is None else functools.partial(
-                    EngramLayer, rows=self.engram.num_embeddings[spec.engram],
-                    columns=self.engram.columns, head_dim=self.engram.head_dim,
-                    hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
-                    emb_features=self.emb_features, norm_eps=self.norm_eps,
-                    dtype=self.dtype, precision=self.precision),
-                engram_index=spec.engram,
-                prediction_slot=spec.prediction_slot,
-                emb_features=self.emb_features,
-                norm_eps=self.norm_eps,
-                scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast,
-                wiring=wiring,
-                per_layer_input_dim=ple or 0,
-                gate_activation=self.mlp,
-                parallel=parallel if spec.routed else None,
-                altup=self.altup,
-                laurel_rank=self.laurel_rank,
-                hyper_connections=self.hyper_connections,
-                residual_site=spec.residual_site,
-                dropout_rate=self.dropout_rate,
-                remat=self.remat,
-                dtype=self.dtype,
-                precision=self.precision,
-                name=name)
+        block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
-        # Prediction depths mirror whole-sequence hidden states, so their
-        # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward routes
-        # like the last layer's (GLM 4.5 ships its depth with the trunk's
-        # experts) and is dense otherwise.
-        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
-        prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
-                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
-            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
-        mtp_mixer = prediction_mixer.build(self.mixer_context(
-            kinds[mtp_type], mtp_type, kv_shared=False))
-        mtp_feedforward = (
-            routed if routed is not None and self.num_layers - 1 in sparse else
-            None if widths[-1] == 0 else
-            # The last layer's width: the one width of every model with
-            # depths, since the widths that vary are Gemma 3n's alone.
-            functools.partial(gated_mlp, hidden_features=widths[-1]))
-        self.mtp = [
-            MTPBlock(
-                mixer=mtp_mixer, feedforward=mtp_feedforward,
-                emb_features=self.emb_features,
-                hyper_connections=self.mtp_hyper_connections,
-                norm_eps=self.norm_eps,
-                scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast,
-                wiring=wiring,
-                dropout_rate=self.dropout_rate,
-                remat=self.remat,
-                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
-            for depth in range(self.num_nextn_predict_layers)]
+        self.mtp = self._prediction_depths(types, kinds, mixer_spec, (gated_mlp, routed), wiring, sparse, widths)
         if self.dspark is not None:
             assert routed is not None
-            layer_type = self.dspark.layer_type
-            drafting = kinds[layer_type].mixer or mixer_spec
-            if not isinstance(drafting, DeepseekV4Mixer):
-                raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
-                                 f"builds {type(drafting).__name__}")
-            drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
-            stages = self.dspark.stages
-            self.dspark_stages = [
-                DSparkStage(
-                    block=functools.partial(
-                        DecoderBlock, mixer=drafter,
-                        feedforward=functools.partial(routed, num_experts=self.dspark.experts,
-                                                      top_k=self.dspark.top_k),
-                        emb_features=self.emb_features, norm_eps=self.norm_eps,
-                        scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                        wiring=wiring, hyper_connections=self.hyper_connections,
-                        dtype=self.dtype, precision=self.precision),
-                    emb_features=self.emb_features, targets=len(self.dspark.target_layers),
-                    vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
-                    first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
-                    dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
-                for stage in range(stages)]
+            self.dspark_stages = self._dspark_stages(kinds, mixer_spec, routed, wiring)
         if self.altup is not None:
             # The copies past the first enter through their own projections
             # and leave through their own (modeling_gemma3n.py,
@@ -2479,6 +2361,159 @@ class CausalTransformer(nn.Module):
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
+
+    @nn.nowrap
+    def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec, read
+                     ) -> tuple[LayerSpec, ...]:
+        """One `LayerSpec` per layer: its kind, whether it routes and how,
+        its feed-forward width and sparsity, the KV it shares or provides,
+        and its attention-residual, engram and DSpark slots. `read` is what
+        setup read off the fields first: the sparse and hash-routed layers,
+        the KV sharing, the widths and the sparsity pattern."""
+        sparse, hashed, sharing, widths, sparsity = read
+        providers = set(sharing.values())
+
+        def provides(index: int, layer_type: str) -> bool:
+            mixer = kinds[layer_type].mixer or mixer_spec
+            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
+                                          and mixer.publishes(index in sharing))
+
+        return tuple(
+            LayerSpec(
+                layer_type=layer_type,
+                kind=kinds[layer_type],
+                routed=index in sparse,
+                hash_routed=index in hashed,
+                width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
+                       else widths[index]),
+                sparsity=0.0 if sparsity is None else sparsity[index],
+                kv_shared=index in sharing,
+                provider=index if provides(index, layer_type) else None,
+                residual_site=(None if self.attention_residuals is None
+                               else self.attention_residuals.site(index)),
+                engram=(None if self.engram is None or index not in self.engram.layer_ids
+                        else self.engram.layer_ids.index(index)),
+                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
+                                 else self.dspark.target_layers.index(index)))
+            for index, layer_type in enumerate(types))
+
+    @nn.nowrap
+    def _block(self, specs: tuple[LayerSpec, ...], mixer_spec, factories, wiring: BlockWiring,
+               index: int, name: str) -> DecoderBlock:
+        """The decoder layer at `index`, named `name`: its mixer and its
+        feed-forward (hash-routed, routed, none, or the gated MLP at its
+        width) from its spec, the rest from the model's fields."""
+        gated_mlp, routed, parallel = factories
+        ple = self.per_layer_input_dim
+        spec = specs[index]
+        return DecoderBlock(
+            mixer=(spec.kind.mixer or mixer_spec).build(
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
+            feedforward=(
+                functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
+                if spec.hash_routed and routed is not None else
+                routed
+                if spec.routed and routed is not None else
+                None
+                if spec.width == 0 else
+                functools.partial(gated_mlp, hidden_features=spec.width,
+                                  activation_sparsity=spec.sparsity)),
+            hash_routed=spec.hash_routed,
+            residual_multiplier=self.residual_multiplier,
+            routed=spec.routed,
+            media_routed=(spec.routed and not spec.hash_routed
+                          and self.mixture is not None and self.mixture.media_bias),
+            engram=None if spec.engram is None or self.engram is None else functools.partial(
+                EngramLayer, rows=self.engram.num_embeddings[spec.engram],
+                columns=self.engram.columns, head_dim=self.engram.head_dim,
+                hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
+                emb_features=self.emb_features, norm_eps=self.norm_eps,
+                dtype=self.dtype, precision=self.precision),
+            engram_index=spec.engram,
+            prediction_slot=spec.prediction_slot,
+            emb_features=self.emb_features,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            wiring=wiring,
+            per_layer_input_dim=ple or 0,
+            gate_activation=self.mlp,
+            parallel=parallel if spec.routed else None,
+            altup=self.altup,
+            laurel_rank=self.laurel_rank,
+            hyper_connections=self.hyper_connections,
+            residual_site=spec.residual_site,
+            dropout_rate=self.dropout_rate,
+            remat=self.remat,
+            dtype=self.dtype,
+            precision=self.precision,
+            name=name)
+
+    @nn.nowrap
+    def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec, factories,
+                           wiring: BlockWiring, sparse, widths) -> list[MTPBlock]:
+        """The multi-token prediction depths."""
+        gated_mlp, routed = factories
+        # Prediction depths mirror whole-sequence hidden states, so their
+        # mixer builds from the full-attention kind where the pattern has
+        # one, else from the first layer's kind; the feed-forward routes
+        # like the last layer's (GLM 4.5 ships its depth with the trunk's
+        # experts) and is dense otherwise.
+        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+        prediction_mixer = kinds[mtp_type].mixer or mixer_spec
+        if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
+                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
+            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
+        mtp_mixer = prediction_mixer.build(self.mixer_context(
+            kinds[mtp_type], mtp_type, kv_shared=False))
+        mtp_feedforward = (
+            routed if routed is not None and self.num_layers - 1 in sparse else
+            None if widths[-1] == 0 else
+            # The last layer's width: the one width of every model with
+            # depths, since the widths that vary are Gemma 3n's alone.
+            functools.partial(gated_mlp, hidden_features=widths[-1]))
+        return [
+            MTPBlock(
+                mixer=mtp_mixer, feedforward=mtp_feedforward,
+                emb_features=self.emb_features,
+                hyper_connections=self.mtp_hyper_connections,
+                norm_eps=self.norm_eps,
+                scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast,
+                wiring=wiring,
+                dropout_rate=self.dropout_rate,
+                remat=self.remat,
+                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
+            for depth in range(self.num_nextn_predict_layers)]
+
+    @nn.nowrap
+    def _dspark_stages(self, kinds: dict[str, ResolvedKind], mixer_spec, routed, wiring: BlockWiring
+                       ) -> list[DSparkStage]:
+        """DSpark's drafting stages, attending with the V4 attention of their
+        layer kind and routing through the trunk's experts."""
+        assert self.dspark is not None
+        layer_type = self.dspark.layer_type
+        drafting = kinds[layer_type].mixer or mixer_spec
+        if not isinstance(drafting, DeepseekV4Mixer):
+            raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
+                             f"builds {type(drafting).__name__}")
+        drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
+        stages = self.dspark.stages
+        return [
+            DSparkStage(
+                block=functools.partial(
+                    DecoderBlock, mixer=drafter,
+                    feedforward=functools.partial(routed, num_experts=self.dspark.experts,
+                                                  top_k=self.dspark.top_k),
+                    emb_features=self.emb_features, norm_eps=self.norm_eps,
+                    scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                    wiring=wiring, hyper_connections=self.hyper_connections,
+                    dtype=self.dtype, precision=self.precision),
+                emb_features=self.emb_features, targets=len(self.dspark.target_layers),
+                vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
+                first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
+                dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
+            for stage in range(stages)]
 
     def _expand(self, x):
         """The embeddings `[B, S, D]` as the residual form the blocks take and
