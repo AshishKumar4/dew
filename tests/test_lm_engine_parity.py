@@ -21,17 +21,19 @@ import numpy as np
 import pytest
 
 from dew.config import OptimConfig
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss, router_moments
 from dew.objectives.lm.objective import _router_scores, router_z_terms
 from dew.training.optim import (
+    Power,
     build_optimizer,
     linear_schedule,
     mup_param_groups,
     param_labels,
-    Power,
     power_schedule,
 )
 

@@ -28,7 +28,8 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, RematPolicy
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives import scalar_loss
 from dew.objectives.base import Step

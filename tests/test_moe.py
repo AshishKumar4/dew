@@ -29,7 +29,8 @@ import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective

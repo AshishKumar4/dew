@@ -29,7 +29,8 @@ from dew.interop.hf_decoders import (
     _softmax_mixture,
     _specified_layer_types,
 )
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 
 
 def _qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:

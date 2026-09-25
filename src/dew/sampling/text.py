@@ -32,7 +32,8 @@ from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
-from dew.nn.backbones.causal_transformer import Mixture, gather_cache_rows
+from dew.nn.backbones.causal_transformer import gather_cache_rows
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
     ArrayT,

@@ -236,7 +236,8 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     does not name."""
     from types import SimpleNamespace
 
-    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.training.trainer import recompute_more
 
     decoder = SimpleNamespace(tile_head=lambda: None, model=CausalTransformer(
@@ -285,7 +286,8 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
     tiled head before any block is recomputed."""
     import optax
 
-    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer, trainer as trainer_module
 

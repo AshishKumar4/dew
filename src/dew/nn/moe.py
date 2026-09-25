@@ -1130,7 +1130,7 @@ class ExpertMLP(nn.Module):
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
-        # covers both (causal_transformer.RESIDUALS).
+        # covers both (decoder_block.RESIDUALS).
         gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
         up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
         if self.swiglu_limit is not None:

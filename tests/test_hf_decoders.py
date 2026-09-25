@@ -108,7 +108,9 @@ import pytest
 from dew.interop import hf_decoders, load_pretrained
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.moe import Situ

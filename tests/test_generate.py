@@ -14,7 +14,8 @@ import numpy as np
 import optax
 import pytest
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.sampling import Sampling, generate
 
 VOCAB = 29
