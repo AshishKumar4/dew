@@ -335,11 +335,11 @@ def token_batch(rows: int = BATCH):
 PIPELINED_ROWS = 16
 
 
-def loss_and_grads(objective, spec, variables, batch):
-    """The objective's loss, metrics and gradients on `spec`'s mesh, with the
-    pipeline's schedule in context the way the trainer's compiled step
-    puts it there."""
-    mesh = build_mesh(spec)
+def loss_and_grads(objective, spec, variables, batch, devices=None):
+    """The objective's loss, metrics and gradients on `spec`'s mesh over
+    `devices` (every device by default), with the pipeline's schedule in
+    context the way the trainer's compiled step puts it there."""
+    mesh = build_mesh(spec, devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
     batch = shard_batch(mesh, batch)
@@ -474,6 +474,34 @@ def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
         MeshSpec(stage=2, microbatches=3)
     with pytest.raises(ValueError, match="stage is 1"):
         MeshSpec(microbatches=4)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [MeshSpec(stage=4, microbatches=4),
+                                  MeshSpec(stage=2, sequence=2, microbatches=4)],
+                         ids=["stage4", "stage2_sequence2"])
+def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spec):
+    """On four devices, four stages, or two beside a sequence axis of two,
+    leave no mesh axis for the rows: every device holds all eight, so any
+    microbatch count that divides them takes a share of every device's
+    rows, and the pipeline runs. The refusal of microbatches that miss a
+    device read the first axis of the rows' spec, which is empty there, and
+    raised IndexError instead (layout_parity's stage4 and stage2_sequence2
+    rows on four GPUs; eight devices put the rest on data and never showed
+    it). Largest observed differences on CPU: loss 0.0, gradients 1.4e-07
+    on leaves of order 0.1."""
+    model = tiny(max_seq_len=16)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32))
+    rng = np.random.default_rng(0)
+    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, 17)).astype(np.int32)}
+    objective, four = LMObjective(model, 16), jax.devices()[:4]
+
+    loss, _, grads = loss_and_grads(objective, MeshSpec(), variables, batch, four)
+    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four)
+
+    assert abs(loss - piped) < 1e-5, (loss, piped)
+    difference = largest_difference(grads, piped_grads)
+    assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
 @mesh_lane
