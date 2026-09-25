@@ -38,6 +38,7 @@ from .sharding import (
     mesh_axes,
     row_axes,
     sequence_shards,
+    split_positions,
 )
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
@@ -1765,10 +1766,13 @@ class NormalAttention(nn.Module):
         if len(context.shape) == 4:
             context = context.reshape(
                 (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
-        # [B, S, heads, head_dim], column-parallel under a tensor axis.
+        # [B, S, heads, head_dim], column-parallel under a tensor axis; a
+        # context's positions split over a sequence axis where its link pays
+        # for it (`split_positions`).
         query = constrain(self.query(x), HEADS)
-        key = constrain(self.key(context), HEADS)
-        value = constrain(self.value(context), HEADS)
+        key, value = split_positions(
+            context, 2 * self.heads * self.dim_head,
+            lambda tokens: (constrain(self.key(tokens), HEADS), constrain(self.value(tokens), HEADS)))
         if self.qk_norm:
             query = self.q_norm(query)
             key = self.k_norm(key)

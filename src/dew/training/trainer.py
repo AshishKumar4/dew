@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import jax
@@ -37,13 +37,14 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
 from dew.nn.sharding import (
+    SEQUENCE_AXIS,
     STAGE_AXIS,
     TENSOR_AXIS,
     LayoutRefused,
+    Link,
     Schedule,
-    TensorLink,
+    measured_links,
     pipeline_microbatches,
-    tensor_link,
 )
 from dew.objectives.base import (
     FROZEN,
@@ -65,6 +66,7 @@ from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
+    AxisLink,
     CheckpointRequested,
     FitEnded,
     FitStarted,
@@ -81,8 +83,8 @@ from dew.training.distributed import (
     batch_shardings,
     build_mesh,
     data_partition,
+    link_bandwidth,
     shard_batch,
-    tensor_bandwidth,
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -483,11 +485,11 @@ class Trainer(Generic[Loss, Effects]):
         self.flops_per_step = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
-        # Whether a down-projection of the step ran on each tensor shard's own
-        # tokens (`dew.nn.sharding.down_projection`), which the link of its
-        # mesh's tensor axis decides, and each mesh's measured bandwidth.
-        self.tensor_spread = False
-        self._tensor_bandwidths: dict[Mesh, float | None] = {}
+        # The links the last compiled step decided its projections by, which
+        # say whether one spread over each axis (`dew.nn.sharding.Link`), and
+        # each mesh axis's measured bandwidth.
+        self.links: dict[str, Link] = {}
+        self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
 
     @classmethod
     def from_config(
@@ -863,33 +865,38 @@ class Trainer(Generic[Loss, Effects]):
     def _default_step(self, shapes):
         return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
 
-    def _tensor_link(self, mesh: Mesh) -> TensorLink | None:
-        """The tensor axis's link on `mesh` for one trace. Every process lists
-        the mesh's devices alike and `tensor_bandwidth` agrees one figure
-        across the pool, so every process decides alike and compiles the same
-        program. The peak is the fastest device's, on which the FLOPs a spread
-        saves take the least time. The bandwidth is measured once per mesh,
-        and not at all on a CPU mesh or for a device the peak table does not
-        name, where it decides nothing."""
-        if mesh.shape[TENSOR_AXIS] == 1:
-            return None
+    def _links(self, mesh: Mesh) -> dict[str, Link]:
+        """The links of `mesh`'s tensor and sequence axes, those it splits,
+        for one trace. Every process lists the mesh's devices alike and
+        `link_bandwidth` agrees one figure across the pool, so every process
+        decides alike and compiles the same program. The peak is the fastest
+        device's, on which the FLOPs a spread saves take the least time. Each
+        axis's bandwidth is measured once per mesh, and not at all on a CPU
+        mesh or for a device the peak table does not name, where it decides
+        nothing."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := peak_flops(device.device_kind)) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
         platform = devices[0].platform
-        if mesh not in self._tensor_bandwidths:
-            self._tensor_bandwidths[mesh] = (
-                None if platform == 'cpu' or peak is None else tensor_bandwidth(mesh))
-        return TensorLink(self._tensor_bandwidths[mesh], peak, platform)
+        links = {}
+        for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
+            if mesh.shape[axis] == 1:
+                continue
+            if (mesh, axis) not in self._bandwidths:
+                self._bandwidths[mesh, axis] = (
+                    None if platform == 'cpu' or peak is None else link_bandwidth(mesh, axis))
+            links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
+        return links
 
     @contextlib.contextmanager
-    def _traced_on(self, mesh: Mesh, link: TensorLink | None = None) -> Iterator[Schedule]:
+    def _traced_on(self, mesh: Mesh, links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
-        parameters, and the tensor axis's link, where the step measured one."""
+        parameters, and the links of the axes the step measured, none by
+        default."""
         with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches) as schedule,
-              nn.logical_axis_rules(self.layout.axis_rules), tensor_link(link)):
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
@@ -913,8 +920,8 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
-        link = self._tensor_link(mesh)
-        with self._traced_on(mesh, link) as schedule:
+        links = self._links(mesh)
+        with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
                 raise LayoutRefused(
@@ -951,7 +958,7 @@ class Trainer(Generic[Loss, Effects]):
                 if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
-            self.tensor_spread = link is not None and link.spread
+            self.links = links
         # The program compiled above, not the jit: a call through the jit
         # traces and compiles its own, without the step's compiler options,
         # which was 25 s of an A100's cold start.
@@ -1423,7 +1430,8 @@ class Trainer(Generic[Loss, Effects]):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
             self._report(StepCompiled(time.perf_counter() - began,
                                       remat_record(_remat_of(_model_of(self.objective))),
-                                      self._tensor_bandwidths.get(self.device_mesh), self.tensor_spread),
+                                      {axis: AxisLink(link.bytes_per_second, link.spread)
+                                       for axis, link in self.links.items()}),
                          int(state.step))
         return compiled[shapes]
 
@@ -1595,7 +1603,7 @@ class Trainer(Generic[Loss, Effects]):
         # The rules and the microbatch count; `evaluate` scores under the mesh
         # itself, and previews decode outside it.
         with (pipeline_microbatches(self.mesh.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), tensor_link(self._tensor_link(mesh))):
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = evaluate(
                 self.objective, params, dataset.val, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,

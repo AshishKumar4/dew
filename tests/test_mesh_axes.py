@@ -189,14 +189,50 @@ def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_sec
     PCIe card and NVLink 4 for the SXM one. A device the peak table does not
     name, and a step with no measured link, keep the projection on every
     token; a CPU mesh spreads."""
-    from dew.nn.sharding import RESIDUAL, SPREAD, TensorLink, down_projection, tensor_link
+    from dew.nn.sharding import RESIDUAL, SPREAD, TENSOR_AXIS, Link, down_projection, measured_links
 
     mesh = build_mesh(MeshSpec(tensor=4), jax.devices()[:4])
     residual = jax.ShapeDtypeStruct((4, 4096, 7168), jnp.bfloat16)
-    link = None if platform is None else TensorLink(bytes_per_second, peak, platform)
-    with jax.set_mesh(mesh), tensor_link(link):
+    link = None if platform is None else Link(bytes_per_second, peak, platform)
+    with jax.set_mesh(mesh), measured_links({} if link is None else {TENSOR_AXIS: link}):
         assert down_projection(residual, 1536 + 512 + 64) == (SPREAD if spreads else RESIDUAL)
     assert link is None or link.spread == spreads
+
+
+@pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "splits"), [
+    (None, None, None, False),
+    (450e9, 989e12, "gpu", False),
+    (2.4e12, 989e12, "gpu", True),
+    (None, None, "gpu", False),
+    (None, None, "cpu", True),
+], ids=["unmeasured", "h100-nvlink", "a-link-that-pays", "unknown-gpu", "cpu"])
+def test_a_contexts_projection_splits_its_positions_only_where_the_sequence_link_pays(
+        bytes_per_second, peak, platform, splits):
+    """SDXL's cross-attention context, 77 text tokens of width 2048, projected
+    into keys and values of 1280 each on sequence4, 8 rows a sequence group.
+    Split over the sequence axis, each shard projects 20 of the 80 padded
+    positions; the split saves 3/4 of the projections' FLOPs and adds their
+    outputs' and the context gradient's gathers and a sum of their weight
+    gradients over the axis, which at 640 positions an H100 would need
+    2.35 TB/s to move in the time its peak takes for the FLOPs saved:
+    `down_projection`'s rule, over the sequence axis's link. NVLink 4's
+    nominal 450 GB/s keeps the projections whole; a CPU mesh splits them."""
+    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links, split_positions
+
+    mesh = build_mesh(MeshSpec(sequence=4), jax.devices()[:4])
+    context = jax.ShapeDtypeStruct((8, 77, 2048), jnp.bfloat16)
+    lengths = []
+
+    def project(tokens):
+        lengths.append(tokens.shape[1])
+        return tokens[..., :1280], tokens[..., :1280]
+
+    link = None if platform is None else Link(bytes_per_second, peak, platform)
+    with jax.set_mesh(mesh), measured_links({} if link is None else {SEQUENCE_AXIS: link}):
+        keys, values = jax.eval_shape(lambda tokens: split_positions(tokens, 2 * 1280, project), context)
+    assert lengths == [80 if splits else 77]
+    assert keys.shape == values.shape == (8, 77, 1280)
+    assert link is None or link.spread == splits
 
 
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
