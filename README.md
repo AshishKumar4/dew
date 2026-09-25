@@ -713,7 +713,8 @@ import numpy as np
 import optax
 
 from dew import Checkpoints, Dataset, Trainer
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
