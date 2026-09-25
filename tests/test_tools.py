@@ -373,9 +373,10 @@ def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monk
     outcomes = {"stage4": LayoutRefused("the stage axis of 4 holds a pipeline's stages"),
                 "tensor4": ValueError("a shape mismatch"),
                 "fsdp4": ([2.0, 1.5], gradient,
-                          {"flops_per_device": 4e9 / jax.device_count(), "mesh": {"fsdp": 4}})}
+                          {"flops_per_device": 4e9 / jax.device_count(),
+                           "mesh": {"data": jax.device_count() // 4, "fsdp": 4}})}
 
-    def trained(case, fields, batch, *, steps, one_device=False):
+    def trained(case, fields, batch, *, steps, one_device=False, devices=None):
         outcome = outcomes[next(name for name, named in tool.LAYOUTS.items() if named == fields)]
         if isinstance(outcome, Exception):
             raise outcome
