@@ -214,6 +214,24 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     return {'xla_gpu_enable_triton_gemm': False}
 
 
+def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
+                    mesh: Mesh) -> tuple[jax.stages.Compiled, bool]:
+    """The step compiled under XLA's default options where it fits and the
+    one compiled under `step_compiler_options` does not, else that one, with
+    whether the returned step fits. The
+    Triton GEMM fusions hold fewer temporaries: on an RTX 4080 (sm89, jax
+    0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens keep their
+    whole logits in 13.1 GiB with them and run 178.7 ms, while without them
+    the step does not fit, tiles its head and runs 211.2 ms. So the fusions
+    come back before the ladder's first rung."""
+    default = program.compile()
+    if not step_fits(default, mesh):
+        return executable, False
+    print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
+                  "compiling it with them", "yellow"), file=sys.stderr)
+    return default, True
+
+
 def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
     """The one module an objective trains, or None. `Objective` declares no
     model, since some train none (JEPA's pair, the RL actors' wrappers), so
@@ -922,8 +940,12 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                self.executable = self.program.compile(step_compiler_options(self.objective))
-                if step_fits(self.executable, mesh) or not recompute_more(self.objective):
+                options = step_compiler_options(self.objective)
+                self.executable = self.program.compile(options)
+                fits = step_fits(self.executable, mesh)
+                if not fits and options is not None:
+                    self.executable, fits = fitting_default(self.program, self.executable, mesh)
+                if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
             self.tensor_spread = link is not None and link.spread
