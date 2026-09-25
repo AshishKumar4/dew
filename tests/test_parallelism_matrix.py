@@ -33,7 +33,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4"),
     "unet": ("tensor4", "fsdp2_tensor2"),
-    "jepa": ("fsdp4", "sequence4"),
+    "jepa": ("fsdp4", "sequence4", "tensor4"),
     "multimodal": ("sequence4", "stage4"),
 }
 CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
