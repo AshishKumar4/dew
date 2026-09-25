@@ -10,7 +10,13 @@ that runs no pipeline is; any other status is a defect. The models are the
 tool's zoo, sized so every layout divides them. Each row lists the layouts
 that split its model in a way no other row covers: a pair's second axis, a
 packed or masked column under a sequence split, a bidirectional exchange, a
-vision tower beside a pipelined decoder."""
+vision tower beside a pipelined decoder.
+
+A layout's data axis takes the devices its other axes leave, so on eight
+devices every pipeline below splits the rows over data. The rows of
+CELLS_ON_FOUR run on four of the eight, where four stages, or two beside a
+sequence axis of two, leave no axis for the rows: every device holds all of
+them."""
 
 import jax
 import pytest
@@ -30,16 +36,22 @@ CELLS: dict[str, tuple[str, ...]] = {
     "jepa": ("fsdp4", "sequence4"),
     "multimodal": ("sequence4", "stage4"),
 }
+CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
+    "dense": ("stage4", "stage2_sequence2"),
+}
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("model", sorted(CELLS))
-def test_each_layout_of_a_model_matches_one_device_or_is_refused(model):
+@pytest.mark.parametrize(("model", "layouts", "devices"), [
+    *(pytest.param(model, layouts, None, id=model) for model, layouts in sorted(CELLS.items())),
+    *(pytest.param(model, layouts, 4, id=f"{model}-on-four")
+      for model, layouts in sorted(CELLS_ON_FOUR.items()))])
+def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layouts, devices):
     tool = load("layout_parity")
     with jax.enable_x64(True):
-        rows = tool.run([model], CELLS[model], dtype="float32", steps=1, anchor=True, mixture={},
+        rows = tool.run([model], layouts, dtype="float32", steps=1, anchor=True, mixture={},
                         objective={}, references=tool.References(), speak=lambda line: None,
-                        keep=lambda rows: None)
+                        keep=lambda rows: None, devices=devices)
     assert tool.verdict(rows) == 0, [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",
                                        "loss_bound", "flops_ratio", "reason", "error")}

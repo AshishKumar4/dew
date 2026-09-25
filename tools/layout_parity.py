@@ -56,8 +56,14 @@ batch is placed from every process alike:
     python tools/layout_parity.py --models dense moe --references refs              # every device
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
         --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' --objective '{"aux_loss_alpha": 0.01}'
+    python tools/layout_parity.py --models dense --layouts stage4,stage2_sequence2 --devices 4
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
+
+A layout's axes other than data are its MeshSpec fields and data takes the
+devices left over, so the same layout splits differently on another device
+count: `--devices 4` runs it on the process's first four, where four stages
+leave no axis for the rows.
 
 Process 0 prints a line per layout and writes the rows. A layout Dew refuses
 by design (`dew.nn.sharding.LayoutRefused`: a stage axis over a model that
@@ -72,6 +78,7 @@ import dataclasses
 import functools
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -298,9 +305,11 @@ def reordered(batch, seed: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1):
-    """The trainer of `case` on the layout `fields` names, or on this
-    process's first device, stashing each gradient the optimizer is handed."""
+def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1,
+             devices: int | None = None):
+    """The trainer of `case` on the layout `fields` names over the first
+    `devices` devices (every device by default), or on this process's first
+    device, stashing each gradient the optimizer is handed."""
     import benchmark_step as bench
     import jax
     import optax
@@ -313,6 +322,8 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                       accumulation=accumulation, checkpoints=None, tracker=None)
     if one_device:
         trainer.device_mesh = build_mesh(MeshSpec(), [jax.local_devices()[0]])
+    elif devices is not None:
+        trainer.device_mesh = build_mesh(trainer.mesh, jax.devices()[:devices])
     return trainer
 
 
@@ -329,11 +340,12 @@ def _gradient(state) -> dict[str, NDArray]:
         for path, leaf in jax.tree_util.tree_flatten_with_path(state.opt_state[0]["gradient"])[0]}
 
 
-def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False
-            ) -> tuple[list[float], dict[str, NDArray], dict[str, Any]]:
-    """The losses of `steps` steps on the layout `fields` names, step one's
-    gradient gathered whole, and what the compiler says of the step."""
-    trainer = _trainer(case, fields, one_device=one_device)
+def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
+            devices: int | None = None) -> tuple[list[float], dict[str, NDArray], dict[str, Any]]:
+    """The losses of `steps` steps on the layout `fields` names (over the
+    first `devices` devices, every device by default), step one's gradient
+    gathered whole, and what the compiler says of the step."""
+    trainer = _trainer(case, fields, one_device=one_device, devices=devices)
     state, _, _ = trainer.place()
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
@@ -406,13 +418,14 @@ def strided(batch, pieces: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def data_parallel_floor(case, batch, reference: Mapping[str, NDArray],
-                        reference_loss: float) -> tuple[dict[str, float], float]:
+def data_parallel_floor(case, batch, reference: Mapping[str, NDArray], reference_loss: float,
+                        devices: int | None = None) -> tuple[dict[str, float], float]:
     """Per leaf, the deviation from the reference of data parallelism over
-    every device of the run, the layout that splits the batch sum and
-    nothing else, and the same of the step-one loss: the floor of an
-    objective that draws noise per row, which no reordering of rows keeps."""
-    losses, gradient, _ = trained(case, {}, batch, steps=1)
+    every device of the run (its first `devices`), the layout that splits
+    the batch sum and nothing else, and the same of the step-one loss: the
+    floor of an objective that draws noise per row, which no reordering of
+    rows keeps."""
+    losses, gradient, _ = trained(case, {}, batch, steps=1, devices=devices)
     return leaf_errors(reference, gradient, case.dtype), abs(losses[0] - reference_loss)
 
 
@@ -692,12 +705,14 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
 
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
         mixture: dict[str, Any], objective: dict[str, Any], references: References,
-        speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None]) -> list[dict[str, Any]]:
+        speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None],
+        devices: int | None = None) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
-    far after each. A reference and a layout run as agreed phases: a failure
-    on one process fails that row on every process, or, where the others
-    wait in a collective it left, ends the pool within the failure grace
-    (dew.artifacts) with the rows kept so far."""
+    far after each, each layout over the process's first `devices` devices
+    (every device by default). A reference and a layout run as agreed
+    phases: a failure on one process fails that row on every process, or,
+    where the others wait in a collective it left, ends the pool within the
+    failure grace (dew.artifacts) with the rows kept so far."""
     import benchmark_step as bench
     import jax
 
@@ -713,7 +728,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             ref_losses, ref_gradient = judge.losses, judge.gradient
             if judge.floors is None or judge.loss_floor is None:
                 floors, loss_floor = agreed(f"floor of {model}", lambda: data_parallel_floor(
-                    reference, batch, ref_gradient, ref_losses[0]))
+                    reference, batch, ref_gradient, ref_losses[0], devices))
             else:
                 floors, loss_floor = judge.floors, judge.loss_floor
             if anchor:
@@ -748,14 +763,15 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             started = time.perf_counter()
             try:
                 losses, gradient, compiled = agreed(
-                    f"{model} on {name}", lambda: trained(case, LAYOUTS[name], batch, steps=steps))
+                    f"{model} on {name}",
+                    lambda: trained(case, LAYOUTS[name], batch, steps=steps, devices=devices))
                 row.update(compiled, losses=losses, **judged(
                     leaf_errors(ref_gradient, gradient, dtype), floors, abs(losses[0] - ref_losses[0]),
                     loss_floor, ref_losses[0]))
-                devices = jax.device_count()
                 if compiled["flops_per_device"] and judge.flops_per_device:
                     # Above one when devices compute what one device need not.
-                    row["flops_ratio"] = compiled["flops_per_device"] * devices / judge.flops_per_device
+                    size = math.prod(compiled["mesh"].values())
+                    row["flops_ratio"] = compiled["flops_per_device"] * size / judge.flops_per_device
                     row["flops_bound"] = flops_bound(LAYOUTS[name])
                     if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
                         row["status"] = "REDUNDANT"
@@ -803,6 +819,9 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
              help="a directory of references a --prepare run wrote, read instead of computed")] = None,
          prepare: Annotated[bool, tyro.conf.arg(
              help="compute each model's missing references into --references and run no layout")] = False,
+         devices: Annotated[int | None, tyro.conf.arg(
+             help="run each layout on this process's first N devices: four stages on four devices "
+                  "leave the rows unsplit, which eight, putting the rest on data, never show")] = None,
          ) -> None:
     """Run the layouts of each model against one device; see the module docstring."""
     from dew.training.runtime import prepare_process
@@ -814,6 +833,9 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
         raise SystemExit("--anchor computes the step in fp64, which needs JAX_ENABLE_X64=1")
     if prepare and (references is None or jax.process_count() > 1):
         raise SystemExit("--prepare writes the --references directory from one process")
+    if devices is not None and (jax.process_count() > 1 or not 0 < devices <= jax.device_count()):
+        raise SystemExit(f"--devices takes the first N of one process's {jax.device_count()} devices; "
+                         "a pool runs every layout on all of its devices")
     jax.config.update("jax_default_matmul_precision", "highest")
     speaker = jax.process_index() == 0
     store = References(references, prepare)
@@ -830,7 +852,8 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
 
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
                objective=json.loads(objective), references=store,
-               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
+               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep,
+               devices=devices)
     if speaker:
         print("\n".join(summary(rows)), flush=True)
     raise SystemExit(verdict(rows))
