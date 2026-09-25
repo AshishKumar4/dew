@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from test_tools import load
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -853,6 +854,11 @@ class RecordedPath(DPMSolverSDE):
         return jnp.sum(jnp.reshape(weights, (-1,) + (1,) * len(shape)) * self.draws, axis=0)
 
 
+FLOOR_FACTOR = load("layout_parity").FLOOR_FACTOR
+"""layout_parity's rule: how far a run may sit from its reference, in
+multiples of the rounding measured for it."""
+
+
 def source_solver(name: str, schedule):
     """The case's solver, with the reference's recorded Brownian path where the
     source drew one."""
@@ -890,10 +896,19 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     A stochastic class integrates the exact draws `sample` folds per step, and
     `DPMSolverSDEScheduler`'s walk integrates the draws its own `torchsde`
     tree answered, whose interval the reconstruction is checked to prepare.
-    Every native walk and VJP runs in float32. Gradients compare directly to
-    the actual source float32 VJP at the same 1e-4 bound as trajectories.
-    The retained float64 source gradients provide additional diagnostic data;
-    they never select a tolerance or change native execution precision.
+    Every native walk and VJP runs in float32.
+
+    The gradient is held to the source's float32 VJP within FLOOR_FACTOR
+    (tools/layout_parity.py's) of the larger of two scales. One is the
+    source's float32 VJP's own distance from its float64 one, which sets the
+    bound for a walk whose VJP amplifies rounding: dpm_multi.cosine_exponential's
+    source lands 8.6e-5 of the gradient's scale from float64, so a fixed
+    1e-4 failed it on a TPU v6e at 1.08e-4. The other is an allowance of one
+    fp32 rounding per step of the walk and of its VJP, which sets the bound
+    for every other case: 4.8e-6 of the gradient's scale at 5 steps, where
+    the fixed bound was 1e-4. It holds a wrong walk out by orders of
+    magnitude; it does not show that Dew's VJP rounds as little as the
+    source's.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -933,7 +948,11 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
 
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     (gradient,) = jax.vjp(final, x_T)[1](cotangent)
-    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad_float32"][None]) < 1e-4
+    rounded, exact = SOURCE_ARRAYS[f"{name}.grad_float32"][None], SOURCE_ARRAYS[f"{name}.grad"][None]
+    steps = SOURCE["cases"][name]["steps"]
+    floor = max(relative_gap(rounded, exact), 2 * steps * float(np.finfo(np.float32).eps))
+    gap = relative_gap(gradient[None], rounded)
+    assert gap <= FLOOR_FACTOR * floor, f"{gap:.3e} against {FLOOR_FACTOR * floor:.3e}"
 
 
 @pytest.mark.parametrize("config", [
