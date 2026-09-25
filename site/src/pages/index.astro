@@ -45,11 +45,13 @@ const shown = [
 const replays = ['lake', 'lighthouse', 'fruit'].map((name) => {
 	// Read from the project's public/, where the build runs (the page's own module is bundled elsewhere).
 	const meta = JSON.parse(readFileSync(path.join(process.cwd(), 'public', 'hero', 'replay', name, 'meta.json'), 'utf8'));
-	return { name, prompt: meta.prompt as string, model: meta.model as { model: string; parameters: number } };
+	return { name, prompt: meta.prompt as string, model: meta.model as { model: string; parameters: number; dew_commit: string } };
 });
+// The note under the figures says one text-to-image model of this size, sampled with Dew:
+// every trajectory's provenance must name the same model and the Dew commit that sampled it.
 const replayModel = replays[0].model;
-if (!replays.every((replay) => replay.model.model === replayModel.model) || !/^FlaxDiff /.test(replayModel.model)) {
-	throw new Error('index.astro: the replays must come from one model trained with FlaxDiff, as the page says');
+if (!replays.every((replay) => replay.model.model === replayModel.model && /^[0-9a-f]{40}$/.test(replay.model.dew_commit))) {
+	throw new Error('index.astro: the replays must come from one model, each sampled with Dew at a recorded commit, as the page says');
 }
 const replayParameters = `${Math.round(replayModel.parameters / 1e6)}M`;
 
@@ -112,8 +114,7 @@ const cards = tutorials.map((entry) => {
 				}
 			</div>
 			<p class="replay-note">
-				A {replayParameters}-parameter model trained with FlaxDiff,{' '}
-				<a href="/getting-started/from-flaxdiff/#load-a-flaxdiff-text-to-image-checkpoint">sampled with Dew</a>.
+				A {replayParameters}-parameter text-to-image model, <a href="/concepts/diffusion/">sampled with Dew</a>.
 			</p>
 		</section>
 
