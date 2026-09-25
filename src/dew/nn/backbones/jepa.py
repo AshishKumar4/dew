@@ -24,6 +24,7 @@ from dew.registry import models
 
 from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
+from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..sharding import constrain, down_projection, logical_axes
 
@@ -123,7 +124,8 @@ class FactorizedTokenStack(nn.Module):
 
     def __call__(self, tokens, train: bool = False):
         B, T, N, F = tokens.shape
-        freqs_temporal = rotary_freqs(jnp.arange(T), self.features // self.num_heads, ROPE_THETA)
+        freqs_temporal = rotary_freqs(jnp.arange(T), self.features // self.num_heads, ROPE_THETA,
+                                      dtype=at_least_fp32(tokens.dtype))
 
         tokens = tokens.reshape(B * T, N, F)
         for spatial, temporal in zip(self.spatial, self.temporal, strict=True):

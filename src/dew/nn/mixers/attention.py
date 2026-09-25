@@ -33,7 +33,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.precision import scaled
+from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
     RopeScaling,
     YarnScaling,
@@ -201,8 +201,9 @@ class CausalSelfAttention(nn.Module):
                 f"head dims, got {factor} of head_dim {self.head_dim}")
         return rot_dim
 
-    def _multimodal_rotary(self, positions: jax.Array):
-        """Qwen's interleaved temporal/height/width rotary frequency selection."""
+    def _multimodal_rotary(self, positions: jax.Array, dtype: jnp.dtype):
+        """Qwen's interleaved temporal/height/width rotary frequency selection,
+        its angles in `dtype`."""
         rotated = self._rot_dim() or self.head_dim
         if self.mrope_section is None:
             raise ValueError("multimodal rotary requires mrope_section")
@@ -214,8 +215,8 @@ class CausalSelfAttention(nn.Module):
             axes = jnp.where((indices % 3 == axis) & (indices < self.mrope_section[axis] * 3), axis, axes)
         selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
         # transformers' 1 / theta ** (2i / dim) (Qwen2VLRotaryEmbedding), on the host.
-        inv = inverse_frequencies(self.rope_theta, rotated)
-        angles = selected.astype(jnp.float32) * inv
+        inv = inverse_frequencies(self.rope_theta, rotated, dtype=dtype)
+        angles = selected.astype(dtype) * inv
         return jnp.cos(angles), jnp.sin(angles)
 
     def _shared_kv(self, kv_store):
@@ -253,24 +254,27 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
-    def _rotary_angles(self, rotary_positions):
-        """Build the rotary cos and sin this layer rotates its heads by.
+    def _rotary_angles(self, rotary_positions, heads: jax.Array):
+        """Build the rotary cos and sin this layer rotates its heads by, in
+        the arithmetic `apply_rotary` rotates `heads` in.
 
         Interleaved mRoPE, YaRN and the plain rope each build their own
         angles; YaRN rotates whole heads at its own frequencies, so it
         takes neither a partial rotary nor a Llama 3.1 ramp.
         """
+        dtype = at_least_fp32(heads.dtype)
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
-            return self._multimodal_rotary(rotary_positions)
+            return self._multimodal_rotary(rotary_positions, dtype)
         if self.yarn is None:
             return rotary_freqs(
                 rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
+                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling,
+                dtype=dtype)
         if self.partial_rotary_factor is not None or self.rope_scaling is not None:
             raise ValueError(
                 "yarn rotates whole heads at its own frequencies, so it takes "
                 "neither partial_rotary_factor nor rope_scaling")
-        return yarn_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn)
+        return yarn_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn, dtype=dtype)
 
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
                        batch: int, length: int, key_length: int, decode: bool):
@@ -413,7 +417,7 @@ class CausalSelfAttention(nn.Module):
             if self.attention_scale is not None:
                 query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
         else:
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
             query = apply_rotary(

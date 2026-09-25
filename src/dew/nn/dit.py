@@ -21,7 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
-from .precision import fp32_result_dot_general
+from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
     build_2d_sincos_pos_embed,
@@ -224,7 +224,7 @@ class ConditioningEmbed(nn.Module):
 
     def setup(self):
         self.time_embed = nn.Sequential([
-            FourierEmbedding(features=self.emb_features),
+            FourierEmbedding(features=self.emb_features, dtype=self.dtype),
             TimeProjection(features=self.emb_features * self.mlp_ratio,
                            dtype=self.dtype, precision=self.precision),
             nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
@@ -493,11 +493,12 @@ class ModulatedBlock(nn.Module):
         return constrain(skip + mlp_output, RESIDUAL)
 
 
-def rope_for_scan(seq_len: int, head_dim: int, scan_order: str):
-    """RoPE frequencies for a token sequence in `scan_order`: the rotation at
-    every index for raster, where the index is a position, and None for the
-    hilbert and zigzag orders, where it is not (the 2D sincos embedding
-    carries position there)."""
+def rope_for_scan(tokens: jax.Array, head_dim: int, scan_order: str):
+    """RoPE frequencies for the `[B, S, F]` tokens in `scan_order`, in the
+    arithmetic they rotate in: the rotation at every index for raster, where
+    the index is a position, and None for the hilbert and zigzag orders,
+    where it is not (the 2D sincos embedding carries position there)."""
     if scan_order != 'raster':
         return None
-    return rotary_freqs(jnp.arange(seq_len), head_dim, ROPE_THETA)
+    return rotary_freqs(jnp.arange(tokens.shape[1]), head_dim, ROPE_THETA,
+                        dtype=at_least_fp32(tokens.dtype))

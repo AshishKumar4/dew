@@ -64,7 +64,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
-from ..precision import head_dot_general, head_product, scaled
+from ..precision import at_least_fp32, head_dot_general, head_product, scaled
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import (
     MLP_HIDDEN,
@@ -2475,7 +2475,7 @@ class CausalTransformer(nn.Module):
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
-                features=self.vocab_size, use_bias=False, dtype=jnp.float32,
+                features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
@@ -2585,9 +2585,9 @@ class CausalTransformer(nn.Module):
                                   self.precision)
         else:
             logits = self.lm_head(x)
-        logits = logits.astype(jnp.float32)
+        logits = logits.astype(at_least_fp32(logits.dtype))
         if self.final_logit_softcap is not None:
-            cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
+            cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
             logits = cap * jnp.tanh(logits / cap)
         return logits
 

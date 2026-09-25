@@ -43,7 +43,7 @@ from jax.sharding import PartitionSpec as P
 from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
-from .precision import rounded_operand, rounded_to
+from .precision import at_least_fp32, rounded_operand, rounded_to
 from .sharding import (
     EXPERT_AXIS,
     STAGE_AXIS,
@@ -345,8 +345,9 @@ class Router(nn.Module):
         return indices
 
     def logits(self, x):
-        """Each token's fp32 gate logit for every expert: `[..., num_experts]`."""
-        return jnp.einsum('...d,de->...e', x.astype(jnp.float32), self.kernel,
+        """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
+        `[..., num_experts]`."""
+        return jnp.einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                           precision=self.precision)
 
     def scores(self, x):
@@ -377,7 +378,7 @@ class Router(nn.Module):
             group_scores = jnp.sum(best_two, axis=-1)
         _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
         kept = jnp.sum(
-            jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.float32), axis=-2)
+            jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
@@ -601,7 +602,8 @@ class Situ:
     linear_beta: float | None = None
 
     def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
-        work_gate, work_up = gate.astype(jnp.float32), up.astype(jnp.float32)
+        wide = at_least_fp32(gate.dtype)
+        work_gate, work_up = gate.astype(wide), up.astype(wide)
         activated = self.beta * jnp.tanh(work_gate / self.beta) * jax.nn.sigmoid(work_gate)
         if self.linear_beta is not None:
             work_up = self.linear_beta * jnp.tanh(work_up / self.linear_beta)
@@ -1137,10 +1139,11 @@ class ExpertMLP(nn.Module):
         return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
+        wide = at_least_fp32(slots.dtype)
         if self.scale_inputs:
-            return jnp.sum(slots.astype(jnp.float32), axis=-2).astype(slots.dtype)
-        return jnp.einsum('...ke,...k->...e', slots.astype(jnp.float32),
-                          weights.astype(jnp.float32), precision=self.precision).astype(slots.dtype)
+            return jnp.sum(slots.astype(wide), axis=-2).astype(slots.dtype)
+        return jnp.einsum('...ke,...k->...e', slots.astype(wide),
+                          weights.astype(wide), precision=self.precision).astype(slots.dtype)
 
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         if weights.shape != indices.shape:

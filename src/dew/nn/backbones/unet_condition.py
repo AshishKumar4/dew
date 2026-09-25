@@ -9,10 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import HEADS, constrain, logical_axes
 from dew.registry import models
 
@@ -35,8 +37,9 @@ class UNetStage:
     cross_only: bool = False
 
 
-def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool = True):
-    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`.
+def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
+    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`,
+    computed in `dtype` (`at_least_fp32` of the model's).
 
     `cosine_first` puts the cosines in the leading half, as SD1/2 and SDXL
     store them. `shift` moves the lowest frequency, the reference's
@@ -48,9 +51,10 @@ def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool
     # Scale the whole exponent before dividing, as the published models do;
     # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
     # the host in float64 so the table does not vary with the backend.
-    exponent = np.arange(half, dtype=np.float32) * np.float32(-math.log(10000.0)) / np.float32(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(np.float32))
-    phase = jnp.asarray(time, jnp.float32).reshape(-1, 1) * frequencies[None]
+    width = np.dtype(dtype).type
+    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
+    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
+    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
     first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
     return jnp.concatenate([first, second], axis=-1)
 
@@ -267,13 +271,15 @@ class UNet2DCondition(nn.Module):
         if x.shape[-1] != self.in_channels:
             raise ValueError(f"UNet input has {x.shape[-1]} channels; expected {self.in_channels}")
         first = self.stages[0].features
-        time = sinusoidal_time(time, first, shift=self.frequency_shift, cosine_first=self.cosine_first)
+        time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
+                               cosine_first=self.cosine_first)
         time = _TimeMLP(first * 4, self.dtype, self.precision, name="time")(time)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
             ids = sinusoidal_time(conditioning.time_ids.reshape(-1), self.additional_time_features,
-                                  shift=self.frequency_shift, cosine_first=self.cosine_first)
+                                  dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
+                                  cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
             time = time + _TimeMLP(first * 4, self.dtype, self.precision, name="additional_time")(extra)
         x = Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)

@@ -446,11 +446,11 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
 
 
 def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
-    """Step one's loss and its gradient by leaf name in fp64: the model built
-    with no dtype of its own, on the reference's own initial variables
-    widened to fp64. The trainer draws those from its key's first split, so
-    they come from the trainer, not from the objective's `init` on the key
-    itself."""
+    """Step one's loss and its gradient by leaf name in fp64: the model's
+    float64 twin (`dew.registry.float64_twin`), which computes in float64
+    throughout, on the reference's own initial variables widened to fp64.
+    The trainer draws those from its key's first split, so they come from
+    the trainer, not from the objective's `init` on the key itself."""
     import benchmark_step as bench
     import jax
     import jax.numpy as jnp

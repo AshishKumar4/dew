@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 
@@ -90,9 +91,10 @@ class DepthAttention(nn.Module):
     def __call__(self, values):
         scale = self.param('scale', nn.initializers.ones, (self.emb_features,), jnp.float32)
         kernel = self.param('kernel', nn.initializers.zeros, (self.emb_features, 1), jnp.float32)
-        work = values.astype(jnp.float32)
+        wide = at_least_fp32(values.dtype)
+        work = values.astype(wide)
         keys = work * jax.lax.rsqrt(jnp.mean(jnp.square(work), axis=-1, keepdims=True) + self.norm_eps)
-        query = scale.astype(jnp.float32) * kernel[:, 0].astype(jnp.float32)
+        query = scale.astype(wide) * kernel[:, 0].astype(wide)
         highest = jax.lax.Precision.HIGHEST
         weights = jax.nn.softmax(jnp.einsum('bsnd,d->bsn', keys, query, precision=highest), axis=-1)
         return jnp.einsum('bsn,bsnd->bsd', weights, work, precision=highest).astype(values.dtype)

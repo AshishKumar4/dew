@@ -367,7 +367,7 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
 
     scaling = YarnScaling(**record["yarn"])
     assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
-    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling)) - expected.numpy())) < 1e-7
+    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy())) < 1e-7
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
 
 

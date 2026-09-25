@@ -440,7 +440,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
         reference, None, layer_type='full_attention')
     record = translate_config(released)['kinds']['full_attention']['yarn']
     scaling = YarnScaling(**record)
-    scaled = yarn_inv_freq(128, 5e5, scaling)
+    scaled = yarn_inv_freq(128, 5e5, scaling, dtype=np.float32)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
 
     # The tables are equal only where torch's float32 pow rounds 5e5 ** x as
@@ -453,7 +453,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
     exponents = torch.arange(0, 128, 2, dtype=torch.int64).float() / 128
     torch_powers = (1.0 / 5e5 ** exponents).numpy()
-    rounded = inverse_frequencies(5e5, 128)
+    rounded = inverse_frequencies(5e5, 128, dtype=np.float32)
     assert np.array_equal(torch_powers, rounded), (
         "torch's float32 pow rounds 5e5 ** x differently from the correctly rounded value at "
         f"{np.flatnonzero(torch_powers != rounded).tolist()}; the YaRN tables then differ by up to 2 ulps")
@@ -1605,12 +1605,13 @@ def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
 
     positions = np.arange(5)
     cos, _ = rotary_freqs(jnp.asarray(positions), config["head_dim"], config["rope_theta"],
-                          rot_dim=rot_dim, partial_rotary_type=config["partial_rotary_type"])
+                          rot_dim=rot_dim, partial_rotary_type=config["partial_rotary_type"],
+                          dtype=np.float32)
     assert cos.shape == (5, 32)
     assert float(np.max(np.abs(np.asarray(cos) - np.cos(positions[:, None] * inv_freq[None])))) < 1e-6
 
     proportional, _ = rotary_freqs(jnp.asarray(positions), config["head_dim"], config["rope_theta"],
-                                   rot_dim=rot_dim, partial_rotary_type="proportional")
+                                   rot_dim=rot_dim, partial_rotary_type="proportional", dtype=np.float32)
     assert proportional.shape == (5, 128)
     assert not np.allclose(np.asarray(proportional)[:, :32],
                            np.cos(positions[:, None] * inv_freq[None]), atol=1e-2)

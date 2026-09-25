@@ -33,9 +33,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -56,27 +58,29 @@ def _image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
-                   axes: Sequence[int]) -> jax.Array:
+                   axes: Sequence[int], *, dtype: DTypeLike) -> jax.Array:
     """The angle of every channel pair of every token, image first,
-    `[B, rows * columns + text, sum(axes) / 2]`.
+    `[B, rows * columns + text, sum(axes) / 2]`, in `dtype` (`at_least_fp32`
+    of the model's).
 
     A text token sits at its index on all three axes. The image's frame axis
     is the row's own text length, and its other two are the centred grid.
     Each axis turns at `QwenImage21Rope.rope_params`' inverse frequencies,
-    theta 10000 in its float32 arithmetic.
+    theta 10000 in its float32 arithmetic below float64.
     """
+    real = np.dtype(dtype).type
     heights, widths = _image_grid(rows, columns)
-    index = jnp.arange(text, dtype=jnp.float32)
+    index = jnp.arange(text, dtype=real)
     batch = lengths.shape[0]
-    frame = jnp.concatenate([jnp.broadcast_to(lengths.astype(jnp.float32)[:, None],
+    frame = jnp.concatenate([jnp.broadcast_to(lengths.astype(real)[:, None],
                                               (batch, rows * columns)),
                              jnp.broadcast_to(index, (batch, text))], axis=1)
-    height = jnp.concatenate([jnp.asarray(heights, jnp.float32), index])
-    width = jnp.concatenate([jnp.asarray(widths, jnp.float32), index])
+    height = jnp.concatenate([jnp.asarray(heights, real), index])
+    width = jnp.concatenate([jnp.asarray(widths, real), index])
     positions = (frame, jnp.broadcast_to(height, frame.shape), jnp.broadcast_to(width, frame.shape))
     return jnp.concatenate([
-        position[..., None] * jnp.asarray(np.float32(1.0) / np.power(
-            np.float32(10000), np.arange(0, dim, 2).astype(np.float32) / np.float32(dim)))
+        position[..., None] * jnp.asarray(real(1.0) / np.power(
+            real(10000), np.arange(0, dim, 2).astype(real) / real(dim)))
         for position, dim in zip(positions, axes, strict=True)], axis=-1)
 
 
@@ -215,7 +219,7 @@ class QwenImageTransformer(nn.Module):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""
         hidden = _dense(self.features, "timestep_embedder_linear_1", self.dtype, self.precision)(
-            sinusoidal_time(time, 256).astype(self.dtype or jnp.float32))
+            sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype)).astype(self.dtype or jnp.float32))
         return _dense(self.features, "timestep_embedder_linear_2", self.dtype, self.precision)(
             nn.silu(hidden))
 
@@ -239,8 +243,9 @@ class QwenImageTransformer(nn.Module):
 
         # The source embeds one extra row at time zero, which the text rows
         # read under `causal_condition`.
-        times = jnp.broadcast_to(jnp.asarray(time, jnp.float32).reshape(-1), (batch,))
-        embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), jnp.float32)]))
+        wide = at_least_fp32(self.dtype)
+        times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
+        embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
         embedded, zero = embedded[:batch], embedded[batch:]
         projected = _dense(4 * self.features, "modulation", self.dtype, self.precision)(
             nn.silu(jnp.concatenate([embedded, zero])))
@@ -248,7 +253,7 @@ class QwenImageTransformer(nn.Module):
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
         modulation = tuple(zip(still, sampled, strict=True))
 
-        angles = _rotary_angles(lengths, text, rows, columns, self.axes_dims_rope)
+        angles = _rotary_angles(lengths, text, rows, columns, self.axes_dims_rope, dtype=wide)
         cos = jnp.repeat(jnp.cos(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         sin = jnp.repeat(jnp.sin(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         for index in range(self.num_layers):

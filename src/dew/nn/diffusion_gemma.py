@@ -24,6 +24,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
+from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
 
@@ -57,15 +58,18 @@ class SelfConditioning(nn.Module):
 
 def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.ArrayLike,
                     scale: float) -> jax.Array:
-    """Previous logits as soft embeddings: fp32 softmax against the table.
+    """Previous logits as soft embeddings: fp32 softmax against the table
+    (the logits' own dtype where it is wider, `at_least_fp32`).
 
     The table is contracted in its stored dtype with fp32 accumulation, which
     is the upcast product up to summation order and materialises no fp32 copy
     of the vocabulary-sized table.
     """
-    probs = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
+    logits = jnp.asarray(logits)
+    wide = at_least_fp32(logits.dtype)
+    probs = jax.nn.softmax(logits.astype(wide), axis=-1)
     return jnp.einsum('...v,vd->...d', probs, jnp.asarray(embed_weight),
-                      preferred_element_type=jnp.float32) * jnp.asarray(scale, jnp.float32)
+                      preferred_element_type=wide) * jnp.asarray(scale, wide)
 
 
 @models("diffusion_gemma")

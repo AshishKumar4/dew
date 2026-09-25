@@ -26,6 +26,7 @@ from ..dit import (
     remat_block,
     rope_for_scan,
 )
+from ..precision import at_least_fp32
 from ..rope import apply_rotary, rotary_freqs
 from ..sharding import logical_axes
 
@@ -222,8 +223,7 @@ class SimpleMMDiT(nn.Module):
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = rope_for_scan(img.shape[1], self.emb_features // self.num_heads,
-                                  self.scan_order)
+        freqs_cis = rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order)
 
         for block in self.blocks:
             img, txt = block(img, txt, cond_emb, freqs_cis, train)
@@ -461,7 +461,7 @@ class HierarchicalMMDiT(nn.Module):
         for stage in range(num_stages):
             freqs_cis = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA)
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
             for block in self.encoder_blocks[stage]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)
@@ -475,7 +475,7 @@ class HierarchicalMMDiT(nn.Module):
             img = self.fusion_layers[i](jnp.concatenate([img, skips[stage]], axis=-1))
             freqs_cis = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA)
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
             for block in self.decoder_blocks[i]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)

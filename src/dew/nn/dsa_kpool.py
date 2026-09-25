@@ -55,6 +55,7 @@ from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
+from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection, logical_axes
 from .sparse_selection import selection_mask
 
@@ -139,7 +140,8 @@ class KPoolIndexer(nn.Module):
         grouped_valid = jnp.logical_and(grouped_valid, indices < total)
         pool_valid = jnp.all(grouped_valid, axis=-1)
         indices = jnp.where(grouped_valid, indices, -1)
-        logits = grouped_gate.astype(jnp.float32) + self.index_kpool_compress_ape.astype(jnp.float32)
+        wide = at_least_fp32(grouped_gate.dtype)
+        logits = grouped_gate.astype(wide) + self.index_kpool_compress_ape.astype(wide)
         logits = jnp.where(grouped_valid[..., None], logits, -jnp.inf)
         # A pool with no valid slot softmaxes to nan, which the reference
         # zeroes (modeling_glm5_next.py:964-966).
@@ -179,9 +181,10 @@ class KPoolIndexer(nn.Module):
         valid = packed[..., -1] > 0
         query = self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim)
         pool_keys, pool_indices, pool_valid = self._pools(packed)
-        scores = jnp.einsum('bshd,bpd->bshp', query.astype(jnp.float32), pool_keys.astype(jnp.float32))
+        wide = at_least_fp32(query.dtype)
+        scores = jnp.einsum('bshd,bpd->bshp', query.astype(wide), pool_keys.astype(wide))
         scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(x).astype(jnp.float32) * (self.n_heads ** -0.5)
+        weights = self.weights_proj(x).astype(wide) * (self.n_heads ** -0.5)
         index_scores = jnp.einsum('bsh,bshp->bsp', weights, scores)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
@@ -190,7 +193,7 @@ class KPoolIndexer(nn.Module):
         pool_visible = jnp.take_along_axis(
             visible, jnp.broadcast_to(pool_end[:, None, :], (batch, length, pool_end.shape[-1])), axis=-1)
         candidates = jnp.logical_and(pool_visible, pool_valid[:, None])
-        index_scores = jnp.where(candidates, index_scores, jnp.finfo(jnp.float32).min)
+        index_scores = jnp.where(candidates, index_scores, jnp.finfo(wide).min)
         # The reference drops the pools no row fills (:969-972) before this
         # minimum; a dropped pool is never a candidate, and a selected
         # non-candidate contributes no indices, so the selection is the same.

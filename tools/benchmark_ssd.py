@@ -124,7 +124,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     scan = scan_fn(case['implementation'], platform)
     row = {**case, 'platform': platform,
            'selected': ssd_kernel_runs(config.chunk_size, config.head_dim,
-                                       config.state_size, platform)}
+                                       config.state_size, platform, dtype=jnp.float32)}
     try:
         forward = jax.jit(scan)
         scanned = jax.block_until_ready(forward(*built))
