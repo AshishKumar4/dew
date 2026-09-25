@@ -15,7 +15,7 @@ from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_atte
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import HEADS, constrain, logical_axes
+from dew.nn.sharding import HEADS, constrain, logical_axes, split_positions
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -85,7 +85,9 @@ class _Attention(nn.Module):
     value projections by their output heads and the output projection by
     its input heads. Left whole, every tensor shard projected the whole text
     context into keys and values (4 times one device's FLOPs for those
-    projections at tensor=4).
+    projections at tensor=4). Under a sequence axis each sequence shard
+    projects its share of the context's tokens where the axis's link pays
+    for it (`split_positions`).
     """
 
     features: int
@@ -102,7 +104,9 @@ class _Attention(nn.Module):
         def project(value, name):
             return constrain(nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
                                              precision=self.precision, name=name)(value), HEADS)
-        attended = scaled_dot_product_attention(project(x, "q"), project(context, "k"), project(context, "v"),
+        keys, values = split_positions(context, 2 * self.features,
+                                       lambda tokens: (project(tokens, "k"), project(tokens, "v")))
+        attended = scaled_dot_product_attention(project(x, "q"), keys, values,
             dtype=self.dtype, precision=self.precision, implementation=self.attention_impl)
         output = nn.DenseGeneral(self.features, axis=(-2, -1), dtype=self.dtype,
                                  precision=self.precision, name="output")(constrain(attended, HEADS))

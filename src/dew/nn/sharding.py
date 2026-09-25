@@ -43,9 +43,11 @@ import contextvars
 import dataclasses
 import fnmatch
 import math
-from collections.abc import Iterable, Iterator, Mapping
+import types
+from collections.abc import Callable, Iterable, Iterator, Mapping
 
 import jax
+import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import spmd
 
@@ -242,17 +244,16 @@ def microbatches() -> int:
 
 
 @dataclasses.dataclass
-class TensorLink:
-    """The tensor axis's interconnect as the trainer measured it when it
-    placed a step (`dew.training.distributed.tensor_bandwidth`), one device's
-    dense bf16 peak, and whether a down-projection in the step ran on each
-    tensor shard's own tokens, which `down_projection` notes as it decides."""
+class Link:
+    """A mesh axis's interconnect as the trainer measured it when it placed a
+    step (`dew.training.distributed.link_bandwidth`), one device's dense bf16
+    peak, and whether a projection in the step ran split over the axis, which
+    `down_projection` and `split_positions` note as they decide."""
 
     bytes_per_second: float | None
-    """What one device receives a second in an all-gather over the tensor
-    axis: (T - 1) / T of the result, over the time it took. None where
-    nothing was measured: a CPU mesh, or a device the peak table does not
-    name."""
+    """What one device receives a second in an all-gather over the axis:
+    (N - 1) / N of the result, over the time it took. None where nothing was
+    measured: a CPU mesh, or a device the peak table does not name."""
     flops_per_second: float | None
     """One device's dense bf16 peak, None for hardware the peak table does
     not name (`dew.telemetry.instrumentation.peak_flops`)."""
@@ -260,55 +261,44 @@ class TensorLink:
     spread: bool = False
 
 
-_TENSOR_LINK: contextvars.ContextVar[TensorLink | None] = contextvars.ContextVar(
-    'tensor_link', default=None)
+_LINKS: contextvars.ContextVar[Mapping[str, Link]] = contextvars.ContextVar(
+    'links', default=types.MappingProxyType({}))
 
 
 @contextlib.contextmanager
-def tensor_link(link: TensorLink | None) -> Iterator[TensorLink | None]:
-    """Trace with `link` as the tensor axis's interconnect, for the
-    down-projections that decide from it; the link yielded says, once the
-    step has traced, whether one of them spread."""
-    token = _TENSOR_LINK.set(link)
+def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
+    """Trace with `links`, each mesh axis's measured interconnect by axis
+    name, for the projections that decide from them; each link yielded says,
+    once the step has traced, whether a projection spread over its axis."""
+    token = _LINKS.set(links)
     try:
-        yield link
+        yield links
     finally:
-        _TENSOR_LINK.reset(token)
+        _LINKS.reset(token)
 
 
-def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
-    """Where the down-projections of the residual `x` to `latent` features
-    in all run: `SPREAD`, each tensor shard on its own tokens, where that
-    cannot slow the step, else `RESIDUAL`, every tensor shard on every token.
+def _spreads(axis: str, x: jax.Array, latent: int, tokens: float) -> bool:
+    """Whether a projection of `x`'s tokens to `latent` features, which would
+    otherwise run on every token of every `axis` shard, runs split over
+    `axis`, each shard on its own share of the `tokens` one `axis` group
+    computes. It splits where that cannot slow the step.
 
-    Spreading takes from each of T shards (T - 1) / T of the projections'
+    Splitting takes from each of N shards (N - 1) / N of the projection's
     6 * width * latent FLOPs a token (the forward product and the backward's
-    two) and adds (T - 1) / T of a token's residual gradient and latent,
-    gathered over the tensor axis, plus a step's sum of the projections' fp32
+    two) and adds (N - 1) / N of a token's input gradient and output,
+    gathered over the axis, plus a step's sum of the projection's fp32
     weight gradient over it, which a ring moves twice. It cannot lose where
-    the link moves those bytes in no more time than the device's peak takes
-    for the FLOPs: the step saves at least that time at any utilisation.
-    The weight gradient's sum is a microbatch's, so the fewer its tokens the
-    more it weighs: at DeepSeek-V3's widths in bf16 (7168 into 1536 + 512 +
-    64) and 16384 tokens that is 20.3 GB/s for an RTX 3090, which an NVLink
-    pair's 31.0 meets and a PCIe 3.0 pair's 5.8 does not (4x RTX 3090, PCIe
-    3.0, one host), and 283 GB/s for an H100, under NVLink 4's nominal 450
-    a direction; at 4096 tokens an H100 needs 524. A CPU mesh's devices
-    share one host's memory, which moves a byte in less time than a CPU's
-    matmul spends on a thousand FLOPs, and it spreads. Without a measured
-    link, or with a device the peak table does not name, the projections
-    stay on every token."""
-    mesh = jax.sharding.get_abstract_mesh()
-    link = _TENSOR_LINK.get()
-    if (mesh.empty or mesh.shape.get(TENSOR_AXIS, 1) == 1 or TENSOR_AXIS in mesh.manual_axes
-            or link is None):
-        return RESIDUAL
+    the axis's link moves those bytes in no more time than the device's
+    peak takes for the FLOPs: the step saves at least that time at any
+    utilisation. The weight gradient's sum is a microbatch's, so the fewer
+    its tokens the more it weighs. A CPU mesh's devices share one host's
+    memory, which moves a byte in less time than a CPU's matmul spends on a
+    thousand FLOPs, and it splits. Without a measured link, or with a device
+    the peak table does not name, the projection runs on every token."""
+    link = _LINKS.get().get(axis)
+    if link is None:
+        return False
     width = x.shape[-1]
-    # The tokens one tensor group computes: the rows and positions the
-    # residual's other axes leave it.
-    split = math.prod(mesh.shape[axis] for entry in logical_spec(RESIDUAL[:2], x.shape[:2])
-                      for axis in mesh_axes(entry))
-    tokens = math.prod(x.shape[:-1]) / split
     flops = 6 * width * latent
     moved = (width + latent) * x.dtype.itemsize + 2 * width * latent * 4 / tokens
     if link.platform == 'cpu':
@@ -318,7 +308,30 @@ def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
     else:
         spreads = link.bytes_per_second * flops >= link.flops_per_second * moved
     link.spread = link.spread or spreads
-    return SPREAD if spreads else RESIDUAL
+    return spreads
+
+
+def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
+    """Where the per-token projections of `x`, the residual or any other
+    `[batch, ..., tokens, width]` input whose width the tensor axis does not
+    split, to `latent` features in all run: `SPREAD`, each tensor shard on
+    its own tokens, where the tensor axis's link pays for it (`_spreads`),
+    else `RESIDUAL`, every tensor shard on every token.
+
+    At DeepSeek-V3's widths in bf16 (7168 into 1536 + 512 + 64) and 16384
+    tokens the link must move 20.3 GB/s for an RTX 3090, which an NVLink
+    pair's 31.0 meets and a PCIe 3.0 pair's 5.8 does not (4x RTX 3090, PCIe
+    3.0, one host), and 283 GB/s for an H100, under NVLink 4's nominal 450
+    a direction; at 4096 tokens an H100 needs 524."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or mesh.shape.get(TENSOR_AXIS, 1) == 1 or TENSOR_AXIS in mesh.manual_axes:
+        return RESIDUAL
+    # The tokens one tensor group computes: the rows and positions the
+    # residual's other axes leave it.
+    split = math.prod(mesh.shape[axis] for entry in logical_spec(RESIDUAL[:2], x.shape[:2])
+                      for axis in mesh_axes(entry))
+    tokens = math.prod(x.shape[:-1]) / split
+    return SPREAD if _spreads(TENSOR_AXIS, x, latent, tokens) else RESIDUAL
 
 
 def sequence_shards() -> int:
@@ -335,6 +348,40 @@ def sequence_shards() -> int:
     if mesh.empty or SEQUENCE_AXIS in mesh.manual_axes:
         return 1
     return mesh.shape.get(SEQUENCE_AXIS, 1)
+
+
+def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array], T]) -> T:
+    """`project(x)`, a projection of a `[batch, length, width]` input whose
+    positions the sequence axis does not divide to `features` output
+    features in all, run on each sequence shard's share of the positions
+    where the sequence axis's link pays for it (`_spreads`, the rule
+    `down_projection` decides by): `x` padded with zero rows to a multiple
+    of the shard count, so `project`'s own constraints split its positions,
+    and every array `project` returns cut back to `length`. `project` must
+    work position by position, as a projection without a sequence mixer
+    does. With the sequence axis at one, a length it divides, or a link that
+    does not pay, it runs on `x` as it is.
+
+    A cross-attention's context is such an input: SD's 77 text tokens. Left
+    whole, every sequence shard projects all of them into keys and values,
+    and the conditional UNet's step on sequence4 computed 1.57 times one
+    device's FLOPs on a CPU mesh, which splits them; split, the pad rows'
+    projections are what is repeated, 3 of 80 rows at SD's length. The
+    projections are small beside the step and the sum of their weight
+    gradients the split adds is not, so a GPU's link rarely pays: at SDXL's
+    widths in bf16 (2048 into 2 x 1280) and 8 rows a group, an H100 would
+    need 2.35 TB/s."""
+    shards = sequence_shards()
+    length = x.shape[1]
+    if shards == 1 or length % shards == 0:
+        return project(x)
+    padded_length = length + -length % shards
+    mesh = jax.sharding.get_abstract_mesh()
+    rows = x.shape[0] / math.prod(mesh.shape[axis] for axis in row_axes(x.shape[0]))
+    if not _spreads(SEQUENCE_AXIS, x, features, rows * padded_length):
+        return project(x)
+    padded = jnp.pad(x, ((0, 0), (0, padded_length - length)) + ((0, 0),) * (x.ndim - 2))
+    return jax.tree.map(lambda out: out[:, :length], project(padded))
 
 
 def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None

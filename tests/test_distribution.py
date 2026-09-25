@@ -672,7 +672,7 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
 
 
 @pytest.mark.mesh(devices=4)
-def test_every_process_of_a_pool_takes_the_same_tensor_bandwidth():
+def test_every_process_of_a_pool_takes_the_same_link_bandwidth():
     """A tensor axis over two processes' devices. Each process times its own
     part of the gathers, and processes that placed the step from different
     figures could compile different programs and hang in their collectives,
@@ -681,9 +681,9 @@ def test_every_process_of_a_pool_takes_the_same_tensor_bandwidth():
                "runtime.prepare_process()\n"
                "import jax\n"
                "from dew.training import MeshSpec, build_mesh\n"
-               "from dew.training.distributed import tensor_bandwidth\n"
+               "from dew.training.distributed import link_bandwidth\n"
                "mesh = build_mesh(MeshSpec(tensor=jax.device_count()))\n"
-               "print('measured', jax.process_index(), repr(tensor_bandwidth(mesh)), flush=True)\n")
+               "print('measured', jax.process_index(), repr(link_bandwidth(mesh, 'tensor')), flush=True)\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=2, timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
     figures = dict(line.split("] measured ", 1)[1].split(" ", 1)
