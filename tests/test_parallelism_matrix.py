@@ -32,7 +32,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "hybrid_sft": ("sequence4", "stage4"),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4"),
-    "unet": ("tensor4", "fsdp2_tensor2"),
+    "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
     "jepa": ("fsdp4", "sequence4", "tensor4"),
     "multimodal": ("sequence4", "stage4"),
 }
