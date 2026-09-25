@@ -1024,8 +1024,9 @@ class Trainer(Generic[Loss, Effects]):
             run.first_step = None
             run.notice = PreemptionNotice()
             while run.current < steps:
-                train = run.train
-                assert train is not None
+                # Read through `run` each time: a local alias would keep the
+                # closed iterator reachable from a failed run's traceback.
+                assert run.train is not None
                 # The window's capture opens before this iteration's first
                 # read, so the step row records the read it waits on rather
                 # than a compile that ran before capture began.
@@ -1038,7 +1039,7 @@ class Trainer(Generic[Loss, Effects]):
                               if capturing else contextlib.nullcontext())
                 with step_scope:
                     with region("input.wait"):
-                        batch = next(train)
+                        batch = next(run.train)
                     if self.rollout is not None:
                         batch, sampled = self._rolled_out(state, batch, mesh)
                         interval.rollout_seconds += sampled
@@ -1051,7 +1052,7 @@ class Trainer(Generic[Loss, Effects]):
                     with region("train.step"):
                         state, loss, aux, finite, accepted = train_step(state, batch)
                     run.loss = loss
-                    position = train.source_state
+                    position = run.train.source_state
                     run.current += 1
                     seen += 1
                     interval.count(batch, measured_flops, loss, finite)
