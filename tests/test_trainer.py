@@ -1250,10 +1250,10 @@ def test_accumulation_must_be_positive():
 @pytest.mark.parametrize("generation,flags,ssd,off", [
     ("sm80", "", False, True), ("sm80", "", True, False),
     ("sm80", "--xla_gpu_enable_triton_gemm=true", False, False),
-    ("sm89", "", False, False), ("v6e", "", False, False)])
+    ("sm89", "", False, True), ("sm86", "", False, False), ("v6e", "", False, False)])
 def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
         monkeypatch, generation, flags, ssd, off):
-    """sm80 compiles a training step with XLA's Triton GEMM fusions off,
+    """sm80 and sm89 compile a training step with XLA's Triton GEMM fusions off,
     except for a model with an SSD mixer, whose scan lost 7.7% without them,
     and except where the run set the flag itself."""
     from types import SimpleNamespace
@@ -1272,8 +1272,8 @@ def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
-def test_an_sm80_step_compiles_its_dots_to_cublas():
-    """On sm80 the compiled training step holds no Triton GEMM fusion: every
+def test_a_measured_generations_step_compiles_its_dots_to_cublas():
+    """On sm80 and sm89 the compiled training step holds no Triton GEMM fusion: every
     dot is a cuBLAS call. Elsewhere the step asks XLA for nothing, whether
     or not XLA fuses GEMMs with Triton on that GPU."""
     from dew.nn.kernels.generation import device_generation
@@ -1287,6 +1287,22 @@ def test_an_sm80_step_compiles_its_dots_to_cublas():
     state, _, _ = trainer.place()
     trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
     assert "__triton_gemm" not in trainer.executable.as_text()
+
+
+def test_a_step_that_fits_only_with_the_default_options_compiles_with_them(monkeypatch):
+    """Where the step compiled without Triton GEMM fusions does not fit and
+    the default one does, the trainer keeps the default one before tiling the
+    head; where neither fits, it keeps the measured options' step for the
+    ladder to climb from."""
+    from dew.training import trainer as module
+
+    program = jax.jit(lambda x: x @ x).lower(jnp.ones((4, 4)))
+    measured = program.compile({"xla_backend_optimization_level": 1})
+    for default_fits in (True, False):
+        monkeypatch.setattr(module, "step_fits", lambda executable, mesh, fits=default_fits:
+                            fits and executable is not measured)
+        chosen, fits = module.fitting_default(program, measured, None)
+        assert (chosen is not measured) == default_fits == fits
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
