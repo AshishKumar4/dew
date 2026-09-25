@@ -73,10 +73,9 @@ from ..sharding import (
     LayoutRefused,
     constrain,
     logical_axes,
-    logical_spec,
-    mesh_axes,
     microbatches,
     pipeline_stages,
+    row_axes,
 )
 
 
@@ -2926,11 +2925,13 @@ class CausalTransformer(nn.Module):
             # the devices that hold none of its rows compute another's again:
             # 1.43 times one device's FLOPs for a stage x fsdp step of 8 rows in
             # 4 microbatches over 4 row shards, where the bubble accounts for 1.25.
-            row_axes = mesh_axes(logical_spec(RESIDUAL[:1], (rows,))[0])
-            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in row_axes)
+            # No axis splits the rows where the mesh leaves none for them
+            # (four stages on four devices): every device holds every row.
+            splitting = row_axes(rows)
+            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
             if (rows // shards) % count_microbatches:
                 raise LayoutRefused(
-                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(row_axes)}, "
+                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
                     f"{rows // shards} rows a device, which {count_microbatches} microbatches "
                     f"do not divide, so the devices that hold none of a microbatch's rows would "
                     f"compute another's again; use a microbatch count that divides "
