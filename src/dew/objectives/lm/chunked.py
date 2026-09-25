@@ -392,11 +392,19 @@ _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(4, 5, 6, 7))
 _whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
 
 
-HEAD_TILE_BY_GENERATION: dict[str, tuple[int, int]] = {'sm80': (4096, 8192)}
+HEAD_TILE_BY_GENERATION: dict[str, tuple[int, int]] = {'sm80': (4096, 8192), 'sm89': (4096, 8192)}
 """The chunked head's `(tokens, columns)` tile where it was measured to beat
-the default: on one A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide,
+the default. On one A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide,
 4096 tokens, bf16) forward and backward took 48.7 ms at 4096 x 8192 and
-60.2 ms at 1024 x 8192, at 0.46 and 0.21 GiB of temporaries."""
+60.2 ms at 1024 x 8192, at 0.46 and 0.21 GiB of temporaries. On an RTX
+4080, a whole training step at those widths (2 layers, bf16): at 4096
+tokens 114.6 ms against 123.4 at 1024 x 8192, 119.7 at 2048 x 8192 and
+116.6 at 4096 x 4096; at 8192 tokens 219.1 against 228.3 (1024 x 8192),
+227.8 (2048 x 16384) and 219.3 (8192 x 4096) with less memory. The whole
+logits beat the 4096 x 8192 tile where they fit once the step compiles
+without XLA's Triton GEMM fusions (`TRITON_GEMM_OFF_GENERATIONS`): 53.5
+against 65.5 ms at 2048 tokens, 93.4 against 110.2 at 4096. With the
+fusions, exactly 4096 whole took 286.0 ms."""
 
 
 def chunked_tile() -> tuple[int, int]:
