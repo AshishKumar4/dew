@@ -15,6 +15,7 @@ each token.
 
 from typing import ClassVar, Literal, Sequence
 
+import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -24,7 +25,7 @@ from dew.registry import models
 from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
 from ..rope import rotary_freqs
-from ..sharding import logical_axes
+from ..sharding import constrain, down_projection, logical_axes
 
 
 def gather_tokens(tokens, indices):
@@ -210,6 +211,13 @@ class JepaPredictor(nn.Module):
 
     Context tokens are projected down, mask tokens stand in for the targets,
     and both carry the sincos signal for the grid position they belong to.
+
+    The projections in and out split no tensor width, so under a tensor axis
+    each runs where `down_projection` places it: on each tensor shard's own
+    tokens where the measured link pays for gathering them, as multi-head
+    latent attention's down-projections do. On every token of every shard,
+    the two made layout_parity's JEPA compute 1.11 times one device's FLOPs
+    on tensor4.
     """
     grid: tuple[int, int] = (14, 14)
     emb_features: int = 384      # encoder width, in and out
@@ -261,7 +269,7 @@ class JepaPredictor(nn.Module):
             return pos[:, None] if self.factorized else pos
 
         num_target_tokens = target_idx.shape[-1]
-        context = self.proj_in(context) + positions(context_idx)
+        context = _projected(self.proj_in, context) + positions(context_idx)
         targets = self.mask_token + positions(target_idx)
         if self.factorized:
             targets = jnp.broadcast_to(
@@ -269,4 +277,13 @@ class JepaPredictor(nn.Module):
 
         tokens = jnp.concatenate([context, targets], axis=-2)
         tokens = self.stack(tokens, train=train)
-        return self.proj_out(self.norm(tokens[..., -num_target_tokens:, :]))
+        return _projected(self.proj_out, self.norm(tokens[..., -num_target_tokens:, :]))
+
+
+def _projected(dense: nn.Dense, x: jax.Array) -> jax.Array:
+    """`dense(x)` over `[batch, ..., tokens, width]`, run where
+    `down_projection` places a projection of `x` to `dense.features`: its
+    positions spread over the tensor axis, or whole on every shard."""
+    flat = x.reshape(x.shape[0], -1, x.shape[-1])
+    place = down_projection(flat, dense.features)
+    return constrain(dense(constrain(flat, place)), place).reshape(*x.shape[:-1], dense.features)
