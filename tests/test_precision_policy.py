@@ -6,12 +6,21 @@
 raises a ValueError for a knob a fused kernel cannot honor.
 """
 
+import collections
+import json
+from pathlib import Path
+
 import jax
+import jax.extend
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from jax._src import source_info_util
+from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew import models
 from dew.diffusion.process import DenoisingCondition
+from dew.interop.hf_decoders import translate_config
 from dew.nn.attention import local_attention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
@@ -205,19 +214,61 @@ PER_ARCH = {
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+FIXTURE_DECODERS = ("mamba2-tiny", "deepseek-v4-tiny", "glm5-next-tiny", "kimi-k3-tiny")
+"""Tiny released configs whose mixers no toy case reaches: Mamba-2,
+DeepSeek V4's compressed attention and hyper-connections, GLM-5 Next's
+k-pool sparse attention and Kimi's delta attention, depth attention and
+SiTU. DeepSeek V4.1's KV quantizers round through float32 bits on
+purpose (`dew.nn.fake_quant`), so its float64 twin is
+tools/deepseek_v41_numerics.py's, not this one."""
+
+
+def _translated(name):
+    """A fixture's decoder config, less the precision fields the policy writes."""
+    config = translate_config(json.loads((FIXTURES / name / "config.json").read_text()))
+    return {key: value for key, value in config.items() if key not in ("dtype", "attention_impl")}
+
+
+DECODERS = ({case.name: case.config for case in ARCHITECTURE_CASES
+             if case.architecture == "causal_transformer" and case.label}
+            | {f"causal_transformer+{name}": _translated(name) for name in FIXTURE_DECODERS})
+"""The decoder's mixers and mixtures past its default, at toy width
+(tests/test_architectures.py): the MoE routers, Gemma 4's, GPT OSS's, MLA,
+Llama 4's, gemma3n's and the gated delta net, by case name; and the
+fixtures' (`FIXTURE_DECODERS`)."""
+
+
+def float64_twin(config):
+    """`config`, a model config `with_precision` wrote, computing in float64:
+    its dtype and the UNets' per-stage attention dtypes, the only nested
+    dtypes the policy writes."""
+    twin = {**config, "dtype": jnp.float64}
+    if isinstance(config.get("attention_configs"), list | tuple):
+        twin["attention_configs"] = [stage if stage is None else {**stage, "dtype": jnp.float64}
+                                     for stage in config["attention_configs"]]
+    return twin
 
 
 def build_model(architecture, dtype="bfloat16"):
     """Every registered architecture at a tiny size, the policy applied where
     it enters: leaf models through `with_precision`; the composites wrap a
-    language model built that way, so the compute dtype reaches their trunk."""
+    language model built that way, so the compute dtype reaches their trunk.
+    "float64" is the float32 configuration's float64 twin (`float64_twin`),
+    which x64 has to be on for."""
+    def resolved(name, fields):
+        config = with_precision(name, fields, dtype="float32" if dtype == "float64" else dtype,
+                                attention_impl="auto")
+        return float64_twin(config) if dtype == "float64" else config
+
+    if architecture in DECODERS:
+        return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
     if architecture not in COMPOSITES:
         own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer")
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
-        return models.build(architecture, **with_precision(
-            architecture, fields, dtype=dtype, attention_impl="auto"))
-    text = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**TINY, **LM, "mlp_features": 64}, dtype=dtype, attention_impl="auto"))
+        return models.build(architecture, **resolved(architecture, fields))
+    text = models.build("causal_transformer", **resolved(
+        "causal_transformer", {**TINY, **LM, "mlp_features": 64}))
     if architecture == "diffusion_gemma":
         return DiffusionGemma(text, canvas_length=4)
     return MultimodalTransformer(
@@ -225,7 +276,8 @@ def build_model(architecture, dtype="bfloat16"):
                            image_size=8, patch_size=4),
         GemmaProjector(vision_width=16, text_width=TINY["emb_features"],
                        patches_per_side=2, tokens_per_side=1),
-        family="gemma3", image_token_id=1, dtype=resolve_dtype(dtype))
+        family="gemma3", image_token_id=1,
+        dtype=jnp.float64 if dtype == "float64" else resolve_dtype(dtype))
 
 
 def tiny_inputs(architecture, rng):
@@ -252,7 +304,7 @@ def tiny_inputs(architecture, rng):
             text.hidden[:, :, :16], mask=text.mask)}
     if architecture == "jepa_encoder":
         return (image,)
-    if architecture == "causal_transformer":
+    if architecture == "causal_transformer" or architecture in DECODERS:
         return (jnp.zeros((1, 8), jnp.int32),)
     if architecture == "diffusion_gemma":
         return (jnp.zeros((1, 4), jnp.int32),)
@@ -266,6 +318,110 @@ def tiny_inputs(architecture, rng):
         return (jax.random.normal(rng, (1, 8, 32)),
                 jnp.arange(8)[None], jnp.arange(8, 12)[None])
     return image, jnp.ones((1,)), text
+
+
+def forward(architecture, dtype, rng):
+    """`architecture` at `dtype`, its variables and inputs, and its forward
+    pass as a function of them: DiffusionGemma's encodes its prompt first.
+    At float64 the parameters and the float inputs are float64 too."""
+    model = build_model(architecture, dtype)
+    inputs = tiny_inputs(architecture, rng)
+    args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
+    variables = model.init(rng, *args, **kwargs)
+    if dtype == "float64":
+        variables, args, kwargs = jax.tree.map(
+            lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+            (variables, args, kwargs))
+
+    def run(variables, args, kwargs):
+        if architecture == "diffusion_gemma":
+            cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]["cache"]
+            cache = model.apply({**variables, "cache": cache}, jnp.zeros((1, 8), jnp.int32),
+                                method=model.encode, mutable=["cache"])[1]["cache"]
+            variables = {**variables, "cache": cache}
+        return model.apply(variables, *args, **kwargs)
+
+    return run, (variables, args, kwargs)
+
+
+def indexing_only(jaxpr) -> set:
+    """The variables of `jaxpr` whose every use ends in integers: floats
+    that compute an index and nothing else. `jax.image.resize` computes its
+    nearest source indices in float32 whatever the image's dtype (on
+    purpose, jax b/206898375), exact below 2**24 and rounding none of the
+    model's values."""
+    uses = collections.defaultdict(list)
+    for eqn in jaxpr.eqns:
+        for var in eqn.invars:
+            if isinstance(var, jax.extend.core.Var):
+                uses[var].append(eqn)
+    returned = {var for var in jaxpr.outvars if isinstance(var, jax.extend.core.Var)}
+    only: set = set()
+    for eqn in reversed(jaxpr.eqns):
+        for var in eqn.outvars:
+            if var not in returned and uses[var] and all(
+                    jnp.issubdtype(out.aval.dtype, jnp.integer) or out in only
+                    for use in uses[var] for out in use.outvars):
+                only.add(var)
+    return only
+
+
+def made_in(jaxpr, dtype) -> list[str]:
+    """Where `jaxpr`, and every jaxpr it holds, makes a value of `dtype` the
+    model computes with (`indexing_only` values are not counted): Dew's
+    source line nearest each, in the order they are made."""
+    indexing = indexing_only(jaxpr)
+    found = []
+    for eqn in jaxpr.eqns:
+        if any(getattr(getattr(var, "aval", None), "dtype", None) == dtype and var not in indexing
+               for var in eqn.outvars):
+            frames = [] if eqn.source_info.traceback is None else list(
+                source_info_util.user_frames(eqn.source_info.traceback))
+            ours = [frame for frame in frames if "/src/dew/" in frame.file_name] or frames
+            found.append(f"{ours[0].file_name.split('/src/')[-1]}:{ours[0].start_line}" if ours else "?")
+        for inner in jax.extend.core.jaxprs_in_params(eqn.params):
+            found += made_in(inner, dtype)
+    return found
+
+
+@pytest.mark.parametrize("architecture", sorted(models) + sorted(DECODERS))
+def test_a_float64_model_computes_nothing_in_float32(architecture, rng):
+    """A float64 model, under x64, computes in float64 throughout: its norm
+    statistics, softmax, rotary angles and heads, which compute in at least
+    float32 (`dew.nn.precision.at_least_fp32`), are float64 there. Rounded
+    to float32, they were roundings a float64 twin shared with the float32
+    model it bounds, so the bound missed them: test_layer_stack's scanned
+    gemma3n read 1.07 of its bound on a TPU and 1.1 on an RTX 4080 at full
+    float32, where 1383 of its twin's values were float32. The twin runs on
+    the CPU backend, which every lane keeps beside its accelerator, since a
+    TPU has no float64."""
+    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
+        run, operands = forward(architecture, "float64", rng)
+        made = made_in(jax.make_jaxpr(run)(*operands).jaxpr, jnp.float32)
+    assert not made, f"{len(made)} float32 values, first at {sorted(set(made))[:8]}"
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("architecture", sorted(models) + sorted(DECODERS))
+def test_a_model_below_float64_computes_the_same_bits_whether_x64_is_on(architecture, dtype, rng):
+    """x64 is one flag for the whole process, which a float64 reference
+    turns on beside the model it checks. A float32 or bfloat16 model
+    computes the same bits either way: nothing it computes widens past
+    float32, whatever a Python float or an index widens to under x64.
+
+    Both run on the CPU backend, which every lane keeps beside its
+    accelerator. The claim is about the arithmetic the model asks for, and
+    a TPU compiles the same arithmetic apart once x64 widens its indices to
+    int64, which it emulates."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        run, operands = forward(architecture, dtype, rng)
+        outputs = []
+        for x64 in (False, True):
+            with jax.enable_x64(x64):
+                outputs.append(jax.tree.map(np.asarray, jax.jit(run)(*operands)))
+    for without, under in zip(jax.tree.leaves(outputs[0]), jax.tree.leaves(outputs[1]), strict=True):
+        assert under.dtype == without.dtype
+        np.testing.assert_array_equal(under, without)
 
 
 @pytest.mark.parametrize("architecture", sorted(models))
