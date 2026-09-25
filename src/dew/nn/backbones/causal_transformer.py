@@ -156,6 +156,45 @@ fetched is applied in a scope of its own, so these are the names whose values
 the loop has to carry back out to the scope that asked for them."""
 
 
+def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
+                  train: bool, decode: bool, positions, segment_ids, kv_store, per_layer_input,
+                  attention_metadata):
+    """`run_stack` without the inference prefetch: each run of one layer
+    called as the plain loop calls it, and each longer run under flax's
+    scan. Training through host-resident banks scans with the fetch mapped
+    onto each row under remat (`run_stack`)."""
+    for run, (first, count) in zip(runs, groups, strict=True):
+        inputs = None if per_layer_input is None else per_layer_input.span(first, count)
+        if count == 1 and not fetching:
+            x = run(x, train=train, decode=decode, positions=positions,
+                    segment_ids=segment_ids, kv_store=kv_store,
+                    per_layer_input=None if inputs is None else inputs.layer(0),
+                    attention_metadata=attention_metadata)
+            continue
+        store = kv_store if count == 1 or specs[first].kv_shared else None
+
+        def step(layer, carry, per_layer_input):
+            return layer(carry, train=train, decode=decode, positions=positions,
+                         segment_ids=segment_ids, kv_store=store,
+                         per_layer_input=per_layer_input,
+                         attention_metadata=attention_metadata), None
+
+        if fetching:
+            # Scan variables are xs, not closed-over bank slices. Native
+            # transposition stacks host cotangent rows instead of adding
+            # a whole-bank device accumulator. Remat retains the original
+            # host operand and refetches only this layer in backward
+            # (MaxText layers/decoders.py:544-565).
+            step = nn.remat(nn.map_variables(
+                step, True, trans_in_fn=_fetched, init=False, mutable=True))
+        if count == 1:
+            x, _ = step(run, x, None if inputs is None else inputs.layer(0))
+        else:
+            x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+                           in_axes=2, length=count)(run, x, inputs)
+    return x
+
+
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
               positions, segment_ids, kv_store, per_layer_input, attention_metadata=None,
@@ -197,36 +236,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             for first, count in groups]
     fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
-        for run, (first, count) in zip(runs, groups, strict=True):
-            inputs = None if per_layer_input is None else per_layer_input.span(first, count)
-            if count == 1 and not fetching:
-                x = run(x, train=train, decode=decode, positions=positions,
-                        segment_ids=segment_ids, kv_store=kv_store,
-                        per_layer_input=None if inputs is None else inputs.layer(0),
-                        attention_metadata=attention_metadata)
-                continue
-            store = kv_store if count == 1 or specs[first].kv_shared else None
-
-            def step(layer, carry, per_layer_input):
-                return layer(carry, train=train, decode=decode, positions=positions,
-                             segment_ids=segment_ids, kv_store=store,
-                             per_layer_input=per_layer_input,
-                             attention_metadata=attention_metadata), None
-
-            if fetching:
-                # Scan variables are xs, not closed-over bank slices. Native
-                # transposition stacks host cotangent rows instead of adding
-                # a whole-bank device accumulator. Remat retains the original
-                # host operand and refetches only this layer in backward
-                # (MaxText layers/decoders.py:544-565).
-                step = nn.remat(nn.map_variables(
-                    step, True, trans_in_fn=_fetched, init=False, mutable=True))
-            if count == 1:
-                x, _ = step(run, x, None if inputs is None else inputs.layer(0))
-            else:
-                x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
-                               in_axes=2, length=count)(run, x, inputs)
-        return x
+        return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
+                             positions=positions, segment_ids=segment_ids, kv_store=kv_store,
+                             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
