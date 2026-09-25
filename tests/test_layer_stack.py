@@ -169,19 +169,30 @@ def widened(tree):
 
 def judged(single, double, candidate) -> tuple[float, str]:
     """The worst leaf of `candidate` against `single`, as a fraction of
-    FLOOR_FACTOR times `single`'s distance from `double`, and its path. A
-    leaf's floor is never below one fp32 rounding of its largest value, so a
-    leaf the float64 run happens to match exactly still has a bound."""
+    FLOOR_FACTOR times `single`'s distance from `double`, and its path.
+
+    A leaf's floor is never below one fp32 rounding of the largest value in
+    its part (the logits, the loss or the gradients), as
+    tools/layout_parity.py measures a leaf against the rounding of the whole
+    step (`leaf_errors`): a sum's rounding scales with its terms, not with
+    the sum, so a leaf whose terms cancel sits below its part's rounding and
+    its own distance from float64 is noise. gemma3n's altup correction
+    coefficients are such leaves: on a TPU v6e at full fp32 matmuls, the
+    plain loop landed 2.3 of the leaf's own fp32 roundings from float64 and
+    the scanned stack 19, which read 2.0 of a floor taken from the leaf
+    alone."""
     worst = (0.0, "")
-    for (path, reference), exact, other in zip(
-            jax.tree_util.tree_leaves_with_path(single), jax.tree.leaves(double),
-            jax.tree.leaves(candidate), strict=True):
-        reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
-        floor = max(float(np.max(np.abs(reference - exact))),
-                    float(np.finfo(np.float32).eps * np.max(np.abs(exact))))
-        difference = float(np.max(np.abs(other - reference)))
-        ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
-        worst = max(worst, (ratio, jax.tree_util.keystr(path)))
+    for part in single:
+        scale = float(np.finfo(np.float32).eps) * max(
+            float(np.max(np.abs(np.asarray(leaf, np.float64)))) for leaf in jax.tree.leaves(double[part]))
+        for (path, reference), exact, other in zip(
+                jax.tree_util.tree_leaves_with_path(single[part]), jax.tree.leaves(double[part]),
+                jax.tree.leaves(candidate[part]), strict=True):
+            reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
+            floor = max(float(np.max(np.abs(reference - exact))), scale)
+            difference = float(np.max(np.abs(other - reference)))
+            ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
+            worst = max(worst, (ratio, f"['{part}']{jax.tree_util.keystr(path)}"))
     return worst
 
 
