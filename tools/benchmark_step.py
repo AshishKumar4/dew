@@ -82,7 +82,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import projectors, resolve_dtype, towers, with_precision
+from dew.registry import float64_twin, projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -632,23 +632,25 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
     The model goes through the same precision function the recipes use, so the
     dtype and the attention kernel land in the nested unet attention configs
     too, and a row of this table is a row a real run would produce. With
-    `widened` every model is built with no dtype of its own instead, so it
-    computes in its variables' dtype: layout_parity's fp64 step.
+    `widened` every model is the float32 configuration's float64 twin
+    (`dew.registry.float64_twin`), nested stages included, which computes in
+    float64 throughout under x64: layout_parity's fp64 step.
 
     A composite takes built values rather than a flat record, so its trunk
     goes through the policy and the wrapper takes it, the way the pretrained
     loader assembles the same two models (dew.interop.pretrained and
     dew.interop.diffusion_gemma.build).
     """
-    if case.dtype is None and not widened:
+    if widened:
+        dtype = "float32"
+    elif case.dtype is None:
         raise ValueError(f"{case.label} names no dtype; build_cases gives it the run's --dtype")
-    dtype = None if widened else case.dtype
+    else:
+        dtype = case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        if dtype is None:
-            return models.build(architecture, **{**config, "dtype": None})
-        return models.build(architecture, **with_precision(
-            architecture, config, dtype=dtype, attention_impl=attention_impl))
+        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl)
+        return models.build(architecture, **(float64_twin(fields) if widened else fields))
 
     sample_key = "video" if case.frames else "image"
 
@@ -663,7 +665,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         # The decoder carries the attention kernel; the wrapper reads none.
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=resolve_dtype(dtype))
+            dtype=jnp.float64 if widened else resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
         objective = decoder_objective(case, built(case.architecture, case.config))

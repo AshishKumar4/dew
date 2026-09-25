@@ -33,6 +33,7 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import RMSNorm
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, collapse_by, expand_streams, first_stream
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 
@@ -98,7 +99,7 @@ class DSparkStage(nn.Module):
                                            (self.vocab_size, self.markov_rank), jnp.float32)
             self.markov_head = self.param('markov_head', nn.initializers.normal(self.markov_rank ** -0.5),
                                           (self.vocab_size, self.markov_rank), jnp.float32)
-            self.confidence = nn.Dense(1, use_bias=False, dtype=jnp.float32,
+            self.confidence = nn.Dense(1, use_bias=False, dtype=at_least_fp32(self.dtype),
                                        precision=self.precision, name='confidence')
 
     def context(self, hidden):
@@ -128,8 +129,9 @@ class DSparkStage(nn.Module):
 
     def confident(self, hidden, embedded):
         """Each position's acceptance score (v41:1089-1097)."""
+        wide = at_least_fp32(hidden.dtype)
         return self.confidence(jnp.concatenate(
-            [hidden.astype(jnp.float32), embedded.astype(jnp.float32)], -1))[..., 0]
+            [hidden.astype(wide), embedded.astype(wide)], -1))[..., 0]
 
 
 def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: int,

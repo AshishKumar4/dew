@@ -42,10 +42,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
 from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
@@ -268,7 +270,8 @@ class GemmaProjector(ProjectorBase):
             tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
 
 
-def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.Array, jax.Array]:
+def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
+                          dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The complex rotary tables of the Llama 4 vision attention, as cos/sin.
 
     Positions are the patch grid in row-major order with the class token last
@@ -282,7 +285,7 @@ def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.A
     kinds = jnp.where(positions == grid * grid, -2, positions)
     safe = jnp.where(kinds < 0, 0, kinds)
     freq_dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, freq_dim)
+    inv_freq = inverse_frequencies(theta, freq_dim, dtype=dtype)
     angles = jnp.concatenate([(safe % grid + 1)[:, None] * inv_freq[None, :],
                               (safe // grid + 1)[:, None] * inv_freq[None, :]], axis=1)
     angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
@@ -315,7 +318,8 @@ class Llama4VisionAttention(nn.Module):
         query = self.q_proj(hidden_states).reshape(heads)
         key = self.k_proj(hidden_states).reshape(heads)
         value = self.v_proj(hidden_states).reshape(heads)
-        cos, sin = _llama4_vision_tables(self.grid, head_dim, self.rope_theta)
+        cos, sin = _llama4_vision_tables(self.grid, head_dim, self.rope_theta,
+                                         dtype=at_least_fp32(query.dtype))
         query = _llama4_vision_rope(query, cos, sin)
         key = _llama4_vision_rope(key, cos, sin)
         attended = scaled_dot_product_attention(
@@ -561,7 +565,7 @@ class Llama4Projector(ProjectorBase):
         return Llama4ProjectorModule(text_width=self.text_width)
 
 def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
-                        theta: float) -> tuple[jax.Array, jax.Array]:
+                        theta: float, *, dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of the Gemma 4 vision attention, as cos/sin.
 
     Each spatial dim carries its own frequencies over half the head
@@ -570,8 +574,8 @@ def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
     the dims concatenate, so `positions` [B, P, 2] yields [B, P, head_dim].
     """
     spatial = head_dim // 2
-    inv_freq = inverse_frequencies(theta, spatial)
-    angles = positions.astype(jnp.float32)[:, :, :, None] * inv_freq
+    inv_freq = inverse_frequencies(theta, spatial, dtype=dtype)
+    angles = positions.astype(dtype)[:, :, :, None] * inv_freq
     doubled = jnp.concatenate([angles, angles], axis=-1)
     cos = jnp.concatenate([jnp.cos(doubled[:, :, 0]), jnp.cos(doubled[:, :, 1])],
                           axis=-1)
@@ -833,7 +837,8 @@ class Gemma4VisionTransformer(nn.Module):
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta)
+        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta,
+                                       dtype=at_least_fp32(hidden_states.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, cos, sin, valid)
         kernel = self.pooling_kernel_size
@@ -954,8 +959,8 @@ def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
     return (table[indices] * weights[..., None]).sum(axis=-2)
 
 
-def _grid_rope_tables(positions: jax.Array, head_dim: int,
-                      theta: float = 10000.0) -> tuple[jax.Array, jax.Array]:
+def _grid_rope_tables(positions: jax.Array, head_dim: int, theta: float = 10000.0, *,
+                      dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of a patch grid's attention, as cos/sin.
 
     Heights then widths share one frequency table over half the head
@@ -963,8 +968,8 @@ def _grid_rope_tables(positions: jax.Array, head_dim: int,
     vision.py:8-15), doubled the way the text rope doubles its pairs.
     """
     dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, dim)
-    flat = (positions.astype(jnp.float32)[..., None] * inv_freq).reshape(
+    inv_freq = inverse_frequencies(theta, dim, dtype=dtype)
+    flat = (positions.astype(dtype)[..., None] * inv_freq).reshape(
         *positions.shape[:-1], -1)
     doubled = jnp.concatenate([flat, flat], axis=-1)
     return jnp.cos(doubled), jnp.sin(doubled)
@@ -1110,7 +1115,8 @@ class Qwen35VisionTransformer(nn.Module):
         hidden_states = self.patch_embed(pixels)
         table = jnp.asarray(self.position_table.embedding, hidden_states.dtype)
         hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
-        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads)
+        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads,
+                                     dtype=at_least_fp32(hidden_states.dtype))
         valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
         frames = jnp.arange(length)[None, :] // area
         keep = (frames[:, :, None] == frames[:, None, :]) & valid[:, None, :]
@@ -1265,7 +1271,8 @@ class DeepseekV41VisionTransformer(nn.Module):
                                  name="patch_embed")(patches.reshape(images, rows * columns, -1))
         grid = jnp.stack(jnp.meshgrid(jnp.arange(rows), jnp.arange(columns), indexing="ij"), axis=-1)
         cos, sin = _grid_rope_tables(grid.reshape(1, rows * columns, 2),
-                                     self.hidden_size // self.num_attention_heads, self.rope_theta)
+                                     self.hidden_size // self.num_attention_heads, self.rope_theta,
+                                     dtype=at_least_fp32(hidden_states.dtype))
         for index in range(self.num_hidden_layers):
             hidden_states = DeepseekV41VisionBlock(
                 self.hidden_size, self.num_attention_heads, self.intermediate_size,

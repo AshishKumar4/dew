@@ -82,8 +82,7 @@ class SimpleDiT(nn.Module):
         _, H, W, _ = x.shape
         x_seq, inv_idx = self.embed(x)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = rope_for_scan(x_seq.shape[1], self.emb_features // self.num_heads,
-                                  self.scan_order)
+        freqs_cis = rope_for_scan(x_seq, self.emb_features // self.num_heads, self.scan_order)
 
         for block in self.blocks:
             x_seq = block(x_seq, cond_emb, freqs_cis, train)

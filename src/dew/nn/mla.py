@@ -45,6 +45,7 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
@@ -226,11 +227,12 @@ class SparseIndexer(nn.Module):
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [self._rotate(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+        wide = at_least_fp32(query.dtype)
         scores = jnp.matmul(
-            query.astype(jnp.float32),
-            jnp.expand_dims(keys.astype(jnp.float32).transpose(0, 2, 1), -3))
+            query.astype(wide),
+            jnp.expand_dims(keys.astype(wide).transpose(0, 2, 1), -3))
         scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(hidden).astype(jnp.float32)
+        weights = self.weights_proj(hidden).astype(wide)
         weights = weights * (self.n_heads ** -0.5)
         return jnp.matmul(weights[..., None, :], scores).squeeze(-2)
 
@@ -493,7 +495,8 @@ class MultiHeadLatentAttention(nn.Module):
         if not self.rotary:
             return q_rot, rot, None, None
         freqs_cos, freqs_sin = yarn_rope_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
+            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn,
+            dtype=at_least_fp32(q_rot.dtype))
         return (self._rotate(q_rot, freqs_cos, freqs_sin),
                 self._rotate(rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)

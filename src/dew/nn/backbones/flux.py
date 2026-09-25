@@ -25,6 +25,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -265,7 +266,7 @@ class FluxTransformer(nn.Module):
         than a time, and the source scales it by a thousand here.
         """
         def embedder(values, name: str):
-            features = sinusoidal_time(values, 256).astype(pooled.dtype)
+            features = sinusoidal_time(values, 256, dtype=at_least_fp32(self.dtype)).astype(pooled.dtype)
             hidden = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
                               name=f"{name}_linear_1")(features)
             return nn.Dense(self.features, dtype=self.dtype, precision=self.precision,

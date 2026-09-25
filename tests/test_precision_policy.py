@@ -31,7 +31,7 @@ from dew.nn.llama4 import Llama4Attention
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import dtype_name, resolve_dtype, with_precision
+from dew.registry import dtype_name, float64_twin, resolve_dtype, with_precision
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -237,17 +237,6 @@ DECODERS = ({case.name: case.config for case in ARCHITECTURE_CASES
 (tests/test_architectures.py): the MoE routers, Gemma 4's, GPT OSS's, MLA,
 Llama 4's, gemma3n's and the gated delta net, by case name; and the
 fixtures' (`FIXTURE_DECODERS`)."""
-
-
-def float64_twin(config):
-    """`config`, a model config `with_precision` wrote, computing in float64:
-    its dtype and the UNets' per-stage attention dtypes, the only nested
-    dtypes the policy writes."""
-    twin = {**config, "dtype": jnp.float64}
-    if isinstance(config.get("attention_configs"), list | tuple):
-        twin["attention_configs"] = [stage if stage is None else {**stage, "dtype": jnp.float64}
-                                     for stage in config["attention_configs"]]
-    return twin
 
 
 def build_model(architecture, dtype="bfloat16"):

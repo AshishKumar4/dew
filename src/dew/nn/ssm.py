@@ -12,6 +12,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 
@@ -38,7 +39,8 @@ class S5Layer(nn.Module):
 
     `A` is `state_dim` complex poles, stored as the log of the negative
     real part so the recurrence cannot grow. `dt` discretizes them per
-    pole, and the scan runs in fp32 whatever dtype the input carries.
+    pole, and the scan runs in at least fp32 whatever dtype the input
+    carries (`at_least_fp32`).
     """
     features: int
     state_dim: int = 64
@@ -125,7 +127,7 @@ class S5Layer(nn.Module):
 
         # x_k = A_bar * x_{k-1} + B_bar @ u_k via associative scan with
         # (a1, b1) * (a2, b2) = (a1 * a2, a2 * b1 + b2)
-        u_float = u.astype(jnp.float32)
+        u_float = u.astype(at_least_fp32(u.dtype))
         Bu = jnp.einsum('bsf,nf->bsn', u_float, B_bar)  # [B, S, state_dim]
 
         A_bar_expanded = jnp.broadcast_to(A_bar[None, None, :], (B, S, self.state_dim))

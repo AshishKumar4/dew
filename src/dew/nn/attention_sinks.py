@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from .precision import at_least_fp32
+
 
 def attention_with_sinks(
     query: jax.Array,
@@ -45,7 +47,7 @@ def attention_with_sinks(
     sink_logits = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:-1], 1))
     combined = jnp.concatenate((logits, sink_logits), axis=-1)
     if force_fp32_for_softmax:
-        combined = combined.astype(jnp.float32)
+        combined = combined.astype(at_least_fp32(combined.dtype))
     combined = combined - jnp.max(combined, axis=-1, keepdims=True)
     scores = jax.nn.softmax(combined, axis=-1)[..., :-1].astype(value.dtype)
     scores = scores.reshape(batch, kv_heads, groups, length, key.shape[1])

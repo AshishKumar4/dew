@@ -24,7 +24,7 @@ from .attention_sinks import attention_with_sinks
 from .conv import Conv
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import at_default_precision, precision_names, rounded_to
+from .precision import at_default_precision, at_least_fp32, precision_names, rounded_to
 from .rope import apply_rotary
 from .sharding import (
     HEADS,
@@ -207,7 +207,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     normalization in the input's dtype.
     """
     if fp32_statistics:
-        y = x.astype(jnp.float32)
+        y = x.astype(at_least_fp32(x.dtype))
         y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
@@ -239,7 +239,7 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
     before it meets the centered activations. `scale` and `bias` of None
     are the affine-free norm.
     """
-    y = x.astype(jnp.float32)
+    y = x.astype(at_least_fp32(x.dtype))
     row_mean = jnp.mean(y, axis=-1)
     variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=-1) - jax.lax.square(row_mean))
     scaling = jax.lax.rsqrt(jnp.expand_dims(variance, -1) + epsilon)
@@ -259,7 +259,7 @@ def unweighted_rmsnorm(x, eps: float):
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
     (modeling_deepseek_v4.py:66-72) and its GLM twin do.
     """
-    fp32 = x.astype(jnp.float32)
+    fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
 
@@ -788,7 +788,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
     if mask is not None:
         logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
     if force_fp32_for_softmax and dtype != jnp.float32:
-        weights = jax.nn.softmax(logits.astype(jnp.float32))
+        weights = jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
     else:
         weights = jax.nn.softmax(logits).astype(dtype)
     return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
@@ -1020,10 +1020,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             return softcapped_attention(
                 query, key, value, softcap, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
+        # flax pins a forced softmax to float32 itself; a wider compute
+        # dtype already runs it at least that wide.
         return nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=None,
-            force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True,
+            force_fp32_for_softmax=(force_fp32_for_softmax
+                                    and at_least_fp32(dtype or query.dtype) == jnp.float32),
+            deterministic=True,
             # flax takes the precision through these two or through
             # `precision`, never both, and its own value product would
             # multiply the fp32 probabilities by the bf16 value.
@@ -1049,6 +1053,18 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
             or (dtype is not None and jnp.dtype(dtype) != query.dtype))
 
 
+def _xla_kernel_narrows(query) -> bool:
+    """Whether jax.nn's xla attention would compute this call below its
+    query's precision, so 'auto' and 'xla' take the reference path, which
+    computes in the query's dtype (`dew.nn.precision.at_least_fp32`).
+
+    It rounds a float64 query's softmax to float32
+    (`_dot_product_attention_core`: "Softmax and it is always carried out in
+    fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
+    older than sm80 rejects at run time, past jax's own fallback."""
+    return query.dtype == jnp.float64 or _bf16_dot_missing(query)
+
+
 def _bf16_dot_missing(query) -> bool:
     """A bf16 query on a GPU backend older than sm80, where jax.nn's xla
     attention cannot run."""
@@ -1062,20 +1078,17 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
-    backend (both 'auto' and 'xla' take the reference path for bf16 on a
-    GPU older than sm80, where jax.nn's xla kernel cannot run): the
-    reference path when the call asks for arithmetic no fused kernel
-    performs (`reference_only`), else cudnn where `cudnn_runs` and the call
-    has no sinks, the tpu kernel where `tpu_runs`, and xla anywhere else.
-    Any other name is returned as it is, so an explicit kernel still refuses
-    what it cannot honour by name.
+    backend (both 'auto' and 'xla' take the reference path where jax.nn's
+    xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
+    path when the call asks for arithmetic no fused kernel performs
+    (`reference_only`), else cudnn where `cudnn_runs` and the call has no
+    sinks, the tpu kernel where `tpu_runs`, and xla anywhere else. Any other
+    name is returned as it is, so an explicit kernel still refuses what it
+    cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and _bf16_dot_missing(query):
-        # jax.nn's xla attention names the BF16_BF16_F32 algorithm, which a
-        # GPU older than sm80 rejects at run time, past jax's own fallback;
-        # the reference path multiplies at the caller's precision.
+    if implementation in ('auto', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
     if implementation != 'auto':
         return implementation
@@ -1107,7 +1120,7 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     if implementation == 'auto' and reference_only(query, dtype, precision,
                                                    force_fp32_for_softmax):
         return 'reference'
-    if implementation in ('auto', 'cudnn', 'xla') and _bf16_dot_missing(query):
+    if implementation in ('auto', 'cudnn', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
 

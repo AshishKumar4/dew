@@ -56,6 +56,7 @@ from .linear import (
     strictly_lower_inverse,
 )
 from .mixers import MixerBase, MixerContext, mixers
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 
@@ -68,8 +69,8 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     strictly lower triangular `A`, which `dew.nn.linear.strictly_lower_inverse`
     sums as a series.
     """
-    dtype = query.dtype
-    query, key, value, g, beta = (x.astype(jnp.float32) for x in (query, key, value, g, beta))
+    dtype, work = query.dtype, at_least_fp32(query.dtype)
+    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
     pad = (chunk_size - S % chunk_size) % chunk_size
@@ -98,7 +99,7 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     out_vals = inv @ vb_c
     k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
-    state = (jnp.zeros((B, H, Dk, Dv), jnp.float32) if state is None else state.astype(jnp.float32))
+    state = (jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work))
     # XLA:CPU workaround. Under a jitted scan over the layers (scan_layers),
     # the chunk loop's zero initial state came back with other values in
     # most processes: GLM-5-Next's scanned forward was off by 8.7, 10.1 or
@@ -202,9 +203,11 @@ class KimiDeltaAttention(nn.Module):
         self.o_proj = dense(self.emb_features, name='o_proj')
 
     def _decay(self, x):
-        """`Glm5NextTextForgetGate.forward` (modeling_glm5_next.py:319-335): `[B, S, H, Dk]` in fp32."""
+        """`Glm5NextTextForgetGate.forward` (modeling_glm5_next.py:319-335): `[B, S, H, Dk]` in fp32
+        (`at_least_fp32`)."""
         B, S, _ = x.shape
-        gate = self.f_b_proj(self.f_a_proj(x)).astype(jnp.float32) + self.dt_bias
+        gate = self.f_b_proj(self.f_a_proj(x))
+        gate = gate.astype(at_least_fp32(gate.dtype)) + self.dt_bias
         gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         rate = jnp.exp(self.A_log)[None, None, :, None]
         if self.lower_bound is not None:
@@ -223,16 +226,17 @@ class KimiDeltaAttention(nn.Module):
             # The reference zeroes padded rows before projecting them
             # (apply_mask_to_padding_states, modeling_glm5_next.py:361-370).
             x = jnp.where(valid[:, :, None], x, 0)
-        conv_input = jnp.moveaxis(
-            jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1).astype(jnp.float32), 2, 1)
+        projected = jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1)
+        wide = at_least_fp32(projected.dtype)
+        conv_input = jnp.moveaxis(projected.astype(wide), 2, 1)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         recurrent = None
         if decode:
             allocated = self.has_variable('cache', 'recurrent_state')
             conv_state = self.variable('cache', 'conv_state', jnp.zeros,
-                                       (B, 3 * self.qkv_features, self.conv_kernel - 1), jnp.float32)
+                                       (B, 3 * self.qkv_features, self.conv_kernel - 1), wide)
             recurrent = self.variable('cache', 'recurrent_state', jnp.zeros,
-                                      (B, self.num_heads, self.head_dim, self.head_dim), jnp.float32)
+                                      (B, self.num_heads, self.head_dim, self.head_dim), wide)
             if not allocated:
                 # Allocation only, as GatedDeltaNet: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -253,7 +257,7 @@ class KimiDeltaAttention(nn.Module):
                              for part in jnp.split(mixed, 3, axis=-1))
         query, key = l2norm(query), l2norm(key)
         g = self._decay(x)
-        beta = nn.sigmoid(self.b_proj(x).astype(jnp.float32))
+        beta = nn.sigmoid(self.b_proj(x).astype(wide))
         if valid is not None:
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)

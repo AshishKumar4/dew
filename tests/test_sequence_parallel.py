@@ -461,7 +461,7 @@ def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
     call has to match them exactly (observed 4.8e-7)."""
     module = NormalAttention(query_dim=32, heads=4, dim_head=8, causal=True)
     x = jax.random.normal(jax.random.key(1), (BATCH, SEQ_LEN, 32), jnp.float32)
-    freqs = rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0)
+    freqs = rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0, dtype=np.float32)
     variables = module.init(jax.random.key(2), x, freqs_cis=freqs)
     whole = module.apply(variables, x, freqs_cis=freqs)
     with jax.set_mesh(build_mesh(SPLIT)):
