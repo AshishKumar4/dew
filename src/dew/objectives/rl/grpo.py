@@ -22,6 +22,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Mean, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
@@ -206,8 +207,8 @@ class GRPOObjective(LMObjective):
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
-        scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32),
-                                  sampled.astype(jnp.float32)], axis=1)
+        wide = at_least_fp32(sampled.dtype)
+        scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), wide), sampled.astype(wide)], axis=1)
         return jnp.where(mask != 0, scored, 0.0)
 
     def _terms(self, params, batch) -> _Terms:

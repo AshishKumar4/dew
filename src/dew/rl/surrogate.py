@@ -39,6 +39,7 @@ import math
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
 from dew.rl.advantage import MEAN_EPS, masked_mean
 
 LOG_RATIO_CLAMP = 20.0
@@ -75,9 +76,12 @@ def token_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array) -> jax.Array
     """Per-token `log pi(a) - log pi_old(a)`, clamped to +-20.
 
     verl calls this `negative_approx_kl` and negates it for its `ppo_kl`
-    metric, which is `-token_mean(token_log_ratio(...), mask)`.
+    metric, which is `-token_mean(token_log_ratio(...), mask)`. It is fp32,
+    or the log-probabilities' dtype where it is wider (`at_least_fp32`).
     """
-    log_ratio = jnp.asarray(log_probs, jnp.float32) - jnp.asarray(old_log_probs, jnp.float32)
+    log_probs = jnp.asarray(log_probs)
+    work = at_least_fp32(log_probs.dtype)
+    log_ratio = log_probs.astype(work) - jnp.asarray(old_log_probs, work)
     return jnp.clip(log_ratio, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
 
 
@@ -89,8 +93,9 @@ def _segment_totals(values: jax.Array, mask: jax.Array,
     data parallelism the reduction stays on the device that holds the row.
     Without `segments` each row is one sequence.
     """
-    values = jnp.asarray(values, jnp.float32)
-    keep = mask.astype(jnp.float32)
+    values = jnp.asarray(values)
+    values = values.astype(at_least_fp32(values.dtype))
+    keep = mask.astype(values.dtype)
     kept = jnp.where(keep != 0, values, 0) * keep
     width = values.shape[1]
     keys = (jnp.ones(values.shape, jnp.int32) if segments is None
@@ -132,8 +137,9 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
     the raw difference, as verl's `compute_policy_loss_gspo` does. The clamp
     at 10 on the result bounds what is exponentiated either way.
     """
-    log_probs = jnp.asarray(log_probs, jnp.float32)
-    log_ratio = log_probs - jnp.asarray(old_log_probs, jnp.float32)
+    log_probs = jnp.asarray(log_probs)
+    log_probs = log_probs.astype(at_least_fp32(log_probs.dtype))
+    log_ratio = log_probs - jnp.asarray(old_log_probs, log_probs.dtype)
     pooled = segment_mean(log_ratio, mask, segments)
     sequence = (log_probs - jax.lax.stop_gradient(log_probs)
                 + jax.lax.stop_gradient(pooled))
@@ -165,8 +171,9 @@ def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: j
         raise ValueError("the dual clip caps a negative advantage, so it needs "
                          f"dual_clip > 1, got {dual_clip}")
 
-    log_ratio = jnp.asarray(log_ratio, jnp.float32)
-    advantages = jnp.asarray(advantages, jnp.float32)
+    log_ratio = jnp.asarray(log_ratio)
+    log_ratio = log_ratio.astype(at_least_fp32(log_ratio.dtype))
+    advantages = jnp.asarray(advantages, log_ratio.dtype)
     if advantages.ndim == 1:
         advantages = advantages[:, None]
     keep = mask.astype(jnp.float32)
@@ -201,9 +208,10 @@ def cispo_terms(log_probs: jax.Array, old_log_probs: jax.Array, advantages: jax.
     gradient of its own log-probability, however far its ratio moved.
     `pg_clipfrac` counts tokens whose ratio the clip changed.
     """
-    log_probs = jnp.asarray(log_probs, jnp.float32)
+    log_probs = jnp.asarray(log_probs)
+    log_probs = log_probs.astype(at_least_fp32(log_probs.dtype))
     log_ratio = token_log_ratio(log_probs, old_log_probs)
-    advantages = jnp.asarray(advantages, jnp.float32)
+    advantages = jnp.asarray(advantages, log_probs.dtype)
     if advantages.ndim == 1:
         advantages = advantages[:, None]
     keep = mask.astype(jnp.float32)
@@ -240,7 +248,9 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     Aggregate it the way the policy loss is aggregated, `token_mean(kl, mask)`,
     and add `beta` times that.
     """
-    diff = jnp.asarray(ref_log_probs, jnp.float32) - jnp.asarray(log_probs, jnp.float32)
+    log_probs = jnp.asarray(log_probs)
+    work = at_least_fp32(log_probs.dtype)
+    diff = jnp.asarray(ref_log_probs, work) - log_probs.astype(work)
     diff = jnp.clip(diff, -KL_DIFF_CLAMP, KL_DIFF_CLAMP)
     return jnp.clip(jnp.exp(diff) - diff - 1, -KL_CLAMP, KL_CLAMP)
 
@@ -365,8 +375,9 @@ def clipped_value_loss_terms(predicted: jax.Array, returns: jax.Array, old_value
     clipped around recorded values is multiplied by one half. Targets and
     recorded values are detached rollout data.
     """
-    returns = jax.lax.stop_gradient(jnp.asarray(returns, jnp.float32))
-    old_values = jax.lax.stop_gradient(jnp.asarray(old_values, jnp.float32))
-    predicted = jnp.asarray(predicted, jnp.float32)
+    predicted = jnp.asarray(predicted)
+    predicted = predicted.astype(at_least_fp32(predicted.dtype))
+    returns = jax.lax.stop_gradient(jnp.asarray(returns, predicted.dtype))
+    old_values = jax.lax.stop_gradient(jnp.asarray(old_values, predicted.dtype))
     clipped = jnp.clip(predicted, old_values - clip, old_values + clip)
     return 0.5 * jnp.maximum(jnp.square(predicted - returns), jnp.square(clipped - returns))
