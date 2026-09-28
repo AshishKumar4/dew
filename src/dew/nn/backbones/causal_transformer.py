@@ -176,12 +176,6 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
     onto each row under remat (`run_stack`)."""
     for run, (first, count) in zip(runs, groups, strict=True):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
-        if count == 1 and not fetching:
-            x = run(x, train=train, decode=decode, positions=positions,
-                    segment_ids=segment_ids, kv_store=kv_store,
-                    per_layer_input=None if inputs is None else inputs.layer(0),
-                    attention_metadata=attention_metadata)
-            continue
         store = kv_store if count == 1 or specs[first].kv_shared else None
 
         def step(layer, carry, per_layer_input):
@@ -279,12 +273,6 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
         def layer(read, cache, hidden, per_layer_slice):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
-            if not mutable:
-                return run.apply(
-                    variables, hidden, train=train, decode=decode, positions=positions,
-                    segment_ids=segment_ids, kv_store=store,
-                    per_layer_input=per_layer_slice,
-                    attention_metadata=attention_metadata), {}
             hidden, changed = run.apply(
                 variables, hidden, mutable=mutable, train=train, decode=decode,
                 positions=positions, segment_ids=segment_ids, kv_store=store,
