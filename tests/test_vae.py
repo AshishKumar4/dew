@@ -92,6 +92,41 @@ def test_vae_reconstructs_metadata_without_reloading_supplied_weights(tmp_path, 
         np.testing.assert_array_equal(actual, original)
 
 
+def test_supplied_vae_params_load_offline_from_a_cache_that_holds_only_the_config(tmp_path, monkeypatch):
+    """A run checkpoint carries the VAE's params, so with the Hub offline the
+    model loads from a cache holding the repo's config.json and no weights,
+    as the live kernel's image does."""
+    import json
+
+    from huggingface_hub import constants
+
+    import dew.nn.autoencoders.vae as loader
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+
+    config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
+                  layers_per_block=1, norm_num_groups=4, use_quant_conv=False,
+                  use_post_quant_conv=False, shift_factor=0.25, scaling_factor=0.5)
+    commit = "b" * 40
+    repo = tmp_path / "models--fixture--vae"
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "snapshots" / commit).mkdir(parents=True)
+    (repo / "snapshots" / commit / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(loader, "_read_vae_weights", lambda *a, **k: pytest.fail("read source weights"))
+
+    model = AutoencoderKL(channels=(8, 16), blocks_per_level=1, norm_groups=4,
+                          quantize=False, post_quantize=False, dtype=jnp.float32)
+    image = jnp.linspace(-0.5, 0.5, 8 * 8 * 3).reshape(1, 8, 8, 3)
+    saved = model.init(jax.random.key(4), image)["params"]
+    restored = StableDiffusionVAE("fixture/vae", revision="main", params=saved, dtype=jnp.float32)
+    expected = StableDiffusionVAE(model=model, params=saved, dtype=jnp.float32,
+                                 latent_shift=0.25, latent_scale=0.5)
+
+    np.testing.assert_array_equal(restored.encode(restored.params, image), expected.encode(saved, image))
+
+
 
 @pytest.mark.parametrize("shape", [(2, 8, 8, 4), (2, 3, 8, 8, 4)])
 def test_latent_normalization_shifts_and_scales_roundtrip(rng, shape):
