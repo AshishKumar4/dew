@@ -54,16 +54,17 @@ On four cores of a workstation CPU it prints:
 Output on four cores of a workstation CPU:
 
 ```text
-Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 25: loss 0.0306
-step 50: loss 0.0102
-step 75: loss 0.0067
-step 100: loss 0.0051
-Goodput: first step after 1.99 s, 31.6% of the wall time in steps
+Training from step 0 to 100 on 1 × cpu, 147,840 parameters
+step  25/100  loss 0.0306  ce 0.0306  perplexity 1.0311  token_accuracy 1.0000  10.1 ms/step  789 samples/s  0:00:01 left
+step  50/100  loss 0.0102  ce 0.0102  perplexity 1.0102  token_accuracy 1.0000  7.7 ms/step  1,033 samples/s  0:00:00 left
+step  75/100  loss 0.0067  ce 0.0067  perplexity 1.0067  token_accuracy 1.0000  7.9 ms/step  1,017 samples/s  0:00:00 left
+step 100/100  loss 0.0051  ce 0.0051  perplexity 1.0051  token_accuracy 1.0000  7.5 ms/step  1,068 samples/s  0:00:00 left
+Trained 100 steps in 0:00:02: first step after 1.53 s, then 129.8 step/s
+33.3% of the wall time in steps, final loss 0.0051
 dew trains jax models. dew trains jax model
 ```
 
-Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
+Each logged line shows the loss and the objective's metrics (for `LMObjective`: cross entropy, perplexity and token accuracy) over the last interval. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
 
 ## Model
 

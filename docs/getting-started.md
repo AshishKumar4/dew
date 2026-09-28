@@ -99,14 +99,15 @@ JAX_PLATFORMS=cpu python train.py
 ```
 
 ```text
-Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 50: loss 0.0002
-step 100: loss 0.0000
-Goodput: first step after 0.18 s, 19.0% of the wall time in steps
+Training from step 0 to 100 on 1 × cpu, 2 parameters
+step  50/100  loss 2.228e-04  mse 2.228e-04  0.5 ms/step  58,604 samples/s  0:00:00 left
+step 100/100  loss 1.416e-07  mse 1.416e-07  0.4 ms/step  73,148 samples/s  0:00:00 left
+Trained 100 steps in 0:00:00: first step after 0.24 s, then 2222.4 step/s
+15.8% of the wall time in steps, final loss 1.416e-07
 Final mean squared error: 0.000000
 ```
 
-The first line names the mesh: one device, so every axis has size 1. The last `Goodput` line reports when the first step finished and the share of wall time spent in training steps; in a run this short, compilation dominates. Other backends and library versions can print slightly different losses.
+The first line names the devices and the parameter count. Each `step` line reports the loss and the objective's metrics (`mse` from `Aux`) averaged over the last `log_every` steps, the step time and the throughput. The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. On a terminal `fit` shows a live progress display instead; elsewhere, as here, it prints one line per logging interval. Only process 0 prints. Other backends and library versions print slightly different numbers.
 
 `fit` returns a `TrainState`. `state.params` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
 

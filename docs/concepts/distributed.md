@@ -40,10 +40,11 @@ print(kernel.addressable_shards[0].data.shape)
 ```
 
 ```text
-Training from step 0 to 4 on {'data': 2, 'expert': 1, 'fsdp': 2, 'tensor': 2, 'sequence': 1, 'stage': 1} (1 process(es))
-step 2: loss 4.7406
-step 4: loss 2.1400
-Goodput: first step after 2.65 s, 15.3% of the wall time in steps
+Training from step 0 to 4 on 8 × cpu (data 2 × fsdp 2 × tensor 2), 2.2M parameters
+step 2/4  loss 4.7406  ce 4.7406  perplexity 114.5022  token_accuracy 0.1885  288.9 ms/step  55 samples/s  0:00:01 left
+step 4/4  loss 2.1400  ce 2.1400  perplexity 8.4992  token_accuracy 0.9248  128.8 ms/step  124 samples/s  0:00:00 left
+Trained 4 steps in 0:00:03: first step after 2.72 s, then 7.3 step/s
+13.2% of the wall time in steps, final loss 2.1400
 (256, 1024) P('fsdp', 'tensor')
 (128, 512)
 ```
