@@ -1,6 +1,6 @@
 """Pack a text-to-image sampling trajectory for the landing page's replay section.
 
-    python scripts/replay-atlas.py SRC_DIR NAME --provenance FILE [--frames 32]
+    python scripts/replay-atlas.py SRC_DIR NAME --provenance FILE [--frames 32] [--aspect 3:2]
 
 SRC_DIR holds x0_NNN.png, the model's predicted image at each sampler step
 (000 is the first step, from pure noise), and trajectory.json with the prompt,
@@ -12,8 +12,10 @@ the last step, and meta.json, which the landing page's replay section reads.
 
 A model trained on LAION draws the flat white or black bands its letterboxed
 training images carry. Every frame is cropped to the box inside the last
-frame's bands, so the replay shows the picture the model drew at its own
-aspect; meta.json records the box.
+frame's bands, so the replay shows the picture the model drew; a content box
+taller than `aspect` (width:height, 3:2 by default, what the letterboxed
+samples leave) is then cropped about its centre to it, so the section's
+figures share one shape. meta.json records the box.
 """
 
 import json
@@ -55,8 +57,8 @@ def band(lines: np.ndarray) -> int:
     return count
 
 
-def content_box(image: Image.Image) -> tuple[int, int, int, int]:
-    """(left, top, right, bottom) of the image inside its letterbox bands."""
+def content_box(image: Image.Image, aspect: float) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the image inside its letterbox bands, no taller than `aspect`."""
     pixels = np.asarray(image.convert("RGB"), np.float32)
     columns = pixels.transpose(1, 0, 2)
     height, width = pixels.shape[:2]
@@ -64,12 +66,18 @@ def content_box(image: Image.Image) -> tuple[int, int, int, int]:
     left, right = band(columns), band(columns[::-1])
     if top + bottom >= height or left + right >= width:
         raise SystemExit("the last frame is one flat colour")
-    return left, top, width - right, height - bottom
+    bottom, right = height - bottom, width - right
+    excess = (bottom - top) - round((right - left) / aspect)
+    if excess > 0:
+        top += excess // 2
+        bottom -= excess - excess // 2
+    return left, top, right, bottom
 
 
 def main() -> None:
     src, name = Path(sys.argv[1]), sys.argv[2]
     frames = int(arg("--frames", "32"))
+    aspect_width, aspect_height = map(int, arg("--aspect", "3:2").split(":"))
     trajectory = json.loads((src / "trajectory.json").read_text())
     provenance = json.loads(Path(arg("--provenance")).read_text())
     for record, keys, where in ((trajectory, ("prompt", "seed", "sampler", "steps"), "trajectory.json"),
@@ -83,7 +91,7 @@ def main() -> None:
     last = steps[-1]
     keep = sorted({round(i * last / (frames - 1)) for i in range(frames)})
     final = Image.open(src / f"x0_{last:03d}.png").convert("RGB")
-    box = content_box(final)
+    box = content_box(final, aspect_width / aspect_height)
     width, height = box[2] - box[0], box[3] - box[1]
 
     out = ROOT / "public" / "hero" / "replay" / name
