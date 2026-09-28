@@ -63,12 +63,13 @@ print(tokenizer.decode(continuation.tokens[0]))
 ```
 
 ```text
-Training from step 0 to 300 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 100: loss 0.0935
-step 200: loss 0.0688
-step 300: loss 0.0694
-Evaluation val at step 300: 2 coordinated batches, 32 records, uneven_shards=False, event_key=(4127360435, 4068970345): {'val/perplexity': 16.677177827766457}
-Goodput: first step after 1.01 s, 75.3% of the wall time in steps
+Training from step 0 to 300 on 1 × cpu, 147,904 parameters
+step 100/300  loss 0.0935  ce 0.0935  perplexity 1.0980  token_accuracy 0.9717  32.1 ms/step  498 samples/s  0:00:06 left
+step 200/300  loss 0.0688  ce 0.0688  perplexity 1.0712  token_accuracy 0.9766  28.3 ms/step  565 samples/s  0:00:03 left
+step 300/300  loss 0.0694  ce 0.0694  perplexity 1.0719  token_accuracy 0.9775  30.0 ms/step  533 samples/s  0:00:00 left
+eval val at step 300: perplexity 16.6772 (32 records in 0.51 s)
+Trained 300 steps in 0:00:11: first step after 1.31 s, then 33.5 step/s
+83.0% of the wall time in steps, final loss 0.0694
 One day, Lily saw a big dog in the park. The dog want
 ```
 
@@ -333,10 +334,11 @@ print(tokenizer.decode(drawn.tokens[0]))
 ```
 
 ```text
-Training from step 0 to 1000 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 500: loss 0.6956
-step 1000: loss 0.7562
-Goodput: first step after 3.15 s, 82.9% of the wall time in steps
+Training from step 0 to 1000 on 1 × cpu, 147,968 parameters
+step  500/1000  loss 0.6956  masked_accuracy 0.6488  masked_fraction 0.4561  38.1 ms/step  420 samples/s  0:00:19 left
+step 1000/1000  loss 0.7562  masked_accuracy 0.6439  masked_fraction 0.5156  42.4 ms/step  377 samples/s  0:00:00 left
+Trained 1000 steps in 0:00:42: first step after 1.85 s, then 24.9 step/s
+95.6% of the wall time in steps, final loss 0.7562
 One day, Lily. She da b tfte,dAt nigl
 ```
 
@@ -423,9 +425,10 @@ print("Optimizer updates:", int(block_state.updates))
 ```
 
 ```text
-Training from step 0 to 1 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 1: loss 6.8016
-Goodput: first step after 2.03 s, 0.0% of the wall time in steps
+Training from step 0 to 1 on 1 × cpu, 1,858 parameters
+step 1/1  loss 6.8016  canvas_ce 3.2591  encoder_ce 3.5425  60.1 ms/step  33 samples/s  0:00:00 left
+Trained 1 steps in 0:00:03: first step after 2.92 s
+0.0% of the wall time in steps, final loss 6.8016
 Optimizer updates: 1
 ```
 
