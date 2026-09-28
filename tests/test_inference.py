@@ -593,8 +593,8 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     with pytest.raises(ValueError, match="no EMA"):
         objective.pipeline(state)
     with pytest.raises(ValueError, match="no EMA"):
-        dew.pipeline(str(tmp_path))
-    restored = dew.pipeline(str(tmp_path), ema=False)
+        dew.pipeline(str(tmp_path), ema=True)
+    restored = dew.pipeline(str(tmp_path))
     live = objective.pipeline(state, ema=False, processor=restored.processor)
     np.testing.assert_array_equal(restored("the ", seed=7).host().tokens,
                                   live("the ", seed=7).host().tokens)
