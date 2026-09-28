@@ -99,6 +99,8 @@ OFFLINE_CACHES = {
     "only the config": ("main", [("main", None, 0.25, "unknown")]),
     "a recorded miss": ("bf16", [("bf16", "vae", 99.0, "missing"), ("flax", "vae", 0.25, "cached")]),
     "ambiguous": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("flax", "vae", 0.25, "unknown")]),
+    # The flax layout's bf16/vae against the torch layout's default-branch vae.
+    "ambiguous across layouts": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("main", "vae", 0.25, "unknown")]),
 }
 
 
@@ -142,7 +144,7 @@ def test_supplied_vae_params_load_offline_with_the_config_an_online_load_chose(t
                           quantize=False, post_quantize=False, dtype=jnp.float32)
     image = jnp.linspace(-0.5, 0.5, 8 * 8 * 3).reshape(1, 8, 8, 3)
     saved = model.init(jax.random.key(4), image)["params"]
-    if case == "ambiguous":
+    if case.startswith("ambiguous"):
         with pytest.raises(FileNotFoundError, match="cannot tell which VAE config"):
             StableDiffusionVAE("fixture/vae", revision=revision, params=saved, dtype=jnp.float32)
         return
