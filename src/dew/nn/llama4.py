@@ -86,6 +86,10 @@ class Llama4Attention(nn.Module):
     force_fp32_for_softmax: bool = True
 
     def setup(self):
+        if self.attention_chunk_size is not None and self.attention_chunk_size < 1:
+            raise ValueError(
+                f"attention_chunk_size is a positive chunk length, got "
+                f"{self.attention_chunk_size}; None attends the whole sequence")
         if self.attention_chunk_size is not None and not self.use_rope:
             raise ValueError(
                 "Llama 4 chunks its rotated local layers only; a global layer "

@@ -67,7 +67,10 @@ class TokenEmbedding(nn.Embed):
             raise ValueError("Input type must be an integer or unsigned integer.")
         if self.num_embeddings == 1:
             values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-            return values.astype(self.dtype or values.dtype)
+            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if promoted is None:
+                raise ValueError("Embedding dtype promotion must return an array")
+            return promoted
         return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
 
 
