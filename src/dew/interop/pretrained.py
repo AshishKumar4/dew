@@ -1271,8 +1271,7 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     the schedule and the call policy - is read once here.
     """
     compute = resolve_dtype(dtype)
-    denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
-                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype)
     policy = _call_policy(index, denoiser)
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute, param_dtype=param_dtype)
@@ -1319,8 +1318,7 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
     directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
-    denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
-                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     if not isinstance(denoiser.text, _TextTowers):
         raise ValueError(f"{checkpoint} conditions through its Qwen3-VL encoder; "
                          "build it with QwenImageConditioner.from_pretrained")
@@ -1364,8 +1362,11 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
-def _transformer_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Build the published transformer this directory holds, by the class it names."""
+def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build the published denoiser this directory holds: its transformer, by the
+    class it names, or else its UNet."""
+    if not (directory / "transformer" / "config.json").is_file():
+        return _unet_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
     if published == "SD3Transformer2DModel":
@@ -1650,7 +1651,7 @@ def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat1
     directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
-    denoiser = _transformer_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
+    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     if not isinstance(denoiser.text, _QwenImageText):
         raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
     if params is None:
