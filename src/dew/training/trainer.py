@@ -1225,8 +1225,8 @@ class Trainer(Generic[Loss, Effects]):
             self._log_interval(current, loss, aux, accepted, state, interval)
 
         if plan.eval_every and current % plan.eval_every == 0 and current < steps:
-            run.other += self._timed_evaluation(
-                state, shardings, plan.dataset, plan.metrics, plan.preview)
+            with region("evaluate"):
+                run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
 
         # On its own clock, not the logging one, so that a cadence
         # which does not divide log_every still fires.
@@ -1282,8 +1282,7 @@ class Trainer(Generic[Loss, Effects]):
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
         if plan.eval_every and run.preempted is None:
-            run.other += self._timed_evaluation(
-                state, shardings, plan.dataset, plan.metrics, plan.preview)
+            run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
         if checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
@@ -1449,17 +1448,6 @@ class Trainer(Generic[Loss, Effects]):
             self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
         return compiled[shapes]
 
-    def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],
-                          dataset: Dataset, metrics: Sequence[Metric], preview: bool) -> float:
-        """Score the validation split, returning the seconds it took.
-
-        Those seconds are the run's, but not its steps', which is what the
-        goodput fraction is measured against."""
-        paused = time.perf_counter()
-        with region("evaluate"):
-            self._evaluate(state, shardings, dataset, metrics, preview)
-        return time.perf_counter() - paused
-
     def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
                           position: bytes | None, interval: _Interval) -> float:
         """Write one checkpoint with the interval's mean loss, report it and
@@ -1571,24 +1559,27 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
-                  metrics: Sequence[Metric], preview: bool) -> None:
-        """Score the validation split with this state's variables and report it.
+                  metrics: Sequence[Metric], preview: bool) -> float:
+        """Score the validation split with this state's variables and report
+        it, returning the seconds it took: the run's, but not its steps',
+        which is what the goodput fraction is measured against.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
+        paused = time.perf_counter()
         mesh, params = self.device_mesh, state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
             from dew.training.execution import HostExecution
-            execution = HostExecution(self.objective, self.layout, self.device_mesh, self.state_mesh)
+            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh)
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `evaluate` scores under the mesh
-        # itself, and previews decode outside it.
+        # The rules and the microbatch count; `evaluate` scores under the
+        # mesh itself, and previews decode outside it.
         with (pipeline_microbatches(self.mesh.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = evaluate(
@@ -1596,6 +1587,7 @@ class Trainer(Generic[Loss, Effects]):
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh)
         self._report_evaluation(evaluation)
+        return time.perf_counter() - paused
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
         """Print one evaluation on rank zero and log its previews and scores."""
