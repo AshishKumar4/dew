@@ -148,7 +148,7 @@ class DiscreteProcess:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
-            _validate_request(model, self, prepared, max_new_tokens, n, eos_token_ids, pad_token_id)
+            _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
             return request, prepared
 
         request, prepared = agreed("masked generation setup", resolve)
@@ -249,11 +249,11 @@ class MDLM:
 
 
 def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelInputs,
-                      budget: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
+                      budget: int, steps: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
     decoder = model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
     if decoder is None or decoder.causal:
         raise ValueError("masked generation requires a bidirectional model")
-    for name, value, minimum in (("max_new_tokens", budget, 0), ("n", n, 1)):
+    for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
     vocab = model.vocab_size
