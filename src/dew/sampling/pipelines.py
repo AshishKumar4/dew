@@ -153,13 +153,15 @@ class TextToImage:
                    blank=objective.blank_conditions)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`).
 
-        `ema` reads the averaged weights when the run kept them. With `mesh`
+        `ema` None reads the averaged weights when the run kept them and the
+        live ones when it kept none; True requires the averaged ones and False
+        reads the live ones. With `mesh`
         the weights restore straight onto that mesh under `layout`, the way
         the trainer places them; without one the default mesh uses the current pool.
         dtype overrides computation in the model, encoders and VAE. param_dtype
@@ -180,7 +182,7 @@ class TextToImage:
         return cls.from_objective(objective, _with_drawn_tables(objective, params))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool = True, mesh: MeshSpec | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: str | None = None,
                         param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
@@ -561,7 +563,7 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
-def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: MeshSpec | None,
+def restore_variables(directory: str, *, ema: bool | None, step: int | None, mesh: MeshSpec | None,
                       layout: Layout | None, param_dtype: str | None,
                       parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
     """A run's published variables, restored onto the current mesh under a layout.
@@ -569,6 +571,8 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     The checkpoint is its own template. Owner-declared parameter roots select
     floating weights for param_dtype; other leaves keep their stored dtype.
     EMA uses the live tree's selection, restricted to the leaves it contains.
+    `ema` None takes the averaged weights when the run kept them; True
+    requires them.
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
@@ -580,7 +584,7 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     template = {"params": stored["params"]}
     if ema and stored.get("ema") is None:
         raise ValueError("the run keeps no EMA; request the live policy with ema=False")
-    averaged = ema
+    averaged = stored.get("ema") is not None if ema is None else ema
     if averaged:
         template["ema"] = stored["ema"]
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
