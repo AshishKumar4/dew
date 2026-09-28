@@ -389,7 +389,6 @@ class _FitRun:
     to step and what its cleanup reads however the run ends."""
 
     started: float
-    process_zero: bool
     current: int = 0
     loss: jax.Array | None = None
     source: Iterator[Batch] | None = None
@@ -1058,29 +1057,23 @@ class Trainer(Generic[Loss, Effects]):
         """
         self._check_validation_is_read(eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
-        run = _FitRun(time.perf_counter(), jax.process_index() == 0)
+        run = _FitRun(time.perf_counter())
         profile, checkpoints = self.profile, self.checkpoints
         profiler = self._own_profile_window()
-        outer = telemetry_profile.active_profile()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
-        tracer = profiler if profiler is not None else outer
+        tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            mesh = self.device_mesh
-            self._check_pipelined_batch(dataset.batch, mesh)
-
+            self._check_pipelined_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview)
             state, shardings, position = self.place()
-            if self._opened(plan, run, state, position, mesh):
+            if self._opened(plan, run, state, position):
                 return state
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            # Rebound once the step is compiled, so the first tick measures steps,
-            # not the compile.
             interval = _Interval(fresh_book(), time.time(), last_saved=(
                 run.current if checkpoints is not None and checkpoints.latest is not None else None))
             seen = 0
-            run.first_step = None
             run.notice = PreemptionNotice()
             while run.current < steps:
                 # Read through `run` each time: a local alias would keep the
@@ -1101,7 +1094,7 @@ class Trainer(Generic[Loss, Effects]):
                     with region("input.wait"):
                         batch = next(run.train)
                     if self.rollout is not None:
-                        batch, sampled = self._rolled_out(state, batch, mesh)
+                        batch, sampled = self._rolled_out(state, batch)
                         interval.rollout_seconds += sampled
                     first_compile = not compiled
                     train_step, measured_flops = self._compiled_for(compiled, state, batch)
@@ -1120,7 +1113,7 @@ class Trainer(Generic[Loss, Effects]):
                         loss.block_until_ready()
                         run.first_step = time.perf_counter() - run.started
                     if self._between_steps(plan, run, interval, state, shardings, position,
-                                           loss, aux, accepted, mesh):
+                                           loss, aux, accepted):
                         break
                 # The step row is complete once its scope exits; closing the
                 # window here keeps the last iteration inside the capture.
@@ -1129,10 +1122,8 @@ class Trainer(Generic[Loss, Effects]):
                     if run.traced == profile.steps:
                         run.tracing = False
                         assert profiler is not None
-                        self._stop_trace(run.traced, run.loss, profile, profiler, step=run.current)
-
-
-            self._wind_down(plan, run, interval, state, shardings, position, mesh, profiler)
+                        self._stop_trace(run, profile, profiler)
+            self._wind_down(plan, run, interval, state, shardings, position, profiler)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1145,36 +1136,54 @@ class Trainer(Generic[Loss, Effects]):
     def _closed(self, run: _FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
         """`fit`'s cleanup however the run ended: the preemption notice, the
-        stream and a trace window closed, and the outcome reported. Returns
-        the error to raise when the run itself raised none."""
+        stream and a trace window closed, the checkpoints waited on, and the
+        outcome reported. Returns the error to raise when the run itself
+        raised none.
+
+        Each teardown step runs even when an earlier one failed, and a later
+        failure becomes a note on the first, so one broken sink cannot hide
+        the error that ended the run."""
         paused = time.perf_counter()
-        profile = self.profile
+        profile, checkpoints = self.profile, self.checkpoints
         if run.notice is not None:
             run.notice.close()
         close = (run.train.close if run.train is not None else
                  run.source.close if isinstance(run.source, Closeable) else None)
-        stop_trace: Callable[[], None] | None = None
+        stop_trace = None
         if run.tracing and profile is not None:
             run.tracing = False
             assert profiler is not None
-            stop_trace = functools.partial(
-                self._stop_trace, run.traced, run.loss, profile, profiler, step=run.current)
-        error = self._cleaned_up(primary, close, stop_trace, self.checkpoints)
+            stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
+        error = primary
+        for label, cleanup in (
+            ("Training iterator", close),
+            ("Profiler", stop_trace),
+            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+        ):
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+                else:
+                    error.add_note(f"{label} cleanup failed: {failure!r}")
         # The traceback of a failed run holds fit's frame and this one, and
         # with them whatever these names still point at.
         run.source = run.train = None
-        close = stop_trace = None
+        close = stop_trace = cleanup = None
         run.other += time.perf_counter() - paused
-        return self._reported_outcome(error, run.started, run.first_step, run.other, run.current,
-                                      process_zero=run.process_zero, preempted=run.preempted is not None)
+        return self._reported_outcome(error, run)
 
-    def _opened(self, plan: _FitPlan, run: _FitRun, state: TrainState, position, mesh: Mesh) -> bool:
+    def _opened(self, plan: _FitPlan, run: _FitRun, state: TrainState, position) -> bool:
         """Start `fit` from the placed state: report it, refuse a run already
         past its steps or a checkpoint cadence with no checkpointer, and open
         the training stream on its prefetch worker. Returns whether the run
         is already complete, a checkpoint at its last step having been
         written, so there is nothing to do."""
-        checkpoints, steps, mesh_shape = self.checkpoints, plan.steps, dict(mesh.shape)
+        mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
+        mesh_shape = dict(mesh.shape)
         run.current = current = int(state.step)
         self._report(FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
@@ -1197,7 +1206,7 @@ class Trainer(Generic[Loss, Effects]):
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         def announce() -> None:
-            if run.process_zero:
+            if jax.process_index() == 0:
                 print(f"Training from step {current} to {steps} on "
                       f"{mesh_shape} ({jax.process_count()} process(es))")
 
@@ -1205,8 +1214,8 @@ class Trainer(Generic[Loss, Effects]):
         return False
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
-                       shardings: Placement[TrainState], position, loss: jax.Array, aux: dict[str, jax.Array],
-                       accepted, mesh: Mesh) -> bool:
+                       shardings: Placement[TrainState], position, loss: jax.Array,
+                       aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
         """The cadenced work after one step of `fit`: the log, the validation,
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
@@ -1217,7 +1226,7 @@ class Trainer(Generic[Loss, Effects]):
 
         if plan.eval_every and current % plan.eval_every == 0 and current < steps:
             run.other += self._timed_evaluation(
-                state, shardings, plan.dataset, plan.metrics, plan.preview, mesh)
+                state, shardings, plan.dataset, plan.metrics, plan.preview)
 
         # On its own clock, not the logging one, so that a cadence
         # which does not divide log_every still fires.
@@ -1239,8 +1248,7 @@ class Trainer(Generic[Loss, Effects]):
         return False
 
     def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
-                   shardings: Placement[TrainState], position, mesh: Mesh,
-                   profiler: Profiler | None) -> None:
+                   shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
         """`fit` after its last step: the stream closed, a preemption
         announced, the trace window stopped, the final validation (skipped on
         a preemption) and the checkpoint of the state the run ends on."""
@@ -1256,7 +1264,7 @@ class Trainer(Generic[Loss, Effects]):
             stopped_at = run.preempted
 
             def announce_preemption() -> None:
-                if run.process_zero:
+                if jax.process_index() == 0:
                     print(f"Preempted at step {stopped_at}: " + (
                         f"its checkpoint and data position go to {checkpoints.directory}, "
                         "where the next run resumes" if checkpoints is not None
@@ -1268,14 +1276,14 @@ class Trainer(Generic[Loss, Effects]):
             # The window outlived the run, and a trace left running takes the
             # next one down with it.
             assert profiler is not None
-            self._stop_trace(run.traced, loss, profile, profiler, step=current)
+            self._stop_trace(run, profile, profiler)
         interval.check_finite(current)
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
         if plan.eval_every and run.preempted is None:
             run.other += self._timed_evaluation(
-                state, shardings, plan.dataset, plan.metrics, plan.preview, mesh)
+                state, shardings, plan.dataset, plan.metrics, plan.preview)
         if checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
@@ -1408,7 +1416,7 @@ class Trainer(Generic[Loss, Effects]):
                     primary.add_note(f"Profiler stop failed: {failure!r}")
             raise
 
-    def _rolled_out(self, state: TrainState, batch: Batch, mesh: Mesh) -> tuple[Batch, float]:
+    def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.
 
         Host-side and untraceable: sampling, scoring, advantages. The key
@@ -1419,7 +1427,7 @@ class Trainer(Generic[Loss, Effects]):
         began = time.perf_counter()
         assert self.rollout is not None
         key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-        batch = shard_batch(mesh, self.rollout(state, batch, key))
+        batch = shard_batch(self.device_mesh, self.rollout(state, batch, key))
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, float | None]],
@@ -1442,15 +1450,14 @@ class Trainer(Generic[Loss, Effects]):
         return compiled[shapes]
 
     def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],
-                          dataset: Dataset, metrics: Sequence[Metric], preview: bool,
-                          mesh) -> float:
+                          dataset: Dataset, metrics: Sequence[Metric], preview: bool) -> float:
         """Score the validation split, returning the seconds it took.
 
         Those seconds are the run's, but not its steps', which is what the
         goodput fraction is measured against."""
         paused = time.perf_counter()
         with region("evaluate"):
-            self._evaluate(state, shardings, dataset, metrics, preview, mesh)
+            self._evaluate(state, shardings, dataset, metrics, preview)
         return time.perf_counter() - paused
 
     def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
@@ -1511,35 +1518,7 @@ class Trainer(Generic[Loss, Effects]):
         with region("log"):
             agreed("training reporting", report)
 
-    def _cleaned_up(self, primary: BaseException | None, close: Callable[[], None] | None,
-                    stop_trace: Callable[[], None] | None,
-                    checkpoints: Checkpoints | None) -> BaseException | None:
-        """Run every teardown step, returning the failure the run ends on.
-
-        Each step runs even when an earlier one failed, and a later failure
-        becomes a note on the first, so one broken sink cannot hide the error
-        that ended the run.
-        """
-        error = primary
-        for label, cleanup in (
-            ("Training iterator", close),
-            ("Profiler", stop_trace),
-            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
-        ):
-            if cleanup is None:
-                continue
-            try:
-                cleanup()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f"{label} cleanup failed: {failure!r}")
-        return error
-
-    def _reported_outcome(self, error: BaseException | None, started: float,
-                          first_step: float | None, other: float, step: int, *,
-                          process_zero: bool, preempted: bool) -> BaseException | None:
+    def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
 
         Every rank reaches the cleanup agreement, so a rank that failed alone
@@ -1553,19 +1532,21 @@ class Trainer(Generic[Loss, Effects]):
                 error = failure
         if error is None:
             def report_goodput() -> None:
-                if process_zero:
-                    scalars = goodput(time.perf_counter() - started, first_step, other)
+                if jax.process_index() == 0:
+                    scalars = goodput(time.perf_counter() - run.started, run.first_step, run.other)
                     print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
                           f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
                     if self.tracker is not None:
-                        self.tracker.log(scalars, step)
+                        self.tracker.log(scalars, run.current)
 
             try:
                 agreed("goodput reporting", report_goodput)
             except BaseException as failure:
                 error = failure
         try:
-            self._report(FitEnded.outcome(time.perf_counter() - started, error, preempted=preempted), step)
+            outcome = FitEnded.outcome(time.perf_counter() - run.started, error,
+                                       preempted=run.preempted is not None)
+            self._report(outcome, run.current)
         except BaseException as failure:
             if error is None:
                 error = failure
@@ -1590,13 +1571,13 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
-                  metrics: Sequence[Metric], preview: bool, mesh) -> None:
+                  metrics: Sequence[Metric], preview: bool) -> None:
         """Score the validation split with this state's variables and report it.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
-        params = state.params
+        mesh, params = self.device_mesh, state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
@@ -1638,13 +1619,14 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: ProfileWindow,
-                    profiler: Profiler, *, step: int) -> None:
+    def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture, then report it on process zero.
 
         The core Profiler drains the backend and exports the native reports
-        on `stop`. The loss's block only orders the primary's failure ahead
-        of the profiler's own drain."""
+        on `stop`. The run's last loss is blocked on only to order the
+        primary's failure ahead of the profiler's own drain."""
+        loss, traced = run.loss, run.traced
+
         def stop() -> None:
             try:
                 if loss is not None:
@@ -1663,7 +1645,7 @@ class Trainer(Generic[Loss, Effects]):
                 print(f"Wrote profile for {traced} steps to {profile.directory}")
 
         agreed("profile stop", stop)
-        self._report(ProfileWindowRecord(profile.directory, traced), step)
+        self._report(ProfileWindowRecord(profile.directory, traced), run.current)
         agreed("profile announcement", announce)
 
     def _throughput(self, elapsed: float, steps: int, samples: int,
