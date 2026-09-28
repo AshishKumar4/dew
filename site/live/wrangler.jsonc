@@ -15,7 +15,8 @@
 		{
 			"class_name": "Kernel",
 			"image": "./container/Dockerfile",
-			"instance_type": "standard-2",
+			// 4 vCPUs and 12 GiB: the landing page's 176M text-to-image model samples on the CPU.
+			"instance_type": "standard-4",
 			"max_instances": 8,
 			// A deploy replaces a running container only after its session could have
 			// reached the wall clock (WALL_SECONDS 1200, plus the Kernel's 15 s alarm).

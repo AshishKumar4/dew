@@ -1,0 +1,106 @@
+---
+// Sample from the text-to-image model on a live kernel: the setup cell runs once
+// when the kernel starts, and the reader edits and runs the sampling cell. The
+// live client loads when Run is first pressed.
+import { Code } from '@astrojs/starlight/components';
+import { live } from '../../live.mjs';
+
+interface Props {
+	setup: string;
+	cell: string;
+	colab: string;
+}
+const { setup, cell, colab } = Astro.props;
+const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
+---
+
+<div class="live-sampler" data-live-sampler data-setup={setup}>
+	<Code code={setup.trimEnd()} lang="python" title="Runs once, when the kernel starts" />
+	<div class="sampler-editor">
+		<div class="sampler-editor-bar">
+			<span>sample.py, editable</span>
+			<span class="sampler-editor-actions">
+				{
+					liveEnabled && (
+						<button type="button" class="sampler-run" data-run>
+							Run
+						</button>
+					)
+				}
+				<button type="button" class="sampler-reset" data-reset>Reset</button>
+			</span>
+		</div>
+		<textarea data-code spellcheck="false" autocapitalize="off" autocomplete="off" rows={cell.trimEnd().split('\n').length + 1}
+			>{cell.trimEnd()}</textarea
+		>
+	</div>
+	<div class="sampler-output" data-output aria-live="polite"></div>
+	<p class="sampler-status" data-status aria-live="polite">
+		{
+			liveEnabled
+				? 'Run starts a kernel on a 4-vCPU Cloudflare container, with JAX on the CPU. It loads the model once, then runs your cell.'
+				: 'Live kernels are not set up for this build of the site.'
+		}
+	</p>
+	<p class="sampler-status">
+		Or <a href={colab} target="_blank" rel="noopener">open it in Colab</a> to run it on a GPU and change anything.
+	</p>
+	<div class="turnstile-holder" data-turnstile></div>
+</div>
+
+<script>
+	import type { LiveSession } from '../../scripts/live';
+
+	const panel = document.querySelector<HTMLElement>('[data-live-sampler]');
+	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
+	if (panel && run) {
+		const editor = panel.querySelector<HTMLTextAreaElement>('[data-code]')!;
+		const output = panel.querySelector<HTMLElement>('[data-output]')!;
+		const status = panel.querySelector<HTMLElement>('[data-status]')!;
+		const holder = panel.querySelector<HTMLElement>('[data-turnstile]')!;
+		const original = editor.value;
+		let session: LiveSession | undefined;
+		const say = (text: string) => (status.textContent = text);
+
+		panel.querySelector('[data-reset]')!.addEventListener('click', () => (editor.value = original));
+
+		const execute = async () => {
+			run.disabled = true;
+			try {
+				const { LiveSession, renderOutput } = await import('../../scripts/live');
+				if (!session) {
+					session = await LiveSession.open(holder, say);
+					session.onClose = (message) => {
+						session = undefined;
+						say(`${message} Press Run to start a new one.`);
+					};
+					say('Loading the model…');
+					const loaded = await session.run(panel.dataset.setup ?? '', (out) => {
+						if (out.type === 'error') renderOutput(output, out);
+					});
+					if (loaded.status !== 'ok') throw new Error('The model did not load on the live kernel.');
+				}
+				say('Sampling…');
+				output.replaceChildren();
+				const started = performance.now();
+				const done = await session.run(editor.value, (out) => renderOutput(output, out));
+				const seconds = ((performance.now() - started) / 1000).toFixed(1);
+				say(done.status === 'ok' ? `Ran in ${seconds} s on the live kernel.` : 'The cell stopped with an error; the output above says why.');
+			} catch (error) {
+				session?.close();
+				session = undefined;
+				say(error instanceof Error ? error.message : String(error));
+			} finally {
+				run.disabled = false;
+			}
+		};
+
+		run.addEventListener('click', execute);
+		editor.addEventListener('keydown', (event) => {
+			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !run.disabled) {
+				event.preventDefault();
+				void execute();
+			}
+		});
+	}
+</script>
