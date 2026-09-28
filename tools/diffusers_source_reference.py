@@ -13,7 +13,9 @@ the repeated stage rows the two-evaluation classes take.
 What lands per case: the saved config, the beta table, the source timesteps and
 sigmas, its `init_noise_sigma`, the latent after every grid interval and the
 vector-Jacobian product of the last one against a fixed cotangent through the
-whole trajectory, in float64 on the torch side.
+whole trajectory. The float64 walk widens every floating scheduler table
+before doing arithmetic; its gradient is stored in float64. Both precisions
+start from the same float32 input and cotangent.
 
 The model is the same closed form on both sides, a function of the scaled model
 input and the model time, so the comparison is of scheduler policy alone. A
@@ -374,44 +376,73 @@ def grid_times(scheduler, case: Case) -> np.ndarray:
     return times
 
 
+class Float64Library:
+    """A scheduler module's explicit float32 constructors and casts widened."""
+
+    def __init__(self, library):
+        self.library = library
+
+    def __getattr__(self, name):
+        return getattr(self.library, "float64" if name == "float32" else name)
+
+
+@contextlib.contextmanager
+def float64_scheduler(module: ModuleType):
+    """Evaluate the published formulas in float64, including table creation.
+
+    Casting already-built tables would retain their float32 cumprod and
+    interpolation errors. Some step methods also explicitly upcast a sample
+    to float32; that minimum precision must become float64 for this oracle.
+    Only this scheduler module sees the widened libraries, and the default
+    dtype is restored before the native float32 reference runs.
+    """
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        with contextlib.ExitStack() as scope:
+            for name, library in (("torch", torch), ("np", np)):
+                if hasattr(module, name):
+                    scope.enter_context(patch.object(module, name, Float64Library(library)))
+            yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 class ReplayBrownian:
     """The draws `RecordedBrownian` kept, answered again in the same order."""
 
     def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
         self.taken = 0
+        self.dtype = x.dtype
 
     def __call__(self, sigma, sigma_next):
         value = RecordedBrownian.draws[self.taken]
         self.taken += 1
-        return torch.tensor(value, dtype=torch.float32)
+        return torch.tensor(value, dtype=self.dtype)
 
 
-def single_precision_gradient(module: ModuleType, case: Case, prior: float,
-                              cotangent: torch.Tensor) -> np.ndarray:
-    """The same trajectory gradient with the sample in float32.
-
-    A reconstruction runs in float32, so how close it can come is bounded by
-    what float32 does to this walk rather than by a fixed number. Recording
-    the reference's own float32 gradient beside its float64 one states that
-    bound from the source's side.
-    """
+def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
+                        cotangent: torch.Tensor, dtype: torch.dtype) -> np.ndarray:
+    """One walk's VJP on identical inputs, cotangent and random draws."""
     scheduler = getattr(module, case.scheduler)(**case.config)
     scheduler.set_timesteps(case.steps)
-    generator = torch.Generator().manual_seed(SEED)
-    x = (torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior).to(torch.float32)
+    if dtype == torch.float64:
+        for attribute, value in vars(scheduler).items():
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                setattr(scheduler, attribute, value.to(dtype))
+    x = initial.detach().to(dtype)
     x.requires_grad_(True)
     if case.scheduler == "DPMSolverSDEScheduler":
-        # Replay the draws the float64 walk recorded: querying the real tree
-        # again at float32 levels would answer a different point of a rough
-        # path, and this measures arithmetic, not the query's placement.
+        # A changed grid queries another point of a rough Brownian path.
+        # Replay the same draws to compare arithmetic rather than paths.
         with patch.object(module, "BrownianTreeNoiseSampler", ReplayBrownian):
             latents, _ = walk(scheduler, module, case, x, [])
     else:
         noises = step_noise(len(scheduler.timesteps))
         runner = guided_walk if case.guidance is not None else walk
         latents, _ = runner(scheduler, module, case, x, noises)
-    (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(torch.float32)).sum(), x)
-    return gradient.numpy().astype(np.float32)
+    (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(dtype)).sum(), x)
+    return gradient.numpy()
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
@@ -431,9 +462,8 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     assert times.count(times[0]) == 1, f"{name}: the first model time repeats in {times}"
     generator = torch.Generator().manual_seed(SEED)
     prior = float(scheduler.init_noise_sigma)
-    x_T = torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior
-    cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64)
-    x_T.requires_grad_(True)
+    x_T = (torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior).float().double()
+    cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64).float().double()
     arrays: dict[str, np.ndarray] = {}
     if case.scheduler == "DPMSolverSDEScheduler":
         RecordedBrownian.real = module.BrownianTreeNoiseSampler
@@ -453,13 +483,14 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
         runner = guided_walk if case.guidance is not None else walk
         latents, inputs = runner(scheduler, module, case, x_T, noises)
     assert len(latents) == case.steps, (name, len(latents), case.steps)
-    (gradient,) = torch.autograd.grad((latents[-1] * cotangent).sum(), x_T)
-    single = single_precision_gradient(module, case, prior, cotangent)
+    single = trajectory_gradient(module, case, x_T, cotangent, torch.float32)
+    with float64_scheduler(module):
+        gradient = trajectory_gradient(module, case, x_T, cotangent, torch.float64)
     arrays.update({
         "x_T": x_T.detach().numpy().astype(np.float32),
         "latents": np.stack([latent.detach().numpy() for latent in latents]).astype(np.float32),
         "cotangent": cotangent.numpy().astype(np.float32),
-        "grad": gradient.numpy().astype(np.float32),
+        "grad": gradient,
         "grad_float32": single,
         "times": scheduler.timesteps.numpy().astype(np.float64),
         "prior": np.asarray(prior, np.float64),
