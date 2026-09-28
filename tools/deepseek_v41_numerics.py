@@ -38,10 +38,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.core import freeze
 from jax.experimental import io_callback
 from reference_error import distance
 
@@ -68,7 +68,7 @@ def unquantized(model):
     architecture outputs were taken."""
     kinds = {name: dataclasses.replace(kind, mixer=dataclasses.replace(kind.mixer, kv_qat=False))
              for name, kind in model.kinds.items()}
-    return model.clone(kinds=flax.core.freeze(kinds))
+    return model.clone(kinds=freeze(kinds))
 
 
 def forward(model, variables, ids):
@@ -147,15 +147,14 @@ class Captured:
 
 
 def widened(model, variables):
-    """The model and its variables in float64, a media model's language
-    model included; x64 has to be on. A media model's towers also ask for
-    HIGHEST precision, at which float64 multiplies anyway: it sends their
-    attention down Dew's reference path (`reference_only`), where jax's own
-    attention takes its softmax in float32 whatever its inputs."""
+    """The model and its variables in float64, including a media model's
+    language model. Dew's precision policy preserves that dtype throughout;
+    its attention dispatch chooses a float64 implementation. x64 must be on.
+    """
     wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
                         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
     if isinstance(model, MultimodalTransformer):
-        return model.clone(dtype=jnp.float64, precision=jax.lax.Precision.HIGHEST,
+        return model.clone(dtype=jnp.float64,
                            language_model=model.language_model.clone(dtype=jnp.float64)), wide
     return model.clone(dtype=jnp.float64), wide
 
@@ -163,11 +162,8 @@ def widened(model, variables):
 def decided(run, model, variables):
     """`run(model, variables)` with every rounding and top-k pick taken from
     its float64 twin: the same run with x64 on, the model and its variables
-    widened (`widened`) and every fp32 pin Dew names as `jnp.float32` (the
-    rotary tables, the norms, the softmaxes, the mHC mixing, the pooling, the
-    router and the engram gate) read as float64 while it traces. There each
-    quantizer rounds its input's float32, which rounds as the float64 value
-    does but at a tie.
+    widened (`widened`). Each quantizer rounds its input's float32, which
+    rounds as the float64 value does except at a tie.
 
     A value within fp32 noise of where its rounding or pick changes then goes
     the way the exact value goes, as the reference's did: `--fp64` refuses a
@@ -189,18 +185,14 @@ def decided(run, model, variables):
     from dew.nn import deepseek_v4
 
     fp8, fp4, top_k = deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k
-    single, made, record = jnp.float32, [], Captured()
+    made, record = [], Captured()
 
     def keep(value):
         made.append(np.asarray(value))
 
     def exact(quantize):
         def call(*args, **kwargs):
-            jnp.float32 = single  # the quantizer's own fp32 arithmetic
-            try:
-                out = quantize(*args, **kwargs)
-            finally:
-                jnp.float32 = jnp.float64
+            out = quantize(*args, **kwargs)
             jax.debug.callback(keep, out, ordered=True)
             return out
         return call
@@ -247,12 +239,8 @@ def decided(run, model, variables):
     try:
         deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = exact(fp8), exact(fp4), picked
         with jax.enable_x64(new_val=True), jax.default_device(host):
-            jnp.float32 = jnp.float64
-            try:
-                wide = run(*widened(model, jax.device_put(variables, host)))
-                jax.effects_barrier()
-            finally:
-                jnp.float32 = single
+            wide = run(*widened(model, jax.device_put(variables, host)))
+            jax.effects_barrier()
         pending = iter(made)
         deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = window, fourbit, ranked
         given = run(model, variables)
