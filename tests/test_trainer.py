@@ -8,9 +8,11 @@ tracker, and what a failure does to the run.
 """
 
 import dataclasses
+import gc
 import json
 import os
 import re
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +21,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from flax import linen as nn
+from flax.errors import ScopeParamShapeError
 
 from dew import position
 from dew.artifacts import Representations
@@ -145,6 +148,32 @@ class RecordingTracker:
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
+    refs = []
+
+    class ObservedPrefetch(trainer_module.DevicePrefetchIterator):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            refs.append(weakref.ref(self))
+
+    class WrongWidth(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            if self.index == 4:
+                batch = {**batch, "x": np.concatenate([batch["x"], batch["x"][:, :1]], axis=1)}
+            return batch
+
+    monkeypatch.setattr(trainer_module, "DevicePrefetchIterator", ObservedPrefetch)
+    with pytest.raises(ScopeParamShapeError) as failure:
+        make_trainer().fit(Data(train=WrongWidth), steps=10, log_every=100)
+    # A caller may retain the error for reporting; its traceback must not
+    # retain the closed worker and its queue after fit has relinquished it.
+    assert failure.value.__traceback__ is not None
+    gc.collect()
+    assert len(refs) == 1
+    assert refs[0]() is None
 
 
 def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
