@@ -1,62 +1,119 @@
 # Distributed training
 
-This page assumes you can train a model on one device and know JAX arrays and Flax variables. Work through [the single-device tutorial](../getting-started.md) before you change placement. You should know your global batch size and the shapes of your model's parameters.
+Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `build_mesh` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
 
-A mesh gives names to groups of devices. A layout maps parameter dimensions to those mesh axes. `Trainer` uses the mesh and the layout to initialize and update sharded state, and JAX compiles the collective communication this needs.
+![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-light.svg)
+![](../assets/mesh-dark.svg)
 
-## Inspect a single-device mesh
+The figure is computed by `docs/assets/figures.py` from the placements `build_mesh`, `Layout().shardings` and `batch_shardings` return.
 
-This example runs on any device, CPU included, and allocates no model:
+## Example
+
+This trains a small decoder on eight simulated CPU devices. `--xla_force_host_platform_device_count` must be set before JAX is imported.
 
 ```python
-import jax
-from dew.training import MeshSpec, build_mesh
+import os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
-mesh = build_mesh(MeshSpec())
-print("Visible devices:", len(jax.devices()))
-print("Mesh dimensions:", dict(mesh.shape))
-assert mesh.size == len(jax.devices())
+import itertools
+
+import jax
+import numpy as np
+import optax
+
+from dew import Dataset, Trainer, models
+from dew.objectives.lm import LMObjective
+from dew.training import MeshSpec
+
+model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=2,
+                     num_heads=4, mlp_features=1024, max_seq_len=64)
+rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
+data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
+               records=16, batch=16)
+trainer = Trainer(LMObjective(model, seq_len=64), optax.adamw(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec(fsdp=2, tensor=2))
+state = trainer.fit(data, steps=4, log_every=2)
+
+kernel = state.params["params"]["layers_0"]["mlp"]["up_proj"]["kernel"]
+print(kernel.shape, kernel.sharding.spec)
+print(kernel.addressable_shards[0].data.shape)
 ```
 
-`MeshSpec()` puts all visible devices on data parallelism. The other fields reserve a factor of the device count for their own axis, and data parallelism gets what is left. The product of the fields must divide the number of devices.
+```text
+Training from step 0 to 4 on {'data': 2, 'expert': 1, 'fsdp': 2, 'tensor': 2, 'sequence': 1, 'stage': 1} (1 process(es))
+step 2: loss 4.7406
+step 4: loss 2.1400
+Goodput: first step after 2.65 s, 15.3% of the wall time in steps
+(256, 1024) P('fsdp', 'tensor')
+(128, 512)
+```
 
-| Mesh axis | Role |
-|---|---|
-| `data` | Partition batch rows while replicating model parameters |
-| `fsdp` | Partition parameter dimensions selected by the layout |
-| `expert` | Partition the expert dimension in sparse layers |
-| `tensor` | Partition widths that layout rules explicitly assign to tensor parallelism |
-| `sequence` | Partition token positions for sequence-parallel attention |
-| `stage` | Place pipeline stages in the layer-stack execution |
+Each device holds a `(128, 512)` block of the `(256, 1024)` kernel: the rows split over the two `fsdp` devices and the columns over the two `tensor` devices. The Adam moments of the kernel are placed the same way.
 
-On eight devices, `MeshSpec(fsdp=4)`, `MeshSpec(fsdp=2, expert=4)` and `MeshSpec(fsdp=4, sequence=2)` are valid configurations. Constructing one of these values tests nothing. Building and running its mesh needs enough visible devices.
+## Mesh
 
-## Describe parameter placement
+`MeshSpec` fields name the devices each axis takes; `data` takes the rest. The product of the fields must divide the device count, or `build_mesh` raises `LayoutRefused`.
 
-Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout` maps those names to mesh axes. The default rules put many large dense dimensions on `fsdp` and expert dimensions on `expert`. Under `MeshSpec(tensor=N)` the widths of Megatron's split take the tensor axis as well: the mlp's hidden width, the query and key-value heads, the attention width `o_proj` reads, and the vocabulary. The residual width stays whole on the tensor axis.
+| Axis | `MeshSpec` field | Splits |
+|---|---|---|
+| `data` | (the remainder) | Batch rows; parameters are replicated over it |
+| `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
+| `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
+| `tensor` | `tensor` | The MLP hidden width, attention heads and vocabulary (Megatron's split) |
+| `sequence` | `sequence` | Token positions, for sequence-parallel attention |
+| `stage` | `stage` | The decoder's layer stack, into pipeline stages |
+
+```python
+from dew.training import build_mesh
+
+print(dict(build_mesh(MeshSpec(fsdp=4)).shape))
+print(dict(build_mesh(MeshSpec(fsdp=2, expert=4)).shape))
+print(dict(build_mesh(MeshSpec(fsdp=4, sequence=2)).shape))
+```
+
+```text
+{'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
+```
+
+`MeshSpec` also has `microbatches` (pipeline microbatches, below) and `replicas` (host groups the data axis spans; see [Multiple hosts](../guides/multi-node.md)).
+
+## Parameter placement
+
+Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout.rules` maps each name to mesh axes, in precedence order; `dew.nn.sharding.DEFAULT_RULES` is the default table. It puts large dense dimensions on `fsdp` and expert dimensions on `expert`. Under `MeshSpec(tensor=N)` the widths of Megatron's split also take the tensor axis: the MLP hidden width, the query and key-value heads, the attention width `o_proj` reads, and the vocabulary. The residual width is not split over `tensor`. A name whose axes do not divide a dimension falls back to its next rule, or stays whole.
+
+| `Layout` field | Default | Meaning |
+|---|---|---|
+| `rules` | `DEFAULT_RULES` | Logical axis name to mesh axes, in precedence order |
+| `min_shard` | `2 ** 16` | Parameters with fewer elements stay replicated |
+| `tolerance` | `0.02` | The fraction of shardable parameter elements that may stay replicated before `Layout.check` raises |
+| `host` | `()` | Train-state fields kept in pinned host memory between steps: `"opt_state"`, `"ema"`, or `"params"` for a CPU-owned step |
+| `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
+
+A parameter whose path no module declares is split on its largest dimension that divides the `fsdp` size. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and lists the largest replicated parameters; raising `tolerance` hides the problem rather than fixing the placement. A rule that puts a parameter on `data`, `sequence` or `stage` is refused.
+
+Optimizer moments and EMA copies have the same shapes as their parameters and take the same placement. When a checkpoint is restored, Dew builds the restore template for the layout requested, so a run can resume on a different mesh; the parameter names and shapes must match the saved state.
+
+## Activation placement
 
 The same table places activations. Its `activation_` names put a batch's rows on the `data`, `expert` and `fsdp` axes, its positions on `sequence`, and the heads, the mlp hidden width and the vocabulary of an activation on `tensor`. The model pins the residual stream, the attention's heads and the mlp's hidden width with `dew.nn.sharding.constrain`, and the trainer compiles its step under `flax.linen.logical_axis_rules(layout.rules)`, so a rule you change moves the activations with the parameters. Without those pins GSPMD chooses each activation's placement from the weights around it. On an fsdp mesh it split the residual width and all-reduced every projection's partial products, and on a tensor mesh it gathered every weight, as fsdp does. A batch's rows never split over `tensor`: every tensor shard reads the rows it computes its part of the width for, as in Megatron. A name whose axes do not divide a dimension falls back to its next rule, or stays whole.
 
-Some per-token work splits no width that the tensor axis splits. Multi-head latent attention's down-projections into its query and key-value latents, and DeepSeek-V4's query latent and shared key head, read the whole residual, so under a tensor axis every tensor shard computed them over every token. At DeepSeek-V3's shape that made a step 1.133 times one device's matmul FLOPs under `tensor=8`. Where the tensor axis's link pays for it, these projections run on each tensor shard's own tokens instead. Their input is placed as `SPREAD`, whose `activation_spread` rule splits positions over the tensor axis beside the sequence axis, and the latents are gathered back for the head-split up-projections. That saves (T - 1)/T of the projections' FLOPs and adds the gathers of the latents and of the residual's gradient, plus a sum of the projections' weight gradient over the tensor axis. `dew.nn.sharding.down_projection` decides for each projection while the step is traced: it spreads when the link moves those bytes in no more time than the device's peak takes for the FLOPs saved, which take at least that long at any utilisation. The trainer measures the link once per mesh, with an all-gather over the tensor axis (`dew.training.distributed.tensor_bandwidth`). Every process takes the pool's lowest figure, so every process compiles the same program, and `StepCompiled` records the figure and whether a projection spread. At DeepSeek-V3's widths in bf16 and 16384 tokens a microbatch, an RTX 3090 needs 20.3 GB/s. On 4x RTX 3090 (PCIe 3.0, one host) the NVLink pair's all-gather moved 31.0 GB/s, so it spreads, and the PCIe pair's 5.8 GB/s does not. An H100 SXM needs 283 GB/s, under NVLink 4's nominal 450 GB/s a direction. I have not measured a spread step's time on NVLink or on a TPU. A CPU mesh always spreads, and a device that the peak table in `dew.telemetry.instrumentation` does not name never does. To keep the projections on every token whatever the link, map `activation_spread` to the sequence axis alone in your rules.
+Some per-token work splits no width that the tensor axis splits. Multi-head latent attention's down-projections into its query and key-value latents, and DeepSeek-V4's query latent and shared key head, read the whole residual, so under a tensor axis every tensor shard computed them over every token. At DeepSeek-V3's shape that made a step 1.133 times one device's matmul FLOPs under `tensor=8`. Where the tensor axis's link pays for it, these projections run on each tensor shard's own tokens instead. Their input is placed as `SPREAD`, whose `activation_spread` rule splits positions over the tensor axis beside the sequence axis, and the latents are gathered back for the head-split up-projections. That saves (T - 1)/T of the projections' FLOPs and adds the gathers of the latents and of the residual's gradient, plus a sum of the projections' weight gradient over the tensor axis. `dew.nn.sharding.down_projection` decides for each projection while the step is traced: it spreads when the link moves those bytes in no more time than the device's peak takes for the FLOPs saved, which take at least that long at any utilisation. The trainer measures the link once per mesh, with an all-gather over the tensor axis (`dew.training.distributed.tensor_bandwidth`). Every process takes the pool's lowest figure, so every process compiles the same program, and `StepCompiled` records the figure and whether a projection spread. At DeepSeek-V3's widths in bf16 and 16384 tokens a microbatch, an RTX 3090 needs 20.3 GB/s. On 4x RTX 3090 (PCIe 3.0, one host) the NVLink pair's all-gather moved 31.0 GB/s, so it spreads, and the PCIe pair's 5.8 GB/s does not. An H100 SXM needs 283 GB/s, under NVLink 4's nominal 450 GB/s a direction. No spread step has been timed on NVLink or on a TPU. A CPU mesh always spreads, and a device that the peak table in `dew.telemetry.instrumentation` does not name never does. To keep the projections on every token whatever the link, map `activation_spread` to the sequence axis alone in your rules.
 
 The cross entropy scores each device's own tokens: it runs in a `shard_map` over the axes that hold the tokens, plus any other axis the token count divides, with the head whole on every device. Only the head's gradient and the loss's sums cross devices.
 
-Parameters smaller than `min_shard` elements stay replicated. `Layout.check` raises when too many of the parameters that should be sharded end up replicated. If it raises, look at the parameter paths and dimensions it lists before you change the rules. Raising `tolerance` only turns the check off. It does not make the placement any better.
+## Host memory
 
-Optimizer moments and EMA variables take their placement from the matching parameter paths. When a checkpoint is restored, Dew builds a restore template for the layout you ask for. The model's shapes and parameter names still have to match the saved state.
-
-`Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy in pinned host memory between steps. The compiled step fetches them to the device, runs the same update and writes them back. The values are the same as with a device-only layout. Only the device memory they take up between steps changes. Checkpoints save and restore this placement. Parameters stay on the device. The transfer adds time to every step, so measure step time with and without it.
+`Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy in pinned host memory between steps. The compiled step fetches them to the device, runs the same update and writes them back. The values are the same as with a device-only layout; only the device memory they occupy between steps changes. Checkpoints save and restore this placement. The transfer adds time to every step, so measure the step time with and without it.
 
 A checkpoint of that state is written before training goes on. Orbax copies a device array to host memory before its asynchronous write, but it writes an array that is already in pinned host memory from the array's own buffer, and the next step donates that buffer, which a GPU refuses while the write reads it. The step after a save therefore waits for the write, and no extra memory is used. The alternative, handing orbax a copy, would make the step wait only for the copy, but it would hold a second copy of the host-resident state in pinned host memory until the write lands: 12 bytes a parameter for fp32 Adam moments and EMA, or 84 GB at 7B parameters, on a host that keeps the state there because it has no room elsewhere. On an RTX 4080 host with a consumer NVMe drive (657 MB/s direct writes), a 6 GiB host-resident state took 18.4 s to write, where the copy would have taken 3.6 s and 8.4 GiB more peak memory. At 7B parameters that is about 4 minutes a checkpoint on that drive, against 20 to 50 s for the copy, and proportionally less on a faster drive. Choose `checkpoint_every` with that in mind. Orbax's write path itself held about 0.9 bytes of transient memory per byte written on that host, whichever way the state was handed to it.
 
 `Layout(host_parameters=("params/layers_*",))` keeps a root decoder stack in pinned host memory for inference. Each model declares every physical stack with a `DecoderBank`, which holds a namespace below every variables collection and its `StackView`. `MultimodalTransformer` puts its decoder under `language_model`. `DiffusionGemma` declares `text` once for the scope its encoder and decoder share. To select a nested stack, use a path such as `params/language_model/layers_*` or `params/text/layers_*`.
 
-A scanned decoder declares one bank per run of like layers. An unscanned decoder declares one bank per layer. Both stream through the same fetch loop. `dew.inference.host_banked(model, source, layout=...)` reads each physical bank once and rejects two different views of the same namespace. The fetch loop holds the current layer and the next one. I have not yet established GPU peak-memory bounds or whether the transfers overlap with compute. Selected leaves keep their FSDP and tensor PartitionSpecs. External cache arrays stay on the device under their logical per-layer paths. `Trainer.place` rejects host-parameter layouts, because the backward pass and optimizer paths for them do not exist.
+A scanned decoder declares one bank per run of like layers. An unscanned decoder declares one bank per layer. Both stream through the same fetch loop. `dew.inference.host_banked(model, source, layout=...)` reads each physical bank once and rejects two different views of the same namespace. The fetch loop holds the current layer and the next one. GPU peak-memory bounds and whether the transfers overlap with compute have not been measured. Selected leaves keep their FSDP and tensor PartitionSpecs. External cache arrays stay on the device under their logical per-layer paths. `Trainer.place` rejects host-parameter layouts, because the backward pass and optimizer paths for them do not exist.
 
 `dew.inference.LayerBanks` has two adapters for real use:
-
-- `CheckpointBanks` reads Dew run checkpoints bank by bank.
-- `HeldBanks` borrows an existing variables tree without donating or deleting it. The whole source stays in memory while the destination banks fill up, so it can hold two copies of the model at once.
 
 Both read the entry leaves outside the declared stacks, and both accept namespaces relative to a collection for bank reads. Media, embeddings and heads stay entries even when they share a parent module with a decoder. Each entry and bank placement finishes before the next read starts. `CausalTransformer(bank_layers=N)` limits how large a bank is when it is built. It does not cap the pinned allocator or free storage that the source owns. `StackView` still exposes the logical `layers_N` paths for saving and export. Synthetic generation exists only in `tools/benchmark_host_offload.py`.
 
@@ -66,23 +123,23 @@ Host-parameter placement works only for decoder stack variables. Dew rejects a s
 
 Every host-resident weight you select is copied to the device on each forward pass, including every decode step. PCIe transfers can take most of the time per token. `tools/benchmark_host_offload.py` reports local addressable-shard bytes, the device and host compiled-memory fields, process RSS and execution times. Its bytes-per-token divided by decode latency is an end-to-end effective rate. It is not a measurement of PCIe bandwidth alone.
 
-An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_layers=8`) reported 18.74 GiB final RSS and 37.9 GiB peak RSS. The saved load probe synchronized every bank, so a backlog of asynchronous work alone cannot explain that peak. The numbers do not separate temporary storage, allocator reservation and duplicate driver mappings. I have no completed result for generating on the GPU with a model larger than device memory, and no throughput result. Looking further into the allocator needs a small process tree with a hard memory cap, swap accounting and RSS/PSS measurements. The earlier oversized runs with an RSS watchdog are not a safe way to do it.
+An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_layers=8`) reported 18.74 GiB final RSS and 37.9 GiB peak RSS. The saved load probe synchronized every bank, so a backlog of asynchronous work alone cannot explain that peak. The numbers do not separate temporary storage, allocator reservation and duplicate driver mappings. There is no completed result yet for generating on a GPU with a model larger than device memory, and no throughput result. Looking further into the allocator needs a small process tree with a hard memory cap, swap accounting and RSS/PSS measurements. The earlier oversized runs with an RSS watchdog are not a safe way to do it.
 
-## Recompute block activations
+## Rematerialization
 
 `CausalTransformer(remat=...)` recomputes each decoder block in the backward pass instead of keeping its activations. The value is a policy. `"full"` keeps only the block inputs. The other names in `dew.nn.backbones.causal_transformer.REMAT_POLICIES` are `minimal`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded` and `qkv_proj_offloaded`. Each keeps some of the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) or offloads them to host memory. They trade recompute time for memory the same way MaxText's recipes of the same names do. You can also pass a record with your own lists, such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}`. The default, `None`, recomputes nothing. Every policy trains the same model. `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
 
-## Feed global batches
+## Batches
 
-`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` open a stream over one share of every global batch, and `dew.training.data_partition(mesh)` returns the `DataPartition(index, count, readers)` that says which share a process reads. The processes whose devices hold the same rows read the same share. Under `stage` or `sequence` axes that span processes, several processes hold one row shard, so they read one share and the partition counts them as `readers`. A loader cuts its records `index::count`, so global batch k holds the same records at every count. `shard_batch` assembles each share into the global arrays, whole rows from each share.
+`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` read one share of every global batch, and `dew.training.data_partition(mesh)` returns the `DataPartition(index, count, readers, reader)` of this process. Processes whose devices hold the same rows read the same share: under `stage` or `sequence` axes that span processes, several processes hold one row shard and count as `readers` of one share. A loader cuts its records `index::count`, so global batch *k* holds the same records at every process count. `shard_batch` assembles the shares into global arrays of whole rows.
 
 For custom data, take the partition you are handed and read that share alone. Two readers of one share must read the same records in the same order. A source that returns rows in whatever order its fetches finish, such as `ImageStream`, refuses a partition with more than one reader. If each process repeats the full dataset on its own, the run trains on a different distribution.
 
 The placement helper treats rank-two and rank-three arrays as sequences. It can split their second dimension when that dimension divides by the sequence factor. Image and video tensors keep their non-batch dimensions in that helper. Check custom rank-three data yourself: the rank of an array does not tell the helper whether its second dimension really is token positions.
 
-## Use sequence-parallel attention
+## Sequence parallelism
 
-`MeshSpec(sequence=N)` splits the token positions of every sequence over N devices. Each attention call picks one of two exact exchanges. The all-to-all follows DeepSpeed Ulysses: each device trades its slice of the positions for a slice of the heads, attends the whole sequence and trades back, so no device holds a whole key or value. It runs when the query heads divide by `tensor` times `sequence` and the query and key lengths both divide by `sequence`. Every other call gathers the whole keys and values beside split queries, which takes any head count and any key length. Where both can run, a causal, windowed or masked call takes the all-to-all, whose kernel skips the masked blocks; the gather hands its kernel an explicit mask that no kernel skips, and took two to four times as long for causal attention. A call with no mask takes whichever exchange sends fewer bytes. A causal or masked call on the gather path stripes query chunks to balance the work, so its sequence length must divide by twice the number of sequence shards. [Training on several nodes](../guides/multi-node.md#split-long-sequences) gives the measurements and the byte count.
+`MeshSpec(sequence=N)` splits the token positions of every sequence over N devices. Each attention call picks one of two exact exchanges. The all-to-all follows DeepSpeed Ulysses: each device trades its slice of the positions for a slice of the heads, attends the whole sequence and trades back, so no device holds a whole key or value. It runs when the query heads divide by `tensor` times `sequence` and the query and key lengths both divide by `sequence`. Every other call gathers the whole keys and values beside split queries, which takes any head count and any key length. Where both can run, a causal, windowed or masked call takes the all-to-all, whose kernel skips the masked blocks; the gather hands its kernel an explicit mask that no kernel skips, and took two to four times as long for causal attention. A call with no mask takes whichever exchange sends fewer bytes. A causal or masked call on the gather path stripes query chunks to balance the work, so its sequence length must divide by twice the number of sequence shards. [Multiple hosts](../guides/multi-node.md) gives the measurements and the byte count.
 
 A window that cuDNN takes as its window flag runs through the all-to-all like any causal call, and the kernel skips the blocks outside the window. Local attention runs banded instead for packed documents or sinks on cuDNN, a validity mask, a window on XLA, and chunks. A banded layer whose span fits in one shard's slice does not exchange at all. Each device attends its own positions, and its first block reads the previous device's last `window` keys and values, with their positions, segment IDs and validity, through one shift. A wider span takes the all-to-all, as a dense call.
 
@@ -92,7 +149,7 @@ Mamba-2 layers split the sequence the same way, so a hybrid of Mamba-2 and atten
 
 Cached autoregressive generation needs `sequence=1`. A mesh that trains with sequence parallelism may still be unable to run the decode cache.
 
-## Scan layers and use a pipeline
+## Layer scan and pipeline
 
 `scan_layers=True` groups compatible consecutive decoder layers into a Flax scan. The stored variables stay per layer. Scanning can cut compile time, but it adds stacking and loop overhead. It does not promise a flat compile time or faster steps. Measure it at the model size and on the backend you plan to use.
 
@@ -102,22 +159,20 @@ Cached autoregressive generation needs `sequence=1`. A mesh that trains with seq
 
 The stored master parameters are replicated over the stage axis, and each step builds a view that is partitioned by stage. Count that copy and its communication when you estimate memory savings. Some mixed layer patterns and KV-sharing configurations cannot use this pipeline. Cached decoding also needs `stage=1`.
 
-Dew does not implement 1F1B. Earlier experiments tried one approach. They do not show that a compiled 1F1B design is impossible. It is still an open gap in the implementation and design.
+Dew does not implement a 1F1B schedule.
 
-## Select precision and kernels
+## Kernels and precision
 
-On GPU, attention can use cuDNN when the shape, dtype, mask and requested features fit its supported path. Other calls use XLA. On TPU, attention uses Pallas. Packed masks and optional attention features can change which kernel runs and how much memory it uses.
+On GPU, attention uses cuDNN when the shape, dtype, mask and requested features fit its supported path, and XLA otherwise. On TPU it uses Pallas. Packed masks and optional attention features can change which kernel runs and how much memory it uses.
 
-Qwix quantization is an optional, experimental training path with int8 and fp8 computation. It keeps the master parameters but changes the numerics. In the local RTX 4080 measurements, fp8 did not make steps faster at the sizes tested. See the [performance measurements](../performance.md), and check accuracy and throughput on your own configuration.
+Qwix quantization is an optional, experimental training path with int8 and fp8 matmuls. It keeps full-precision master parameters and changes the numerics. In the RTX 4080 measurements on [Performance](../performance.md), fp8 did not make steps faster at the sizes tested.
 
-## Run across hosts
+## Several hosts
 
-Initialize the JAX process pool before you create any device arrays or models. The built-in recipes call their process setup function early. Each host needs compatible software, access to the data and a coordinator it can reach. `dew launch` starts a pool over ssh or under Slurm, and `MeshSpec(replicas=N)` keeps fsdp inside a node while the data axis spans the nodes. [Training on several nodes](../guides/multi-node.md) covers both and how to rehearse them on one machine. Test remote checkpoint storage and iterator partitioning separately.
+The JAX process pool must be initialized before any device array or model is created; the built-in recipes do this first. Each host needs the same software, access to the data and a reachable coordinator. `dew launch` starts a pool over ssh or under Slurm, and `MeshSpec(replicas=N)` keeps `fsdp` inside a node while the data axis spans the nodes. [Multiple hosts](../guides/multi-node.md) covers both and how to rehearse them on one machine, and [Cloud TPUs](../tpu.md) covers TPU provisioning.
 
-The local process-pool tests run real `jax.distributed` processes. They do not test network failures, remote storage, TPU collectives or cluster preemption. [TPU setup](../tpu.md) describes provisioning, which can cost money on the cloud.
+The local process-pool tests run real `jax.distributed` processes. They do not cover network failures, remote storage, TPU collectives or cluster preemption.
 
-## Verify a distributed run
+## Checking a distributed run
 
-Compute a small global operation under each placement you plan to use and compare the results. Check the loss and gradients, record identity, optimizer and EMA state, and saving and restoring. Write down the compiler and backend versions and the tolerances you used. A device count and a finite loss do not show that two runs train the same way.
-
-CPU tests on global arrays cover loss normalization with unequal masks and restarting partway through a window. Read the [checkpoint guide](../guides/checkpoints.md) and the [evaluation limits](../guides/evaluation.md) to see what a resumed run and a reported metric each guarantee.
+Compare a small global computation under each placement you plan to use: the loss and gradients, record identity, optimizer and EMA state, and a save and restore. Record the compiler and backend versions and the tolerances used. A device count and a finite loss do not show that two runs train the same way. [Checkpoints](../guides/checkpoints.md) and [Evaluation and tracking](../guides/evaluation.md) describe what a resumed run and a reported metric guarantee.
