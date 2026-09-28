@@ -328,17 +328,19 @@ def _last_hidden_state(model, features, *, key: str):
 @encoders("hf_audio")
 @dataclass(frozen=True, eq=False)
 class HFAudio(ConditionEncoder[AudioRow, TextContext]):
-    """Any transformers audio model's last hidden state, with the checkpoint's
+    """A transformers audio model's last hidden state, with the checkpoint's
     own feature extractor.
 
-    The extractor turns waveforms into whatever the model reads,
-    `input_values` for wav2vec2 and HuBERT, `input_features` for Whisper and
-    AST, and transformers' PyTorch forward runs lowered to JAX by torchax,
-    so any model `AutoModel` builds serves; an encoder-decoder contributes
-    its encoder. Weight-norm parametrizations are folded into plain weights,
-    which the frozen tower computes the same. The states come back as a
-    `TextContext` with every position real, so a model that cross-attends to
-    text attends to them unchanged.
+    The extractor's first model input (`model_input_names[0]`) is the one
+    array the model is called with, and transformers' PyTorch forward runs
+    lowered to JAX by torchax. A checkpoint serves when `AutoModel` builds
+    it, its forward (or, for an encoder-decoder, its encoder's) takes that
+    one input and returns `last_hidden_state`, and torchax lowers every op
+    it runs; wav2vec2 (`input_values`) and Whisper's encoder
+    (`input_features`) are the ones tested. Weight-norm parametrizations are
+    folded into plain weights, which the frozen tower computes the same. The
+    states come back as a `TextContext` with every position real, so a model
+    that cross-attends to text attends to them unchanged.
 
     Every waveform is cut or zero-padded to `seconds`, so every clip, and
     the constant the unconditional branch is encoded from, has one length.
