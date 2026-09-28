@@ -354,17 +354,16 @@ def sequence_shards() -> int:
     return mesh.shape.get(SEQUENCE_AXIS, 1)
 
 
-def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array], T]) -> T:
-    """`project(x)`, a projection of a `[batch, length, width]` input whose
-    positions the sequence axis does not divide to `features` output
-    features in all, run on each sequence shard's share of the positions
-    where the sequence axis's link pays for it (`_spreads`, the rule
-    `down_projection` decides by): `x` padded with zero rows to a multiple
-    of the shard count, so `project`'s own constraints split its positions,
-    and every array `project` returns cut back to `length`. `project` must
-    work position by position, as a projection without a sequence mixer
-    does. With the sequence axis at one, a length it divides, or a link that
-    does not pay, it runs on `x` as it is.
+def split_positions[T](x: jax.Array, head_shape: tuple[int, int], project: Callable[[jax.Array], T]) -> T:
+    """Project a context's keys and values on each sequence shard's positions.
+
+    `project(x)` returns the two HEADS-shaped projections, each ending in
+    `head_shape`. Price the output and weight-gradient bytes and FLOPs at
+    the head width the active rules leave on each device, not at the global
+    width. Where the sequence link pays, pad to a multiple of its shard
+    count, project, and trim the added positions. With the sequence axis at
+    one, a length it already divides, or a link that does not pay, project
+    the context unchanged.
 
     A cross-attention's context is such an input: SD's 77 text tokens. Left
     whole, every sequence shard projects all of them into keys and values,
@@ -373,8 +372,8 @@ def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array
     projections are what is repeated, 3 of 80 rows at SD's length. The
     projections are small beside the step and the sum of their weight
     gradients the split adds is not, so a GPU's link rarely pays: at SDXL's
-    widths in bf16 (2048 into 2 x 1280) and 8 rows a group, an H100 would
-    need 2.47 TB/s, including the padded positions' extra work."""
+    widths in bf16 (2048 into 2 x 1280) and 8 rows a group without a head
+    split, an H100 would need 2.47 TB/s, including the padded positions' work."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:
@@ -382,6 +381,9 @@ def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array
     padded_length = length + -length % shards
     mesh = jax.sharding.get_abstract_mesh()
     rows = x.shape[0] / math.prod(mesh.shape[axis] for axis in row_axes(x.shape[0]))
+    projected = logical_spec(HEADS, (x.shape[0], padded_length, *head_shape))
+    feature_shards = math.prod(mesh.shape[axis] for entry in projected[2:] for axis in mesh_axes(entry))
+    features = 2 * math.prod(head_shape) // feature_shards
     if not _spreads(SEQUENCE_AXIS, x, features, rows * length,
                     padding=rows * (padded_length - length)):
         return project(x)
