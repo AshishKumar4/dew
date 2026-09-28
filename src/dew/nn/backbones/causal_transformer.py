@@ -91,7 +91,6 @@ INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
 
 
-
 def layer_outputs(module: nn.Module, method: str) -> bool:
     """The `capture_intermediates` filter that keeps every layer's output.
 
@@ -111,8 +110,6 @@ def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]],
                       if name.startswith("layers_") and name[len("layers_"):].isdigit())
         raise ValueError(f"the model kept no layer {index}; it has layers {held}")
     return kept["__call__"][0]
-
-
 
 
 Block = Callable[[int, str], DecoderBlock]
@@ -782,31 +779,21 @@ class CausalTransformer(nn.Module):
         if self.activation_sparsity_pattern is not None:
             object.__setattr__(self, "activation_sparsity_pattern",
                                tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
-        if isinstance(self.altup, Mapping):
-            object.__setattr__(self, "altup", AltUp(**self.altup))
-        if isinstance(self.hyper_connections, Mapping):
-            object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
-        if isinstance(self.attention_residuals, Mapping):
-            object.__setattr__(self, "attention_residuals", AttentionResiduals(**self.attention_residuals))
-        if isinstance(self.mlp, Mapping):
-            # A config states SiTU's betas as a record in the activation's place.
-            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
-        if isinstance(self.mtp_hyper_connections, Mapping):
-            object.__setattr__(self, "mtp_hyper_connections", HyperConnections(**self.mtp_hyper_connections))
-        if isinstance(self.engram, Mapping):
-            object.__setattr__(self, "engram", Engram(**self.engram))
-        if isinstance(self.dspark, Mapping):
-            object.__setattr__(self, "dspark", DSpark(**self.dspark))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, as a test or a notebook
         # writes them.
-        if isinstance(self.yarn, Mapping):
-            object.__setattr__(self, 'yarn', YarnScaling(**self.yarn))
-        if isinstance(self.mixture, Mapping):
-            object.__setattr__(self, "mixture", Mixture(**self.mixture))
-        if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
+        for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
+                             ("mtp_hyper_connections", HyperConnections),
+                             ("attention_residuals", AttentionResiduals), ("engram", Engram),
+                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture),
+                             ("rope_scaling", RopeScaling)):
+            value = getattr(self, name)
+            if isinstance(value, Mapping):
+                object.__setattr__(self, name, record(**value))
+        if isinstance(self.mlp, Mapping):
+            # A config states SiTU's betas as a record in the activation's place.
+            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -824,7 +811,6 @@ class CausalTransformer(nn.Module):
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         object.__setattr__(self, "remat", remat_policy(self.remat))
         super().__post_init__()
-
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -2317,7 +2303,6 @@ class CausalTransformer(nn.Module):
                 f"dtype, got {where.dtype}")
         rows = jnp.arange(batch)[:, None]
         return x.at[rows, where].set(replacements.astype(x.dtype))
-
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in its stored dtype, as the forward
