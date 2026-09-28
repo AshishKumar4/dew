@@ -9,20 +9,20 @@ On one accelerator, where the experts cannot be split, each device computes ever
     python examples/moe_mesh.py --out runs/moe-mesh-gpu --expert 1 --fsdp 1 --dispatch global
 
 The training text mixes three kinds of line: short English sentences, sums and assignments.
-Every `snapshot_every` steps the script routes one fixed validation batch through the model
-and records, for each MoE layer, the experts each token picked and how many of those slots
-each device sends to every other device. The drawing reads the placement from the objects
-the run used: the device grid from the mesh, each device's experts and kernel slice from
-the expert kernel's sharding, each device's rows from the sharding the layout gives the
-layer's input, and the count of all-to-all operations from the compiled training step.
+Before every training step the script runs the step's batch through the step's parameters
+once more, reads the experts each token's router picked, and counts, for each MoE layer,
+the slots each device sends to every other device and the exchange rounds that takes. The
+drawing reads the placement from the objects the run used: the device grid from the mesh,
+each device's experts and kernel slice from the expert kernel's sharding, each device's
+rows from the sharding the layout gives the layer's input, and the all-to-all operations
+the compiled training step's program holds.
 
 After training, `dew.inference.serving.Server` generates greedy continuations of eight
-prompts on the same mesh; under `--dispatch exchange` every decode step trades tokens
-between the expert shards. (`dew.sampling.generate` refuses the exchange until
-jax-ml/jax#40907 is fixed.)
+prompts on the same mesh, with the model's own dispatch. (`dew.sampling.generate` refuses
+the exchange dispatch until jax-ml/jax#40907 is fixed.)
 
-Writes OUT/moe-mesh.svg, an animation with one frame per snapshot and a last frame that
-routes the generated text, and OUT/moe-mesh.json with the recorded numbers.
+Writes OUT/moe-mesh.json with every step's traffic, and OUT/moe-mesh.svg, an animation
+with a frame every `snapshot_every` steps and a last frame that routes the generated text.
 """
 import html
 import json
@@ -155,37 +155,48 @@ def placement(mesh, kernel: jax.Array, batch_shape: tuple[int, int, int], layout
     return Placement(mesh, devices, held, kernel_slices, rows, owner)
 
 
-def routing_record(sown, tokens: np.ndarray, where: Placement, experts: int) -> list[dict]:
-    """Per MoE layer: slots sent between devices, slots per expert and the
-    share of each token class's slots each expert takes."""
+def routing_record(selections, tokens: np.ndarray, where: Placement, experts: int, shards: int,
+                   dispatch: str) -> list[dict]:
+    """Per MoE layer: slots sent between devices, the exchange rounds they
+    take, slots per expert and each byte class's slots per expert."""
     classes = token_class(tokens)
     layers = []
-    for name in sorted(sown["router"], key=lambda name: int(name.split("_")[1])):
-        (indices,) = sown["router"][name]["mlp"]["gate"]["indices"]
-        indices = np.asarray(indices)
+    for name in sorted(selections, key=lambda name: int(name.split("_")[1])):
+        (indices,) = selections[name]["mlp"]["gate"]["indices"]
         sent = np.zeros((len(where.devices),) * 2, np.int64)
         for device, rows in enumerate(where.rows):
-            chosen = indices[rows].ravel()
-            np.add.at(sent[device], where.owner[device, chosen], 1)
+            np.add.at(sent[device], where.owner[device, indices[rows].ravel()], 1)
         by_class = np.zeros((len(CLASSES), experts), np.int64)
         np.add.at(by_class, (np.repeat(classes.ravel(), indices.shape[-1]), indices.ravel()), 1)
-        layers.append({"layer": name, "sent": sent.tolist(),
+        layers.append({"layer": name, "sent": sent.tolist(), "rounds": exchange_rounds(sent, shards, dispatch),
                        "per_expert": np.bincount(indices.ravel(), minlength=experts).tolist(),
                        "by_class": by_class.tolist()})
     return layers
 
 
-def routed(model, params, tokens: jax.Array, trainer: Trainer):
-    """The router's sown selections for `tokens`, computed on the trainer's mesh."""
+def exchange_rounds(sent: np.ndarray, shards: int, dispatch: str) -> int:
+    """The all-to-all rounds one MoE layer's forward runs, by the rule in
+    `dew.nn.moe._exchange_shard`: a first round sends every peer a bucket of
+    ceil(slots / shards) rows, and the overflow of the fullest bucket in an
+    expert group takes further rounds of the same size. 0 under `global`."""
+    if dispatch != "exchange":
+        return 0
+    first = -(-sent.sum(axis=1, keepdims=True) // shards)
+    overflow = -(-np.maximum(sent - first, 0) // np.maximum(first, 1))
+    return 1 + int(overflow.max())
+
+
+def routing(selections, params, tokens: jax.Array, trainer: Trainer) -> dict:
+    """The routers' sown selections for `tokens`, computed on the trainer's mesh."""
     with jax.set_mesh(trainer.device_mesh), nn.logical_axis_rules(trainer.layout.axis_rules):
-        _, sown = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"]))(
-            params, tokens)
-    return jax.tree.map(np.asarray, sown)
+        return jax.tree.map(np.asarray, selections(params, tokens))
 
 
 def all_to_all_ops(hlo: str) -> tuple[int, str]:
-    """How many all-to-all operations a compiled program runs, and the
-    replica groups of the first."""
+    """How many all-to-all operations a compiled program holds, and the
+    replica groups of the first. The count is of the program's text: an op
+    inside a loop or a conditional runs as many times as the loop or the
+    branch does."""
     ops = [line for line in hlo.splitlines() if re.search(r"= .*\ball-to-all\(", line)]
     groups = re.search(r"replica_groups=(\S+(?: \{[^}]*\})?)", ops[0]) if ops else None
     return len(ops), groups.group(1) if groups else ""
@@ -209,58 +220,60 @@ def main(config: Config) -> None:
     state, _, _ = trainer.place()
     kernel = state.params["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
     print(f"Expert kernel {kernel.shape} placed as {kernel.sharding.spec}")
+    shards = mesh.shape["expert"]
+    where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
+                      config.dispatch)
+    # The compiled step returns no routing, so a second forward over the
+    # step's parameters and inputs reads the routers' sown selections.
+    selections = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"])[1]["router"])
 
-    # One fixed validation batch, routed at every snapshot.
-    with DevicePrefetchIterator(data.val(data_partition(mesh)), mesh) as source:
-        probe = np.asarray(next(source)["text"])[:, :config.sequence_length]
-    probe_on_mesh = jax.device_put(probe, batch_shardings(mesh, {"text": probe})["text"])
-    where = placement(mesh, kernel, (*probe.shape, 64), trainer.layout, config.dispatch)
-
-    frames = []
-    losses = []
+    steps, frames = [], []
     with DevicePrefetchIterator(data.train(data_partition(mesh)), mesh) as source:
         batch = next(source)
         step = trainer.compile(state, batch)
         operations, groups = all_to_all_ops(trainer.executable.as_text())
-        print(f"The compiled training step runs {operations} all-to-all operations"
+        print(f"The compiled training step holds {operations} all-to-all operations"
               + (f" over {groups}" if groups else ""))
-        for current in range(config.steps + 1):
-            if current % config.snapshot_every == 0 or current == config.steps:
-                frames.append({
-                    "label": f"training step {current} of {config.steps}", "step": current,
-                    "loss": losses[-1] if losses else None,
-                    "rows": [[rows.start, rows.stop] for rows in where.rows],
-                    "layers": routing_record(routed(model, state.params, probe_on_mesh, trainer),
-                                             probe, where, config.experts)})
-            if current == config.steps:
-                break
+        for current in range(1, config.steps + 1):
+            # LMObjective predicts text[:, 1:] from text[:, :-1].
+            inputs = batch["text"][:, :-1]
+            layers = routing_record(routing(selections, state.params, inputs, trainer), np.asarray(inputs),
+                                    where, config.experts, shards, config.dispatch)
             state, loss, _, _, _ = step(state, batch)
-            losses.append(float(loss))
-            if (current + 1) % config.snapshot_every == 0:
-                print(f"step {current + 1}: loss {losses[-1]:.3f}")
+            steps.append({"step": current, "loss": float(loss),
+                          "sent": [layer["sent"] for layer in layers],
+                          "rounds": [layer["rounds"] for layer in layers]})
+            if current == 1 or current % config.snapshot_every == 0 or current == config.steps:
+                print(f"step {current}: loss {float(loss):.3f}" + (
+                    f", exchange rounds per layer {[layer['rounds'] for layer in layers]}"
+                    if config.dispatch == "exchange" else ""))
+                frames.append({"label": f"training step {current} of {config.steps}", "step": current,
+                               "loss": float(loss), "rows": [[rows.start, rows.stop] for rows in where.rows],
+                               "layers": layers})
             batch = next(source)
 
     # Serve on the same mesh: the weights keep their placement, the server's
-    # rows split over the batch axes, and each decode step runs the exchange.
+    # rows split over the batch axes, and under `exchange` its decode steps
+    # run the same dispatch.
     tokenizer = ByteTokenizer()
     starts = ["the cat ", "a dog li", "my frien", "12+30=", "7+41=", "x = y * ", "total = ", "count = "]
     width = max(len(start) for start in starts)
     starts = [start.rjust(width, "\n") for start in starts]
-    new_tokens = config.sequence_length - width
     task = TextGeneration(model, state.params, RunProcessor(tokenizer), sampling=Sampling(temperature=0.0))
     server = Server.from_task(task, slots=len(starts), capacity=64)
-    continuations = [generation.text[0] for generation in server(starts, new_tokens, seed=config.seed)]
-    for start, continuation in zip(starts, continuations, strict=True):
-        print(f"{start.lstrip()!r} -> {continuation.split(chr(10))[0]!r}")
-    sequences = np.asarray([tokenizer.encode(start + continuation)[:config.sequence_length]
-                            for start, continuation in zip(starts, continuations, strict=True)], np.int32)
+    generations = [generation.host() for generation in
+                   server(starts, config.sequence_length - width, seed=config.seed)]
+    for start, generation in zip(starts, generations, strict=True):
+        print(f"{start.lstrip()!r} -> {generation.text[0].split(chr(10))[0]!r}")
+    sequences = np.concatenate([np.asarray(generation.tokens) for generation in generations])
     sequences_on_mesh = jax.device_put(sequences, batch_shardings(mesh, {"text": sequences})["text"])
     inference = placement(mesh, kernel, (*sequences.shape, 64), trainer.layout, config.dispatch)
     frames.append({
-        "label": "generation: prompts and their greedy continuations", "step": None, "loss": None,
+        "label": "after training: one forward over the prompts and their greedy continuations", "step": None,
+        "loss": None,
         "rows": [[rows.start, rows.stop] for rows in inference.rows],
-        "layers": routing_record(routed(model, state.params, sequences_on_mesh, trainer),
-                                 sequences, inference, config.experts)})
+        "layers": routing_record(routing(selections, state.params, sequences_on_mesh, trainer), sequences,
+                                 inference, config.experts, shards, config.dispatch)})
 
     record = {
         "mesh": dict(mesh.shape), "device_kind": jax.devices()[0].device_kind,
@@ -269,8 +282,8 @@ def main(config: Config) -> None:
         "kernel_spec": str(kernel.sharding.spec), "kernel_shape": list(kernel.shape),
         "kernel_slices": where.kernel_slices,
         "dispatch": config.dispatch, "all_to_all_ops": operations, "all_to_all_groups": groups,
-        "losses": losses, "frames": frames,
-        "generated": continuations,
+        "steps": steps, "frames": frames,
+        "generated": [generation.text[0] for generation in generations],
     }
     (config.out / "moe-mesh.json").write_text(json.dumps(record))
     (config.out / "moe-mesh.svg").write_text(drawing(record, where, config))
@@ -308,7 +321,7 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
     grid_h = panel_rows * panel_h + (panel_rows - 1) * GAP
     chart_x = grid_w + 60
     width = chart_x + 40 + config.experts * 34 + 60
-    height = max(grid_top + grid_h + 190, grid_top + layers * 250 + 40)
+    height = max(grid_top + grid_h + 300, grid_top + layers * 250 + 40)
 
     def panel(data: int) -> tuple[int, int]:
         return ((data % per_row) * (panel_w + GAP),
@@ -339,7 +352,7 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
         static += [f'<rect x="{x}" y="{y}" width="{panel_w}" height="{panel_h}" rx="10" '
                    f'fill="none" stroke="#ccc" stroke-dasharray="4 3"/>',
                    text(x + 10, y + 16, f"data {data}", 12, fill="#666")]
-    ops = (f"compiled step: {record['all_to_all_ops']} all-to-all ops"
+    ops = (f"compiled step: its program holds {record['all_to_all_ops']} all-to-all ops"
            + (f" over {record['all_to_all_groups']}" if record["all_to_all_groups"] else ""))
     # Several CPU devices in one run are XLA's host platform split by
     # --xla_force_host_platform_device_count, not separate hardware.
@@ -349,18 +362,23 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
         text(0, 20, f"MoE decoder on mesh {shape} of {len(where.devices)} {kind}, "
                     f"{config.experts} experts, top-{config.top_k}, dispatch={config.dispatch}", 15, weight="bold"),
         text(0, 62, ops, 11, fill="#555"),
-        text(0, grid_top + grid_h + 24, "Arrows: routed slots a device sends to another for this batch, "
+        text(0, grid_top + grid_h + 24, "Arrows: routed slots a device sends to another in this step's forward, "
              "summed over the MoE layers (d, e, f = data, expert, fsdp coordinate).", 11, fill="#555"),
-        text(0, grid_top + grid_h + 40, "Probe: "
-             f"one fixed validation batch of {config.batch_size} x {config.sequence_length} bytes; "
-             "the last frame routes the generated text.", 11, fill="#555"),
+        text(0, grid_top + grid_h + 40, "Each training frame routes that step's own batch through the "
+             "step's parameters; the last frame routes the generated text.", 11, fill="#555"),
     ]
     if config.dispatch == "global":
         static.append(text(0, 80, "dispatch=global: each device computes every expert for its own rows, "
                                   "so no token leaves its device", 11, fill="#555"))
-    curve = loss_curve(record["losses"], 0, grid_top + grid_h + 80, grid_w, 90)
-    static.append(curve.static)
-    frames = [frame_group(frame, centre, config, chart_x, grid_top) + curve.marker(frame["step"])
+    charts = [
+        series([step["loss"] for step in record["steps"]], "training loss", 0, grid_top + grid_h + 80,
+               grid_w, 80),
+        series([int(np.sum(step["sent"]) - np.trace(np.sum(step["sent"], axis=0))) for step in record["steps"]],
+               "slots sent to another device per step, all MoE layers", 0, grid_top + grid_h + 200, grid_w, 80),
+    ]
+    static += [chart.static for chart in charts]
+    frames = [frame_group(frame, centre, config, chart_x, grid_top)
+              + "".join(chart.marker(frame["step"]) for chart in charts)
               for frame in record["frames"]]
     count = len(frames)
     total = count * SECONDS_PER_FRAME
@@ -379,37 +397,39 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
 
 
 @dataclass
-class LossCurve:
+class Series:
     static: str
     points: list[tuple[float, float]]
 
     def marker(self, step: int | None) -> str:
-        """A dot on the curve at `step`; none before the first step or after training."""
-        if not step:
+        """A dot on the line at training step `step` (1-based); none for the generation frame."""
+        if step is None:
             return ""
         x, y = self.points[step - 1]
         return f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#e45756"/>'
 
 
-def loss_curve(losses: list[float], x: float, y: float, width: float, height: float) -> LossCurve:
-    """The training loss as a line, with its scale labelled."""
-    low, high = min(losses), max(losses)
-    points = [(x + 40 + (width - 40) * index / max(1, len(losses) - 1),
-               y + height - height * (loss - low) / max(high - low, 1e-9)) for index, loss in enumerate(losses)]
+def series(values: list[float], label: str, x: float, y: float, width: float, height: float) -> Series:
+    """One value per training step as a line, with its range labelled."""
+    low, high = min(values), max(values)
+    points = [(x + 40 + (width - 40) * index / max(1, len(values) - 1),
+               y + height - height * (value - low) / max(high - low, 1e-9)) for index, value in enumerate(values)]
     line = " ".join(f"{px:.1f},{py:.1f}" for px, py in points)
     static = "".join([
-        text(x, y - 6, "training loss", 11, fill="#555"),
-        text(x + 34, y + 10, f"{high:.2f}", 10, "end", fill="#555"),
-        text(x + 34, y + height, f"{low:.2f}", 10, "end", fill="#555"),
+        text(x, y - 6, label, 11, fill="#555"),
+        text(x + 34, y + 10, f"{high:.4g}", 10, "end", fill="#555"),
+        text(x + 34, y + height, f"{low:.4g}", 10, "end", fill="#555"),
         f'<polyline points="{line}" fill="none" stroke="#4c78a8" stroke-width="1.5"/>',
     ])
-    return LossCurve(static, points)
+    return Series(static, points)
 
 
 def frame_group(frame: dict, centre: dict, config: Config, chart_x: float, top: float) -> str:
     """One frame: the title, the traffic arrows, each device's slot counts and the per-layer charts."""
-    parts = [text(0, 42, frame["label"] + (f", loss {frame['loss']:.3f}" if frame["loss"] is not None else ""),
-                  13, fill="#333")]
+    label = frame["label"] + (f", loss {frame['loss']:.3f}" if frame["loss"] is not None else "")
+    if config.dispatch == "exchange":
+        label += ", exchange rounds per MoE layer " + ", ".join(str(layer["rounds"]) for layer in frame["layers"])
+    parts = [text(0, 42, label, 13, fill="#333")]
     sent = np.sum([layer["sent"] for layer in frame["layers"]], axis=0)
     away = sent - np.diag(np.diag(sent))
     peak = max(1, int(away.max()))
