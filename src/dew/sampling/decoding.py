@@ -1074,6 +1074,9 @@ def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[Log
     """
     if callable(values):
         return (as_pytree(values),)
+    if not isinstance(values, (tuple, list)):
+        raise TypeError("decoding components are a callable or a list or tuple of callables, "
+                        f"got {type(values).__name__}")
     return tuple(as_pytree(value) for value in values)
 
 
