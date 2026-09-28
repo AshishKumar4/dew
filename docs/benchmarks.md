@@ -44,8 +44,8 @@ Observations from the table:
 
 - The DiT family suits this card best. `simple_dit`, `simple_udit` and `hybrid_dit` all run under 10 ms/step at 28-40% of peak, which is the range a 64px, patch-4 (256 token) workload should reach.
 - `unet` does the most arithmetic for its time of the image models: 646 GFLOP/step in 16 ms is 40.5% of peak, ahead of the transformers at the same resolution. With XLA's own `cost_analysis()` as the numerator, the same measurement shows 28.7 GFLOP/step; the gap is convolution arithmetic that cost analysis cannot see.
-- `unet_3d` is the slowest step in the table, at 41.8% of peak. Its 3D convolutions carry 1.38 TFLOP/step, more than twice the 760 of `video_dit` for the same (8, 64, 64, 3) samples; for video, the factorized transformer saves about a third of the step time.
-- `hierarchical_mmdit` is the largest model here (55 M) and the most expensive diffusion step, which fits its 1024-token finest stage.
+- `unet_3d` is the slowest diffusion step in the table (33.9 ms/step, 41.8% of peak). Its 3D convolutions carry 1,384 GFLOP/step, 1.8 times the 760 of `video_dit` for the same (8, 64, 64, 3) samples, and `video_dit`'s step (17.3 ms) takes about half as long.
+- `hierarchical_mmdit` is the largest diffusion model here (55 M; the 67 M `causal_transformer` is a language model) and the slowest image step (32.7 ms), which fits its 1024-token finest stage.
 - Compile time dominates a short run: 9-47 s per architecture against 8-84 ms per step, so a real run should set `compilation_cache_dir`.
 
 ### Rerun, 2026-09-05
@@ -113,6 +113,6 @@ The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 recor
 | 0 (in-process) |     322.1 |  25.1 ms |  32.8 ms |
 | 8              |     505.0 |  0.05 ms |  77.1 ms |
 
-With workers, the p50 is a queue read, so the loader only shows up in the p95. At 8 workers the pipeline delivers 505 samples/s: below every image row in the step table (668-1564 samples/s) and above the video rows (107-207). At 64px this dataset keeps up with the video models and starves the image models, so a low `train/mfu` on an image run is worth checking against the loader first.
+With workers, the p50 is a queue read, so the loader only shows up in the p95. At 8 workers the pipeline delivers 505 samples/s. The image rows of the first step table consume 489-2036 samples/s, all but `hierarchical_mmdit` (489) above 505, and the video rows 118-232. At 64px this loader keeps up with the video models and `hierarchical_mmdit` and starves the other image models, so a low `train/mfu` on an image run is worth checking against the loader first.
 
 These two points are not the loader's ceiling. The measured run read with 16 threads; `tools/benchmark_data.py` now has no read-thread setting of its own and reads with the dataset spec's `Loading`, whose defaults are 32 workers and 64 threads, changed with `--data.loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.
