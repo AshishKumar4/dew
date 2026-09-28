@@ -199,26 +199,34 @@ def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_sec
     assert link is None or link.spread == spreads
 
 
-@pytest.mark.parametrize("length", [1, 13])
-def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(length):
+@pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
+    (1, 1, 4, 60e9, None),
+    (13, 1, 4, 60e9, 80e9),
+    (13, 2, 4, 75e9, 90e9),
+    (13, 2, 1, 90e9, 100e9),
+], ids=["one-position", "sequence", "tensor-sequence", "indivisible-heads"])
+def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
+        length, tensor_shards, heads, slow, fast):
     """An indivisible context's projection trades redundant FLOPs for bytes.
 
     Two rows of 13 positions, width 96, projected to 128 key/value features
     need 71.8 GB/s at a 1 TFLOP/s peak: each shard saves nine positions,
     not twelve, because three padded positions add work. The links straddle
-    that crossover. A one-position context saves no work even on a CPU link.
+    that crossover. Splitting four heads over tensor2 raises it to 78.7 GB/s;
+    one head cannot split, and its smaller projection needs 92.6 GB/s.
+    A one-position context saves no work even on a CPU link.
     """
     from dew.nn.attention import NormalAttention
     from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links
     from dew.telemetry.instrumentation import compiled_flops
 
-    model = NormalAttention(64, heads=4, dim_head=16, attention_impl="reference")
+    model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
     query = jax.random.normal(jax.random.key(21), (2, 8, 64))
     context = jax.random.normal(jax.random.key(22), (2, length, 96))
     params = model.init(jax.random.key(23), query, context)["params"]
 
-    def compiled(shards, link):
-        mesh = build_mesh(MeshSpec(sequence=shards), jax.devices()[:shards])
+    def compiled(sequence, tensor, link):
+        mesh = build_mesh(MeshSpec(sequence=sequence, tensor=tensor), jax.devices()[:sequence * tensor])
         whole = NamedSharding(mesh, P())
         inputs = jax.tree.map(lambda value: jax.device_put(value, whole), (params, query, context))
 
@@ -238,12 +246,12 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
             if match:
                 moved += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
                              for dtype, dims in TYPED.findall(match["shape"]))
-        return result, flops * shards, moved
+        return result, flops * sequence * tensor, moved
 
-    expected, _, _ = compiled(1, Link(None, None, "cpu"))
-    kept, kept_flops, kept_bytes = compiled(4, Link(60e9, 1e12, "gpu"))
-    fast = Link(80e9, 1e12, "gpu") if length > 1 else Link(None, None, "cpu")
-    split, split_flops, split_bytes = compiled(4, fast)
+    expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
+    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12, "gpu"))
+    link = Link(fast, 1e12, "gpu") if fast is not None else Link(None, None, "cpu")
+    split, split_flops, split_bytes = compiled(4, tensor_shards, link)
     for actual in (kept, split):
         for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
