@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
@@ -91,6 +92,50 @@ def _simple_encoder():
 def _simple_decoder():
     model = SimpleDecoder(out_channels=3, feature_depths=(16, 32), dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 4, 4, 4), jnp.bfloat16),), {}
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("backward", [False, True], ids=["encode", "vjp"])
+def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
+    """The full jitted encoder, not an isolated downsampler, and its VJP.
+
+    XLA:TPU's stride-two rewrite moved the batch-one output by 40%. Compare
+    both paths to a float64 host evaluation, allowing only the host fp32
+    reference's rounding (the shared reference_error rule).
+    """
+    model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
+                        norm_num_groups=8, double_z=True)
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    rng = np.random.default_rng(43)
+    image = rng.standard_normal((batch, 17, 17, 3)).astype(np.float32)
+    cotangent = rng.standard_normal((batch, 8, 8, 8)).astype(np.float32)
+    with jax.default_device(host):
+        variables = jax.tree.map(np.asarray, model.init(jax.random.key(0), image[:1]))
+
+    def evaluate(dtype, target):
+        network = model.clone(dtype=dtype)
+        arguments = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                                  (variables, image, cotangent))
+
+        def run(params, x, cot):
+            if backward:
+                return jax.grad(lambda p, a: jnp.sum(network.apply(p, a) * cot),
+                                argnums=(0, 1))(params, x)
+            return network.apply(params, x)
+
+        with jax.default_device(target):
+            return jax.tree.map(np.asarray, jax.jit(run)(*arguments))
+
+    reference = evaluate(np.float32, host)
+    with jax.enable_x64():
+        truth = evaluate(np.float64, host)
+    actual = evaluate(np.float32, device)
+    if backward:
+        # Treat the complete parameter/input VJP as one vector rather than
+        # scaling a cancelling bias leaf by its near-zero norm.
+        actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
+                                    for value in (actual, reference, truth)]
+    assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
 
 
 @pytest.mark.parametrize("build", [
