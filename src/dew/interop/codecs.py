@@ -96,6 +96,9 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     Codes arrive as uint8 or int8, exponents as uint8 or float8_e8m0fnu.
     """
     codes, scales = _bytes(packed, _CODE_DTYPES), e8m0_scales(exponents)
+    if codes.shape[:-1] != scales.shape[:-1] or codes.shape[-1] != scales.shape[-1] * (GROUP // 2):
+        raise ValueError(f"packed E2M1 codes [..., n / 2] take E8M0 exponents [..., n / {GROUP}], "
+                         f"got {codes.shape} and {scales.shape}")
     values = _E2M1_BYTES[codes].reshape(*scales.shape, GROUP)
     values *= scales[..., None]
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
