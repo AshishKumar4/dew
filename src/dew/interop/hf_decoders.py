@@ -921,10 +921,13 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
 
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
     config = family.translate_config(hf_config, used)
+    return config, _unread(hf_config, used)
 
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
-               - {key for key in hf_config if str(key).startswith('_')})
-    return config, unknown
+
+def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
+    """Return the config fields no reader took and none of the ignored, codec or inert sets names."""
+    return (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(hf_config.get('model_type'), hf_config)
+            - {key for key in hf_config if str(key).startswith('_')})
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
@@ -946,14 +949,13 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(text)
 
 
-def _wrapper_image_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
-    """Return the image token id under either of its spellings."""
+def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
+    """Return a placeholder token id under the first of its spellings that is set."""
     for name in names:
         if hf_config.get(name) is not None:
             used.add(name)
             return records.integer(hf_config[name], name)
-    _refuse("image_token_id",
-            f"the image positions are marked by {list(names)}, none is set")
+    _refuse(names[0], f"the placeholder positions are marked by {list(names)}, none is set")
 
 
 # Every wrapper record carries the audio fields; families without an audio
@@ -989,7 +991,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("mm_tokens_per_image")
     projector = vision_nn.translate_gemma_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"), mm)
-    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     return {
         "model_type": "gemma3",
@@ -1010,7 +1012,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
     ratio = _record_float(tower, "pixel_shuffle_ratio")
@@ -1060,7 +1062,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
             "norm_eps": encoder.rms_norm_eps}))}
     return {"audio": {"kind": records.text(audio["model_type"], "audio_config model_type"),
                       **asdict(encoder)},
-            "audio_token_id": _wrapper_image_id(hf_config, used, "audio_token_id"),
+            "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
 
 
@@ -1071,7 +1073,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
+    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
@@ -1100,7 +1102,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
@@ -1126,13 +1128,18 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     count = _record_int(tower, "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
-    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
     return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
             "tower": tower, "projector": projector, "image_token_id": image,
             "tokens_per_image": count,
             **_wrapper_audio(hf_config, used, _record_int(text, "emb_features"))}
+
+
+_WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
+    "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
+    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -1145,24 +1152,16 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     embedders also embed their hard vocabulary ranges.
     """
     model_type = hf_config.get("model_type")
-    used = {"model_type"}
-    if model_type == "gemma3":
-        record = _gemma3_wrapper(hf_config, used)
-    elif model_type == "llama4":
-        record = _llama4_wrapper(hf_config, used)
-    elif model_type == "gemma4":
-        record = _gemma4_wrapper(hf_config, used)
-    elif model_type == "qwen3_5":
-        record = _qwen35_wrapper(hf_config, used)
-    elif model_type == "gemma3n":
-        record = _gemma3n_wrapper(hf_config, used)
-    elif isinstance(model_type, str) and model_type in _FAMILIES and (read := _FAMILIES[model_type].wrapper):
-        record = read(hf_config, used)
-    else:
+    read = None
+    if isinstance(model_type, str):
+        bundled = _bundled(model_type)
+        read = _WRAPPERS.get(model_type, None if bundled is None else bundled.wrapper)
+    if read is None:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
-               - {key for key in hf_config if str(key).startswith("_")})
+    used = {"model_type"}
+    record = read(hf_config, used)
+    unknown = _unread(hf_config, used)
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
                 "the wrapper has no counterpart, so translating them would "
@@ -1170,42 +1169,48 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     return record
 
 
-# Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
-_WRAPPER_AUDIO_PREFIX = "audio_tower."
-_WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
+def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
+    """Return the wrapper component a source tensor belongs to, and its name there.
+
+    One leading `model.` comes off first, which is the released nesting. Gemma
+    4 keeps its embedder under `embed_vision` and Qwen 3.5 its merger inside
+    the vision model, so the projector prefix runs before the tower's. Gemma
+    3n and Gemma 4 nest their audio encoder and embedder beside the vision
+    ones. A family that reads its media bundle whole keeps the decoder's
+    tensors unprefixed.
+    """
+    tower_prefix = vision_nn.TOWER_PREFIX[_kind_name(record, "tower")]
+    projector_prefix = vision_nn.PROJECTOR_PREFIX[_kind_name(record, "projector")]
+    audio = record.get("audio") is not None
+    bundled = _bundled(record["model_type"])
+    bare = name.removeprefix("model.")
+    if bare.startswith("language_model."):
+        tail = bare[len("language_model."):]
+        return "language_model", tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+    if bare.startswith(projector_prefix):
+        return "projector", bare[len(projector_prefix):]
+    if bare.startswith(tower_prefix):
+        return "tower", bare[len(tower_prefix):]
+    if audio and bare.startswith("embed_audio."):
+        return "audio_projector", bare[len("embed_audio."):]
+    if audio and bare.startswith("audio_tower."):
+        return "audio_tower", bare[len("audio_tower."):]
+    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+        return "language_model", bare
+    if bundled is not None:
+        return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
+    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record):
     """Route source names once, checking any names that claim one local leaf.
     The table retains names, not decoded arrays, so read can be a codec accessor.
     """
-    tower_prefix = vision_nn.TOWER_PREFIX[record["tower"]["kind"]]
-    projector_prefix = vision_nn.PROJECTOR_PREFIX[record["projector"]["kind"]]
-    audio = record.get("audio")
-    bundled = _bundled(record["model_type"])
     sources: dict[str, dict[str, str]] = {name: {} for name in (
         "language_model", "tower", "projector", "audio_tower", "audio_projector")}
     aliases: list[tuple[str, str]] = []
     for name in names:
-        bare = name.removeprefix("model.")
-        if bare.startswith("language_model."):
-            tail = bare[len("language_model."):]
-            local = tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
-            group = "language_model"
-        elif bare.startswith(projector_prefix):
-            group, local = "projector", bare[len(projector_prefix):]
-        elif bare.startswith(tower_prefix):
-            group, local = "tower", bare[len(tower_prefix):]
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PROJECTOR_PREFIX):
-            group, local = "audio_projector", bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
-            group, local = "audio_tower", bare[len(_WRAPPER_AUDIO_PREFIX):]
-        elif (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
-            group, local = "language_model", bare
-        elif bundled is not None:
-            group, local = ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
-        else:
-            raise ValueError(f"unknown tensor name {name!r}")
+        group, local = _wrapper_route(name, record)
         previous = sources[group].get(local)
         if previous is not None:
             if not np.array_equal(read(previous), read(name)):
@@ -1334,47 +1339,30 @@ def translate_wrapper_weights(
 ) -> Variables:
     """Map wrapper weights into language, tower, projector and audio trees.
 
-    One leading `model.` comes off every name first, which is the released
-    nesting; what stays routes by prefix. The language half rides the text
-    family's own map, including the top-level tied head copy, and the tower
-    and projector halves ride theirs. Gemma 4 keeps its embedder under
-    `embed_vision`, and Qwen 3.5 keeps its merger inside the vision model, so
-    the projector prefix runs before the tower's. A record with an audio
-    tower routes `audio_tower` and `embed_audio` too, and a Qwen 3.5 record
-    routes the `mtp.` prediction layers a wrapper keeps outside its language
-    model. A prefix outside those raises ValueError with the tensor name.
-    `lazy` leaves the language model's leaves unread (`translate_weights`);
-    the towers and projectors are small and read whole.
+    Each name routes by prefix (`_wrapper_route`). The language half rides
+    the text family's own map, including the top-level tied head copy, and
+    the tower and projector halves ride theirs. `lazy` leaves the language
+    model's leaves unread (`translate_weights`); the towers and projectors
+    are small and read whole.
     """
-    tower_kind = _kind_name(record, "tower")
-    projector_kind = _kind_name(record, "projector")
-    audio = record.get("audio")
     sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
-    text_tensors = tables["language_model"]
-    tower_tensors = tables["tower"]
-    projector_tensors = tables["projector"]
-    audio_tensors = tables["audio_tower"]
-    audio_projector_tensors = tables["audio_projector"]
     variables = {
-        "language_model": translate_weights(
-            text_tensors, record["text"], param_dtype=param_dtype, lazy=lazy
-        ),
-        "tower": vision_nn.tower_variables(tower_kind, tower_tensors, param_dtype),
-        "projector": {
-            "params": vision_nn.projector_variables(
-                projector_kind, projector_tensors, param_dtype
-            )
-        },
+        "language_model": translate_weights(tables["language_model"], record["text"],
+                                            param_dtype=param_dtype, lazy=lazy),
+        "tower": vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"], param_dtype),
+        "projector": {"params": vision_nn.projector_variables(
+            _kind_name(record, "projector"), tables["projector"], param_dtype)},
     }
+    audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder, param_dtype=param_dtype)
+        variables["audio_tower"] = audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
         variables["audio_projector"] = {"params": vision_nn.projector_variables(
-            _kind_name(record, "audio_projector"), audio_projector_tensors, param_dtype)}
+            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
     return variables
 
 

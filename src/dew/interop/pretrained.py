@@ -826,64 +826,47 @@ def _wrapper_layouts(tensors, record, variables):
     from dew.nn import vision
 
     tower_kind = record["tower"]["kind"]
-    projector_kind = record["projector"]["kind"]
-    tower_path = vision.TOWER_PATHS[tower_kind]
-    tower_prefix = vision.TOWER_PREFIX[tower_kind]
-    projector_prefix = vision.PROJECTOR_PREFIX[projector_kind]
-    bundled = decoders._bundled(record["model_type"])
-    audio_encoder = None
-    if record["audio"] is not None:
-        audio_encoder = towers.from_record(record["audio"])
-        if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError("source export requires a Gemma audio encoder")
+    audio_encoder = None if record["audio"] is None else towers.from_record(record["audio"])
     bindings = []
     retained = {}
     for name, tensor in tensors.items():
-        bare = name.removeprefix("model.")
-        paths: tuple[tuple[str, ...], ...] = ()
-        transpose = None
-        concatenate = None
-        if bare.startswith(projector_prefix) or (bundled is not None and bare in bundled.wrapper_projector_names):
-            tail = bare.removeprefix(projector_prefix)
-            path = vision.projector_weight_path(projector_kind, tail)
-            paths = (("params", "projector", *path),)
-            if path[-1] == "kernel" and tail != "mm_input_projection_weight":
-                transpose = (1, 0)
-        elif bare.startswith(tower_prefix):
-            path = tower_path(bare.removeprefix(tower_prefix))
-            if path is not None:
-                paths = ((path[0], "tower", *path[1:]),) if tower_kind == "gemma4" else (("params", "tower", *path),)
-                if path[-1] == "kernel":
-                    transpose = (1, 0) if tensor.ndim == 2 else (3, 2, 0, 1)
-                    if tensor.ndim == 5:
-                        transpose = (1, 0)
-        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX):
-            tail = bare.removeprefix(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX)
-            path = vision.projector_weight_path(record["audio_projector"]["kind"], tail)
-            paths = (("params", "audio_projector", *path),)
-            if path[-1] == "kernel":
-                transpose = (1, 0)
-        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PREFIX):
-            path = audio_nn.audio_weight_path(bare.removeprefix(decoders._WRAPPER_AUDIO_PREFIX), audio_encoder)
-            paths = ((path[0], "audio_tower", *path[1:]),)
-            if path[-1] == "kernel":
-                # Kernels store [*window, in, out]; the source keeps [out, in, *window].
-                transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight" or bundled is not None:
-            tail = bare.removeprefix("language_model.")
-            text_name = tail if bundled is not None or tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
-            layout = _language_layout(name, text_name, tensor, record["text"],
-                                      record["text_model_type"], variables,
-                                      "language_model")
+        group, local = decoders._wrapper_route(name, record)
+        if group == "language_model":
+            layout = _language_layout(name, local, tensor, record["text"], record["text_model_type"],
+                                      variables, "language_model")
             if layout is None:
                 retained[name] = tensor
             else:
                 bindings.append(layout)
             continue
+        paths: tuple[tuple[str, ...], ...] = ()
+        transpose = None
+        if group == "projector":
+            path = vision.projector_weight_path(record["projector"]["kind"], local)
+            paths = (("params", "projector", *path),)
+            if path[-1] == "kernel" and local != "mm_input_projection_weight":
+                transpose = (1, 0)
+        elif group == "tower":
+            path = vision.TOWER_PATHS[tower_kind](local)
+            if path is not None:
+                paths = ((path[0], "tower", *path[1:]),) if tower_kind == "gemma4" else (("params", "tower", *path),)
+                if path[-1] == "kernel":
+                    transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
+        elif group == "audio_projector":
+            path = vision.projector_weight_path(record["audio_projector"]["kind"], local)
+            paths = (("params", "audio_projector", *path),)
+            if path[-1] == "kernel":
+                transpose = (1, 0)
         else:
-            raise ValueError(f"unknown source tensor {name!r}")
+            if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+                raise ValueError("source export requires a Gemma audio encoder")
+            path = audio_nn.audio_weight_path(local, audio_encoder)
+            paths = ((path[0], "audio_tower", *path[1:]),)
+            if path[-1] == "kernel":
+                # Kernels store [*window, in, out]; the source keeps [out, in, *window].
+                transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
         if paths:
-            bindings.append(WeightLayout(name, paths, tensor.shape, transpose, concatenate))
+            bindings.append(WeightLayout(name, paths, tensor.shape, transpose))
         else:
             # SigLIP's pooling head and reference-ignored auxiliary tensors
             # have no forward consumer; export preserves their source bytes.
