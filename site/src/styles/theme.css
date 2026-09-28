@@ -258,6 +258,14 @@ h1#_top,
 	color: var(--sl-color-accent-high);
 }
 
+/* Docs figures come in two files, docs/assets/<name>-light.svg and
+   <name>-dark.svg, placed one after the other; each theme shows its own. */
+
+:root[data-theme='light'] .sl-markdown-content img[src*='-dark.'],
+:root:not([data-theme='light']) .sl-markdown-content img[src*='-light.'] {
+	display: none;
+}
+
 /* Header and page chrome. */
 
 .header {
