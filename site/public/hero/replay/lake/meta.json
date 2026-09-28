@@ -1,9 +1,9 @@
 {
- "prompt": "a canyon at sunset with red rocks",
+ "prompt": "a mountain lake reflecting snowy peaks",
  "seed": 9,
- "sampler": "Heun",
- "steps": 40,
- "cfg": 7.0,
+ "sampler": "UniPC",
+ "steps": 30,
+ "cfg": 6.0,
  "guidance_interval": [
   0.2,
   0.9
@@ -12,51 +12,49 @@
  "model": {
   "model": "FlaxDiff 0.2 simple_udit, loaded into Dew's SimpleUDiT (adaln_silu=False, text_pooling='all') by dew.interop.flaxdiff.load_flaxdiff",
   "parameters": 71298064,
-  "dew_commit": "5c83529957e1909bb4831204313c7aa7137f2532",
+  "dew_commit": "e895533a70160fd8f4ddc926dc2cd1ddb8b0dfd0",
   "device": "NVIDIA GeForce RTX 4080"
  },
- "frames": 32,
+ "frames": 30,
  "kept_steps": [
   0,
   1,
+  2,
   3,
   4,
   5,
   6,
+  7,
   8,
   9,
   10,
   11,
+  12,
   13,
   14,
   15,
   16,
+  17,
   18,
   19,
   20,
   21,
+  22,
   23,
   24,
   25,
   26,
+  27,
   28,
-  29,
-  30,
-  31,
-  33,
-  34,
-  35,
-  36,
-  38,
-  39
+  29
  ],
  "columns": 8,
  "crop": [
   0,
-  42,
+  0,
   256,
-  213
+  256
  ],
  "width": 256,
- "height": 171
+ "height": 256
 }
