@@ -107,7 +107,7 @@ Other specifications include `OxfordFlowers`, `HFImages`, `DocumentChunks`, `Cha
 
 Use `Loading(workers=0)` for small local runs, and raise the settings only after measuring the input pipeline on your data and hardware.
 
-Image sources can need network access the first time. Token-window sources read files written by `tools/tokenize_text.py`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs.
+Image sources can need network access the first time. Token-window sources read files written by `tools/tokenize_text.py`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
 
 ## TFDS and Hugging Face datasets
 
