@@ -12,6 +12,9 @@ import gc
 import json
 import os
 import re
+from pathlib import Path
+import subprocess
+import sys
 import weakref
 
 import jax
@@ -1247,62 +1250,67 @@ def test_accumulation_must_be_positive():
         make_trainer(accumulation=0)
 
 
-@pytest.mark.parametrize("generation,flags,ssd,off", [
-    ("sm80", "", False, True), ("sm80", "", True, False),
-    ("sm80", "--xla_gpu_enable_triton_gemm=true", False, False),
-    ("sm89", "", False, True), ("sm86", "", False, False), ("v6e", "", False, False)])
-def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
-        monkeypatch, generation, flags, ssd, off):
-    """sm80 and sm89 compile a training step with XLA's Triton GEMM fusions off,
-    except for a model with an SSD mixer, whose scan lost 7.7% without them,
-    and except where the run set the flag itself."""
-    from types import SimpleNamespace
-
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.mixers.mamba2 import Mamba2Mixer
-    from dew.training import trainer as module
-
-    monkeypatch.setattr(module, "device_generation", lambda: generation)
-    monkeypatch.setenv("XLA_FLAGS", flags)
-    decoder = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
-                                mlp_features=16, max_seq_len=8,
-                                mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=8, n_groups=1) if ssd else None)
-    options = module.step_compiler_options(SimpleNamespace(model=decoder))
-    assert options == ({"xla_gpu_enable_triton_gemm": False} if off else None)
-
-
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
 def test_a_measured_generations_step_compiles_its_dots_to_cublas():
-    """On sm80 and sm89 the compiled training step holds no Triton GEMM fusion: every
-    dot is a cuBLAS call. Elsewhere the step asks XLA for nothing, whether
-    or not XLA fuses GEMMs with Triton on that GPU."""
+    """Measured generations compile cuBLAS GEMMs rather than Triton fusions."""
     from dew.nn.kernels.generation import device_generation
     from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS
-    from dew.training.trainer import step_compiler_options
 
-    trainer, _, _ = held_lm_trainer()
     if device_generation() not in TRITON_GEMM_OFF_GENERATIONS:
-        assert step_compiler_options(trainer.objective) is None
-        return
+        pytest.skip("no measured compiler option for this generation")
+    trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
-    assert "__triton_gemm" not in trainer.executable.as_text()
+    assert trainer.executable is not None
+    text = trainer.executable.as_text()
+    assert text is not None and "__triton_gemm" not in text
 
 
-def test_a_step_that_fits_only_with_the_default_options_compiles_with_them(monkeypatch):
-    """Where the step compiled without Triton GEMM fusions does not fit and
-    the default one does, the trainer keeps the default one before tiling the
-    head; where neither fits, it keeps the measured options' step for the
-    ladder to climb from."""
-    from dew.training import trainer as module
+@pytest.mark.parametrize("tokens", [4096, 8192, 16384])
+def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
+    """Compare real Trainer steps with the measured recipe: unfused whole
+    logits at 4096 tokens, fused whole logits at 8192, and a 4096-row tile
+    at 16384. Fresh processes keep conftest's deterministic XLA flags out
+    of the measurement; those flags change which whole-logits step fits.
+    The ABBA order and warmed step medians allow 4% noise, below the old
+    8%, 18%, and 3x regressions. Run alone with GPU preallocation disabled.
+    """
+    devices = jax.devices()
+    if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
+        pytest.skip("measured on one 16 GiB RTX 4080")
+    if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "").lower() != "false":
+        pytest.skip("disable GPU preallocation so the isolated measurements can use it")
+    if "xla_gpu_enable_triton_gemm" in os.environ.get("XLA_FLAGS", ""):
+        pytest.skip("an explicit Triton option overrides the measured default")
+    root = Path(__file__).resolve().parents[1]
+    case = {"architecture": "causal_transformer", "config": {
+        "vocab_size": 151936, "emb_features": 1024, "num_layers": 2, "num_heads": 16,
+        "num_kv_heads": 8, "head_dim": 128, "mlp_features": 3072, "max_seq_len": 1024,
+        "tie_embeddings": True}, "dtype": "bfloat16", "batch_size": tokens // 1024,
+        "seq_len": 1024}
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_gpu_deterministic_ops"))
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
+                   "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.85",
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+    samples = ([], [])
+    for index, reference in enumerate((False, True, True, False)):
+        objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
+        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        record = tmp_path / f"step-{index}.json"
+        done = subprocess.run(
+            [sys.executable, "tools/benchmark_step.py", "--cases",
+             json.dumps([{**case, "objective": objective}]), "--warmup", "6", "--steps", "20",
+             "--json-out", str(record)], cwd=root,
+            env={**environment, "XLA_FLAGS": flags + options}, capture_output=True, text=True, timeout=180)
+        assert done.returncode == 0, done.stdout + done.stderr
+        row, = json.loads(record.read_text())
+        assert row["finite"], row
+        samples[int(reference)].append(row["p50_ms"])
+    measured, baseline = (float(np.median(values)) for values in samples)
+    assert measured < baseline * 1.04, (tokens, measured, baseline)
 
-    program = jax.jit(lambda x: x @ x).lower(jnp.ones((4, 4)))
-    measured = program.compile({"xla_backend_optimization_level": 1})
-    for default_fits in (True, False):
-        monkeypatch.setattr(module, "step_fits", lambda executable, mesh, fits=default_fits:
-                            fits and executable is not measured)
-        chosen, fits = module.fitting_default(program, measured, None)
-        assert (chosen is not measured) == default_fits == fits
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():

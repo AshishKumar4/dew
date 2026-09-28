@@ -219,7 +219,7 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """The step compiled under XLA's default options where it fits and the
     one compiled under `step_compiler_options` does not, else that one, with
     whether the returned step fits. The
-    Triton GEMM fusions hold fewer temporaries: on an RTX 4080 (sm89, jax
+    Triton GEMM fusions can hold fewer temporaries: on an RTX 4080 (sm89, jax
     0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens keep their
     whole logits in 13.1 GiB with them and run 178.7 ms, while without them
     the step does not fit, tiles its head and runs 211.2 ms. So the fusions
@@ -272,7 +272,10 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | N
     temporaries and new outputs are placed, None where the executable or a
     device reports no memory. The arguments, the state and the batch, are
     already resident and counted in use; the donated state's buffers are
-    reused for the outputs that alias them."""
+    reused for the outputs that alias them.
+
+    This compares against the allocator's limit; a growable allocator
+    (XLA_PYTHON_CLIENT_PREALLOCATE=false) can fragment below it."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):

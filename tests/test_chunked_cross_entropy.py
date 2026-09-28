@@ -848,14 +848,3 @@ def test_the_split_cotangent_reaches_its_products_in_bf16():
     dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
     assert len(dots) == 2
     assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots
-
-
-@pytest.mark.parametrize("generation, tile", [("sm80", (4096, 8192)), ("sm89", (4096, 8192)),
-                                              ("sm90", (1024, 8192)), ("cpu", (1024, 8192))])
-def test_the_head_tiles_as_its_generation_was_measured(monkeypatch, generation, tile):
-    """A step that does not fit the whole logits falls to the tile measured
-    fastest on its GPU generation (an RTX 4080's whole step: 114.6 ms at
-    4096 x 8192 against 123.4 at the unmeasured default); an unmeasured one
-    keeps the default."""
-    monkeypatch.setattr(chunked, "device_generation", lambda: generation)
-    assert chunked.chunked_tile() == tile

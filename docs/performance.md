@@ -593,6 +593,17 @@ On the v6e the fp32 operands already multiplied in one bf16 pass, so only skippi
 
 The bf16 product changes the loss by less than its own rerun spread. `tools/lm_step_parity.py`, 100 steps of the 39M-parameter decoder on the RTX 4080, twice each way: two fp32-head runs differ by at most 2.3e-4 relative at any step, two bf16-head runs by 7.7e-4, and a bf16-head run differs from an fp32-head run by 3.4e-4 and 7.2e-4, within the bf16 head's own rerun spread. Final losses 0.0078378 and 0.0078376 (fp32 head), 0.0078368 and 0.0078387 (bf16 head). Rejected: the fused Pallas kernel, 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, 2.24x slower on the v6e (kernel catalog, 2026-09-22).
 
+On sm89, the trainer compiles without XLA's Triton GEMM fusions unless the
+run explicitly sets that flag or the model has an SSD mixer. At Qwen3-0.6B's
+widths with two layers, bf16, vocabulary 151936, and a 0.9 allocator
+fraction on an RTX 4080 (JAX 0.11.2), this removes a 4096-token cliff:
+286.0 ms per training step with the fusions, 93.4 ms without. At other
+shapes, the unfused step can use more temporary memory. Before tiling the
+head or recomputing blocks, a step that does not fit is tried with XLA's default
+options; at 8192 tokens only that whole-logits step fits (178.7 ms, versus
+211.2 ms after tiling). When tiling is needed, sm89 uses the measured
+4096-by-8192 tile. These are two-layer measurements, not full-model times.
+
 ### Generations below sm80
 
 A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the one test: below sm80 bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
