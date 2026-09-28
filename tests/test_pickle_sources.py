@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.interop import hf_decoders, load_pretrained, sources
+from dew.interop import load_pretrained, sources
 
 torch = pytest.importorskip("torch")
 
@@ -109,7 +109,7 @@ def test_mamba2_130ms_pickle_converts_to_its_safetensors_conversions_weights(cac
     lookup made to find nothing. The same fp32 weights, bit for bit."""
     commit = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
     pull = load_pretrained("state-spaces/mamba2-130m", revision=commit, dtype="float32")
-    monkeypatch.setattr(hf_decoders, "_conversion_revision", lambda name, commit: None)
+    monkeypatch.setattr(sources, "_conversion_revision", lambda name, commit: None)
     pickled = load_pretrained("state-spaces/mamba2-130m", revision=commit, dtype="float32")
 
     assert (pull.revision, pickled.revision) == ("ea6060f68a4289e9c06f80effa896629ba519216", commit)
