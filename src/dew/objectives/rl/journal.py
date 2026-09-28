@@ -101,6 +101,8 @@ class JournalRun:
 
     def save(self, episode: Episode, pending: Action | None, snapshot: bytes) -> None:
         """Commit one sample's episode, its pending action and the environment snapshot."""
+        if episode._binding_id != self.binding:
+            raise ValueError("journal cannot mix collection bindings")
         encoded = json.dumps(episode_record(episode), allow_nan=False)
         action = None if pending is None else json.dumps(asdict(pending), allow_nan=False)
         with self.connection:
