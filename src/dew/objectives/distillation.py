@@ -23,7 +23,7 @@ whose widths differ gets a trainable `[student, teacher]` projection under
 
 Any objective that scores token logits serves as student or teacher through
 `Objective.predict`; `LMObjective` does. Both score the same batch, so they
-share a tokenizer, and a vocabulary mismatch is refused.
+share a tokenizer and a vocabulary.
 """
 
 from __future__ import annotations
@@ -176,12 +176,6 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
         _, _, teacher = self.teacher.predict(
             params[TEACHER], batch, replace(step, ema=None), train=False,
             layers=tuple(teacher_layer for teacher_layer, _ in self.features))
-        if student.logits.shape[-1] != teacher.logits.shape[-1]:
-            raise ValueError(
-                f"the KL compares the two distributions column by column, so the "
-                f"teacher and the student share a tokenizer and a vocabulary; the "
-                f"student scores {student.logits.shape[-1]} ids and the teacher "
-                f"{teacher.logits.shape[-1]}")
         return statistics, aux, student, teacher
 
     def _distance(self, student: jax.Array, teacher: jax.Array) -> jax.Array:
