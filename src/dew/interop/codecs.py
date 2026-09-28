@@ -483,6 +483,9 @@ def _finite_matrix(weight: ArrayLike, rows: int, cols: int) -> np.ndarray:
         raise ValueError(
             f"block-scaled quantization takes a [rows, cols] weight, got shape "
             f"{values.shape}")
+    if type(cols) is not int or cols < 1:
+        raise ValueError(
+            f"a block covers a positive number of rows and columns, got {cols!r}")
     if not np.isfinite(values).all():
         raise ValueError(
             f"a {values.shape} weight holds "
