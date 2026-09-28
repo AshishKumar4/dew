@@ -87,8 +87,6 @@ class Registry(Mapping[str, T], Generic[T, Built]):
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
         """Register the class it names, as `@models("simple_dit")`."""
-        if type(name) is not str or not name:
-            raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
 
         def register(member: M) -> M:
             held = self._members.get(name)
@@ -189,10 +187,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
     @property
     def union(self) -> type[Built] | types.UnionType:
         """Return `Union[...]` of the members, for a tyro subcommand over the table."""
-        members = list(self._members.values())
-        if not members:
-            raise ValueError(f"the {self.kind} registry is empty")
-        return functools.reduce(operator.or_, members)
+        return functools.reduce(operator.or_, self._members.values())
 
 
 class Named(Protocol):
