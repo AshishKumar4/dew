@@ -52,7 +52,8 @@ class Config:
     config: Path | None = None
     """The training config (JSON) saved with a checkpoint step; given, --checkpoint is that step."""
     jax_version: str = "0.5.3"
-    """The jax version the checkpoint step was written under."""
+    """The jax version the model trained under; the loader rebuilds the model's
+    random Fourier tables with it, so they match the ones the model learned with."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""
     prompts: tuple[str, ...] = (
@@ -66,7 +67,8 @@ class Config:
     seeds: tuple[int, ...] = (0, 1, 2, 3)
     samplers: tuple[str, ...] = tuple(SAMPLERS)
     negative: str | None = None
-    """The prompt for the unconditional branch of classifier-free guidance; None is the empty prompt."""
+    """The prompt for the unconditional branch of classifier-free guidance; None
+    keeps the one the loaded model is configured with (empty for the recorded model)."""
 
 
 def load(config: Config) -> TextToImage:
