@@ -415,8 +415,6 @@ class _RequestServer:
     def __init__(self, sampling: Sampling, weights: WeightSync, version: int, workers: int):
         if sampling.temperature == 0:
             raise ValueError("a rollout samples; greedy decoding gives every group member the same draw")
-        if type(workers) is not int or workers < 1:
-            raise ValueError("workers must be a positive number of concurrent requests")
         self._sampling = sampling
         self._weights = weights
         self._version = version
