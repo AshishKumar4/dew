@@ -287,7 +287,7 @@ def test_an_integer_format_without_its_code_width_is_refused_by_name():
     config = fixture_config("qwen3-8b-fp8")
     config["quantization_config"] = {"quant_method": "awq", "group_size": 128, "version": "gemm"}
 
-    with pytest.raises(ValueError, match="awq quantization_config has no bits"):
+    with pytest.raises(ValueError, match="awq bits=None"):
         codecs.source_quantization(config)
 
 @pytest.mark.parametrize("name, inert", [

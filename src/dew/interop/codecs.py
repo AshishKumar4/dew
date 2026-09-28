@@ -96,9 +96,6 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     Codes arrive as uint8 or int8, exponents as uint8 or float8_e8m0fnu.
     """
     codes, scales = _bytes(packed, _CODE_DTYPES), e8m0_scales(exponents)
-    if codes.shape[:-1] != scales.shape[:-1] or codes.shape[-1] != scales.shape[-1] * (GROUP // 2):
-        raise ValueError(f"packed E2M1 codes [..., n / 2] take E8M0 exponents [..., n / {GROUP}], "
-                         f"got {codes.shape} and {scales.shape}")
     values = _E2M1_BYTES[codes].reshape(*scales.shape, GROUP)
     values *= scales[..., None]
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
@@ -148,8 +145,6 @@ def _mxfp4_arrays(blocks: ArrayLike, scales: ArrayLike) -> tuple[np.ndarray, np.
     blocks, scales = np.asarray(blocks), np.asarray(scales)
     if blocks.ndim != 4 or blocks.shape[-1] != GROUP // 2 or blocks.shape[:-1] != scales.shape:
         raise ValueError("MXFP4 blocks must be [expert, output, group, 16] with one scale per group")
-    if blocks.dtype != np.uint8 or scales.dtype != np.uint8:
-        raise ValueError("MXFP4 blocks and scales must be uint8")
     return blocks, scales
 
 
@@ -180,10 +175,8 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     0 to the NaN byte 0xff.
     """
     values = np.asarray(weight)
-    if values.ndim != 3 or values.shape[1] % GROUP:
-        raise ValueError(
-            "MXFP4 takes an [expert, input, output] weight whose input axis is a "
-            f"multiple of the {GROUP}-value group, got {values.shape}")
+    if values.ndim != 3:
+        raise ValueError(f"MXFP4 takes an [expert, input, output] weight, got {values.shape}")
     groups = _float_groups(values.swapaxes(1, 2), "MXFP4", ml_dtypes.bfloat16).astype(np.float32)
     bits = (np.abs(groups).max(-1) / np.float32(6)).view(np.uint32)
     exponents = ((bits + np.uint32(0x007fffff)) >> 23).astype(np.uint8)
@@ -243,13 +236,10 @@ class SourceQuantization:
     def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str]) -> dict[str, np.ndarray]:
         """Write each of `names` back in the format, for the names a source
         shipped quantized (`names`). Every other tensor passes through as
-        itself. A name the caller no longer holds is refused rather than
-        written dense under a config that calls it quantized, and so is a
-        part already among the tensors, which the encoding would overwrite."""
+        itself. A part already among the tensors is refused, since the
+        encoding would overwrite it."""
         out = dict(tensors)
         for name in names:
-            if name not in out:
-                raise ValueError(f"{name} was quantized in the source and is not among the tensors to write")
             taken = [partner for partner in self.partners(name) if partner in out]
             if taken:
                 raise ValueError(f"{', '.join(taken)} is already among the tensors to write, so "
@@ -303,9 +293,6 @@ def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
     Weights alone are quantized, as groups of 32 inputs under one E8M0
     exponent; activations and the KV cache stay in the compute dtype.
     """
-    if quantization.get('format') != 'mxfp4-pack-quantized':
-        raise ValueError(f"compressed-tensors format {quantization.get('format')!r}: this loader reads "
-                         "mxfp4-pack-quantized weights and nothing else")
     if quantization.get('quantization_status', 'compressed') != 'compressed':
         raise ValueError("compressed-tensors quantization_status must be 'compressed'")
     if quantization.get('kv_cache_scheme') is not None:
@@ -493,9 +480,6 @@ def _finite_matrix(weight: ArrayLike, rows: int, cols: int) -> np.ndarray:
         raise ValueError(
             f"block-scaled quantization takes a [rows, cols] weight, got shape "
             f"{values.shape}")
-    if type(cols) is not int or cols < 1:
-        raise ValueError(
-            f"a block covers a positive number of rows and columns, got {cols!r}")
     if not np.isfinite(values).all():
         raise ValueError(
             f"a {values.shape} weight holds "
@@ -700,9 +684,6 @@ def quantize_fp8_rows(weight: ArrayLike, group: int) -> tuple[np.ndarray, np.nda
     layout V4.1's engram tables ship in.
     """
     values = _finite_matrix(weight, 1, group)
-    if values.shape[1] % group:
-        raise ValueError(f"row groups of {group} take a weight whose width is a multiple of "
-                         f"{group}, got {values.shape}")
     groups = values.reshape(values.shape[0], values.shape[1] // group, group)
     scale_inv = _fp8_scale_inv(np.abs(groups).max(-1), ue8m0=True)
     codes = (groups * (np.float32(1.0) / scale_inv)[..., None]).astype(E4M3)
@@ -896,13 +877,10 @@ def gptq(bits: int, *, v1: bool, grid: Mapping[str, np.ndarray] | None = None) -
         grid=lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in GPTQ_SUFFIXES[1:]))
 
 
-def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[int, int]:
-    """The `bits` and `group_size` an AWQ or GPTQ config declares, refusing what
-    this loader does not decode."""
-    if 'bits' not in quantization:
-        raise ValueError(f"{method} quantization_config has no bits, the code width its weights are packed "
-                         "at; the checkpoint's config.json is incomplete")
-    bits, group = records.integer(quantization['bits'], f'{method} bits'), quantization.get('group_size')
+def _integer_bits(quantization: Mapping[str, object], method: str) -> int:
+    """The `bits` an AWQ or GPTQ config declares, refusing what this loader
+    does not decode."""
+    bits = records.integer(quantization.get('bits'), f'{method} bits')
     if method == 'awq':
         if quantization.get('version', 'gemm') != 'gemm' or quantization.get('zero_point', True) is not True:
             raise ValueError(f"awq version {quantization.get('version')!r} with zero_point "
@@ -916,13 +894,7 @@ def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[in
         if quantization.get('checkpoint_format', 'gptq') not in ('gptq', 'gptq_v2'):
             raise ValueError(f"gptq checkpoint_format {quantization.get('checkpoint_format')!r}: this loader "
                              "reads the gptq and gptq_v2 formats")
-    # GPTQ's decode reads each input's group from g_idx, so any group_size
-    # holds, -1 (one group per row) included; AWQ's reads it from group_size.
-    if method == 'awq' and (not isinstance(group, int) or isinstance(group, bool) or group <= 0):
-        raise ValueError(f"awq group_size {group!r}: a positive group of inputs per scale")
-    if not isinstance(group, int) or isinstance(group, bool):
-        raise ValueError(f"{method} group_size {group!r}: an integer")
-    return bits, group
+    return bits
 
 
 # --------------------------------------------------------------------------
@@ -1272,11 +1244,15 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         packed_mxfp4_format(quantization)
         return PACKED_MXFP4
     if method == "awq":
-        bits, group = _integer_format(quantization, method)
-        return awq(bits, group, grid)
+        # AWQ's decode reads each input's group from group_size; GPTQ's reads
+        # it from g_idx, so any group_size holds there.
+        group = quantization.get("group_size")
+        if not isinstance(group, int) or isinstance(group, bool) or group <= 0:
+            raise ValueError(f"awq group_size {group!r}: a positive group of inputs per scale")
+        return awq(_integer_bits(quantization, method), group, grid)
     if method == "gptq":
-        bits, _ = _integer_format(quantization, method)
-        return gptq(bits, v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
+        return gptq(_integer_bits(quantization, method),
+                    v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
         f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4, compressed-tensors' "

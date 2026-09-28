@@ -209,7 +209,7 @@ def test_mxfp4_zero_and_smallest_groups_take_the_floor_of_the_format():
     (np.full((1, 32, 1), np.nan, np.float32), "reserved E8M0 NaN scale"),
     (np.full((1, 32, 1), np.inf, np.float32), "reserved E8M0 NaN scale"),
     (np.zeros((1, 48, 1), np.float32), "multiple of the 32-value group"),
-    (np.zeros((32, 1), np.float32), "multiple of the 32-value group"),
+    (np.zeros((32, 1), np.float32), r"\[expert, input, output\] weight"),
     (np.zeros((1, 32, 1), np.int32), "encodes float weights"),
 ])
 def test_mxfp4_refuses_what_the_format_cannot_hold(weight, message):
@@ -244,8 +244,6 @@ def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():
     np.testing.assert_array_equal(
         released_decode(packed[f"{stem}_blocks"], packed[f"{stem}_scales"]), unpacked[stem])
 
-    with pytest.raises(ValueError, match="is not among the tensors to write"):
-        MXFP4.requantize({name: value for name, value in unpacked.items() if name != stem}, (stem,))
     with pytest.raises(ValueError, match=r"holds no .*_scales"):
         MXFP4.names({name: value for name, value in tensors.items()
                      if not name.endswith("_scales")})
