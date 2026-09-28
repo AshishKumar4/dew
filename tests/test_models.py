@@ -139,6 +139,54 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
 
 
+@pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
+def test_strided_convolution_linearizations_keep_host_precision(transform):
+    """Random filters expose a tangent chain just as they expose the primal.
+
+    A boundary whose JVP drops the barrier leaves the same miscompiled
+    convolution chain in the tangent-only program.
+    """
+    def network(dtype):
+        return nn.Sequential([
+            Conv(12, (1, 1), use_bias=False, dtype=dtype, precision=jax.lax.Precision.HIGHEST),
+            Conv(8, (3, 3), strides=2, padding="VALID", use_bias=False,
+                 dtype=dtype, precision=jax.lax.Precision.HIGHEST),
+        ])
+
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    rng = np.random.default_rng(23)
+    image, direction = (rng.standard_normal((1, 17, 17, 3)).astype(np.float32) for _ in range(2))
+    cotangent = rng.standard_normal((1, 8, 8, 8)).astype(np.float32)
+    with jax.default_device(host):
+        variables = jax.tree.map(np.asarray, network(np.float32).init(jax.random.key(0), image))
+
+    def evaluate(dtype, target):
+        model = network(dtype)
+        args = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                             (variables, image, direction, cotangent))
+
+        def run(params, x, tangent, cot):
+            forward = lambda value: model.apply(params, value)
+            if transform == "jvp":
+                return jax.jvp(forward, (x,), (tangent,))[1]
+            if transform == "transpose":
+                return jax.linear_transpose(forward, x)(cot)[0]
+            if transform == "forward_over_reverse":
+                return jax.jvp(jax.grad(lambda value: jnp.sum(forward(value)**2)),
+                               (x,), (tangent,))[1]
+            return jax.grad(lambda value: jnp.sum(
+                jax.jvp(forward, (value,), (tangent,))[1] * forward(value)))(x)
+
+        with jax.default_device(target):
+            return np.asarray(jax.jit(run)(*args))
+
+    reference = evaluate(np.float32, host)
+    with jax.enable_x64():
+        truth = evaluate(np.float64, host)
+    actual = evaluate(np.float32, device)
+    assert_as_exact_as_the_reference(actual, reference, truth, transform)
+
+
 def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
     """Small integer operands make every product/sum exact in fp32.
 
