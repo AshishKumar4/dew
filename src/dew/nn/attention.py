@@ -508,9 +508,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     for such a call (`all_to_all_moves_less`). A call with no mask does the
     same work either way, and takes the exchange that sends fewer bytes.
     """
-    mesh = jax.sharding.get_abstract_mesh()
-    tensor = math.prod(mesh.shape[axis]
-                       for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
+    tensor = _tensor_shards(query)
     heads, kv_heads = query.shape[-2], key.shape[-2]
     masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
@@ -556,6 +554,13 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int) -
 def _entry(spec: P, dimension: int):
     """What `spec` names for `dimension`: a spec leaves off trailing whole ones."""
     return spec[dimension] if dimension < len(spec) else None
+
+
+def _tensor_shards(query) -> int:
+    """How many ways the mesh's tensor axes split the query heads."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return math.prod(mesh.shape[axis]
+                     for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
 def _four_dimensional(x):
@@ -625,15 +630,12 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
             ("activation_batch",), key_value_seq_lengths.shape))
-    names = tuple(extras)
 
     def local(query, key, value, *arrays):
         query, key, value = (jax.lax.all_to_all(x, SEQUENCE_AXIS, 2, 1, tiled=True)
                              for x in (query, key, value))
-        given = dict(zip(names, arrays, strict=True))
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
-                     key_value_seq_lengths=given.get('key_value_seq_lengths'))
+                     **dict(zip(extras, arrays, strict=True)))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
     exchanged = manual_map(
@@ -666,12 +668,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     whole keys, which neither order moves.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
-    tensor = mesh_axes(_entry(logical_spec(HEADS, query.shape), 2))
-    if tensor:
-        # Each tensor shard's query heads beside the key heads they read.
-        kv_heads = math.lcm(key.shape[-2], math.prod(
-            jax.sharding.get_abstract_mesh().shape[axis] for axis in tensor))
-        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    # Each tensor shard's query heads beside the key heads they read.
+    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 
     reordered = causal or sliding_window is not None or mask is not None
     if reordered:
@@ -708,16 +707,13 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
             ("activation_batch",), key_value_seq_lengths.shape))
-    names = tuple(extras)
 
     def local(query, key, value, *arrays):
         if gathered:
             key, value = (jax.lax.all_gather(x, SEQUENCE_AXIS, axis=1, tiled=True)
                           for x in (key, value))
-        given = dict(zip(names, arrays, strict=True))
         return kernel(query, key, value, causal=False, sliding_window=None,
-                      mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
-                      key_value_seq_lengths=given.get('key_value_seq_lengths'))
+                      **dict(zip(extras, arrays, strict=True)))
 
     attended = manual_map(
         local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
@@ -1266,15 +1262,12 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     The heads split over the tensor axis where they divide, the key heads
     repeated to the least common multiple of their count and the tensor
     axis, as the exchanges repeat them."""
-    mesh = jax.sharding.get_abstract_mesh()
     batch, length = query.shape[:2]
     span = window if window is not None else chunk
     assert span is not None
     queries = logical_spec(HEADS, query.shape)
-    tensor = mesh_axes(_entry(queries, 2))
-    if tensor:
-        kv_heads = math.lcm(key.shape[2], math.prod(mesh.shape[axis] for axis in tensor))
-        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    kv_heads = math.lcm(key.shape[2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
     keys = logical_spec(KV_HEADS, key.shape)
     fields = {}
     if positions is not None:
