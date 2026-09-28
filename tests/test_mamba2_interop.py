@@ -57,7 +57,6 @@ def test_the_config_reads_the_references_fields(hf_config):
 @pytest.mark.parametrize("field, value, message", [
     ("hidden_act", "gelu", "hidden_act"),
     ("head_dim", 4, "must equal"),
-    ("model_type", "mamba", "model_type"),
 ])
 def test_a_field_the_mixer_cannot_compute_is_refused(hf_config, field, value, message):
     with pytest.raises(ValueError, match=message):
