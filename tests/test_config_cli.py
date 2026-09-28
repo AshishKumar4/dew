@@ -14,7 +14,7 @@ import tyro
 from test_diffusion_objective import RES, StubText
 
 from dew.config import RunConfig
-from dew.data import Dataset, OxfordFlowers, PackedTokens
+from dew.data import Dataset, OnlineImages, OxfordFlowers, PackedTokens
 from dew.data.dataset import tokenized
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
@@ -86,6 +86,18 @@ def test_a_recipe_config_round_trips_through_its_json_record(name):
 
     assert getattr(recipe, cls).from_dict(record) == config
     assert record["data"]["name"] == datasets.name_of(type(config.data))
+
+
+def test_a_run_over_url_datasets_round_trips_through_its_json_record():
+    """A diffusion run may train on any hub table of urls; its record has to
+    name the sources, so the run and its samplers rebuild from run.json."""
+    recipe = load_recipe("diffusion")
+    config = recipe.DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
+
+    record = json.loads(json.dumps(config.to_dict()))
+
+    assert recipe.DiffusionRunConfig.from_dict(record) == config
+    assert record["data"]["name"] == "online_images"
 
 
 def test_steps_and_epochs_are_one_choice():

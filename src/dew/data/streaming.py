@@ -10,6 +10,7 @@ from dew.registry import datasets
 from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Loading, Tokenize, tokenized
 
 
+@datasets("online_images")
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
     """Fetches images by url as they are read, an endless stream.
