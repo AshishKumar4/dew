@@ -921,13 +921,10 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
 
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
     config = family.translate_config(hf_config, used)
-    return config, _unread(hf_config, used)
 
-
-def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
-    """Return the config fields no reader took and none of the ignored, codec or inert sets names."""
-    return (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(hf_config.get('model_type'), hf_config)
-            - {key for key in hf_config if str(key).startswith('_')})
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
+               - {key for key in hf_config if str(key).startswith('_')})
+    return config, unknown
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
@@ -1161,7 +1158,8 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "no supported multimodal wrapper is registered for this model")
     used = {"model_type"}
     record = read(hf_config, used)
-    unknown = _unread(hf_config, used)
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
+               - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
                 "the wrapper has no counterpart, so translating them would "
