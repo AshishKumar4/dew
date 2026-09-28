@@ -61,8 +61,13 @@ class AutoAudioProcessor:
         self.sampling_rate = sampling_rate or stated
 
     def __call__(self, audio):
+        """The extractor's arrays for one waveform or a batch of equal-length ones.
+
+        Each extractor pads the way its model reads: Whisper's to the
+        30-second window its encoder is built for, wav2vec2's not at all.
+        """
         features = self.processor(audio, sampling_rate=self.sampling_rate,
-                                  padding=True, return_tensors=self.tensor_type)
+                                  return_tensors=self.tensor_type)
         return dict(features)
 
     def __repr__(self):

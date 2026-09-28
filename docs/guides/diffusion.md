@@ -66,6 +66,8 @@ The call to `evaluate` passes its own independent key. When `Trainer.fit` schedu
 
 For text conditioning, `InputSpec.conditions` maps a model keyword argument to a condition encoder and the batch field it reads. Tokenize captions with the same encoder and tokenizer settings you train with. A pretrained text tower may need a model download and a lot of memory.
 
+To condition on sound instead, `HFAudio` (`hf_audio`) runs any transformers audio model, such as wav2vec2 or Whisper's encoder, through torchax (the `torchax` extra) and hands the model its last hidden states under the same `textcontext` keyword. A run selects it with `DiffusionRunConfig(data=LocalVideos(...), text=None, audio=AudioCondition())`: the video dataset's `audio_model` names the tower, its clips' `audio` field carries the extractor's input, and the clip length sets the waveform length every clip and the silent unconditional input are encoded at. Sampling takes one `{"audio": waveform}` record per sample, mono at the extractor's rate.
+
 With an autoencoder configured, training runs on latent tensors instead of pixels. Set the denoising model's channel count and spatial shape to match the encoder output, and keep the encoder's scaling convention. Loading a VAE does not load the weights of an external diffusion transformer.
 
 Use [training recipes](../recipes.md) for runs on real datasets. [Supported models](../models.md) lists the published checkpoints that load.

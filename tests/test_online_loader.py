@@ -744,9 +744,8 @@ def test_a_fetched_video_reaches_the_queue_as_consecutive_frames(clips, monkeypa
 
     clip, caption = sink.get_nowait()
     assert caption == "clip.mkv" and clip.shape == (4, 24, 24, 3) and clip.dtype == np.uint8
-    first = int(round(int(clip[0, 12, 12, 0]) / CLIP_GREY_STEP))
-    assert [int(round(int(frame[12, 12, 0]) / CLIP_GREY_STEP)) for frame in clip] == \
-        list(range(first, first + 4))
+    indices = [round(int(frame[12, 12, 0]) / CLIP_GREY_STEP) for frame in clip]
+    assert indices == list(range(indices[0], indices[0] + 4))
     assert [sink.get_nowait() for _ in range(5)] == [
         f"{clips}/{name}" for name in ("still.png", "junk.mp4", "short.mkv", "small.mkv", "gone.mkv")]
 

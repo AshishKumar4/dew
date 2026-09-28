@@ -35,6 +35,7 @@ from .dataset import (
 )
 from .images import import_opencv
 from .processors import AutoAudioProcessor
+from .sources.av_utils import FPS
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -113,6 +114,12 @@ class VideoDataset(DatasetSpec):
     """HF audio model whose feature extractor prepares the audio inputs."""
     val_batches: int | None = 4
     count: int | None = None
+
+    @property
+    def audio_seconds(self) -> float:
+        """How long the waveform under a clip is: its frames and the padding
+        on either side, at the rate clips are sampled at."""
+        return (self.frames + 2 * self.audio_padding) / FPS
 
     def source(self) -> list[dict[str, str]]:
         """One `{"video_path", "caption"}` record per clip, in a fixed order."""
