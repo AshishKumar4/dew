@@ -644,7 +644,11 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
     alpha_s = jnp.where(alpha_s == 0, 1.0, alpha_s)
     if algorithm == "dpmsolver++":
         phi = jnp.exp(-h) - 1.0
-        return (sigma_t / sigma_s, -alpha_t * phi, -0.5 * alpha_t * phi,
+        sample_scale = sigma_t / sigma_s
+        # exp(-h) = alpha_s / alpha_t * sigma_t / sigma_s. Use the
+        # rates directly rather than round them through logarithms and exp.
+        clean_scale = alpha_t - sample_scale * alpha_s
+        return (sample_scale, clean_scale, 0.5 * clean_scale,
                 alpha_t * (phi / h + 1.0), -alpha_t * ((phi + h) / h ** 2 - 0.5), 0.0)
     if algorithm == "dpmsolver":
         psi = jnp.exp(h) - 1.0
