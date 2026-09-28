@@ -116,6 +116,7 @@ SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
 # bank_layers.
 SHAPES = {
     "dense": dict(num_layers=4),
+    "narrow": dict(num_layers=8, emb_features=4, num_heads=1, num_kv_heads=1, mlp_features=8),
     "moe": dict(num_layers=4, mixture={"experts": 4, "top_k": 2, "bias": True}),
     "gated_delta_net": dict(num_layers=4, layer_types=("linear_attention",) * 4,
                             kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}),
@@ -395,7 +396,8 @@ def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer()
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     """A run's saved weights read one bank at a time, against the same
     checkpoint read into resident banks."""
-    plain, scanned, _, tokens = pair(num_layers=4, bank_layers=2)
+    plain, scanned, _, tokens = pair(num_layers=8, bank_layers=4, emb_features=2,
+                                      num_heads=1, num_kv_heads=1, mlp_features=4)
     directory = str(tmp_path / "run")
     checkpoints = Checkpoints(directory, keep=1)
     trainer = Trainer(LMObjective(plain, SHAPE["max_seq_len"] - 1, head_chunks=1),
@@ -411,7 +413,7 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
 
     resident = host_banked(scanned, CheckpointBanks(directory), layout=DEVICE)
     on_host = host_banked(scanned, CheckpointBanks(directory), layout=BANKS)
-    assert memory_kinds(on_host["params"]["layers_0_1"]) == {"pinned_host"}
+    assert memory_kinds(on_host["params"]["layers_0_3"]) == {"pinned_host"}
     assert np.array_equal(np.asarray(scanned.apply(on_host, tokens)),
                           np.asarray(scanned.apply(resident, tokens)))
     trained = StackView(scanned.bind({}).groups).unstack(resident)
