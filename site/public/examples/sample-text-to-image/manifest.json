@@ -1,565 +1,661 @@
 {
-  "checkpoint": "/mnt/scratch/diffq/udit_ema/350000",
+  "checkpoint": "cmbd8bia/1350000",
   "device": "NVIDIA GeForce RTX 4080",
-  "negative": "white border, frame, text, watermark, collage, blurry, low quality",
+  "negative": null,
   "batches": [
     {
       "sampler": "heun40",
       "seed": 0,
-      "images": 5,
-      "seconds": 4.29
+      "images": 6,
+      "seconds": 48.95
     },
     {
       "sampler": "heun40",
       "seed": 1,
-      "images": 5,
-      "seconds": 0.82
+      "images": 6,
+      "seconds": 1.92
     },
     {
       "sampler": "heun40",
       "seed": 2,
-      "images": 5,
-      "seconds": 0.83
+      "images": 6,
+      "seconds": 1.85
     },
     {
       "sampler": "heun40",
       "seed": 3,
-      "images": 5,
-      "seconds": 0.83
+      "images": 6,
+      "seconds": 1.91
     },
     {
-      "sampler": "dpm2m40",
+      "sampler": "dpm2m20",
       "seed": 0,
-      "images": 5,
-      "seconds": 1.46
+      "images": 6,
+      "seconds": 13.07
     },
     {
-      "sampler": "dpm2m40",
+      "sampler": "dpm2m20",
       "seed": 1,
-      "images": 5,
-      "seconds": 0.46
+      "images": 6,
+      "seconds": 0.6
     },
     {
-      "sampler": "dpm2m40",
+      "sampler": "dpm2m20",
       "seed": 2,
-      "images": 5,
-      "seconds": 0.46
+      "images": 6,
+      "seconds": 0.65
     },
     {
-      "sampler": "dpm2m40",
+      "sampler": "dpm2m20",
       "seed": 3,
-      "images": 5,
-      "seconds": 0.46
+      "images": 6,
+      "seconds": 0.61
     },
     {
       "sampler": "ea100",
       "seed": 0,
-      "images": 5,
-      "seconds": 2.63
+      "images": 6,
+      "seconds": 16.89
     },
     {
       "sampler": "ea100",
       "seed": 1,
-      "images": 5,
-      "seconds": 1.04
+      "images": 6,
+      "seconds": 2.37
     },
     {
       "sampler": "ea100",
       "seed": 2,
-      "images": 5,
-      "seconds": 1.06
+      "images": 6,
+      "seconds": 2.4
     },
     {
       "sampler": "ea100",
       "seed": 3,
-      "images": 5,
-      "seconds": 1.05
+      "images": 6,
+      "seconds": 2.37
     }
   ],
   "images": [
     {
       "file": "heun40/p0_s0.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 0,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p1_s0.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 0,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p2_s0.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 0,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p3_s0.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 0,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p4_s0.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 0,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p0_s1.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 1,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p1_s1.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 1,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p2_s1.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 1,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p3_s1.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 1,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p4_s1.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 1,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p0_s2.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 2,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p1_s2.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 2,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p2_s2.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 2,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p3_s2.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 2,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p4_s2.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 2,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p0_s3.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 3,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p1_s3.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 3,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p2_s3.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 3,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p3_s3.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 3,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
       "file": "heun40/p4_s3.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 3,
       "sampler": "Heun",
       "steps": 40,
-      "guidance": 7.0,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p0_s0.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "file": "heun40/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s0.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 0,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p1_s0.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "file": "dpm2m20/p1_s0.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 0,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p2_s0.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "file": "dpm2m20/p2_s0.webp",
+      "prompt": "a red fox in a snowy forest",
       "seed": 0,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p3_s0.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "file": "dpm2m20/p3_s0.webp",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 0,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p4_s0.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "file": "dpm2m20/p4_s0.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 0,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p0_s1.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "file": "dpm2m20/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s1.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 1,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p1_s1.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "file": "dpm2m20/p1_s1.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 1,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p2_s1.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "file": "dpm2m20/p2_s1.webp",
+      "prompt": "a red fox in a snowy forest",
       "seed": 1,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p3_s1.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "file": "dpm2m20/p3_s1.webp",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 1,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p4_s1.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "file": "dpm2m20/p4_s1.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 1,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p0_s2.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "file": "dpm2m20/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s2.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p1_s2.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "file": "dpm2m20/p1_s2.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p2_s2.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "file": "dpm2m20/p2_s2.webp",
+      "prompt": "a red fox in a snowy forest",
       "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p3_s2.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "file": "dpm2m20/p3_s2.webp",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p4_s2.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "file": "dpm2m20/p4_s2.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
       "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p0_s3.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
-      "seed": 3,
+      "file": "dpm2m20/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 2,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p1_s3.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "file": "dpm2m20/p0_s3.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 3,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p2_s3.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "file": "dpm2m20/p1_s3.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 3,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p3_s3.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "file": "dpm2m20/p2_s3.webp",
+      "prompt": "a red fox in a snowy forest",
       "seed": 3,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
       ]
     },
     {
-      "file": "dpm2m40/p4_s3.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "file": "dpm2m20/p3_s3.webp",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 3,
       "sampler": "DPMSolverMultistep",
-      "steps": 40,
-      "guidance": 6.0,
+      "steps": 20,
+      "guidance": 5.0,
       "guidance_interval": [
-        0.2,
-        0.9
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p4_s3.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
       ]
     },
     {
       "file": "ea100/p0_s0.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 0,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -571,7 +667,7 @@
     },
     {
       "file": "ea100/p1_s0.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 0,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -583,7 +679,7 @@
     },
     {
       "file": "ea100/p2_s0.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 0,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -595,7 +691,7 @@
     },
     {
       "file": "ea100/p3_s0.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 0,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -607,7 +703,19 @@
     },
     {
       "file": "ea100/p4_s0.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
       "seed": 0,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -619,7 +727,7 @@
     },
     {
       "file": "ea100/p0_s1.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 1,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -631,7 +739,7 @@
     },
     {
       "file": "ea100/p1_s1.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 1,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -643,7 +751,7 @@
     },
     {
       "file": "ea100/p2_s1.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 1,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -655,7 +763,7 @@
     },
     {
       "file": "ea100/p3_s1.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 1,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -667,7 +775,19 @@
     },
     {
       "file": "ea100/p4_s1.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
       "seed": 1,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -679,7 +799,7 @@
     },
     {
       "file": "ea100/p0_s2.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 2,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -691,7 +811,7 @@
     },
     {
       "file": "ea100/p1_s2.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 2,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -703,7 +823,7 @@
     },
     {
       "file": "ea100/p2_s2.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 2,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -715,7 +835,7 @@
     },
     {
       "file": "ea100/p3_s2.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 2,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -727,7 +847,19 @@
     },
     {
       "file": "ea100/p4_s2.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
       "seed": 2,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -739,7 +871,7 @@
     },
     {
       "file": "ea100/p0_s3.webp",
-      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "prompt": "a tropical beach with palm trees and turquoise water",
       "seed": 3,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -751,7 +883,7 @@
     },
     {
       "file": "ea100/p1_s3.webp",
-      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "prompt": "a colorful hot air balloon over a green valley",
       "seed": 3,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -763,7 +895,7 @@
     },
     {
       "file": "ea100/p2_s3.webp",
-      "prompt": "an impressionist painting of a garden with a pond",
+      "prompt": "a red fox in a snowy forest",
       "seed": 3,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -775,7 +907,7 @@
     },
     {
       "file": "ea100/p3_s3.webp",
-      "prompt": "a waterfall in a lush green forest",
+      "prompt": "a stained glass window with geometric patterns",
       "seed": 3,
       "sampler": "EulerAncestral",
       "steps": 100,
@@ -787,7 +919,19 @@
     },
     {
       "file": "ea100/p4_s3.webp",
-      "prompt": "the milky way over snowy mountains at night",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
       "seed": 3,
       "sampler": "EulerAncestral",
       "steps": 100,

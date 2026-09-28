@@ -1,18 +1,21 @@
-"""Sample a pretrained text-to-image model over prompts, seeds and samplers.
+"""Sample the pretrained text-to-image model over prompts, seeds and samplers.
 
-Run from the repository root on a GPU, with one step of a FlaxDiff checkpoint
-and the config its trainer logged, read through `dew.interop.flaxdiff`:
+Run from the repository root on a GPU, with a checkpoint step and the
+training config saved beside it:
 
-    python examples/sample_text_to_image.py --checkpoint udit_ema/350000 \
-        --flaxdiff-config udit_config.json
+    python examples/sample_text_to_image.py --checkpoint cmbd8bia/1350000 \
+        --config cmbd8bia/cmbd8bia_config.json
 
 or with a Dew run directory, read through `TextToImage.from_run`:
 
     python examples/sample_text_to_image.py --checkpoint RUN_DIR
 
-The recorded grids come from the first form: a U-DiT that FlaxDiff trained,
-at step 350000 of its EMA weights. The second form has been run on the small
-text-conditioned run that `examples/train_flowers_tpu.py --smoke` writes.
+The recorded grids come from the first form: a hybrid DiT of state-space and
+attention blocks trained with Dew, at step 1350000 of its EMA weights. Its
+denoiser holds 175.6M parameters, beside a 123.1M-parameter CLIP text encoder
+and an 83.7M-parameter Stable Diffusion autoencoder, and it samples 256x256
+images. The second form has been run on the small text-conditioned run that
+`examples/train_flowers_tpu.py --smoke` writes.
 
 Each sampler draws one batch per seed, holding every prompt. The output
 directory gets one PNG per image, one grid per sampler (rows are prompts,
@@ -36,8 +39,8 @@ from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, TextToIm
 
 # Each sampler's solver, step count and classifier-free guidance.
 SAMPLERS = {
-    "heun40": (Heun(), 40, CFG(7.0, interval=(0.2, 0.9))),
-    "dpm2m40": (DPMSolverMultistep(), 40, CFG(6.0, interval=(0.2, 0.9))),
+    "heun40": (Heun(), 40, CFG(5.0)),
+    "dpm2m20": (DPMSolverMultistep(), 20, CFG(5.0)),
     "ea100": (EulerAncestral(), 100, CFG(5.0)),
 }
 
@@ -45,31 +48,32 @@ SAMPLERS = {
 @dataclass
 class Config:
     checkpoint: Path
-    """A Dew run directory, or a FlaxDiff checkpoint step with --flaxdiff-config."""
-    flaxdiff_config: Path | None = None
-    """The FlaxDiff run config (JSON); given, --checkpoint is read as FlaxDiff's."""
-    flaxdiff_jax_version: str = "0.5.3"
-    """The jax version the FlaxDiff run trained under."""
+    """A Dew run directory, or a checkpoint step directory with --config."""
+    config: Path | None = None
+    """The training config (JSON) saved with a checkpoint step; given, --checkpoint is that step."""
+    jax_version: str = "0.5.3"
+    """The jax version the checkpoint step was written under."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""
     prompts: tuple[str, ...] = (
-        "a watercolor painting of a mountain lake at sunrise",
-        "an oil painting of a forest in autumn with golden leaves",
-        "an impressionist painting of a garden with a pond",
-        "a waterfall in a lush green forest",
-        "the milky way over snowy mountains at night",
+        "a tropical beach with palm trees and turquoise water",
+        "a colorful hot air balloon over a green valley",
+        "a red fox in a snowy forest",
+        "a stained glass window with geometric patterns",
+        "a bowl of ramen with an egg and green onions",
+        "the northern lights over a frozen lake at night",
     )
     seeds: tuple[int, ...] = (0, 1, 2, 3)
     samplers: tuple[str, ...] = tuple(SAMPLERS)
-    negative: str = "white border, frame, text, watermark, collage, blurry, low quality"
-    """The prompt for the unconditional branch of classifier-free guidance."""
+    negative: str | None = None
+    """The prompt for the unconditional branch of classifier-free guidance; None is the empty prompt."""
 
 
 def load(config: Config) -> TextToImage:
-    if config.flaxdiff_config is None:
+    if config.config is None:
         return TextToImage.from_run(str(config.checkpoint))
-    return load_flaxdiff(config.checkpoint, json.loads(config.flaxdiff_config.read_text()),
-                         jax_version=config.flaxdiff_jax_version)
+    return load_flaxdiff(config.checkpoint, json.loads(config.config.read_text()),
+                         jax_version=config.jax_version)
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
