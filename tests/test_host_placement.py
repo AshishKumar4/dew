@@ -364,29 +364,27 @@ def compiled_forward(scanned, store, cache, tokens):
 
 
 def staged_plan(depth: int) -> tuple[int, int, int]:
-    """The host parameters, the bank leaves and the device temporaries past
-    the cache of one compiled fetched forward pass."""
+    """Cached host placement and cache-free parameter-staging workspace."""
     _, scanned, variables, tokens = pair(num_layers=depth)
     resident, on_host = stores(scanned, variables)
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     compiled = compiled_forward(scanned, on_host, cache, tokens)
     assert host_parameters_in_plan(compiled_forward(scanned, resident, cache, tokens)) == 0
-    cache_bytes = sum(leaf.nbytes for leaf in jax.tree.leaves(cache))
-    analysis = compiled.memory_analysis()
+    uncached = jax.jit(lambda held, ids: scanned.apply(held, ids)).lower(on_host, tokens).compile()
+    analysis = uncached.memory_analysis()
     assert analysis is not None
-    return (host_parameters_in_plan(compiled), bank_leaves(on_host),
-            analysis.temp_size_in_bytes - cache_bytes)
+    return host_parameters_in_plan(compiled), bank_leaves(on_host), analysis.temp_size_in_bytes
 
 
 def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer():
-    """The compiled module's own memory-space assignment, and what its device
-    temporaries cost.
+    """Parameter staging, not total cached-decode workspace, is depth-bounded.
 
-    Every leaf of every bank is a host parameter of the compiled forward and
-    no other parameter is, at either depth, while the same forward over
-    resident banks has none. The device temporaries past the cache are the
-    staging, and doubling the layers does not grow them: the loop holds the
-    layer it computes with and the one it fetched, never the stack.
+    The cached forward still assigns every bank leaf to host memory, unlike
+    its resident counterpart. The cache-free public forward isolates the
+    parameter-staging cost: it holds the current and prefetched layers, not
+    the whole stack. Cached decode has depth-dependent KV-bank tiling and
+    output formatting on TPU; subtracting logical cache nbytes from physical
+    temporaries cannot remove that cost. Separate decode tests check values.
     """
     shallow, deep = staged_plan(8), staged_plan(16)
     assert shallow[0] == shallow[1] and deep[0] == deep[1]
