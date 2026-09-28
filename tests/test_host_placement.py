@@ -339,8 +339,8 @@ def test_a_store_holding_a_leaf_in_both_a_bank_and_its_layers_is_refused():
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
     mixed = {"params": {**on_host["params"],
-                        "layers_0": variables["params"]["layers_0"]}}
-    with pytest.raises(ValueError, match="a leaf is read from one"):
+                        "layers_2": variables["params"]["layers_2"]}}
+    with pytest.raises(ValueError, match="in its layer layers_2;"):
         scanned.apply(mixed, tokens)
 
 

@@ -2015,33 +2015,31 @@ class CausalTransformer(nn.Module):
                 for first, count in self.groups if count > 1}
         banked = []
         for collection, tree in self.variables.items():
-            names = set(tree)
-            if not names & set(runs):
+            banks = set(tree) & set(runs)
+            if not banks:
                 continue
             mixed = False
             for bank, layers in runs.items():
-                rows = [tree[layer] for layer in layers if layer in tree]
-                if bank not in tree:
-                    if rows:
-                        mixed = True
-                    continue
+                rows = [layer for layer in layers if layer in tree]
                 if not rows:
                     continue
                 mixed = True
+                if bank not in tree:
+                    continue
                 shared = {tuple(entry.key for entry in path)
                           for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
-                for layer, row in zip(layers, rows, strict=False):
+                for layer in rows:
                     overlap = shared & {tuple(entry.key for entry in path)
-                                        for path, _ in jax.tree_util.tree_leaves_with_path(row)}
+                                        for path, _ in jax.tree_util.tree_leaves_with_path(tree[layer])}
                     if overlap:
                         raise ValueError(
                             f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
                             f"the bank {bank} and in its layer {layer}; a leaf is read from one")
             if mixed:
                 continue
-            if not set(runs) <= names:
+            if banks != set(runs):
                 raise ValueError(
-                    f"collection {collection!r} holds the banks {sorted(names & set(runs))} "
+                    f"collection {collection!r} holds the banks {sorted(banks)} "
                     f"of the runs {sorted(runs)} and not the others; a store holds every "
                     f"run's bank or every layer's own subtree")
             banked.append(collection)
