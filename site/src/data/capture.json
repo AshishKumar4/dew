@@ -1,20 +1,20 @@
 {
 	"about": "What site/src/data/hero.py printed, written by site/scripts/capture_snippets.py.",
 	"meta": {
-		"where": "a workstation CPU",
-		"vcpus": 4,
-		"python": "3.13.13",
+		"where": "a workstation",
+		"device": "NVIDIA GeForce RTX 4080",
+		"python": "3.12.13",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.9",
 		"optax": "0.2.8",
-		"dew": "a437d4729e04eecdbf3a0dd00c56498cfa4a6824",
-		"date": "2026-09-24"
+		"dew": "87260db6174855350ffc88ec50f3750453904485",
+		"date": "2026-09-28"
 	},
 	"snippets": {
 		"hero": {
 			"returncode": 0,
-			"seconds": 8.6,
-			"stdout": "Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))\nstep 25: loss 0.0306\nstep 50: loss 0.0102\nstep 75: loss 0.0067\nstep 100: loss 0.0051\nGoodput: first step after 1.99 s, 31.6% of the wall time in steps\ndew trains jax models. dew trains jax model\n"
+			"seconds": 87.2,
+			"stdout": "Training from step 0 to 1500 on 1 \u00d7 NVIDIA GeForce RTX 4080, 14.3M parameters\nstep  150/1500  loss 2.0273  ce 2.0273  perplexity 7.5935  token_accuracy 0.4023  30.3 ms/step  2,114 samples/s  MFU 51.5%  0:00:41 left\nstep  300/1500  loss 1.4972  ce 1.4972  perplexity 4.4691  token_accuracy 0.5389  29.9 ms/step  2,144 samples/s  MFU 52.2%  0:00:36 left\nstep  450/1500  loss 1.4096  ce 1.4096  perplexity 4.0945  token_accuracy 0.5659  29.6 ms/step  2,165 samples/s  MFU 52.7%  0:00:31 left\nstep  600/1500  loss 1.3115  ce 1.3115  perplexity 3.7116  token_accuracy 0.5913  29.6 ms/step  2,165 samples/s  MFU 52.7%  0:00:27 left\nstep  750/1500  loss 1.2531  ce 1.2531  perplexity 3.5011  token_accuracy 0.6052  29.6 ms/step  2,164 samples/s  MFU 52.7%  0:00:22 left\nstep  900/1500  loss 1.2403  ce 1.2403  perplexity 3.4566  token_accuracy 0.6069  29.6 ms/step  2,164 samples/s  MFU 52.7%  0:00:18 left\nstep 1050/1500  loss 1.1786  ce 1.1786  perplexity 3.2499  token_accuracy 0.6247  29.6 ms/step  2,163 samples/s  MFU 52.7%  0:00:13 left\nstep 1200/1500  loss 1.1559  ce 1.1559  perplexity 3.1768  token_accuracy 0.6309  29.6 ms/step  2,161 samples/s  MFU 52.6%  0:00:09 left\nstep 1350/1500  loss 1.1461  ce 1.1461  perplexity 3.1460  token_accuracy 0.6363  29.6 ms/step  2,160 samples/s  MFU 52.6%  0:00:04 left\nstep 1500/1500  loss 1.1432  ce 1.1432  perplexity 3.1368  token_accuracy 0.6346  29.6 ms/step  2,160 samples/s  MFU 52.6%  0:00:00 left\nTrained 1500 steps in 0:00:57: first step after 12.21 s, then 33.8 step/s\n78.4% of the wall time in steps, final loss 1.1432\nROMEO:\nTurn you the rather Clarence! therefore fair bod your power\nIn the namish and my subjecture to lie.\n\nSTANLEY:\nSo the stone of Ireland and children wrongs,\nAnd sweain you that did not where she state.\n\nSecond Citizen:\nDeath, here speak her honour to the court;\nAnd make his movers married to many sla\n"
 		}
 	}
 }
