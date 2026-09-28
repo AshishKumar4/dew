@@ -60,7 +60,7 @@ def deterministic_ops_requested() -> bool:
 # fusions take the whole-logits head's backward from 69 to 261 ms (4088 and
 # 4104 run 75), a 286.0 ms step against 93.4 without them; at 2048, 4080
 # and 16384 tokens the steps run 56.7 -> 53.5, 103.8 -> 94.0 and
-# 420.5 -> 406.3 ms, and tiled heads 3-6% faster. They hold fewer
+# 420.5 -> 406.3 ms, and tiled heads 3-6% faster. They can hold fewer
 # temporaries, so a step that fits only with them keeps them
 # (`dew.training.trainer.fitting_default`). Unmeasured generations, sm86
 # among them, keep XLA's default.
