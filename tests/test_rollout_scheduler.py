@@ -396,14 +396,9 @@ def test_a_rollout_spanning_a_push_keeps_its_oldest_version():
     assert set(batch["versions"][batch["response_mask"] > 0].tolist()) == {0, 1}
 
 
-def test_a_stalled_push_is_pushed_again_and_one_that_never_takes_raises():
+def test_a_push_that_does_not_take_raises():
     source = Scripted(lambda task, submission, sample, version: finished(float(sample), version))
-    publisher = Publisher(stall=1)
-    rollout, data, _ = scheduler(source, publisher, ahead=0)
-    rollout(State(2), next(iter(data.train(DataPartition()))), None)
-    assert publisher.loads == [2, 2] and publisher.version == 2
-
-    rollout, data, _ = scheduler(source, Publisher(stall=5), ahead=0)
+    rollout, data, _ = scheduler(source, Publisher(stall=1), ahead=0)
     with pytest.raises(RuntimeError, match="did not take"):
         rollout(State(2), next(iter(data.train(DataPartition()))), None)
 
