@@ -1,0 +1,24 @@
+Mesh {'data': 2, 'expert': 2, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1} over 8 cpu device(s)
+Expert kernel (8, 64, 128) placed as P('expert', None, 'fsdp')
+The compiled training step runs 24 all-to-all operations over mesh['data'=2,'expert'=2,'fsdp'=2,'tensor'=1,'sequence'=1,'stage'=1] {'expert'}
+step 25: loss 2.024
+step 50: loss 0.998
+step 75: loss 0.991
+step 100: loss 0.858
+step 125: loss 0.639
+step 150: loss 0.530
+step 175: loss 0.558
+step 200: loss 0.592
+step 225: loss 0.575
+step 250: loss 0.698
+step 275: loss 0.589
+step 300: loss 0.588
+'the cat ' -> 'wants the moon.'
+'a dog li' -> 'kes the moon.'
+'my frien' -> 'd wants the moon.'
+'12+30=' -> '44'
+'7+41=' -> '47'
+'x = y * ' -> '2;'
+'total = ' -> 'count * 2;'
+'count = ' -> 'count * 2;'
+Wrote /mnt/scratch/dew/tmp/moe-final/moe-mesh.svg and /mnt/scratch/dew/tmp/moe-final/moe-mesh.json

@@ -1,10 +1,12 @@
 """Sample Dew's pretrained text-to-image model over prompts, seeds and samplers.
 
 Run from the repository root on a GPU, with a Dew run directory:
+
     python examples/sample_text_to_image.py --checkpoint RUN_DIR
 
 or with one step of a FlaxDiff checkpoint and the config its trainer logged,
 read through `dew.interop.flaxdiff`:
+
     python examples/sample_text_to_image.py --checkpoint udit_ema/350000 \
         --flaxdiff-config udit_config.json
 
