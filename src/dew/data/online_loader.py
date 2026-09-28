@@ -1,10 +1,11 @@
-"""Images fetched by url while a run trains, behind `OnlineImages`.
+"""Images and video clips fetched by url while a run trains, behind
+`OnlineImages` and `OnlineVideos`.
 
 The rows are Hugging Face `datasets` tables of urls and captions. A pool of
 worker processes walks them forever, a shard each and many threads per
 worker, fetching and decoding every url and putting the finished samples on
-one bounded queue. `ImageStream` takes `batch` samples off that queue at a
-time. A fetch that fails, or an image not worth training on, is counted and
+one bounded queue. `UrlStream` takes `batch` samples off that queue at a
+time. A fetch that fails, or a sample not worth training on, is counted and
 dropped; nothing is ever filled in for it.
 """
 
@@ -18,6 +19,7 @@ import multiprocessing
 import multiprocessing.queues
 import multiprocessing.synchronize
 import queue
+import tempfile
 import threading
 import time
 import urllib.request
@@ -46,8 +48,9 @@ CAPTION_COLUMNS = ("caption", "CAPTION", "text", "TEXT", "txt")
 MAX_ASPECT = 2.4
 
 Sample = tuple[np.ndarray, str]
-"""The pixels at the stream's size and the row's caption, queued for a url
-that yielded an image. A dropped url is queued as the url."""
+"""The pixels at the stream's size, an image or a clip of frames, and the
+row's caption, queued for a url that yielded one. A dropped url is queued as
+the url."""
 
 # The fetcher's worker processes are started without forking this one. This
 # loader runs inside a training process, and os.fork carries over only the
@@ -161,6 +164,32 @@ def prepare_image(pixels: np.ndarray, size: int, min_size: int) -> np.ndarray | 
                               cv2.BORDER_CONSTANT, value=(255, 255, 255))
 
 
+def prepare_clip(blob: bytes, frames: int, size: int, min_size: int) -> np.ndarray | None:
+    """`frames` consecutive frames of the video in `blob` from a random start,
+    each resized to a `size` square, or None when the bytes are no video that
+    long or its frames are under `min_size` on their shorter side.
+
+    The frames are read at 25 fps and resized the way `VideoDataset` reads a
+    local clip. The decoder reads a file, so the bytes are written to one
+    under the temporary directory for the length of the read.
+    """
+    from .sources.av_utils import read_random_frames
+    from .video import fit_frames
+
+    with tempfile.NamedTemporaryFile() as file:
+        file.write(blob)
+        file.flush()
+        try:
+            clip, _ = read_random_frames(file.name, num_frames=frames, padding=0,
+                                         seed=int(np.random.default_rng().integers(0, 2**32 - 1)))
+        except (OSError, ValueError) as error:
+            _log.debug("undecodable video of %d bytes: %s", len(blob), error)
+            return None
+    if min(clip.shape[1:3]) < min_size:
+        return None
+    return fit_frames(clip, size)
+
+
 @dataclasses.dataclass(frozen=True)
 class Fetch:
     """Says how a worker turns one url into a sample."""
@@ -169,6 +198,8 @@ class Fetch:
     min_size: int
     timeout: float
     retries: int
+    frames: int | None = None
+    """None fetches an image; a count fetches a clip of that many frames."""
 
 
 def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues.Queue,
@@ -177,9 +208,14 @@ def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues
     if stop is not None and stop.is_set():
         return
     blob = fetch_bytes(url, fetch.timeout, fetch.retries)
-    pixels = None if blob is None else decode_pixels(blob)
-    image = None if pixels is None else prepare_image(pixels, fetch.size, fetch.min_size)
-    sample = url if image is None else (image, caption)
+    if blob is None:
+        pixels = None
+    elif fetch.frames is None:
+        image = decode_pixels(blob)
+        pixels = None if image is None else prepare_image(image, fetch.size, fetch.min_size)
+    else:
+        pixels = prepare_clip(blob, fetch.frames, fetch.size, fetch.min_size)
+    sample = url if pixels is None else (pixels, caption)
     while stop is None or not stop.is_set():
         try:
             sink.put(sample, timeout=0.05)
@@ -266,9 +302,11 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
             shutdown.wait()
 
 
-class ImageStream:
+class UrlStream:
     """Yields endless batches of fetched images,
-    `{"image": uint8 [batch, size, size, 3], "caption": [batch] str}`.
+    `{"image": uint8 [batch, size, size, 3], "caption": [batch] str}`, or of
+    clips, `{"video": uint8 [batch, frames, size, size, 3], ...}`, when
+    `fetch` names a frame count.
 
     A batch is `batch` samples the fetchers really produced, and a quiet
     queue is no batch. While production runs the stream keeps waiting. When
@@ -282,10 +320,10 @@ class ImageStream:
     over it does not checkpoint.
     """
 
-    def __init__(self, rows: Dataset, *, batch: int, size: int, min_size: int,
-                 workers: int, threads: int, timeout: float, retries: int,
+    def __init__(self, rows: Dataset, *, batch: int, fetch: Fetch, workers: int, threads: int,
                  prefetch: int, queue_timeout: float = 60.0):
         self.batch = batch
+        self.field = "image" if fetch.frames is None else "video"
         self.queue_timeout = queue_timeout
         self.dropped = 0
         self.samples: multiprocessing.queues.Queue | None = _WORKER_CONTEXT.Queue(prefetch * batch)
@@ -295,7 +333,6 @@ class ImageStream:
         self._closed = False
         self._error: BaseException | None = None
         self._waiting_logged = False
-        fetch = Fetch(size=size, min_size=min_size, timeout=timeout, retries=retries)
 
         # The fetcher's exception is kept for `__next__` to re-raise.
         def produce() -> None:
@@ -313,17 +350,17 @@ class ImageStream:
         self.fetcher = threading.Thread(target=produce, daemon=True)
         self.fetcher.start()
 
-    def __iter__(self) -> ImageStream:
+    def __iter__(self) -> UrlStream:
         return self
 
     def __next__(self) -> Batch:
         samples = self.samples
         if samples is None:
             raise StopIteration
-        images: list[np.ndarray] = []
+        pixels: list[np.ndarray] = []
         captions: list[str] = []
         waiting_since = time.monotonic()
-        while len(images) < self.batch:
+        while len(pixels) < self.batch:
             if self._stop.is_set():
                 raise StopIteration
             try:
@@ -336,12 +373,12 @@ class ImageStream:
             if isinstance(sample, str):
                 self.dropped += 1
                 continue
-            pixels, caption = sample
-            images.append(pixels)
+            media, caption = sample
+            pixels.append(media)
             captions.append(caption)
         if self._stop.is_set():
             raise StopIteration
-        return {"image": np.stack(images), CAPTION: np.asarray(captions)}
+        return {self.field: np.stack(pixels), CAPTION: np.asarray(captions)}
 
     def _finish(self, error: BaseException | None) -> None:
         self._error = error

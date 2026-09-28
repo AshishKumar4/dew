@@ -50,6 +50,39 @@ def audio_window(path: str, start: float, duration: float, sample_rate: int) -> 
     return np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
 
 
+def read_random_frames(path: str, *, num_frames: int, padding: int, seed: int,
+                       fps: float = 25.0) -> tuple[np.ndarray, int]:
+    """`num_frames` consecutive frames of `path` sampled at `fps`, as uint8
+    `[num_frames, H, W, 3]` RGB, and the index of the first.
+
+    The start is the one `seed` picks leaving `padding` frames free on
+    either side, so a caller can read the sound around the clip.
+    """
+    from moviepy import VideoFileClip
+
+    padded_frames = num_frames + 2 * padding
+    with VideoFileClip(path, audio=False) as video:
+        if video.duration is None:
+            raise ValueError(f"{path} reports no duration, so no clip can be cut from it")
+        total_frames = int(video.duration * fps)
+        if total_frames < padded_frames:
+            raise ValueError(
+                f"{path} has {total_frames} frames at {fps} fps and a clip of "
+                f"{num_frames} with {padding} of padding needs {padded_frames}")
+        start = choose_clip_start(total_frames, num_frames, padding, np.random.default_rng(seed))
+        # One frame per index, asked for by its own time. The reader seeks
+        # to the first and steps to the rest, where a subclip's iterator
+        # enumerates times from a float duration and can come up one short.
+        decoded: list[np.ndarray] = []
+        for index in range(num_frames):
+            timestamp = (start + index) / fps
+            frame = video.get_frame(timestamp)
+            if frame is None:
+                raise ValueError(f"{path} returned no video frame at {timestamp} seconds")
+            decoded.append(frame)
+    return np.stack(decoded), start
+
+
 def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed: int,
                         sample_rate: int = 16000, fps: float = 25.0
                         ) -> tuple[np.ndarray, np.ndarray]:
@@ -62,8 +95,6 @@ def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed:
     sample_rate / fps]`, so row `audio_padding + i` is the sound under frame
     `i`; the rate therefore has to be a whole number of samples per frame.
     """
-    from moviepy import VideoFileClip
-
     samples_per_frame = sample_rate / fps
     if not samples_per_frame.is_integer():
         raise ValueError(
@@ -72,30 +103,10 @@ def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed:
     samples_per_frame = int(samples_per_frame)
     padded_frames = num_frames + 2 * audio_padding
 
-    # The audio is not opened here. A file without a track fails in
-    # audio_window with ffmpeg's own words for it.
-    with VideoFileClip(path, audio=False) as video:
-        if video.duration is None:
-            raise ValueError(f"{path} reports no duration, so no clip can be cut from it")
-        total_frames = int(video.duration * fps)
-        if total_frames < padded_frames:
-            raise ValueError(
-                f"{path} has {total_frames} frames at {fps} fps and a clip of "
-                f"{num_frames} with {audio_padding} of padding needs {padded_frames}")
-        start = choose_clip_start(total_frames, num_frames, audio_padding,
-                                  np.random.default_rng(seed))
-        # One frame per index, asked for by its own time. The reader seeks
-        # to the first and steps to the rest, where a subclip's iterator
-        # enumerates times from a float duration and can come up one short.
-        decoded: list[np.ndarray] = []
-        for index in range(num_frames):
-            timestamp = (start + index) / fps
-            frame = video.get_frame(timestamp)
-            if frame is None:
-                raise ValueError(f"{path} returned no video frame at {timestamp} seconds")
-            decoded.append(frame)
-        frames = np.stack(decoded)
-
+    # The audio is not opened with the frames. A file without a track fails
+    # in audio_window with ffmpeg's own words for it.
+    frames, start = read_random_frames(path, num_frames=num_frames, padding=audio_padding,
+                                       seed=seed, fps=fps)
     samples = audio_window(path, (start - audio_padding) / fps, padded_frames / fps, sample_rate)
     needed = padded_frames * samples_per_frame
     if len(samples) < needed:

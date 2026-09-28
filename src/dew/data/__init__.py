@@ -55,7 +55,7 @@ from .sources.text import (
     TokenWindowSource,
 )
 from .sources.tfds import TFDSOptions
-from .streaming import CombinedOnline, OnlineImages
+from .streaming import CombinedOnline, OnlineImages, OnlineVideos
 from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
@@ -67,7 +67,7 @@ __all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "DatasetSpec", "DiffusionDB",
            "HFDatasetSource", "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
            "Laion2bAesthetic", "Laion12mCoco",
-           "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers",
+           "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
            "TFDSOptions", "TokenBytes", "TokenColumn",
