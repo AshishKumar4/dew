@@ -4,7 +4,7 @@ Samples from models trained with Dew. [Diffusion training](guides/diffusion.md) 
 
 ## Text-to-image, 176M hybrid DiT
 
-A latent text-to-image model with a hybrid DiT denoiser (state-space and attention blocks), trained with Dew, sampled at step 1,350,000 from its EMA weights. It generates 256×256 images through the Stable Diffusion VAE, conditioned on a CLIP text encoder.
+A latent text-to-image model with a hybrid DiT denoiser (state-space and attention blocks), trained with Dew, sampled at step 1,350,000 from its EMA weights. It generates 256×256 images through the Stable Diffusion VAE, conditioned on a CLIP text encoder. The weights are public on the Hugging Face Hub as [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
 
 | Component | Parameters |
 |---|---|
