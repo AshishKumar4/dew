@@ -487,7 +487,7 @@ The Python-only `recipes.chain.Recipe` takes a shared decoder, optimizer, key, o
 
 In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead. For a fresh chain, use distinct stage names and a new run directory. The returned list keeps every stage's final state, so a long chain can hold a lot of memory.
 
-The chain exposes `beta`, `reward`, `groups`, `max_new_tokens` and `sample`. It does not expose the rollout's `decode`, `eos_id` or `temperature`, so its default reward input is token-ID text. For rewards on decoded text or for stop tokens, build `SampledRollout` and `Trainer` yourself. The [LM command-line recipe](../recipes.md) accepts the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files. It is not a command-line SFT, DPO and GRPO chain.
+The chain exposes `beta`, `reward`, `groups`, `max_new_tokens` and `estimator`. It does not expose the rollout's `decode`, `eos_id` or `temperature`, so its default reward input is token-ID text. For rewards on decoded text or for stop tokens, build `SampledRollout` and `Trainer` yourself. The [LM command-line recipe](../recipes.md) accepts the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files. It is not a command-line SFT, DPO and GRPO chain.
 
 ## Limits and evidence
 
