@@ -77,6 +77,7 @@ The run records in `dew.telemetry.records` are:
 
 - `RunRecord`: the resolved model, data and optimizer configuration, and package versions.
 - `FitStarted`.
+- `StepCompiled`: a training step compiled for a new batch shape, with the seconds it took, the remat it compiled under and the tensor axis's placement.
 - `CheckpointRequested`: records that a checkpoint save was submitted asynchronously, not that it is durable. Checkpoint waits work as before this record was added.
 - `ProfileWindow`: the directory a `Trainer` profile window wrote and the number of steps it traced. It is reported once the trace has stopped, and it copies no per-step layer tensors. A standalone `dew.profile` capture writes its own directory and reports no record.
 - `FitEnded`.
