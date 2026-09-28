@@ -1573,13 +1573,12 @@ class CausalTransformer(nn.Module):
                  input_embeddings=None, embedding_positions=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
-        x, prediction = self.hidden_and_mtp_inputs(tokens, train=train, decode=decode,
-                               positions=positions, segment_ids=segment_ids,
-                               input_embeddings=input_embeddings,
-                               embedding_positions=embedding_positions, attention_mask=attention_mask,
-                               image_groups=image_groups, rotary_positions=rotary_positions,
-                               attention_pairwise_mask=attention_pairwise_mask,
-                               attention_key_positions=attention_key_positions)
+        x, prediction = self.hidden_and_mtp_inputs(
+            tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
+            attention_mask=attention_mask, image_groups=image_groups,
+            rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
+            attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1652,14 +1651,15 @@ class CausalTransformer(nn.Module):
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
         # build a mask and drop off the fused kernel.
-        restricted = attention_mask is not None or segment_ids is not None
-        valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
-                 ) if restricted else None
+        valid = None
+        if segment_ids is not None or attention_mask is not None:
+            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                valid = valid[:, :-1] & (jnp.ones(tokens[:, depth:].shape, bool)
-                                         if attention_mask is None else attention_mask[:, depth:])
+                valid = valid[:, :-1]
+                if attention_mask is not None:
+                    valid = valid & attention_mask[:, depth:]
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             metadata = AttentionMetadata(
@@ -1792,18 +1792,16 @@ class CausalTransformer(nn.Module):
                   jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
                   prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
-
-
     def hidden_states(self, tokens, **kwargs):
         """The final normalized states, excluding the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None,
-                      input_embeddings=None, embedding_positions=None,
-                      attention_mask=None, image_groups=None, rotary_positions=None,
-                      attention_pairwise_mask=None, attention_key_positions=None,
-                      routed_experts=None, routed=None, media_mask=None):
+                              positions=None, segment_ids=None,
+                              input_embeddings=None, embedding_positions=None,
+                              attention_mask=None, image_groups=None, rotary_positions=None,
+                              attention_pairwise_mask=None, attention_key_positions=None,
+                              routed_experts=None, routed=None, media_mask=None):
         """The final normalized states and the prediction depth's input.
 
         V4's depth reads the raw residual streams before the collapse head
