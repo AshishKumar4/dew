@@ -1,10 +1,8 @@
-"""dew.interop.flaxdiff: FlaxDiff 0.2's SimpleUDiT, its names and its config,
-onto Dew's SimpleUDiT.
+"""FlaxDiff 0.2 DiTs, their names and configs, onto Dew's models.
 
-tools/flaxdiff_reference.py ran FlaxDiff's own SimpleUDiT at commit 3e3497e
-(the code flaxdiff 0.2.8 shipped) on CPU at fp32 and wrote the fixture:
-random weights under FlaxDiff's names, the inputs, the text mask a Dew
-caller hands the model beside them, and FlaxDiff's output.
+tools/flaxdiff_reference.py ran the original SimpleUDiT (3e3497e) and
+hybrid DiT (94d2d21) on CPU at fp32. The fixtures contain random weights,
+fixed inputs and original outputs, with a text mask for Dew's caller.
 """
 
 import json
@@ -21,6 +19,8 @@ from dew import models
 from dew.interop.flaxdiff import (
     flaxdiff_weights,
     fourier_table,
+    hybrid_dit_fields,
+    hybrid_dit_variables,
     read_checkpoint,
     simple_udit_fields,
     simple_udit_variables,
@@ -37,19 +37,30 @@ FIXTURE = Path(__file__).parent / "fixtures" / "flaxdiff"
 TOLERANCE = 1e-6
 
 
-@pytest.fixture(scope="module")
-def reference():
-    with np.load(FIXTURE / "reference.npz") as arrays:
+def read_reference(directory):
+    with np.load(directory / "reference.npz") as arrays:
         data = {name: arrays[name] for name in arrays.files}
-    config = json.loads((FIXTURE / "config.json").read_text())
+    config = json.loads((directory / "config.json").read_text())
     weights = unflatten_dict({name.removeprefix("params/"): value for name, value in data.items()
                               if name.startswith("params/")}, sep="/")
     return config["model"], weights, data
 
 
-def dew_output(model_config, weights, data):
-    model = models.build("simple_udit", simple_udit_fields(model_config))
-    variables = simple_udit_variables(weights, model_config, jax_version="0.5.3")
+@pytest.fixture(scope="module")
+def reference():
+    return read_reference(FIXTURE)
+
+
+@pytest.fixture(scope="module")
+def hybrid_reference():
+    return read_reference(FIXTURE / "hybrid_dit")
+
+
+def dew_output(model_config, weights, data, architecture="simple_udit"):
+    fields = hybrid_dit_fields if architecture == "hybrid_dit" else simple_udit_fields
+    convert = hybrid_dit_variables if architecture == "hybrid_dit" else simple_udit_variables
+    model = models.build(architecture, fields(model_config))
+    variables = convert(weights, model_config, jax_version="0.5.3")
     with jax.default_matmul_precision("highest"):
         return np.asarray(model.apply(variables, data["x"], data["temb"],
                                       TextContext(data["text"], data["text_mask"])))
@@ -59,6 +70,17 @@ def test_simple_udit_computes_what_flaxdiff_computed(reference):
     """Names, config and Fourier table mapped, Dew's model gives FlaxDiff's output."""
     model_config, weights, data = reference
     assert np.max(np.abs(dew_output(model_config, weights, data) - data["output"])) < TOLERANCE
+
+
+def test_hybrid_dit_computes_what_flaxdiff_computed(hybrid_reference):
+    """S5, 2D fusion, zigzag order and attention compute the trained architecture."""
+    # CPU fp32 max error is 1.12e-8. Project-then-pool in the reference and
+    # pool-then-project here round their reductions differently; 1e-6 leaves
+    # room for backend rounding on outputs of order 0.1. Restoring SiLU or
+    # real-token pooling moves this fixture by 2.44e-4 or 5.93e-4 respectively.
+    model_config, weights, data = hybrid_reference
+    actual = dew_output(model_config, weights, data, "hybrid_dit")
+    assert np.max(np.abs(actual - data["output"])) < TOLERANCE
 
 
 def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
