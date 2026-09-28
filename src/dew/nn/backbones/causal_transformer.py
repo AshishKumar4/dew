@@ -1204,58 +1204,26 @@ class CausalTransformer(nn.Module):
         parallel branch, each a partial the block calls with a name. A
         model with no mixture has only the first.
         """
-        mixture = self.mixture
-        # The shared branch is the dense feed-forward at the mixture's shared
-        # width, handed to the sparse layer as a factory the way the block
-        # takes its own slots.
+        init_std, output_init_std = self.init_stds
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
-        init_std, output_init_std = self.init_stds
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
-        shared = None if mixture is None or not mixture.shared_features else functools.partial(
-            gated_mlp, hidden_features=mixture.shared_features)
-        routed = None if mixture is None else functools.partial(
-            SparseMLP,
-            num_experts=mixture.experts,
-            top_k=mixture.top_k,
-            hidden_features=(self.hidden_features
-                             if mixture.expert_features is None
-                             else mixture.expert_features),
-            out_features=self.emb_features,
-            activation=self.mlp,
-            implementation=mixture.implementation,
-            dispatch=mixture.dispatch,
-            capacity_factor=mixture.capacity_factor,
-            score_function=mixture.score_function,
-            normalize_weights=mixture.norm_topk_prob,
-            routed_scaling_factor=mixture.scaling,
-            expert_groups=mixture.groups,
-            groups_per_token=mixture.groups_per_token,
-            group_score=mixture.group_score,
-            expert_bias=mixture.bias,
-            media_bias=mixture.media_bias,
-            scale_inputs=mixture.scale_inputs,
-            swiglu_limit=self.swiglu_limit,
-            shared=shared,
-            shared_gate=mixture.shared_gate,
-            init_std=init_std,
-            output_init_std=output_init_std,
-            latent_features=mixture.latent_features,
-            latent_norm=None if not mixture.latent_norm else functools.partial(
-                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype),
-            dtype=self.dtype,
-            precision=self.precision)
-        parallel = None if mixture is None or not mixture.parallel else functools.partial(
+        mixture = self.mixture
+        if self.mlp == 'swigluoai' and (mixture is None or mixture.shared_features
+                                        or len(self.sparse_layers) != self.num_layers):
+            raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+        if mixture is None:
+            return gated_mlp, None, None
+        expert_features = (self.hidden_features if mixture.expert_features is None
+                           else mixture.expert_features)
+        parallel = None if not mixture.parallel else functools.partial(
             Gemma4Experts,
             num_experts=mixture.experts,
             top_k=mixture.top_k,
-            hidden_features=(self.hidden_features
-                             if mixture.expert_features is None
-                             else mixture.expert_features),
+            hidden_features=expert_features,
             out_features=self.emb_features,
             activation=self.mlp,
             implementation=mixture.implementation,
@@ -1266,12 +1234,7 @@ class CausalTransformer(nn.Module):
             scale_after_cast=self.scale_after_cast,
             dtype=self.dtype,
             precision=self.precision)
-        if parallel is not None:
-            # The branch rides beside every sparse layer's dense feed-forward.
-            routed = None
         if self.mlp == 'swigluoai':
-            if mixture is None or mixture.shared_features or len(self.sparse_layers) != self.num_layers:
-                raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,
@@ -1280,6 +1243,43 @@ class CausalTransformer(nn.Module):
                 dispatch=mixture.dispatch,
                 capacity_factor=mixture.capacity_factor,
                 dtype=self.dtype, precision=self.precision)
+        elif mixture.parallel:
+            # The branch rides beside every sparse layer's dense feed-forward.
+            routed = None
+        else:
+            routed = functools.partial(
+                SparseMLP,
+                num_experts=mixture.experts,
+                top_k=mixture.top_k,
+                hidden_features=expert_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                implementation=mixture.implementation,
+                dispatch=mixture.dispatch,
+                capacity_factor=mixture.capacity_factor,
+                score_function=mixture.score_function,
+                normalize_weights=mixture.norm_topk_prob,
+                routed_scaling_factor=mixture.scaling,
+                expert_groups=mixture.groups,
+                groups_per_token=mixture.groups_per_token,
+                group_score=mixture.group_score,
+                expert_bias=mixture.bias,
+                media_bias=mixture.media_bias,
+                scale_inputs=mixture.scale_inputs,
+                swiglu_limit=self.swiglu_limit,
+                # The shared branch is the dense feed-forward at the mixture's
+                # shared width, a factory the sparse layer builds like a slot.
+                shared=None if not mixture.shared_features else functools.partial(
+                    gated_mlp, hidden_features=mixture.shared_features),
+                shared_gate=mixture.shared_gate,
+                init_std=init_std,
+                output_init_std=output_init_std,
+                latent_features=mixture.latent_features,
+                latent_norm=None if not mixture.latent_norm else functools.partial(
+                    RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                    scale_after_cast=self.scale_after_cast, dtype=self.dtype),
+                dtype=self.dtype,
+                precision=self.precision)
         return gated_mlp, routed, parallel
 
     def setup(self):
