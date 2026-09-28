@@ -1771,7 +1771,7 @@ class NormalAttention(nn.Module):
         # for it (`split_positions`).
         query = constrain(self.query(x), HEADS)
         key, value = split_positions(
-            context, 2 * self.heads * self.dim_head,
+            context, (self.heads, self.dim_head),
             lambda tokens: (constrain(self.key(tokens), HEADS), constrain(self.value(tokens), HEADS)))
         if self.qk_norm:
             query = self.q_norm(query)

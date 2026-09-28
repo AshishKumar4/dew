@@ -104,7 +104,7 @@ class _Attention(nn.Module):
         def project(value, name):
             return constrain(nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
                                              precision=self.precision, name=name)(value), HEADS)
-        keys, values = split_positions(context, 2 * self.features,
+        keys, values = split_positions(context, (self.heads, depth),
                                        lambda tokens: (project(tokens, "k"), project(tokens, "v")))
         attended = scaled_dot_product_attention(project(x, "q"), keys, values,
             dtype=self.dtype, precision=self.precision, implementation=self.attention_impl)
