@@ -18,7 +18,11 @@ from ..dit import (
 
 @models("simple_dit")
 class SimpleDiT(nn.Module):
-    """Standard DiT: a plain stack of adaLN-Zero attention blocks."""
+    """Standard DiT: a plain stack of adaLN-Zero attention blocks.
+
+    `adaln_silu=False` and `text_pooling="all"` use FlaxDiff 0.2's
+    conditioning, as in `SimpleUDiT`.
+    """
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
@@ -34,6 +38,8 @@ class SimpleDiT(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
     remat: RematChoice = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
+    adaln_silu: bool = True
+    text_pooling: Literal["real", "all"] = "real"
 
 
     def setup(self):
@@ -49,6 +55,7 @@ class SimpleDiT(nn.Module):
             mlp_ratio=self.mlp_ratio,
             dtype=self.dtype,
             precision=self.precision,
+            text_pooling=self.text_pooling,
         )
         self.blocks = self.stack()
         self.output = PatchSequenceOutput(
@@ -72,6 +79,7 @@ class SimpleDiT(nn.Module):
                 precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 norm_epsilon=self.norm_epsilon,
+                adaln_silu=self.adaln_silu,
                 qk_norm=self.qk_norm,
                 attention_impl=self.attention_impl,
                 name=f"dit_block_{i}"
