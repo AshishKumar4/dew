@@ -49,8 +49,6 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-On four cores of a workstation CPU it prints:
-
 Output on four cores of a workstation CPU:
 
 ```text
@@ -64,7 +62,7 @@ Trained 100 steps in 0:00:02: first step after 1.53 s, then 129.8 step/s
 dew trains jax models. dew trains jax model
 ```
 
-Each logged line shows the loss and the objective's metrics (for `LMObjective`: cross entropy, perplexity and token accuracy) over the last interval. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
+Each `step` line shows the loss and the objective's metrics (for `LMObjective`: cross entropy, perplexity and token accuracy) of that step, and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
 
 ## Model
 
