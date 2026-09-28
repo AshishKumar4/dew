@@ -406,13 +406,13 @@ class _FitRun:
 class _Interval:
     """What `fit` sums between logs and between checkpoints.
 
-    `book` is the interval's loss and both bad-loss counters, on device, so
-    the loop never blocks on a result, and they move together in one
-    dispatch; the host reads them at the logging cadence. `steps` counts
-    since the last checkpoint, `since_log` since the last log. The records
-    and FLOPs are summed per step rather than taken off the dataset's batch,
-    so a ramped interval reports the records it read and their FLOPs.
-    `rollout_seconds` is the time spent sampling, logged under
+    `book` is the loss summed since the last checkpoint and both bad-loss
+    counters, on device, so the loop never blocks on a result, and they move
+    together in one dispatch; the host reads them at the logging cadence.
+    `steps` counts since the last checkpoint, the rest since the last log.
+    The records and FLOPs are summed per step rather than taken off the
+    dataset's batch, so a ramped interval reports the records it read and
+    their FLOPs. `rollout_seconds` is the time spent sampling, logged under
     train/rollout_seconds when a rollout is set."""
 
     book: Book
@@ -431,6 +431,34 @@ class _Interval:
         self.samples += rows_of(batch)
         self.flops = None if self.flops is None or flops is None else self.flops + flops
         self.book = bookkeep(self.book, loss, finite)
+
+    def check_finite(self, step: int) -> None:
+        """Raise RuntimeError once the loss has been non-finite for
+        BAD_LOSS_STEPS steps, and start the longest streak over.
+
+        Deferred to the logging cadence so the step loop never synchronises;
+        detection is late by at most that many steps, never missed.
+        """
+        loss, bad_run, worst_bad_run = self.book
+        streak = int(worst_bad_run)
+        if streak >= BAD_LOSS_STEPS:
+            raise RuntimeError(
+                f"Loss has been non-finite for {streak} consecutive steps "
+                f"ending near step {step}, stopping")
+        if streak:
+            print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
+        self.book = (loss, bad_run, jnp.zeros((), jnp.int32))
+
+    def logged(self, now: float) -> None:
+        """Start the next logging interval at `now`."""
+        self.last_log_time, self.since_log, self.samples = now, 0, 0
+        self.flops, self.rollout_seconds = 0.0, 0.0
+
+    def saved(self, step: int) -> None:
+        """Start the next checkpoint interval after the one saved at `step`."""
+        loss, bad_run, worst_bad_run = self.book
+        self.last_saved, self.steps = step, 0
+        self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -1184,17 +1212,8 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, steps, checkpoints = run.current, plan.steps, self.checkpoints
         if current % plan.log_every == 0:
-            interval_loss, _, worst_bad_run = interval.book
-            self._check_finite(worst_bad_run, current)
-            interval.book = (interval_loss, interval.book[1], jnp.zeros((), jnp.int32))
-            now = self._log_interval(
-                current, loss, aux, accepted, state, since=interval.last_log_time,
-                steps=interval.since_log, samples=interval.samples,
-                flops=interval.flops, rollout_seconds=interval.rollout_seconds,
-                process_zero=run.process_zero)
-            if now is not None:
-                interval.last_log_time, interval.since_log, interval.rollout_seconds = now, 0, 0.0
-                interval.samples, interval.flops = 0, 0.0
+            interval.check_finite(current)
+            self._log_interval(current, loss, aux, accepted, state, interval)
 
         if plan.eval_every and current % plan.eval_every == 0 and current < steps:
             run.other += self._timed_evaluation(
@@ -1204,11 +1223,7 @@ class Trainer(Generic[Loss, Effects]):
         # which does not divide log_every still fires.
         if (plan.checkpoint_every and checkpoints is not None
                 and current % plan.checkpoint_every == 0 and current < steps):
-            run.other += self._saved_checkpoint(checkpoints, current, state, position,
-                                                interval.book, interval.steps)
-            interval.last_saved = current
-            interval.book = (jnp.zeros_like(interval.book[0]), interval.book[1], interval.book[2])
-            interval.steps = 0
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
         if (plan.local_every and checkpoints is not None
                 and current % plan.local_every == 0 and current < steps):
             run.other += self._saved_local_checkpoint(
@@ -1218,9 +1233,7 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         if current < steps and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
-                run.other += self._saved_checkpoint(checkpoints, current, state, position,
-                                                    interval.book, interval.steps)
-                interval.last_saved = current
+                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
             run.preempted = current
             return True
         return False
@@ -1256,25 +1269,19 @@ class Trainer(Generic[Loss, Effects]):
             # next one down with it.
             assert profiler is not None
             self._stop_trace(run.traced, loss, profile, profiler, step=current)
-        interval_loss, _, worst_bad_run = interval.book
-        self._check_finite(worst_bad_run, current)
+        interval.check_finite(current)
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
-        paused = time.perf_counter()
         if plan.eval_every and run.preempted is None:
-            self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview, mesh)
+            run.other += self._timed_evaluation(
+                state, shardings, plan.dataset, plan.metrics, plan.preview, mesh)
         if checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
             # step: a step-0 checkpoint holding the final weights would
             # make a resume restart the schedule from the beginning.
-            checkpoints.save(
-                current, state, position,
-                {"loss": float(interval_loss / interval.steps)} if interval.steps else None,
-                share=data_partition(mesh))
-            self._report(CheckpointRequested(checkpoints.directory), current)
-        run.other += time.perf_counter() - paused
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
@@ -1447,16 +1454,18 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
-                          position: bytes | None, book: Book, interval_steps: int) -> float:
-        """Write one checkpoint with the interval's mean loss, and report it.
+                          position: bytes | None, interval: _Interval) -> float:
+        """Write one checkpoint with the interval's mean loss, report it and
+        start the next interval.
 
         Returns the seconds it took, the reading of the interval's loss
         included: that read waits on the device, and the wait is time the
         steps did not have."""
         paused = time.perf_counter()
-        checkpoints.save(step, state, position, {"loss": float(book[0] / interval_steps)},
-                         share=data_partition(self.device_mesh))
+        metadata = {"loss": float(interval.book[0] / interval.steps)} if interval.steps else None
+        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(checkpoints.directory), step)
+        interval.saved(step)
         return time.perf_counter() - paused
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int,
@@ -1471,38 +1480,36 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, *, since: float, steps: int,
-                      samples: int, flops: float | None, rollout_seconds: float,
-                      process_zero: bool) -> float | None:
-        """Report one logging interval, returning the clock the next one starts from.
+                      accepted: jax.Array, state: TrainState, interval: _Interval) -> None:
+        """Report one logging interval and start the next.
 
-        Rank zero builds the row and returns the time it read; every other
-        rank has nothing to report and returns None. The report is agreed, so
-        a tracker that failed on rank zero stops its peers here rather than
-        at their next collective.
+        Rank zero builds the row; every other rank has nothing to report.
+        The report is agreed, so a tracker that failed on rank zero stops its
+        peers here rather than at their next collective.
         """
-        def report() -> float | None:
-            if not process_zero:
-                return None
+        def report() -> None:
+            if jax.process_index() != 0:
+                return
             # The interval's numbers need the loss on the host, so this is
             # where the loop waits on the device.
             loss.block_until_ready()
             now = time.time()
             scalars = {"train/loss": float(loss),
                        **{f"train/{k}": float(v) for k, v in aux.items()},
-                       **self._throughput(now - since, steps, samples, flops)}
+                       **self._throughput(now - interval.last_log_time, interval.since_log,
+                                          interval.samples, interval.flops)}
             scalars["train/accepted"] = float(accepted)
             if state.scale is not None:
                 scalars["train/loss_scale"] = float(state.scale.scale)
             if self.rollout is not None:
-                scalars["train/rollout_seconds"] = rollout_seconds
+                scalars["train/rollout_seconds"] = interval.rollout_seconds
             print(f"step {step}: loss {scalars['train/loss']:.4f}")
             if self.tracker is not None:
                 self.tracker.log(scalars, step)
-            return now
+            interval.logged(now)
 
         with region("log"):
-            return agreed("training reporting", report)
+            agreed("training reporting", report)
 
     def _cleaned_up(self, primary: BaseException | None, close: Callable[[], None] | None,
                     stop_trace: Callable[[], None] | None,
@@ -1658,20 +1665,6 @@ class Trainer(Generic[Loss, Effects]):
         agreed("profile stop", stop)
         self._report(ProfileWindowRecord(profile.directory, traced), step)
         agreed("profile announcement", announce)
-
-    def _check_finite(self, worst_bad_run, step: int):
-        """Raise RuntimeError once the loss has been non-finite for BAD_LOSS_STEPS steps.
-
-        Deferred to the logging cadence so the step loop never synchronises;
-        detection is late by at most that many steps, never missed.
-        """
-        streak = int(worst_bad_run)
-        if streak >= BAD_LOSS_STEPS:
-            raise RuntimeError(
-                f"Loss has been non-finite for {streak} consecutive steps "
-                f"ending near step {step}, stopping")
-        if streak:
-            print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
 
     def _throughput(self, elapsed: float, steps: int, samples: int,
                     flops: float | None) -> dict[str, float]:
