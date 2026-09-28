@@ -1,0 +1,801 @@
+{
+  "checkpoint": "/mnt/scratch/diffq/udit_ema/350000",
+  "device": "NVIDIA GeForce RTX 4080",
+  "negative": "white border, frame, text, watermark, collage, blurry, low quality",
+  "batches": [
+    {
+      "sampler": "heun40",
+      "seed": 0,
+      "images": 5,
+      "seconds": 4.29
+    },
+    {
+      "sampler": "heun40",
+      "seed": 1,
+      "images": 5,
+      "seconds": 0.82
+    },
+    {
+      "sampler": "heun40",
+      "seed": 2,
+      "images": 5,
+      "seconds": 0.83
+    },
+    {
+      "sampler": "heun40",
+      "seed": 3,
+      "images": 5,
+      "seconds": 0.83
+    },
+    {
+      "sampler": "dpm2m40",
+      "seed": 0,
+      "images": 5,
+      "seconds": 1.46
+    },
+    {
+      "sampler": "dpm2m40",
+      "seed": 1,
+      "images": 5,
+      "seconds": 0.46
+    },
+    {
+      "sampler": "dpm2m40",
+      "seed": 2,
+      "images": 5,
+      "seconds": 0.46
+    },
+    {
+      "sampler": "dpm2m40",
+      "seed": 3,
+      "images": 5,
+      "seconds": 0.46
+    },
+    {
+      "sampler": "ea100",
+      "seed": 0,
+      "images": 5,
+      "seconds": 2.63
+    },
+    {
+      "sampler": "ea100",
+      "seed": 1,
+      "images": 5,
+      "seconds": 1.04
+    },
+    {
+      "sampler": "ea100",
+      "seed": 2,
+      "images": 5,
+      "seconds": 1.06
+    },
+    {
+      "sampler": "ea100",
+      "seed": 3,
+      "images": 5,
+      "seconds": 1.05
+    }
+  ],
+  "images": [
+    {
+      "file": "heun40/p0_s0.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p1_s0.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p2_s0.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p3_s0.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p4_s0.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p0_s1.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p1_s1.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p2_s1.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p3_s1.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p4_s1.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p0_s2.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p1_s2.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p2_s2.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p3_s2.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p4_s2.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p0_s3.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p1_s3.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p2_s3.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p3_s3.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "heun40/p4_s3.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 7.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p0_s0.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p1_s0.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p2_s0.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p3_s0.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p4_s0.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p0_s1.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p1_s1.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p2_s1.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p3_s1.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p4_s1.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p0_s2.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p1_s2.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p2_s2.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p3_s2.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p4_s2.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p0_s3.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p1_s3.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p2_s3.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p3_s3.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "dpm2m40/p4_s3.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 40,
+      "guidance": 6.0,
+      "guidance_interval": [
+        0.2,
+        0.9
+      ]
+    },
+    {
+      "file": "ea100/p0_s0.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s0.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s0.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s0.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s0.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s1.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s1.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s1.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s1.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s1.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s2.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s2.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s2.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s2.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s2.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s3.png",
+      "prompt": "a watercolor painting of a mountain lake at sunrise",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s3.png",
+      "prompt": "an oil painting of a forest in autumn with golden leaves",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s3.png",
+      "prompt": "an impressionist painting of a garden with a pond",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s3.png",
+      "prompt": "a waterfall in a lush green forest",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s3.png",
+      "prompt": "the milky way over snowy mountains at night",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}
