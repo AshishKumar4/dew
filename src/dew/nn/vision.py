@@ -1371,23 +1371,21 @@ _SIGLIP_TENSORS = {
     "post_layernorm.weight": ("post_layernorm", "scale"),
     "post_layernorm.bias": ("post_layernorm", "bias"),
 }
-_SIGLIP_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
-_SIGLIP_NORMS = ("layer_norm1", "layer_norm2")
 
 
-def _siglip_layer_path(parts) -> tuple[str, ...] | None:
-    """`encoder.layers.N...` into the layer's path."""
-    if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
+def _encoder_layer_path(parts, root: str, norms: tuple[str, ...],
+                        projections: tuple[str, ...]) -> tuple[str, ...] | None:
+    """`<root>.layers.N...` into the path of a CLIP-style encoder layer: two
+    layer norms, biased attention maps and a biased fc1/fc2 MLP."""
+    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
+            or parts[-1] not in ("weight", "bias")):
         return None
     layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in _SIGLIP_NORMS and leaf in ("weight", "bias"):
+    if len(parts) == 5 and module in norms:
         return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and leaf in ("weight", "bias"):
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in _SIGLIP_PROJECTIONS:
-            return (layer, module, sublayer, "kernel" if leaf == "weight" else "bias")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "kernel" if leaf == "weight" else "bias")
+    if len(parts) == 6 and ((module == "self_attn" and parts[4] in projections)
+                            or (module == "mlp" and parts[4] in ("fc1", "fc2"))):
+        return (layer, module, parts[4], "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -1398,16 +1396,14 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     head some checkpoints carry maps to nothing: the Gemma path reads the
     trunk sequence alone. Anything else unknown raises ValueError.
     """
-    if hf_name == "embeddings.position_ids":
+    if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
         return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _siglip_layer_path(hf_name.split("."))
-    if path is not None:
-        return path
-    if hf_name.split(".")[0] == "head":
-        # The attention pooling head some checkpoints carry. The Gemma path
-        # reads the trunk sequence alone, so its tensors map to nothing.
-        return None
-    raise ValueError(f"unknown tensor name {hf_name!r}")
+    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(
+        hf_name.split("."), "encoder", ("layer_norm1", "layer_norm2"),
+        ("q_proj", "k_proj", "v_proj", "out_proj"))
+    if path is None:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    return path
 
 
 def translate_siglip_vision_weights(
@@ -1428,38 +1424,13 @@ _LLAMA4_VISION_TENSORS = {
     "vision_adapter.mlp.fc1.weight": ("vision_adapter", "mlp", "fc1", "kernel"),
     "vision_adapter.mlp.fc2.weight": ("vision_adapter", "mlp", "fc2", "kernel"),
 }
-_LLAMA4_VISION_LAYERS = {
-    "input_layernorm": "input_layernorm",
-    "post_attention_layernorm": "post_attention_layernorm",
-}
-
-
-def _llama4_vision_layer_path(parts) -> tuple[str, ...] | None:
-    """`model.layers.N...` into the layer's path."""
-    if len(parts) < 5 or parts[:2] != ["model", "layers"] or not parts[2].isdigit():
-        return None
-    layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in _LLAMA4_VISION_LAYERS and leaf in ("weight", "bias"):
-        return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and leaf == "weight":
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            return (layer, module, sublayer, "kernel")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "kernel")
-    if len(parts) == 6 and leaf == "bias":
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            return (layer, module, sublayer, "bias")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "bias")
-    return None
 
 
 def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Llama 4 vision tensor name into its path in a trunk tree."""
-    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _llama4_vision_layer_path(
-        hf_name.split("."))
+    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
+        hf_name.split("."), "model", ("input_layernorm", "post_attention_layernorm"),
+        ("q_proj", "k_proj", "v_proj", "o_proj"))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
@@ -1822,27 +1793,22 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
 
 
 _QWEN35_VISION_TENSORS = {
+    "patch_embed.proj.weight": ("patch_embed", "kernel"),
+    "patch_embed.proj.bias": ("patch_embed", "bias"),
     "pos_embed.weight": ("position_table", "embedding"),
 }
-_QWEN35_VISION_BLOCK_NORMS = ("norm1", "norm2")
-_QWEN35_VISION_MLP = ("linear_fc1", "linear_fc2")
 
 
 def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
-    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit():
+    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit() or parts[-1] not in ("weight", "bias"):
         return None
-    block = f"blocks_{parts[1]}"
-    if len(parts) == 4 and parts[2] in _QWEN35_VISION_BLOCK_NORMS and parts[3] in (
-            "weight", "bias"):
-        return (block, parts[2], "scale" if parts[3] == "weight" else "bias")
-    if len(parts) == 5 and parts[4] in ("weight", "bias"):
-        leaf = "kernel" if parts[4] == "weight" else "bias"
-        if parts[2] == "attn" and parts[3] in ("qkv", "proj"):
-            return (block, "attn", parts[3], leaf)
-        if parts[2] == "mlp" and parts[3] in _QWEN35_VISION_MLP:
-            return (block, "mlp", {"linear_fc1": "fc1", "linear_fc2": "fc2"}[parts[3]],
-                    leaf)
+    block, leaf = f"blocks_{parts[1]}", parts[-1]
+    if len(parts) == 4 and parts[2] in ("norm1", "norm2"):
+        return (block, parts[2], "scale" if leaf == "weight" else "bias")
+    if len(parts) == 5 and (parts[2], parts[3]) in (("attn", "qkv"), ("attn", "proj"),
+                                                     ("mlp", "linear_fc1"), ("mlp", "linear_fc2")):
+        return (block, parts[2], parts[3].removeprefix("linear_"), "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -1855,10 +1821,6 @@ def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name.split(".")[0] == "merger":
         return None
-    if hf_name == "patch_embed.proj.weight":
-        return ("patch_embed", "kernel")
-    if hf_name == "patch_embed.proj.bias":
-        return ("patch_embed", "bias")
     path = _QWEN35_VISION_TENSORS.get(hf_name) or _qwen35_vision_block_path(
         hf_name.split("."))
     if path is None:
@@ -1878,8 +1840,6 @@ def translate_qwen35_vision_weights(
     rest = {name: tensor for name, tensor in hf_tensors.items()
             if name != "patch_embed.proj.weight"}
     params = _translate(rest, qwen35_vision_path, param_dtype)
-    if "patch_embed.proj.weight" not in hf_tensors:
-        raise ValueError("patch_embed.proj.weight is missing, the trunk reads it")
     conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
     params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
         conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
