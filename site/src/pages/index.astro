@@ -42,7 +42,7 @@ const shown = [
 });
 
 // Sampling trajectories of a text-to-image model, packed into public/hero/replay/ by scripts/replay-atlas.py.
-const replays = ['aurora', 'canyon', 'waterfall'].map((name) => {
+const replays = ['aurora', 'lake', 'waterfall'].map((name) => {
 	// Read from the project's public/, where the build runs (the page's own module is bundled elsewhere).
 	const meta = JSON.parse(readFileSync(path.join(process.cwd(), 'public', 'hero', 'replay', name, 'meta.json'), 'utf8'));
 	return {
