@@ -192,13 +192,12 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
 
     The committed fixture is this module's own InceptionV3 at a sixteenth of
     every channel width, its parameters drawn rather than trained, so the
-    values are its own and not the published checkpoint's. What a distance
-    promises is the ordering, and that holds: a population against itself is
-    zero to the rounding in the matrix square root (observed -3.2e-09), the
-    same pixels brightened by 40 counts sit above it (0.064), and a flat gray
-    field sits twenty times further out (1.3). The registered metric reads the
-    same file and lands on the same number. `source.json` says how wide the
-    features it pools are, and the extractor agrees.
+    values are its own and not the published checkpoint's. For these images,
+    a population against itself scores zero to matrix-square-root rounding;
+    brightening the pixels by 40 counts scores above it, and a flat gray
+    field further out. The registered metric reads the same file and lands
+    on the same number. `source.json` states the feature width, and the
+    extractor agrees.
     """
     from dew.eval.fid import _get_activations
     from dew.inputs import unit_range
