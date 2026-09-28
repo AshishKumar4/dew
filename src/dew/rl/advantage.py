@@ -78,8 +78,7 @@ def masked_whiten(x: jax.Array, mask: jax.Array) -> jax.Array:
 
 
 def _grouped(rewards: jax.Array, group: int) -> jax.Array:
-    """`[prompts, group]` float32 rewards. Anything else is refused, with the
-    reason named.
+    """`[prompts, group]` float32 rewards.
 
     A group of one has no baseline, and the three references answer it three
     ways (verl with the raw reward, Tunix with a nan from ddof 1 or with zeros,
@@ -90,9 +89,6 @@ def _grouped(rewards: jax.Array, group: int) -> jax.Array:
     if rewards.ndim != 1:
         raise ValueError(
             f"rewards are one scalar per completion, [B], got {rewards.shape}")
-    if rewards.shape[0] % group:
-        raise ValueError(
-            f"{rewards.shape[0]} rewards do not divide into groups of {group}")
     return jnp.asarray(rewards, jnp.float32).reshape(-1, group)
 
 

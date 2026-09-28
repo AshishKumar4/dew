@@ -310,8 +310,6 @@ def behavior_band_weights(old_log_probs: jax.Array, behavior_log_probs: jax.Arra
     ratio clamped to +-20, masked, then zeroed outside the band instead of
     capped (arXiv:2510.18855). The band is inclusive at both ends.
     """
-    if not 0 < low <= high:
-        raise ValueError(f"an IcePop band needs 0 < low <= high, got [{low}, {high}]")
     ratio = jnp.exp(token_log_ratio(old_log_probs, behavior_log_probs))
     weights = jnp.where(mask != 0, ratio * mask, 0)
     return jax.lax.stop_gradient(jnp.where((weights >= low) & (weights <= high), weights, 0))
@@ -330,8 +328,6 @@ def sequence_rejection_mask(old_log_probs: jax.Array, behavior_log_probs: jax.Ar
     SkyRL's geometric sequence mask (0.99 to 1.01). A sequence is a row or a
     packed chain, as in `segment_mean`; outside `mask` the result is 1.
     """
-    if not 0 < low <= high:
-        raise ValueError(f"a rejection band needs 0 < low <= high, got [{low}, {high}]")
     k1 = -token_log_ratio(old_log_probs, behavior_log_probs)
     total, count = _segment_totals(k1, mask, segments)
     statistic = total / (count + MEAN_EPS) if geometric else total
