@@ -1,47 +1,39 @@
 # Gallery
 
-These are samples from models trained with Dew. Each section lists the training data, image size, sampling settings and model fields recorded for the run; scheduler and model names are those of the Dew version the run used, not configurations for the current API.
+Samples from models trained with Dew. [Diffusion training](guides/diffusion.md) and [Recipes](recipes.md) describe how to train one, and [Diffusion processes and solvers](concepts/diffusion.md) the samplers named below.
 
-The records have no complete environment, checkpoint, seed or quality evaluation. [Recipes](recipes.md) and [Diffusion training](guides/diffusion.md) describe the current workflow, and [Step benchmarks](benchmarks.md) lists timed measurements with their revision and hardware.
+## Text-to-image, 176M hybrid DiT
 
-## Text-to-image on a mixed captioned dataset
+A latent text-to-image model with a hybrid DiT denoiser (state-space and attention blocks), trained with Dew, sampled at step 1,350,000 from its EMA weights. It generates 256×256 images through the Stable Diffusion VAE, conditioned on a CLIP text encoder.
 
-This model trained on LAION-Aesthetics 12M, CC12M, MS COCO, and a one-million-image subset of COYO-700M with aesthetic score 6 or higher, on a TPU-v4-32 slice. Sampling used Euler ancestral sampling for 200 steps with classifier-free guidance (CFG). CFG mixes the model's conditional and unconditional predictions; its scale sets how closely samples follow the text.
+| Component | Parameters |
+|---|---|
+| Denoiser (hybrid DiT) | 175,640,848 |
+| CLIP text encoder | 123,060,480 |
+| Stable Diffusion VAE | 83,653,863 |
 
-Every image in the grid used the same prompt, "a beautiful landscape with a river with mountains." The record does not give the guidance scale for this grid.
+Each grid has one row per prompt and one column per seed (0, 1, 2, 3), with classifier-free guidance 5.0 against the empty prompt. `examples/sample_text_to_image.py` drew them in float32 on an RTX 4080; a batch of six images took 1.9 s with Heun over 40 steps and 0.6 s with `DPMSolverMultistep` over 20 steps. Some images carry flat white bands at their edges, which the model draws.
 
-| Setting | Recorded value |
-| --- | --- |
-| Batch size | 256 |
-| Image size | 128 × 128 |
-| Training epochs | 5 |
-| Steps per epoch | 74,573 |
-| Feature depths | `[128, 256, 512, 1024]` |
-| Training noise schedule | `EDMNoiseScheduler` |
-| Inference noise schedule | `KarrasVENoiseScheduler` |
+The prompts, in row order:
 
-![text-to-image landscape grid using Euler ancestral sampling and CFG](assets/gallery/medium_epoch5.png)
+1. a tropical beach with palm trees and turquoise water
+2. a colorful hot air balloon over a green valley
+3. a red fox in a snowy forest
+4. a stained glass window with geometric patterns
+5. a bowl of ramen with an egg and green onions
+6. the northern lights over a frozen lake at night
 
-## Text-to-image on Oxford Flowers
+![Six prompts by four seeds from the 176M hybrid DiT, Heun sampler, 40 steps, guidance 5.0](assets/gallery/hybrid-dit-heun40.webp)
 
-This run used Oxford Flowers 102, Euler ancestral sampling for 200 steps, and CFG scale 2. The prompts, in grid order, were:
+![The same prompts and seeds with DPMSolverMultistep, 20 steps, guidance 5.0](assets/gallery/hybrid-dit-dpm2m20.webp)
 
-> water tulip; a water lily; a water lily; a water lily; a photo of a marigold; a water lily; a water lily; a photo of a lotus; a photo of a lotus; a photo of a lotus; a photo of a rose; a photo of a rose; a photo of a rose; a photo of a rose; a photo of a rose
+## Unconditional models
 
-| Setting | Recorded value |
-| --- | --- |
-| Batch size | 16 |
-| Image size | 128 × 128 |
-| Training epochs | 1,000 |
-| Steps per epoch | 511 |
-| Training noise schedule | `EDMNoiseScheduler` |
-| Inference noise schedule | `KarrasVENoiseScheduler` |
+The two grids below come from unconditional models trained with Dew on Oxford Flowers 102. Their records give the image size, sampling settings and model fields, but no complete environment, checkpoint, seed or quality evaluation, and their scheduler and model names are those of the Dew version the runs used.
 
-![Oxford Flowers text-to-image grid using Euler ancestral sampling at guidance scale 2](assets/gallery/text2img_euler_ancestral_1.png)
+### DDPM sampling
 
-## Unconditional Oxford Flowers with DDPM
-
-An unconditional model generates images without a text prompt. This grid used DDPM sampling for 1,000 steps, with `CosineNoiseScheduler` for both training and inference.
+This grid used DDPM sampling for 1,000 steps, with `CosineNoiseScheduler` for both training and inference.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -60,9 +52,9 @@ The attention list and the feature-depth list are the recorded settings, not arg
 
 ![unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
 
-## Unconditional Oxford Flowers with Heun
+### Heun sampling
 
-This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The recorded caption said 20 model evaluations, but I kept no trace that confirms that count.
+This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The recorded caption said 20 model evaluations; no trace confirms that count.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -76,4 +68,4 @@ This grid used a 10-step Heun sampler. Heun takes a prediction step and then a c
 
 ![unconditional Oxford Flowers grid using 10-step Heun sampling](assets/gallery/heun.png)
 
-Do not read these grids as a controlled comparison of samplers. The records do not show that they used the same checkpoints, seeds, or training settings. If you prepare a new run with any of these datasets, check its license and access conditions; the gallery does not redistribute the datasets. [References and attribution](references.md) lists the research and the upstream implementations behind these methods.
+The two unconditional grids are not a controlled comparison of samplers: the records do not show that they used the same checkpoints, seeds or training settings. The gallery does not redistribute the datasets; each has its own license and access conditions. [Papers and attribution](references.md) lists the research and the upstream implementations behind these methods.
