@@ -440,6 +440,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     recorded a support, fixes the per-row length of the support arrays so
     every batch has one shape and the step compiles once.
     """
+    if type(width) is not int or width < 2:
+        raise ValueError("a packed row holds at least two ids")
     if rows is not None and (type(rows) is not int or rows < 1):
         raise ValueError("rows is a positive integer, or None for as many as the chains need")
     values = advantages(sessions, estimator, truncation=truncation)
