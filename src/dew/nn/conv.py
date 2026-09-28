@@ -32,7 +32,7 @@ rules are identities; JAX's primitive defines neither.
 
 `Conv` exists only to work around these bugs. The partitioner bugs are
 reported at https://github.com/openxla/xla/issues/49382 and drafted in
-~/.cache/dew/verification-evidence/upstream-reports/xla-conv-halo-kernel-split/.
+Dew issue #4 (https://github.com/AshishKumar4/dew/issues/4).
 When XLA fixes these lowerings, every model can use `flax.linen.Conv` again.
 """
 
