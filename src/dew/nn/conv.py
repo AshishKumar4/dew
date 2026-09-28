@@ -42,32 +42,26 @@ import jax
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import PromoteDtypeFn
-from jax.custom_batching import custom_vmap
+from jax.extend import core
+from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
 
+# A linear boundary must survive in tangents and cotangents too: dropping it
+# from either leaves the same convolution chain open to the faulty rewrite.
+_barrier_p = core.Primitive("dew_conv_barrier")
+_barrier_p.def_impl(lambda x: x)
+_barrier_p.def_abstract_eval(lambda x: x)
+mlir.register_lowering(
+    _barrier_p, mlir.lower_fun(jax.lax.optimization_barrier, multiple_results=False))
+ad.deflinear(_barrier_p, lambda cotangent: (_barrier_p.bind(cotangent),))
+batching.defvectorized(_barrier_p)
 
-@custom_vmap
-def _barrier_value(x: jax.Array) -> jax.Array:
-    return jax.lax.optimization_barrier(x)
 
-
-@_barrier_value.def_vmap
-def _barrier_batch(axis_size, in_batched, x):
-    del axis_size
-    return _barrier_value(x), in_batched[0]
-
-
-@jax.custom_jvp
 def _barrier(x: jax.Array) -> jax.Array:
-    return _barrier_value(x)
-
-
-@_barrier.defjvp
-def _barrier_jvp(primals, tangents):
-    return _barrier(primals[0]), tangents[0]
+    return _barrier_p.bind(x)
 
 
 def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
