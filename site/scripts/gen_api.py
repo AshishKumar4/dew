@@ -39,7 +39,7 @@ GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.jepa", "dew.objectives.rl", "dew.objectives.rl.flow",
                     "dew.objectives.rl.harbor", "dew.objectives.rl.scheduler"]),
     ("Data", ["dew.data", "dew.data.chat", "dew.data.images"]),
-    ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
+    ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer", "dew.nn.kv_cache",
                 "dew.nn.backbones.flux", "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
                 "dew.nn.autoencoders", "dew.nn.kernels", "dew.lora"]),

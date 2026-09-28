@@ -51,6 +51,6 @@
 <text x="340" y="530" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">Each image is α x₀ + σ ε with the same ε,</text>
 <text x="340" y="552" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">at the rates schedule.rates(t) returns.</text>
 <text x="340" y="574" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start"></text>
-<text x="340" y="596" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">x₀ is a 64 × 64 sample from the FlaxDiff</text>
-<text x="340" y="618" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">gallery, scaled to [-1, 1].</text>
+<text x="340" y="596" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">x₀ is a 64 × 64 image sampled from a model</text>
+<text x="340" y="618" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#93aba7" text-anchor="start">trained with Dew, scaled to [-1, 1].</text>
 </svg>

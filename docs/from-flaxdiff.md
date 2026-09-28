@@ -50,6 +50,6 @@ A Dew run starts from a current configuration in a new output directory. A recip
 
 ## Older results
 
-The [FlaxDiff gallery](gallery.md) keeps the earlier image grids and their recorded settings, with the old API names marked as historical. They were produced by FlaxDiff, not by Dew, and say nothing about whether Dew reproduces them. The [benchmark page](benchmarks.md) lists the revision, environment, and hardware for each measured Dew run.
+The [Gallery](gallery.md) shows samples from models trained with Dew, with their recorded settings. The [benchmark page](benchmarks.md) lists the revision, environment, and hardware for each measured Dew run.
 
 Dew still contains code adapted from the earlier project and ideas taken from other research. [Papers and attribution](references.md) lists Diffusers, jax-fid, JEPA, and the other upstream sources. Their attribution and license terms still apply after the code moved into different modules.

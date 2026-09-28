@@ -56,7 +56,7 @@ The Stable Diffusion Flax VAE is adapted from [Hugging Face Diffusers](https://g
 
 [Sander Dieleman's posts](https://sander.ai/posts/) cover [diffusion](https://sander.ai/2022/01/31/diffusion.html), [typicality](https://sander.ai/2020/09/01/typicality.html), [guidance geometry](https://sander.ai/2023/08/28/geometry.html#warning), and [noise schedules](https://sander.ai/2024/06/14/noise-schedules.html). [Tony Duan's Diffusion Models from Scratch](https://www.tonyduan.com/diffusion/index.html) works through the mathematics with small MNIST implementations and [accompanying code](https://github.com/tonyduan/diffusion).
 
-The original FlaxDiff experiments started from the Keras tutorials for [DDPM by A_K Nain](https://keras.io/examples/generative/ddpm/) and [DDIM by András Béres](https://keras.io/examples/generative/ddim/), which remain good introductions. [Coming from FlaxDiff](from-flaxdiff.md) maps FlaxDiff's modules to Dew's.
+Dew's first diffusion experiments started from the Keras tutorials for [DDPM by A_K Nain](https://keras.io/examples/generative/ddpm/) and [DDIM by András Béres](https://keras.io/examples/generative/ddim/), which remain good introductions. [Coming from FlaxDiff](from-flaxdiff.md) maps FlaxDiff's modules to Dew's.
 
 ## Related projects and interoperability
 
