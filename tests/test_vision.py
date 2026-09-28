@@ -283,7 +283,7 @@ def test_a_gemma4_field_with_no_counterpart_is_refused(field, value, message):
 @pytest.mark.parametrize("field,value,message", [
     ("num_position_embeddings", 60, "square"),
     ("hidden_act", "swiglu", "hidden_act"),
-    ("patch_size", [16, 8], "square patches"),
+    ("patch_size", [16, 8], "patch_size"),
     ("model_type", "qwen3_vl", "vision model_type"),
 ])
 def test_a_qwen35_field_with_no_counterpart_is_refused(field, value, message):

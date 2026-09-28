@@ -1517,9 +1517,7 @@ def _image_size(value: object, field: str) -> int:
             raise ValueError(
                 f"{field} {list(value)!r} is not square, this trunk tiles squares")
         value = value[0]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} is {value!r}, an image side is an int")
-    return value
+    return records.integer(value, field)
 
 
 def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1531,13 +1529,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     """
     vision = _vision_section(hf_config)
     hidden = records.integer(vision["hidden_size"], "hidden_size")
-    image = vision.get("image_size", 224)
     patch = vision.get("patch_size", 16)
-    if isinstance(image, (list, tuple)):
-        if len(image) != 2 or image[0] != image[1]:
-            raise ValueError(
-                f"image_size {list(image)!r} is not square, this trunk tiles squares")
-        image = image[0]
     if isinstance(patch, (list, tuple)):
         patch = patch[0]
     activation = str(vision.get("hidden_act", vision.get("hidden_activation",
@@ -1554,7 +1546,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": records.integer(image, "image_size"),
+        "image_size": _image_size(vision.get("image_size", 224), "image_size"),
         "patch_size": records.integer(patch, "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "hidden_act": activation,
@@ -1580,12 +1572,8 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         raise ValueError(
             f"vision_feature_layer {vision.get('vision_feature_layer')!r} reads a "
             "middle layer this trunk never returns")
-    rope = vision.get("rope_parameters") or {}
-    if not isinstance(rope, Mapping):
-        raise ValueError(f"rope_parameters is {rope!r}, not a config")
-    theta = rope.get("rope_theta", vision.get("rope_theta", 10000.0))
-    if theta is None or isinstance(theta, (Mapping, bool)):
-        raise ValueError(f"rope_theta is {theta!r}, not a frequency")
+    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    theta = records.number(rope.get("rope_theta", vision.get("rope_theta", 10000.0)), "rope_theta")
     if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(vision.get("projector_dropout", 0.0), "projector_dropout"):
         raise ValueError("attention_dropout/projector_dropout is training-time")
     if vision.get("multi_modal_projector_bias", False):
@@ -1605,7 +1593,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "layer_norm_eps": records.number(vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"),
-        "rope_theta": float(theta),
+        "rope_theta": theta,
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
         "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),
@@ -1718,21 +1706,6 @@ def translate_gemma4_projector_weights(
     return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
-def _gemma4_rope_theta(vision: Mapping[str, object]) -> float:
-    """The vision rope theta, defaulting the way the config class does."""
-    rope = vision.get("rope_parameters") or {}
-    if not isinstance(rope, Mapping):
-        raise ValueError(f"rope_parameters is {rope!r}, not a config")
-    if rope.get("rope_type", "default") != "default":
-        raise ValueError(
-            f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
-            "runs the default 2D rotary")
-    theta = rope.get("rope_theta", vision.get("rope_theta", 100.0))
-    if theta is None or isinstance(theta, (Mapping, bool)):
-        raise ValueError(f"rope_theta is {theta!r}, not a frequency")
-    return float(theta)
-
-
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
@@ -1763,6 +1736,11 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
             "projector width this record leaves to the text width")
+    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError(
+            f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
+            "runs the default 2D rotary")
     return {
         "kind": "gemma4",
         "hidden_size": hidden,
@@ -1775,7 +1753,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "position_embedding_size": records.integer(vision.get("position_embedding_size", 10240), "position_embedding_size"),
         "hidden_act": activation,
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": _gemma4_rope_theta(vision),
+        "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }
@@ -1853,15 +1831,6 @@ def translate_qwen35_projector_weights(
     return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
 
-def _qwen35_patch_field(vision: Mapping[str, object], field: str) -> int:
-    """A patch-size field as an int; a pair has no square form here."""
-    value = vision[field]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(
-            f"{field} is {value!r}, the trunk tiles square patches of one size")
-    return value
-
-
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """A Qwen3_5VisionConfig into a Qwen35Vision value's fields.
 
@@ -1892,9 +1861,9 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_heads": records.integer(vision["num_heads"], "num_heads"),
         "in_channels": records.integer(vision.get("in_channels", 3), "in_channels"),
-        "patch_size": _qwen35_patch_field(vision, "patch_size"),
+        "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": _qwen35_patch_field(vision, "temporal_patch_size"),
+        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "out_hidden_size": records.integer(vision["out_hidden_size"], "out_hidden_size"),
         "num_position_embeddings": table,
     }
@@ -2167,7 +2136,8 @@ def translate_gemma3n_projector_weights(
 
 def _gemma3n_vision_record(
         hf_config: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """Validate the whole vision record before either component consumes it."""
+    """The vision embedder's fields and the encoder's model_args, the whole
+    record validated before either component consumes it."""
     vision = _vision_section(hf_config)
     if vision.get("model_type", "gemma3n_vision") != "gemma3n_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not gemma3n_vision")
@@ -2185,27 +2155,23 @@ def _gemma3n_vision_record(
         raise ValueError(f"vision_config fields {sorted(unknown)} have no counterpart")
     if vision.get("architecture", "mobilenetv5_300m_enc") != "mobilenetv5_300m_enc":
         raise ValueError(f"architecture {vision.get('architecture')!r} is not the MobileNet-v5 encoder")
-    for name, default in (("hidden_size", 2048), ("vocab_size", 128), ("vocab_offset", 262144)):
-        value = vision.get(name, default)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"vision_config.{name} must be an integer")
-    epsilon = vision.get("rms_norm_eps", 1e-6)
-    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
-        raise ValueError("vision_config.rms_norm_eps must be a number")
-    if records.integer(vision.get("hidden_size", 2048), "hidden_size") != 2048:
+    embedder = {
+        "vision_width": records.integer(vision.get("hidden_size", 2048), "hidden_size"),
+        "vocab_size": records.integer(vision.get("vocab_size", 128), "vocab_size"),
+        "vocab_offset": records.integer(vision.get("vocab_offset", 262144), "vocab_offset"),
+        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+    }
+    if embedder["vision_width"] != 2048:
         raise ValueError("hidden_size must be 2048; timm's MobileNet-v5 encoder fixes its adapter width")
     if vision.get("do_pooling", False):
         raise ValueError("do_pooling=True requests a classifier head the encoder does not have")
     options = vision.get("model_args")
-    if options is None:
-        options = {}
-    if not isinstance(options, Mapping):
-        raise ValueError("model_args must be a mapping")
+    options = records.record({} if options is None else options, "model_args")
     allowed = {field.name for field in dataclasses.fields(Gemma3nVision)}
     unknown = set(options) - allowed
     if unknown:
         raise ValueError(f"MobileNet-v5 model_args {sorted(unknown)} are not supported")
-    return vision, options
+    return embedder, options
 
 
 def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -2216,13 +2182,8 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Mapping[
 
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Mapping[str, object]:
-    vision, _ = _gemma3n_vision_record(hf_config)
-    value: Gemma3nProjector = from_record(Gemma3nProjector, {
-        "vision_width": vision.get("hidden_size", 2048), "text_width": text_width,
-        "vocab_size": vision.get("vocab_size", 128),
-        "vocab_offset": vision.get("vocab_offset", 262144),
-        "norm_eps": vision.get("rms_norm_eps", 1e-6),
-    })
+    embedder, _ = _gemma3n_vision_record(hf_config)
+    value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
     return {"kind": "gemma3n", **dataclasses.asdict(value)}
 
 
