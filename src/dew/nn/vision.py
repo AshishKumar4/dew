@@ -53,7 +53,7 @@ from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_ar
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
-from .mobilenet import MobileNetV5Encoder
+from .mobilenet import _ARCHITECTURE, MobileNetV5Encoder
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -201,16 +201,6 @@ class SiglipVision(TowerBase):
                              channels=self.num_channels)
 
 
-def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """The complex rotation on real pairs, one shared angle per pair."""
-    pairs = values.reshape(*values.shape[:-1], -1, 2)
-    first, second = pairs[..., 0], pairs[..., 1]
-    table, turn = cos[:, None, :], sin[:, None, :]
-    rotated = jnp.stack([first * table - second * turn,
-                         first * turn + second * table], axis=-1)
-    return rotated.reshape(values.shape)
-
-
 class GemmaProjectorModule(nn.Module):
     """Patch features into soft tokens: block average, norm, map to text width.
 
@@ -291,6 +281,15 @@ def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
     angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
     return jnp.cos(angles), jnp.sin(angles)
 
+
+def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """The complex rotation on real pairs, one shared angle per pair."""
+    pairs = values.reshape(*values.shape[:-1], -1, 2)
+    first, second = pairs[..., 0], pairs[..., 1]
+    table, turn = cos[:, None, :], sin[:, None, :]
+    rotated = jnp.stack([first * table - second * turn,
+                         first * turn + second * table], axis=-1)
+    return rotated.reshape(values.shape)
 
 
 class Llama4VisionAttention(nn.Module):
@@ -403,6 +402,24 @@ class Llama4VisionAdapterMLP(nn.Module):
         return gelu(self.fc2(gelu(self.fc1(hidden_states))))
 
 
+class Llama4VisionAdapter(nn.Module):
+    """Pixel shuffle into the adapter MLP, the tower's last stage."""
+
+    ratio: float
+    input_dim: int
+    output_dim: int
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    def setup(self):
+        self.mlp = Llama4VisionAdapterMLP(
+            self.input_dim, self.output_dim, dtype=self.dtype,
+            precision=self.precision, name="mlp")
+
+    def __call__(self, encoded_patches) -> jax.Array:
+        return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
+
+
 class Llama4VisionTransformer(nn.Module):
     """The Llama 4 vision trunk, param layout of `Llama4VisionConfig`.
 
@@ -486,24 +503,6 @@ class Llama4VisionTransformer(nn.Module):
         return self.vision_adapter(hidden_states)
 
 
-class Llama4VisionAdapter(nn.Module):
-    """Pixel shuffle into the adapter MLP, the tower's last stage."""
-
-    ratio: float
-    input_dim: int
-    output_dim: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        self.mlp = Llama4VisionAdapterMLP(
-            self.input_dim, self.output_dim, dtype=self.dtype,
-            precision=self.precision, name="mlp")
-
-    def __call__(self, encoded_patches) -> jax.Array:
-        return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
-
-
 @towers("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Vision(TowerBase):
@@ -564,6 +563,7 @@ class Llama4Projector(ProjectorBase):
     def build(self) -> nn.Module:
         return Llama4ProjectorModule(text_width=self.text_width)
 
+
 def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
                         theta: float, *, dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of the Gemma 4 vision attention, as cos/sin.
@@ -621,7 +621,6 @@ class Gemma4ClippableLinear(nn.Dense):
             high = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf, jnp.float32))
             output = jnp.clip(output, low.value.astype(output.dtype), high.value.astype(output.dtype))
         return output
-
 
 
 class Gemma4VisionAttention(nn.Module):
@@ -857,7 +856,6 @@ class Gemma4VisionTransformer(nn.Module):
         return pooled.astype(hidden_states.dtype)
 
 
-
 @towers("gemma4")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Vision(TowerBase):
@@ -927,6 +925,7 @@ class Gemma4Projector(ProjectorBase):
 
     def build(self) -> nn.Module:
         return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
+
 
 def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:
     """Bilinear taps into a `side`-long table for positions along one axis.
@@ -1123,7 +1122,6 @@ class Qwen35VisionTransformer(nn.Module):
         for block in self.blocks:
             hidden_states = block(hidden_states, cos, sin, keep[:, None])
         return hidden_states
-
 
 
 @towers("qwen3_5")
@@ -1512,7 +1510,6 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
     return _PROJECTOR_PATHS[kind][name]
 
 
-
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
@@ -1679,6 +1676,7 @@ def translate_llama4_projector_config(vision: Mapping[str, object],
         "text_width": int(text_width),
     }
 
+
 _GEMMA4_VISION_TENSORS = {
     "patch_embedder.input_proj.weight": ("patch_embed", "kernel"),
     "patch_embedder.position_embedding_table": ("position_table",),
@@ -1713,6 +1711,7 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
         # Gemma4VisionAttention), so a weight under its name is unknown.
         return (layer, "self_attn", parts[4], "scale")
     return None
+
 
 def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Gemma 4 vision tensor name into its collection and trunk path.
@@ -2145,8 +2144,6 @@ class Gemma3nProjector(ProjectorBase):
 
 def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     """A timm MobileNet-v5 weight into the corresponding Linen module."""
-    from .mobilenet import _ARCHITECTURE
-
     bare = hf_name.removeprefix("timm_model.")
     parts = tuple(bare.split("."))
     prefix: tuple[str, ...] = ()
