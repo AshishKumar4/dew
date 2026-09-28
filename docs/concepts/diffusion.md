@@ -7,7 +7,7 @@ $$x_t = \alpha_t x_0 + \sigma_t \epsilon.$$
 The network sees $x_t$ and $t$ and predicts a quantity from which $x_0$ and $\epsilon$ can be recovered. Sampling starts from noise at the highest time and walks a grid of times down to zero with a solver. In Dew, a `Process` holds everything about this convention that training and sampling must agree on, a preset builds a published `Process`, and `dew.sampling.sample` runs a solver over it.
 
 ![The same image noised at six times under the Cosine and Flow presets, with the alpha and sigma curves of both.](../assets/diffusion-forward-light.svg)
-![](../assets/diffusion-forward-dark.svg)
+![The same image noised at six times under the Cosine and Flow presets, with the alpha and sigma curves of both.](../assets/diffusion-forward-dark.svg)
 
 ## Example
 
