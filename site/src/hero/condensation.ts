@@ -24,6 +24,7 @@ import {
 	runLoop,
 	type Target,
 } from './gl';
+import { placementFor, type Placement } from './placement';
 
 const DURATION = 2.9; // seconds from t = 1 to t = 0 at the base rate; pixels run 0.62 to 2.1 times as fast
 const SLOWEST = 0.62; // the slowest pixel's rate, relative to the base rate
@@ -182,20 +183,6 @@ function random(seed: number): () => number {
 	};
 }
 
-interface Layout {
-	/** Center of the wordmark and its width, as fractions of the field. */
-	cx: number;
-	cy: number;
-	width: number;
-	/** A box, in field fractions, where drops stay sparse so the copy reads. */
-	quiet: [number, number, number, number];
-}
-
-function layoutFor(width: number, height: number): Layout {
-	if (width < height) return { cx: 0.5, cy: 0.66, width: 0.86, quiet: [0, 0, 1, 0.5] };
-	return { cx: 0.66, cy: 0.68, width: 0.5, quiet: [0, 0, 0.52, 0.56] };
-}
-
 /** Distance from each inside pixel to the nearest outside pixel (a 3-4 chamfer transform). */
 function insideDistance(mask: Uint8Array, w: number, h: number): Float32Array {
 	const big = 1e6;
@@ -232,9 +219,8 @@ interface Drop {
  * `word` and scattered thinly over the rest of the pane. Rows run bottom to top,
  * as WebGL reads them.
  */
-function dropField(w: number, h: number, word: string, family: string, seed: number): Float32Array {
+function dropField(w: number, h: number, word: string, family: string, seed: number, layout: Placement): Float32Array {
 	const rand = random(seed);
-	const layout = layoutFor(w, h);
 
 	const canvas = document.createElement('canvas');
 	canvas.width = w;
@@ -457,7 +443,7 @@ export function startCondensation(hero: HTMLElement, canvas: HTMLCanvasElement, 
 			format: gl.RG,
 			type: gl.FLOAT,
 			filter: gl.LINEAR,
-			data: dropField(w, h, word, family, seed),
+			data: dropField(w, h, word, family, seed, placementFor(hero)),
 		});
 		fieldX = createTarget(gl, w, h);
 		const tw = Math.ceil(w / TIME_SCALE);
