@@ -6,6 +6,11 @@ any of them would invalidate checkpoints or change what a run converges to.
 
 import contextlib
 import io
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -258,18 +263,43 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs GPU allocator memory statistics")
 def test_compilation_counts_memory_kept_alive_outside_its_state():
-    """A second model or serving cache still occupies device memory. The
-    compiled step must fit what remains, not the allocator's whole limit.
-    Reserve enough real memory to force recompilation, then run the step.
+    """A fresh 2 GiB allocator isolates the accounting regression from
+    fragmentation left by earlier GPU tests. Its real held buffers force
+    the compiler to fit the remaining memory, then the step runs there.
     """
+    if jax.device_count() != 1 or shutil.which("nvidia-smi") is None:
+        pytest.skip("needs one NVIDIA GPU with memory reporting")
+    rows = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True, timeout=10).stdout.splitlines()
+    if len(rows) != 1:
+        pytest.skip("the isolated allocator experiment needs one physical GPU")
+    name, total, free = (value.strip() for value in rows[0].split(","))
+    if name != jax.devices()[0].device_kind:
+        pytest.skip("cannot identify the current GPU's physical memory")
+    pool_mib, runtime_mib = 2048, 1024
+    if int(free) < pool_mib + runtime_mib:
+        pytest.skip("needs 2 GiB for the child pool and 1 GiB for its CUDA runtime")
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda",
+                   "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "tests"))),
+                   "XLA_PYTHON_CLIENT_ALLOCATOR": "bfc",
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(pool_mib / int(total)),
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+    done = subprocess.run(
+        [sys.executable, "-c", "from test_remat import _resident_memory_step; _resident_memory_step()"],
+        cwd=root, env=environment, capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def _resident_memory_step():
+    """Compile and run with real external buffers in the bounded child pool."""
     import optax
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
-    if jax.device_count() != 1:
-        pytest.skip("reserves memory on one GPU")
     device = jax.devices()[0]
     model = CausalTransformer(vocab_size=65536, emb_features=64, num_layers=1,
                               num_heads=2, mlp_features=128, max_seq_len=256,
@@ -279,8 +309,7 @@ def test_compilation_counts_memory_kept_alive_outside_its_state():
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((4, 257), jnp.int32)}
     trainer.compile(state, batch)
-    if objective.head_tile is not None:
-        pytest.skip("not enough free GPU memory to establish the whole-logits step")
+    assert objective.head_tile is None, "the unconstrained step must keep the whole logits"
 
     def additional_bytes():
         assert trainer.executable is not None
@@ -289,12 +318,9 @@ def test_compilation_counts_memory_kept_alive_outside_its_state():
         return stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
 
     memory = device.memory_stats()
-    if memory is None:
-        pytest.skip("this GPU allocator reports no memory statistics")
+    assert memory is not None
     reserve = memory["bytes_limit"] - memory["bytes_in_use"] - additional_bytes() // 2
-    if reserve <= 0:
-        pytest.skip("not enough free GPU memory to establish the unconstrained step")
-    # Cache-sized allocations also fit around buffers retained by earlier tests.
+    assert reserve > 0
     allocate = jax.jit(lambda value, size: jnp.broadcast_to(value, (size,)), static_argnums=1)
     block = 64 * 2**20
     zero = jnp.asarray(0, jnp.uint8)
