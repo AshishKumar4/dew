@@ -310,6 +310,8 @@ class TextToImage:
             process = self.process if prepared.process is None else prepared.process
         else:
             process, times = self.prepared_process(count)
+        if type(decode) is not bool:
+            raise ValueError("decode must be a boolean")
         solver = self.sampler if sampler is None else sampler
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
