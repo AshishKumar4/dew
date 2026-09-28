@@ -246,8 +246,9 @@ searched = generate(model, variables, prompts, 32, seed=0,
                     logits=(decoding.NoRepeatNGram(3),),
                     strategy=Beam(width=4, length_penalty=1.0), n=2)
 
-# Or drafted by the model's own prediction depths, with the same law as the
-# first call and fewer target forwards.
+# Drafted by the model's own prediction depths and verified by the model:
+# tokens are distributed exactly as ordinary sampling under this call's
+# policy; accepted drafts save target forwards, which untrained depths rarely give.
 drafted = generate(model, variables, prompts, 32, seed=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
