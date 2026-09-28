@@ -384,8 +384,6 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
     text = records.record(hf_config.get("text_config", hf_config), "text_config")
 
     activation = records.text(text.get("hidden_act", "quick_gelu"), "hidden_act")
-    if activation not in ("quick_gelu", "gelu", "gelu_pytorch_tanh"):
-        raise ValueError(f"Unsupported CLIP text activation: {activation}")
     eos_token_id = text.get("eos_token_id", 49407)
     if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
         raise ValueError(

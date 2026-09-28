@@ -52,7 +52,7 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 
 
 def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
-                   max_seq_len, *, valid=None):
+                   max_seq_len: int, *, valid=None):
     """Open a compact per-row decode cache of two tensors, `first` and `second`
     under `names`, and of the sparse indexer's keys when `index_keys` is given.
 
@@ -63,8 +63,6 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
     writes the new rows and returns the whole cache, the index keys last or
     None.
     """
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
     batch, length = first.shape[:2]
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a cache of {max_seq_len}.")
@@ -81,8 +79,6 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
             for variable, rows in zip(cached, (new_first, new_second), strict=True):
                 variable.value = write_cache(variable.value, rows, positions)
             if cached_index is not None:
-                if new_index_keys is None:
-                    raise ValueError("the indexer scores, so decode must append its keys")
                 cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
         return cached[0].value, cached[1].value, full_index
