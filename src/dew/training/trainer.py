@@ -218,14 +218,15 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
                     mesh: Mesh) -> tuple[jax.stages.Compiled, bool]:
-    """The step compiled under XLA's default options where it fits and the
-    one compiled under `step_compiler_options` does not, else that one, with
-    whether the returned step fits. The
-    Triton GEMM fusions can hold fewer temporaries: on an RTX 4080 (sm89, jax
-    0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens keep their
-    whole logits in 13.1 GiB with them and run 178.7 ms, while without them
-    the step does not fit, tiles its head and runs 211.2 ms. So the fusions
-    come back before the ladder's first rung."""
+    """Fall back to the step compiled under XLA's default options where it
+    fits and the one compiled under `step_compiler_options` does not.
+    Returns the step to run and whether it fits.
+
+    The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
+    (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
+    keep their whole logits in 13.1 GiB with them and run 178.7 ms, while
+    without them the step does not fit, tiles its head and runs 211.2 ms. So
+    the fusions come back before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh):
         return executable, False
@@ -257,6 +258,8 @@ def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
     a decoder's `RematPolicy`, a diffusion backbone's bool or name, and
     None for a model with no remat field."""
     return getattr(model, 'remat', None)
+
+
 # What a model recomputes in its backward pass when its step does not fit,
 # weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
 # jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
@@ -861,10 +864,6 @@ class Trainer(Generic[Loss, Effects]):
             pending = jax.jit(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
-
-    def _default_step(self, shapes):
-        return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
-
     def _links(self, mesh: Mesh) -> dict[str, Link]:
         """The links of `mesh`'s tensor and sequence axes, those it splits,
         for one trace. Every process lists the mesh's devices alike and
@@ -935,8 +934,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             while True:
-                body = (self.step(self.objective, self.optimizer) if self.step is not None
-                        else self._default_step(shapes))
+                body = (self.step(self.objective, self.optimizer) if self.step is not None else
+                        Transaction(self.objective, self.optimizer, self.accumulation, shapes).step())
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
@@ -1065,7 +1064,8 @@ class Trainer(Generic[Loss, Effects]):
                 if (profiler is not None and profile is not None
                         and not run.tracing and run.traced == 0
                         and seen >= profile.warmup):
-                    run.tracing = self._start_window(profiler)
+                    self._start_window(profiler)
+                    run.tracing = True
                 capturing = tracer is not None and tracer.running
                 step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                               if capturing else contextlib.nullcontext())
@@ -1378,8 +1378,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
                 f"holds a batch that is a multiple of {divisor}")
 
-    def _start_window(self, profiler: Profiler) -> bool:
-        """Open the profiler's capture on every rank, and say it is capturing.
+    def _start_window(self, profiler: Profiler) -> None:
+        """Open the profiler's capture on every rank.
 
         A peer that failed to start raises here. A capture this rank did
         start is closed first, so no live trace outlives the aborted run.
@@ -1400,7 +1400,6 @@ class Trainer(Generic[Loss, Effects]):
                 except BaseException as failure:
                     primary.add_note(f"Profiler stop failed: {failure!r}")
             raise
-        return capturing
 
     def _rolled_out(self, state: TrainState, batch: Batch, mesh: Mesh) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.
@@ -1428,11 +1427,11 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-            self._report(StepCompiled(time.perf_counter() - began,
-                                      remat_record(_remat_of(_model_of(self.objective))),
-                                      {axis: AxisLink(link.bytes_per_second, link.spread)
-                                       for axis, link in self.links.items()}),
-                         int(state.step))
+            seconds = time.perf_counter() - began
+            remat = _remat_of(_model_of(self.objective))
+            links = {axis: AxisLink(link.bytes_per_second, link.spread)
+                     for axis, link in self.links.items()}
+            self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
         return compiled[shapes]
 
     def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],
