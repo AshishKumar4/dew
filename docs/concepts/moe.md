@@ -31,7 +31,7 @@ experts per token, layer 0: [[1, 3], [3, 1], [1, 0], [3, 2]]
 Every layer here routes (`every=1`) to two of four experts. The logits keep the usual `(batch, sequence, vocabulary)` shape. Opening the `router` collection makes each router record its choices (`indices`, `[batch, sequence, top_k]`), its scores and its log partition; without it nothing is recorded. Flax keeps sown values in a tuple, hence the first `[0]`. The figure reads the same collection from this model over 64 random tokens:
 
 ![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-light.svg)
-![](../assets/moe-routing-dark.svg)
+![Router choices of a four-expert, top-2 mixture at layer 0 for 32 tokens, with each chosen expert's normalized weight, and the number of tokens each expert received in both layers.](../assets/moe-routing-dark.svg)
 
 ## Mixture
 

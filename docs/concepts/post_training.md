@@ -13,7 +13,7 @@ Post-training changes how a trained model behaves. Dew runs each method as an ob
 DPO and GRPO (with `beta > 0`) keep the starting weights as a frozen reference. [Language models](language_models.md) covers next-token training, and [Objectives](objectives.md) how models, objectives and the trainer fit together.
 
 ![SFT reads token rows with roles; DPO reads chosen and rejected rows against a frozen reference; GRPO samples groups of completions from the policy, scores them with a reward and trains on the packed rows.](../assets/post-training-light.svg)
-![](../assets/post-training-dark.svg)
+![SFT reads token rows with roles; DPO reads chosen and rejected rows against a frozen reference; GRPO samples groups of completions from the policy, scores them with a reward and trains on the packed rows.](../assets/post-training-dark.svg)
 
 ## Example
 
