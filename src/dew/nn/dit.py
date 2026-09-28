@@ -180,8 +180,6 @@ class PatchSequenceEmbed(nn.Module):
 
     def __call__(self, x):
         _, H, W, _ = x.shape
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, \
-            "Image dimensions must be divisible by patch size"
         H_P, W_P = H // self.patch_size, W // self.patch_size
 
         inv_idx = None

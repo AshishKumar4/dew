@@ -628,10 +628,8 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
     was. A `Situ` computes its own product."""
     if isinstance(activation, Situ):
         return activation
-    gates = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True), 'geglu_exact': exact_gelu}
-    if activation not in gates:
-        raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
-    activate = gates[activation]
+    activate = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True),
+                'geglu_exact': exact_gelu}[activation]
 
     # Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
     # differentiated as written it keeps five fp32 copies of the MLP's width
