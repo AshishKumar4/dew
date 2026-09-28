@@ -454,6 +454,48 @@ def test_a_window_wider_than_a_shard_takes_the_exchange():
     assert_close_by_leaf(split, whole)
 
 
+def test_rotary_angles_use_the_same_rounded_frequency_table_on_every_backend():
+    """The configuration table rounds its power in float64 before the fp32
+    reciprocal; a backend's approximate pow must not move a token's angle.
+    """
+    dimension, theta = 96, 10000.0
+    positions = jnp.asarray([0, 1, 4093], jnp.float32)
+    exponents = np.arange(0, dimension, 2, dtype=np.float32) / dimension
+    powers = np.power(np.float64(theta), exponents.astype(np.float64)).astype(np.float32)
+    angles = positions[:, None] * jnp.asarray(np.float32(1) / powers)[None, :]
+    expected = (jnp.cos(angles), jnp.sin(angles))
+    actual = rotary_freqs(positions, dimension, theta, dtype=jnp.float32)
+    for have, want in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(have, want)
+
+
+def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_positions():
+    """Equal temporal and spatial coordinates reduce M-RoPE to plain RoPE,
+    including the keys a later layer shares. Both must read the same table.
+    """
+    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    plain = CausalSelfAttention(emb_features=16, num_heads=2, num_kv_heads=1,
+                                head_dim=128, max_seq_len=4096, rope_theta=5e5,
+                                partial_rotary_type="default", kv_store_key="shared")
+    multimodal = plain.clone(mrope_section=(16, 24, 24))
+    hidden = jax.random.normal(jax.random.key(1), (1, 3, 16))
+    positions = jnp.asarray([[0, 1, 4093]], jnp.int32)
+    variables = plain.init(jax.random.key(2), hidden, positions=positions)
+    coordinates = jnp.repeat(positions[..., None], 3, axis=-1)
+
+    def shared_keys(layer, metadata):
+        store = {}
+        layer.apply(variables, hidden, positions=positions, kv_store=store,
+                    attention_metadata=metadata)
+        return store["shared"][0]
+
+    np.testing.assert_array_equal(
+        shared_keys(multimodal, AttentionMetadata(rotary_positions=coordinates)),
+        shared_keys(plain, None))
+
+
 @pytest.mark.mesh
 def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
     """A full attention module: rotary angles from the row's position, then

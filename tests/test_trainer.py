@@ -1324,9 +1324,15 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+    from dew.objectives.base import Step, scalar_loss
 
-    assert trainer.executable is not None
+    compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+    batch = {"text": jnp.zeros((8, 5), jnp.int32)}
+    expected, _ = scalar_loss(trainer.objective, state.params, batch,
+                              Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
+    advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
+    assert loss == pytest.approx(float(expected), rel=1e-6)
+    assert int(advanced.step) == 1 and bool(finite)
 
 
 def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):

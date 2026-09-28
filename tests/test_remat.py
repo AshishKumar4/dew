@@ -256,27 +256,58 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
 
 
-def test_the_headroom_is_the_tightest_devices_free_memory_less_what_the_step_adds():
-    """Outputs that alias the donated state take no new memory; the rest of
-    the outputs and the temporaries do. The arguments, the state and the
-    batch, are resident already and counted in use, so they are not counted
-    again as the step's (8d578658: they were, against the whole limit). A
-    device or an executable that reports no memory leaves the answer
-    unknown."""
-    from types import SimpleNamespace
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs GPU allocator memory statistics")
+def test_compilation_counts_memory_kept_alive_outside_its_state():
+    """A second model or serving cache still occupies device memory. The
+    compiled step must fit what remains, not the allocator's whole limit.
+    Reserve enough real memory to force recompilation, then run the step.
+    """
+    import optax
 
-    from dew.training.trainer import step_headroom
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
 
-    step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
-        argument_size_in_bytes=700, output_size_in_bytes=100, alias_size_in_bytes=40,
-        temp_size_in_bytes=50))
+    if jax.device_count() != 1:
+        pytest.skip("reserves memory on one GPU")
+    device = jax.devices()[0]
+    model = CausalTransformer(vocab_size=65536, emb_features=64, num_layers=1,
+                              num_heads=2, mlp_features=128, max_seq_len=256,
+                              dtype=jnp.bfloat16)
+    objective = LMObjective(model, seq_len=256)
+    trainer = Trainer(objective, optax.adam(1e-4), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.zeros((4, 257), jnp.int32)}
+    trainer.compile(state, batch)
+    if objective.head_tile is not None:
+        pytest.skip("not enough free GPU memory to establish the whole-logits step")
 
-    def device(in_use):
-        return SimpleNamespace(memory_stats=lambda: {'bytes_limit': 1000, 'bytes_in_use': in_use})
+    def additional_bytes():
+        assert trainer.executable is not None
+        stats = trainer.executable.memory_analysis()
+        assert stats is not None
+        return stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
 
-    assert step_headroom(step, [device(800), device(850)]) == 150 - 110
-    assert step_headroom(step, [device(800), SimpleNamespace(memory_stats=lambda: None)]) is None
-    assert step_headroom(SimpleNamespace(memory_analysis=lambda: None), [device(800)]) is None
+    memory = device.memory_stats()
+    if memory is None:
+        pytest.skip("this GPU allocator reports no memory statistics")
+    reserve = memory["bytes_limit"] - memory["bytes_in_use"] - additional_bytes() // 2
+    if reserve <= 0:
+        pytest.skip("not enough free GPU memory to establish the unconstrained step")
+    # Cache-sized allocations also fit around buffers retained by earlier tests.
+    allocate = jax.jit(lambda value, size: jnp.broadcast_to(value, (size,)), static_argnums=1)
+    block = 64 * 2**20
+    zero = jnp.asarray(0, jnp.uint8)
+    held = [allocate(zero, min(block, reserve - start)) for start in range(0, reserve, block)]
+    jax.block_until_ready(held)
+    step = trainer.compile(state, batch)
+    memory = device.memory_stats()
+    assert memory is not None
+    assert additional_bytes() <= memory["bytes_limit"] - memory["bytes_in_use"]
+    _, loss, _, finite, _ = jax.block_until_ready(step(state, batch))
+    assert bool(finite), float(loss)
+    jax.block_until_ready(held)
+
 
 
 def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
