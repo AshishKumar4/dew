@@ -98,7 +98,6 @@ def inflate_unet_variables(variables_2d, variables_3d):
         out = dict(dst)
         for key, value in src.items():
             if isinstance(value, dict):
-                assert key in dst, f"2D module '{key}' has no counterpart in the 3D tree"
                 out[key] = merge(dst[key], value)
             else:
                 out[key] = value

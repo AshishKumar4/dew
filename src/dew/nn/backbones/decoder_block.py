@@ -210,10 +210,6 @@ class GatedMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if not 0 <= self.activation_sparsity < 1:
-            raise ValueError(
-                f"activation_sparsity is the fraction of gate activations dropped, "
-                f"within [0, 1), got {self.activation_sparsity}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
@@ -254,10 +250,6 @@ class BlockWiring:
     pre_norms: bool = True
     output_norms: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
-
-    def __post_init__(self):
-        if self.layer_scalar not in (None, "frozen", "trainable"):
-            raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
@@ -564,9 +556,6 @@ class DecoderBlock(nn.Module):
             if self.feedforward is not None:
                 self.mlp_res = site(name='mlp_res')
         if self.engram is not None:
-            if self.hyper_connections is None or self.engram_index is None:
-                raise ValueError("an engram lookup gates into mHC's residual streams and reads "
-                                 "one engram layer's bucket ids, so it needs both")
             self.engram_layer = self.engram(name='engram')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
