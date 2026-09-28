@@ -109,9 +109,11 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         wide = jnp.promote_types(tokens.dtype, kernel.dtype)
         tokens, kernel = tokens.astype(wide), kernel.astype(wide)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
+    # Keep the wider domain for CPU calls whose row count actually needs it.
+    index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
     if group_sizes.dtype == jnp.int64:
-        group_sizes = group_sizes.astype(jnp.int32)
-    grouped = jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None] < jnp.sum(group_sizes, dtype=jnp.int32)
+        group_sizes = group_sizes.astype(index_dtype)
+    grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(group_sizes, dtype=index_dtype)
     out = jax.lax.ragged_dot(
         jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)
