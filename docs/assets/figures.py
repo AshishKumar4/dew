@@ -301,87 +301,79 @@ def moe_routing_figure():
         indices, scores = np.asarray(gate["indices"][0][0]), np.asarray(gate["scores"][0][0])
         chosen = np.take_along_axis(scores, indices, axis=-1)
         layers.append((indices, chosen / chosen.sum(-1, keepdims=True)))
-    shown = 32
+    shown = 22
     for variant, t in THEMES.items():
-        svg = Svg(1040, 420, t)
-        svg.text(24, 30, 'mixture={"experts": 4, "top_k": 2}: layer 0, the first 32 of 64 tokens',
-                 size=13, mono=True, weight=600)
+        svg = Svg(760, 490, t)
+        svg.text(20, 30, 'mixture={"experts": 4, "top_k": 2}, layer 0', size=14, mono=True, weight=600)
+        svg.text(20, 52, f"The router's choices for the first {shown} of 64 tokens.", size=13,
+                 color=t["muted"])
         indices, weights = layers[0]
-        cell, x0, y0 = 22, 96, 50
+        cell, x0, y0 = 28, 100, 70
         for expert in range(4):
-            svg.text(x0 - 10, y0 + expert * (cell + 4) + 15, f"expert {expert}", size=11, mono=True,
+            svg.text(x0 - 10, y0 + expert * (cell + 4) + 19, f"expert {expert}", size=12, mono=True,
                      anchor="end", color=t["muted"])
             for token in range(shown):
                 x, y = x0 + token * cell, y0 + expert * (cell + 4)
                 hit = np.nonzero(indices[token] == expert)[0]
                 if hit.size:
                     svg.rect(x, y, cell - 2, cell, fill=t["tints"][expert], rx=3)
-                    svg.text(x + (cell - 2) / 2, y + 15, f"{weights[token, hit[0]]:.2f}"[1:], size=8,
+                    svg.text(x + (cell - 2) / 2, y + 19, f"{weights[token, hit[0]]:.2f}"[1:], size=12,
                              mono=True, anchor="middle")
                 else:
                     svg.rect(x, y, cell - 2, cell, fill=t["fill"], rx=3)
         for token in range(0, shown, 4):
-            svg.text(x0 + token * cell + (cell - 2) / 2, y0 + 4 * (cell + 4) + 12, str(token), size=10,
+            svg.text(x0 + token * cell + (cell - 2) / 2, y0 + 4 * (cell + 4) + 16, str(token), size=12,
                      mono=True, anchor="middle", color=t["muted"])
-        svg.text(x0, y0 + 4 * (cell + 4) + 30, "token position", size=11, color=t["muted"])
+        svg.text(x0, y0 + 4 * (cell + 4) + 36, "token position", size=12, color=t["muted"])
 
         # Tokens per expert over all 64 tokens, per layer.
-        bx, by, bh = 96, 250, 80
-        svg.text(bx - 72, by - 16, "tokens routed to each expert (64 tokens × top 2 = 128 slots)", size=12,
+        by, bh = 300, 80
+        svg.text(20, by - 26, "Tokens routed to each expert: 64 tokens × top 2 = 128 slots", size=14,
                  weight=600)
         for layer, (indices, _) in enumerate(layers):
             counts = np.bincount(indices.ravel(), minlength=4)
-            lx = bx + layer * 360
-            svg.text(lx, by + bh + 36, f"layer {layer}", size=12, mono=True)
+            lx = 100 + layer * 330
             for expert, count in enumerate(counts):
                 h = bh * count / 64
-                x = lx + expert * 70
-                svg.rect(x, by + bh - h, 52, h, fill=t["tints"][expert], rx=3)
-                svg.text(x + 26, by + bh - h - 6, str(int(count)), size=11, mono=True, anchor="middle")
-                svg.text(x + 26, by + bh + 16, f"e{expert}", size=11, mono=True, anchor="middle",
+                x = lx + expert * 60
+                svg.rect(x, by + bh - h, 44, h, fill=t["tints"][expert], rx=3)
+                svg.text(x + 22, by + bh - h - 6, str(int(count)), size=13, mono=True, anchor="middle")
+                svg.text(x + 22, by + bh + 18, f"e{expert}", size=12, mono=True, anchor="middle",
                          color=t["muted"])
-        svg.text(812, by + 10, "Each token takes the top 2", size=12, color=t["muted"])
-        svg.text(812, by + 28, "experts by router score.", size=12, color=t["muted"])
-        svg.text(812, by + 52, "Cell numbers: the token's", size=12, color=t["muted"])
-        svg.text(812, by + 70, "normalized routing weight.", size=12, color=t["muted"])
-        svg.text(24, 405, "Read from the 'router' collection a fresh init sows (indices, scores); "
-                 "random weights and tokens, so the load is uneven.", size=12, color=t["muted"])
+            svg.text(lx, by + bh + 42, f"layer {layer}", size=13, mono=True)
+        svg.text(20, 455, "Cell numbers: the token's normalized routing weight for that expert.",
+                 size=13, color=t["muted"])
+        svg.text(20, 476, "Read from the 'router' collection of a fresh init: random weights and tokens, "
+                 "so the load is uneven.", size=13, color=t["muted"])
         svg.write("moe-routing", variant)
 
 
 def post_training_figure():
     """The data each post-training objective reads, from dew.data, dew.objectives.rl and pack."""
     for variant, t in THEMES.items():
-        svg = Svg(1040, 440, t)
+        svg = Svg(760, 372, t)
         lanes = [
             ("SFT", "ChatMessages", ["conversations, rendered by", "the chat template"],
              "text, text_roles", ["[B, L + 1]"], "LMObjective", ["loss_role=Role.ASSISTANT"]),
             ("DPO", "PreferencePairs", ["chosen, rejected and", "their completion masks"],
-             "input_ids, completion_mask", ["[B, 2, S]"], "DPOObjective", ["policy against the", "frozen reference"]),
+             "input_ids", ["completion_mask", "both [B, 2, S]"], "DPOObjective",
+             ["policy against the frozen", "reference in TrainState.ema"]),
             ("GRPO", "Prompts", ["left-padded prompt,", "prompt_length, reward fields"],
              "SampledRollout → pack", ["G completions per prompt,", "reward → advantages"],
-             "GRPOObjective", ["clipped ratio + beta · KL"]),
+             "GRPOObjective", ["clipped ratio + beta · KL", "to the reference in .ema"]),
         ]
         for row, (name, source, source_lines, fields, field_lines, objective, objective_lines) in enumerate(lanes):
-            y = 30 + row * 128
-            svg.text(24, y + 44, name, size=14, mono=True, weight=600)
-            box(svg, 90, y, 230, 92, source, source_lines)
-            box(svg, 370, y, 260, 92, fields, field_lines)
-            box(svg, 680, y, 230, 92, objective, objective_lines, accent=True)
-            svg.arrow(320, y + 46, 368, y + 46)
-            svg.arrow(630, y + 46, 678, y + 46)
-        # The frozen reference DPO and GRPO (beta > 0) keep in the EMA slot.
-        svg.rect(930, 158, 96, 220, fill=t["raised"], rx=6)
-        svg.text(978, 182, "TrainState", size=11, mono=True, anchor="middle", weight=600)
-        svg.text(978, 198, ".ema", size=11, mono=True, anchor="middle", weight=600)
-        for i, line in enumerate(["frozen", "reference:", "the starting", "weights,", "decay 1"]):
-            svg.text(978, 222 + 16 * i, line, size=11, anchor="middle", color=t["muted"])
-        svg.arrow(930, 204, 912, 204)
-        svg.arrow(930, 332, 912, 332)
+            y = 20 + row * 104
+            svg.text(20, y + 45, name, size=14, mono=True, weight=600)
+            box(svg, 70, y, 200, 84, source, source_lines)
+            box(svg, 290, y, 210, 84, fields, field_lines)
+            box(svg, 520, y, 220, 84, objective, objective_lines, accent=True)
+            svg.arrow(270, y + 42, 288, y + 42)
+            svg.arrow(500, y + 42, 518, y + 42)
         # GRPO samples with the policy it trains.
-        svg.polyline([(795, 378), (795, 404), (505, 404)], t["muted"], width=1.25)
-        svg.arrow(505, 404, 505, 380)
-        svg.text(650, 428, "the current policy samples the next batch", size=11, color=t["muted"],
+        svg.polyline([(630, 312), (630, 336), (395, 336)], t["muted"], width=1.25)
+        svg.arrow(395, 336, 395, 314)
+        svg.text(512, 360, "the current policy samples the next batch", size=13, color=t["muted"],
                  anchor="middle")
         svg.write("post-training", variant)
 
