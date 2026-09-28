@@ -1,14 +1,18 @@
-"""Sample Dew's pretrained text-to-image model over prompts, seeds and samplers.
+"""Sample a pretrained text-to-image model over prompts, seeds and samplers.
 
-Run from the repository root on a GPU, with a Dew run directory:
-
-    python examples/sample_text_to_image.py --checkpoint RUN_DIR
-
-or with one step of a FlaxDiff checkpoint and the config its trainer logged,
-read through `dew.interop.flaxdiff`:
+Run from the repository root on a GPU, with one step of a FlaxDiff checkpoint
+and the config its trainer logged, read through `dew.interop.flaxdiff`:
 
     python examples/sample_text_to_image.py --checkpoint udit_ema/350000 \
         --flaxdiff-config udit_config.json
+
+or with a Dew run directory, read through `TextToImage.from_run`:
+
+    python examples/sample_text_to_image.py --checkpoint RUN_DIR
+
+The recorded grids come from the first form: a U-DiT that FlaxDiff trained,
+at step 350000 of its EMA weights. No text-to-image Dew run exists yet, so the
+second form has not been run.
 
 Each sampler draws one batch per seed, holding every prompt. The output
 directory gets one PNG per image, one grid per sampler (rows are prompts,
@@ -76,9 +80,13 @@ def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
     rows, columns, height, width = images.shape[:4]
     font = ImageFont.load_default(size=14)
     label, gap = 22, 4
-    sheet = Image.new("RGB", (columns * (width + gap) - gap, label + rows * (label + height)), "#b0b0b0")
+    heading = title + "   seeds " + ", ".join(map(str, seeds))
+    # As wide as the images, or as the longest caption where it is wider.
+    widest = max(font.getlength(caption) for caption in (heading, *prompts)) + 8
+    sheet = Image.new("RGB", (max(columns * (width + gap) - gap, int(widest)), label + rows * (label + height)),
+                      "#b0b0b0")
     draw = ImageDraw.Draw(sheet)
-    draw.text((4, 4), title + "   seeds " + ", ".join(map(str, seeds)), fill="black", font=font)
+    draw.text((4, 4), heading, fill="black", font=font)
     for row, prompt in enumerate(prompts):
         top = label + row * (label + height)
         draw.text((4, top + 4), prompt, fill="black", font=font)
