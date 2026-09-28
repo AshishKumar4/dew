@@ -48,7 +48,7 @@ Image sources can need network access the first time you use them. Token-window 
 
 ## Read a dataset a provider already holds
 
-For data that TFDS or Hugging Face already holds, `dew.data.load("<provider>/<name>", batch=...)` returns the same kind of `Dataset` a specification returns. You must pass `preprocess(record, rng)` to turn a provider record into batch fields. There is no default, because each provider's rows have their own shape.
+For data that TFDS or Hugging Face already holds, `dew.data.load("<provider>/<name>", batch=...)` returns the same kind of `Dataset` a specification returns. Pass `preprocess(record, rng)` to turn a provider record into batch fields. Without it, the provider's records are the batch fields as they come: there is no default conversion, because each provider's rows have their own shape.
 
 ```python
 import dew.data

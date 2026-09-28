@@ -106,7 +106,7 @@ Dew does not implement 1F1B. Earlier experiments tried one approach. They do not
 
 ## Select precision and kernels
 
-On GPU, attention can use cuDNN when the shape, dtype, mask and requested features fit its supported path. Other calls use XLA. On TPU, attention uses Pallas. Packed masks and optional attention features can change which kernel runs and how much memory it uses.
+On GPU, attention can use cuDNN when the shape, dtype, mask and requested features fit its supported path. Other calls use XLA, or the reference path where the call asks for arithmetic no fused kernel performs. On TPU, `"auto"` uses the Pallas splash kernel when it can tile the shapes and the sequence is at least 512 tokens, and XLA otherwise. Packed masks and optional attention features can change which kernel runs and how much memory it uses.
 
 Qwix quantization is an optional, experimental training path with int8 and fp8 computation. It keeps the master parameters but changes the numerics. In the local RTX 4080 measurements, fp8 did not make steps faster at the sizes tested. See the [performance measurements](../performance.md), and check accuracy and throughput on your own configuration.
 
