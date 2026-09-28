@@ -1,14 +1,19 @@
 {
- "prompt": "a bowl of fresh fruit on a wooden table",
- "seed": 0,
+ "prompt": "a canyon at sunset with red rocks",
+ "seed": 9,
  "sampler": "Heun",
  "steps": 40,
- "cfg": 4.0,
+ "cfg": 7.0,
+ "guidance_interval": [
+  0.2,
+  0.9
+ ],
+ "negative_prompt": "white border, frame, text, watermark, collage, blurry, low quality",
  "model": {
   "model": "FlaxDiff 0.2 simple_udit, loaded into Dew's SimpleUDiT (adaln_silu=False, text_pooling='all') by dew.interop.flaxdiff.load_flaxdiff",
   "parameters": 71298064,
-  "dew_commit": "8f1b788a9369c1ad8f4b643761549b044b138bfa",
-  "device": "NVIDIA L4"
+  "dew_commit": "5c83529957e1909bb4831204313c7aa7137f2532",
+  "device": "NVIDIA GeForce RTX 4080"
  },
  "frames": 32,
  "kept_steps": [
@@ -46,5 +51,12 @@
   39
  ],
  "columns": 8,
- "size": 256
+ "crop": [
+  0,
+  42,
+  256,
+  213
+ ],
+ "width": 256,
+ "height": 171
 }
