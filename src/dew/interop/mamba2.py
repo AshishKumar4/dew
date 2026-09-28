@@ -48,8 +48,6 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     (num_heads, head_dim) takes one head of the model width; the SSD layer
     reads its own heads from the mixer value and never that.
     """
-    if hf_config.get("model_type", MODEL_TYPE) != MODEL_TYPE:
-        raise ValueError(f"model_type {hf_config.get('model_type')!r} is not {MODEL_TYPE!r}")
     read = {"model_type", "num_hidden_layers"} if used is None else used
 
     def integer(key: str, default: int) -> int:
