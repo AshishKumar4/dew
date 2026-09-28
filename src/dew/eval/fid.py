@@ -114,14 +114,19 @@ class GaussianStats:
     @classmethod
     def from_features(cls, features, *, population: str) -> "GaussianStats":
         x = np.asarray(features, dtype=np.float64)
-        if not np.isfinite(x).all():
-            raise ValueError(f"fid {population}: non-finite features")
+        if x.ndim != 2 or not np.isfinite(x).all():
+            raise ValueError(f"fid {population}: expected finite [N, D] features")
         count, width = x.shape
         mean = x.mean(axis=0) if count else np.zeros(width, dtype=np.float64)
         centered = x - mean
-        return cls(count, mean, centered.T @ centered)
+        m2 = centered.T @ centered
+        if not np.isfinite(mean).all() or not np.isfinite(m2).all():
+            raise ValueError(f"fid {population}: non-finite feature statistics")
+        return cls(count, mean, m2)
 
     def merge(self, other: "GaussianStats") -> "GaussianStats":
+        if self.mean.shape != other.mean.shape:
+            raise ValueError("fid: feature dimensions differ between batches")
         if other.count == 0:
             return self
         if self.count == 0:
@@ -132,9 +137,13 @@ class GaussianStats:
         self.m2 += np.outer(delta, delta) * (self.count * other.count / count)
         self.mean += delta * (other.count / count)
         self.count = count
+        if not np.isfinite(self.mean).all() or not np.isfinite(self.m2).all():
+            raise ValueError("fid: non-finite pooled feature statistics")
         return self
 
-    def covariance(self) -> NDArray[np.float64]:
+    def covariance(self, *, population: str) -> NDArray[np.float64]:
+        if self.count < 2:
+            raise ValueError(f"fid {population}: at least two rows required, got {self.count}")
         return self.m2 / (self.count - 1)
 
 
@@ -205,8 +214,8 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
         raise ValueError(
             "fid generated and real populations require at least two rows each; "
             f"got generated={generated.count}, real={real.count}")
-    distance = frechet_distance(generated.mean, generated.covariance(),
-                                real.mean, real.covariance())
+    distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
+                                real.mean, real.covariance(population="real"))
     _log.info("FID populations: generated=%d, real=%d; features=%s",
               generated.count, real.count, _features(weights))
     return distance
