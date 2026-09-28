@@ -367,9 +367,6 @@ def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
     """
     batch, count, channels = patches.shape
     side = round(count ** 0.5)
-    if side * side != count:
-        raise ValueError(
-            f"{count} patches are not a square grid, so no shuffle ratio tiles them")
     grown = round(channels / ratio ** 2)
     if abs(grown * ratio ** 2 - channels) > 1e-6:
         raise ValueError(
