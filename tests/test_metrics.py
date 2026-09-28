@@ -248,7 +248,12 @@ def test_fid_extraction_is_independent_of_small_batch_boundaries():
     """
     from dew.inputs import unit_range
 
-    images, brighter = fid_sets()
+    # IID noise alone becomes nearly constant after global pooling. Vary
+    # each image's brightness so covariance does not subtract nearly equal
+    # features and amplify their float32 rounding into a relative error.
+    images = np.random.default_rng(93).integers(0, 64, (16, 32, 32, 3), dtype=np.uint8)
+    images += (10 * np.arange(16, dtype=np.uint8))[:, None, None, None]
+    brighter = images + np.uint8(40)
     metric = FID(weights=str(INCEPTION_TINY))
     whole = metric(ImageGrid(unit_range(brighter)), {"image": images})
     split = metric(ImageGrid(unit_range(brighter[:1])), {"image": images[:1]})
