@@ -1473,39 +1473,32 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     takes no such argument, so the calls that fall through to it run on a TPU
     and nowhere else.
     """
-    if jnp.finfo(query.dtype).bits == 16 and not interpret:
-        # Mosaic multiplies 16-bit operands at the default precision only.
-        # Their products are exact and accumulate in fp32; splash's fp32 P·V
-        # takes one bf16 pass, as at any default-precision run
-        # (`at_default_precision`).
-        return at_default_precision(lambda query, key, value, bias, sinks: _tpu_kernels(
-            query, key, value, bias, mask, causal, sliding_window, softcap=softcap,
-            sinks=sinks, segment_ids=segment_ids, interpret=interpret))(
-                query, key, value, bias, sinks)
-    return _tpu_kernels(query, key, value, bias, mask, causal, sliding_window,
-                        softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                        interpret=interpret)
-
-
-def _tpu_kernels(query, key, value, bias, mask, causal, sliding_window, *,
-                 softcap, sinks, segment_ids, interpret: bool):
-    """`tpu_attention` at whatever matmul precision is configured."""
     q_len, kv_len = query.shape[-3], key.shape[-3]
     descriptor = None
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
             q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
-    if descriptor is not None:
-        return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
-                                segment_ids=segment_ids, interpret=interpret)
-    if softcap is not None or sinks is not None:
+    if descriptor is None and (softcap is not None or sinks is not None):
         raise ValueError(
             "attention implementation 'tpu' takes a softcap and sinks only on "
             "the splash kernel, and this call has a bias, a mask splash cannot "
             "describe or a length that is not a multiple of "
             f"{SPLASH_LANES}. Use attention_impl 'xla'.")
-    return pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window,
-                                  segment_ids)
+
+    def attend(query, key, value, bias, sinks):
+        if descriptor is None:
+            return pallas_flash_attention(query, key, value, bias, mask, causal,
+                                          sliding_window, segment_ids)
+        return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, interpret=interpret)
+
+    if jnp.finfo(query.dtype).bits == 16 and not interpret:
+        # Mosaic multiplies 16-bit operands at the default precision only.
+        # Their products are exact and accumulate in fp32; splash's fp32 P·V
+        # takes one bf16 pass, as at any default-precision run
+        # (`at_default_precision`).
+        return at_default_precision(attend)(query, key, value, bias, sinks)
+    return attend(query, key, value, bias, sinks)
 
 
 def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_ids,
