@@ -32,8 +32,6 @@ def attention_with_sinks(
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     batch, length, heads, width = query.shape
     kv_heads = key.shape[-2]
-    if heads % kv_heads:
-        raise ValueError("attention sinks require query heads divisible by key/value heads")
     if sinks.shape != (heads,):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
     groups = heads // kv_heads
