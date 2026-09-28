@@ -811,11 +811,12 @@ class Gemma4VisionTransformer(nn.Module):
 
     def __call__(self, pixel_values, pixel_position_ids=None) -> jax.Array:
         pixels = jnp.asarray(pixel_values)
+        kernel = self.pooling_kernel_size
         if pixels.ndim == 4:
             if pixel_position_ids is not None:
                 raise ValueError("position IDs accompany patch pixels, not NCHW images")
             batch, channels, height, width = pixels.shape
-            stride = self.patch_size * self.pooling_kernel_size
+            stride = self.patch_size * kernel
             if channels != 3 or height % stride or width % stride:
                 raise ValueError(f"Gemma4 images must have three channels and sides divisible by {stride}")
             rows, columns = height // self.patch_size, width // self.patch_size
@@ -830,6 +831,8 @@ class Gemma4VisionTransformer(nn.Module):
             raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
         if not jnp.issubdtype(pixel_position_ids.dtype, jnp.integer):
             raise ValueError("pixel_position_ids must be integers")
+        if pixels.shape[1] % kernel ** 2:
+            raise ValueError("patch count must divide into whole pooling blocks")
         valid = (pixel_position_ids >= 0).all(axis=-1)
         safe = jnp.maximum(pixel_position_ids, 0)
         hidden_states = self.patch_embed(2 * (pixels - 0.5))
@@ -840,9 +843,6 @@ class Gemma4VisionTransformer(nn.Module):
                                        dtype=at_least_fp32(hidden_states.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, cos, sin, valid)
-        kernel = self.pooling_kernel_size
-        if pixels.shape[1] % kernel ** 2:
-            raise ValueError("patch count must divide into whole pooling blocks")
         output_length = pixels.shape[1] // kernel ** 2
         width = safe[..., 0].max(axis=-1, keepdims=True) + 1
         indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)
