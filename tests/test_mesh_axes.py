@@ -199,40 +199,60 @@ def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_sec
     assert link is None or link.spread == spreads
 
 
-@pytest.mark.parametrize(("bytes_per_second", "peak", "platform", "splits"), [
-    (None, None, None, False),
-    (450e9, 989e12, "gpu", False),
-    (2.4e12, 989e12, "gpu", True),
-    (None, None, "gpu", False),
-    (None, None, "cpu", True),
-], ids=["unmeasured", "h100-nvlink", "a-link-that-pays", "unknown-gpu", "cpu"])
-def test_a_contexts_projection_splits_its_positions_only_where_the_sequence_link_pays(
-        bytes_per_second, peak, platform, splits):
-    """SDXL's cross-attention context, 77 text tokens of width 2048, projected
-    into keys and values of 1280 each on sequence4, 8 rows a sequence group.
-    Split over the sequence axis, each shard projects 20 of the 80 padded
-    positions; the split saves 3/4 of the projections' FLOPs and adds their
-    outputs' and the context gradient's gathers and a sum of their weight
-    gradients over the axis, which at 640 positions an H100 would need
-    2.35 TB/s to move in the time its peak takes for the FLOPs saved:
-    `down_projection`'s rule, over the sequence axis's link. NVLink 4's
-    nominal 450 GB/s keeps the projections whole; a CPU mesh splits them."""
-    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links, split_positions
+@pytest.mark.parametrize("length", [1, 13])
+def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(length):
+    """An indivisible context's projection trades redundant FLOPs for bytes.
 
-    mesh = build_mesh(MeshSpec(sequence=4), jax.devices()[:4])
-    context = jax.ShapeDtypeStruct((8, 77, 2048), jnp.bfloat16)
-    lengths = []
+    Two rows of 13 positions, width 96, projected to 128 key/value features
+    need 71.8 GB/s at a 1 TFLOP/s peak: each shard saves nine positions,
+    not twelve, because three padded positions add work. The links straddle
+    that crossover. A one-position context saves no work even on a CPU link.
+    """
+    from dew.nn.attention import NormalAttention
+    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links
+    from dew.telemetry.instrumentation import compiled_flops
 
-    def project(tokens):
-        lengths.append(tokens.shape[1])
-        return tokens[..., :1280], tokens[..., :1280]
+    model = NormalAttention(64, heads=4, dim_head=16, attention_impl="reference")
+    query = jax.random.normal(jax.random.key(21), (2, 8, 64))
+    context = jax.random.normal(jax.random.key(22), (2, length, 96))
+    params = model.init(jax.random.key(23), query, context)["params"]
 
-    link = None if platform is None else Link(bytes_per_second, peak, platform)
-    with jax.set_mesh(mesh), measured_links({} if link is None else {SEQUENCE_AXIS: link}):
-        keys, values = jax.eval_shape(lambda tokens: split_positions(tokens, 2 * 1280, project), context)
-    assert lengths == [80 if splits else 77]
-    assert keys.shape == values.shape == (8, 77, 1280)
-    assert link is None or link.spread == splits
+    def compiled(shards, link):
+        mesh = build_mesh(MeshSpec(sequence=shards), jax.devices()[:shards])
+        whole = NamedSharding(mesh, P())
+        inputs = jax.tree.map(lambda value: jax.device_put(value, whole), (params, query, context))
+
+        def loss(weights, x, tokens):
+            output = model.apply({"params": weights}, x, tokens)
+            return jnp.mean(jnp.square(output)), output
+
+        with jax.set_mesh(mesh), measured_links({SEQUENCE_AXIS: link}):
+            step = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))
+            executable = step.lower(*inputs).compile()
+        result = jax.device_get(executable(*inputs))
+        flops = compiled_flops(executable)
+        assert flops is not None
+        moved = 0
+        for line in executable.as_text().splitlines():
+            match = COLLECTIVE.match(line)
+            if match:
+                moved += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
+                             for dtype, dims in TYPED.findall(match["shape"]))
+        return result, flops * shards, moved
+
+    expected, _, _ = compiled(1, Link(None, None, "cpu"))
+    kept, kept_flops, kept_bytes = compiled(4, Link(60e9, 1e12, "gpu"))
+    fast = Link(80e9, 1e12, "gpu") if length > 1 else Link(None, None, "cpu")
+    split, split_flops, split_bytes = compiled(4, fast)
+    for actual in (kept, split):
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+    if length > 1:
+        assert split_flops < kept_flops * 0.65
+        assert split_bytes > kept_bytes
+    else:
+        assert split_flops == kept_flops
+        assert split_bytes == kept_bytes
 
 
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
