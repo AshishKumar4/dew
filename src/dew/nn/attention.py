@@ -1178,9 +1178,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
-    kernel = functools.partial(
-        attention_kernel, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
+    whole = functools.partial(
+        scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
@@ -1200,11 +1200,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
         if on_splash or (segment_ids is None and (
                 (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span)):
-            return scaled_dot_product_attention(
-                query, key, value, dtype=dtype, precision=precision,
-                force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-                causal=True, sliding_window=window, sinks=sinks, softcap=softcap,
-                segment_ids=segment_ids)
+            return whole(implementation=implementation, causal=True, sliding_window=window,
+                         segment_ids=segment_ids)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's
@@ -1220,15 +1217,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         if valid is not None:
             live = jnp.asarray(valid, bool)[:, None, None, :]
             mask = live if mask is None else mask & live
-        if mask is not None:
-            mask = combined_attention_mask(length, length, causal=True,
-                                           sliding_window=window, mask=mask)
-            implementation = masked
-        return scaled_dot_product_attention(
-            query, key, value, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-            causal=mask is None, sliding_window=window if mask is None else None, mask=mask,
-            sinks=sinks, softcap=softcap)
+        if mask is None:
+            return whole(implementation=implementation, causal=True, sliding_window=window)
+        return whole(implementation=masked, mask=combined_attention_mask(
+            length, length, causal=True, sliding_window=window, mask=mask))
+    kernel = functools.partial(
+        attention_kernel, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
     if shards > 1:
         out = _local_over_sequence(
             kernel, query, key, value, shards, window=window, chunk=chunk, positions=positions,
