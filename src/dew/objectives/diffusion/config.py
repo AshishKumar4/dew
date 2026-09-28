@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
-from dew.data import ImageDataset, OnlineImages, OxfordFlowers, VideoDataset
+from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
@@ -168,10 +168,12 @@ class DiffusionRunConfig(RunConfig):
     def sample_field(self) -> Field:
         """The batch field the model generates, at the resolution the data comes in."""
         spec = self.data
-        if isinstance(spec, (ImageDataset, OnlineImages)):
-            return Field("image", (spec.image_size, spec.image_size, 3))
         if isinstance(spec, VideoDataset):
             return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
+        if isinstance(spec, OnlineVideos):
+            return Field("video", (spec.frames, spec.image_size, spec.image_size, 3))
+        if isinstance(spec, (ImageDataset, OnlineImages)):
+            return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(
             f"the diffusion recipe trains on image or video datasets, not "
             f"{datasets.name_of(type(spec))}")

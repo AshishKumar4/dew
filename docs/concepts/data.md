@@ -44,7 +44,7 @@ Built-in sources such as `OxfordFlowers`, `TokenWindows` and `ChatMessages` are 
 
 `Loading` sets the number of Grain worker processes, read threads and buffers. The defaults start many workers (32). For a small local example, pass `Loading(workers=0)` to specifications that accept it. Raise concurrency only after you have measured the input pipeline on your own data and hardware.
 
-Image sources can need network access the first time you use them. Token-window sources read files written by the tokenizer preparation tool. Streaming sources can depend on remote servers and may not expose an iterator position you can restore. See [recipes](../recipes.md) for entry points and [installation extras](../installation.md#add-optional-dependencies) for dependencies.
+Image sources can need network access the first time you use them. Token-window sources read files written by the tokenizer preparation tool. Streaming sources can depend on remote servers and may not expose an iterator position you can restore. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions; `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file, `frames` consecutive frames at 25 fps, without audio. See [recipes](../recipes.md) for entry points and [installation extras](../installation.md#add-optional-dependencies) for dependencies.
 
 ## Read a dataset a provider already holds
 

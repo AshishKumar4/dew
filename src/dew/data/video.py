@@ -48,6 +48,15 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
     return sorted(paths)
 
 
+def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
+    """`frames` `[T, H, W, 3]` resized to `size` squares by area interpolation."""
+    if frames.shape[1] == size and frames.shape[2] == size:
+        return frames
+    import cv2
+    return np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+                     for frame in frames])
+
+
 class AudioVideoTransform(pygrain.RandomMapTransform):
     """Reads one clip per record: its frames, their audio, and its caption.
 
@@ -73,11 +82,7 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
             element["video_path"], num_frames=self.spec.frames,
             audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)),
             sample_rate=self.audio.sampling_rate)
-        size = self.spec.frame_size
-        if frames.shape[1] != size or frames.shape[2] != size:
-            import cv2
-            frames = np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
-                               for frame in frames])
+        frames = fit_frames(frames, self.spec.frame_size)
         # The extractor takes one waveform and hands back a batch of one;
         # given the rows it would read each frame's samples as a clip of
         # its own. Key names differ per audio model, so its output passes
