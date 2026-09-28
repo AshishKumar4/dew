@@ -73,11 +73,11 @@ The custom `step(objective, optimizer)` factory owns accepted/update clocks, sca
 ### Train
 
 ```text
-fit(data, *, steps, log_every=100, eval_every=None,
+fit(dataset, *, steps, log_every=100, eval_every=None,
     checkpoint_every=None, metrics=(), preview=False) -> TrainState
 ```
 
-- `data` is a `Dataset`.
+- `dataset` is a `Dataset`.
 - `steps` is the final target, including a restored step count.
 - `log_every` controls training log ticks.
 - `eval_every=None` disables evaluation. With an interval, evaluation also runs at the end.
@@ -120,11 +120,11 @@ Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
 
 ```text
 Dataset(train, val, records, batch, ramp=None)
-DataPartition(index=0, count=1, readers=1)
+DataPartition(index=0, count=1, readers=1, reader=0)
 Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
+`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
 Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
 
@@ -160,16 +160,16 @@ This object does not write `run.json`; run configuration saving is separate. Use
 Import `LMObjective` from `dew.objectives.lm`.
 
 ```text
-LMObjective(model, seq_len, *, ema_decay=0.999, pad_id=None, head_chunks=4,
+LMObjective(model, seq_len, *, ema_decay=0.999, pad_id=None, head_chunks=4, head_tile=None,
             samples=None, pretrained=None, balance_rate=None, aux_loss_alpha=None,
-            seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, qk_stats=False,
-            indexer=None, trainable=None)
+            seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, router_z_loss=0.0,
+            qk_stats=False, indexer=None, trainable=None, token_accuracy=True)
 IndexerTraining(phase, weight=1.0)
 ```
 
 The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
-`pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling; `samples` configures text previews. `ema_decay=None` trains without an averaged copy, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
+`pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay=None` trains without an averaged copy, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
 `indexer` trains DeepSeek-V3.2's lightning indexer on a model whose `mla` mixer names `index_n_heads` and `index_head_dim`. `IndexerTraining("warmup")` needs a mixer without `index_topk`: the model runs dense attention, `init` keeps the indexer alone in `params` and the rest of the tree under `frozen` (a `pretrained` tree may omit the indexer, as a dense checkpoint does), and the loss is the KL of the indexer's softmax from the attention distribution, reported as `indexer_kl`. `IndexerTraining("sparse")` needs a mixer with `index_topk`: the whole tree trains, the cross entropy trains the main weights and the KL over the selected keys trains the indexer, whose inputs are detached; a warm-up checkpoint's split tree is accepted as `pretrained`. `weight` scales the KL term.
 
@@ -290,12 +290,12 @@ An active row is drawable only when every score is finite or `-inf` and at least
 #### Strategies
 
 ```text
-Sample()
+Sample(grammar=None)
 Beam(width=1, length_penalty=1.0, early_stopping=False, stop_ids=1)
 Speculative(block=4, confidence=0.0)
 ```
 
-`Sample` draws every row independently and is what a request without a strategy runs.
+`Sample` draws every row independently and is what a request without a strategy runs. A `grammar` from `dew.sampling.guided` (`regex` or `json_schema`) keeps every draw inside it.
 
 `Beam` is deterministic beam search, with `_beam_search`'s bookkeeping from Transformers 5.16.1: a step keeps the best `(1 + stop_ids) * width` continuations so `width` live beams always remain, a criterion moves one into the completed set with its score divided by its generated length raised to `length_penalty`, and `early_stopping` takes the reference's `False`, `True` and `"never"`. The prompt is prefilled once and copied into `width` cache rows, which each step reparents, so a branched beam decodes exactly like a separately selected prefix. `n` is how many completed hypotheses to return and `n > width` is an error. A selected path is a search result rather than a draw, so its behaviour log probability is zero while the raw ones stay the model's own. Sampling with beams is refused: the marginal probability of a selected beam is not the per-step candidate probability, so there is no correct behaviour likelihood to record.
 
@@ -425,7 +425,8 @@ image_task.prepare(prompts, *, key=None, seed=None, steps=None, unconditional=No
 image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None,
            seed=None, decode=True) -> Images
 RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
-Server.from_task(task, *, slots, capacity, admission=None) -> Server
+Server.from_task(task, *, slots, capacity, admission=None, kv_cache=None, chunk=None,
+                 prefix_cache=False, decode_steps=1) -> Server
 ```
 
 A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
@@ -529,6 +530,6 @@ A registry maps names to known classes or factories. For example, `models.build(
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 
-`attention_impl` is a model field and names the attention kernel: `'reference'` (also spelled `None`) is the einsum and softmax, the only path that reads `dtype`, `precision` and `force_fp32_for_softmax`; `'xla'` and `'cudnn'` are `jax.nn.dot_product_attention`'s two; `'tpu'` is the Pallas splash kernel; `'auto'` resolves per trace, so a configuration logged as `'auto'` runs on the next machine. `'auto'` takes `'cudnn'` where its kernel runs (a GPU backend, bf16 or fp16, a query head width that is a multiple of 8 and at most 128, no softcap, no sinks, and no `--xla_gpu_deterministic_ops`), then `'tpu'` where splash's runs (a TPU backend, bf16 or fp32, query and key lengths that are multiples of 128 and at least 512, no additive bias, no mesh splitting the sequence, and a mask splash can describe), and `'xla'` otherwise. Splash's mask is a block-sparse descriptor built while the executable is, so a causal or sliding-window sequence skips the blocks it empties instead of paying its rectangle; the head width is unconstrained, because the kernel pads it, while the query and key lengths have to be multiples of 128 for its mask blocking to tile them. An additive bias, a mask that is a value of the trace (a KV-cache decode mask, the striped mask sequence parallelism builds), a mask past the published cell budget, and a length that is not a multiple of 128 keep the older Pallas flash kernel under an explicit `'tpu'` and keep `'auto'` on `'xla'`. Splash applies a logit softcap (Gemma 2) and attention sinks (GPT-OSS) itself, and a packed batch reaches it as segment ids rather than a mask; the flash kernel has neither a softcap nor sinks, so an explicit `'tpu'` call that splash cannot describe refuses them, and on a GPU `'auto'` runs both on `'xla'` while `'cudnn'` refuses them by name. Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention.py`). The parameter tree never changes with the implementation, so checkpoints are interchangeable across hardware.
+`attention_impl` is a model field and names the attention kernel: `'reference'` is the einsum and softmax, the only path that reads `dtype`, `precision` and `force_fp32_for_softmax`; `'xla'` and `'cudnn'` are `jax.nn.dot_product_attention`'s two; `'tpu'` is the Pallas splash kernel; `'auto'` resolves per trace, so a configuration logged as `'auto'` runs on the next machine. `'auto'` takes `'reference'` for a call that asks for arithmetic only that path performs (a matmul precision above DEFAULT, a softmax outside fp32, or a compute dtype other than the inputs'), and `'auto'` and `'xla'` both take it for bf16 on a GPU older than sm80. Otherwise `'auto'` takes `'cudnn'` where its kernel runs (a GPU of sm80 or later, bf16 or fp16, a query head width that is a multiple of 8 and at most 128, no softcap, no sinks, and no `--xla_gpu_deterministic_ops`), then `'tpu'` where splash's runs (a TPU backend, bf16 or fp32, query and key lengths that are multiples of 128 and at least 512, no additive bias, no mesh splitting the sequence, and a mask splash can describe), and `'xla'` otherwise. Splash's mask is a block-sparse descriptor built while the executable is, so a causal or sliding-window sequence skips the blocks it empties instead of paying its rectangle; the head width is unconstrained, because the kernel pads it, while the query and key lengths have to be multiples of 128 for its mask blocking to tile them. An additive bias, a mask that is a value of the trace (a KV-cache decode mask, the striped mask sequence parallelism builds), a mask past the published cell budget, and a length that is not a multiple of 128 keep the older Pallas flash kernel under an explicit `'tpu'` and keep `'auto'` on `'xla'`. Splash applies a logit softcap (Gemma 2) and attention sinks (GPT-OSS) itself, and a packed batch reaches it as segment ids rather than a mask; the flash kernel has neither a softcap nor sinks, so an explicit `'tpu'` call that splash cannot describe refuses them, and on a GPU `'auto'` runs both on `'xla'` while `'cudnn'` refuses them by name. Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention.py`). The parameter tree never changes with the implementation, so checkpoints are interchangeable across hardware.
 
 The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.
