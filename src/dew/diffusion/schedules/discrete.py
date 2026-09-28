@@ -20,11 +20,13 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     def __init__(self, betas: np.ndarray,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
         self.T = len(betas)
-        alpha_cumprod = jnp.cumprod(1 - betas, axis=0)
+        # The table is fixed at construction. Device float32 prefix products
+        # and roots introduce backend-dependent error into every later step.
+        alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)
 
-        self.alpha_cumprod = alpha_cumprod.astype(jnp.float32)
-        self.sqrt_alpha_cumprod = jnp.sqrt(alpha_cumprod).astype(jnp.float32)
-        self.sqrt_one_minus_alpha_cumprod = jnp.sqrt(1 - alpha_cumprod).astype(jnp.float32)
+        self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
+        self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
+        self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
         self.p2_loss_weights = (
             p2_loss_weight_k + self.alpha_cumprod / (1 - self.alpha_cumprod)
         ) ** -p2_loss_weight_gamma
