@@ -11,8 +11,8 @@ or with a Dew run directory, read through `TextToImage.from_run`:
     python examples/sample_text_to_image.py --checkpoint RUN_DIR
 
 The recorded grids come from the first form: a U-DiT that FlaxDiff trained,
-at step 350000 of its EMA weights. No text-to-image Dew run exists yet, so the
-second form has not been run.
+at step 350000 of its EMA weights. The second form has been run on the small
+text-conditioned run that `examples/train_flowers_tpu.py --smoke` writes.
 
 Each sampler draws one batch per seed, holding every prompt. The output
 directory gets one PNG per image, one grid per sampler (rows are prompts,
