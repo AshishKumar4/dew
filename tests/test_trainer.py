@@ -1335,11 +1335,12 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
-def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
-    """The step's first call runs the program `compile` built. Through the
-    jit it traced and compiled a second one, without the step's compiler
-    options: 25 s of an A100's cold start, and a step that ran with Triton
-    GEMM on where it was off."""
+def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
+    """The first execution requests no compilation after the public compile
+    call, including a second program retrieved from the persistent cache.
+    """
+    from jax import monitoring
+
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
@@ -1347,7 +1348,29 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    step = trainer.compile(state, batch)
-    with caplog.at_level("WARNING"), jax.log_compiles():
+    events = []
+
+    def record(event, **metadata):
+        if event == "/jax/compilation_cache/compile_requests_use_cache":
+            events.append(event)
+
+    previous_dir = jax.config.jax_compilation_cache_dir
+    previous_enabled = jax.config.jax_enable_compilation_cache
+    monitoring.register_event_listener(record)
+    try:
+        jax.config.update("jax_compilation_cache_dir", str(tmp_path))
+        jax.config.update("jax_enable_compilation_cache", True)
+        step = trainer.compile(state, batch)
+        assert events, "the public compile must reach the compilation event listener"
+        # Input placement is separate from executing the compiled transaction.
+        assert trainer.executable is not None
+        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0])
+        jax.block_until_ready((state, batch))
+        events.clear()
         jax.block_until_ready(step(state, batch))
-    assert not [record for record in caplog.records if "jit(step)" in record.getMessage()]
+        assert not events, events
+    finally:
+        monitoring.unregister_event_listener(record)
+        jax.config.update("jax_compilation_cache_dir", previous_dir)
+        jax.config.update("jax_enable_compilation_cache", previous_enabled)
+
