@@ -266,6 +266,19 @@ h1#_top,
 	display: none;
 }
 
+/* The figures are drawn 760 px wide for the content column. A narrow screen
+   scrolls them sideways at that width rather than shrinking the labels. */
+
+@media (max-width: 50rem) {
+	.sl-markdown-content p:has(> img[src*='-light.'], > img[src*='-dark.']) {
+		overflow-x: auto;
+	}
+	.sl-markdown-content img[src*='-light.'],
+	.sl-markdown-content img[src*='-dark.'] {
+		max-width: none;
+	}
+}
+
 /* Header and page chrome. */
 
 .header {

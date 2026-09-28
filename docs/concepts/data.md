@@ -3,7 +3,7 @@
 A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of NumPy arrays whose first dimension is this process's rows of the global batch (all of them with one process); the trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name. This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-light.svg)
-![](../assets/data-pipeline-dark.svg)
+![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-dark.svg)
 
 ## Dataset
 

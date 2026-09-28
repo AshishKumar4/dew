@@ -3,7 +3,7 @@
 Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `build_mesh` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
 
 ![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-light.svg)
-![](../assets/mesh-dark.svg)
+![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-dark.svg)
 
 The figure is computed by `docs/assets/figures.py` from the placements `build_mesh`, `Layout().shardings` and `batch_shardings` return.
 

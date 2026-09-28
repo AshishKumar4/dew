@@ -96,9 +96,9 @@ def box(svg: Svg, x, y, w, h, title, lines=(), accent=False):
     t = svg.t
     svg.rect(x, y, w, h, fill=t["accent_fill"] if accent else t["fill"],
              stroke=t["accent"] if accent else t["rule"])
-    svg.text(x + 12, y + 22, title, size=13, mono=True, weight=600)
+    svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
     for i, line in enumerate(lines):
-        svg.text(x + 12, y + 42 + 18 * i, line, size=12, color=t["muted"])
+        svg.text(x + 12, y + 45 + 19 * i, line, size=13, color=t["muted"])
 
 
 def mesh_figure():
@@ -126,119 +126,118 @@ def mesh_figure():
     kernel_blocks = holders(kernel, kernel_shape)
 
     for variant, t in THEMES.items():
-        svg = Svg(1040, 340, t)
+        svg = Svg(760, 540, t)
         # The mesh: data picks the panel, fsdp the row, tensor the column.
-        svg.text(24, 30, "mesh  MeshSpec(fsdp=2, tensor=2) on 8 devices", size=13, weight=600)
-        svg.text(24, 50, "data = 8 / (2 × 2) = 2", size=12, color=t["muted"])
+        svg.text(24, 30, "MeshSpec(fsdp=2, tensor=2) on 8 devices", size=14, weight=600)
+        svg.text(24, 50, "data takes the rest: 8 / (2 × 2) = 2", size=13, color=t["muted"])
         for d in range(2):
-            ox, oy = 24 + d * 172, 76
-            svg.text(ox, oy - 6, f"data {d}", size=12, color=t["muted"])
+            ox, oy = 24 + d * 172, 80
+            svg.text(ox, oy - 8, f"data {d}", size=13, color=t["muted"])
             for f in range(2):
                 for k in range(2):
                     device = next(i for i, c in coords.items() if c == (d, f, k))
                     x, y = ox + k * 80, oy + f * 64
-                    svg.rect(x, y, 72, 56, fill=t["tints"][2 * f + k], stroke=t["rule"])
-                    svg.text(x + 36, y + 24, f"device {device}", size=12, mono=True, anchor="middle", weight=600)
-                    svg.text(x + 36, y + 42, f"f{f} t{k}", size=11, color=t["muted"], anchor="middle")
-        svg.text(24, 234, "f = fsdp index, t = tensor index", size=12, color=t["muted"])
+                    svg.rect(x, y, 74, 56, fill=t["tints"][2 * f + k], stroke=t["rule"])
+                    svg.text(x + 37, y + 25, f"device {device}", size=13, mono=True, anchor="middle", weight=600)
+                    svg.text(x + 37, y + 44, f"f{f} t{k}", size=12, color=t["muted"], anchor="middle")
+        svg.text(24, 228, "f = fsdp index, t = tensor index", size=13, color=t["muted"])
 
         # The batch: rows split over data and fsdp; tensor pairs hold the same rows.
-        bx, by = 400, 76
-        svg.text(bx, 30, "batch  text (16, 65) int32", size=13, weight=600)
-        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=12, color=t["muted"])
+        bx, by = 400, 80
+        svg.text(bx, 30, "batch: text (16, 65) int32", size=14, weight=600)
+        svg.text(bx, 50, "rows over (data, expert, fsdp)", size=13, color=t["muted"])
         for (rows, _), devices in sorted(batch_blocks.items()):
-            y = by + rows[0] * 9
-            f, k = coords[devices[0]][1], coords[devices[0]][2]
-            svg.rect(bx, y, 220, rows[1] * 9 - rows[0] * 9 - 3, fill=t["tints"][2 * f], rx=3)
-            svg.text(bx + 10, y + 21, f"rows {rows[0]}–{rows[1] - 1}", size=12, mono=True)
-            svg.text(bx + 210, y + 21, "devices " + ", ".join(map(str, sorted(devices))), size=12,
+            y = by + rows[0] * 8
+            f = coords[devices[0]][1]
+            svg.rect(bx, y, 336, 29, fill=t["tints"][2 * f], rx=3)
+            svg.text(bx + 12, y + 20, f"rows {rows[0]}–{rows[1] - 1}", size=13, mono=True)
+            svg.text(bx + 324, y + 20, "devices " + ", ".join(map(str, sorted(devices))), size=13,
                      color=t["muted"], anchor="end")
+        svg.text(bx, 228, "Both devices of a tensor pair hold the same rows.", size=13, color=t["muted"])
 
         # The kernel: (embed, mlp) split fsdp × tensor; each block on one device per data index.
-        kx, ky = 680, 76
-        svg.text(kx, 30, f"mlp up_proj kernel {kernel_shape}", size=13, weight=600)
-        svg.text(kx, 50, f"PartitionSpec{tuple(kernel.spec)}", size=12, mono=True, color=t["muted"])
+        kx, ky = 24, 300
+        svg.text(kx, 280, f"MLP up_proj kernel {kernel_shape}, PartitionSpec{tuple(kernel.spec)}",
+                 size=14, weight=600)
         for (rows, cols), devices in sorted(kernel_blocks.items()):
             f, k = coords[devices[0]][1], coords[devices[0]][2]
-            x, y = kx + (cols[0] // 512) * 170, ky + (rows[0] // 128) * 72
-            svg.rect(x, y, 164, 66, fill=t["tints"][2 * f + k], rx=3)
-            svg.text(x + 10, y + 22, f"[{rows[0]}:{rows[1]}, {cols[0]}:{cols[1]}]", size=12, mono=True)
-            svg.text(x + 10, y + 44, "devices " + ", ".join(map(str, sorted(devices))), size=12,
+            x, y = kx + (cols[0] // 512) * 216, ky + (rows[0] // 128) * 76
+            svg.rect(x, y, 208, 70, fill=t["tints"][2 * f + k], rx=3)
+            svg.text(x + 12, y + 26, f"[{rows[0]}:{rows[1]}, {cols[0]}:{cols[1]}]", size=13, mono=True)
+            svg.text(x + 12, y + 50, "devices " + ", ".join(map(str, sorted(devices))), size=13,
                      color=t["muted"])
-        svg.text(kx, 250, "rows (embed) split over fsdp,", size=12, color=t["muted"])
-        svg.text(kx, 268, "columns (mlp) over tensor,", size=12, color=t["muted"])
-        svg.text(kx, 286, "each block copied on both data indices", size=12, color=t["muted"])
-        svg.text(bx, 250, "rows split over data × fsdp;", size=12, color=t["muted"])
-        svg.text(bx, 268, "both devices of a tensor pair", size=12, color=t["muted"])
-        svg.text(bx, 286, "hold the same rows", size=12, color=t["muted"])
-        svg.text(24, 320, "Placements read from build_mesh, Layout().shardings and batch_shardings "
-                 "(dew.training) on 8 simulated CPU devices.", size=12, color=t["muted"])
+        svg.text(476, 326, "Rows (embed) split over fsdp,", size=13, color=t["muted"])
+        svg.text(476, 346, "columns (mlp) over tensor.", size=13, color=t["muted"])
+        svg.text(476, 376, "Each block is held by one", size=13, color=t["muted"])
+        svg.text(476, 396, "device of each data index.", size=13, color=t["muted"])
+        svg.text(24, 500, "Placements read from build_mesh, Layout().shardings and batch_shardings", size=13,
+                 color=t["muted"])
+        svg.text(24, 520, "(dew.training) on 8 simulated CPU devices.", size=13, color=t["muted"])
         svg.write("mesh", variant)
 
 
 def training_step_figure():
     """The order of work in Trainer.fit and in one compiled step."""
     for variant, t in THEMES.items():
-        svg = Svg(1040, 470, t)
-        svg.text(24, 30, "Trainer.fit(dataset, steps=...)", size=14, mono=True, weight=600)
-        box(svg, 24, 50, 230, 84, "Trainer.place()", ["init or restore TrainState,", "placed by Layout on the mesh"])
-        box(svg, 24, 160, 230, 84, "dataset.train(partition)", ["this process's rows of", "every global batch"])
-        box(svg, 24, 270, 230, 84, "DevicePrefetchIterator", ["shard_batch: host arrays", "to one global jax.Array"])
-        svg.arrow(139, 244, 139, 268)
+        svg = Svg(760, 610, t)
+        svg.text(24, 30, "Trainer.fit(dataset, steps=...)", size=15, mono=True, weight=600)
+        box(svg, 24, 50, 224, 86, "Trainer.place()", ["init or restore TrainState,", "placed on the mesh"])
+        box(svg, 24, 162, 224, 86, "dataset.train(partition)", ["this process's rows of", "every global batch"])
+        box(svg, 24, 274, 224, 86, "DevicePrefetchIterator", ["shard_batch: host arrays", "to one global jax.Array"])
+        svg.arrow(136, 136, 136, 160)
+        svg.arrow(136, 248, 136, 272)
 
         # The compiled step.
-        svg.rect(300, 50, 460, 360, fill=t["raised"], stroke=t["accent"], rx=10)
-        svg.text(316, 74, "compiled step (jax.jit), once per step", size=13, weight=600, color=t["accent"])
-        box(svg, 320, 90, 420, 64, "objective.loss(variables, batch, step)",
+        svg.rect(272, 50, 464, 360, fill=t["raised"], stroke=t["accent"], rx=10)
+        svg.text(288, 74, "compiled step (jax.jit), once per step", size=14, weight=600, color=t["accent"])
+        box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
             ["→ Mean(total, mass), Aux(metrics)"], accent=True)
-        box(svg, 320, 172, 420, 64, "gradient", ["of the mean over the accumulation window (jax.vjp)"])
-        box(svg, 320, 254, 420, 64, "optimizer.update  +  optax.apply_updates",
-            ["when the window closes; skipped for non-finite values"])
-        box(svg, 320, 336, 420, 58, "ema_update", ["EMA copy of the leaves objective.ema names"])
-        for y in (154, 236, 318):
-            svg.arrow(530, y, 530, y + 17)
-        svg.arrow(254, 312, 318, 122)
-        svg.arrow(139, 134, 139, 158)
-        svg.arrow(254, 92, 318, 110)
+        box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
+        box(svg, 288, 254, 432, 66, "optimizer.update, optax.apply_updates",
+            ["when the window closes"])
+        box(svg, 288, 336, 432, 62, "ema_update", ["of the leaves objective.ema selects"])
+        for y in (156, 238, 320):
+            svg.arrow(504, y, 504, y + 15)
+        svg.arrow(248, 93, 286, 110)
+        svg.arrow(248, 317, 286, 130)
 
         # After the step, on the host.
-        svg.text(800, 74, "then, on the host", size=13, weight=600)
-        rows = [("log_every", "loss, metrics, throughput"), ("eval_every", "objective.evaluate on val"),
-                ("checkpoint_every", "state + data position")]
+        svg.arrow(504, 410, 504, 452)
+        svg.text(24, 446, "then, on the host, between steps", size=14, weight=600)
+        rows = [("log_every", "loss, metrics, speed"), ("eval_every", "evaluate on val"),
+                ("checkpoint_every", "state, data position")]
         for i, (name, what) in enumerate(rows):
-            box(svg, 800, 90 + i * 82, 216, 64, name, [what])
-        svg.arrow(760, 230, 798, 230)
-        svg.text(24, 400, "TrainState: params, opt_state, ema,", size=12, color=t["muted"])
-        svg.text(24, 418, "key, step, microstep, updates", size=12, color=t["muted"])
-        svg.text(24, 452, "step counts attempts, microstep accepted microbatches, updates optimizer updates.",
-                 size=12, color=t["muted"])
+            box(svg, 24 + i * 242, 462, 228, 66, name, [what])
+        svg.text(24, 568, "TrainState holds params, opt_state, ema, key and three counters:", size=13,
+                 color=t["muted"])
+        svg.text(24, 588, "step counts attempts, microstep accepted microbatches, updates optimizer updates.",
+                 size=13, color=t["muted"])
         svg.write("training-loop", variant)
 
 
 def data_figure():
     """A Dataset's iterators, the process's share and the global batch."""
     for variant, t in THEMES.items():
-        svg = Svg(1040, 290, t)
-        box(svg, 24, 40, 220, 100, "Dataset", ["train(partition) → iterator", "val(partition) → one pass",
+        svg = Svg(760, 390, t)
+        box(svg, 24, 24, 280, 104, "Dataset", ["train(partition) → iterator", "val(partition) → one pass",
                                                "records, batch"])
-        box(svg, 290, 40, 220, 100, "DataPartition", ["index, count: which share", "of every global batch",
+        box(svg, 456, 24, 280, 104, "DataPartition", ["index, count: which share of", "every global batch",
                                                       "this process reads"])
-        box(svg, 556, 40, 220, 100, "host batch", ['{"text": (B / count, S)}', "NumPy arrays,",
+        box(svg, 24, 196, 280, 104, "host batch", ['{"text": (B / count, S)}', "NumPy arrays,",
                                                    "one dict per step"])
-        box(svg, 822, 40, 194, 100, "global batch", ["jax.Array (B, S)", "rows split over", "data × expert × fsdp"],
-            accent=True)
-        svg.arrow(244, 90, 288, 90)
-        svg.arrow(510, 90, 554, 90)
-        svg.arrow(776, 90, 820, 90)
-        svg.text(266, 168, "data_partition(mesh)", size=12, mono=True, color=t["muted"])
-        svg.text(532, 168, "next(iterator)", size=12, mono=True, color=t["muted"])
-        svg.text(798, 168, "shard_batch(mesh, batch)", size=12, mono=True, color=t["muted"])
-        svg.text(24, 220, "One process: DataPartition() reads every row, and the host batch is the global batch.",
-                 size=12, color=t["muted"])
-        svg.text(24, 242, "Several processes: each reads B / count rows of every step; "
-                 "jax.make_array_from_process_local_data joins them.", size=12, color=t["muted"])
-        svg.text(24, 264, "The objective receives the global batch and reads fields by name.",
-                 size=12, color=t["muted"])
+        box(svg, 456, 196, 280, 104, "global batch", ["jax.Array (B, S)", "rows split over",
+                                                      "data × expert × fsdp"], accent=True)
+        svg.arrow(304, 76, 454, 76)
+        svg.arrow(456, 128, 306, 196)
+        svg.arrow(304, 248, 454, 248)
+        svg.text(380, 66, "data_partition(mesh)", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(400, 170, "next(train(partition))", size=12, mono=True, color=t["muted"])
+        svg.text(380, 238, "shard_batch", size=12, mono=True, color=t["muted"], anchor="middle")
+        svg.text(24, 336, "One process: DataPartition() reads every row; the host batch is the global batch.",
+                 size=13, color=t["muted"])
+        svg.text(24, 358, "Several processes: each reads B / count rows of every step, and", size=13,
+                 color=t["muted"])
+        svg.text(24, 378, "jax.make_array_from_process_local_data joins them.", size=13, color=t["muted"])
         svg.write("data-pipeline", variant)
 
 
@@ -256,19 +255,21 @@ def diffusion_figure():
         return alpha, sigma, np.clip((x + 1) * 127.5, 0, 255).astype(np.uint8)
 
     for variant, t in THEMES.items():
-        svg = Svg(1040, 450, t)
+        svg = Svg(760, 700, t)
         for row, (name, schedule) in enumerate([("Cosine()", cosine), ("Flow()", flow)]):
-            y = 40 + row * 180
-            svg.text(24, y, f"{name}  T = {schedule.T:g}", size=13, mono=True, weight=600)
+            y = 30 + row * 200
+            svg.text(24, y, f"{name}, T = {schedule.T:g}", size=14, mono=True, weight=600)
             for i, fraction in enumerate(fractions):
                 alpha, sigma, image = noised(schedule, fraction)
-                x = 24 + i * 118
-                svg.image(x, y + 12, 108, image)
-                svg.text(x + 54, y + 138, f"t = {fraction * schedule.T:g}", size=11, mono=True, anchor="middle")
-                svg.text(x + 54, y + 154, f"α {alpha:.2f}  σ {sigma:.2f}", size=11, color=t["muted"], anchor="middle")
+                x = 24 + i * 120
+                svg.image(x, y + 12, 112, image)
+                svg.text(x + 56, y + 146, f"t = {fraction * schedule.T:g}", size=13, mono=True, anchor="middle")
+                svg.text(x + 56, y + 165, f"α {alpha:.2f}  σ {sigma:.2f}", size=12, color=t["muted"],
+                         anchor="middle")
 
         # alpha_t and sigma_t against t / T for both presets.
-        px, py, pw, ph = 760, 52, 250, 250
+        px, py, pw, ph = 24, 444, 280, 220
+        svg.text(px, py - 14, "α and σ against t / T", size=14, weight=600)
         svg.rect(px, py, pw, ph, fill=t["raised"], rx=4)
         grid = np.linspace(0, 1, 101)
         for schedule, dash in [(cosine, None), (flow, "5 4")]:
@@ -276,15 +277,13 @@ def diffusion_figure():
             for column, color in [(0, t["accent"]), (1, t["muted"])]:
                 svg.polyline([(px + g * pw, py + ph - r * ph) for g, r in zip(grid, rates[:, column])],
                              color, dash=dash)
-        svg.text(px, py + ph + 18, "0", size=11, color=t["muted"])
-        svg.text(px + pw, py + ph + 18, "t / T = 1", size=11, color=t["muted"], anchor="end")
-        svg.text(px - 6, py + 10, "1", size=11, color=t["muted"], anchor="end")
-        svg.text(px, py + ph + 40, "α (accent), σ (grey)", size=12, color=t["muted"])
-        svg.text(px, py + ph + 58, "solid Cosine(), dashed Flow()", size=12, color=t["muted"])
-        svg.text(24, 410, "Each image is alpha_t * x_0 + sigma_t * epsilon with the same epsilon, "
-                 "at the rates schedule.rates(t) returns.", size=12, color=t["muted"])
-        svg.text(24, 430, "x_0 is a 64 × 64 sample from the FlaxDiff gallery, scaled to [-1, 1].",
-                 size=12, color=t["muted"])
+        svg.text(px, py + ph + 20, "0", size=12, color=t["muted"])
+        svg.text(px + pw, py + ph + 20, "1", size=12, color=t["muted"], anchor="end")
+        legend = ["α: accent, σ: grey", "solid: Cosine(), dashed: Flow()", "",
+                  "Each image is α x₀ + σ ε with the same ε,", "at the rates schedule.rates(t) returns.",
+                  "", "x₀ is a 64 × 64 sample from the FlaxDiff", "gallery, scaled to [-1, 1]."]
+        for i, line in enumerate(legend):
+            svg.text(340, py + 20 + 22 * i, line, size=13, color=t["muted"])
         svg.write("diffusion-forward", variant)
 
 

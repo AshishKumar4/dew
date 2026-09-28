@@ -88,14 +88,14 @@ Dew ships objectives for autoregressive language modeling (`LMObjective`), image
 The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, are specifications whose `.load(batch=...)` returns a `Dataset`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint resumes the data stream where it stopped. [Training data](concepts/data.md) covers the details.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-light.svg)
-![](assets/data-pipeline-dark.svg)
+![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-dark.svg)
 
 ## Trainer
 
 `Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
 
 ![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-light.svg)
-![](assets/training-loop-dark.svg)
+![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-dark.svg)
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
 
