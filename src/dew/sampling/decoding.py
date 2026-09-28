@@ -1057,8 +1057,6 @@ def as_pytree(value: LogitsTransform) -> LogitsTransform:
     A plain function is wrapped in a Partial that keeps the function static
     and its bound arguments as data; strategies use that same callable rule.
     """
-    if not callable(value):
-        raise TypeError(f"a decoding component must be callable, got {type(value).__name__}")
     if type(value) is Temperature:
         return jax.tree_util.Partial(_temperature, value.value)
     if type(value) is TopP:
@@ -1069,17 +1067,13 @@ def as_pytree(value: LogitsTransform) -> LogitsTransform:
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 
-def components(values: LogitsTransform | Sequence[LogitsTransform],
-               where: str) -> tuple[LogitsTransform, ...]:
+def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[LogitsTransform, ...]:
     """`values` as a tuple of pytrees `jax.jit` accepts as data.
 
-    Takes one transform or criterion or a sequence of either. `where` names
-    the argument in the refusal a non-callable earns.
+    Takes one transform or criterion or a sequence of either.
     """
     if callable(values):
         return (as_pytree(values),)
-    if not isinstance(values, (tuple, list)):
-        raise TypeError(f"{where} must be a callable or a sequence of callables")
     return tuple(as_pytree(value) for value in values)
 
 
