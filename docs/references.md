@@ -1,10 +1,10 @@
-# References and attribution
+# Papers and attribution
 
-The papers below explain methods that Dew uses. The projects below are Dew's dependencies, reference implementations it is checked against, or sources of code it adapts. Citing a paper or project does not mean Dew reproduces all of its results or supports every model it covers. For Dew's own interfaces, use the [core API reference](reference/core-api.md). For measurements with their hardware and revision, see [benchmarks](benchmarks.md).
+The papers below explain methods that Dew uses. The projects below are Dew's dependencies, reference implementations it is checked against, or sources of code it adapts. Citing a paper or project does not mean Dew reproduces all of its results or supports every model it covers. Dew's own interfaces are in the [API reference](reference/core-api.md), and its measurements with hardware and revision in [Step benchmarks](benchmarks.md).
 
 ## Diffusion and flow models
 
-If you are new to diffusion, read DDPM first for the denoising objective. Then read EDM, which explains how noise levels, the network's parameterization, training, and sampling relate to each other. Flow Matching describes a related way to learn continuous paths between two distributions. The other papers each cover a particular sampler, weighting rule, architecture, or guidance method.
+DDPM introduces the denoising objective. EDM relates noise levels, the network's parameterization, training and sampling. Flow Matching describes a related way to learn continuous paths between two distributions. The other papers each cover a particular sampler, weighting rule, architecture, or guidance method.
 
 | Topic | Paper |
 | --- | --- |
@@ -56,10 +56,10 @@ The Stable Diffusion Flax VAE is adapted from [Hugging Face Diffusers](https://g
 
 [Sander Dieleman's posts](https://sander.ai/posts/) cover [diffusion](https://sander.ai/2022/01/31/diffusion.html), [typicality](https://sander.ai/2020/09/01/typicality.html), [guidance geometry](https://sander.ai/2023/08/28/geometry.html#warning), and [noise schedules](https://sander.ai/2024/06/14/noise-schedules.html). [Tony Duan's Diffusion Models from Scratch](https://www.tonyduan.com/diffusion/index.html) works through the mathematics with small MNIST implementations and [accompanying code](https://github.com/tonyduan/diffusion).
 
-I started my original FlaxDiff experiments from the Keras tutorials for [DDPM by A_K Nain](https://keras.io/examples/generative/ddpm/) and [DDIM by András Béres](https://keras.io/examples/generative/ddim/). They are still good introductions, though their APIs are not Dew's. The [FlaxDiff history page](from-flaxdiff.md) keeps those older experiments apart from current runs.
+The original FlaxDiff experiments started from the Keras tutorials for [DDPM by A_K Nain](https://keras.io/examples/generative/ddpm/) and [DDIM by András Béres](https://keras.io/examples/generative/ddim/), which remain good introductions. [Coming from FlaxDiff](from-flaxdiff.md) maps FlaxDiff's modules to Dew's.
 
 ## Related projects and interoperability
 
 [MaxText](https://github.com/AI-Hypercomputer/maxtext) and [Levanter](https://github.com/stanford-crfm/levanter) are JAX projects for training language models. [verl](https://github.com/verl-project/verl) is for RL post-training and [vLLM](https://github.com/vllm-project/vllm) is for inference and serving. Each project documents its own supported models and deployment requirements.
 
-Dew's `save_hf_layout` writes `model.safetensors` and `config.json` into a directory in the Hugging Face layout. It does not translate tensor names or the model configuration. The separate `save_pretrained_decoder` API does translate for the decoder families it accepts, refuses model features it does not support, and writes the files of the tokenizer you give it next to the weights. Neither API guarantees that a given serving engine can run the export. Check the family-specific limits in [language models](concepts/language_models.md), pass the tokenizer you trained with, and test the export in the program that will load it.
+Dew's `save_hf_layout` writes `model.safetensors` and `config.json` into a directory in the Hugging Face layout. It does not translate tensor names or the model configuration. The separate `save_pretrained_decoder` API does translate for the decoder families it accepts, refuses model features it does not support, and writes the files of the tokenizer you give it next to the weights. Neither API guarantees that a given serving engine can run the export. [Language models](concepts/language_models.md) lists the family-specific limits; test an export in the program that will load it.

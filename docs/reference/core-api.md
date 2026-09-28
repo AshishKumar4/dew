@@ -1,6 +1,6 @@
-# Core API reference
+# Core API
 
-This page describes the interfaces the tutorials use and the contracts between them. Every public module also has its own page, generated from its docstrings; the list is at the [end of this page](#all-modules). For a complete example, read [your first training run](../getting-started.md).
+This page describes the main interfaces and the contracts between them, grouped by task. Every public module also has a page generated from its docstrings; they are listed at the [end of this page](#all-modules) and in the sidebar. The [Quickstart](../getting-started.md) uses the core of it in one script.
 
 ## Objective
 
@@ -23,7 +23,7 @@ Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `
 
 ### Collections and EMA selection
 
-A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [stateful example](../concepts/objectives.md#update-non-parameter-state).
+A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).
 
 `EMASpec(decay, select=everything)` comes from `dew.objectives.base`. `decay` maps completed optimizer-update count to a scalar. `select` accepts a tuple of keys naming a leaf; `under("params", "context_encoder")` selects that subtree, and `everything` selects all leaves. EMA arithmetic uses at least fp32 and preserves explicit fp64, then rounds each result to the initialized EMA leaf dtype. Unit decay selects the frozen leaf exactly. Router bias updates also retain the initialized bias dtype; integer load comparisons avoid converting large counts to floats.
 
@@ -211,8 +211,16 @@ StepState(tokens, valid, step, active, keys, prompt_width)
 Built-in transforms are pytrees, so a configuration holding arrays travels as data rather than entering a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` carries array configuration for one. Everything runs inside the compiled loop; there is no host callback. Across a pool the resolved components are compared by their structure and by the contents of their configuration arrays, so two ranks banning different tokens are refused instead of each running its own policy.
 
 ```python
+import jax
 import jax.numpy as jnp
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.sampling import Beam, Sampling, Speculative, decoding, generate
+
+# An untrained decoder with one prediction depth, which Speculative drafts with.
+model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+                          mlp_features=64, max_seq_len=64, num_nextn_predict_layers=1)
+variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+prompts = [[5, 6, 7], [8, 9, 10]]
 
 
 def favor_short(state, logits):
@@ -243,6 +251,7 @@ searched = generate(model, variables, prompts, 32, seed=0,
 drafted = generate(model, variables, prompts, 32, seed=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
+print(drawn.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
 
 The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
@@ -444,6 +453,7 @@ Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and pad
 
 Dew does not run an HTTP server. Install `[inference-clients]` and inject the official client configured for your local or deployed engine. The adapter does not own the SDK client's lifetime.
 
+<!-- not run: needs running Ollama and OpenAI-compatible servers -->
 ```python
 import ollama
 import openai
@@ -507,6 +517,7 @@ Unimplemented active controls fail explicitly: Lu-lambda and flow-sigma grids, U
 
 The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers scheduler objects. Ordinary stochastic walks share explicit Gaussian draws. DPM-Solver SDE runs the actual `torchsde` tree, and native solver parity uses its recorded increments; separate tests exercise the native Brownian bridge law. All native source-trajectory and VJP checks run in float32 at a fixed `1e-4` scaled-error bound, with VJPs compared directly to the actual float32 source. Saved float64 VJPs are diagnostic data, not a tolerance adjustment.
 
+<!-- not run: needs a local diffusion checkpoint directory -->
 ```python
 from dew.interop import load_pretrained
 from dew.objectives.diffusion import DiffusionObjective

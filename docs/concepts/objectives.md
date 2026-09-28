@@ -1,20 +1,28 @@
-# Writing a custom objective
+# Custom objectives
 
-This page assumes you have run [the first training example](../getting-started.md) and know Flax Linen's `init` and `apply` methods. An `Objective` says how to initialize a variables tree, how to compute a loss and, optionally, how to evaluate a batch. `Trainer` differentiates the loss, applies the optimizer and manages the training state.
+An `Objective` defines what a run learns: how to initialize the variables, how to compute the loss and, optionally, how to evaluate a batch. `Trainer` differentiates the loss, applies the optimizer and manages the training state. This page describes each method of `dew.objectives.base.Objective` and ends with the built-in objectives. It assumes the [Quickstart](../getting-started.md) and Flax Linen's `init` and `apply`.
 
-## Initialization
+| Method or attribute | Required | Returns |
+|---|---|---|
+| `init(key, variables=None)` | Yes | The complete Flax variables tree, with a `params` collection |
+| `loss(variables, batch, step)` | Yes | `(statistics, Aux)`; statistics is usually `Mean(total, mass)` |
+| `held_variables()` | No | Arrays the objective starts from, or `None` |
+| `reduce_loss(statistics)` | For composite statistics | `(value, has_data)` |
+| `evaluate(variables, batch, step)` | No | Scoring artifacts for a validation batch |
+| `preview(variables, batch, step, *, scored=None)` | No | Display artifacts, once per evaluation event |
+| `ema` | No | An `EMASpec`, or `None` for no moving average |
 
-Subclass `dew.objectives.base.Objective`. Implement `init(key, variables=None)` so it returns the complete Flax variables mapping, including a `params` collection. The tree can hold one model or several, as long as your loss reads the same structure. Callers pass only the key. The second parameter is for objectives that start from weights they hold, described below.
+An objective is passed to `Trainer` as an instance. Registering it (`dew.registry`) is only needed when a configuration file must find it by name.
 
-The trainer traces initialization to find the shapes, then initializes the variables directly in their device placement. Keep `init` pure. It should compute arrays from its key and configuration, without downloading weights or opening files. If you need external weights, load them yourself before you construct an objective that accepts pretrained variables.
+## init
 
-The [regression tutorial](../getting-started.md#define-initialization-and-loss) has a complete custom objective. Register an objective only when a configuration needs to find it through a registry. You can pass an instance straight to `Trainer` without any decorator.
+`init(key, variables=None)` returns the complete variables mapping. The tree can hold one model or several, as long as `loss` reads the same structure. The trainer traces `init` to find the shapes and then runs it directly in each variable's device placement, so `init` must be pure: it computes arrays from the key and the configuration and does not download weights or open files. Load external weights before constructing the objective and pass them in, as below. The [Quickstart](../getting-started.md#objective) has a complete objective.
 
-### Objectives that start from held weights
+### Held weights
 
 An objective that continues from a checkpoint, or keeps a frozen tower next to the model it trains, holds real arrays. The trainer passes those arrays into its compiled state construction as JIT arguments, never as constants compiled into the program. A 0.6B checkpoint compiled in as a constant takes 2.2 GiB inside the executable, which is over the 2 GiB limit for a compilation cache entry.
 
-Two public methods describe the held arrays. `held_variables()` reports what the objective starts from. `init(key, variables=None)` initializes from what the caller passes. `Objective.initializer` combines them into one value a JIT accepts: `Partial(self.init)` when `held_variables()` is `None`, and `Partial(self.init, variables=held)` otherwise. `jax.tree_util.Partial` is a pytree whose bound arguments are its children, so the held tree arrives as data. An objective that builds its whole tree from the key only needs `init`. Here is one that holds weights:
+Two methods describe the held arrays. `held_variables()` returns what the objective starts from, and `init(key, variables=None)` initializes from what the caller passes. `Objective.initializer` combines them into one value `jax.jit` accepts: `Partial(self.init)` when `held_variables()` is `None`, and `Partial(self.init, variables=held)` otherwise. `jax.tree_util.Partial` is a pytree whose bound arguments are its children, so the held tree arrives as data. An objective that builds its whole tree from the key only needs `init`. An objective that holds weights:
 
 ```python
 import jax.numpy as jnp
@@ -36,25 +44,23 @@ class Continued(Objective):
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
 ```
 
-`variables=None` means "use the configured input", which is what a plain `init(key)` does. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace.
+`variables=None` means the objective's own configured input, which is what a plain `init(key)` uses. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the `variables` parameter; if it does not, the call raises.
 
-The call goes through the public `init`. A subclass that overrides `init` therefore decides what the state holds, whether you call it directly or the trainer compiles it. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the second parameter. If it does not, the call raises instead of silently skipping it.
+`Trainer.initial_state(initializer=None, key=None)` is the one place the state is built; each `None` is filled in from the run. `Trainer.place` calls it once for the shapes and once for the values, so `trainer.initial_state()` returns the state a run starts from.
 
-`Trainer.initial_state(initializer=None, key=None)` is the one place the state is built. Each `None` is filled in from the run. `place` resolves both inputs once and calls this method for the shapes and for the values. A `Trainer` subclass that overrides `initial_state` is therefore used on every path, and `trainer.initial_state()` still returns the state a run starts from.
+## loss
 
-## Loss and auxiliary values
+`loss(variables, batch, step)` returns `(statistics, aux)`. `Mean(total, mass)` holds additive terms that share one denominator; the mass is nonnegative and does not depend on the parameters. The trainer adds totals and masses over an accumulation window and then divides, treating zero mass as no data. A plain scalar is one term with unit mass; Dew does not infer token or row weights from a scalar.
 
-`loss(variables, batch, step)` returns `(statistics, aux)`. Return `Mean(total, mass)` for additive terms that share one denominator, where the denominator is nonnegative and does not depend on the parameters. The default reducer divides the summed numerator by the summed mass, and treats zero mass as "no data". A plain scalar stands for one term with unit mass. Dew does not guess token or row weights from a scalar.
+For a composite loss, return a pytree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`, keeping independent denominators separate. `scalar_loss(objective, variables, batch, step)` computes `(value, aux)` from the same statistics for direct differentiation. A loss that is not additive over the batch needs its own decomposition into additive statistics; a per-microbatch mean is not a substitute.
 
-For a composite loss, return a Flax PyTree that your objective owns, whose leaves are additive sufficient statistics, and implement `reduce_loss(statistics) -> (value, has_data)`. Keep independent denominators separate. To differentiate directly, `scalar_loss(objective, variables, batch, step)` computes `(value, aux)` from the same statistics. A batch loss that is not additive needs its own decomposition. A local mean does not work as a general replacement.
-
-`Aux(metrics=...)` holds scalar arrays to report next to the loss. With a tracker configured, the trainer records them as `train/<name>` at the logging interval. A metric in `Aux` is measured on the training batch. It is not a score over the whole validation set.
+`Aux(metrics=...)` holds scalar arrays to report next to the loss. With a tracker configured, the trainer records them as `train/<name>` at the logging interval. They are measured on the training batch, not on the validation set.
 
 `Aux.variables` holds replacements for non-parameter state, such as BatchNorm statistics, applied in order after each accepted microbatch. `Aux.effects` holds additive observations for `apply_effects(variables, effects)`, which returns non-parameter replacements once per supported optimizer commit. Router balancing uses these deferred counts so its bias stays fixed within an accumulation window. `Aux.qk_stats` carries attention observations, and the trainer keeps the per-head maximum across accepted microbatches.
 
-## Update non-parameter state
+## Non-parameter state
 
-A variables tree is a nested mapping. Its outer keys are collections, such as `params` for trainable arrays and `batch_stats` for BatchNorm's running statistics. Each leaf is one array, such as a kernel, bias, mean or variance. A typical tree looks like this:
+A variables tree is a nested mapping whose outer keys are collections, such as `params` for trainable arrays and `batch_stats` for BatchNorm's running statistics:
 
 ```text
 variables
@@ -65,7 +71,7 @@ variables
     norm: mean, var
 ```
 
-Linen returns the collections that changed from `apply(..., mutable=["batch_stats"])`. Pass those collections through `Aux.variables` so the trainer stores them with the updated parameters. This complete example trains a BatchNorm model and checks that the running mean was saved:
+`apply(..., mutable=["batch_stats"])` returns the collections that changed. Returning them in `Aux.variables` makes the trainer store them with the updated parameters. This example trains a BatchNorm model and checks that the running mean was stored:
 
 ```python
 import itertools
@@ -116,35 +122,35 @@ assert np.all(running_mean > 0)
 print("Stored running mean:", running_mean)
 ```
 
-`updated` is the complete replacement `batch_stats` collection from this call. Dew does not merge part of a collection: a nested leaf you leave out is not kept. Leave parameter changes to the optimizer, and do not return a replacement `params` collection through `Aux.variables`. At inference, call this model with `train=False` so it uses the stored running statistics. A few updates are not enough to calibrate BatchNorm on a real dataset.
+`updated` replaces the whole `batch_stats` collection; Dew does not merge part of a collection, so a leaf left out is dropped. The optimizer owns `params`, so `Aux.variables` must not carry a `params` collection. At inference, call this model with `train=False` to use the stored running statistics.
 
-The [core reference](../reference/core-api.md#collections-and-ema-selection) describes how collections and EMA weights are selected.
+[API overview](../reference/core-api.md) describes how collections and EMA weights are selected.
 
 ## Randomness
 
-`Step.step` is the index of the accepted microbatch in the schedule. `Step.key` comes from the root key and the number of attempts consumed, so a rejected attempt does not reuse its random draws. Split this key when a loss needs several independent random operations.
+`Step.step` is the number of accepted microbatches. `Step.key` is `jax.random.fold_in(root_key, state.step)`, where `state.step` counts attempts, so a rejected attempt does not reuse its random draws. Split it when a loss needs several independent random operations.
 
-A `TrainState` stores the run key. A deterministic step key alone does not make results bit-for-bit equal across devices, compiler versions, reduction orders or data-loader randomness that Dew does not track. Continuing a run exactly also needs a checkpoint of the relevant state and the iterator position.
+The root key is part of `TrainState`. A deterministic key does not make results bitwise equal across devices, compiler versions or reduction orders. Continuing a run exactly also needs the checkpointed state and the data iterator's position.
 
-## Moving-average variables
+## EMA
 
-The base `Objective` has `ema=None`. Set an `EMASpec` only if your method uses an exponential moving average. It gives a decay schedule and a path filter that picks the leaves to average. JEPA picks its context encoder. DPO uses a decay of one to keep a frozen reference.
+The base `Objective` has `ema=None`. An `EMASpec` turns on an exponential moving average: a decay schedule and a path filter that selects the leaves to average. JEPA averages its context encoder; DPO uses a decay of one to keep a frozen reference.
 
-The trainer stores the selected copy in `TrainState.ema`. `state.averaged` lays it over the live variables, and raises when no EMA is configured. EMA arithmetic runs in at least fp32 and keeps explicit fp64, then stores each result in the leaf's initialized dtype. So there is no wider persistent EMA copy in memory. Frozen references with a decay of one stay exact. Count the selected copy when you size a run.
+The trainer stores the selected copy in `TrainState.ema`. `state.averaged` lays it over the live variables and raises when no EMA is configured. EMA arithmetic runs in at least fp32 (fp64 when the leaves are fp64) and stores each result in the leaf's initialized dtype, so there is no wider persistent copy. A decay of one keeps the reference exact. The copy counts toward memory.
 
-The trainer updates the EMA only on a supported optimizer commit. Shared `Mean` accumulation keeps one gradient tree, at least as precise as fp32, and a mass. Explicit float64 inputs keep their precision when JAX x64 is on. The finished gradient is converted to each parameter's dtype before Optax sees it, so the optimizer state keeps its expected dtypes.
+The EMA is updated only when the optimizer commits an update. `Mean` accumulation keeps one gradient tree, at least fp32, and a mass; float64 inputs keep their precision when JAX x64 is on. The finished gradient is cast to each parameter's dtype before Optax sees it, so the optimizer state keeps its dtypes.
 
-Composite accumulation keeps the realized inputs and snapshots of the mutable state it read, then replays the scalar pullbacks with the final normalization coefficients. Keep the loss computation pure, and collect rollouts and external rewards before the compiled step. Replays do not apply mutable writes twice. BatchNorm calls on separate microbatches keep their sequential behavior, and do not equal one BatchNorm forward pass over the full batch.
+Composite accumulation keeps each microbatch's inputs and snapshots of the mutable state it read, then replays the pullbacks with the final normalization coefficients. The loss must therefore be pure; collect rollouts and external rewards before the compiled step. Replays do not apply mutable writes twice. BatchNorm over separate microbatches keeps its sequential behavior and differs from one BatchNorm pass over the full batch.
 
 ## Evaluation
 
-Override `evaluate(variables, batch, step)` to produce scoring artifacts for the complete coordinated batch. It can return one artifact, a tuple or `None`. Artifact types that exist today include token scores, image grids, text samples and representations. A `Metric[S]` declares which artifact type it reads, computes sufficient statistics per batch, merges them into state that the evaluation pass owns, and finalizes once.
+`evaluate(variables, batch, step)` returns scoring artifacts for a validation batch: one artifact, a tuple or `None`. Artifact types include token scores, image grids, text samples and representations. A `Metric[S]` declares the artifact type it reads, computes sufficient statistics per batch, merges them over the pass and finalizes once.
 
-Override `preview(variables, batch, step, *, scored=None)` for display work that runs once per event. The base implementation reuses the first scoring artifacts when there are any. All ranks run the numerical work and the gathers. Decode only on process zero, after every gather has finished.
+`preview(variables, batch, step, *, scored=None)` produces display artifacts once per evaluation event; the base implementation reuses the first scoring artifacts. Every process runs the numerical work and the gathers; decode only on process zero, after every gather has finished.
 
-Evaluation is opt-in when you call `fit`: pass validation data and set `eval_every`. Passing `metrics` on its own does not start it. Evaluation runs outside the compiled optimization step, so compile any expensive device work inside your evaluation code. [Evaluation and tracking](../guides/evaluation.md) describes scheduling, metrics and current limits.
+`fit` evaluates only when `eval_every` is set, and refuses an `eval_every` whose pass nothing would read: it needs `metrics`, or `preview=True` with a tracker. Evaluation runs outside the compiled training step, so `evaluate` should compile its own expensive device work. [Evaluation and tracking](../guides/evaluation.md) describes scheduling and metrics.
 
-## Choose a built-in objective
+## Built-in objectives
 
 | Objective | Expected model and data |
 |---|---|
@@ -154,4 +160,4 @@ Evaluation is opt-in when you call `fit`: pass validation data and set `eval_eve
 | `DPOObjective` | A language decoder; chosen/rejected token pairs and completion masks |
 | `GRPOObjective` | A language decoder; generated responses with old log probabilities, masks, rewards, and advantages |
 
-Each built-in objective expects more from its model than any `flax.linen.Module`. Read the matching guide before you swap in a different model. For a different loss or state layout, write your own objective and state its field and method requirements.
+Each built-in objective expects more from its model than a plain `flax.linen.Module`; the matching guide lists the methods it calls.

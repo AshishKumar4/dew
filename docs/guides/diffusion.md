@@ -1,10 +1,10 @@
-# Train an image diffusion model
+# Diffusion training
 
-This guide assumes you have done the [first training run](../getting-started.md), know how image tensors are laid out, and know the idea of predicting a clean signal from a noisy input. It walks through Dew's diffusion configuration with a small flow-matching run. You do not need to download any data or model.
+`DiffusionObjective` trains a denoising model under a diffusion `Process`: it noises each image to a random time, runs the model and computes the process's loss. Its `evaluate` samples images with a solver. This page trains a small flow-matching DiT on synthetic images; the data, the model and the steps are tiny so the example runs on a CPU in seconds, and the samples say nothing about image quality. [Diffusion processes and solvers](../concepts/diffusion.md) describes the processes, presets and solvers.
 
-## Train on synthetic images
+## Example
 
-The example makes eight striped images, trains a small DiT on them, and saves one generated image per batch row, eight in all, to a NumPy file. It shows the API and the output range. It says nothing about image quality.
+The example makes eight striped 8×8 images, trains for three steps and samples one image per batch row.
 
 ```python
 import itertools
@@ -44,28 +44,26 @@ assert Path("preview.npy").is_file()
 print("Saved preview.npy:", output.shape)
 ```
 
-The image batch is NHWC: batch, height, width, channels. The source images are uint8 pixels in `[0, 255]`, and the objective converts them to the model's normalized range. `Field("image", (8, 8, 3))` describes one sample, without the batch dimension.
+The image batch is NHWC (batch, height, width, channels) uint8 in `[0, 255]`; the objective converts it to the model's range `[-1, 1]`. `InputSpec(Field("image", (8, 8, 3)))` describes one sample, without the batch dimension. The DiT cuts each 8×8 image into 4×4 patches, four tokens per image.
 
-The DiT cuts each 8×8 image into 4×4 patches, which gives four spatial tokens. The sizes are this small so the example runs in seconds. Real training needs more data, a larger model and many more optimizer steps.
+## Process and solver
 
-## Understand the process and solver
+`Flow()` is a preset, a frozen dataclass of the numbers that define rectified flow. Calling it builds the `Process`, which draws noise and times, builds the training target and converts the model's output; hence `Flow()()`.
 
-`Flow()` is a configuration value. Calling it builds the `Process`, which samples noise, builds the training target and converts the model's prediction. That is why the example writes `Flow()()`: the first call makes the preset and the second makes its process.
+`DiffusionObjective(steps=4)` is the number of solver steps `evaluate` samples with; `trainer.fit(..., steps=3)` is the number of training steps.
 
-The objective samples noise and noise levels and computes the flow-matching loss. Its `steps=4` sets the number of sampling steps for evaluation previews, not the number of optimizer updates. `trainer.fit(..., steps=3)` sets the training target.
+`Euler()` is the solver `evaluate` uses. The solver can change without retraining; the process cannot, because it defines what the model learned to predict.
 
-`Euler()` is the numerical solver that generates the preview. A different solver, noise schedule or prediction transform samples differently, so pick a process and solver that work together. [Diffusion processes and solvers](../concepts/diffusion.md) lists the presets and solvers and explains classifier-free guidance.
+## Samples
 
-## Inspect the preview
+`evaluate` returns an image artifact whose `images` are float32 in `[-1, 1]`, one sample per row of the batch it is given; `(output + 1) / 2` maps them to `[0, 1]` for display.
 
-The script writes `preview.npy` to its working directory. It holds eight float32 images with values in `[-1, 1]`: `evaluate` draws one sample for every real row of the batch it is given. To display them, compute `(output + 1) / 2` and clip to `[0, 1]`. Three updates on striped images do not give you a useful generative model.
+The example passes `evaluate` its own key. When `Trainer.fit` schedules evaluation, the keys come from the run key and the step. [Evaluation and tracking](evaluation.md) covers scheduled evaluation and the image metrics (FID, CLIP score).
 
-The call to `evaluate` passes its own independent key. When `Trainer.fit` schedules evaluation, it derives the keys from the run key and the step instead; [evaluation and tracking](evaluation.md) describes this. Eight samples are not a dataset-level measure of generative quality; that guide also covers the metrics.
+## Conditions and latent encoders
 
-## Add conditions or a latent encoder
+For text conditioning, `InputSpec.conditions` maps a model keyword argument to a condition encoder and the batch field it reads. Captions must be tokenized with the encoder and tokenizer settings used in training. A pretrained text tower is downloaded on first use.
 
-For text conditioning, `InputSpec.conditions` maps a model keyword argument to a condition encoder and the batch field it reads. Tokenize captions with the same encoder and tokenizer settings you train with. A pretrained text tower may need a model download and a lot of memory.
+With an autoencoder configured, training runs on latents instead of pixels. The denoising model's channel count and spatial shape must match the encoder's output, and the encoder's scaling convention must be kept.
 
-With an autoencoder configured, training runs on latent tensors instead of pixels. Set the denoising model's channel count and spatial shape to match the encoder output, and keep the encoder's scaling convention. Loading a VAE does not load the weights of an external diffusion transformer.
-
-Use [training recipes](../recipes.md) for runs on real datasets. [Supported models](../models.md) lists the published checkpoints that load.
+[Recipes](../recipes.md) runs diffusion training on real datasets from the command line. [Supported models](../models.md) lists the published diffusion checkpoints that load.

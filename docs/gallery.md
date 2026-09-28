@@ -1,14 +1,14 @@
-# Gallery: historical FlaxDiff experiments
+# FlaxDiff gallery
 
-These images come from my earlier experiments with FlaxDiff, the project Dew grew out of. The settings below copy the run descriptions I recorded at the time, including the old scheduler and model names. You cannot run them as configurations with today's Dew API, and they do not show that a current checkout reproduces these images.
+These images come from experiments with FlaxDiff, the project Dew grew out of. The settings are the run descriptions recorded at the time, with FlaxDiff's scheduler and model names. They are not configurations for the current Dew API, and they do not show that Dew reproduces these images.
 
-For each run the gallery records the training data, the image size, the sampling settings, and some model fields. It has no complete environment, checkpoint, seed record, or quality evaluation for any of them. For a current workflow, start with [recipes](recipes.md) and the [diffusion guide](guides/diffusion.md). For timed measurements with their revision and hardware, see [benchmarks](benchmarks.md).
+For each run the gallery records the training data, the image size, the sampling settings, and some model fields. It has no complete environment, checkpoint, seed record, or quality evaluation for any of them. [Recipes](recipes.md) and [Diffusion training](guides/diffusion.md) describe the current workflow, and [Step benchmarks](benchmarks.md) lists timed measurements with their revision and hardware.
 
 ## Text-to-image on a mixed captioned dataset
 
-This model trained on LAION-Aesthetics 12M, CC12M, MS COCO, and a one-million-image subset of COYO-700M with aesthetic score 6 or higher, on a TPU-v4-32 slice. Sampling used Euler ancestral sampling for 200 steps with classifier-free guidance (CFG). CFG mixes the model's conditional and unconditional predictions to control how closely sampling follows the text.
+This model trained on LAION-Aesthetics 12M, CC12M, MS COCO, and a one-million-image subset of COYO-700M with aesthetic score 6 or higher, on a TPU-v4-32 slice. Sampling used Euler ancestral sampling for 200 steps with classifier-free guidance (CFG). CFG mixes the model's conditional and unconditional predictions; its scale sets how closely samples follow the text.
 
-Every image in the grid used the same prompt, "a beautiful landscape with a river with mountains." My record does not give the guidance scale for this grid.
+Every image in the grid used the same prompt, "a beautiful landscape with a river with mountains." The record does not give the guidance scale for this grid.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -56,7 +56,7 @@ An unconditional model generates images without a text prompt. This grid used DD
 | Residual blocks | 2 |
 | Middle residual blocks | 1 |
 
-The attention list and the feature-depth list copy the old record. They are not arguments you can pass to the current UNet.
+The attention list and the feature-depth list copy the old record. They are not arguments of the current UNet.
 
 ![Historical unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
 
