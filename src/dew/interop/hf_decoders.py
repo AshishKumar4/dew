@@ -987,7 +987,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_siglip_vision_config(hf_config)
     used.add("vision_config")
-    mm = hf_config.get("mm_tokens_per_image")
+    mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = vision_nn.translate_gemma_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"), mm)
@@ -1840,10 +1840,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'the attention output gate, a partial rotary and a mixer other than attention '
             'have no counterpart in this dense tensor encoder')
-    model_type = config['model_type']
-    if not isinstance(model_type, str):
-        raise ValueError('model_type must name a decoder family')
-    family = _FAMILIES[model_type]
+    family = _FAMILIES[records.text(config['model_type'], 'model_type')]
     if model.mixture is not None and family.export_path is _hf_name:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
     params = variables.get('params', variables)
