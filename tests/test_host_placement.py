@@ -137,11 +137,18 @@ SHAPES = {
     "capped_banks": dict(num_layers=6, bank_layers=2),
 }
 
-# The scanned stack against the plain loop, which is the bound
-# tests/test_layer_stack.py states for the same comparison. A fetched run
-# reassociates nothing the scan does not; what it must not do is differ from
-# the same banks on the device, which every case asserts bitwise.
-SCAN_BOUND = 1e-5
+# The scanned stack against the plain loop. Both are fp32 evaluations of the
+# same logits, so they can differ by the sum of their errors against the
+# exact values. Measured against a float64 evaluation of the same weights on
+# CPU, the narrow shape's scanned logits are off by up to 7.3e-06 and its
+# plain ones by up to 4.7e-06, depending on the ISA XLA compiles for
+# (--xla_cpu_max_isa SSE4_2, AVX, AVX2); an AVX-512 CI runner measured a
+# difference of 1.03e-05 between them. Twice the larger error, 1.5e-05,
+# rounded up, is the bound.
+# A fetched run reassociates nothing the scan does not; what it must not do
+# is differ from the same banks on the device, which every case asserts
+# bitwise.
+SCAN_BOUND = 2e-5
 
 
 def pair(**overrides):
