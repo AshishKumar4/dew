@@ -363,8 +363,9 @@ def compiled_forward(scanned, store, cache, tokens):
             store, cache, tokens).compile()
 
 
-def staged_plan(depth: int) -> tuple[int, int, int]:
-    """Cached host placement and cache-free parameter-staging workspace."""
+def staged_plan(depth: int) -> tuple[int, int, int, int]:
+    """Cached host placement, cache-free parameter-staging workspace, and one
+    layer's parameter bytes."""
     _, scanned, variables, tokens = pair(num_layers=depth)
     resident, on_host = stores(scanned, variables)
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
@@ -373,7 +374,10 @@ def staged_plan(depth: int) -> tuple[int, int, int]:
     uncached = jax.jit(lambda held, ids: scanned.apply(held, ids)).lower(on_host, tokens).compile()
     analysis = uncached.memory_analysis()
     assert analysis is not None
-    return host_parameters_in_plan(compiled), bank_leaves(on_host), analysis.temp_size_in_bytes
+    banks = {name: tree for name, tree in on_host["params"].items() if name.startswith("layers_")}
+    layer = sum(leaf.nbytes for leaf in jax.tree.leaves(banks)) // depth
+    return (host_parameters_in_plan(compiled), bank_leaves(on_host),
+            analysis.temp_size_in_bytes, layer)
 
 
 def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer():
@@ -382,13 +386,20 @@ def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer()
     The cached forward still assigns every bank leaf to host memory, unlike
     its resident counterpart. The cache-free public forward isolates the
     parameter-staging cost: it holds the current and prefetched layers, not
-    the whole stack. Cached decode has depth-dependent KV-bank tiling and
-    output formatting on TPU; subtracting logical cache nbytes from physical
-    temporaries cannot remove that cost. Separate decode tests check values.
+    the whole stack, so eight more layers add less than one layer's bytes to
+    its temporaries, where staging the stack would add eight layers'. The
+    bound is not zero: with deterministic ops on an RTX 4080 and an A100 the
+    sixteen-layer plan's temporaries are 256 bytes over the eight-layer
+    plan's, and on the 4080 the resident plan's grow by the same 256. Both
+    plans hold the same temporaries apart from a loop's s32[depth - 1]; XLA
+    packs them into its temporary allocation differently. Cached decode has
+    depth-dependent KV-bank tiling and output formatting on TPU; subtracting
+    logical cache nbytes from physical temporaries cannot remove that cost.
+    Separate decode tests check values.
     """
     shallow, deep = staged_plan(8), staged_plan(16)
     assert shallow[0] == shallow[1] and deep[0] == deep[1]
-    assert deep[2] <= shallow[2], (shallow, deep)
+    assert deep[2] - shallow[2] < shallow[3], (shallow, deep)
 
 
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
