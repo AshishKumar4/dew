@@ -40,7 +40,7 @@ pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
 images = pipe(["a lighthouse on a rocky coast"], seed=0, steps=25, sampler=Heun()).host().images
 ```
 
-`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture (for `simple_udit`, with `adaln_silu=False` and `text_pooling="all"`, the two places where FlaxDiff 0.2's blocks differ from Dew's defaults), and `tests/test_flaxdiff.py` checks its output against FlaxDiff's own code.
+`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where FlaxDiff 0.2's blocks differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against FlaxDiff's own code.
 
 Anything else, including FlaxDiff's UNets and its 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 
