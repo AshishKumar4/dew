@@ -583,8 +583,8 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     termination by accident. No strategy means `Sample`.
     """
     transforms = sampling.transforms() if logits is None else logits
-    return (decoding.components(transforms, "logits"),
-            (() if stopping is None else decoding.components(stopping, "stopping"))
+    return (decoding.components(transforms),
+            (() if stopping is None else decoding.components(stopping))
             + sampling.criteria(),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
