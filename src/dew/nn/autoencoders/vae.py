@@ -458,6 +458,22 @@ def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
 FLAX_REVISIONS = ("bf16", "flax")
 
 
+def _check_weights(modelname: str, filename: str, revision: str | None, subfolder: str | None) -> None:
+    """Raise EntryNotFoundError when a candidate ships no `filename`, reading no weight bytes.
+
+    Supplied params make the file's presence the only question, which a
+    dry run answers online. With the Hub offline (HF_HUB_OFFLINE) nothing
+    can be asked, so a run that carries its own weights loads from the
+    configs in the cache: the first candidate whose config is cached is
+    taken, which is the one an online load settled on unless the cache also
+    holds the config of a candidate that ships no weights.
+    """
+    from huggingface_hub import constants, hf_hub_download
+
+    if not constants.HF_HUB_OFFLINE:
+        hf_hub_download(modelname, filename, revision=revision, subfolder=subfolder, dry_run=True)
+
+
 def _flax_layout(modelname: str, revision: str, params, errors: list) -> dict | None:
     """Read the SD1-era flax msgpack, or None when the repo ships none.
 
@@ -483,12 +499,11 @@ def _flax_layout(modelname: str, revision: str, params, errors: list) -> dict | 
                 config = json.load(f)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
-            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
-                                           revision=candidate_revision, subfolder=subfolder,
-                                           dry_run=params is not None)
             if params is not None:
+                _check_weights(modelname, "diffusion_flax_model.msgpack", candidate_revision, subfolder)
                 return {"config": config, "params": params}
-            assert isinstance(weights_path, str)
+            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
+                                           revision=candidate_revision, subfolder=subfolder)
             with open(weights_path, "rb") as f:
                 return {"config": config, "params": msgpack_restore(f.read())}
         except (EntryNotFoundError, RevisionNotFoundError) as e:
@@ -513,8 +528,11 @@ def _torch_layout(modelname: str, revision: str, params, errors: list) -> dict |
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
-            hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
-                            revision=candidate_revision, subfolder=subfolder, dry_run=params is not None)
+            if params is None:
+                hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
+                                revision=candidate_revision, subfolder=subfolder)
+            else:
+                _check_weights(modelname, "diffusion_pytorch_model.safetensors", candidate_revision, subfolder)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             errors.append(e)
             continue
