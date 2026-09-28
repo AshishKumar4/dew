@@ -132,6 +132,17 @@ def _fetched(tree):
     return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
 
 
+def _fetched_layer(tree, index):
+    """Copy the layer with its bank axis intact; squeeze only in device memory.
+
+    TPU host tiles cannot in general be bitcast to the lower-rank shape.
+    The bank's layer-major physical layout also keeps the copied tile valid.
+    """
+    return jax.tree.map(
+        lambda leaf: jax.lax.squeeze(jax.device_put(jax.lax.dynamic_index_in_dim(leaf, index, 0),
+                                                    jax.memory.Space.Device), (0,)), tree)
+
+
 def _on_host(tree) -> bool:
     """Whether any leaf of `tree` sits in host memory."""
     return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
@@ -258,7 +269,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if index >= len(runs):
             return None
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held if groups[index][1] == 1 else _layer_slice(held, 0))
+        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
     staged = first_of(0)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
@@ -315,7 +326,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     """
     def body(carry, index):
         hidden, current, held = carry
-        staged = _fetched(_layer_slice(banks, index + 1))
+        staged = _fetched_layer(banks, index + 1)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
