@@ -207,13 +207,46 @@ def test_code_reward_runs_the_containers_own_interpreter():
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
-def test_a_deadline_during_container_start_leaves_no_container():
+def test_a_deadline_during_container_start_leaves_no_container(tmp_path):
+    """Delay the real Docker create until after the removal request returns.
+    Killing the client first fences off that late create; removing first
+    leaves a running container when the client is subsequently killed.
+    """
+    docker = shutil.which("docker")
+    runtime = tmp_path / "delayed-docker"
+    runtime.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, subprocess, sys, time\n"
+        f"root = pathlib.Path({str(tmp_path)!r})\n"
+        f"docker = {docker!r}\n"
+        "args = sys.argv[1:]\n"
+        "released = root / 'removed'\n"
+        "if args[0] == 'run':\n"
+        "    (root / 'name').write_text(args[args.index('--name') + 1])\n"
+        "    while not released.exists():\n"
+        "        time.sleep(.01)\n"
+        "    os.execv(docker, [docker, *args])\n"
+        "else:\n"
+        "    removed = subprocess.run([docker, *args], capture_output=True)\n"
+        "    released.touch()\n"
+        "    deadline = time.monotonic() + 3\n"
+        "    while time.monotonic() < deadline:\n"
+        "        found = subprocess.run([docker, 'inspect', args[-1]], capture_output=True)\n"
+        "        if found.returncode == 0:\n"
+        "            break\n"
+        "        time.sleep(.05)\n"
+        "    sys.exit(removed.returncode)\n")
+    runtime.chmod(0o755)
     program = Program({"main.py": "import time\ntime.sleep(60)"}, ("python", "main.py"))
-    with SandboxFleet(ContainerRunner(IMAGE), limits=SandboxLimits(wall_seconds=.4), workers=4) as fleet:
-        outcomes = fleet.run([program] * 8)
-    assert all(outcome.verdict is Verdict.TIMEOUT for outcome in outcomes)
-    time.sleep(3)
-    leftover = subprocess.run(["docker", "ps", "-a", "--filter", "name=dew-fleet-", "-q"],
-                              capture_output=True, text=True, check=True).stdout.split()
-    subprocess.run(["docker", "rm", "--force", *leftover], capture_output=True, check=False)
-    assert leftover == [], f"{len(leftover)} containers outlived their deadline"
+    try:
+        outcome = ContainerRunner(IMAGE, runtime=str(runtime))(
+            program, SandboxLimits(wall_seconds=2))
+        assert outcome.verdict is Verdict.TIMEOUT
+        name = (tmp_path / "name").read_text()
+        found = subprocess.run([docker, "inspect", name], capture_output=True, check=False)
+        assert found.returncode != 0, f"{name} was created after its deadline"
+    finally:
+        if (tmp_path / "name").exists():
+            subprocess.run([docker, "rm", "--force", (tmp_path / "name").read_text()],
+                           capture_output=True, check=False)
+

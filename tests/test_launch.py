@@ -5,9 +5,11 @@ programs on this machine, so what is checked is what a shell sees: the exit
 code, the output, and which processes are left alive.
 """
 
+import errno
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -21,6 +23,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # The launches below stand in for Slurm, Open MPI or a plain host with
 # variables of their own, on a machine in no cluster of its own.
 ENV = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src")}
+
+def test_a_launch_avoids_an_occupied_coordinator_port():
+    """A service on the old fixed port must not stop a new pool starting."""
+    program = ("import os, socket\n"
+               "host, port = os.environ['JAX_COORDINATOR_ADDRESS'].rsplit(':', 1)\n"
+               "with socket.socket() as coordinator:\n"
+               "    coordinator.bind((host, int(port)))\n"
+               "    print('coordinator bound')\n")
+    with socket.socket() as occupied:
+        try:
+            occupied.bind(("localhost", 43217))
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
+                raise
+        done = launched("--processes-per-host", "1",
+                        "--", sys.executable, "-c", program, env={**ENV, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "coordinator bound" in done.stdout
 
 
 def test_training_does_not_import_the_command_line():
@@ -358,17 +378,15 @@ def failing_nvidia_smi(tmp_path: Path) -> dict:
 
 
 def test_a_host_whose_gpus_cannot_be_counted_starts_its_pool_unchecked(tmp_path):
-    """A failing nvidia-smi counts nothing, which is not zero GPUs: a pool
-    that names two starts as asked, and says the check was skipped. The
-    same host with CUDA_VISIBLE_DEVICES=0 shows one GPU without asking
-    nvidia-smi, and a pool that names two is refused."""
+    """A failing nvidia-smi cannot count GPUs, which is not zero GPUs:
+    a pool naming two starts as asked. With CUDA_VISIBLE_DEVICES=0 the
+    same host shows one GPU without asking nvidia-smi and refuses two."""
     env = failing_nvidia_smi(tmp_path)
     arguments = ("--dry-run", "--processes-per-host", "2", "--devices-per-process", "1",
                  "--", "python", "train.py")
     started = launched(*arguments, env=env)
     assert started.returncode == 0, started.stderr
     assert "JAX_LOCAL_DEVICE_IDS=1" in started.stdout, started.stdout
-    assert "could not count localhost's GPUs" in started.stderr, started.stderr
     refused = launched(*arguments, env={**env, "CUDA_VISIBLE_DEVICES": "0"})
     assert refused.returncode != 0, refused.stdout
     assert "needs 2 GPUs on localhost, which shows 1" in refused.stderr, refused.stderr

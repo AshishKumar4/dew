@@ -591,6 +591,43 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_failure_stays_published_until_its_diagnostic_reaches_the_pool():
+    """A second failure cannot replace the first while its diagnostic is
+    still in flight. Pause at the real diagnostic broadcast, try publishing
+    another failure, then complete the broadcast on both ranks.
+    """
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax, numpy as np\n"
+               "from jax.experimental import multihost_utils\n"
+               "from dew import artifacts\n"
+               "broadcast = multihost_utils.broadcast_one_to_all\n"
+               "replaced = []\n"
+               "def during_diagnostic(value, *args, **kwargs):\n"
+               "    if value.dtype == np.uint8 and jax.process_index() == 0:\n"
+               "        replaced.append(artifacts.publish_failure(ValueError('second'), 'transfer'))\n"
+               "    return broadcast(value, *args, **kwargs)\n"
+               "multihost_utils.broadcast_one_to_all = during_diagnostic\n"
+               "error = ValueError('original') if jax.process_index() == 0 else None\n"
+               "try:\n"
+               "    artifacts.agree_process_phase(error, phase='diagnostic')\n"
+               "except (ValueError, RuntimeError) as heard:\n"
+               "    assert 'original' in str(heard), heard\n"
+               "else:\n"
+               "    raise AssertionError('the pool lost the original failure')\n"
+               "if jax.process_index() == 0:\n"
+               "    assert replaced == [False], replaced\n"
+               "    assert artifacts.publish_failure(ValueError('next'), 'next phase')\n"
+               "    artifacts.withdraw_failure()\n"
+               "print('diagnostic delivered', jax.process_index(), flush=True)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  devices=1, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "diagnostic delivered 0" in done.stdout and "diagnostic delivered 1" in done.stdout
+
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
     """Rank 1 spends longer on its host than the pool's execution bound, as
     process 0 uploading a checkpoint to W&B does, before it agrees with rank
