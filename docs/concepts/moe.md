@@ -74,7 +74,7 @@ Dew sorts tokens into expert order and runs the experts as one grouped matrix mu
 | `'pallas'` | JAX's own Pallas/Triton grouped-matmul kernels, `gmm` and `tgmm`, vendored in `dew.nn.kernels.ragged_dot` from the jax 0.11.2 source tree because no wheel ships them. |
 | `'tokamax'` | `tokamax.ragged_dot` with the kernel named per generation (`TOKAMAX_KERNEL_BY_GENERATION`): Triton on sm80 and sm89, `mosaic_tpu_v2` on v5e and v6e, tokamax's XLA path elsewhere. Only the forward runs on tokamax; the backward differentiates on XLA. |
 
-On an L4 the Pallas kernels take the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates the Pallas Triton backend they run on; Dew keeps them on compute capability 8.0 to 8.9, where JAX's Mosaic GPU grouped matmul does not compile (on sm89 it fails for lack of wgmma), and leaves the deprecation warning to the user's warning filters. They support first-order reverse mode only, which is all training needs; forward mode and higher-order derivatives need `'xla'`. They fall back to `'xla'` where they would change the product: float64, fp32 operands at a precision above the default, and an x64 run.
+On an L4 the Pallas kernels take the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates the Pallas Triton backend they run on; Dew keeps them on compute capability 8.0 to 8.9, where JAX's Mosaic GPU grouped matmul does not compile (on sm89 it fails for lack of wgmma), and leaves the deprecation warning to the user's warning filters. They support first-order reverse mode only, which is what the ordinary `Trainer` step uses; forward mode and higher-order derivatives, as in meta-learning, need `'xla'`. They fall back to `'xla'` where they would change the product: float64, fp32 operands at a precision above the default, and an x64 run.
 
 A mesh does not change the choice: the experts run inside the dispatch's `shard_map` on each device's rows, with the weights they need gathered there. On 2x RTX 3090 one fsdp-sharded expert layer took 26.2 ms on the Pallas kernels against 271.9 ms on `'xla'`. Every routed expert module the decoder builds follows `implementation`, GPT OSS's included.
 
@@ -93,7 +93,7 @@ The `expert` mesh axis splits the expert dimension across devices. Dense paramet
 Both dispatch modes run their expert projections through `moe.expert_projection`, which fixes the arithmetic of a routed layer during training, whatever the activation dtype and placement:
 
 - each contraction accumulates in at least fp32 and rounds once to the compute dtype;
-- a kernel gradient sums every device's and every exchange round's share in at least fp32 and rounds to the master dtype once, so a bf16 master gets the same gradient on one device and on any mesh;
+- a kernel gradient sums every device's and every exchange round's share in at least fp32 and rounds to the master dtype once, rather than rounding each share; the fp32 summation order still depends on the mesh, so gradients on different meshes agree to fp32 rounding, not bit for bit;
 - kernel gradients keep the master dtype, and input gradients their input's dtype;
 - the exact GELU rounds once.
 
