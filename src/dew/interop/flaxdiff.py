@@ -9,10 +9,10 @@ the run as a `TextToImage` over Dew's own model, built with the fields that
 compute what FlaxDiff computed. This module maps names and config and
 nothing else.
 
-It knows `simple_udit`, FlaxDiff 0.2's U-shaped DiT (commit 3e3497e, the
-code flaxdiff 0.2.8 shipped). Its blocks project the conditioning vector
-without a SiLU and it averages the text over every position, so it loads as
-`SimpleUDiT(adaln_silu=False, text_pooling="all")`. FlaxDiff drew the Fourier
+It knows `simple_udit`, the U-shaped DiT, and `hybrid_dit`, the S5-attention
+DiT. Both project the conditioning vector without a SiLU and average the
+text over every position, so Dew builds them with
+`adaln_silu=False, text_pooling="all"`. FlaxDiff drew the Fourier
 table of its time embedding with `jax.random.normal` at PRNGKey(42) and never
 saved it, and jax 0.5.0 changed that stream, so the loader draws the table
 the way the run's jax did. From then on the table is the `constants` variable
@@ -36,16 +36,23 @@ from dew import records
 if TYPE_CHECKING:
     from dew.sampling.pipelines import TextToImage
 
-# FlaxDiff 0.2's SimpleUDiT held these at its root; Dew's nests them under the
+# FlaxDiff 0.2's DiTs held these at their root; Dew nests them under the
 # conditioning embed and the output head.
 _MOVED = {"time_embed": ("conditioning", "time_embed"),
           "text_proj": ("conditioning", "text_context_proj"),
           "final_norm": ("output", "final_norm"),
           "final_proj": ("output", "final_proj")}
+_HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
+                 "text_context_proj": ("conditioning", "text_context_proj"),
+                 "hilbert_projection": ("embed", "hilbert_projection"),
+                 "patch_embed": ("embed", "patch_embed"),
+                 "final_norm": ("output", "final_norm"),
+                 "final_proj": ("output", "final_proj")}
 
 _READ = frozenset({"output_channels", "patch_size", "emb_features", "num_layers", "num_heads",
                    "mlp_ratio", "norm_epsilon"})
-# Model config keys FlaxDiff 0.2's SimpleUDiT computed nothing with on a CPU
+_HYBRID_READ = frozenset({"ssm_state_dim", "ssm_attention_ratio", "use_2d_fusion", "use_zigzag"})
+# Model config keys FlaxDiff 0.2's DiTs computed nothing with on a CPU
 # or GPU: its blocks take `dropout_rate` and never apply it, and it reads
 # none of the others.
 _UNREAD = frozenset({"dropout_rate", "activation", "norm_groups", "use_flash_attention",
@@ -68,27 +75,38 @@ class SimpleUDiTFields(TypedDict):
     text_pooling: Literal["real", "all"]
 
 
-def read_checkpoint(directory: str | os.PathLike) -> dict:
-    """One FlaxDiff checkpoint step, the directory holding `default/`, as the
-    nested dict of host arrays FlaxDiff saved there with orbax.
+class HybridDiTFields(SimpleUDiTFields):
+    """The `hybrid_dit` fields a FlaxDiff 0.2 run config sets."""
 
-    FlaxDiff's 2024 runs saved orbax's older aggregate file
-    (`default/checkpoint`), which this does not read: no model of those runs
-    has a loader.
+    ssm_state_dim: int
+    ssm_attention_ratio: str
+    use_2d_fusion: bool
+    scan_order: Literal["raster", "zigzag"]
+
+
+def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: bool = False) -> dict:
+    """The model weights from one FlaxDiff checkpoint step holding `default/`.
+
+    Read the averaged weights of the last state by default; `ema=False`
+    selects live weights and `best=True` selects `best_state`. Return the
+    parameter dict under FlaxDiff's model names as host arrays. Only that
+    copy is restored, without allocating the optimizer or other states.
+
+    The older 2024 aggregate format (`default/checkpoint`) is not supported.
     """
     import orbax.checkpoint as ocp
 
-    restored = ocp.PyTreeCheckpointer().restore((Path(directory) / "default").resolve())
-    if not isinstance(restored, dict) or "state" not in restored:
-        raise ValueError(f"{directory} is not a FlaxDiff checkpoint step: it holds no 'state'")
-    return restored
-
-
-def flaxdiff_weights(tree: Mapping, *, ema: bool = True, best: bool = False) -> dict:
-    """The model parameters a FlaxDiff checkpoint tree holds: the averaged
-    copy (`ema`) or the live one, of the last state or of `best_state`."""
-    state = tree["best_state" if best else "state"]
-    return dict(state["ema_params" if ema else "params"]["params"])
+    path = (Path(directory) / "default").resolve()
+    state = "best_state" if best else "state"
+    weights = "ema_params" if ema else "params"
+    handler = ocp.PyTreeCheckpointHandler()
+    with ocp.Checkpointer(handler) as checkpointer:
+        metadata = handler.metadata(path)
+        item = {state: {weights: metadata.tree[state][weights]}}
+        restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), item)
+        tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
+            item=item, restore_args=restore_args, partial_restore=True))
+    return dict(tree[state][weights]["params"])
 
 
 def fourier_table(features: int, jax_version: str, scale: float = 16) -> np.ndarray:
@@ -136,9 +154,32 @@ def simple_udit_variables(weights: Mapping, model: Mapping[str, object], *,
                           jax_version: str) -> dict:
     """FlaxDiff 0.2 SimpleUDiT weights as the variables of Dew's model: the
     params under Dew's names and the Fourier table the run's jax drew."""
+    return _variables(weights, model, _MOVED, jax_version)
+
+
+def hybrid_dit_fields(model: Mapping[str, object]) -> HybridDiTFields:
+    """The `hybrid_dit` fields that compute FlaxDiff 0.2's S5-attention DiT."""
+    common = simple_udit_fields({name: value for name, value in model.items()
+                                 if name not in _HYBRID_READ})
+    return HybridDiTFields(
+        **common,
+        ssm_state_dim=records.integer(model.get("ssm_state_dim", 64), "ssm_state_dim"),
+        ssm_attention_ratio=records.text(model.get("ssm_attention_ratio", "3:1"), "ssm_attention_ratio"),
+        use_2d_fusion=records.boolean(model.get("use_2d_fusion", False), "use_2d_fusion"),
+        scan_order="zigzag" if records.boolean(model.get("use_zigzag", False), "use_zigzag") else "raster")
+
+
+def hybrid_dit_variables(weights: Mapping, model: Mapping[str, object], *,
+                         jax_version: str) -> dict:
+    """FlaxDiff 0.2 hybrid DiT weights and Fourier table under Dew's names."""
+    return _variables(weights, model, _HYBRID_MOVED, jax_version)
+
+
+def _variables(weights: Mapping, model: Mapping[str, object],
+               moved: Mapping[str, tuple[str, ...]], jax_version: str) -> dict:
     params: dict = {}
     for name, value in weights.items():
-        *parents, leaf = _MOVED.get(name, (name,))
+        *parents, leaf = moved.get(name, (name,))
         branch = params
         for parent in parents:
             branch = branch.setdefault(parent, {})
@@ -148,12 +189,16 @@ def simple_udit_variables(weights: Mapping, model: Mapping[str, object], *,
             "constants": {"conditioning": {"time_embed": {"layers_0": {"frequencies": table}}}}}
 
 
+_ARCHITECTURES = {"simple_udit": (simple_udit_fields, simple_udit_variables),
+                  "hybrid_dit": (hybrid_dit_fields, hybrid_dit_variables)}
+
+
 def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
     """The one text condition of a FlaxDiff run: the keyword the model takes
     it under, the CLIP checkpoint that encodes it, and the unconditional text."""
     conditions = input_config.get("conditions")
     if not isinstance(conditions, list) or len(conditions) != 1:
-        raise ValueError(f"a FlaxDiff simple_udit run conditions on one text; got {conditions!r}")
+        raise ValueError(f"a FlaxDiff run conditions on one text; got {conditions!r}")
     condition = records.record(conditions[0], "conditions")
     encoder = records.record(condition["encoder"], "encoder")
     return (records.text(condition.get("model_key_override") or "textcontext", "model_key_override"),
@@ -168,7 +213,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     `directory` is one checkpoint step, `config` the run config FlaxDiff's
     trainer logged (`wandb.Api().run(path).config`), and `jax_version` the jax
     the run trained under, from its `requirements.txt`. `ema` and `best` pick
-    the weights (`flaxdiff_weights`); `dtype` is the model's compute dtype.
+    the weights (`read_checkpoint`); `dtype` is the model's compute dtype.
 
     The text tower and the VAE load from the Hub under the names the config
     records, both computing in bfloat16 as FlaxDiff's did. A call samples the
@@ -184,13 +229,13 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     from dew.registry import resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 
-    architecture = config.get("architecture")
-    if architecture != "simple_udit":
-        raise ValueError(f"load_flaxdiff knows simple_udit runs, not {architecture!r}")
+    architecture = records.text(config.get("architecture"), "architecture")
+    if architecture not in _ARCHITECTURES:
+        raise ValueError(f"load_flaxdiff knows simple_udit and hybrid_dit runs, not {architecture!r}")
     arguments = records.record(config.get("arguments") or {}, "arguments")
     schedule = config.get("noise_schedule") or arguments.get("noise_schedule")
     if schedule != "edm":
-        raise ValueError(f"a FlaxDiff simple_udit run trains on the EDM schedule, not {schedule!r}")
+        raise ValueError(f"a FlaxDiff {architecture} run trains on the EDM schedule, not {schedule!r}")
     autoencoder = config.get("autoencoder")
     if autoencoder != "stable_diffusion":
         raise ValueError(f"load_flaxdiff knows latent runs on the SD VAE, not {autoencoder!r}")
@@ -202,9 +247,10 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     keyword, clip, unconditional = _condition(input_config)
     height, width, channels = records.integers(input_config["sample_data_shape"], "sample_data_shape")
     model_config = records.record(config["model"], "model")
-    model = models.build("simple_udit", simple_udit_fields(model_config), dtype=resolve_dtype(dtype))
-    variables = simple_udit_variables(flaxdiff_weights(read_checkpoint(directory), ema=ema, best=best),
-                                      model_config, jax_version=jax_version)
+    fields, convert = _ARCHITECTURES[architecture]
+    model = models.build(architecture, fields(model_config), dtype=resolve_dtype(dtype))
+    variables = convert(read_checkpoint(directory, ema=ema, best=best),
+                         model_config, jax_version=jax_version)
 
     # FlaxDiff's encoders ran in bfloat16, and it read the VAE's main branch.
     condition = TextCondition(checkpoint=clip, dtype="bfloat16", unconditional=unconditional).build()
@@ -225,5 +271,6 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
                        sampler=EulerAncestral())
 
 
-__all__ = ["SimpleUDiTFields", "flaxdiff_weights", "fourier_table", "load_flaxdiff",
+__all__ = ["HybridDiTFields", "SimpleUDiTFields", "fourier_table",
+           "hybrid_dit_fields", "hybrid_dit_variables", "load_flaxdiff",
            "read_checkpoint", "simple_udit_fields", "simple_udit_variables"]
