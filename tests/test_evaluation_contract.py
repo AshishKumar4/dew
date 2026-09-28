@@ -24,7 +24,7 @@ def test_fid_pools_unequal_batches_and_singletons():
     expected = frechet_distance(generated.mean(0), np.cov(generated, rowvar=False),
                                 real.mean(0), np.cov(real, rowvar=False))
     assert (accumulated.generated.count, accumulated.real.count) == (19, 23)
-    np.testing.assert_allclose(accumulated.generated.covariance(population="generated"),
+    np.testing.assert_allclose(accumulated.generated.covariance(),
                                np.cov(generated, rowvar=False), rtol=1e-13, atol=1e-13)
     assert metric.finalize(accumulated) == pytest.approx(expected, rel=1e-12, abs=1e-12)
 
