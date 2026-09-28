@@ -57,7 +57,7 @@ Trained 150 steps in 0:00:08: first step after 2.64 s, then 30.3 step/s
 
 ```text
 pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
-         ema=True, step=None, revision=None)
+         ema=None, step=None, revision=None)
 ```
 
 | Argument | Meaning |
@@ -66,7 +66,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
 | `param_dtype` | Parameter storage. `None` keeps a run's stored dtypes and uses float32 master weights for a published source; `"auto"` keeps the stored dtypes for both, which for a published source means its `config.json` `dtype`, or else its first floating tensor's. |
-| `ema` | Read a run's moving-average weights. |
+| `ema` | `None` (default): the run's moving-average weights when it stored them, else the live ones. `True` requires the average; `False` reads the live weights. |
 | `step` | Which of a run's checkpoints to load; refused for a source checkpoint. |
 | `revision` | Pins a Hub source; refused for a run directory. |
 
@@ -98,7 +98,7 @@ A run assembled by hand needs its configuration saved next to the checkpoints be
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights, and raises if the run or state has no EMA copy; `ema=False` reads the live weights. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline` and the tasks' `from_run` and `from_pretrained` default to `ema=None`, which takes the EMA copy when the run stored one and the live weights otherwise; `objective.pipeline` defaults to `ema=True`. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
