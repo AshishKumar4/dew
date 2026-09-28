@@ -40,9 +40,10 @@ print(result.lengths, result.terminated)
 ```
 
 ```text
-Training from step 0 to 150 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 150: loss 0.0091
-Goodput: first step after 2.72 s, 45.6% of the wall time in steps
+Training from step 0 to 150 on 1 × cpu, 147,904 parameters
+step 150/150  loss 0.0091  ce 0.0091  perplexity 1.0091  token_accuracy 0.9961  33.7 ms/step  475 samples/s  0:00:00 left
+Trained 150 steps in 0:00:08: first step after 2.64 s, then 30.3 step/s
+65.1% of the wall time in steps, final loss 0.0091
 ', Lily saw a big dog'
 ', Lily saw a big dog'
 ' play. One day, Lily'
