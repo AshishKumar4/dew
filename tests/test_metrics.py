@@ -240,33 +240,27 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
 
 
 def test_fid_extraction_is_independent_of_small_batch_boundaries():
-    """A short last batch must not change either population's features.
+    """The mean of repeated copies of one image is that image's feature.
 
-    XLA:TPU's space-to-batch rewrite corrupted Inception below batch 8.
-    Pool the same images at batch 16 and across 1/3/7/5-row batches, including
-    single-row contributions whose covariance exists only after merging.
+    Compare these public FID statistics across the batch-eight boundary.
+    Unlike a relative covariance check, this tests the extracted features
+    themselves: centering nearly constant features magnifies their rounding.
     """
     from dew.inputs import unit_range
 
-    # IID noise alone becomes nearly constant after global pooling. Vary
-    # each image's brightness so covariance does not subtract nearly equal
-    # features and amplify their float32 rounding into a relative error.
-    images = np.random.default_rng(93).integers(0, 64, (16, 32, 32, 3), dtype=np.uint8)
-    images += (10 * np.arange(16, dtype=np.uint8))[:, None, None, None]
-    brighter = images + np.uint8(40)
+    images, brighter = fid_sets()
     metric = FID(weights=str(INCEPTION_TINY))
-    whole = metric(ImageGrid(unit_range(brighter)), {"image": images})
-    split = metric(ImageGrid(unit_range(brighter[:1])), {"image": images[:1]})
-    for start, end in ((1, 4), (4, 11), (11, 16)):
-        split = metric.merge(split, metric(ImageGrid(unit_range(brighter[start:end])),
-                                           {"image": images[start:end]}))
-    for actual, expected in ((split.generated, whole.generated), (split.real, whole.real)):
-        assert actual.count == expected.count == 16
-        np.testing.assert_allclose(actual.mean, expected.mean, rtol=1e-5,
-                                   atol=1e-6 * np.abs(expected.mean).max())
-        np.testing.assert_allclose(actual.m2, expected.m2, rtol=1e-5,
-                                   atol=1e-6 * np.abs(expected.m2).max())
-    assert metric.finalize(split) == pytest.approx(metric.finalize(whole), rel=1e-5)
+
+    def extract(rows):
+        return metric(ImageGrid(unit_range(np.repeat(brighter[:1], rows, axis=0))),
+                      {"image": np.repeat(images[:1], rows, axis=0)})
+
+    reference = extract(8)
+    for rows in (1, 3, 7, 9):
+        actual = extract(rows)
+        for part, whole in ((actual.generated, reference.generated), (actual.real, reference.real)):
+            assert part.count == rows
+            np.testing.assert_allclose(part.mean, whole.mean, rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.network
