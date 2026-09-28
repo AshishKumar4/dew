@@ -23,6 +23,7 @@ from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.unet import Unet
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
+from dew.nn.conv import Conv
 from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
@@ -136,6 +137,42 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
         actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
                                     for value in (actual, reference, truth)]
     assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
+
+
+def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
+    """Small integer operands make every product/sum exact in fp32.
+
+    The largest possible sum in this two-convolution VJP is below 2**24,
+    so a mapped axis or tangent lost by the TPU barrier cannot hide in a
+    tolerance. The host evaluates the same six images as one batch.
+    """
+    model = nn.Sequential([
+        Conv(4, (1, 1), use_bias=False, precision=jax.lax.Precision.HIGHEST),
+        Conv(2, (3, 3), strides=2, padding="VALID", use_bias=False,
+             precision=jax.lax.Precision.HIGHEST),
+    ])
+    image = (np.arange(2 * 3 * 17 * 17 * 3).reshape(2, 3, 17, 17, 3) % 7).astype(np.float32)
+    cotangent = (np.arange(2 * 3 * 8 * 8 * 2).reshape(2, 3, 8, 8, 2) % 5 - 2).astype(np.float32)
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    with jax.default_device(host):
+        variables = jax.tree.map(jnp.ones_like, model.init(jax.random.key(0), image[0, 0]))
+
+    def mapped(params, x):
+        return jax.vmap(jax.vmap(lambda item: model.apply(params, item)))(x)
+
+    results = []
+    for forward, target in ((model.apply, host), (mapped, device)):
+        arguments = jax.tree.map(lambda x: jax.device_put(x, target), (variables, image, cotangent))
+
+        def loss(params, x, cot):
+            return jnp.sum(forward(params, x) * cot)
+
+        with jax.default_device(target):
+            values = jax.jit(forward)(*arguments[:2])
+            gradients = jax.jit(jax.grad(loss, argnums=(0, 1)))(*arguments)
+            results.append(jax.tree.map(np.asarray, (values, gradients)))
+    for actual, expected in zip(jax.tree.leaves(results[1]), jax.tree.leaves(results[0]), strict=True):
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("build", [

@@ -23,11 +23,17 @@ output features, or whole image rows came out right. A layout that splits a kern
 whichever width its heuristic picks, so the kernel is used whole, as fully
 sharded data parallelism gathers a layer's weights before it computes.
 
-`Conv` exists only to work around those bugs, the first reported as
-https://github.com/openxla/xla/issues/49382, the second drafted in
-~/.cache/dew/verification-evidence/upstream-reports/xla-conv-halo-kernel-split/
-and not filed. When XLA partitions both correctly, this module goes and
-every model uses `flax.linen.Conv` again.
+On TPU, XLA's space-to-batch rewrite also corrupts a convolution feeding
+a strided 2D convolution at small batches (Dew issue #5). A barrier at the
+strided convolution's input fixes both the forward and the VJP. It applies
+regardless of the global batch: partitioning may make a shard's batch small.
+CPU and GPU lower the input unchanged. The barrier's derivative and batching
+rules are identities; JAX's primitive defines neither.
+
+`Conv` exists only to work around these bugs. The partitioner bugs are
+reported at https://github.com/openxla/xla/issues/49382 and drafted in
+~/.cache/dew/verification-evidence/upstream-reports/xla-conv-halo-kernel-split/.
+When XLA fixes these lowerings, every model can use `flax.linen.Conv` again.
 """
 
 import math
@@ -36,10 +42,32 @@ import jax
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import PromoteDtypeFn
+from jax.custom_batching import custom_vmap
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
+
+
+@custom_vmap
+def _barrier_value(x: jax.Array) -> jax.Array:
+    return jax.lax.optimization_barrier(x)
+
+
+@_barrier_value.def_vmap
+def _barrier_batch(axis_size, in_batched, x):
+    del axis_size
+    return _barrier_value(x), in_batched[0]
+
+
+@jax.custom_jvp
+def _barrier(x: jax.Array) -> jax.Array:
+    return _barrier_value(x)
+
+
+@_barrier.defjvp
+def _barrier_jvp(primals, tangents):
+    return _barrier(primals[0]), tangents[0]
 
 
 def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
@@ -100,16 +128,21 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
 
 
 class Conv(nn.Conv):
-    """`flax.linen.Conv`, with its input and output constrained by
-    `_unreplicated` under a mesh and its kernel used whole, for the XLA
-    partitioner bugs in the module docstring. The kernel is placed where
-    flax's convolution reads its promoted operands, its `promote_dtype`
-    hook, so the convolution itself stays flax's. The parameters, their
-    names and the result are flax's, so checkpoints and one-device runs are
-    unchanged. Remove the class when XLA fixes the bugs."""
+    """Flax's convolution with the placement and TPU input barriers above.
+
+    The kernel is placed where Flax reads its promoted operands, through
+    `promote_dtype`. Parameters and names remain Flax's, so checkpoints do
+    not change. Remove the workarounds when XLA fixes the lowerings.
+    """
 
     promote_dtype: PromoteDtypeFn = _promoted_whole
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         spatial = 1 if isinstance(self.kernel_size, int) else len(self.kernel_size)
-        return _unreplicated(super().__call__(_unreplicated(inputs, spatial)), spatial)
+        inputs = _unreplicated(inputs, spatial)
+        if spatial == 2 and self.strides is not None:
+            strided = (self.strides > 1 if isinstance(self.strides, int)
+                       else any(stride > 1 for stride in self.strides))
+            if strided:
+                inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
+        return _unreplicated(super().__call__(inputs), spatial)
