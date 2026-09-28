@@ -1,6 +1,6 @@
 # Training data
 
-A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of NumPy arrays whose first dimension is the global batch; the objective reads the fields it needs by name. This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
+A `Dataset` supplies the batches a run trains and validates on. A batch is a dictionary of NumPy arrays whose first dimension is this process's rows of the global batch (all of them with one process); the trainer joins the processes' rows into global arrays, and the objective reads the fields it needs by name. This page covers the `Dataset` class, the fields each built-in objective expects, the built-in readers, reading data that TFDS or Hugging Face already holds, and resuming the data stream from a checkpoint.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](../assets/data-pipeline-light.svg)
 ![](../assets/data-pipeline-dark.svg)
@@ -181,7 +181,7 @@ A global position is the number of records the whole run has consumed, and every
 
 The position also records what it counts through: the source's description, its record count and the shuffle seed. Dew refuses to resume with a different record count or seed. A source without its own `__repr__` is described by its type name, so two corpora of equal length and seed are only told apart if the source describes its data; give any source you resume across runs a `__repr__` that names its data.
 
-Which process holds which row of a step depends on the process count, so randomness keyed by row, such as diffusion noise or sampled timesteps, falls on different records at a different process count. Losses still agree because they are means over the step's rows. A record's own random draws are keyed by its place in the shuffled stream and do not depend on the process count.
+Which process holds which row of a step depends on the process count, so randomness keyed by row, such as diffusion noise or sampled timesteps, falls on different records at a different process count. The resumed run then draws different noise for the same records: it optimizes the same objective, but its losses are not the same numbers an uninterrupted run would have logged. A record's own random draws are keyed by its place in the shuffled stream and do not depend on the process count.
 
 `Checkpoints.restore` refuses a shard offset written by a different number of processes and names both counts; resume such a run on the process count that wrote it. [Checkpoints](../guides/checkpoints.md) shows the whole save and restore path.
 

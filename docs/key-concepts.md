@@ -9,7 +9,7 @@ A Dew training run is built from four objects. Each owns one part of the work:
 | `Dataset` | The iterators that yield training and validation batches | Your data does not fit a built-in reader. |
 | `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | Never; it is configured, not subclassed. |
 
-`Trainer.fit` returns a `TrainState`, which holds everything needed to continue a run: the variables, the optimizer state, the root random key, the step counters and the moving-average copy.
+`Trainer.fit` returns a `TrainState`, the numerical state of the run: the variables, the optimizer state, the root random key, the step counters and the moving-average copy. Continuing a run also needs the data position and the configuration, which checkpoints store beside it.
 
 ## Example
 
