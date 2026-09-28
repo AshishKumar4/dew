@@ -148,7 +148,7 @@ class DiscreteProcess:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
-            _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
+            _validate_request(model, self, prepared, max_new_tokens, n, eos_token_ids, pad_token_id)
             return request, prepared
 
         request, prepared = agreed("masked generation setup", resolve)
@@ -249,11 +249,11 @@ class MDLM:
 
 
 def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelInputs,
-                      budget: int, steps: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
+                      budget: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
     decoder = model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
     if decoder is None or decoder.causal:
         raise ValueError("masked generation requires a bidirectional model")
-    for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):
+    for name, value, minimum in (("max_new_tokens", budget, 0), ("n", n, 1)):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
     vocab = model.vocab_size
@@ -283,8 +283,8 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
     Every per-token field is continued past the prompt's last real token: a
     logical position counts on from it, a rotary coordinate counts on from
     the largest on each axis, the attention mask marks the response valid for
-    rows that hold a prompt, and a segment id repeats. A field with no rule
-    here is filled with -1.
+    rows that hold a prompt, and a segment id repeats. `_validate_request`
+    admits no other field.
     """
     batch, prompt = inputs.tokens.shape
     valid = jnp.asarray(inputs.token_fields.get("attention_mask", jnp.ones((batch, prompt), bool)), bool)
@@ -305,10 +305,8 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
                                     (batch, width, *value.shape[2:]))
         elif name == "attention_mask":
             tail = jnp.broadcast_to(active[:, None], (batch, width))
-        elif name == "segment_ids":
-            tail = jnp.broadcast_to(value[jnp.arange(batch), last_slot, None], (batch, width))
         else:
-            tail = jnp.full((batch, width, *value.shape[2:]), -1, value.dtype)
+            tail = jnp.broadcast_to(value[jnp.arange(batch), last_slot, None], (batch, width))
         fields[name] = jnp.concatenate([value, tail.astype(value.dtype)], axis=1)
     tokens = jnp.concatenate([inputs.tokens, jnp.full((batch, width), mask_id, jnp.int32)], axis=1)
     mutable = jnp.concatenate([jnp.zeros((batch, prompt), bool),
