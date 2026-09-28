@@ -11,7 +11,8 @@ On one accelerator, where the experts cannot be split, each device computes ever
 The training text mixes three kinds of line: short English sentences, sums and assignments.
 Before every training step the script runs the step's batch through the step's parameters
 once more, reads the experts each token's router picked, and counts, for each MoE layer,
-the slots each device sends to every other device and the exchange rounds that takes. The
+the slots each device sends to every other device and the most exchange rounds any expert
+group needs for them, predicted by the exchange's own rule. The
 drawing reads the placement from the objects the run used: the device grid from the mesh,
 each device's experts and kernel slice from the expert kernel's sharding, each device's
 rows from the sharding the layout gives the layer's input, and the all-to-all operations
@@ -157,7 +158,7 @@ def placement(mesh, kernel: jax.Array, batch_shape: tuple[int, int, int], layout
 
 def routing_record(selections, tokens: np.ndarray, where: Placement, experts: int, shards: int,
                    dispatch: str) -> list[dict]:
-    """Per MoE layer: slots sent between devices, the exchange rounds they
+    """Per MoE layer: slots sent between devices, the most exchange rounds they
     take, slots per expert and each byte class's slots per expert."""
     classes = token_class(tokens)
     layers = []
@@ -175,10 +176,11 @@ def routing_record(selections, tokens: np.ndarray, where: Placement, experts: in
 
 
 def exchange_rounds(sent: np.ndarray, shards: int, dispatch: str) -> int:
-    """The all-to-all rounds one MoE layer's forward runs, by the rule in
-    `dew.nn.moe._exchange_shard`: a first round sends every peer a bucket of
-    ceil(slots / shards) rows, and the overflow of the fullest bucket in an
-    expert group takes further rounds of the same size. 0 under `global`."""
+    """The most all-to-all rounds any expert group runs in one MoE layer's
+    forward, predicted by the rule in `dew.nn.moe._exchange_shard`: a first
+    round sends every peer a bucket of ceil(slots / shards) rows, and the
+    overflow of the fullest bucket in an expert group takes further rounds of
+    the same size. Each group runs its own count; 0 under `global`."""
     if dispatch != "exchange":
         return 0
     first = -(-sent.sum(axis=1, keepdims=True) // shards)
@@ -245,7 +247,8 @@ def main(config: Config) -> None:
                           "rounds": [layer["rounds"] for layer in layers]})
             if current == 1 or current % config.snapshot_every == 0 or current == config.steps:
                 print(f"step {current}: loss {float(loss):.3f}" + (
-                    f", exchange rounds per layer {[layer['rounds'] for layer in layers]}"
+                    f", predicted exchange rounds per layer (max over expert groups) "
+                    f"{[layer['rounds'] for layer in layers]}"
                     if config.dispatch == "exchange" else ""))
                 frames.append({"label": f"training step {current} of {config.steps}", "step": current,
                                "loss": float(loss), "rows": [[rows.start, rows.stop] for rows in where.rows],
@@ -428,7 +431,8 @@ def frame_group(frame: dict, centre: dict, config: Config, chart_x: float, top: 
     """One frame: the title, the traffic arrows, each device's slot counts and the per-layer charts."""
     label = frame["label"] + (f", loss {frame['loss']:.3f}" if frame["loss"] is not None else "")
     if config.dispatch == "exchange":
-        label += ", exchange rounds per MoE layer " + ", ".join(str(layer["rounds"]) for layer in frame["layers"])
+        label += (", predicted exchange rounds per MoE layer (max over expert groups) "
+                  + ", ".join(str(layer["rounds"]) for layer in frame["layers"]))
     parts = [text(0, 42, label, 13, fill="#333")]
     sent = np.sum([layer["sent"] for layer in frame["layers"]], axis=0)
     away = sent - np.diag(np.diag(sent))
