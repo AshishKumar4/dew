@@ -975,13 +975,14 @@ class Pretrained:
                 max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
                 max_length=generation_limit(self.config, self.generation_config, "max_length"),
                 n=return_sequences(self.config, self.generation_config))
+        rows = return_sequences(self.config, self.generation_config)
         policy, logits, stopping, strategy = source_decoding(
-            self.config, self.generation_config, self.model, self.processor, sampling)
+            self.config, self.generation_config, self.model, self.processor, rows,
+            sampling)
         return TextGeneration(self.model, self.variables, self.processor, policy,
                               max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
                               max_length=generation_limit(self.config, self.generation_config, "max_length"),
-                              n=return_sequences(self.config, self.generation_config),
-                              logits=logits, stopping=stopping, strategy=strategy)
+                              n=rows, logits=logits, stopping=stopping, strategy=strategy)
 
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
