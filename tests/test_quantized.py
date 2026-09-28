@@ -528,7 +528,7 @@ def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
     """A source tensor that was quantized and is missing from the export
     would otherwise be written dense under a config that calls it
     quantized, which is the lie this whole path exists to avoid."""
-    with pytest.raises(ValueError, match="up_proj.weight was quantized"):
+    with pytest.raises(KeyError, match="up_proj.weight"):
         fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
                                           ("model.layers.0.mlp.up_proj.weight",))
 
