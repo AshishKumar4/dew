@@ -453,8 +453,8 @@ of peak, as `docs/benchmarks.md` reports.
 
 ## Muon against AdamW at equal tokens
 
-These are the only CPU rows in this file. A loss curve at equal tokens does
-not depend on the card's kernels, and the run is small enough that one
+These are the only CPU rows in this file. They compare optimizers at equal
+token budgets, not accelerator speed; the run is small enough that one
 workstation CPU does nine of them in under an hour.
 
 ```
@@ -504,10 +504,9 @@ Muon with the parameter groups reaches 1.4386 where AdamW reaches 1.4764,
 0.038 nats lower at the same tokens. The three seeds of an arm spread 0.007
 to 0.013, so the gap to AdamW is three times that noise. The gap to unsplit
 Muon is 0.018, one and a half times the noise, and the split version is ahead
-on each of the three seeds, by 0.016, 0.020 and 0.017. Muon also holds its
-loss at ten times its best learning rate: it loses 0.028, where AdamW loses
-0.116. That matches the tolerance the labs report
-(`docs/research/frontier-training.md:183`).
+on each of the three seeds, by 0.016, 0.020 and 0.017. Raising the learning
+rate from each arm's best to 1e-2 costs Muon 0.028 (3.3 times its best rate)
+and AdamW 0.116 (10 times its best rate).
 
 These numbers say nothing about 0.4B parameters. That is the run section 4.9
 of `docs/design/plan.md` asks for, and it needs a v5e-16. The wall-clock
@@ -696,4 +695,4 @@ A model's `remat` is where its step starts, and the trainer moves it up one rung
 | RTX 3090 | 359.8M decoder, 8 x 1024 | 420.9 ms, 13.16 GiB | 438.3 ms, 9.77 GiB | 505.1 ms, 6.33 GiB |
 | RTX 3090 | 321.8M MoE decoder, 4 x 1024 | 126.5 ms, 7.82 GiB | 133.6 ms, 6.26 GiB | 150.2 ms, 6.02 GiB |
 
-`'minimal'` costs 3-11% over no recomputation and `'full'` 17-24%, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), the RTX 3090 rows one GPU of the box.
+Over no recomputation, `'minimal'` and `'dots'` cost 4-10% and `'full'` 15-21% in the rows where all three ran, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), the RTX 3090 rows one GPU of the box.
