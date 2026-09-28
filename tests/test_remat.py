@@ -336,11 +336,18 @@ def _resident_memory_step():
 
 
 
-def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
-    """The first compile leaves no headroom, so the trainer tiles the head;
-    the second leaves none either, so it compiles the step again under
-    'minimal', which fits, and stops there. A memory-tight step takes the
-    tiled head before any block is recomputed."""
+@pytest.mark.parametrize('options', [None, {'xla_embed_ir_in_executable': False}],
+                         ids=['default', 'step_options'])
+def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, options):
+    """A step that does not fit tiles the head first, then compiles again
+    under 'minimal', which fits, and stops there: a memory-tight step takes
+    the tiled head before any block is recomputed.
+
+    Where the device has step compiler options (the Triton GEMM fusions off
+    on sm80 and sm89), a step that does not fit is compiled once more under
+    XLA's defaults before it climbs (`fitting_default`). So the headroom
+    answers by the rung it was compiled at, not by how many compiles came
+    before it."""
     import optax
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -348,23 +355,25 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer, trainer as trainer_module
 
-    headrooms = iter([-1, -1, 0])
     compiled = []
 
     def headroom(executable, devices):
-        compiled.append(executable)
-        return next(headrooms)
+        rung = (trainer.objective.head_tile is not None,
+                trainer_module.remat_record(trainer.objective.model.remat))
+        compiled.append(rung)
+        return 0 if rung[1] == 'minimal' else -1
 
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
     trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert len(compiled) == 3
-    assert trainer.objective.head_tile is not None
+    # Each rung that does not fit is compiled once, or twice with options.
+    tries = 1 if options is None else 2
+    assert compiled == [(False, None)] * tries + [(True, None)] * tries + [(True, 'minimal')]
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
-    assert trainer_module.remat_record(trainer.objective.model.remat) == 'minimal'
 
 
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
