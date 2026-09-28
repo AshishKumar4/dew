@@ -458,120 +458,105 @@ def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
 FLAX_REVISIONS = ("bf16", "flax")
 
 
-def _check_weights(modelname: str, filename: str, candidate: tuple[str | None, str | None],
-                   candidates: list[tuple[str | None, str | None]]) -> None:
-    """Raise EntryNotFoundError when `candidate` ships no `filename`, reading no weight bytes.
+FLAX_WEIGHTS = "diffusion_flax_model.msgpack"
+TORCH_WEIGHTS = "diffusion_pytorch_model.safetensors"
+
+Candidate = tuple[str, str | None, str | None]
+"""A place a VAE may live on the Hub: its weight file, revision and subfolder."""
+
+
+def _candidates(revision: str) -> list[Candidate]:
+    """Every place a load looks, in the order it looks.
+
+    First the SD1-era flax msgpack: the revision the caller named and the
+    `flax` branch, each with and without the `vae` subfolder. Then the torch
+    safetensors: a revision outside `FLAX_REVISIONS` is a pin, so only that
+    revision, and otherwise the repo's default branch.
+    """
+    torch = ([(revision, "vae"), (revision, None)] if revision not in FLAX_REVISIONS
+             else [(None, "vae"), (None, None)])
+    return ([(FLAX_WEIGHTS, *place) for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]]
+            + [(TORCH_WEIGHTS, *place) for place in torch])
+
+
+def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> None:
+    """Raise EntryNotFoundError when `candidates[index]` ships no weights, reading no weight bytes.
 
     Supplied params make the file's presence the only question, which a
     dry run answers online. With the Hub offline (HF_HUB_OFFLINE) the cache
     answers it: a cached file, or the Hub's cached record that the file is
     missing, settles it. When the cache knows neither, the candidate is
-    taken only if no later candidate has a cached config that could be the
-    one an online load chose; otherwise which config applies cannot be told
-    offline, and a FileNotFoundError says so rather than guessing.
+    taken only if no later candidate, in either layout, has a different
+    cached config that could be the one an online load chose; otherwise
+    which config applies cannot be told offline, and a FileNotFoundError
+    says so rather than guessing.
     """
     from huggingface_hub import constants, hf_hub_download, try_to_load_from_cache
     from huggingface_hub.errors import EntryNotFoundError
 
-    revision, subfolder = candidate
+    weights, revision, subfolder = candidates[index]
     if not constants.HF_HUB_OFFLINE:
-        hf_hub_download(modelname, filename, revision=revision, subfolder=subfolder, dry_run=True)
+        hf_hub_download(modelname, weights, revision=revision, subfolder=subfolder, dry_run=True)
         return
 
-    def cached(name: str, other: tuple[str | None, str | None]):
+    def cached(name: str, place: Candidate):
         """The cached path (str), the Hub's cached miss (another object) or unknown (None)."""
-        other_revision, other_subfolder = other
-        return try_to_load_from_cache(modelname, name if other_subfolder is None else f"{other_subfolder}/{name}",
-                                      revision=other_revision)
+        _, place_revision, place_subfolder = place
+        return try_to_load_from_cache(modelname, name if place_subfolder is None else f"{place_subfolder}/{name}",
+                                      revision=place_revision)
 
-    def recorded_missing(other: tuple[str | None, str | None]) -> bool:
-        found = cached(filename, other)
+    def recorded_missing(place: Candidate) -> bool:
+        found = cached(place[0], place)
         return found is not None and not isinstance(found, str)
 
-    if isinstance(cached(filename, candidate), str):
+    candidate = candidates[index]
+    if isinstance(cached(weights, candidate), str):
         return
     if recorded_missing(candidate):
-        raise EntryNotFoundError(f"{modelname} has no {filename} at {candidate}, as the cache records")
-    # A later candidate naming the same cached files (None is the default branch) is no rival.
+        raise EntryNotFoundError(f"{modelname} has no {weights} at {candidate[1:]}, as the cache records")
+    # A later candidate naming the same cached config (None is the default branch) is no rival.
     here = cached("config.json", candidate)
-    later = candidates[candidates.index(candidate) + 1:]
-    rivals = [other for other in later if isinstance(cached("config.json", other), str)
-              and cached("config.json", other) != here and not recorded_missing(other)]
+    rivals = [place[1:] for place in candidates[index + 1:]
+              if isinstance(cached("config.json", place), str)
+              and cached("config.json", place) != here and not recorded_missing(place)]
     if rivals:
         raise FileNotFoundError(
-            f"offline, the cache cannot tell which VAE config of {modelname} applies: {filename} at "
-            f"{candidate} is neither cached nor recorded missing, and {rivals} have cached configs too; "
+            f"offline, the cache cannot tell which VAE config of {modelname} applies: {weights} at "
+            f"{candidate[1:]} is neither cached nor recorded missing, and {rivals} have cached configs too; "
             "load once with the Hub online, or put the weight file in the cache")
 
 
-def _flax_layout(modelname: str, revision: str, params, errors: list) -> dict | None:
-    """Read the SD1-era flax msgpack, or None when the repo ships none.
-
-    The four candidates are the revision the caller named and the `flax`
-    branch, each with and without the `vae` subfolder. Every miss is
-    appended to `errors`, so the caller can raise the last one.
-    """
+def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict | None:
+    """The first candidate with a config and weights, as `load_pretrained_vae`
+    reads it, or None. Every miss is appended to `errors`, so the caller can
+    raise the last one."""
     from flax.serialization import msgpack_restore
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
-    candidates = [
-        (revision, "vae"),
-        ("flax", "vae"),
-        (revision, None),
-        (None, None),
-    ]
-    for candidate_revision, subfolder in candidates:
+    candidates = _candidates(revision)
+    for index, (weights, candidate_revision, subfolder) in enumerate(candidates):
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
-            with open(config_path) as f:
-                config = json.load(f)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
             if params is not None:
-                _check_weights(modelname, "diffusion_flax_model.msgpack", (candidate_revision, subfolder),
-                               candidates)
-                return {"config": config, "params": params}
-            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
-                                           revision=candidate_revision, subfolder=subfolder)
-            with open(weights_path, "rb") as f:
-                return {"config": config, "params": msgpack_restore(f.read())}
-        except (EntryNotFoundError, RevisionNotFoundError) as e:
-            errors.append(e)
-    return None
-
-
-def _torch_layout(modelname: str, revision: str, params, errors: list) -> dict | None:
-    """Read the torch safetensors and translate them, or None when absent.
-
-    A revision outside `FLAX_REVISIONS` is a pin, so only that revision is
-    tried; otherwise the repo's default branch is. Every miss is appended
-    to `errors`.
-    """
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
-
-    pinned = revision not in FLAX_REVISIONS
-    candidates = ([(revision, "vae"), (revision, None)]
-                  if pinned else [(None, "vae"), (None, None)])
-    for candidate_revision, subfolder in candidates:
-        try:
-            config_path = hf_hub_download(modelname, "config.json",
-                                          revision=candidate_revision, subfolder=subfolder)
-            if params is None:
-                hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
-                                revision=candidate_revision, subfolder=subfolder)
+                _check_weights(modelname, candidates, index)
             else:
-                _check_weights(modelname, "diffusion_pytorch_model.safetensors", (candidate_revision, subfolder),
-                               candidates)
+                weights_path = hf_hub_download(modelname, weights,
+                                               revision=candidate_revision, subfolder=subfolder)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             errors.append(e)
             continue
-        directory = Path(config_path).parent
         with open(config_path) as handle:
             config = json.load(handle)
-        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
+        if params is not None:
+            return {"config": config, "params": params}
+        if weights == FLAX_WEIGHTS:
+            with open(weights_path, "rb") as handle:
+                return {"config": config, "params": msgpack_restore(handle.read())}
+        return {"config": config, "params": _read_vae_weights(Path(config_path).parent)}
     return None
 
 
@@ -597,9 +582,7 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
         return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     errors: list[Exception] = []
-    loaded = _flax_layout(modelname, revision, params, errors)
-    if loaded is None:
-        loaded = _torch_layout(modelname, revision, params, errors)
+    loaded = _load_from_hub(modelname, revision, params, errors)
     if loaded is not None:
         return loaded
     last_error = errors[-1] if errors else None
