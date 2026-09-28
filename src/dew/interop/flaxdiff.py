@@ -84,24 +84,16 @@ class HybridDiTFields(SimpleUDiTFields):
     scan_order: Literal["raster", "zigzag"]
 
 
-def read_checkpoint(directory: str | os.PathLike) -> dict:
-    """One FlaxDiff checkpoint step, the directory holding `default/`, as the
-    nested dict of host arrays FlaxDiff saved there with orbax.
+def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: bool = False) -> dict:
+    """The model weights from one FlaxDiff checkpoint step holding `default/`.
 
-    FlaxDiff's 2024 runs saved orbax's older aggregate file
-    (`default/checkpoint`), which this does not read: no model of those runs
-    has a loader.
+    Read the averaged weights of the last state by default; `ema=False`
+    selects live weights and `best=True` selects `best_state`. Return the
+    parameter dict under FlaxDiff's model names as host arrays. Only that
+    copy is restored, without allocating the optimizer or other states.
+
+    The older 2024 aggregate format (`default/checkpoint`) is not supported.
     """
-    import orbax.checkpoint as ocp
-
-    restored = ocp.PyTreeCheckpointer().restore((Path(directory) / "default").resolve())
-    if not isinstance(restored, dict) or "state" not in restored:
-        raise ValueError(f"{directory} is not a FlaxDiff checkpoint step: it holds no 'state'")
-    return restored
-
-
-def _read_weights(directory: str | os.PathLike, *, ema: bool, best: bool) -> dict:
-    """Restore the selected weights without allocating the optimizer or other copies."""
     import orbax.checkpoint as ocp
 
     path = (Path(directory) / "default").resolve()
@@ -114,14 +106,7 @@ def _read_weights(directory: str | os.PathLike, *, ema: bool, best: bool) -> dic
         restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), item)
         tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
             item=item, restore_args=restore_args, partial_restore=True))
-    return flaxdiff_weights(tree, ema=ema, best=best)
-
-
-def flaxdiff_weights(tree: Mapping, *, ema: bool = True, best: bool = False) -> dict:
-    """The model parameters a FlaxDiff checkpoint tree holds: the averaged
-    copy (`ema`) or the live one, of the last state or of `best_state`."""
-    state = tree["best_state" if best else "state"]
-    return dict(state["ema_params" if ema else "params"]["params"])
+    return dict(tree[state][weights]["params"])
 
 
 def fourier_table(features: int, jax_version: str, scale: float = 16) -> np.ndarray:
@@ -228,7 +213,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     `directory` is one checkpoint step, `config` the run config FlaxDiff's
     trainer logged (`wandb.Api().run(path).config`), and `jax_version` the jax
     the run trained under, from its `requirements.txt`. `ema` and `best` pick
-    the weights (`flaxdiff_weights`); `dtype` is the model's compute dtype.
+    the weights (`read_checkpoint`); `dtype` is the model's compute dtype.
 
     The text tower and the VAE load from the Hub under the names the config
     records, both computing in bfloat16 as FlaxDiff's did. A call samples the
@@ -264,7 +249,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     model_config = records.record(config["model"], "model")
     fields, convert = _ARCHITECTURES[architecture]
     model = models.build(architecture, fields(model_config), dtype=resolve_dtype(dtype))
-    variables = convert(_read_weights(directory, ema=ema, best=best),
+    variables = convert(read_checkpoint(directory, ema=ema, best=best),
                          model_config, jax_version=jax_version)
 
     # FlaxDiff's encoders ran in bfloat16, and it read the VAE's main branch.
@@ -286,6 +271,6 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
                        sampler=EulerAncestral())
 
 
-__all__ = ["HybridDiTFields", "SimpleUDiTFields", "flaxdiff_weights", "fourier_table",
+__all__ = ["HybridDiTFields", "SimpleUDiTFields", "fourier_table",
            "hybrid_dit_fields", "hybrid_dit_variables", "load_flaxdiff",
            "read_checkpoint", "simple_udit_fields", "simple_udit_variables"]
