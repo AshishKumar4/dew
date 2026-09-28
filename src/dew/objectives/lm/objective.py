@@ -860,8 +860,6 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             return -self.token_scores(params, tokens).losses
         prepared = _prepared(tokens)
         padding = jnp.asarray(left_padding, jnp.int32)
-        if padding.shape != (prepared.tokens.shape[0],):
-            raise ValueError("left_padding must have one count per token row")
         aligned = prepared.align_left(padding)
         losses = self.token_scores(params, aligned).losses
         restored, valid = _unpadded(losses, padding)
