@@ -316,13 +316,18 @@ def test_edm_draws_the_sigmas_of_the_space_it_denoises(regime, P_mean, P_std):
         presets.EDM()()
 
 
-def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with():
+def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
     from dew.objectives.diffusion.config import DiffusionRunConfig, StableDiffusionAutoencoder
 
-    assert DiffusionRunConfig().preset == presets.EDM(regime="pixel")
-    assert DiffusionRunConfig(autoencoder=StableDiffusionAutoencoder()).preset == presets.EDM(regime="latent")
-    stated = presets.EDM(P_mean=-0.4, P_std=1.0)
-    assert DiffusionRunConfig(preset=stated).preset == stated
+    for config, mean, std in (
+        (DiffusionRunConfig(), -1.2, 1.2),
+        (DiffusionRunConfig(autoencoder=StableDiffusionAutoencoder()), -0.4, 1.0),
+        (DiffusionRunConfig(preset=presets.EDM(P_mean=-0.8, P_std=0.7)), -0.8, 0.7),
+    ):
+        schedule = config.preset().schedule
+        log_sigma = jnp.log(schedule.sigmas(schedule.sample_t(rng, 20000)))
+        assert abs(float(jnp.mean(log_sigma)) - mean) < 0.05
+        assert abs(float(jnp.std(log_sigma)) - std) < 0.05
 
 
 def test_edm_preset_samples_on_the_karras_grid():
