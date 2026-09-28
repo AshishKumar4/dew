@@ -1,5 +1,5 @@
 {
-  "checkpoint": "cmbd8bia/1350000",
+  "model": "dewml/hybrid-dit-176m",
   "device": "NVIDIA GeForce RTX 4080",
   "negative": null,
   "batches": [
@@ -7,73 +7,73 @@
       "sampler": "heun40",
       "seed": 0,
       "images": 6,
-      "seconds": 48.95
+      "seconds": 18.98
     },
     {
       "sampler": "heun40",
       "seed": 1,
       "images": 6,
-      "seconds": 1.92
+      "seconds": 1.76
     },
     {
       "sampler": "heun40",
       "seed": 2,
       "images": 6,
-      "seconds": 1.85
+      "seconds": 1.75
     },
     {
       "sampler": "heun40",
       "seed": 3,
       "images": 6,
-      "seconds": 1.91
+      "seconds": 1.75
     },
     {
       "sampler": "dpm2m20",
       "seed": 0,
       "images": 6,
-      "seconds": 13.07
+      "seconds": 14.1
     },
     {
       "sampler": "dpm2m20",
       "seed": 1,
       "images": 6,
-      "seconds": 0.6
+      "seconds": 0.51
     },
     {
       "sampler": "dpm2m20",
       "seed": 2,
       "images": 6,
-      "seconds": 0.65
+      "seconds": 0.51
     },
     {
       "sampler": "dpm2m20",
       "seed": 3,
       "images": 6,
-      "seconds": 0.61
+      "seconds": 0.5
     },
     {
       "sampler": "ea100",
       "seed": 0,
       "images": 6,
-      "seconds": 16.89
+      "seconds": 19.42
     },
     {
       "sampler": "ea100",
       "seed": 1,
       "images": 6,
-      "seconds": 2.37
+      "seconds": 2.24
     },
     {
       "sampler": "ea100",
       "seed": 2,
       "images": 6,
-      "seconds": 2.4
+      "seconds": 2.24
     },
     {
       "sampler": "ea100",
       "seed": 3,
       "images": 6,
-      "seconds": 2.37
+      "seconds": 2.26
     }
   ],
   "images": [

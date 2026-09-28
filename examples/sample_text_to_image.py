@@ -1,21 +1,18 @@
 """Sample the pretrained text-to-image model over prompts, seeds and samplers.
 
-Run from the repository root on a GPU, with a checkpoint step and the
-training config saved beside it:
+Run from the repository root on a GPU. By default the script downloads the
+model from the Hugging Face Hub:
 
-    python examples/sample_text_to_image.py --checkpoint cmbd8bia/1350000 \
-        --config cmbd8bia/cmbd8bia_config.json
+    python examples/sample_text_to_image.py
 
-or with a Dew run directory, read through `TextToImage.from_run`:
+`--model` also takes a Dew run directory, read through `TextToImage.from_run`:
 
-    python examples/sample_text_to_image.py --checkpoint RUN_DIR
+    python examples/sample_text_to_image.py --model RUN_DIR
 
-The recorded grids come from the first form: a hybrid DiT of state-space and
-attention blocks trained with Dew, at step 1350000 of its EMA weights. Its
-denoiser holds 175.6M parameters, beside a 123.1M-parameter CLIP text encoder
-and an 83.7M-parameter Stable Diffusion autoencoder, and it samples 256x256
-images. The second form has been run on the small text-conditioned run that
-`examples/train_flowers_tpu.py --smoke` writes.
+The default model, dewml/hybrid-dit-176m, is a hybrid DiT of state-space and
+attention blocks trained with Dew. Its denoiser holds 175.6M parameters,
+beside a 123.1M-parameter CLIP text encoder and an 83.7M-parameter Stable
+Diffusion autoencoder, and it samples 256x256 images.
 
 Each sampler draws one batch per seed, holding every prompt. The output
 directory gets one PNG per image, one grid per sampler (rows are prompts,
@@ -34,7 +31,6 @@ import tyro
 from PIL import Image, ImageDraw, ImageFont
 
 from dew.artifacts import uint8_pixels
-from dew.interop.flaxdiff import load_flaxdiff
 from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, TextToImage
 
 # Each sampler's solver, step count and classifier-free guidance.
@@ -47,13 +43,8 @@ SAMPLERS = {
 
 @dataclass
 class Config:
-    checkpoint: Path
-    """A Dew run directory, or a checkpoint step directory with --config."""
-    config: Path | None = None
-    """The training config (JSON) saved with a checkpoint step; given, --checkpoint is that step."""
-    jax_version: str = "0.5.3"
-    """The jax version the model trained under; the loader rebuilds the model's
-    random Fourier tables with it, so they match the ones the model learned with."""
+    model: str = "dewml/hybrid-dit-176m"
+    """A Hugging Face Hub repository, or a local Dew run directory."""
     out: Path = Path("runs/sample-text-to-image")
     """A new directory for the images, grids and manifest."""
     prompts: tuple[str, ...] = (
@@ -71,11 +62,10 @@ class Config:
     keeps the one the loaded model is configured with (empty for the recorded model)."""
 
 
-def load(config: Config) -> TextToImage:
-    if config.config is None:
-        return TextToImage.from_run(str(config.checkpoint))
-    return load_flaxdiff(config.checkpoint, json.loads(config.config.read_text()),
-                         jax_version=config.jax_version)
+def load(model: str) -> TextToImage:
+    if Path(model).is_dir():
+        return TextToImage.from_run(model)
+    return TextToImage.from_pretrained(model)
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
@@ -106,9 +96,9 @@ def main(config: Config):
     out.mkdir(parents=True, exist_ok=False)
     prompts = list(config.prompts)
     started = time.perf_counter()
-    pipe = load(config)
+    pipe = load(config.model)
     print(f"Loaded in {time.perf_counter() - started:.1f} s on {jax.devices()[0].device_kind}")
-    manifest = {"checkpoint": str(config.checkpoint), "device": jax.devices()[0].device_kind,
+    manifest = {"model": config.model, "device": jax.devices()[0].device_kind,
                 "negative": config.negative, "batches": [], "images": []}
     for name in config.samplers:
         solver, steps, guidance = SAMPLERS[name]
