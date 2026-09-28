@@ -168,11 +168,6 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
     """
     if bins < 1:
         raise ValueError(f"a packer fills at least one window at a time, got {bins}")
-    longest = int(sizes.max()) if len(sizes) else 0
-    if longest > window:
-        raise ValueError(
-            f"a chunk of {longest} tokens does not fit a window of {window}; "
-            f"documents are cut to the window before they are packed")
     room = [window] * bins
     plan = np.empty(len(sizes), np.int64)
     closed = 0
