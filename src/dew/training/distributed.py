@@ -807,8 +807,6 @@ class DevicePrefetchIterator:
         if timeout is None:
             seconds = self._iterator.stop_seconds if isinstance(self._iterator, Budgeted) else None
             timeout = 5.0 if seconds is None else float(seconds)
-        if timeout < 0:
-            raise ValueError("close timeout must be nonnegative")
         error = None
         try:
             self._cancel()
