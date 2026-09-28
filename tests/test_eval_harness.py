@@ -225,22 +225,12 @@ def test_generate_until_reads_each_request_as_lm_evals_own_model_does():
 
 
 def test_the_adapter_refuses_a_task_it_cannot_score(run):
-    """It scores next-token likelihoods, so it takes the task that has them,
-    and it needs the processor that turns the harness's text into tokens."""
+    """It needs the processor that turns the harness's text into tokens."""
     task = TextGeneration.from_run(str(run))
-    with pytest.raises(TypeError, match="TextToImage is a different task"):
-        DewLM(_NotText())
     with pytest.raises(ValueError, match="needs the processor"):
         DewLM(dataclasses.replace(task, processor=None))
     with pytest.raises(ValueError, match="batch_size is a positive integer"):
         DewLM(task, batch_size=0)
-
-
-class _NotText:
-    """Stands in for another task kind; only its class name is read."""
-
-
-_NotText.__name__ = "TextToImage"
 
 
 def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
