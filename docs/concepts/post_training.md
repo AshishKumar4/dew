@@ -63,10 +63,11 @@ sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit
 ```
 
 ```text
-Training from step 0 to 20 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 10: loss 1.1361
-step 20: loss 0.2127
-Goodput: first step after 1.54 s, 12.2% of the wall time in steps
+Training from step 0 to 20 on 1 × cpu, 147,904 parameters
+step 10/20  loss 1.1361  ce 1.1361  perplexity 3.1145  token_accuracy 0.9286  20.6 ms/step  388 samples/s  0:00:00 left
+step 20/20  loss 0.2127  ce 0.2127  perplexity 1.2370  token_accuracy 1.0000  10.8 ms/step  743 samples/s  0:00:00 left
+Trained 20 steps in 0:00:01: first step after 0.86 s, then 91.6 step/s
+19.4% of the wall time in steps, final loss 0.2127
 ```
 
 ### Preference optimization
@@ -87,17 +88,18 @@ dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
 ```
 
 ```text
-Training from step 0 to 10 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 5: loss 0.0352
-step 10: loss 0.0089
-Goodput: first step after 3.45 s, 6.1% of the wall time in steps
+Training from step 0 to 10 on 1 × cpu, 147,904 parameters
+step  5/10  loss 0.0352  accuracy 1.0000  rewards/chosen -1.7112  rewards/rejected -5.0394  54.9 ms/step  146 samples/s  0:00:00 left
+step 10/10  loss 0.0089  accuracy 1.0000  rewards/chosen -3.6454  rewards/rejected -8.3572  21.0 ms/step  380 samples/s  0:00:00 left
+Trained 10 steps in 0:00:02: first step after 1.61 s, then 43.9 step/s
+11.3% of the wall time in steps, final loss 0.0089
 ```
 
 `PreferencePairs.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
 
-GRPO samples a group of completions per prompt, scores each with a reward function and trains on their rewards relative to the rest of the group. The prompt batch uses the numeric layout `Prompts` produces, with the reward metadata as UTF-8 bytes. The reward here is the share of letters in the decoded completion.
+GRPO samples a group of completions per prompt, scores each with a reward function and trains on their rewards relative to the rest of the group. The prompt batch uses the numeric layout `Prompts` produces, with the reward metadata as UTF-8 bytes. The reward here counts the alphabetic characters in the decoded completion and divides the count by 8, the response budget in bytes, so an 8-byte completion of letters scores 1.
 
 ```python
 story = tokenizer.encode("Once upon a time")
@@ -127,10 +129,11 @@ print(int(rl_state.updates), "GRPO updates")
 ```
 
 ```text
-Training from step 0 to 4 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 2: loss 0.0000
-step 4: loss 0.0003
-Goodput: first step after 3.76 s, 6.5% of the wall time in steps
+Training from step 0 to 4 on 1 × cpu, 147,904 parameters
+step 2/4  loss 2.506e-05  actor/pg_clipfrac 0.0000  actor/pg_clipfrac_lower 0.0000  actor/ppo_kl 1.770e-08  kl 0.0025  mismatch/ess 0.9903  mismatch/k3_kl 0.1754  mismatch/kl 0.6520  pg -2.049e-08  rollout_seconds 1.4131  98.3 ms/step  326 samples/s  0:00:00 left
+step 4/4  loss 2.535e-04  actor/pg_clipfrac 0.0000  actor/pg_clipfrac_lower 0.0000  actor/ppo_kl 2.980e-08  kl 0.0254  mismatch/ess 0.9888  mismatch/k3_kl 0.1683  mismatch/kl 0.6362  pg -3.306e-08  rollout_seconds 0.1555  95.6 ms/step  335 samples/s  0:00:00 left
+Trained 4 steps in 0:00:03: first step after 2.57 s, then 11.2 step/s
+9.4% of the wall time in steps, final loss 2.535e-04
 4 GRPO updates
 ```
 
@@ -225,10 +228,11 @@ print("Completed", int(state.updates), "DPO updates; reference stayed fixed.")
 ```
 
 ```text
-Training from step 0 to 2 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 1: loss 0.6931
-step 2: loss 0.6703
-Goodput: first step after 1.62 s, 0.2% of the wall time in steps
+Training from step 0 to 2 on 1 × cpu, 2,752 parameters
+step 1/2  loss 0.6931  accuracy 0.0000  rewards/chosen -2.384e-08  rewards/rejected 0.0000  41.1 ms/step  195 samples/s  0:00:00 left
+step 2/2  loss 0.6703  accuracy 1.0000  rewards/chosen 0.0334  rewards/rejected -0.0129  1.5 ms/step  5,169 samples/s  0:00:00 left
+Trained 2 steps in 0:00:02: first step after 1.76 s, then 237.8 step/s
+0.2% of the wall time in steps, final loss 0.6703
 Completed 2 DPO updates; reference stayed fixed.
 ```
 
@@ -473,10 +477,11 @@ print("PPO updates:", int(state.updates))
 ```
 
 ```text
-Training from step 0 to 2 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))
-step 1: loss 0.1247
-step 2: loss 0.1797
-Goodput: first step after 2.30 s, 2.6% of the wall time in steps
+Training from step 0 to 2 on 1 × cpu, 169 parameters
+step 1/2  loss 0.1247  actor/pg_clipfrac 0.0000  actor/pg_clipfrac_lower 0.0000  actor/ppo_kl 0.0000  critic/loss 0.2493  kl 0.0000  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.0087  pg -4.470e-08  rollout_seconds 1.2519  3.5 ms/step  3,415 samples/s  0:00:00 left
+step 2/2  loss 0.1797  actor/pg_clipfrac 0.0000  actor/pg_clipfrac_lower 0.0000  actor/ppo_kl 0.0000  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.0102  pg 8.941e-08  rollout_seconds 0.0652  67.3 ms/step  178 samples/s  0:00:00 left
+Trained 2 steps in 0:00:02: first step after 2.01 s, then 14.7 step/s
+3.3% of the wall time in steps, final loss 0.1797
 PPO updates: 2
 ```
 
