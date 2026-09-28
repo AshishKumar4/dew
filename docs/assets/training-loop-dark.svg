@@ -1,35 +1,58 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" role="img">
-  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6e7681"/></marker></defs>
-  <rect x="24" y="24" width="208" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="42" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">next batch</text>
-  <text x="42" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">from the prefetch iterator</text>
-  <line x1="236" y1="62.0" x2="258" y2="62.0" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
-  <rect x="262" y="24" width="208" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="280" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">shard</text>
-  <text x="280" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">onto the (data, fsdp) mesh</text>
-  <line x1="474" y1="62.0" x2="496" y2="62.0" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
-  <rect x="500" y="24" width="208" height="76" rx="8" fill="#0f2a27" stroke="#2fb8a8" stroke-width="1.25"/>
-  <text x="518" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">compiled step</text>
-  <text x="518" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">loss, grad, optimizer, EMA</text>
-  <line x1="712" y1="62.0" x2="734" y2="62.0" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
-  <rect x="738" y="24" width="208" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="756" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">log</text>
-  <text x="756" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">loss, aux metrics, throughput</text>
-  <path d="M 946 62.0 L 980 62.0 L 980 126 L 128.0 126 L 128.0 104" fill="none" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
-  <text x="140.0" y="122" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">every step</text>
-  <rect x="24" y="170" width="356" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="42" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">validation</text>
-  <text x="42" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">objective.evaluate, then the metrics</text>
-  <rect x="410" y="170" width="356" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="428" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">checkpoint</text>
-  <text x="428" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">state, EMA, optimizer, rng, iterator position</text>
-  <rect x="796" y="170" width="380" height="76" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
-  <text x="814" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">best tracking</text>
-  <text x="814" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">lowest validation loss kept alongside the latest</text>
-  <line x1="200" y1="140" x2="200" y2="168" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)" stroke-dasharray="5 5"/>
-  <line x1="588" y1="140" x2="588" y2="168" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)" stroke-dasharray="5 5"/>
-  <text x="214" y="160" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">every eval_every</text>
-  <text x="602" y="160" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">every checkpoint_every, and at the end</text>
-  <line x1="766" y1="208.0" x2="794" y2="208.0" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
-  <text x="24" y="276" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">The compiled step is one XLA program: the loss from the objective, the gradient, the optimizer update and the EMA update. It is compiled once per run.</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 470" width="1040" height="470" role="img">
+<text x="24" y="30" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#d8e5e2" text-anchor="start">Trainer.fit(dataset, steps=...)</text>
+<rect x="24" y="50" width="230" height="84" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="36" y="72" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">Trainer.place()</text>
+<text x="36" y="92" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">init or restore TrainState,</text>
+<text x="36" y="110" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">placed by Layout on the mesh</text>
+<rect x="24" y="160" width="230" height="84" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="36" y="182" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">dataset.train(partition)</text>
+<text x="36" y="202" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">this process's rows of</text>
+<text x="36" y="220" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">every global batch</text>
+<rect x="24" y="270" width="230" height="84" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="36" y="292" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">DevicePrefetchIterator</text>
+<text x="36" y="312" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">shard_batch: host arrays</text>
+<text x="36" y="330" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">to one global jax.Array</text>
+<line x1="139" y1="244" x2="139" y2="268" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M139.0,268.0 L135.5,261.0 L142.5,261.0 z" fill="#93aba7"/>
+<rect x="300" y="50" width="460" height="360" rx="10" fill="#131f23" stroke="#2fb8a8" stroke-width="1"/>
+<text x="316" y="74" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#2fb8a8" text-anchor="start">compiled step (jax.jit), once per step</text>
+<rect x="320" y="90" width="420" height="64" rx="6" fill="#0b3531" stroke="#2fb8a8" stroke-width="1"/>
+<text x="332" y="112" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">objective.loss(variables, batch, step)</text>
+<text x="332" y="132" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">→ Mean(total, mass), Aux(metrics)</text>
+<rect x="320" y="172" width="420" height="64" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="332" y="194" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">gradient</text>
+<text x="332" y="214" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">of the mean over the accumulation window (jax.vjp)</text>
+<rect x="320" y="254" width="420" height="64" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="332" y="276" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">optimizer.update  +  optax.apply_updates</text>
+<text x="332" y="296" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">when the window closes; skipped for non-finite values</text>
+<rect x="320" y="336" width="420" height="58" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="332" y="358" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">ema_update</text>
+<text x="332" y="378" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">EMA copy of the leaves objective.ema names</text>
+<line x1="530" y1="154" x2="530" y2="171" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M530.0,171.0 L526.5,164.0 L533.5,164.0 z" fill="#93aba7"/>
+<line x1="530" y1="236" x2="530" y2="253" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M530.0,253.0 L526.5,246.0 L533.5,246.0 z" fill="#93aba7"/>
+<line x1="530" y1="318" x2="530" y2="335" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M530.0,335.0 L526.5,328.0 L533.5,328.0 z" fill="#93aba7"/>
+<line x1="254" y1="312" x2="318" y2="122" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M318.0,122.0 L319.1,129.8 L312.4,127.5 z" fill="#93aba7"/>
+<line x1="139" y1="134" x2="139" y2="158" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M139.0,158.0 L135.5,151.0 L142.5,151.0 z" fill="#93aba7"/>
+<line x1="254" y1="92" x2="318" y2="110" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M318.0,110.0 L310.3,111.5 L312.2,104.7 z" fill="#93aba7"/>
+<text x="800" y="74" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">then, on the host</text>
+<rect x="800" y="90" width="216" height="64" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="812" y="112" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">log_every</text>
+<text x="812" y="132" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">loss, metrics, throughput</text>
+<rect x="800" y="172" width="216" height="64" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="812" y="194" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">eval_every</text>
+<text x="812" y="214" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">objective.evaluate on val</text>
+<rect x="800" y="254" width="216" height="64" rx="6" fill="#0f191c" stroke="#243639" stroke-width="1"/>
+<text x="812" y="276" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#d8e5e2" text-anchor="start">checkpoint_every</text>
+<text x="812" y="296" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">state + data position</text>
+<line x1="760" y1="230" x2="798" y2="230" stroke="#93aba7" stroke-width="1.25"/>
+<path d="M798.0,230.0 L791.0,233.5 L791.0,226.5 z" fill="#93aba7"/>
+<text x="24" y="400" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">TrainState: params, opt_state, ema,</text>
+<text x="24" y="418" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">key, step, microstep, updates</text>
+<text x="24" y="452" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#93aba7" text-anchor="start">step counts attempts, microstep accepted microbatches, updates optimizer updates.</text>
 </svg>
