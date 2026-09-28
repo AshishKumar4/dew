@@ -277,30 +277,34 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
         _LINKS.reset(token)
 
 
-def _spreads(axis: str, x: jax.Array, latent: int, tokens: float) -> bool:
+def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: float = 0.0) -> bool:
     """Whether a projection of `x`'s tokens to `latent` features, which would
     otherwise run on every token of every `axis` shard, runs split over
     `axis`, each shard on its own share of the `tokens` one `axis` group
     computes. It splits where that cannot slow the step.
 
-    Splitting takes from each of N shards (N - 1) / N of the projection's
-    6 * width * latent FLOPs a token (the forward product and the backward's
-    two) and adds (N - 1) / N of a token's input gradient and output,
-    gathered over the axis, plus a step's sum of the projection's fp32
-    weight gradient over it, which a ring moves twice. It cannot lose where
+    Each of N shards currently projects all tokens; a split projects
+    (tokens + padding) / N on each. The saved work excludes padded rows,
+    but their input gradients and outputs still cross the link. Their
+    gathers move (N - 1) / N of the padded arrays, and a ring sum moves
+    twice that fraction of the fp32 weight gradient. It cannot lose where
     the axis's link moves those bytes in no more time than the device's
-    peak takes for the FLOPs: the step saves at least that time at any
-    utilisation. The weight gradient's sum is a microbatch's, so the fewer
-    its tokens the more it weighs. A CPU mesh's devices share one host's
+    peak takes for the saved FLOPs. The weight gradient is a microbatch's,
+    so it weighs more at fewer tokens. A CPU mesh's devices share one host's
     memory, which moves a byte in less time than a CPU's matmul spends on a
     thousand FLOPs, and it splits. Without a measured link, or with a device
     the peak table does not name, the projection runs on every token."""
     link = _LINKS.get().get(axis)
     if link is None:
         return False
+    shards = jax.sharding.get_abstract_mesh().shape[axis]
+    saved = tokens - (tokens + padding) / shards
+    if saved <= 0:
+        return False
     width = x.shape[-1]
-    flops = 6 * width * latent
-    moved = (width + latent) * x.dtype.itemsize + 2 * width * latent * 4 / tokens
+    flops = 6 * width * latent * saved
+    moved = (1 - 1 / shards) * ((width + latent) * x.dtype.itemsize * (tokens + padding)
+                                + 2 * width * latent * 4)
     if link.platform == 'cpu':
         spreads = True
     elif link.bytes_per_second is None or link.flops_per_second is None:
@@ -370,7 +374,7 @@ def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array
     projections are small beside the step and the sum of their weight
     gradients the split adds is not, so a GPU's link rarely pays: at SDXL's
     widths in bf16 (2048 into 2 x 1280) and 8 rows a group, an H100 would
-    need 2.35 TB/s."""
+    need 2.47 TB/s, including the padded positions' extra work."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:
@@ -378,7 +382,8 @@ def split_positions[T](x: jax.Array, features: int, project: Callable[[jax.Array
     padded_length = length + -length % shards
     mesh = jax.sharding.get_abstract_mesh()
     rows = x.shape[0] / math.prod(mesh.shape[axis] for axis in row_axes(x.shape[0]))
-    if not _spreads(SEQUENCE_AXIS, x, features, rows * padded_length):
+    if not _spreads(SEQUENCE_AXIS, x, features, rows * length,
+                    padding=rows * (padded_length - length)):
         return project(x)
     padded = jnp.pad(x, ((0, 0), (0, padded_length - length)) + ((0, 0),) * (x.ndim - 2))
     return jax.tree.map(lambda out: out[:, :length], project(padded))
