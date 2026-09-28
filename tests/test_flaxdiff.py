@@ -17,7 +17,6 @@ from flax.traverse_util import unflatten_dict
 
 from dew import models
 from dew.interop.flaxdiff import (
-    flaxdiff_weights,
     fourier_table,
     hybrid_dit_fields,
     hybrid_dit_variables,
@@ -108,25 +107,27 @@ def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
         np.testing.assert_array_equal(fourier_table(features, "0.5.3"), data["fourier_table"])
 
 
-def test_a_checkpoint_publishes_the_averaged_weights_of_its_last_state(reference, tmp_path):
-    """FlaxDiff saved live and averaged weights for `state` and `best_state`;
-    by default the loader takes the averaged ones of `state`."""
+def test_checkpoint_selects_last_or_best_and_live_or_averaged_weights(reference, tmp_path):
+    """All four selections restore distinct saved weights through the production reader."""
     model_config, weights, data = reference
-    shifted = jax.tree.map(lambda leaf: leaf + 0.01, weights)
-    tree = {"state": {"params": {"params": shifted}, "ema_params": {"params": weights},
+    live = jax.tree.map(lambda leaf: leaf + 0.01, weights)
+    best_ema = jax.tree.map(lambda leaf: leaf + 0.02, weights)
+    best_live = jax.tree.map(lambda leaf: leaf + 0.03, weights)
+    tree = {"state": {"params": {"params": live}, "ema_params": {"params": weights},
                       "step": np.asarray(7)},
-            "best_state": {"params": {"params": shifted}, "ema_params": {"params": shifted},
+            "best_state": {"params": {"params": best_live}, "ema_params": {"params": best_ema},
                            "step": np.asarray(5)},
             "best_loss": np.asarray(0.3)}
     step = tmp_path / "7"
     ocp.PyTreeCheckpointer().save((step / "default").resolve(), tree)
 
-    restored = read_checkpoint(step)
-    published = dew_output(model_config, flaxdiff_weights(restored), data)
+    for options, expected in (({}, weights), ({"ema": False}, live),
+                              ({"best": True}, best_ema),
+                              ({"best": True, "ema": False}, best_live)):
+        restored = read_checkpoint(step, **options)
+        jax.tree.map(np.testing.assert_array_equal, restored, expected)
+    published = dew_output(model_config, read_checkpoint(step), data)
     assert np.max(np.abs(published - data["output"])) < TOLERANCE
-    for other in ({"ema": False}, {"best": True}):
-        assert np.max(np.abs(dew_output(model_config, flaxdiff_weights(restored, **other), data)
-                             - data["output"])) > 1e-3
 
 
 def test_config_the_port_does_not_reproduce_is_refused(reference):
