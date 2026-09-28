@@ -412,7 +412,6 @@ def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
 
 def chain_lengths(sessions: Sequence[Session], width: int, *, truncation: str) -> list[int]:
     """The length of every chain `pack` builds from `sessions` under `truncation`."""
-    check_truncation(truncation)
     return [len(chain.tokens) for chain in _built(sessions, width, truncation)]
 
 
@@ -441,8 +440,6 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     recorded a support, fixes the per-row length of the support arrays so
     every batch has one shape and the step compiles once.
     """
-    if type(width) is not int or width < 2:
-        raise ValueError("a packed row holds at least two ids")
     if rows is not None and (type(rows) is not int or rows < 1):
         raise ValueError("rows is a positive integer, or None for as many as the chains need")
     values = advantages(sessions, estimator, truncation=truncation)
@@ -598,7 +595,6 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     Trainer-versus-engine mismatch is the loss's own metric (`mismatch/*`),
     computed where the proximal policy is known.
     """
-    check_truncation(truncation)
     rewards_of = [_trained_reward(session, truncation) for session in sessions]
     metrics: dict[str, float] = {}
     total = max(len(sessions), 1)

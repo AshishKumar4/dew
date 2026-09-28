@@ -308,8 +308,6 @@ class SandboxFleet:
 
     def __init__(self, runner: Runner = ProcessRunner(), *, limits: SandboxLimits = SandboxLimits(),
                  workers: int = os.cpu_count() or 1):
-        if type(workers) is not int or workers < 1:
-            raise ValueError("a fleet needs at least one worker")
         self.runner, self.limits = runner, limits
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-fleet")
 
