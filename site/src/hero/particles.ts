@@ -8,6 +8,7 @@
 // puts noise back into the particles it passes, and the network brings them home.
 
 import { FULLSCREEN_VERTEX, createContext, createProgram, fitCanvas, prefersReducedMotion, runLoop, type Program } from './gl';
+import { placementFor, type Placement } from './placement';
 
 export interface Manifest {
 	layers: { name: string; in: number; out: number }[];
@@ -250,11 +251,6 @@ export interface ParticleField {
 	resample(): void;
 }
 
-function placementFor(width: number, height: number): { cx: number; cy: number; width: number } {
-	if (width < height) return { cx: 0.5, cy: 0.66, width: 0.84 };
-	return { cx: 0.66, cy: 0.68, width: 0.5 };
-}
-
 /**
  * Run the particle model on `canvas`. Returns null when the browser lacks
  * WebGL2 with float render targets; the page then shows its still frame.
@@ -365,8 +361,16 @@ export function startParticles(
 		current = 1 - current;
 	};
 
+	// The word's place follows the page's layout, so it is measured again only when the canvas's size changes.
+	let placement: Placement | null = null;
+	let placedAt = '';
 	const view = () => {
-		const { cx, cy, width } = placementFor(canvas.clientWidth, canvas.clientHeight);
+		const size = `${canvas.clientWidth}x${canvas.clientHeight}`;
+		if (!placement || size !== placedAt) {
+			placement = placementFor(hero);
+			placedAt = size;
+		}
+		const { cx, cy, width } = placement;
 		const scaleX = (width * 2) / 3.6; // the word spans x in [-1.8, 1.8] of model space
 		const scaleY = (scaleX * canvas.clientWidth) / Math.max(1, canvas.clientHeight);
 		return [scaleX, scaleY, cx * 2 - 1, cy * 2 - 1] as const;

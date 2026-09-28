@@ -10,7 +10,9 @@ export interface ReplayMeta {
 	prompt: string;
 	frames: number;
 	columns: number;
-	size: number;
+	/** Pixels of one frame in the atlas. */
+	width: number;
+	height: number;
 }
 
 const FRAGMENT = `#version 300 es
@@ -20,14 +22,14 @@ uniform sampler2D uAtlas;
 uniform vec2 uGrid;      // columns, rows of the atlas
 uniform float uStep;     // fractional frame index
 uniform float uFrames;
-uniform float uSize;     // pixels per frame
+uniform vec2 uSize;      // pixels per frame
 out vec4 outColor;
 
 vec2 cell(float frame, vec2 uv) {
 	float column = mod(frame, uGrid.x);
 	float row = floor(frame / uGrid.x);
 	// Half a texel of margin keeps linear filtering inside the frame.
-	vec2 inner = mix(vec2(0.5 / uSize), vec2(1.0 - 0.5 / uSize), uv);
+	vec2 inner = mix(0.5 / uSize, 1.0 - 0.5 / uSize, uv);
 	return (vec2(column, row) + inner) / uGrid;
 }
 
@@ -97,7 +99,7 @@ export class Replay {
 		gl.uniform2f(this.program.uniform('uGrid'), meta.columns, Math.ceil(meta.frames / meta.columns));
 		gl.uniform1f(this.program.uniform('uStep'), Math.max(0, Math.min(meta.frames - 1, this.step)));
 		gl.uniform1f(this.program.uniform('uFrames'), meta.frames);
-		gl.uniform1f(this.program.uniform('uSize'), meta.size);
+		gl.uniform2f(this.program.uniform('uSize'), meta.width, meta.height);
 		gl.bindVertexArray(this.vao);
 		gl.drawArrays(gl.TRIANGLES, 0, 3);
 	}

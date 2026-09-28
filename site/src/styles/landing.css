@@ -394,13 +394,18 @@ html[data-has-hero][data-past-hero] header.header {
 	gap: 1.5rem;
 }
 
+/* Each figure spans two rows of the grid, so the captions line up when the crops differ in height. */
 .replay-figure {
+	display: grid;
+	grid-row: span 2;
+	grid-template-rows: subgrid;
+	row-gap: 0;
+	align-content: start;
 	margin: 0;
 }
 
 .replay-frame {
 	position: relative;
-	aspect-ratio: 1;
 	border-radius: 0.6rem;
 	overflow: hidden;
 	background: var(--dew-output-bg);
