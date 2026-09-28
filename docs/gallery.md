@@ -12,7 +12,7 @@ A latent text-to-image model with a hybrid DiT denoiser (state-space and attenti
 | CLIP text encoder | 123,060,480 |
 | Stable Diffusion VAE | 83,653,863 |
 
-Each grid has one row per prompt and one column per seed (0, 1, 2, 3), with classifier-free guidance 5.0 against the empty prompt. `examples/sample_text_to_image.py` loaded the model from that repository and drew them on an RTX 4080 with the denoiser in float32 and the CLIP encoder and VAE in bfloat16. After compilation, a batch of six images took 1.9 s with Heun over 40 steps and 0.6 s with `DPMSolverMultistep` over 20 steps. Some images carry flat white bands at their edges, which the model draws.
+Each grid has one row per prompt and one column per seed (0, 1, 2, 3), with classifier-free guidance 5.0 against the empty prompt. `examples/sample_text_to_image.py` loaded the model from that repository and drew them on an RTX 4080 with the denoiser computing in float32 and the CLIP encoder and VAE in bfloat16. After compilation, a batch of six images took 1.7-1.8 s with Heun over 40 steps and 0.5 s with `DPMSolverMultistep` over 20 steps. Some images carry flat white bands at their edges, which the model draws.
 
 The prompts, in row order:
 
