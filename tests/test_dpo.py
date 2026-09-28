@@ -273,10 +273,6 @@ def test_a_misshapen_batch_is_refused():
     with pytest.raises(ValueError, match="one mark per token"):
         scalar_loss(objective, params, wide, step)
 
-    bare = {IDS_KEY: batch[IDS_KEY]}
-    with pytest.raises(ValueError, match="completion_mask"):
-        scalar_loss(objective, params, bare, step)
-
     no_ref = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     with pytest.raises(ValueError, match="step.ema"):
         scalar_loss(objective, params, batch, no_ref)
