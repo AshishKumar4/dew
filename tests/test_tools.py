@@ -378,7 +378,8 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
 
     assert loss == pytest.approx(reference.losses[0], rel=1e-5)
     errors = tool.leaf_errors(gradient, reference.gradient, "float32")
-    assert max(errors.values()) < 1e-3, max(errors.items(), key=lambda item: item[1])
+    assert max(errors.values()) <= tool.rounding_limit("float32"), max(
+        errors.items(), key=lambda item: item[1])
 
 
 def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
