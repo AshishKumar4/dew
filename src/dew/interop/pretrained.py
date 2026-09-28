@@ -201,9 +201,9 @@ class Processor:
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
                  video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
+        if video_metadata is not None and videos is None:
+            raise ValueError("video_metadata requires videos")
         if images is None and audio is None and videos is None:
-            if video_metadata is not None:
-                raise ValueError("video_metadata requires videos")
             rows = [text] if isinstance(text, str) else list(text)
             values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
             pad_id, side = _row_padding(self.reference)
@@ -223,8 +223,6 @@ class Processor:
         if videos is not None:
             arguments["videos"] = videos
         if video_metadata is not None:
-            if videos is None:
-                raise ValueError("video_metadata requires videos")
             arguments["video_metadata"] = video_metadata
         # An audio-only processor takes no images keyword at all, so the
         # absent one is left out of the call rather than passed as None.
@@ -257,8 +255,6 @@ class Processor:
             # Llama 4's processor emits bf16; float32 widening is exact.
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
         return self.from_hf(arrays)
-
-
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
@@ -513,8 +509,6 @@ class Processor:
                         "audio_lengths": jnp.asarray(counts)}
         return {"audio_indices": jnp.asarray(indices)}, conditioning
 
-
-
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
         """Return views of packed image/video patches in text order, one item per frame.
 
@@ -575,7 +569,6 @@ class Processor:
             raise ValueError("image and video patch widths must agree")
         return list(chunks), np.asarray(grids, np.int32), merge
 
-
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
                                 groups: jax.Array, grids: jax.Array) -> jax.Array:
         """Compute Qwen3.5's get_rope_index on host-normalized image grids.
@@ -584,12 +577,8 @@ class Processor:
         temporal/height/width grid, and following text starts after its longest
         spatial side. Padding keeps coordinate zero, as in the reference.
         """
-        vision = self.config.get("vision_config")
-        if not isinstance(vision, Mapping):
-            raise ValueError("image rotary positions require a vision config")
-        merge = vision.get("spatial_merge_size")
-        if type(merge) is not int or merge < 1:
-            raise ValueError("spatial_merge_size must be a positive integer")
+        vision = records.record(self.config["vision_config"], "vision_config")
+        merge = records.integer(vision["spatial_merge_size"], "spatial_merge_size")
         image_groups, grid_values = np.asarray(groups), np.asarray(grids)
         prepared = np.zeros((*tokens.shape, 3), np.int32)
         for row in range(tokens.shape[0]):
@@ -613,7 +602,6 @@ class Processor:
                     cursor += max(height, width) // merge
                 start = stop
         return jnp.asarray(prepared)
-
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         """Decode token rows with the tokenizer retained by the source processor."""
