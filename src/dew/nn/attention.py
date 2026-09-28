@@ -908,15 +908,32 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     Every fused kernel runs one head width for the keys and the values, so a
     narrower value rides in padded and its own columns come back out. The
     widths a caller passes are static, so this costs no runtime branch.
-    A softcap, sinks and segment ids reach only 'tpu'; `attention_kernel`
-    runs them elsewhere on its own paths. `key_value_seq_lengths` goes to
-    the cudnn and xla kernels as lengths and to 'tpu' as the mask it means.
+    'cudnn' refuses here whatever its kernel cannot take: sinks, a softcap,
+    deterministic ops, and dtypes and head widths outside its tiles.
+    `key_value_seq_lengths` goes to the cudnn and xla kernels as lengths and
+    to 'tpu' as the mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
+        if sinks is not None:
+            raise ValueError("attention implementation 'cudnn' cannot honor sinks")
+        if softcap is not None:
+            raise ValueError(
+                f"attention implementation 'cudnn' cannot apply an attention logit "
+                f"softcap of {softcap}: the fused kernel has no tanh between its "
+                "scaling and its softmax. Use attention_impl 'xla' or the reference "
+                "implementation (attention_impl 'reference').")
+        if deterministic_ops_requested():
+            raise ValueError(
+                "attention implementation 'cudnn' cannot run under "
+                "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
+                "is unusable, because an executable holding two identical fused "
+                "attention backward calls, which every multi-layer model has, fails "
+                "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
+                "which is deterministic, or drop the flag.")
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
@@ -938,14 +955,12 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             key_value_seq_lengths=key_value_seq_lengths,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation='xla')
-    elif implementation == 'tpu':
+    else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
                             interpret=jax.default_backend() != 'tpu')
-    else:
-        raise ValueError(f"Unknown attention implementation: {implementation}")
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
@@ -958,11 +973,12 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     'auto' resolves here, against this call's shapes and this machine's
     backend. Splash takes sinks, a softcap and packed segment ids itself.
     Anywhere else the segment ids become the document mask, and sinks and a
-    softcap run their own XLA paths, because `jax.nn.dot_product_attention`
-    has neither argument. What is left goes to `fused_attention`, after the
-    arguments it cannot honour raise. Key lengths reach the cudnn and xla
-    kernels as they are; every other path reads them as the mask they mean,
-    which splash cannot describe, so 'auto' never picks 'tpu' for them.
+    softcap run their own XLA paths on 'reference' and 'xla', because
+    `jax.nn.dot_product_attention` has neither argument. What is left goes
+    to `fused_attention`, after the arguments it cannot honour raise. Key
+    lengths reach the cudnn and xla kernels as they are; every other path
+    reads them as the mask they mean, which splash cannot describe, so
+    'auto' never picks 'tpu' for them.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -984,30 +1000,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # (`kernel_for_materialized_mask`), so a packed call runs on xla.
         if implementation == 'cudnn':
             implementation = 'xla'
-    if sinks is not None and implementation != 'tpu':
-        if implementation not in ('reference', 'xla'):
-            raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
+    if sinks is not None and implementation in ('reference', 'xla'):
         mask = combined_attention_mask(
             query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         return attention_with_sinks(
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
-    if softcap is not None and implementation == 'cudnn':
-        raise ValueError(
-            f"attention implementation 'cudnn' cannot apply an attention logit "
-            f"softcap of {softcap}: the fused kernel has no tanh between its "
-            "scaling and its softmax. Use attention_impl 'xla' or the reference "
-            "implementation (attention_impl 'reference').")
-    if implementation == 'cudnn' and deterministic_ops_requested():
-        raise ValueError(
-            "attention implementation 'cudnn' cannot run under "
-            "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
-            "is unusable, because an executable holding two identical fused "
-            "attention backward calls, which every multi-layer model has, fails "
-            "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
-            "which is deterministic, or drop the flag.")
-
-    if implementation == 'reference' or (softcap is not None and implementation != 'tpu'):
+    if implementation == 'reference' or (softcap is not None and implementation == 'xla'):
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -1059,14 +1058,8 @@ def _xla_kernel_narrows(query) -> bool:
     (`_dot_product_attention_core`: "Softmax and it is always carried out in
     fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
     older than sm80 rejects at run time, past jax's own fallback."""
-    return query.dtype == jnp.float64 or _bf16_dot_missing(query)
-
-
-def _bf16_dot_missing(query) -> bool:
-    """A bf16 query on a GPU backend older than sm80, where jax.nn's xla
-    attention cannot run."""
-    return (query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu'
-            and not bf16_dot_runs())
+    return query.dtype == jnp.float64 or (
+        query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
