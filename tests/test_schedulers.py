@@ -10,6 +10,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 import dew.diffusion.schedules as schedulers
@@ -230,6 +231,15 @@ def test_discrete_p2_default_makes_the_v_loss_an_x0_loss():
     assert jnp.allclose(schedule.weight(DISCRETE_STEPS) * VPredictionTransform().target_error_scale(snr),
                         1.0, rtol=1e-4)
 
+
+def test_small_beta_p2_weights_agree_with_the_reported_snr():
+    """A rounded alpha-bar of one must not erase a nonzero training weight."""
+    schedule = schedulers.DiscreteNoiseScheduler(np.array([1e-10, 1e-7, .01], np.float32))
+    steps = jnp.arange(3)
+    expected = 1 / (1 + np.asarray(schedule.snr(steps), np.float64))
+    # The independently rounded rates, SNR and weight allow a few fp32 operations.
+    np.testing.assert_allclose(schedule.weight(steps), expected,
+                               rtol=8 * np.finfo(np.float32).eps, atol=0)
 
 ############################################################################################################
 # min-SNR-gamma loss weighting (Hang et al. 2023), through Process
