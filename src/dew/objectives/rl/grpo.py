@@ -190,9 +190,6 @@ class GRPOObjective(LMObjective):
         every chain start and all padding. The loss and a proximal rescoring
         read this one function.
         """
-        for key in (IDS_KEY, SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
-            if key not in batch:
-                raise ValueError(f"a packed GRPO batch carries {key}; the batch has {sorted(batch)}")
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
@@ -217,9 +214,6 @@ class GRPOObjective(LMObjective):
         The old policy is `old_log_probs` when a rescoring or the sampler
         supplied it, and the recorded behavior otherwise.
         """
-        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY):
-            if key not in batch:
-                raise ValueError(f"a GRPO batch carries {key} from pack; the batch has {sorted(batch)}")
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
         for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, SESSION_WEIGHTS_KEY):
             if key in batch and jnp.shape(batch[key]) != mask.shape:
@@ -332,18 +326,8 @@ class GRPOObjective(LMObjective):
         weights, taken off the row's `prompt_length`. Pads predict nothing
         and count nothing.
         """
-        try:
-            prompts = jnp.asarray(batch[PROMPT_KEY])
-        except KeyError:
-            raise ValueError(
-                f"GRPO validation scores {PROMPT_KEY} batches; "
-                f"the batch has {sorted(batch)}") from None
-        try:
-            lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
-        except KeyError:
-            raise ValueError(
-                f"GRPO validation weights with {LENGTH_KEY}; "
-                f"the batch has {sorted(batch)}") from None
+        prompts = jnp.asarray(batch[PROMPT_KEY])
+        lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
         if prompts.shape[1] < 2:
             raise ValueError(
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")
