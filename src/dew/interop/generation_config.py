@@ -341,7 +341,7 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     top_k = _generation_value(config, generation_config, "top_k")
     return Sampling(
         temperature=records.number(temperature, "temperature") if do_sample else 0.0,
-        top_k=records.integer(top_k, "top_k") if do_sample and top_k else None,
+        top_k=(records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
         eos_id=(eos_ids(config, generation_config) or None),
         pad_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
