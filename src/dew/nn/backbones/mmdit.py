@@ -217,7 +217,6 @@ class SimpleMMDiT(nn.Module):
         )
 
     def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
-        assert textcontext is not None, "textcontext must be provided for SimpleMMDiT"
         _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
@@ -244,10 +243,7 @@ class PatchMerging(nn.Module):
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        B, L, C = x.shape
-        assert H_patches * \
-            W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
-        assert H_patches % self.merge_size == 0 and W_patches % self.merge_size == 0, f"Patch dimensions ({H_patches}, {W_patches}) not divisible by merge size {self.merge_size}"
+        B, _, C = x.shape
 
         x = x.reshape(B, H_patches, W_patches, C)
         merged = einops.rearrange(
@@ -282,8 +278,7 @@ class PatchExpanding(nn.Module):
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        B, L, _ = x.shape
-        assert H_patches * W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
+        B = x.shape[0]
 
         expanded_features = self.expand_size * self.expand_size * self.out_features
         x = nn.Dense(
@@ -443,7 +438,6 @@ class HierarchicalMMDiT(nn.Module):
         )
 
     def __call__(self, x, temb, textcontext, train: bool = False):
-        assert textcontext is not None, "textcontext must be provided"
         _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
         assert H % (self.base_patch_size * (2**(num_stages - 1))) == 0 and \
