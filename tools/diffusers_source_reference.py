@@ -20,13 +20,14 @@ start from the same float32 input and cotangent.
 The model is the same closed form on both sides, a function of the scaled model
 input and the model time, so the comparison is of scheduler policy alone. A
 stochastic class is fed the exact draws Dew's solver makes at that step;
-`DPMSolverSDEScheduler`'s Brownian sampler is fed Dew's own bridge over the
-interval the source builds its tree on, and its own `torchsde` tree is
-recorded separately so the bridge's identities are checked against real ones.
+`DPMSolverSDEScheduler`'s own `torchsde` draws are recorded and replayed
+in both precisions and in Dew. A separate record checks the native bridge's
+identities against the source tree.
 
-Run in the isolated reference environment on CPU:
+Run on CPU in an isolated reference environment with Dew, diffusers==0.34.0
+and torchsde==0.2.6:
 
-    PYTHONPATH=src:/tmp/dew-sched-ref/libs python tools/diffusers_source_reference.py
+    PYTHONPATH=src python tools/diffusers_source_reference.py
 """
 
 from __future__ import annotations

@@ -126,12 +126,12 @@ def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]
 
 
 def _published_linspace(start: float, end: float, count: int) -> np.ndarray:
-    """Torch's float32 endpoints and step, with positions fused from each end.
+    """The source's float32 endpoints and step, spaced from each end.
 
-    NumPy spaces the original double endpoints, which changes hundreds of a
-    training table's beta values by an ULP. Those differences accumulate in
-    alpha-bar. Widen the rounded operands for the fused multiply-add, then
-    round each position once, measuring the second half from the endpoint.
+    NumPy spaces the original double endpoints. Those different roundings
+    change the beta table and accumulate in alpha-bar. Widen the rounded
+    operands so the position's multiply-add is rounded only once to float32,
+    rather than introducing another rounding at its intermediate product.
     """
     first, last = float(np.float32(start)), float(np.float32(end))
     if count == 1:
