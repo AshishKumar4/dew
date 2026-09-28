@@ -354,7 +354,9 @@ def sequence_shards() -> int:
     return mesh.shape.get(SEQUENCE_AXIS, 1)
 
 
-def split_positions[T](x: jax.Array, head_shape: tuple[int, int], project: Callable[[jax.Array], T]) -> T:
+def split_positions(x: jax.Array, head_shape: tuple[int, int],
+                    project: Callable[[jax.Array], tuple[jax.Array, jax.Array]]
+                    ) -> tuple[jax.Array, jax.Array]:
     """Project a context's keys and values on each sequence shard's positions.
 
     `project(x)` returns the two HEADS-shaped projections, each ending in
