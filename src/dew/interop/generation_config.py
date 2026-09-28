@@ -85,11 +85,7 @@ def return_sequences(config: Mapping[str, object], generation_config: Mapping[st
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        raise ValueError(f"{name} must be numeric")
-    return float(value)
+    return default if value is None else records.number(value, name)
 
 
 @dataclass(frozen=True)
@@ -342,14 +338,10 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
     if temperature is None:
         temperature = Sampling.temperature
-    if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
-        raise ValueError("temperature must be numeric")
     top_k = _generation_value(config, generation_config, "top_k")
-    if top_k is not None and type(top_k) is not int:
-        raise ValueError("top_k must be an integer")
     return Sampling(
-        temperature=float(temperature) if do_sample else 0.0,
-        top_k=top_k if do_sample and top_k else None,
+        temperature=records.number(temperature, "temperature") if do_sample else 0.0,
+        top_k=records.integer(top_k, "top_k") if do_sample and top_k else None,
         eos_id=(eos_ids(config, generation_config) or None),
         pad_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
@@ -371,17 +363,11 @@ def _token_list(value: object, name: str) -> list[int]:
     return ids
 
 
-def _as_float(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
-    return float(value)
-
-
 def _as_decay(value: object) -> tuple[int, float]:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("exponential_decay_length_penalty must be (start_index, factor)")
     return (records.integer(value[0], "exponential_decay_length_penalty start"),
-            _as_float("exponential_decay_length_penalty factor", value[1]))
+            records.number(value[1], "exponential_decay_length_penalty factor"))
 
 
 def _as_bias(value: object) -> list[tuple[list[int], float]]:
@@ -391,7 +377,7 @@ def _as_bias(value: object) -> list[tuple[list[int], float]]:
     for entry in value:
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
             raise ValueError("each sequence_bias entry is a token id list and a bias")
-        entries.append((_token_list(entry[0], "sequence_bias"), _as_float("sequence_bias", entry[1])))
+        entries.append((_token_list(entry[0], "sequence_bias"), records.number(entry[1], "sequence_bias")))
     return entries
 
 
@@ -430,9 +416,9 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if (value := read("sequence_bias")) is not None:
         transforms.append(decoding.sequence_bias(_as_bias(value)))
     if (value := read("encoder_repetition_penalty")) is not None:
-        transforms.append(decoding.PromptRepetitionPenalty(_as_float("encoder_repetition_penalty", value)))
+        transforms.append(decoding.PromptRepetitionPenalty(records.number(value, "encoder_repetition_penalty")))
     if (value := read("repetition_penalty")) is not None:
-        transforms.append(decoding.RepetitionPenalty(_as_float("repetition_penalty", value)))
+        transforms.append(decoding.RepetitionPenalty(records.number(value, "repetition_penalty")))
     if (value := read("no_repeat_ngram_size")) is not None:
         transforms.append(decoding.NoRepeatNGram(records.integer(value, "no_repeat_ngram_size")))
     if (value := read("encoder_no_repeat_ngram_size")) is not None:
@@ -472,7 +458,7 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
         if sampling.temperature != 1.0:
             transforms.append(decoding.Temperature(sampling.temperature))
         if (value := read("top_h")) is not None:
-            transforms.append(decoding.TopH(_as_float("top_h", value)))
+            transforms.append(decoding.TopH(records.number(value, "top_h")))
         if sampling.top_k is not None:
             transforms.append(decoding.TopK(sampling.top_k))
         if sampling.top_p < 1.0:
@@ -480,11 +466,11 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
         if sampling.min_p > 0.0:
             transforms.append(decoding.MinP(sampling.min_p))
         if (value := read("typical_p")) is not None:
-            transforms.append(decoding.Typical(_as_float("typical_p", value)))
+            transforms.append(decoding.Typical(records.number(value, "typical_p")))
         if (value := read("epsilon_cutoff")) is not None:
-            transforms.append(decoding.EpsilonCutoff(_as_float("epsilon_cutoff", value)))
+            transforms.append(decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff")))
         if (value := read("eta_cutoff")) is not None:
-            transforms.append(decoding.EtaCutoff(_as_float("eta_cutoff", value)))
+            transforms.append(decoding.EtaCutoff(records.number(value, "eta_cutoff")))
     if read("renormalize_logits") is not None:
         transforms.append(decoding.Renormalize())
     return tuple(transforms)
@@ -527,7 +513,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
         if early not in (True, False, "never"):
             raise ValueError("early_stopping is True, False or 'never'")
         return Beam(width=width,
-                    length_penalty=Beam.length_penalty if penalty is None else _as_float("length_penalty", penalty),
+                    length_penalty=Beam.length_penalty if penalty is None else records.number(penalty, "length_penalty"),
                     early_stopping=early is True if isinstance(early, bool) else "never",
                     stop_ids=len(eos_ids(config, generation_config)))
     if not speculating:
@@ -539,12 +525,10 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
     length = read("num_assistant_tokens")
     threshold = read("assistant_confidence_threshold")
     drafted = Speculative.block - 1 if length is None else records.integer(length, "num_assistant_tokens")
-    if drafted < 1:
-        raise ValueError("num_assistant_tokens must draft at least one token")
     # The block includes the target draw the proposer chains from.
     return Speculative(block=drafted + 1,
                        confidence=Speculative.confidence if threshold is None else
-                       _as_float("assistant_confidence_threshold", threshold))
+                       records.number(threshold, "assistant_confidence_threshold"))
 
 
 def _mtp_mode(value: object) -> bool:
