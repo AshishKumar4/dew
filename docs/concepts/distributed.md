@@ -55,6 +55,8 @@ A checkpoint of that state is written before training goes on. Orbax copies a de
 
 A scanned decoder declares one bank per run of like layers. An unscanned decoder declares one bank per layer. Both stream through the same fetch loop. `dew.inference.host_banked(model, source, layout=...)` reads each physical bank once and rejects two different views of the same namespace. The fetch loop holds the current layer and the next one. I have not yet established GPU peak-memory bounds or whether the transfers overlap with compute. Selected leaves keep their FSDP and tensor PartitionSpecs. External cache arrays stay on the device under their logical per-layer paths. `Trainer.place` rejects host-parameter layouts, because the backward pass and optimizer paths for them do not exist.
 
+On a TPU, pinned banks keep their layer axis major-most in physical memory. A fetch retains that axis until the copy reaches device memory, then squeezes it there. This avoids incompatible host tile bitcasts while retaining per-layer transfers. Bank sources must honor any JAX `Format` supplied in their placement; both built-in sources do.
+
 `dew.inference.LayerBanks` has two adapters for real use:
 
 - `CheckpointBanks` reads Dew run checkpoints bank by bank.
