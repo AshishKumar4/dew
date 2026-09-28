@@ -1294,12 +1294,7 @@ class CausalTransformer(nn.Module):
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         self.refuse_unbuildable_fields(kinds)
-        sparse = self.sparse_layers
-        hashed = self.hash_layers
-        sharing = self.kv_sharing
         ple = self.per_layer_input_dim
-        widths = self.mlp_widths
-        sparsity = self.activation_sparsity_pattern
 
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -1326,7 +1321,7 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
-        specs = self._layer_specs(types, kinds, mixer_spec, (sparse, hashed, sharing, widths, sparsity))
+        specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar)
 
@@ -1337,7 +1332,7 @@ class CausalTransformer(nn.Module):
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
-        self.mtp = self._prediction_depths(types, kinds, mixer_spec, (gated_mlp, routed), wiring, sparse, widths)
+        self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
             assert routed is not None
             self.dspark_stages = self._dspark_stages(kinds, mixer_spec, routed, wiring)
@@ -1374,14 +1369,13 @@ class CausalTransformer(nn.Module):
                 name='lm_head', **normal_kernel(self.initializer_range))
 
     @nn.nowrap
-    def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec, read
+    def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
                      ) -> tuple[LayerSpec, ...]:
         """One `LayerSpec` per layer: its kind, whether it routes and how,
         its feed-forward width and sparsity, the KV it shares or provides,
-        and its attention-residual, engram and DSpark slots. `read` is what
-        setup read off the fields first: the sparse and hash-routed layers,
-        the KV sharing, the widths and the sparsity pattern."""
-        sparse, hashed, sharing, widths, sparsity = read
+        and its attention-residual, engram and DSpark slots."""
+        sparse, hashed, sharing = self.sparse_layers, self.hash_layers, self.kv_sharing
+        widths, sparsity = self.mlp_widths, self.activation_sparsity_pattern
         providers = set(sharing.values())
 
         def provides(index: int, layer_type: str) -> bool:
@@ -1461,10 +1455,11 @@ class CausalTransformer(nn.Module):
             name=name)
 
     @nn.nowrap
-    def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec, factories,
-                           wiring: BlockWiring, sparse, widths) -> list[MTPBlock]:
+    def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
+                           gated_mlp, routed, wiring: BlockWiring) -> list[MTPBlock]:
         """The multi-token prediction depths."""
-        gated_mlp, routed = factories
+        if not self.num_nextn_predict_layers:
+            return []
         # Prediction depths mirror whole-sequence hidden states, so their
         # mixer builds from the full-attention kind where the pattern has
         # one, else from the first layer's kind; the feed-forward routes
@@ -1472,13 +1467,14 @@ class CausalTransformer(nn.Module):
         # experts) and is dense otherwise.
         mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
+        if (self.index_share_for_mtp_iteration
                 and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
             raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
+        widths = self.mlp_widths
         mtp_feedforward = (
-            routed if routed is not None and self.num_layers - 1 in sparse else
+            routed if routed is not None and self.num_layers - 1 in self.sparse_layers else
             None if widths[-1] == 0 else
             # The last layer's width: the one width of every model with
             # depths, since the widths that vary are Gemma 3n's alone.
