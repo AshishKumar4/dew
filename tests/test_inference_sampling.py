@@ -213,6 +213,7 @@ def test_unsupported_source_controls_report_their_reason(task):
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     refusals = {
         "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
+        "beams below rows": ({"num_beams": 2, "num_return_sequences": 3}, "exceeds num_beams"),
         "num_beam_groups": ({"num_beams": 2, "num_beam_groups": 2}, "group beam search"),
         "penalty_alpha": ({"do_sample": True, "penalty_alpha": 0.6}, "contrastive search"),
         "unknown": ({"a_future_control": 3}, "does not know this control"),
@@ -240,9 +241,6 @@ def test_unsupported_source_controls_report_their_reason(task):
     for name, (active, reason) in refusals.items():
         with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
-    beams = replace(source, generation_config={"num_beams": 2, "num_return_sequences": 3}).text_generation()
-    with pytest.raises(ValueError, match="at most its width"):
-        beams([[1, 2]], 4, key=jax.random.key(1))
 
 
 def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(task):

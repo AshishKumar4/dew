@@ -491,7 +491,7 @@ def _source_stopping(config: Mapping[str, object], generation_config: Mapping[st
 
 
 def _source_strategy(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, do_sample: bool) -> Strategy | None:
+                     model: nn.Module, do_sample: bool, rows: int) -> Strategy | None:
     """Return the device loop a source's config names, or None for plain sampling."""
     read = functools.partial(_active, config, generation_config)
     beams = read("num_beams")
@@ -504,6 +504,8 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
                              "probability is not the per-step candidate probability, so no honest "
                              "behaviour likelihood exists")
         width = records.integer(beams, "num_beams")
+        if rows > width:
+            raise ValueError(f"num_return_sequences {rows} exceeds num_beams {width}")
         early = _generation_value(config, generation_config, "early_stopping")
         penalty = _generation_value(config, generation_config, "length_penalty")
         if early is None:
@@ -539,7 +541,7 @@ def _mtp_mode(value: object) -> bool:
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None,
+                     model: nn.Module, processor: Processor | None, rows: int,
                      override: Sampling | None
                      ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None,
                                 tuple[decoding.Stopping, ...], Strategy | None]:
@@ -555,7 +557,7 @@ def source_decoding(config: Mapping[str, object], generation_config: Mapping[str
     do_sample = requested_mode is True
     _audit(config, generation_config, model, do_sample,
            _generation_value(config, generation_config, "num_beams"), override is not None)
-    strategy = _source_strategy(config, generation_config, model, do_sample)
+    strategy = _source_strategy(config, generation_config, model, do_sample, rows)
     decoder = _decoder(model)
     criteria = _source_stopping(config, generation_config, processor,
                                 None if decoder is None else decoder.vocab_size)
