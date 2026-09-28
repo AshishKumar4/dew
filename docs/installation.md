@@ -1,6 +1,6 @@
 # Installation
 
-Dew is published as the `dew-ml` package and imported as `dew`. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
+Dew's package name is `dew-ml` and its import name is `dew`; it is installed from the GitHub repository. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
 
 ## Installing from GitHub
 
