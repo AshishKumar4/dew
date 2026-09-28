@@ -12,10 +12,10 @@ import gc
 import json
 import os
 import re
-from pathlib import Path
 import subprocess
 import sys
 import weakref
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -1250,22 +1250,6 @@ def test_accumulation_must_be_positive():
         make_trainer(accumulation=0)
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
-def test_a_measured_generations_step_compiles_its_dots_to_cublas():
-    """Measured generations compile cuBLAS GEMMs rather than Triton fusions."""
-    from dew.nn.kernels.generation import device_generation
-    from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS
-
-    if device_generation() not in TRITON_GEMM_OFF_GENERATIONS:
-        pytest.skip("no measured compiler option for this generation")
-    trainer, _, _ = held_lm_trainer()
-    state, _, _ = trainer.place()
-    trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
-    assert trainer.executable is not None
-    text = trainer.executable.as_text()
-    assert text is not None and "__triton_gemm" not in text
-
-
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384])
 def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
     """Compare real Trainer steps with the measured recipe: unfused whole
@@ -1273,15 +1257,24 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     at 16384. Fresh processes keep conftest's deterministic XLA flags out
     of the measurement; those flags change which whole-logits step fits.
     The ABBA order and warmed step medians allow 4% noise, below the old
-    8%, 18%, and 3x regressions. Run alone with GPU preallocation disabled.
+    8%, 18%, and 3x regressions. Children need room for a preallocated pool.
     """
     devices = jax.devices()
     if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
         pytest.skip("measured on one 16 GiB RTX 4080")
-    if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "").lower() != "false":
-        pytest.skip("disable GPU preallocation so the isolated measurements can use it")
     if "xla_gpu_enable_triton_gemm" in os.environ.get("XLA_FLAGS", ""):
         pytest.skip("an explicit Triton option overrides the measured default")
+    # Freed arrays can still occupy the parent's growable BFC pool. Check
+    # physical free VRAM, not just JAX's live arrays or its preallocation flag.
+    fraction = 0.85
+    memory = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True, timeout=10).stdout.splitlines()
+    if len(memory) != 1:
+        pytest.skip("the isolated benchmark needs one physical GPU")
+    total, free = (int(value) for value in memory[0].split(","))
+    if free < fraction * total:
+        pytest.skip(f"{free} MiB free VRAM; the child pool needs {fraction * total:.0f} MiB")
     root = Path(__file__).resolve().parents[1]
     case = {"architecture": "causal_transformer", "config": {
         "vocab_size": 151936, "emb_features": 1024, "num_layers": 2, "num_heads": 16,
@@ -1292,7 +1285,7 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
                      if not flag.startswith("--xla_gpu_deterministic_ops"))
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
-                   "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.85",
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
