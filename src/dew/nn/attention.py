@@ -1880,7 +1880,6 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
 
-    @nn.compact
     def __call__(self, hidden_states, context=None):
         if self.only_pure_attention:
             return self.attention2(hidden_states, context)
@@ -1963,28 +1962,24 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, context=None):
-        inner_dim = self.heads * self.dim_head
-        C = x.shape[-1]
+        channels = x.shape[-1]
         if self.norm_inputs:
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
-        if self.use_projection:
+
+        def project(features: int, name: str):
             if self.use_linear_attention:
-                projected_x = nn.Dense(features=inner_dim,
-                                       use_bias=False, precision=self.precision,
-                                       dtype=self.dtype, name='project_in')(x)
-            else:
-                projected_x = Conv(
-                    features=inner_dim, kernel_size=(1, 1),
-                    strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='project_in_conv',
-                )(x)
+                return nn.Dense(features=features, use_bias=False, precision=self.precision,
+                                dtype=self.dtype, name=name)
+            return Conv(features=features, kernel_size=(1, 1), strides=(1, 1), padding='VALID',
+                        use_bias=False, dtype=self.dtype, precision=self.precision,
+                        name=f'{name}_conv')
+
+        if self.use_projection:
+            inner_dim = self.heads * self.dim_head
+            hidden = project(inner_dim, 'project_in')(x)
         else:
-            projected_x = x
-            inner_dim = C
-
-        context = projected_x if context is None else context
-
-        projected_x = BasicTransformerBlock(
+            inner_dim, hidden = channels, x
+        hidden = BasicTransformerBlock(
             query_dim=inner_dim,
             heads=self.heads,
             dim_head=self.dim_head,
@@ -1997,20 +1992,10 @@ class TransformerBlock(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon
-        )(projected_x, context)
-
+        )(hidden, hidden if context is None else context)
         if self.use_projection:
-            if self.use_linear_attention:
-                projected_x = nn.Dense(features=C, precision=self.precision,
-                                       dtype=self.dtype, use_bias=False,
-                                       name='project_out')(projected_x)
-            else:
-                projected_x = Conv(
-                    features=C, kernel_size=(1, 1),
-                    strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='project_out_conv',
-                )(projected_x)
+            hidden = project(channels, 'project_out')(hidden)
 
         if self.only_pure_attention or self.explicitly_add_residual:
-            projected_x = x + projected_x
-        return projected_x
+            hidden = x + hidden
+        return hidden
