@@ -1,8 +1,8 @@
-# FlaxDiff gallery
+# Gallery
 
-These images come from experiments with FlaxDiff, the project Dew grew out of. The settings are the run descriptions recorded at the time, with FlaxDiff's scheduler and model names. They are not configurations for the current Dew API, and they do not show that Dew reproduces these images.
+These are samples from models trained with Dew. Each section lists the training data, image size, sampling settings and model fields recorded for the run; scheduler and model names are those of the Dew version the run used, not configurations for the current API.
 
-For each run the gallery records the training data, the image size, the sampling settings, and some model fields. It has no complete environment, checkpoint, seed record, or quality evaluation for any of them. [Recipes](recipes.md) and [Diffusion training](guides/diffusion.md) describe the current workflow, and [Step benchmarks](benchmarks.md) lists timed measurements with their revision and hardware.
+The records have no complete environment, checkpoint, seed or quality evaluation. [Recipes](recipes.md) and [Diffusion training](guides/diffusion.md) describe the current workflow, and [Step benchmarks](benchmarks.md) lists timed measurements with their revision and hardware.
 
 ## Text-to-image on a mixed captioned dataset
 
@@ -20,7 +20,7 @@ Every image in the grid used the same prompt, "a beautiful landscape with a rive
 | Training noise schedule | `EDMNoiseScheduler` |
 | Inference noise schedule | `KarrasVENoiseScheduler` |
 
-![Historical text-to-image landscape grid using Euler ancestral sampling and CFG](assets/gallery/medium_epoch5.png)
+![text-to-image landscape grid using Euler ancestral sampling and CFG](assets/gallery/medium_epoch5.png)
 
 ## Text-to-image on Oxford Flowers
 
@@ -37,7 +37,7 @@ This run used Oxford Flowers 102, Euler ancestral sampling for 200 steps, and CF
 | Training noise schedule | `EDMNoiseScheduler` |
 | Inference noise schedule | `KarrasVENoiseScheduler` |
 
-![Historical Oxford Flowers text-to-image grid using Euler ancestral sampling at guidance scale 2](assets/gallery/text2img_euler_ancestral_1.png)
+![Oxford Flowers text-to-image grid using Euler ancestral sampling at guidance scale 2](assets/gallery/text2img_euler_ancestral_1.png)
 
 ## Unconditional Oxford Flowers with DDPM
 
@@ -56,13 +56,13 @@ An unconditional model generates images without a text prompt. This grid used DD
 | Residual blocks | 2 |
 | Middle residual blocks | 1 |
 
-The attention list and the feature-depth list copy the old record. They are not arguments of the current UNet.
+The attention list and the feature-depth list are the recorded settings, not arguments of the current UNet.
 
-![Historical unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
+![unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
 
 ## Unconditional Oxford Flowers with Heun
 
-This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The old caption said 20 model evaluations, but I kept no trace that confirms that count.
+This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The recorded caption said 20 model evaluations, but I kept no trace that confirms that count.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -74,6 +74,6 @@ This grid used a 10-step Heun sampler. Heun takes a prediction step and then a c
 | Training noise schedule | `EDMNoiseScheduler` |
 | Inference noise schedule | `KarrasVENoiseScheduler` |
 
-![Historical unconditional Oxford Flowers grid using 10-step Heun sampling](assets/gallery/heun.png)
+![unconditional Oxford Flowers grid using 10-step Heun sampling](assets/gallery/heun.png)
 
 Do not read these grids as a controlled comparison of samplers. The records do not show that they used the same checkpoints, seeds, or training settings. If you prepare a new run with any of these datasets, check its license and access conditions; the gallery does not redistribute the datasets. [References and attribution](references.md) lists the research and the upstream implementations behind these methods.

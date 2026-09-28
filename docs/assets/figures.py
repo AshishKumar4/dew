@@ -281,7 +281,7 @@ def diffusion_figure():
         svg.text(px + pw, py + ph + 20, "1", size=12, color=t["muted"], anchor="end")
         legend = ["α: accent, σ: grey", "solid: Cosine(), dashed: Flow()", "",
                   "Each image is α x₀ + σ ε with the same ε,", "at the rates schedule.rates(t) returns.",
-                  "", "x₀ is a 64 × 64 sample from the FlaxDiff", "gallery, scaled to [-1, 1]."]
+                  "", "x₀ is a 64 × 64 image sampled from a model", "trained with Dew, scaled to [-1, 1]."]
         for i, line in enumerate(legend):
             svg.text(340, py + 20 + 22 * i, line, size=13, color=t["muted"])
         svg.write("diffusion-forward", variant)

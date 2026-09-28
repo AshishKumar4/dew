@@ -83,7 +83,7 @@ export const groups = [
 		items: [
 			{ source: 'docs/examples.md', slug: 'examples', label: 'Example scripts' },
 			{ source: 'docs/guides/end-to-end.md', slug: 'examples/end-to-end', label: 'End-to-end runs' },
-			{ source: 'docs/gallery.md', slug: 'examples/flaxdiff-gallery', label: 'FlaxDiff gallery' },
+			{ source: 'docs/gallery.md', slug: 'examples/gallery', label: 'Gallery' },
 		],
 	},
 	{
