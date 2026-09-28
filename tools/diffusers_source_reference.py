@@ -39,6 +39,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -68,6 +69,7 @@ from diffusers.schedulers import (
 )
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
 
+from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
@@ -107,7 +109,7 @@ class Case:
     and the number of steps the walk asks for."""
 
     scheduler: str
-    config: Mapping[str, object] = field(default_factory=dict)
+    config: Mapping[str, Any] = field(default_factory=dict)
     steps: int = STEPS
     guidance: float | None = None
 
@@ -358,7 +360,9 @@ def native_bounds(config: Mapping[str, object], steps: int) -> tuple[float, floa
     interval the source builds its Brownian tree over."""
     schedule = SourceSchedule.from_config(config)
     process, _ = schedule.sampling(steps)
-    return float(process.sampler_schedule.sigma_min), float(process.sampler_schedule.sigma_max)
+    sigma_schedule = process.sampler_schedule
+    assert isinstance(sigma_schedule, GeneralizedNoiseScheduler)
+    return float(sigma_schedule.sigma_min), float(sigma_schedule.sigma_max)
 
 
 def grid_times(scheduler, case: Case) -> np.ndarray:
@@ -616,7 +620,7 @@ def main() -> None:
     for key, value in brownian_record().items():
         arrays[f"brownian.{key}"] = value
     print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
-    np.savez_compressed(FIXTURES / "source_schedulers.npz", **arrays)
+    np.savez_compressed(FIXTURES / "source_schedulers.npz", allow_pickle=False, **arrays)
     (FIXTURES / "source_schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = (FIXTURES / "source_schedulers.npz").stat().st_size
     print(f"{FIXTURES / 'source_schedulers.npz'}: {size / 1e3:.0f} kB, {len(CASES)} cases")
