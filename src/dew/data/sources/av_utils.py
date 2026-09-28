@@ -11,6 +11,9 @@ import subprocess
 
 import numpy as np
 
+FPS = 25.0
+"""The rate clips are sampled at, which cuts the audio into rows per frame."""
+
 
 def choose_clip_start(total_frames: int, num_frames: int, padding: int,
                       rng: np.random.Generator) -> int:
@@ -51,7 +54,7 @@ def audio_window(path: str, start: float, duration: float, sample_rate: int) -> 
 
 
 def read_random_frames(path: str, *, num_frames: int, padding: int, seed: int,
-                       fps: float = 25.0) -> tuple[np.ndarray, int]:
+                       fps: float = FPS) -> tuple[np.ndarray, int]:
     """`num_frames` consecutive frames of `path` sampled at `fps`, as uint8
     `[num_frames, H, W, 3]` RGB, and the index of the first.
 
@@ -84,7 +87,7 @@ def read_random_frames(path: str, *, num_frames: int, padding: int, seed: int,
 
 
 def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed: int,
-                        sample_rate: int = 16000, fps: float = 25.0
+                        sample_rate: int = 16000, fps: float = FPS
                         ) -> tuple[np.ndarray, np.ndarray]:
     """`num_frames` consecutive frames of `path` from a start `seed` picks,
     and the audio under them with `audio_padding` frames more on each side.

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, ClassVar, Generic, Mapping, Self, Sequence
 
 import jax.numpy as jnp
@@ -35,7 +36,10 @@ from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
 
 if TYPE_CHECKING:
+    from torchax.interop import JittableModule
     from transformers import PreTrainedTokenizerBase
+
+    from dew.data.processors import AutoAudioProcessor
 
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
@@ -53,6 +57,10 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     parameter_collections: ClassVar[tuple[str, ...] | None] = None
     """None declares a bare parameter tree; otherwise these collections own
     learned weights, including frozen ones. Other collections retain their dtype."""
+    reads_captions: ClassVar[bool] = True
+    """Whether a dataset's captions are this encoder's raw data. One that is
+    not reads the batch field its dataset writes itself, audio for instance,
+    and `InputSpec.tokenize` leaves that field alone."""
 
     @classmethod
     @abstractmethod
@@ -307,4 +315,138 @@ class CharTable(ConditionEncoder[str, TextContext]):
                 "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
 
 
-__all__ = ["CLIPText", "CharTable", "ConditionEncoder", "T5Text", "rebuild"]
+type AudioRow = np.ndarray | float | Mapping[str, object]
+"""One waveform, mono at the extractor's rate; a constant, which fills the
+clip (0.0 is silence); or a conditioning record holding either under `audio`."""
+
+
+def _last_hidden_state(model, features, *, key: str):
+    """`model`'s last hidden state for its input `key`, run by torchax."""
+    return model(**{key: features}).last_hidden_state
+
+
+@encoders("hf_audio")
+@dataclass(frozen=True, eq=False)
+class HFAudio(ConditionEncoder[AudioRow, TextContext]):
+    """Any transformers audio model's last hidden state, with the checkpoint's
+    own feature extractor.
+
+    The extractor turns waveforms into whatever the model reads,
+    `input_values` for wav2vec2 and HuBERT, `input_features` for Whisper and
+    AST, and transformers' PyTorch forward runs lowered to JAX by torchax,
+    so any model `AutoModel` builds serves; an encoder-decoder contributes
+    its encoder. Weight-norm parametrizations are folded into plain weights,
+    which the frozen tower computes the same. The states come back as a
+    `TextContext` with every position real, so a model that cross-attends to
+    text attends to them unchanged.
+
+    Every waveform is cut or zero-padded to `seconds`, so every clip, and
+    the constant the unconditional branch is encoded from, has one length.
+    A dataset that writes the extractor's arrays itself (`VideoDataset`'s
+    `audio` field) hands them to `encode` unchanged, which is why this
+    encoder reads no captions.
+    """
+
+    checkpoint: str
+    seconds: float
+    module: JittableModule
+    params: Variables
+    audio: AutoAudioProcessor
+    dtype: Dtype | None = None
+    param_dtype: str = "float32"
+    parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
+    reads_captions: ClassVar[bool] = False
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
+                        dtype=None, param_dtype: str = "float32",
+                        params: Variables | None = None) -> HFAudio:
+        from dew.data.processors import AutoAudioProcessor
+        from dew.interop.pickles import host_view
+        from dew.interop.torchax_fallback import INSTALL
+
+        try:
+            import torch
+            from torch.nn.utils import parametrize
+            from torchax.interop import JittableModule, extract_all_buffers
+            from transformers import AutoConfig, AutoModel
+        except ImportError as error:
+            raise ImportError(f"hf_audio runs transformers' audio model through torchax: {INSTALL}") from error
+        if params is None:
+            model = AutoModel.from_pretrained(checkpoint, dtype=getattr(torch, param_dtype))
+        else:
+            # Supplied weights replace every tensor, so the tower is built
+            # without storage.
+            with torch.device("meta"):
+                model = AutoModel.from_config(AutoConfig.from_pretrained(checkpoint))
+        if model.config.is_encoder_decoder:
+            model = model.get_encoder()
+        model.eval()
+        for layer in model.modules():
+            if parametrize.is_parametrized(layer):
+                for name in list(layer.parametrizations):
+                    parametrize.remove_parametrizations(layer, name)
+        module = JittableModule(model)
+        if params is None:
+            params = {"params": {name: host_view(leaf, name) for name, leaf in module.params.items()},
+                      "buffers": {name: host_view(leaf, name)
+                                  for name, leaf in extract_all_buffers(model)[1].items()}}
+        # Torch's copies are no longer read: the forward runs on the arrays above.
+        torch.nn.Module.to(model, "meta")
+        return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
+                   audio=AutoAudioProcessor(modelname=checkpoint), dtype=resolve_dtype(dtype),
+                   param_dtype=param_dtype)
+
+    @property
+    def input_name(self) -> str:
+        """The extractor's array the model reads."""
+        return self.audio.processor.model_input_names[0]
+
+    @property
+    def samples(self) -> int:
+        """How many samples every waveform is cut or padded to."""
+        return round(self.seconds * self.audio.sampling_rate)
+
+    def waveform(self, row: AudioRow) -> np.ndarray:
+        """One row as a float32 waveform `samples` long."""
+        value = row.get("audio") if isinstance(row, Mapping) else row
+        if value is None:
+            raise ValueError("an audio conditioning record holds its waveform under 'audio'")
+        if isinstance(value, str):
+            raise ValueError(f"hf_audio encodes waveforms, and was handed the text {value!r}")
+        if isinstance(value, (int, float)):
+            return np.full(self.samples, value, np.float32)
+        wave = np.asarray(value, np.float32).reshape(-1)[:self.samples]
+        return np.pad(wave, (0, self.samples - len(wave)))
+
+    def tokenize(self, texts: Sequence[AudioRow]) -> dict[str, np.ndarray]:
+        features = self.audio([self.waveform(row) for row in texts])
+        return {self.input_name: np.asarray(features[self.input_name], np.float32)}
+
+    def encode(self, params, tokens) -> TextContext:
+        import torchax
+
+        # The tower and its input run in one dtype: the compute dtype, or
+        # float32 when none is set, whatever the weights are stored in.
+        compute = jnp.float32 if self.dtype is None else self.dtype
+
+        def in_compute(leaf):
+            value = jnp.asarray(leaf)
+            return value.astype(compute) if jnp.issubdtype(value.dtype, jnp.floating) else value
+
+        weights = {name: in_compute(leaf) for name, leaf in params["params"].items()}
+        buffers = {name: jnp.asarray(leaf) for name, leaf in params.get("buffers", {}).items()}
+        env = torchax.default_env()
+        arguments = env.j2t_iso((weights, buffers, in_compute(tokens[self.input_name])))
+        with env:
+            hidden = self.module.functional_call(
+                partial(_last_hidden_state, key=self.input_name), *arguments)
+        hidden = env.t2j_iso(hidden)
+        return TextContext(hidden=hidden, mask=jnp.ones(hidden.shape[:2], jnp.int32))
+
+    def to_json(self) -> dict:
+        return {"checkpoint": self.checkpoint, "seconds": self.seconds,
+                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
+
+
+__all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text", "rebuild"]

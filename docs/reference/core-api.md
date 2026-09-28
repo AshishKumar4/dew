@@ -37,7 +37,7 @@ Condition(encoder, field="text", unconditional="")
 InputSpec(sample, conditions={}, mask=None)
 ```
 
-`Field.shape` is the shape of one sample, excluding batch. A `Condition` connects a condition encoder to its tokenized batch field. `InputSpec.conditions` maps the model keyword, such as `textcontext`, to a `Condition`. Each condition must read a distinct batch field. `mask` is an optional `Field` for a binary image mask, used for explicit masked-image latent conditioning. `InputSpec.tokenize(captions)` returns tokenized fields for those conditions; an empty condition mapping returns no fields. Encoders define tokenization, parameters, and encoded output types.
+`Field.shape` is the shape of one sample, excluding batch. A `Condition` connects a condition encoder to its tokenized batch field. `InputSpec.conditions` maps the model keyword, such as `textcontext`, to a `Condition`. Each condition must read a distinct batch field. `mask` is an optional `Field` for a binary image mask, used for explicit masked-image latent conditioning. `InputSpec.tokenize(captions)` returns tokenized fields for the conditions whose encoder reads captions (`reads_captions`); an empty condition mapping returns no fields. An encoder of another modality, such as `HFAudio`, reads the field its dataset writes. Encoders define tokenization, parameters, and encoded output types.
 
 ### Mesh and layout
 
