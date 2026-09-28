@@ -239,6 +239,31 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
     np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
 
 
+def test_fid_extraction_is_independent_of_small_batch_boundaries():
+    """A short last batch must not change either population's features.
+
+    XLA:TPU's space-to-batch rewrite corrupted Inception below batch 8.
+    Pool the same images at batch 16 and across 1/3/7/5-row batches, including
+    single-row contributions whose covariance exists only after merging.
+    """
+    from dew.inputs import unit_range
+
+    images, brighter = fid_sets()
+    metric = FID(weights=str(INCEPTION_TINY))
+    whole = metric(ImageGrid(unit_range(brighter)), {"image": images})
+    split = metric(ImageGrid(unit_range(brighter[:1])), {"image": images[:1]})
+    for start, end in ((1, 4), (4, 11), (11, 16)):
+        split = metric.merge(split, metric(ImageGrid(unit_range(brighter[start:end])),
+                                           {"image": images[start:end]}))
+    for actual, expected in ((split.generated, whole.generated), (split.real, whole.real)):
+        assert actual.count == expected.count == 16
+        np.testing.assert_allclose(actual.mean, expected.mean, rtol=1e-5,
+                                   atol=1e-6 * np.abs(expected.mean).max())
+        np.testing.assert_allclose(actual.m2, expected.m2, rtol=1e-5,
+                                   atol=1e-6 * np.abs(expected.m2).max())
+    assert metric.finalize(split) == pytest.approx(metric.finalize(whole), rel=1e-5)
+
+
 @pytest.mark.network
 def test_the_fid_metric_and_the_function_report_the_same_distance():
     """The registered metric is that same path with a trainer's artifact and

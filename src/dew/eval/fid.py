@@ -163,7 +163,7 @@ def _get_activations(weights: str | None = None):
     model, variables = _get_inception(weights)
 
     @jax.jit
-    def activations(images):
+    def extracted(images):
         # pytorch-fid's F.interpolate(bilinear, align_corners=False) does not
         # antialias; jax.image.resize does unless told not to.
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear',
@@ -171,6 +171,19 @@ def _get_activations(weights: str | None = None):
         features = model.apply(variables, resized)
         assert isinstance(features, jax.Array)
         return features.reshape(features.shape[0], -1)
+
+    if jax.default_backend() != 'tpu':
+        return extracted
+
+    def activations(images):
+        # XLA:TPU's space-to-batch rewrite corrupts Inception's stride-2
+        # convolutions below batch 8 (#5). Keep the padding outside the jit
+        # so the network compiles at batch 8; inference never mixes rows.
+        rows = images.shape[0]
+        if rows >= 8:
+            return extracted(images)
+        filler = jnp.zeros((8 - rows, *images.shape[1:]), images.dtype)
+        return extracted(jnp.concatenate([jnp.asarray(images), filler]))[:rows]
 
     return activations
 
