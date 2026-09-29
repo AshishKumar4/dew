@@ -20,10 +20,10 @@ from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
 from dew.registry import models
@@ -52,6 +52,7 @@ class Block(nn.Module):
     res_balance: float = 0.3
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x: jax.Array, emb: jax.Array, train: bool) -> jax.Array:
@@ -78,8 +79,7 @@ class Block(nn.Module):
             # then query, key and value interleaved.
             qkv = qkv.reshape(batch, height * width, heads, self.features // heads, 3)
             q, k, v = (part[..., 0] for part in jnp.split(normalize(qkv, axes=(3,)), 3, axis=-1))
-            logits = jnp.einsum("bqhc,bkhc->bhqk", q, k / np.sqrt(q.shape[-1]))
-            y = jnp.einsum("bhqk,bkhc->bqhc", jax.nn.softmax(logits, axis=-1), v)
+            y = scaled_dot_product_attention(q, k, v, implementation=self.attention_impl)
             y = MPConv(self.features, (1, 1), name="attn_proj")(y.reshape(x.shape))
             x = mp_sum(x, y, t=self.attn_balance)
         if self.clip_act is not None:
@@ -108,6 +108,7 @@ class EDM2UNet(nn.Module):
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
     dtype: Dtype | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x: jax.Array, time: jax.Array, textcontext: TextContext | None = None,
@@ -117,7 +118,7 @@ class EDM2UNet(nn.Module):
         width = self.model_channels * (self.channel_mult_emb or max(self.channel_mult))
         block = {"channels_per_head": self.channels_per_head, "dropout": self.dropout,
                  "res_balance": self.res_balance, "attn_balance": self.attn_balance,
-                 "clip_act": self.clip_act}
+                 "clip_act": self.clip_act, "attention_impl": self.attention_impl}
         if self.dtype is not None:
             x = x.astype(self.dtype)
 
