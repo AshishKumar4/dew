@@ -174,6 +174,7 @@ class TextToImage:
         if compute is not None:
             config = replace(config, model=replace(config.model, dtype=compute),
                              text=None if config.text is None else replace(config.text, dtype=compute),
+                             audio=None if config.audio is None else replace(config.audio, dtype=compute),
                              autoencoder=None if config.autoencoder is None else
                              replace(config.autoencoder, dtype=compute))
         params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,

@@ -35,6 +35,7 @@ from .dataset import (
 )
 from .images import import_opencv
 from .processors import AutoAudioProcessor
+from .sources.av_utils import FPS
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -46,6 +47,15 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
         paths += [os.path.join(directory, name) for name in files
                   if os.path.splitext(name)[1].lower() in suffixes]
     return sorted(paths)
+
+
+def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
+    """`frames` `[T, H, W, 3]` resized to `size` squares by area interpolation."""
+    if frames.shape[1] == size and frames.shape[2] == size:
+        return frames
+    import cv2
+    return np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+                     for frame in frames])
 
 
 class AudioVideoTransform(pygrain.RandomMapTransform):
@@ -73,11 +83,7 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
             element["video_path"], num_frames=self.spec.frames,
             audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)),
             sample_rate=self.audio.sampling_rate)
-        size = self.spec.frame_size
-        if frames.shape[1] != size or frames.shape[2] != size:
-            import cv2
-            frames = np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
-                               for frame in frames])
+        frames = fit_frames(frames, self.spec.frame_size)
         # The extractor takes one waveform and hands back a batch of one;
         # given the rows it would read each frame's samples as a clip of
         # its own. Key names differ per audio model, so its output passes
@@ -108,6 +114,12 @@ class VideoDataset(DatasetSpec):
     """HF audio model whose feature extractor prepares the audio inputs."""
     val_batches: int | None = 4
     count: int | None = None
+
+    @property
+    def audio_seconds(self) -> float:
+        """How long the waveform under a clip is: its frames and the padding
+        on either side, at the rate clips are sampled at."""
+        return (self.frames + 2 * self.audio_padding) / FPS
 
     def source(self) -> list[dict[str, str]]:
         """One `{"video_path", "caption"}` record per clip, in a fixed order."""
