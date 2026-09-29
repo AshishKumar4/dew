@@ -152,6 +152,32 @@ def test_a_scanned_quantized_stack_scores_as_the_plain_one():
     assert float(jnp.max(jnp.abs(scanned - plain))) < 5e-2
 
 
+@pytest.mark.parametrize("group_width", [1, 4])
+def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width):
+    """A grouped convolution never adds one group's inputs into another's
+    outputs, so each group's activations take their own int8 scale. Over 64
+    channels whose ranges span 1e-3 to 1, every output channel lands within
+    int8 rounding of float (depthwise and 4 channels per group). One scale
+    per example for all channels rounds the small groups to zero instead:
+    observed on CPU before the fix, the worst channel 100% (depthwise) and
+    107% (4 per group) off. Observed after: 1.0% and 1.2%."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    features = 64
+    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
+                feature_group_count=features // group_width, use_bias=False)
+    ranges = jnp.logspace(-3, 0, features)
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges
+    variables = conv.init(jax.random.key(1), x)
+    plain = conv.apply(variables, x)
+    quantized = apply_quantization(conv, Quantization()).apply(variables, x)
+    error = (jnp.sqrt(jnp.sum((quantized - plain) ** 2, axis=(0, 1, 2)))
+             / jnp.sqrt(jnp.sum(plain ** 2, axis=(0, 1, 2))))
+    assert float(error.max()) < 0.02, np.asarray(error)
+    assert float(error.min()) > 0.0
+
+
 @pytest.mark.mesh
 def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     """The int8 trunk over two stages on the eight simulated devices: finite

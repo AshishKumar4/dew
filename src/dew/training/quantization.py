@@ -36,8 +36,10 @@ without the package the call raises naming it, the way the tokamax branch of
 `dew.nn.moe` behaves.
 """
 import dataclasses
+import functools
 import importlib
 import re
+from collections.abc import Sequence
 from typing import Literal, Protocol, runtime_checkable
 
 import jax
@@ -126,6 +128,85 @@ def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
     return jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
 
 
+def _group_scales(lhs: jax.Array, dimension_numbers: jax.lax.ConvDimensionNumbers,
+                  groups: int) -> jax.Array:
+    """Each example's absolute maximum in each feature group of a
+    convolution's input, `[batch, groups]`, with 1 standing in for an
+    all-zero group."""
+    batch, feature = dimension_numbers.lhs_spec[:2]
+    moved = jnp.moveaxis(lhs, (batch, feature), (0, -1))
+    grouped = moved.reshape(*moved.shape[:-1], groups, moved.shape[-1] // groups)
+    peak = jnp.max(jnp.abs(grouped), axis=(*range(1, moved.ndim - 1), moved.ndim))
+    return jax.lax.stop_gradient(jnp.where(peak > 0, peak, 1).astype(lhs.dtype))
+
+
+def _per_feature(scales: jax.Array, ndim: int, batch: int, feature: int, features: int) -> jax.Array:
+    """`[batch, groups]` scales repeated over each group's `features // groups`
+    contiguous features, laid out to broadcast against an array of rank
+    `ndim` with its batch and feature axes where the arguments say."""
+    repeated = jnp.repeat(scales, features // scales.shape[1], axis=1)
+    shape = [1] * ndim
+    shape[batch], shape[feature] = repeated.shape
+    return (repeated if batch < feature else repeated.T).reshape(shape)
+
+
+class _GroupScaledConvolution:
+    """Quantizes a grouped convolution's input with one scale per feature
+    group, where Qwix (0.1.8 `conv_general.get_how_to_quantize`) takes one
+    per example across every feature.
+
+    A grouped convolution contracts each group's features on their own, so
+    one group's range has no bearing on another's rounding. With one scale
+    across all of them a depthwise convolution rounds each channel against
+    the loudest. The hybrid DiT's spatial fusion, whose channel peaks span
+    36x, came out 4.1% off in int8 against 1.0% with a scale per group, and
+    quantizing it alone dropped the 176M text-to-image model's CLIP score
+    from 0.248 to 0.124.
+    Dividing each group by its own peak before Qwix quantizes, and
+    multiplying each output group by it after, gives the per-group scales
+    exactly: the convolution is linear and keeps groups apart, and every
+    group then peaks at 1, so Qwix's single scale is each group's own.
+    """
+
+    def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
+                             padding: str | Sequence[tuple[int, int]],
+                             lhs_dilation: Sequence[int] | None = None,
+                             rhs_dilation: Sequence[int] | None = None,
+                             dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+                             feature_group_count: int = 1, batch_group_count: int = 1,
+                             precision: jax.lax.PrecisionLike = None,
+                             preferred_element_type: jax.typing.DTypeLike | None = None,
+                             out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+        convolve = functools.partial(
+            super().conv_general_dilated,  # pyright: ignore[reportAttributeAccessIssue]
+            rhs=rhs, window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
+            rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
+            feature_group_count=feature_group_count, batch_group_count=batch_group_count,
+            precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
+        rule, _ = self._get_current_rule_and_op_id(  # pyright: ignore[reportAttributeAccessIssue]
+            "conv_general_dilated", only_rule=True)
+        if feature_group_count == 1 or rule is None or rule.act_qtype is None:
+            return convolve(lhs=lhs)
+        numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+        scales = _group_scales(lhs, numbers, feature_group_count)
+        batch, feature = numbers.lhs_spec[:2]
+        out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
+        batch, feature = numbers.out_spec[:2]
+        return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
+
+
+@functools.cache
+def _qt_provider() -> type:
+    """Qwix's quantized-training provider with Dew's grouped convolution;
+    importing Qwix here keeps it optional."""
+    qwix = importlib.import_module("qwix")
+
+    class QtProvider(_GroupScaledConvolution, qwix.QtProvider):
+        pass
+
+    return QtProvider
+
+
 def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
 
@@ -149,7 +230,7 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
         for pattern in spec.patterns
     ]
     methods = tuple(method for method in METHODS if hasattr(model, method))
-    return qwix.quantize_model(model, qwix.QtProvider(rules), methods=methods)
+    return qwix.quantize_model(model, _qt_provider()(rules), methods=methods)
 
 
 @runtime_checkable
