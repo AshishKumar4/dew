@@ -43,7 +43,7 @@ import optax
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers
 from dew.objectives.base import Step, scalar_loss
-from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
+from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.registry import presets, samplers
 from dew.training import Trainer
@@ -68,7 +68,7 @@ def run_config(directory):
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
         preset=presets.Flow(), sampler=samplers.Euler(), sampling_steps=3, guidance=None,
         text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
-        autoencoder=StableDiffusionAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
+        autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=())
 
 
