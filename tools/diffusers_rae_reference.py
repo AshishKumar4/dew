@@ -35,11 +35,18 @@ float32 tensors.
 revisions, for `tests/fixtures/rae_published.npz`: the latent of a smooth
 256x256 image (its first 32 channels) and the decode of a fixed standard
 normal latent (its top-left 64x64 pixels), in float64, and the patch tokens
-`facebook/dinov2-base` gives the image at 224 pixels (its first 32 channels), and how far the
-source's own float32 run lands from each. SigLIP's residual stream reaches
+`facebook/dinov2-base` gives the image at 224 pixels (its first 32
+channels), and how far the source's own float32 run lands from each. SigLIP's residual stream reaches
 several hundred, so float32 rounding alone moves its latent by 2e-5 of the
 largest value. Both inputs are built from numpy alone, so a test rebuilds
 them without the fixture.
+
+diffusers 0.40.0 asks for huggingface-hub 1.x and transformers 4.57.1 for
+0.x, so the two install in turn, the second moving huggingface-hub to 0.36.2;
+nothing here reaches the Hub API that changed. With torch 2.8.0, CPU:
+
+    uv pip install torch==2.8.0 diffusers==0.40.0
+    uv pip install transformers==4.57.1
 
     python tools/diffusers_rae_reference.py OUTPUT_DIR
     python tools/diffusers_rae_reference.py bundle OUTPUT_DIR tests/fixtures/rae.tar.xz
