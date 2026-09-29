@@ -130,8 +130,10 @@ class AudioCondition:
 
 
 @dataclasses.dataclass(frozen=True)
-class StableDiffusionAutoencoder:
-    """Run latent diffusion behind the vendored Stable Diffusion VAE."""
+class PretrainedAutoencoder:
+    """Run latent diffusion behind a published autoencoder: a Stable
+    Diffusion AutoencoderKL, or a DC-AE where the checkpoint's config names
+    `AutoencoderDC` (`dew.nn.autoencoders.pretrained.load_autoencoder`)."""
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
@@ -141,14 +143,13 @@ class StableDiffusionAutoencoder:
     """Per-dataset latent statistics; None keeps the checkpoint's."""
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
-        """Bind supplied VAE params while reconstructing its model metadata."""
-        from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+        """Bind supplied params while reconstructing the model from its config."""
+        from dew.nn.autoencoders.pretrained import load_autoencoder
         from dew.registry import resolve_dtype
 
-        return StableDiffusionVAE(self.modelname, revision=self.revision,
-                                  dtype=resolve_dtype(self.dtype),
-                                  latent_shift=self.latent_shift, latent_scale=self.latent_scale,
-                                  params=params)
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=resolve_dtype(self.dtype),
+                                latent_shift=self.latent_shift, latent_scale=self.latent_scale,
+                                params=params)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,7 +179,7 @@ class DiffusionRunConfig(RunConfig):
     """The audio condition, under the same `textcontext` keyword in place of
     text, so it needs `text` None and a `VideoDataset`, whose clips carry the
     audio."""
-    autoencoder: StableDiffusionAutoencoder | None = None
+    autoencoder: PretrainedAutoencoder | None = None
     """Set for latent diffusion; None trains in pixel space."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The

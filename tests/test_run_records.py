@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from dew.config import migrations
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
 
 RUNS = Path(__file__).resolve().parent / "fixtures" / "runs"
 
@@ -29,10 +29,13 @@ def test_a_run_from_before_the_regime_trains_on_the_sigmas_it_recorded():
     assert run.preset.lognormal() == (-0.4, 1.0)
 
 
-def test_a_run_with_a_regime_keeps_it():
+def test_a_run_with_a_regime_keeps_it_and_its_autoencoder():
+    """The autoencoder is recorded by its fields alone, so the SD VAE the run
+    names reads back as the `PretrainedAutoencoder` it is today."""
     run = DiffusionRunConfig.load(str(RUNS / "hybrid-dit-176m-dfa94d6"))
     assert run.audio is None
     assert run.preset.regime == "latent" and run.preset.lognormal() == (-0.4, 1.0)
+    assert run.autoencoder == PretrainedAutoencoder(modelname="pcuenq/sd-vae-ft-mse-flax", revision="main")
 
 
 def test_a_migrated_run_writes_the_current_version_and_reads_back_equal():

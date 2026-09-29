@@ -28,7 +28,7 @@ from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
+from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
 from dew.training import Checkpoints, Trainer
@@ -333,7 +333,7 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
     record with that revision."""
     config = dataclasses.replace(
         run_config(tmp_path),
-        autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
+        autoencoder=PretrainedAutoencoder(revision="flax", latent_scale=0.5))
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
 
 
@@ -730,7 +730,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         model=ModelConfig("simple_dit", {**MODEL, "patch_size": 2},
                           dtype="float32", attention_impl="reference"),
         text=TextCondition(encoder="clip_text", checkpoint=str(fixtures / "clip/tiny"), dtype="float32"),
-        autoencoder=StableDiffusionAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
+        autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
     params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
