@@ -341,11 +341,11 @@ def test_edm_refuses_an_unspecified_training_distribution():
 
 
 def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
-    from dew.objectives.diffusion.config import DiffusionRunConfig, StableDiffusionAutoencoder
+    from dew.objectives.diffusion.config import DiffusionRunConfig, PretrainedAutoencoder
 
     for config, mean, std in (
         (DiffusionRunConfig(), -1.2, 1.2),
-        (DiffusionRunConfig(autoencoder=StableDiffusionAutoencoder()), -0.4, 1.0),
+        (DiffusionRunConfig(autoencoder=PretrainedAutoencoder()), -0.4, 1.0),
         (DiffusionRunConfig(preset=presets.EDM(P_mean=-0.8, P_std=0.7)), -0.8, 0.7),
     ):
         schedule = config.preset().schedule

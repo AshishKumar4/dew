@@ -1,13 +1,17 @@
-"""Images streamed by URL from Hugging Face datasets of (url, caption) rows."""
+"""Images and video clips streamed by URL from Hugging Face datasets of
+(url, caption) rows."""
 
 from __future__ import annotations
 
 import dataclasses
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from dew.registry import datasets
 
 from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Loading, Tokenize, tokenized
+
+if TYPE_CHECKING:
+    from .online_loader import Fetch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,26 +46,32 @@ class OnlineImages(DatasetSpec):
     timeout: int = 15
     retries: int = 3
 
+    def fetch(self) -> Fetch:
+        """How a fetcher turns one of this spec's urls into a sample."""
+        from .online_loader import Fetch
+
+        return Fetch(size=self.image_size, min_size=self.min_image_size,
+                     timeout=self.timeout, retries=self.retries)
+
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         if not self.sources:
             raise ValueError(f"{type(self).__name__} needs sources= set to one or more datasets")
-        from .online_loader import ImageStream, load_rows
+        from .online_loader import UrlStream, load_rows
 
         rows = load_rows(self.sources)
 
         def stream(partition: DataPartition) -> Iterator[Batch]:
             if partition.readers > 1:
                 raise ValueError(
-                    f"{type(self).__name__} yields whichever images its fetches return "
+                    f"{type(self).__name__} yields whichever samples its fetches return "
                     f"first, so the {partition.readers} processes that read share "
                     f"{partition.index} of {partition.count} would train on different "
-                    f"images as one; lay the mesh out so every process holds rows of "
+                    f"samples as one; lay the mesh out so every process holds rows of "
                     f"its own (no sequence or stage axis across processes)")
-            return ImageStream(
+            return UrlStream(
                 rows.shard(num_shards=partition.count, index=partition.index),
-                batch=partition.rows(batch), size=self.image_size, min_size=self.min_image_size,
+                batch=partition.rows(batch), fetch=self.fetch(),
                 workers=self.loading.workers, threads=self.loading.threads,
-                timeout=self.timeout, retries=self.retries,
                 prefetch=self.loading.worker_buffer)
 
         return Dataset(train=tokenized(stream, tokenize), val=None,
@@ -90,3 +100,22 @@ class CombinedOnline(OnlineImages):
         "gs://dew-datasets-regional/datasets/cc3m",
         "gs://dew-datasets-regional/datasets/laion2B-en-aesthetic-4.2_37M",
     )
+
+
+@datasets("online_videos")
+@dataclasses.dataclass(frozen=True)
+class OnlineVideos(OnlineImages):
+    """Fetches video clips by url as they are read, an endless stream.
+
+    Each url's video is decoded the way `VideoDataset` reads a local clip:
+    `frames` consecutive frames at 25 fps from a random start, each resized
+    to an `image_size` square, and no audio. A row is dropped and counted
+    when its url yields no video `frames` long, or when the video is under
+    `min_image_size` on its shorter side. Needs the streaming extra and the
+    `av` extra.
+    """
+
+    frames: int = 16
+
+    def fetch(self) -> Fetch:
+        return dataclasses.replace(super().fetch(), frames=self.frames)
