@@ -352,10 +352,8 @@ class TrainingDisplay:
 
     def rows(self) -> list[tuple[str, Row]]:
         """The metrics to show as (group, row) pairs, grouped in the order
-        each group was first logged. A metric whose values are those of the
-        first one logged, the loss, is an alias for it and is left out."""
-        rows = [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
-        return rows[:1] + [(group, row) for group, row in rows[1:] if row.values != rows[0][1].values]
+        each group was first logged."""
+        return [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
 
     def scores(self, evaluation: Evaluation) -> Text:
         """An evaluation's scores, each with its change since the split's
@@ -449,7 +447,8 @@ class TrainingDisplay:
         value, a sparkline and its change across the sparkline; those that
         have held one value share a line per group. Groups stay whole, and
         fill two columns where one would be taller than `lines` or where
-        there are many rows and the room for them."""
+        there are many rows and the room for them. A terminal too narrow
+        for the sparklines gets the names and values alone."""
         groups: dict[str, list[Row]] = {}
         for group, row in rows:
             groups.setdefault(group, []).append(row)
@@ -462,7 +461,9 @@ class TrainingDisplay:
         columns = 2 if len(groups) > 1 and fits and (height > lines or (roomy and height > 8)) else 1
         column_width = (inner - (columns - 1) * 4) // columns
         # As wide as the room, or as the longest history while it is shorter.
+        graphs = column_width - fixed >= 4
         spark = min(TREND, column_width - fixed, max(len(row.values) for _, row in rows))
+        name_width = min(name_width, max(4, column_width - 12))
 
         # Whole groups, in order, into columns of about equal height.
         stacks: list[list[RenderableType]] = [[] for _ in range(columns)]
@@ -473,17 +474,21 @@ class TrainingDisplay:
             table = Table.grid(padding=(0, 2))
             table.add_column(width=name_width, no_wrap=True, overflow="ellipsis")
             table.add_column(justify="right", no_wrap=True, width=10)
-            table.add_column(no_wrap=True, width=spark)
-            table.add_column(justify="right", no_wrap=True, width=9)
+            if graphs:
+                table.add_column(no_wrap=True, width=spark)
+                table.add_column(justify="right", no_wrap=True, width=9)
             steady = Text(overflow="fold")
             for row in named:
-                values = list(row.values)[-spark:]
-                value = Text(number(values[-1], row.shown), "bold")
-                if len(values) >= 3 and min(values) == max(values):
+                value = Text(number(row.values[-1], row.shown), "bold")
+                if len(row.values) >= 3 and min(row.values) == max(row.values):
                     steady.append("   " if steady else "  ").append(f"{row.name} ", LABEL).append_text(value)
                     continue
-                table.add_row(Text(f"  {row.name}", LABEL), value, sparkline(values),
-                              change(values[0], values[-1], row.shown) if len(values) > 1 else Text())
+                cells: list[RenderableType] = [Text(f"  {row.name}", LABEL), value]
+                if graphs:
+                    values = list(row.values)[-spark:]
+                    cells += [sparkline(values),
+                              change(values[0], values[-1], row.shown) if len(values) > 1 else Text()]
+                table.add_row(*cells)
             stack.append(Text(group, GROUP))
             if table.row_count:
                 stack.append(table)

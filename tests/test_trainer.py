@@ -9,6 +9,7 @@ tracker, and what a failure does to the run.
 
 import dataclasses
 import gc
+import io
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import orbax.checkpoint as ocp
 import pytest
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
+from rich.console import Console
 
 from dew import position
 from dew.artifacts import Representations
@@ -37,6 +39,7 @@ from dew.training import (
     MeshSpec,
     ProfileWindow,
     Trainer,
+    display,
     ema_update,
     trainer as trainer_module,
     write_back,
@@ -823,6 +826,23 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     assert scored[-1][1]["val/spread"] == pytest.approx(expected, rel=1e-6)
     # The first batch's artifact of each pass reaches the tracker.
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [2, 4]
+
+
+@pytest.mark.parametrize("width", [30, 120])
+def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch):
+    """The live panel lays itself out for the terminal it has: one too
+    narrow for the sparklines still shows each metric's name and value,
+    through the evaluations, to the last frame."""
+    screen = io.StringIO()
+    monkeypatch.setattr(display, "terminal", lambda console: True)
+    monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
+                                                            force_terminal=True, color_system=None))
+    make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
+                                           metrics=(Spread([]),))
+
+    last = screen.getvalue().rpartition("dew · ")[2]
+    for name in ("loss", "step_time_ms", "spread"):
+        assert re.search(rf" {name} +\S", last), last
 
 
 def test_a_failing_metric_fails_the_validation_pass():
