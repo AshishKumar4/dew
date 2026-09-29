@@ -66,7 +66,7 @@ For text conditioning, `InputSpec.conditions` maps a model keyword argument to a
 
 With an autoencoder configured, training runs on latents instead of pixels. The denoising model's channel count and spatial shape must match the encoder's output, and the encoder's scaling convention must be kept.
 
-`DiffusionRunConfig.autoencoder` is a `PretrainedAutoencoder`, which builds the autoencoder its checkpoint's config names: a Stable Diffusion `AutoencoderKL`, or SANA's deep compression autoencoder (`AutoencoderDC`), whose f32c32 checkpoints downsample 32 times into 32 channels. A DC-AE repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era Flax layouts:
+`DiffusionRunConfig.autoencoder` is a `PretrainedAutoencoder`, which builds the autoencoder its checkpoint's config names: a Stable Diffusion `AutoencoderKL`, SANA's deep compression autoencoder (`AutoencoderDC`; the f32c32 checkpoints downsample 32 times into 32 channels), or Wan 2.1's causal video VAE (`AutoencoderKLWan`, read from a pipeline's `vae/`). A DC-AE or Wan repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era Flax layouts:
 
 ```python
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
@@ -76,6 +76,8 @@ config = DiffusionRunConfig(autoencoder=PretrainedAutoencoder(
 ```
 
 On the published SANA 1.1 weights and a 256x384 batch, the DC-AE port matches diffusers 0.34.0's `AutoencoderDC` to 9e-6 of the largest latent value and 3e-6 of the largest decoded pixel.
+
+The Wan VAE compresses time as well as space: a clip of 1 + 4k frames encodes to 1 + k latent frames, each 8 times smaller on a side with 16 channels, and a `VideoDataset` run's clips need that length. Each frame reads only the frames before it, so the first frame encodes alone and an image is a one-frame clip. On `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` and a 9-frame 128x192 clip, the port matches diffusers 0.34.0's `AutoencoderKLWan`: the largest difference, divided by the larger of 1 and the largest reference value, is 1.5e-6 for the latent and 8.8e-6 for the decoded pixels (`tests/test_wan_vae.py`, a `network` test).
 
 To condition on sound, `HFAudio` (`hf_audio`) runs a transformers audio model, such as wav2vec2 or Whisper's encoder, through torchax (the `torchax` extra) and hands the model its last hidden states under the same `textcontext` keyword. A run selects it with `DiffusionRunConfig(data=LocalVideos(...), text=None, audio=AudioCondition())`, or `text:None audio:audio-condition` on the command line. The video dataset's `audio_model` names the tower, its clips' `audio` field carries the extractor's input, and the clip length sets the waveform length every clip and the silent unconditional input are encoded at. Sampling takes one `{"audio": waveform}` record per sample, mono at the extractor's rate.
 

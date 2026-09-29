@@ -204,7 +204,8 @@ class TrainingDisplay:
     evaluations: dict[str, tuple[Evaluation, Evaluation | None]] = dataclasses.field(default_factory=dict)
     phase: str = ""
     ended: bool = False
-    spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT))
+    # How the phase is drawn, not what the display holds: left out of equality.
+    spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT), compare=False)
     live: Live | None = None
 
     @property

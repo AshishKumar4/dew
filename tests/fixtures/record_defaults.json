@@ -566,6 +566,8 @@
    "class": "dew.diffusion.presets.EDM",
    "sets": {}
   },
+  "pretrained": null,
+  "rl": null,
   "sampler": {
    "class": "dew.sampling.solvers.EulerAncestral",
    "sets": {}
@@ -583,6 +585,16 @@
   "val_metrics": [
    "clip"
   ]
+ },
+ "dew.objectives.diffusion.config.FlowGRPO": {
+  "adv_clip_max": 5.0,
+  "beta": 0.0,
+  "clip_range": 0.0001,
+  "groups": 4,
+  "noise_level": 0.7,
+  "reward": "clip_score",
+  "rollout_steps": 11,
+  "train_steps": null
  },
  "dew.objectives.diffusion.config.PretrainedAutoencoder": {
   "dtype": "bfloat16",
