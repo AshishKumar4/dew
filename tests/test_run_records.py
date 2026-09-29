@@ -55,3 +55,20 @@ def test_a_current_record_missing_a_field_is_refused():
 def test_a_record_of_an_unknown_version_is_refused(version):
     with pytest.raises(ValueError, match="version"):
         DiffusionRunConfig.from_dict({**record("hybrid-dit-176m-dfa94d6"), "version": version})
+
+
+def test_another_run_keeps_its_missing_fields_refused():
+    """The steps migrate the records of the runs that changed: a run of its
+    own with an `audio` field is not a diffusion run's history."""
+    import dataclasses
+
+    from dew.config import RunConfig
+
+    @dataclasses.dataclass(frozen=True)
+    class ListeningRun(RunConfig):
+        audio: str | None = None
+
+    written = ListeningRun().to_dict()
+    del written["version"], written["audio"]
+    with pytest.raises(ValueError, match=r"missing fields \['audio'\]"):
+        ListeningRun.from_dict(written)
