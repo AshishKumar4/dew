@@ -114,15 +114,19 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
 
 def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
     """`pil()` drops the rows a row plan padded, maps [-1, 1] to [0, 255],
-    and refuses a result that kept only latents."""
+    and refuses a result that kept only latents or holds video."""
     pixels = jnp.stack([jnp.full((2, 3, 3), -1.0), jnp.full((2, 3, 3), 1.0), jnp.zeros((2, 3, 3))])
-    pictures = Images(pixels, rows=2).pil()
+    pictures = Images(pixels, rows=2, latents=jnp.zeros((3, 1, 1, 4))).pil()
     assert [picture.size for picture in pictures] == [(3, 2), (3, 2)]
     assert [picture.mode for picture in pictures] == ["RGB", "RGB"]
     np.testing.assert_array_equal(np.asarray(pictures[0]), np.zeros((2, 3, 3), np.uint8))
     np.testing.assert_array_equal(np.asarray(pictures[1]), np.full((2, 3, 3), 255, np.uint8))
+    gray = Images(jnp.ones((1, 2, 3, 1)), rows=1).pil()[0]
+    assert gray.mode == "L" and gray.size == (3, 2) and np.all(np.asarray(gray) == 255)
     with pytest.raises(ValueError, match="decode"):
         Images(None, rows=1, latents=jnp.zeros((1, 2, 2, 4))).pil()
+    with pytest.raises(ValueError, match="shape"):
+        Images(jnp.zeros((1, 4, 2, 3, 3)), rows=1).pil()
 
 
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
