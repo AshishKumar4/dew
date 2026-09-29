@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -123,6 +123,21 @@ class Aux(Generic[Effects]):
     collection, in which case the clip steps aside."""
     effects: Effects | None = None
     """Additive observations applied once on a supported optimizer commit."""
+
+
+@dataclass(frozen=True)
+class Shown:
+    """How the training display shows one reported metric.
+
+    `better` says which way the metric improves, "higher" or "lower", and
+    colours its change as progress or regress; `percent` shows a fraction as
+    a percentage; `group` files it under a heading other than its name's
+    prefix. A metric nothing declares is shown by its name, plainly.
+    """
+    better: Literal["higher", "lower"] | None = None
+    percent: bool = False
+    group: str | None = None
+
 
 
 @struct.dataclass
@@ -234,6 +249,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
+    shown: Mapping[str, Shown] = {}
+    """How the display shows the metrics `loss` reports, by the names it
+    reports them under, and the loss itself, under `loss`, where the
+    trainer's default (lower is better) does not hold."""
 
     def held_variables(self) -> Variables | None:
         """The arrays this objective starts from, or None when it draws them.
@@ -386,7 +405,8 @@ class Metric(Protocol[S]):
 
     The first contribution initializes a pass. State belongs to that pass
     alone; merge may update its owned buffers in place. Metrics must never
-    perform process collectives or retain state between passes.
+    perform process collectives or retain state between passes. A metric
+    may carry `shown`, a `Shown` for how the training display shows it.
     """
 
     @property

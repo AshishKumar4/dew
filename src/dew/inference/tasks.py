@@ -253,13 +253,16 @@ def _pulled(repo_id: str) -> str:
 
 
 def run_record(directory: str) -> Mapping[str, object]:
-    """Read the `run.json` a run directory publishes beside its checkpoints."""
+    """Read the `run.json` a run directory publishes beside its checkpoints,
+    brought forward to today's fields (`dew.config.migrations`)."""
     import json
 
     from etils import epath
 
     from dew.checkpoints import RUN_FILE
-    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
+    from dew.config import RunConfig, migrations
+    raw = json.loads((epath.Path(directory) / RUN_FILE).read_text())
+    return named_fields(migrations.migrate(RunConfig, raw), RUN_FILE)
 
 
 def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
@@ -396,15 +399,16 @@ class TextGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
         rebuilt the way the recipe built it, over the weights of its latest
         checkpoint (or `step`), decoding through the run's own tokenizer.
 
-        `ema` reads the averaged weights, except under an objective whose
-        average is a reference policy rather than the trained one. With
+        `ema` reads the averaged weights (None: when the run kept them), except
+        under an objective whose average is a reference policy rather than the
+        trained one. With
         `mesh` the weights restore straight onto that mesh under `layout`,
         the way the trainer places them. dtype overrides computation;
         param_dtype overrides parameter storage, and None preserves what the
@@ -421,7 +425,7 @@ class TextGeneration:
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
         objective_type = objectives[kind]
-        variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
+        variables = restore_variables(directory, ema=False if objective_type._ema_is_reference else ema,
                                       step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if kind == "ppo":
             from dew.objectives.rl.ppo import _part
@@ -435,7 +439,7 @@ class TextGeneration:
                    max_new_tokens=budget if budget else None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -519,7 +523,7 @@ class BlockGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
@@ -549,7 +553,7 @@ class BlockGeneration:
                    processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -618,7 +622,7 @@ class MaskedGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
@@ -644,7 +648,7 @@ class MaskedGeneration:
                    max_new_tokens=budget or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
