@@ -553,11 +553,11 @@ is the warm guided denoiser call over 12 prompts (batch 24, median of 5),
 sample is the warm wall time of 12 images with 20 DPM-Solver++(2M) steps at
 guidance 5 including text encoding and decoding, CLIP is the mean ViT-L/14
 cosine over 12 prompts at seeds 0 and 1, and memory is the denoiser's weight
-bytes and the compiled forward's temporaries.
+bytes and the compiled forward's temporaries, in MiB.
 
 RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 
-| compute | precision | forward ms | sample s | CLIP | weights MB | temporaries MB |
+| compute | precision | forward ms | sample s | CLIP | weights MiB | temporaries MiB |
 |---|---|---:|---:|---:|---:|---:|
 | fp32 | none | 53.3 | 1.24 | 0.2474 | 670 | 182 |
 | fp32 | int8w | 52.0 | 1.26 | 0.2489 | 183 | 183 |
@@ -572,8 +572,9 @@ RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
 
 Weight-only quantization saves memory, not time: the kernels take 27% of
 their fp32 bytes and the forward runs as fast as the unquantized one in the
-same compute dtype. Weights and activations in int8 or fp8 make the bf16
-forward 21% faster (28.3 ms against 36.0) and the fp32 one 35% faster. Every
+same compute dtype. Weights and activations in int8 or fp8 take 21% off the
+bf16 forward's time (28.3 ms against 36.0) and 35% to 39% off the fp32
+one's (34.7 and 32.5 ms against 53.3). Every
 quantized row keeps CLIP within 0.002 of fp32.
 
 The spatial fusion's depthwise convolutions stay unquantized on this card

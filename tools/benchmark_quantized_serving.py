@@ -6,10 +6,10 @@ with their scales (`dew.training.quantization.quantize_for_serving`). This
 tool loads a model once in a compute dtype, quantizes it as one precision
 says, and prints one JSON line:
 
-- `weights_mb`: the denoiser's parameter bytes.
+- `weights_mib`: the denoiser's parameter bytes, in MiB.
 - `forward_ms`: the median of 5 warm denoiser forwards over the guided batch
   (every prompt twice, conditional and unconditional), as one sampling step
-  runs it; `arguments_mb` and `temporaries_mb` are that compiled forward's
+  runs it; `arguments_mib` and `temporaries_mib` are that compiled forward's
   memory as XLA reports it.
 - `sample_s`: the warm wall time of sampling every prompt at once, 20
   DPM-Solver++(2M) steps with guidance 5, encoding the prompts and decoding
@@ -107,10 +107,10 @@ def forward(pipe: TextToImage) -> dict:
         started = time.perf_counter()
         jax.block_until_ready(compiled(variables, x, t))
         times.append(time.perf_counter() - started)
-    return {"weights_mb": round(nbytes(variables["params"]) / 2**20, 1),
+    return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
             "forward_ms": round(1e3 * statistics.median(times), 2),
-            "arguments_mb": round(memory.argument_size_in_bytes / 2**20, 1),
-            "temporaries_mb": round(memory.temp_size_in_bytes / 2**20, 1)}
+            "arguments_mib": round(memory.argument_size_in_bytes / 2**20, 1),
+            "temporaries_mib": round(memory.temp_size_in_bytes / 2**20, 1)}
 
 
 def sample(pipe: TextToImage, seed: int, decode_batch: int) -> np.ndarray:

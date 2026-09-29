@@ -295,7 +295,7 @@ def quantize_for_serving(model: nn.Module, variables: Mapping[str, object], spec
 
     This is Qwix's post-training quantization. The returned variables hold
     each matched kernel as int8 or fp8 values with their scales, in place of
-    the float kernel, so the weights take a quarter of fp32's memory, and the
+    the float kernel, so the weights take about a quarter of fp32's memory, and the
     returned module computes with them. Unless `spec.weight_only`, its
     activations quantize at each matmul from their own range, as training
     under `apply_quantization` does, and a matmul of two quantized operands
