@@ -20,7 +20,7 @@ from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
-from dew.training.quantization import Quantization, apply_quantization
+from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving
 
 VOCAB = 64
 SEQ_LEN = 8
@@ -176,6 +176,63 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
              / jnp.sqrt(jnp.sum(plain ** 2, axis=(0, 1, 2))))
     assert float(error.max()) < 0.02, np.asarray(error)
     assert float(error.min()) > 0.0
+
+
+def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
+    """Served weights are int8 values with their scales, and the served
+    projections reproduce the quantized-training forward they were trained
+    under, away from fp32. Observed on CPU: served against wrapped 0.0 on
+    logits of order 3, 1.2e-01 from fp32. (Qwix's serving and training
+    providers quantize attention's matmuls of two activations differently:
+    with those quantized too, the two forwards differ by 3e-02.)"""
+    pytest.importorskip("qwix")
+    spec = Quantization(patterns=(".*_proj",))
+    model, qmodel, variables, ids = quantized_forward(spec)
+    served, served_variables = quantize_for_serving(model, variables, spec, ids)
+    dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
+    assert jnp.dtype(jnp.int8) in dtypes
+    logits = served.apply(served_variables, ids)
+    assert float(jnp.max(jnp.abs(logits - qmodel.apply(variables, ids)))) < 1e-4
+    assert float(jnp.max(jnp.abs(logits - model.apply(variables, ids)))) > 1e-2
+
+
+@pytest.mark.parametrize("weight_only", [False, True])
+def test_a_served_bf16_module_computes_in_bf16(weight_only):
+    """A quantized kernel follows the module's compute dtype as its float
+    kernel would: a bf16 Dense stays bf16 through its matmul. Before, the
+    fp32 scales of the stored kernel promoted it to fp32."""
+    pytest.importorskip("qwix")
+    from flax import linen as nn
+
+    dense = nn.Dense(16, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (4, 32), jnp.bfloat16)
+    variables = dense.init(jax.random.key(1), x)
+    served, served_variables = quantize_for_serving(dense, variables, Quantization(weight_only=weight_only), x)
+    assert served.apply(served_variables, x).dtype == jnp.bfloat16
+
+
+def test_serving_leaves_complex_matmuls_in_float():
+    """Qwix quantizes real values only; a complex matmul, like the S5 scan's
+    in the hybrid DiT, runs unquantized beside the quantized Dense, within
+    int8 rounding of float. Observed on CPU: 4e-03 relative."""
+    pytest.importorskip("qwix")
+    from flax import linen as nn
+
+    class Rotated(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            h = nn.Dense(8)(x).astype(jnp.complex64)
+            rotation = jnp.exp(1j * jnp.arange(64.0).reshape(8, 8))
+            mixed = jnp.einsum("bf,fg->bg", h, rotation)
+            return jnp.real(jax.lax.dot_general(mixed, rotation, (((1,), (0,)), ((), ()))))
+
+    model = Rotated()
+    x = jax.random.normal(jax.random.key(0), (4, 16))
+    variables = model.init(jax.random.key(1), x)
+    served, served_variables = quantize_for_serving(model, variables, Quantization(), x)
+    plain = model.apply(variables, x)
+    error = jnp.linalg.norm(served.apply(served_variables, x) - plain) / jnp.linalg.norm(plain)
+    assert 0.0 < float(error) < 0.02
 
 
 @pytest.mark.mesh
