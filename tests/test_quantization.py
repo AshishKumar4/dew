@@ -238,6 +238,27 @@ def test_a_served_bf16_module_computes_in_bf16(weight_only):
     assert served.apply(served_variables, x).dtype == jnp.bfloat16
 
 
+def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
+    """A served bf16 Dense multiplies its int8 matmul's int32 accumulator by
+    both scales in float32 and rounds once to bf16. Qwix 0.1.8 rounded the
+    accumulator to bf16 before the scales multiplied in, and XLA:TPU then
+    compiled the int8 matmuls of the bf16 176M text-to-image model with bf16
+    results, which sampled NaN images on a v6e."""
+    pytest.importorskip("qwix")
+    from flax import linen as nn
+    from qwix._src.core import qarray
+
+    dense = nn.Dense(64, use_bias=False, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (8, 256), jnp.bfloat16)
+    variables = dense.init(jax.random.key(1), x)
+    served, served_variables = quantize_for_serving(dense, variables, Quantization(), x)
+    kernel = served_variables["params"]["kernel"].array.astype(jnp.bfloat16)
+    activations = qarray.quantize(x, qarray.HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,)))
+    products = jax.lax.dot(activations.qvalue, kernel.qvalue, preferred_element_type=jnp.int32)
+    scaled = products * activations.scale.astype(jnp.float32) * kernel.scale.astype(jnp.float32)
+    np.testing.assert_array_equal(served.apply(served_variables, x), scaled.astype(jnp.bfloat16))
+
+
 def test_serving_leaves_complex_matmuls_in_float():
     """Qwix quantizes real values only; a complex matmul, like the S5 scan's
     in the hybrid DiT, runs unquantized beside the quantized Dense, within

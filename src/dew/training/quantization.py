@@ -47,7 +47,7 @@ import dataclasses
 import functools
 import importlib
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -193,6 +193,32 @@ def _refuse_grouped_on_gpu() -> None:
             "convolutions, or quantize weights only (weight_only=True)")
 
 
+def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
+    """Qwix's quantized `op` with the product of two quantized operands
+    scaled in float32, then rounded once to the dtype Qwix returns it in.
+
+    Qwix 0.1.8 scales it in the scales' dtype: a bf16 model's int32
+    accumulators became bf16 before either scale multiplied in, and XLA:TPU
+    then emitted its int8 and fp8 matmuls and convolutions with bf16
+    results. The bf16 176M text-to-image model served that way sampled NaN
+    images on a v6e, while the float32 one, whose 8-bit products come out
+    in int32 or float32, sampled as well as unquantized. A weight-only
+    product, one quantized operand, dequantizes before a float matmul and
+    passes through."""
+    qarray = importlib.import_module("qwix._src.core.qarray")
+
+    def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
+        operands = [arg for arg in args if isinstance(arg, qarray.QArray)]
+        if len(operands) < 2:
+            return op(*args, **kwargs)
+        _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
+        rescaled = jax.tree.map(lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+                                args, is_leaf=lambda arg: isinstance(arg, qarray.QArray))
+        return op(*rescaled, **kwargs).astype(dtype)
+
+    return scaled
+
+
 @functools.cache
 def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
@@ -201,12 +227,16 @@ def _providers() -> tuple[type, type]:
     The serving provider also passes complex matmuls through unquantized,
     as the training provider does (`numerics.should_quantize`); Qwix 0.1.8's
     PTQ raises on them instead, and the hybrid DiT's S5 scan multiplies
-    complex states. And it casts a quantized kernel's scales to the dtype a
+    complex states. It casts a quantized kernel's scales to the dtype a
     module promotes its kernel to, where Qwix 0.1.8 passes the kernel
     through: a bf16 module then multiplied bf16 activations by fp32
     dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080)."""
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
     qwix = importlib.import_module("qwix")
+    core = {name: importlib.import_module(f"qwix._src.core.{name}")
+            for name in ("conv_general", "dot_general", "einsum")}
     quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
@@ -257,6 +287,12 @@ def _providers() -> tuple[type, type]:
         pass
 
     class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
+        def __init__(self, rules: Sequence[object]) -> None:
+            super().__init__(
+                rules, _dot_general_fn=_scaled_in_float32(core["dot_general"].dot_general),
+                _einsum_fn=_scaled_in_float32(core["einsum"].einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(core["conv_general"].conv_general_dilated))
+
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
             if _real(lhs.dtype, rhs.dtype):
