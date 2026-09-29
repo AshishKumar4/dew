@@ -430,19 +430,22 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
         return super().decode(params, z * self.latents_std.astype(z.dtype) + self.latents_mean.astype(z.dtype))
 
 
-def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32"
+def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32",
+                        params: Variables | None = None
                         ) -> tuple[QwenImageAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build the published autoencoder, its parameters and their source layouts
     from `directory/vae`. Every tensor the module declares must be published,
-    in the shape it declares."""
+    in the shape it declares. Supplied `params` are bound without a weight read."""
     from dew.interop import diffusion
 
     config = json.loads((directory / "vae" / "config.json").read_text())
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
-    tensors = diffusion.component_tensors(directory, "vae")
-    params, layouts = diffusion.record_layouts(
-        "vae", tensors, lambda name: qwen_image_vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-        param_dtype=param_dtype)
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, "vae")
+        params, layouts = diffusion.record_layouts(
+            "vae", tensors, lambda name: qwen_image_vae_path(name, np.ndim(tensors[name])),
+            ("autoencoder",), param_dtype=param_dtype)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     check_tree({"params": params}, model, frame)

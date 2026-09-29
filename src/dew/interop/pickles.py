@@ -65,7 +65,7 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     if importlib.util.find_spec("torch") is None:
         raise ImportError(
             f"{directory} holds PyTorch pickles ({', '.join(shards)}), and converting them needs torch: "
-            f"pip install 'dew-ml[torch]', or open their safetensors conversion at {CONVERT_SPACE} "
+            f"pip install 'dewml[torch]', or open their safetensors conversion at {CONVERT_SPACE} "
             "and load its refs/pr/N revision")
     target.mkdir(parents=True, exist_ok=True)
     outputs = ([WEIGHTS_FILE] if len(shards) == 1 else

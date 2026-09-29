@@ -83,7 +83,7 @@ def _safetensors():
         from safetensors import numpy as safetensors_numpy
     except ImportError as error:
         raise ImportError(
-            "dew.interop needs safetensors: pip install dew-ml[interop]"
+            "dew.interop needs safetensors: pip install dewml[interop]"
         ) from error
     return safetensors, safetensors_numpy
 

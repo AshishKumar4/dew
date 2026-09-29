@@ -273,6 +273,21 @@ def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
     return getattr(objective, 'model', None)
 
 
+def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
+    """The rollout's report of its latest call. A rollout is any callable,
+    and a plain function reports nothing, so the trainer reads `metrics` at
+    this boundary."""
+    return getattr(rollout, 'metrics', {})
+
+
+def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, Shown]:
+    """How the display shows what the rollout and the validation metrics
+    report. Both may declare `shown`, which their protocols leave optional,
+    so the trainer reads it at this boundary."""
+    return {**getattr(rollout, 'shown', {}),
+            **{metric.name: metric.shown for metric in metrics if hasattr(metric, 'shown')}}
+
+
 def _keeps_triton_gemm(model: nn.Module) -> bool:
     """Whether a mixer of the model keeps XLA's Triton GEMM fusions
     (`MixerBase.keeps_triton_gemm`). Any flax module arrives here, so its
@@ -1240,16 +1255,15 @@ class Trainer(Generic[Loss, Effects]):
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
-        model = getattr(self.objective, "model", self.objective)
+        model = _model_of(self.objective)
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.params["params"])})
         compute = getattr(model, "dtype", None)
         precision = "/".join(stored)
         if compute is not None and [str(jnp.dtype(compute))] != stored:
             precision += f" parameters, {jnp.dtype(compute)} compute"
-        shown = {**TRAINER_SHOWN, **self.objective.shown, **getattr(self.rollout, "shown", {}),
-                 **{metric.name: metric.shown for metric in plan.metrics if hasattr(metric, "shown")}}
+        shown = {**TRAINER_SHOWN, **self.objective.shown, **_reported(self.rollout, plan.metrics)}
         agreed("training announcement", functools.partial(
-            self._display.start, started, model=type(model).__name__,
+            self._display.start, started, model=type(self.objective if model is None else model).__name__,
             batch=plan.dataset.batch, precision=precision, shown=shown))
         return False
 
@@ -1544,7 +1558,7 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
                 scalars.update({f"rollout/{name}": float(value)
-                                for name, value in getattr(self.rollout, "metrics", {}).items()})
+                                for name, value in _rollout_metrics(self.rollout).items()})
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)

@@ -41,7 +41,7 @@ Add the extra that matches the hardware:
 
 Each extra installs the accelerator build of the JAX version Dew pins (a GitHub build of 0.11.2 with a compilation-cache fix for process pools on different GPUs). Use these extras rather than PyPI's `jax[cuda13]` or `jax[tpu]`: pip cannot resolve those beside the pin, and a later `-U "jax[...]"` replaces the pinned build. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
-The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. [Cloud TPUs](tpu.md) covers TPU provisioning.
+The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
 ## Optional extras
 
