@@ -335,13 +335,14 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--dew-accent-text);
 }
 
-/* A training log's lines are as long as a terminal's, so they scroll rather than wrap. */
+/* A terminal's lines are as long as its columns, so they scroll rather than
+   wrap, and sit as close as a terminal's so its box edges join. */
 .hero-output-text {
 	flex: 1;
 	margin: 0;
 	padding: 0.8rem 0.9rem;
 	overflow-x: auto;
-	font: 0.78rem/1.65 var(--__sl-font-mono);
+	font: 0.78rem/1.25 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
 	white-space: pre;
 }
@@ -357,6 +358,39 @@ html[data-has-hero][data-past-hero] header.header {
 
 .hero-output-meta a {
 	color: inherit;
+}
+
+/* The terminal's colours, in the site's palette for either theme. */
+.hero-output-text .t-bold {
+	font-weight: 700;
+	color: var(--sl-color-white);
+}
+.hero-output-text .t-red {
+	color: var(--sl-color-red);
+}
+.hero-output-text .t-green {
+	color: var(--sl-color-green);
+}
+.hero-output-text .t-yellow {
+	color: var(--sl-color-orange);
+}
+.hero-output-text .t-blue {
+	color: var(--sl-color-blue);
+}
+.hero-output-text .t-magenta {
+	color: var(--sl-color-purple);
+}
+.hero-output-text .t-cyan {
+	color: var(--dew-accent-text);
+}
+.hero-output-text .t-white {
+	color: var(--sl-color-white);
+}
+.hero-output-text .t-black {
+	color: var(--sl-color-gray-5);
+}
+.hero-output-text .t-dim {
+	opacity: 0.6;
 }
 
 /* Text to image: sampling trajectories that run as they scroll past. */
@@ -428,6 +462,7 @@ html[data-has-hero][data-past-hero] header.header {
 
 .live-sampler {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	gap: 1rem;
 	max-width: 52rem;
 }
@@ -535,6 +570,7 @@ html[data-has-hero][data-past-hero] header.header {
 
 .shown {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	gap: clamp(3rem, 8vh, 5rem);
 }
 
@@ -671,7 +707,8 @@ html[data-has-hero][data-past-hero] header.header {
 
 /* Tutorials. */
 
-.tutorial-list {
+.tutorial-list,
+.try-list {
 	display: grid;
 	grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
 	gap: 0.75rem;
@@ -680,11 +717,13 @@ html[data-has-hero][data-past-hero] header.header {
 	list-style: none;
 }
 
-.tutorial-list li {
+.tutorial-list li,
+.try-list li {
 	margin: 0;
 }
 
-.tutorial-link {
+.tutorial-link,
+.try-link {
 	display: grid;
 	grid-template-columns: auto 1fr auto;
 	align-items: baseline;
@@ -701,7 +740,8 @@ html[data-has-hero][data-past-hero] header.header {
 		transform 150ms ease;
 }
 
-.tutorial-link:hover {
+.tutorial-link:hover,
+.try-link:hover {
 	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
 	color: var(--sl-color-white);
 }
@@ -721,6 +761,25 @@ html[data-has-hero][data-past-hero] header.header {
 	font: 500 0.68rem var(--__sl-font-mono);
 	letter-spacing: 0.06em;
 	color: var(--dew-muted);
+}
+
+/* Try it: a name over what the link offers. */
+
+.try-link {
+	grid-template-columns: minmax(0, 1fr);
+	gap: 0.35rem;
+}
+
+.try-name {
+	font-weight: 560;
+	font-size: 1rem;
+	letter-spacing: -0.01em;
+}
+
+.try-what {
+	font-size: 0.85rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-2);
 }
 
 /* The footer. */
