@@ -30,7 +30,7 @@ RUN useradd --create-home --uid 1001 --shell /usr/sbin/nologin kernel
 # cache's programs target AVX2, which every host this runs on has.
 ENV JAX_PLATFORMS=cpu JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
 	JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2
-COPY warm.py sampler_setup.py sampler.py /opt/live/
+COPY warm.py sampler_setup.py sampler.py progress.py preload.py /opt/live/
 RUN python /opt/live/warm.py && chown -R kernel:kernel /opt/xla /opt/hf
 
 COPY server.py /opt/live/server.py
