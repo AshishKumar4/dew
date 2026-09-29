@@ -9,6 +9,9 @@ import { limitsOf } from './limits';
 /** The header the Worker sets to the session id it verified; the object is reachable only through the Worker. */
 export const SESSION_HEADER = 'X-Dew-Session';
 
+/** How long a session's first connection waits for its container to get a host and open its port. */
+const START_WAIT = { instanceGetTimeoutMS: 90_000, portReadyTimeoutMS: 150_000 };
+
 export class Kernel extends Container<Env> {
 	defaultPort = 8888;
 	// With the page's WebSocket open the container stays up, and server.py applies the
@@ -34,6 +37,14 @@ export class Kernel extends Container<Env> {
 		if (known === undefined) await this.ctx.storage.put('session', session);
 		else if (known !== session) return new Response('wrong session', { status: 409 });
 		if (await this.ctx.storage.get<boolean>('ended')) return new Response('this session is over', { status: 410 });
+		// A cold start fetches the image to the host before it boots, which takes longer than
+		// containerFetch waits for the port (8 s for the instance, 20 s in all); it then answers
+		// 500 and the page's socket never opens.
+		try {
+			await this.startAndWaitForPorts(this.defaultPort, { abort: request.signal, ...START_WAIT });
+		} catch (error) {
+			return new Response(`the container did not start: ${error instanceof Error ? error.message : String(error)}`, { status: 503 });
+		}
 		return this.containerFetch(new Request('http://container/ws', request), this.defaultPort);
 	}
 
