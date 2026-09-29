@@ -128,14 +128,15 @@ def change(first: float, last: float, shown: Shown = PLAIN) -> Text:
     """The change from `first` to `last`: an arrow and its size, relative,
     as a factor once that is ten or more, or in points for a percentage;
     green where it is progress and red where it is regress. A change of
-    ten times its start or more, as through zero, shows only its arrow."""
+    ten times its start or more, as through zero, shows only its arrow;
+    one too small to show at its precision is no change."""
     if not (math.isfinite(first) and math.isfinite(last)):
         return Text()
-    if first == last:
+    relative = abs(last - first) / abs(first) if first else math.inf
+    if first == last or (abs(last - first) < 5e-4 if shown.percent else relative < 5e-4):
         return Text("→", LABEL)
     rising = last > first
     arrow = "↑" if rising else "↓"
-    relative = abs(last - first) / abs(first) if first else math.inf
     if shown.percent:
         size = f" {abs(last - first) * 100:.1f} pt"
     elif first * last > 0 and not 0.1 < last / first < 10:
