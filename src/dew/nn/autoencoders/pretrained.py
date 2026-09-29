@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from dew.objectives.base import Variables
 
 from .api import AutoEncoder
 from .vae import FLAX_REVISIONS
+
+_log = logging.getLogger(__name__)
 
 
 def _class_name(modelname: str, revision: str) -> str | None:
@@ -31,7 +34,9 @@ def _class_name(modelname: str, revision: str) -> str | None:
 
         try:
             path = Path(hf_hub_download(modelname, "config.json", revision=revision))
-        except (EntryNotFoundError, RevisionNotFoundError):
+        except (EntryNotFoundError, RevisionNotFoundError) as missing:
+            _log.debug("%s names no root config at %s (%s); loading it as an AutoencoderKL",
+                       modelname, revision, missing)
             return None
     return json.loads(path.read_text()).get("_class_name") if path.is_file() else None
 

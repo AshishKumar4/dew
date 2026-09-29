@@ -72,7 +72,7 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
     generator = torch.Generator().manual_seed(SEED)
     model = AutoencoderDC(**config).eval()
     with torch.no_grad():
-        for name, module in model.named_modules():
+        for module in model.modules():
             if isinstance(module, torch.nn.BatchNorm2d):
                 module.running_mean.copy_(0.1 * torch.randn(module.running_mean.shape, generator=generator))
                 module.running_var.copy_(torch.rand(module.running_var.shape, generator=generator) + 0.5)
