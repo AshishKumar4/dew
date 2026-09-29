@@ -458,17 +458,44 @@ html[data-has-hero][data-past-hero] header.header {
 	}
 }
 
-/* Sample it yourself: the setup cell, the editable cell, and what it drew on a live kernel. */
+/* The live sampler: the editable cell (with the setup cell folded under it)
+   beside a figure that keeps its size through a run. */
 
 .live-sampler {
 	display: grid;
 	grid-template-columns: minmax(0, 1fr);
-	gap: 1rem;
-	max-width: 52rem;
+	gap: 1.25rem;
+	max-width: 64rem;
 }
 
-.live-sampler .expressive-code {
-	margin: 0;
+@media (min-width: 62rem) {
+	.live-sampler {
+		grid-template-columns: minmax(0, 1fr) 24rem;
+		align-items: start;
+	}
+
+	.sampler-log,
+	.sampler-colab {
+		grid-column: 1 / -1;
+	}
+}
+
+.sampler-code {
+	display: grid;
+	gap: 0.75rem;
+	min-width: 0;
+}
+
+.sampler-setup summary,
+.sampler-log summary {
+	cursor: pointer;
+	font: 500 0.75rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+}
+
+.sampler-setup .expressive-code,
+.sampler-log > div {
+	margin-top: 0.5rem;
 }
 
 .sampler-editor {
@@ -534,18 +561,135 @@ html[data-has-hero][data-past-hero] header.header {
 	outline-offset: -2px;
 }
 
-.sampler-output:empty {
+.sampler-stage {
+	margin: 0;
+	display: grid;
+	gap: 0.6rem;
+	min-width: 0;
+}
+
+/* The frame's shape is fixed: the model draws 256 by 256. */
+.sampler-frame {
+	position: relative;
+	aspect-ratio: 1;
+	width: min(100%, 24rem);
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.6rem;
+	background: var(--dew-output-bg);
+	overflow: hidden;
+}
+
+.sampler-frame img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}
+
+.sampler-frame [hidden] {
 	display: none;
 }
 
-.sampler-output img {
-	display: block;
-	width: min(100%, 24rem);
-	height: auto;
-	border-radius: 0.5rem;
+/* A step's preview is the model's guess at the finished image, drawn from the latent at
+   32 by 32 and blurred rather than shown as blocks; the result fades in over it. */
+.sampler-frame [data-preview] {
+	filter: blur(6px);
+	scale: 1.08;
 }
 
-.sampler-output pre {
+.sampler-frame [data-final] {
+	animation: sampler-arrive 450ms ease-out;
+	transition: opacity 300ms ease;
+}
+
+/* The last run's image stays, faded, until the next run's first preview replaces it. */
+.sampler-stage:is([data-stage='starting'], [data-stage='loading'], [data-stage='sampling']) [data-final] {
+	opacity: 0.35;
+}
+
+@keyframes sampler-arrive {
+	from {
+		opacity: 0;
+	}
+}
+
+.sampler-frame-empty {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	margin: 0;
+	padding: 1rem;
+	text-align: center;
+	font-size: 0.85rem;
+	color: var(--dew-muted);
+}
+
+/* A hairline under the frame: filled by the steps done, or a moving segment while the length of a wait is unknown. */
+.sampler-bar {
+	position: relative;
+	width: min(100%, 24rem);
+	height: 2px;
+	border-radius: 1px;
+	background: var(--dew-rule);
+	overflow: hidden;
+}
+
+.sampler-bar span {
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: calc(var(--progress, 0) * 100%);
+	background: var(--dew-accent-fill);
+	transition: width 250ms ease;
+}
+
+.sampler-stage:is([data-stage='idle'], [data-stage='error']) .sampler-bar span {
+	width: 0;
+}
+
+.sampler-stage:not([data-stage='idle'], [data-stage='error']) .sampler-bar[data-determinate='false'] span {
+	width: 30%;
+	animation: sampler-wait 1.4s ease-in-out infinite;
+}
+
+@keyframes sampler-wait {
+	from {
+		translate: -100% 0;
+	}
+	to {
+		translate: 340% 0;
+	}
+}
+
+.sampler-stage figcaption {
+	min-height: 2.6rem;
+}
+
+.sampler-status,
+.sampler-detail,
+.sampler-colab {
+	margin: 0;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
+}
+
+.sampler-status {
+	color: var(--sl-color-gray-2);
+}
+
+.sampler-stage[data-stage='error'] .sampler-status {
+	color: var(--dew-error);
+}
+
+.sampler-detail {
+	font-family: var(--__sl-font-mono);
+	font-size: 0.75rem;
+	font-variant-numeric: tabular-nums;
+}
+
+.sampler-log pre {
 	margin: 0.5rem 0 0;
 	padding: 0.8rem 0.9rem;
 	border: 1px solid var(--dew-rule);
@@ -555,15 +699,16 @@ html[data-has-hero][data-past-hero] header.header {
 	white-space: pre-wrap;
 }
 
-.sampler-status {
-	margin: 0;
-	font-size: 0.85rem;
-	line-height: 1.55;
-	color: var(--dew-muted);
+.sampler-colab a {
+	color: inherit;
 }
 
-.sampler-status a {
-	color: inherit;
+@media (prefers-reduced-motion: reduce) {
+	.sampler-frame [data-final],
+	.sampler-bar span {
+		animation: none;
+		transition: none;
+	}
 }
 
 /* Shown: cells from the tutorials and what they printed. */
