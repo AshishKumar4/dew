@@ -92,6 +92,67 @@ def test_vae_reconstructs_metadata_without_reloading_supplied_weights(tmp_path, 
         np.testing.assert_array_equal(actual, original)
 
 
+# Hub cache states for the offline test: per candidate, the revision, its
+# subfolder, the config's shift_factor, and whether the weight file is in
+# the cache, recorded missing (`.no_exist`), or unknown.
+OFFLINE_CACHES = {
+    "only the config": ("main", [("main", None, 0.25, "unknown")]),
+    "a recorded miss": ("bf16", [("bf16", "vae", 99.0, "missing"), ("flax", "vae", 0.25, "cached")]),
+    "ambiguous": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("flax", "vae", 0.25, "unknown")]),
+    # The flax layout's bf16/vae against the torch layout's default-branch vae.
+    "ambiguous across layouts": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("main", "vae", 0.25, "unknown")]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(OFFLINE_CACHES))
+def test_supplied_vae_params_load_offline_with_the_config_an_online_load_chose(tmp_path, monkeypatch, case):
+    """A run checkpoint carries the VAE's params, so with the Hub offline the
+    model loads from the configs in the cache, as the live kernel's image
+    does. The Hub's cached record of a missing weight file rules a candidate
+    out, and when the cache cannot tell two candidates apart the load
+    refuses rather than pick a config."""
+    import json
+
+    from huggingface_hub import constants
+
+    import dew.nn.autoencoders.vae as loader
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+
+    config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
+                  layers_per_block=1, norm_num_groups=4, use_quant_conv=False,
+                  use_post_quant_conv=False, shift_factor=0.25, scaling_factor=0.5)
+    revision, entries = OFFLINE_CACHES[case]
+    repo = tmp_path / "models--fixture--vae"
+    (repo / "refs").mkdir(parents=True)
+    for index, (ref, subfolder, shift, weights) in enumerate(entries):
+        commit = str(index) * 40
+        (repo / "refs" / ref).write_text(commit)
+        folder = repo / "snapshots" / commit / (subfolder or "")
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({**config, "shift_factor": shift}))
+        if weights == "cached":
+            (folder / "diffusion_flax_model.msgpack").write_bytes(b"not read")
+        if weights == "missing":
+            absent = repo / ".no_exist" / commit / (subfolder or "") / "diffusion_flax_model.msgpack"
+            absent.parent.mkdir(parents=True, exist_ok=True)
+            absent.write_text("")
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(loader, "_read_vae_weights", lambda *a, **k: pytest.fail("read source weights"))
+
+    model = AutoencoderKL(channels=(8, 16), blocks_per_level=1, norm_groups=4,
+                          quantize=False, post_quantize=False, dtype=jnp.float32)
+    image = jnp.linspace(-0.5, 0.5, 8 * 8 * 3).reshape(1, 8, 8, 3)
+    saved = model.init(jax.random.key(4), image)["params"]
+    if case.startswith("ambiguous"):
+        with pytest.raises(FileNotFoundError, match="cannot tell which VAE config"):
+            StableDiffusionVAE("fixture/vae", revision=revision, params=saved, dtype=jnp.float32)
+        return
+    restored = StableDiffusionVAE("fixture/vae", revision=revision, params=saved, dtype=jnp.float32)
+    expected = StableDiffusionVAE(model=model, params=saved, dtype=jnp.float32,
+                                 latent_shift=0.25, latent_scale=0.5)
+    np.testing.assert_array_equal(restored.encode(restored.params, image), expected.encode(saved, image))
+
 
 @pytest.mark.parametrize("shape", [(2, 8, 8, 4), (2, 3, 8, 8, 4)])
 def test_latent_normalization_shifts_and_scales_roundtrip(rng, shape):
