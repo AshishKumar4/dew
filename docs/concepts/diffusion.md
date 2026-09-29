@@ -106,6 +106,8 @@ The classic integrators are `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `
 
 `FlowSDE` is Flow-GRPO's Euler-Maruyama solver on a rectified-flow process.
 
+`Heun` is Algorithm 2 of Karras et al. (2022), and its `s_churn`, `s_tmin`, `s_tmax` and `s_noise` are that algorithm's stochasticity: inside `[s_tmin, s_tmax]` each step first raises sigma by the factor 1 + min(s_churn / N, sqrt(2) - 1) with fresh noise, then takes the Heun step from there. It matches NVlabs' `edm_sampler` (`tools/edm_reference.py`). The churn walks sigma, so it needs a variance-exploding process, and a walk that would raise sigma past the schedule's top is refused.
+
 `MultiStepDPM` and `DPMSolverMultistep` are different things despite the names. `DPMSolverSDE` is the solver of `DPMSolverSDEScheduler`, not one of the SDE algorithms of `DPMSolverMultistep`: each interval takes two ancestral steps, and both draw noise from one keyed Brownian bridge over the schedule's positive sigma range, so the two draws are nested increments of a single path.
 
 `DDPM(variance="large")` uses the wider published posterior variance, the beta of the variance-preserving forward step. That beta is zero wherever alpha is one, so DDPM refuses a variance-exploding grid instead of sampling it without noise. Neither variance adds noise on the step whose own time is the schedule's zero.
