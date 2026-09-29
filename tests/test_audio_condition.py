@@ -62,6 +62,19 @@ def _tone(hertz, seconds):
     return (0.5 * np.sin(2 * np.pi * hertz * np.arange(int(seconds * RATE)) / RATE)).astype(np.float32)
 
 
+def test_the_audio_processor_pads_a_batch_to_its_longest_or_to_the_models_window(towers):
+    """wav2vec2's extractor pads nothing unless asked, so a batch of two
+    lengths comes back padded to the longer; Whisper's encoder reads a fixed
+    30-second window, so even a short clip comes back at its 3000 frames."""
+    from dew.data import AutoAudioProcessor
+
+    values = AutoAudioProcessor(modelname=str(towers / "wav2vec2"))([_tone(440, 0.025), _tone(440, 0.05)])
+    features = AutoAudioProcessor(modelname=str(towers / "whisper"))(_tone(440, 0.05))
+
+    assert values["input_values"].dtype == np.float32 and values["input_values"].shape == (2, 800)
+    assert features["input_features"].shape == (1, 8, 3000)
+
+
 @pytest.mark.parametrize("name, key", [("wav2vec2", "input_values"), ("whisper", "input_features")])
 def test_the_audio_tower_encodes_what_transformers_computes(towers, name, key):
     """The states are transformers' own, from the extractor's input the model

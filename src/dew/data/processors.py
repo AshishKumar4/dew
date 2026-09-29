@@ -4,6 +4,7 @@ These run inside grain's workers, so the device only ever sees ready tensors.
 `transformers` is imported on construction, not on import.
 """
 
+import inspect
 from typing import Protocol, runtime_checkable
 
 from .text import load_tokenizer
@@ -59,15 +60,17 @@ class AutoAudioProcessor:
         self.tensor_type = tensor_type
         stated = self.processor.sampling_rate if isinstance(self.processor, Sampled) else 16000
         self.sampling_rate = sampling_rate or stated
+        # An extractor that pads to a fixed window by default (Whisper's 30
+        # seconds, which its encoder is built for) keeps that; one that pads
+        # nothing by default (wav2vec2's) pads a batch to its longest
+        # waveform, so rows of several lengths still stack.
+        padding = inspect.signature(self.processor.__call__).parameters.get("padding")
+        self.padding = {} if padding is None else {"padding": padding.default or True}
 
     def __call__(self, audio):
-        """The extractor's arrays for one waveform or a batch of equal-length ones.
-
-        Each extractor pads the way its model reads: Whisper's to the
-        30-second window its encoder is built for, wav2vec2's not at all.
-        """
+        """The extractor's arrays for one waveform or a batch of them."""
         features = self.processor(audio, sampling_rate=self.sampling_rate,
-                                  return_tensors=self.tensor_type)
+                                  return_tensors=self.tensor_type, **self.padding)
         return dict(features)
 
     def __repr__(self):
