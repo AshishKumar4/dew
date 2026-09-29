@@ -215,12 +215,37 @@ def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
     np.testing.assert_array_equal(np.asarray(rebound.encode(rebound.params, image)), expected)
 
 
-def test_every_parameter_takes_a_layout_the_sharding_rules_can_place(variant):
-    """Placement reads a leaf's axes from its module's name; a DC-AE name
-    that matched another module's declaration of fewer axes (a bare
-    `proj_out`, a 2-D projection) left a run unable to place its variables."""
-    from dew.nn.sharding import declared_axes
+def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
+    """A diffusion run places the DC-AE's variables beside the model's and
+    trains the model alone. Placement reads a leaf's axes from its module's
+    name, and a DC-AE module named like another's declaration of fewer axes
+    (a bare `proj_out`) left the run unable to place its variables."""
+    import optax
+    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 
-    _, (_, params, _, _), _ = variant
-    for path, leaf in jax.tree_util.tree_leaves_with_path({"autoencoder": params}):
-        declared_axes(path, np.ndim(leaf))
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import Dataset, OxfordFlowers
+    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+    from dew.registry import samplers
+    from dew.training import Trainer
+
+    config = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
+                          dtype="float32", attention_impl="reference"),
+        data=OxfordFlowers(image_size=16), trainer=TrainerConfig(batch_size=8, steps=2),
+        sampler=samplers.Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"))
+    objective = config.build()
+    images = (np.random.default_rng(0).random((8, 16, 16, 3)) * 255).astype(np.uint8)
+    batch = {"image": images, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
+    initial = trainer.initial_state()
+    state = trainer.fit(Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+                        steps=2, log_every=100)
+
+    for before, after in zip(jax.tree.leaves(initial.params["autoencoder"]),
+                             jax.tree.leaves(state.params["autoencoder"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
+             zip(jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True)]
+    assert any(moved)
