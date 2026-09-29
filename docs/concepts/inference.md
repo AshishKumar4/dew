@@ -26,6 +26,17 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 
 `objective.pipeline(state)` picks weights by the same rule without reloading a checkpoint. It keeps the arrays the trainer has already placed. `task.bind(variables)` makes a task over another set of variables. It copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
+`TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`uv pip install qwix`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MB of denoiser weights in place of 670 MB, and in bf16 with int8 weights and activations it denoises 21% faster, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). On that card (sm_89) XLA:GPU computes the model's depthwise convolutions wrongly in int8 and cannot compile them in fp8, so there they stay out:
+
+```python
+from dew.sampling import TextToImage
+from dew.training.quantization import Quantization
+
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
+served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
+images = served(["a red fox in a snowy forest"], steps=20, seed=0).host().images
+```
+
 ## Placement
 
 Without `mesh`, the default `MeshSpec()` puts the current process pool's devices on data parallelism. Pass `mesh=MeshSpec(...)` for another layout. Weights are placed with `Layout.shardings` and its replication check, the same way the trainer places them. Checkpoint restore gets explicit shardings for the current devices. It does not reuse the topology the writer recorded.
