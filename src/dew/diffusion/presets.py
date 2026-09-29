@@ -27,6 +27,7 @@ from dew.diffusion.transforms import (
     KarrasPredictionTransform,
     MinSNR,
     ScheduleWeighting,
+    VelocityLoss,
     VPredictionTransform,
     Weighting,
 )
@@ -220,6 +221,29 @@ class Flow:
                 density=self.density, mode_scale=self.mode_scale),
             prediction=FlowMatchPredictionTransform(),
             weighting=_weighting(self.min_snr_gamma))
+
+
+@presets("jit")
+@dataclass(frozen=True)
+class JiT:
+    """JiT (Li & He 2025, "Back to Basics: Let Denoising Generative Models
+    Denoise"): rectified flow on the linear path in which the model
+    predicts the clean sample and is scored in velocity space
+    (`VelocityLoss`). Its training times are LTH14/JiT's logit-normal at
+    P_mean -0.8 and P_std 0.8 in its clean-at-one time, which is Dew's
+    noise-at-one time at `logit_mean` 0.8. The reference's `noise_scale` is
+    1, its value at 256 pixels.
+    """
+
+    logit_mean: float = 0.8
+    logit_std: float = 0.8
+    t_eps: float = 0.05
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=FlowMatchingScheduler(logit_mean=self.logit_mean, logit_std=self.logit_std),
+            prediction=DirectPredictionTransform(),
+            weighting=VelocityLoss(self.t_eps))
 
 
 @presets("sqrt")

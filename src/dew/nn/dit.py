@@ -96,22 +96,31 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
 
 class PatchEmbedding(nn.Module):
     """Non-overlapping `patch_size` patches through one convolution, as a
-    row-major token sequence `[B, H_P * W_P, embedding_dim]`."""
+    row-major token sequence `[B, H_P * W_P, embedding_dim]`.
+
+    `bottleneck` factors the projection through that many channels, a
+    bias-free patch convolution and then a dense layer, as JiT's
+    `BottleneckPatchEmbed` (Li & He 2025) does for large pixel patches.
+    """
     patch_size: int
     embedding_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    bottleneck: int | None = None
 
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
         assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
-        x = Conv(features=self.embedding_dim,
+        x = Conv(features=self.bottleneck or self.embedding_dim,
                  kernel_size=(self.patch_size, self.patch_size),
                  strides=(self.patch_size, self.patch_size),
+                 use_bias=self.bottleneck is None,
                  dtype=self.dtype,
                  precision=self.precision)(x)
+        if self.bottleneck is not None:
+            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
         return jnp.reshape(x, (batch, -1, self.embedding_dim))
 
 
@@ -150,13 +159,15 @@ class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
     Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
-    way out and is None for raster.
+    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s, in
+    raster order only.
     """
     patch_size: int
     emb_features: int
     scan_order: str = 'raster'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    bottleneck: int | None = None
 
     def setup(self):
         assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
@@ -166,8 +177,11 @@ class PatchSequenceEmbed(nn.Module):
                 embedding_dim=self.emb_features,
                 dtype=self.dtype,
                 precision=self.precision,
+                bottleneck=self.bottleneck,
                 name="patch_embed",
             )
+        elif self.bottleneck is not None:
+            raise ValueError(f"a patch bottleneck embeds raster patches, not {self.scan_order} ones")
         else:
             # The patches arrive already permuted, so a dense projection of
             # the raw pixels replaces the strided convolution.
