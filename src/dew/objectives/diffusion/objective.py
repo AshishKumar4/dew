@@ -29,6 +29,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.mp import Uncertainty
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
@@ -41,6 +42,17 @@ if TYPE_CHECKING:
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
+
+UNCERTAINTY = "loss_uncertainty"
+"""Where the learned loss weighting's head lives in the `params` and
+`constants` collections, beside the model's own modules."""
+
+
+def _without_uncertainty(variables: Variables) -> Variables:
+    """`variables` without the loss's uncertainty head, which the model never reads."""
+    return {name: ({key: value for key, value in tree.items() if key != UNCERTAINTY}
+                   if name in ("params", "constants") else tree)
+            for name, tree in variables.items()}
 
 
 def check_solver(process, sampler, steps: int) -> None:
@@ -76,17 +88,28 @@ class DiffusionObjective(Objective[Mean]):
         guidance: CFG | None = CFG(3.0),
         steps: int = 200,
         pretrained: Variables | None = None,
+        uncertainty: int | None = None,
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
         `sampler`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction.
+
+        `uncertainty` learns EDM2's loss weighting (Karras et al. 2024,
+        Eq. 21): a head u of the model time, `dew.nn.mp.Uncertainty` with
+        this many Fourier channels, and the loss w / e^u ||D - y||^2 + u in
+        place of w ||D - y||^2, halved as Dew's L2 loss is. Its minimum over
+        u is at the log of the weighted error each noise level leaves, so
+        every level contributes about equally. The head trains beside the
+        model under `params`, as `UNCERTAINTY`, and a published task drops it.
+        None keeps the preset's fixed weighting.
         """
         self.model = model
         self.process = process
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.pretrained = pretrained
+        self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
         # The unconditional branch is a pure function of the frozen towers
@@ -162,24 +185,32 @@ class DiffusionObjective(Objective[Mean]):
 
     def init(self, key, variables: Variables | None = None) -> Variables:
         held = self.held_variables() if variables is None else variables
+        head_key = jax.random.fold_in(key, 1)
         if "params" in held:
-            return held
-        conditions = self.encode(held["encoders"])
-        if self.inputs.mask is not None:
-            conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
-                          "masked_image": jnp.zeros((1, *self.latent_shape))}
-        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
-        state: dict[str, Any] = {**drawn, "encoders": held["encoders"]}
-        if "autoencoder" in held:
-            # The frozen weights are state, like the encoders'. They ride in
-            # as an argument to the compiled step for the layout to place.
-            state["autoencoder"] = held["autoencoder"]
+            state: dict[str, Any] = dict(held)
+        else:
+            conditions = self.encode(held["encoders"])
+            if self.inputs.mask is not None:
+                conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
+                              "masked_image": jnp.zeros((1, *self.latent_shape))}
+            drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
+                                    **conditions)
+            state = {**drawn, "encoders": held["encoders"]}
+            if "autoencoder" in held:
+                # The frozen weights are state, like the encoders'. They ride in
+                # as an argument to the compiled step for the layout to place.
+                state["autoencoder"] = held["autoencoder"]
+        if self.uncertainty is not None and UNCERTAINTY not in state["params"]:
+            head = self.uncertainty.init(head_key, jnp.ones((1,)))
+            for collection, value in head.items():
+                state[collection] = {**state.get(collection, {}), UNCERTAINTY: value}
         return state
 
     def trainable(self, params) -> dict:
-        """Return the model's own collections, without the frozen towers."""
-        return {name: value for name, value in params.items()
-                if name not in ("encoders", "autoencoder")}
+        """Return the model's own collections, without the frozen towers or
+        the loss's uncertainty head."""
+        return _without_uncertainty({name: value for name, value in params.items()
+                                     if name not in ("encoders", "autoencoder")})
 
     def encoded_conditions(self, params, batch) -> dict:
         """Encode each condition's own batch field under the tree's frozen towers."""
@@ -242,8 +273,12 @@ class DiffusionObjective(Objective[Mean]):
             train=True, rngs={"dropout": dropout_key})
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         losses = optax.l2_loss(preds, target)
-        weights = expand(self.process.weight(t), losses)
-        return Mean(jnp.sum(losses * weights),
+        weighted = losses * expand(self.process.weight(t), losses)
+        if self.uncertainty is not None:
+            head = {collection: params[collection][UNCERTAINTY] for collection in ("params", "constants")}
+            logvar = expand(self.uncertainty.apply(head, schedule.model_time(t)), losses)
+            weighted = weighted * jnp.exp(-logvar) + logvar / 2
+        return Mean(jnp.sum(weighted),
                     jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
     def _sample_impl(self, params, batch, key, *, count: int):

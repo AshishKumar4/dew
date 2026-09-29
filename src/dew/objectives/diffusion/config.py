@@ -234,6 +234,10 @@ class DiffusionRunConfig(RunConfig):
     unset."""
     rl: FlowGRPO | None = None
     """Train with Flow-GRPO on a reward instead of the denoising loss."""
+    uncertainty: int | None = None
+    """Learn EDM2's loss weighting with a head of this many Fourier channels
+    (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
+    preset's fixed weighting."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered
@@ -379,6 +383,7 @@ class DiffusionRunConfig(RunConfig):
             sampler=self.sampler,
             guidance=self.guidance,
             steps=self.sampling_steps,
+            uncertainty=self.uncertainty,
         )
 
     def rollout(self, objective: DiffusionObjective):

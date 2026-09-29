@@ -9,6 +9,7 @@
  },
  "dew.config.OptimConfig": {
   "clip_grads": 0.0,
+  "forced_weight_normalization": false,
   "learning_rate": 0.00027,
   "optimizer": "adamw",
   "optimizer_opts": {},
@@ -591,6 +592,7 @@
    "class": "dew.config.TrainerConfig",
    "sets": {}
   },
+  "uncertainty": null,
   "unconditional_prob": 0.12,
   "val_metrics": [
    "clip"
