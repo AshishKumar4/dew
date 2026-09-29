@@ -544,6 +544,31 @@ def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
         jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), state.ema)
 
 
+def test_an_ema_held_in_lists_comes_back_bit_for_bit(tmp_path):
+    """Variables may nest sequences; the EMA's leaves inside them are found by
+    their key paths, read whole, alone, and beside weights asked for in
+    another dtype, which sends the weights they undo to a read of their own."""
+    kernels = [bit_patterns((4, 3), np.float32, seed) for seed in (0, 1)]
+    params = {"params": {"layers": [{"w": jnp.asarray(kernel)} for kernel in kernels]}}
+    ema = {"params": {"layers": [{"w": jnp.asarray(bit_patterns((4, 3), np.float32, seed))}
+                                 for seed in (2, 3)]}}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, held_state(params, ema), None)
+    checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def typed(tree, dtype=None):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, dtype or leaf.dtype,
+                                                              sharding=where), tree)
+
+    whole, _ = checkpoints.restore()
+    alone, _ = checkpoints.restore({"ema": typed(ema)})
+    beside, _ = checkpoints.restore({"params": typed(params, jnp.bfloat16), "ema": typed(ema)})
+    for restored in (whole["ema"], alone["ema"], beside["ema"]):
+        assert jax.tree.all(jax.tree.map(same_bits, ema, restored))
+
+
 def test_an_ema_that_follows_its_weights_is_stored_in_fewer_bytes(tmp_path):
     """An average agrees with the weights it follows in its leading bits, and
     the checkpoint stores it in fewer bytes than an EMA that does not."""
