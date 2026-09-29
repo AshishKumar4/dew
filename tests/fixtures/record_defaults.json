@@ -715,7 +715,12 @@
  },
  "dew.sampling.solvers.Euler": {},
  "dew.sampling.solvers.EulerAncestral": {},
- "dew.sampling.solvers.Heun": {},
+ "dew.sampling.solvers.Heun": {
+  "s_churn": 0.0,
+  "s_noise": 1.0,
+  "s_tmax": Infinity,
+  "s_tmin": 0.0
+ },
  "dew.sampling.solvers.KDPM2": {
   "ancestral": false
  },
