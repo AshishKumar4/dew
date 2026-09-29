@@ -604,7 +604,7 @@ html[data-has-hero][data-past-hero] header.header {
 }
 
 /* The last run's image stays, faded, until the next run's first preview replaces it. */
-.sampler-stage:is([data-stage='starting'], [data-stage='loading'], [data-stage='sampling']) [data-final] {
+.sampler-stage:is([data-stage='starting'], [data-stage='sampling']) [data-final] {
 	opacity: 0.35;
 }
 
