@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -184,7 +185,7 @@ class _Encoder(nn.Module):
         dims = [self.base * m for m in (1, *self.multipliers)]
         x = _causal(dims[0], 3, self.dtype, "conv_in")(x)
         index = 0
-        for level, (in_features, features) in enumerate(zip(dims[:-1], dims[1:])):
+        for level, (in_features, features) in enumerate(pairwise(dims)):
             for _ in range(self.blocks):
                 x = _ResidualBlock(in_features, features, self.dtype, name=f"down_blocks_{index}")(x)
                 in_features, index = features, index + 1
@@ -229,7 +230,7 @@ class _Decoder(nn.Module):
         x = _causal(dims[0], 3, self.dtype, "conv_in")(z)
         x = _MidBlock(dims[0], self.dtype, name="mid_block")(x)
         upsampling = self.temporal[::-1]
-        for level, (in_features, features) in enumerate(zip(dims[:-1], dims[1:])):
+        for level, (in_features, features) in enumerate(pairwise(dims)):
             upsample = level != len(self.multipliers) - 1
             x = _UpBlock(in_features // 2 if level > 0 else in_features, features, self.blocks, upsample,
                          upsample and upsampling[level], self.dtype, name=f"up_blocks_{level}")(x)
