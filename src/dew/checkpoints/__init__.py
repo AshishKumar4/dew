@@ -250,14 +250,12 @@ def _from_delta_planes(planes, live):
     return (delta ^ live.view(kind)).view(live.dtype)
 
 
-def _encode_deltas(averages: list[jax.Array], lives: list[jax.Array]) -> list[jax.Array]:
-    return [_delta_planes(average, live) for average, live in zip(averages, lives, strict=True)]
-
-
 @jax.jit(static_argnums=2)
-def _decode_deltas(stacks: list[jax.Array], lives: list[jax.Array], dtypes: tuple) -> list[jax.Array]:
-    return [_from_delta_planes(planes, live).astype(dtype)
-            for planes, live, dtype in zip(stacks, lives, dtypes, strict=True)]
+def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
+    """`_from_delta_planes` as one program per leaf signature: a model's
+    repeated blocks share a handful, where one program over every leaf
+    would compile anew for every model."""
+    return _from_delta_planes(planes, live).astype(dtype)
 
 
 def _planes_sharding(sharding):
@@ -318,32 +316,34 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
     paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
     leaves = [leaf for _, leaf in paths_leaves]
     lives = [_at(state_tree['params'], path) for path, _ in paths_leaves]
-    chosen = [index for index, (average, live) in enumerate(zip(leaves, lives))
+    chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
               if _stored_as_delta(average, live)]
     if not chosen:
         return state_tree, []
-    planes = jax.jit(_encode_deltas, out_shardings=[_planes_sharding(leaves[index].sharding)
-                                                    for index in chosen])(
-        [leaves[index] for index in chosen], [lives[index] for index in chosen])
-    for index, stack in zip(chosen, planes, strict=True):
-        leaves[index] = stack
+    for index in chosen:
+        encode = jax.jit(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
+        leaves[index] = encode(leaves[index], lives[index])
     return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
 
 
-def _ema_deltas(metadata, custom: Mapping | None) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
-    """The EMA leaves the checkpoint stores as byte planes, by path, each with
-    the shape and dtype of the weight it is the difference from, which are
-    its own. `custom` is the step's custom metadata, where a save records
-    those paths; a checkpoint written before the EMA was stored so records
-    none."""
-    recorded = set((custom or {}).get('ema_deltas', ()))
+def _ema_deltas(checkpointer: ocp.CheckpointManager, step: int,
+                metadata) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
+    """The EMA leaves the checkpoint at `step` stores as byte planes, by path,
+    each with the shape and dtype of the weight it is the difference from,
+    which are its own. The step's custom metadata records those paths; a
+    checkpoint written before the EMA was stored so records none."""
+    stored = dict(metadata)
+    if stored.get('ema') is None:
+        return {}
+    custom = checkpointer.metadata(step).custom_metadata or {}
+    recorded = set(custom.get('ema_deltas', ()))
     if not recorded:
         return {}
     deltas = {}
-    for path, _ in jax.tree_util.tree_flatten_with_path(dict(metadata['ema']))[0]:
+    for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
         if jax.tree_util.keystr(path) in recorded:
-            live = _at(metadata['params'], path)
+            live = _at(stored['params'], path)
             deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
     return deltas
 
@@ -650,7 +650,7 @@ class Checkpoints:
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
                   for name, value in dict(metadata).items()}
-        deltas = _ema_deltas(metadata, checkpointer.metadata(step).custom_metadata)
+        deltas = _ema_deltas(checkpointer, step, metadata)
         if deltas:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
@@ -715,7 +715,6 @@ class Checkpoints:
                 f"persistent checkpoint at {self.path(step)}")
         metadata = checkpointer.item_metadata(step)
         stored = metadata.keys()
-        deltas = _ema_deltas(metadata, checkpointer.metadata(step).custom_metadata)
         _check_template(template, metadata, stored)
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
@@ -728,6 +727,7 @@ class Checkpoints:
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
+            deltas = _ema_deltas(checkpointer, step, metadata)
             if deltas:
                 restored = dict(restored)
                 restored['ema'] = jax.tree_util.tree_map_with_path(
@@ -738,8 +738,9 @@ class Checkpoints:
                 if not isinstance(template, Mapping) else dict(template)
             if from_local:
                 self._check_placement(step, state_tree)
-            targets = {}
-            if deltas and state_tree.get('ema') is not None:
+            targets, deltas = {}, {}
+            if state_tree.get('ema') is not None:
+                deltas = _ema_deltas(checkpointer, step, metadata)
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             restore_args = jax.tree.map(
                 lambda leaf: ocp.ArrayRestoreArgs(
@@ -803,22 +804,20 @@ class Checkpoints:
                     deltas[path].shape, deltas[path].dtype,
                     sharding=None if sharding is None else sharding.with_memory_kind("device"))
         if unread:
-            item = {'params': _nested(unread)}
+            weights = {'params': _nested(unread)}
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-                item=item, partial_restore=True, restore_args=jax.tree.map(
-                    lambda leaf: ocp.ArrayRestoreArgs(sharding=leaf.sharding), item)))
+                item=weights, partial_restore=True, restore_args=jax.tree.map(
+                    lambda leaf: ocp.ArrayRestoreArgs(sharding=leaf.sharding), weights)))
             lives.update({path: _at(read['params'], path) for path in unread})
 
-        paths = list(targets)
-        values = _decode_deltas([_at(restored['ema'], path) for path in paths],
-                                [lives[path] for path in paths],
-                                tuple(np.dtype(targets[path].dtype) for path in paths))
-        averages = {}
-        for path, value in zip(paths, values, strict=True):
-            sharding = getattr(targets[path], "sharding", None)
-            averages[path] = value if sharding is None else jax.device_put(value, sharding)
-        return jax.tree_util.tree_map_with_path(lambda path, leaf: averages.get(path, leaf),
-                                                restored['ema'])
+        def average(path, planes):
+            if path not in targets:
+                return planes
+            target = targets[path]
+            value = _decode_delta(planes, lives[path], np.dtype(target.dtype))
+            sharding = getattr(target, "sharding", None)
+            return value if sharding is None else jax.device_put(value, sharding)
+        return jax.tree_util.tree_map_with_path(average, restored['ema'])
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
