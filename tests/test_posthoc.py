@@ -1,17 +1,20 @@
 """Post-hoc EMA: the Algorithm 3 solve, power-function averages kept by the
 solver, their snapshots, and averages reconstructed from them."""
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_trainer import Data, Regression
 
 from dew.checkpoints import Checkpoints
+from dew.config import OptimConfig, RunConfig
 from dew.objectives.base import EMASpec
 from dew.training import Layout, Trainer
-from dew.training.optim import power_profiles
+from dew.training.optim import PowerProfilesState, build_optimizer, power_profiles
 from dew.training.posthoc import coefficients, exponent, power_decay, reconstruct, relative_std
-from test_trainer import Data, Regression
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -76,3 +79,20 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     assert distance(rebuilt, direct) <= bound
     assert all(distance(average, direct) > 100 * bound for average in stored)
     assert jax.tree.map(lambda leaf: leaf.dtype, rebuilt) == jax.tree.map(lambda leaf: leaf.dtype, direct)
+
+
+def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
+    config = RunConfig(optim=OptimConfig(ema_profiles=(0.05, 0.10)))
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+    assert loaded == config
+
+    params = {"w": jnp.ones(3)}
+    solver = build_optimizer(loaded.optim, steps=10)
+    state = solver.init(params)
+    assert isinstance(state, PowerProfilesState)
+    np.testing.assert_array_equal(state.stds, np.float32([0.05, 0.10]))
+    _, state = solver.update({"w": jnp.ones(3)}, state, params)
+    assert int(state.count) == 1
+    # The first update takes the weights it made whole.
+    for average in state.averages:
+        np.testing.assert_array_equal(average["w"], params["w"] - 2.7e-4 * np.ones(3, np.float32))
