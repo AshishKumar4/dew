@@ -28,6 +28,7 @@ from flax.errors import ScopeParamShapeError
 
 from dew import position
 from dew.artifacts import Representations
+from dew.checkpoints import STATE_LEAVES
 from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
@@ -37,6 +38,7 @@ from dew.training import (
     MeshSpec,
     ProfileWindow,
     Trainer,
+    TrainState,
     ema_update,
     trainer as trainer_module,
     write_back,
@@ -475,6 +477,104 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
     assert jnp.array_equal(jax.random.key_data(trained.key), jax.random.key_data(state.key))
     assert json.loads(position)["index"] == 3
+
+
+def held_state(params, ema):
+    """A train state that holds `params` and `ema` and scalars beside them."""
+    count = jnp.zeros((), jnp.int32)
+    return TrainState(step=count, microstep=count, updates=count, params=params,
+                      opt_state={"count": count}, ema=ema,
+                      key=jax.random.key_data(jax.random.key(0)), scale=None,
+                      window_size=jnp.ones((), jnp.int32), accumulation=None)
+
+
+def bit_patterns(shape, dtype, seed):
+    """Values drawn bit by bit, so NaN payloads and subnormals turn up, with
+    both zeros, a NaN of every payload bit set and the smallest subnormal first."""
+    kind = np.dtype(f"u{np.dtype(dtype).itemsize}")
+    bits = np.random.default_rng(seed).integers(0, np.iinfo(kind).max, size=shape,
+                                                dtype=kind, endpoint=True)
+    bits.flat[:4] = [1 << (8 * kind.itemsize - 1), 0, np.iinfo(kind).max, 1]
+    return bits.view(dtype)
+
+
+def same_bits(expected, actual):
+    expected, actual = np.asarray(expected), np.asarray(actual)
+    return (expected.dtype == actual.dtype and expected.shape == actual.shape
+            and np.array_equal(expected.view(np.uint8), actual.view(np.uint8)))
+
+
+def awkward_state():
+    """Weights in fp32 and bf16, and an EMA of each dtype, one of them
+    narrower than the weight it follows."""
+    params = {"params": {"kernel": bit_patterns((16, 8), np.float32, 0),
+                         "scale": bit_patterns((8,), jnp.bfloat16, 1),
+                         "bias": bit_patterns((8,), np.float32, 2)}}
+    ema = {"params": {"kernel": bit_patterns((16, 8), np.float32, 3),
+                      "scale": bit_patterns((8,), jnp.bfloat16, 4),
+                      "bias": bit_patterns((8,), jnp.bfloat16, 5)}}
+    return held_state(jax.tree.map(jnp.asarray, params), jax.tree.map(jnp.asarray, ema))
+
+
+def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
+    """Every NaN payload, signed zero and subnormal of the EMA survives a save,
+    read whole, typed, without the weights beside it, into pinned host memory
+    and as the shapes the checkpoint reports."""
+    state = awkward_state()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+
+    def typed(tree, memory_kind="device"):
+        where = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind=memory_kind)
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where),
+                            tree)
+
+    whole, _ = checkpoints.restore()
+    ema_alone, _ = checkpoints.restore({"ema": typed(state.ema)})
+    pinned, _ = checkpoints.restore({"params": typed(state.params),
+                                     "ema": typed(state.ema, "pinned_host")})
+    resumed, _ = checkpoints.restore(held_state(typed(state.params), typed(state.ema)))
+    for restored in (whole["ema"], ema_alone["ema"], pinned["ema"], resumed.ema):
+        assert jax.tree.all(jax.tree.map(same_bits, state.ema, restored))
+    assert jax.tree.all(jax.tree.map(same_bits, state.params, resumed.params))
+    assert all(leaf.sharding.memory_kind == "pinned_host" for leaf in jax.tree.leaves(pinned["ema"]))
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), checkpoints.stored()["ema"]) == \
+        jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), state.ema)
+
+
+def test_an_ema_that_follows_its_weights_is_stored_in_fewer_bytes(tmp_path):
+    """An average agrees with the weights it follows in its leading bits, and
+    the checkpoint stores it in fewer bytes than an EMA that does not."""
+    rng = np.random.default_rng(0)
+    kernel = rng.normal(size=(512, 512)).astype(np.float32)
+    near = kernel * (1 + 1e-4 * rng.normal(size=kernel.shape)).astype(np.float32)
+    far = rng.normal(size=kernel.shape).astype(np.float32)
+
+    def stored_bytes(ema, name):
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(0, held_state({"params": {"kernel": jnp.asarray(kernel)}},
+                                       {"params": {"kernel": jnp.asarray(ema)}}), None)
+        checkpoints.wait()
+        return sum(path.stat().st_size for path in (tmp_path / name).rglob("*") if path.is_file())
+
+    assert stored_bytes(near, "near") < stored_bytes(far, "far") - 0.3 * kernel.nbytes
+
+
+def test_a_checkpoint_that_stores_the_ema_as_itself_still_restores(tmp_path):
+    """Checkpoints written before the EMA was stored as its difference from
+    the weights hold it as plain arrays, and read back as they were written."""
+    state = awkward_state()
+    written = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
+    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in STATE_LEAVES}))
+    written.wait_until_finished()
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                              sharding=leaf.sharding), state.ema)
+    for restored in (checkpoints.restore()[0]["ema"], checkpoints.restore({"ema": template})[0]["ema"]):
+        assert jax.tree.all(jax.tree.map(same_bits, state.ema, restored))
 
 
 class AffineWithOffset(nn.Module):
