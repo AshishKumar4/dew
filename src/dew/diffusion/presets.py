@@ -8,7 +8,8 @@ with. A record that holds the preset's fields rebuilds it exactly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
@@ -19,6 +20,7 @@ from dew.diffusion.schedules import (
     KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
+from dew.diffusion.schedules.flow import Density
 from dew.diffusion.transforms import (
     DirectPredictionTransform,
     FlowMatchPredictionTransform,
@@ -152,21 +154,70 @@ class Cosine:
             weighting=_weighting(self.min_snr_gamma))
 
 
+@dataclass(frozen=True)
+class ResolutionShift:
+    """Flux's shift by resolution (the pipelines' `calculate_shift`): mu is
+    linear in a token count, `base_shift` at `base_tokens` and `max_shift`
+    at `max_tokens`, and the shift is exp(mu).
+
+    `at` counts the image's 16 x 16-pixel cells, the grid Flux's constants
+    are stated on (an 8x autoencoder under 2x2 patches). That is a reference
+    grid, not every model's own token count: a model that tokenizes the
+    image otherwise, a 32x autoencoder under 1x1 patches for one, takes
+    `tokens` set to its own count. `DiffusionRunConfig` fills an unset
+    `tokens` from the data's resolution on that grid.
+    """
+
+    base_shift: float = 0.5
+    max_shift: float = 1.15
+    base_tokens: int = 256
+    max_tokens: int = 4096
+    tokens: int | None = None
+
+    def at(self, height: int, width: int) -> ResolutionShift:
+        """This shift at an image of `height` x `width` pixels, counted in
+        16 x 16-pixel cells."""
+        return replace(self, tokens=(height // 16) * (width // 16))
+
+    def shift(self) -> float:
+        if self.tokens is None:
+            raise ValueError("a resolution shift needs the image's token count; set tokens "
+                             "or build through DiffusionRunConfig, which fills it")
+        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
+        return math.exp(self.base_shift + slope * (self.tokens - self.base_tokens))
+
+
 @presets("flow")
 @dataclass(frozen=True)
 class Flow:
-    """Rectified flow on the linear path, velocity prediction, logit-normal
-    times, with SD3's resolution shift."""
+    """Rectified flow on the linear path with velocity prediction.
+
+    `density` is SD3's training time density (`FlowMatchingScheduler`):
+    logit-normal at `logit_mean` and `logit_std`, the heavy-tailed mode
+    density at `mode_scale`, cosmap or uniform. `shift` is SD3's static
+    resolution shift; `resolution_shift` sets it from the image size instead,
+    for training and sampling alike.
+    """
 
     shift: float = 1.0
     logit_mean: float = 0.0
     logit_std: float = 1.0
+    density: Density = "logit_normal"
+    mode_scale: float = 1.29
+    resolution_shift: ResolutionShift | None = None
     min_snr_gamma: float | None = None
 
+    def __post_init__(self) -> None:
+        if self.resolution_shift is not None and self.shift != 1.0:
+            raise ValueError("shift is static and resolution_shift sets it from the image "
+                             "size; name one")
+
     def __call__(self) -> Process:
+        shift = self.shift if self.resolution_shift is None else self.resolution_shift.shift()
         return Process(
             schedule=FlowMatchingScheduler(
-                shift=self.shift, logit_mean=self.logit_mean, logit_std=self.logit_std),
+                shift=shift, logit_mean=self.logit_mean, logit_std=self.logit_std,
+                density=self.density, mode_scale=self.mode_scale),
             prediction=FlowMatchPredictionTransform(),
             weighting=_weighting(self.min_snr_gamma))
 

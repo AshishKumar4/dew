@@ -19,6 +19,7 @@ import pytest
 
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import OxfordFlowers
+from dew.diffusion.presets import ResolutionShift
 from dew.objectives import Step
 from dew.objectives.diffusion import DiffusionRunConfig, FlowGRPO, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
@@ -119,6 +120,18 @@ def test_flux_trains_at_the_shift_its_pipeline_samples_the_runs_size_at(size, pi
     tokens = (size // (2 * objective.autoencoder.downscale_factor)) ** 2
     mu = 0.5 + (tokens - 256) * (1.15 - 0.5) / (4096 - 256)
     assert objective.process.schedule.shift == pytest.approx(np.exp(mu), rel=1e-12)
+
+
+@pytest.mark.parametrize("size", [128, 256, 512, 1024])
+def test_a_scratch_flow_run_shifts_by_the_datas_resolution(size):
+    """The preset's resolution shift at the data's 16-pixel token count, as
+    the Flux pipeline's calculate_shift takes it."""
+    config = DiffusionRunConfig(preset=presets.Flow(resolution_shift=ResolutionShift()),
+                                data=OxfordFlowers(image_size=size), text=None,
+                                model=ModelConfig("simple_dit"), val_metrics=())
+    tokens = (size // 16) ** 2
+    mu = 0.5 + (tokens - 256) * (1.15 - 0.5) / (4096 - 256)
+    assert config.preset().schedule.shift == pytest.approx(np.exp(mu), rel=1e-12)
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():

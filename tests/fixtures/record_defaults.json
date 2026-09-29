@@ -493,9 +493,12 @@
   "sigma_min": 0.002
  },
  "dew.diffusion.presets.Flow": {
+  "density": "logit_normal",
   "logit_mean": 0.0,
   "logit_std": 1.0,
   "min_snr_gamma": null,
+  "mode_scale": 1.29,
+  "resolution_shift": null,
   "shift": 1.0
  },
  "dew.diffusion.presets.Karras": {
@@ -504,6 +507,13 @@
   "sigma_data": 0.5,
   "sigma_max": 80.0,
   "sigma_min": 0.002
+ },
+ "dew.diffusion.presets.ResolutionShift": {
+  "base_shift": 0.5,
+  "base_tokens": 256,
+  "max_shift": 1.15,
+  "max_tokens": 4096,
+  "tokens": null
  },
  "dew.diffusion.presets.Sqrt": {
   "min_snr_gamma": null
