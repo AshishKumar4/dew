@@ -15,7 +15,7 @@ from jax.experimental import multihost_utils
 from dew.artifacts import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Shown, Step, Variables, mean_loss
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
@@ -105,6 +105,10 @@ class PPOObjective(Objective[Mean, Variables]):
     segment_ids and positions and returns [B, T] values; ValueHead supplies
     that interface for a decoder.
     """
+
+    # The loss is a policy-gradient surrogate plus the critic's, so only the
+    # critic's own has a direction.
+    shown = {"loss": Shown(), "critic/loss": Shown(better="lower")}
 
     _ema_is_reference = True
 

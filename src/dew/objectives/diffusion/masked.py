@@ -31,7 +31,7 @@ import optax
 from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Shown, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.registry import objectives
@@ -54,6 +54,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
     """
 
     artifact = TextSamples
+    shown = {"masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 
     def __init__(
         self,

@@ -408,14 +408,9 @@ def main(config: Config) -> dict:
     else:
         raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
 
+    # The trainer shows each call's rollout metrics as rollout/<name>; the
+    # records are kept for the summary written below.
     history: list[SchedulerRecord] = []
-
-    def log(record: SchedulerRecord) -> None:
-        history.append(record)
-        print(f"update {record.updates:3d}  reward {record.metrics.get('reward/mean', 0.0):.3f}  "
-              f"version {record.version}  "
-              f"lag {record.lag}  resubmitted {sum(record.resubmitted.values())}  "
-              f"truncated {record.metrics['status/truncated']:.2f}  waited {record.waited:.1f}s", flush=True)
 
     limits = SandboxLimits(wall_seconds=5.0, cpu_seconds=2, memory_bytes=512 * 1024 ** 2, message_bytes=65536)
     if config.runner not in ("process", "container"):
@@ -437,7 +432,8 @@ def main(config: Config) -> dict:
     # Every session packs as one chain within the width.
     rollout = RolloutScheduler(objective, sessions, server, width=width, rows=config.prompts * config.groups,
                                tasks=prompt_tasks, groups=config.groups,
-                               max_lag=config.max_lag, ahead=config.max_lag, truncation="score", log=log)
+                               max_lag=config.max_lag, ahead=config.max_lag, truncation="score",
+                               log=history.append)
     optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                             optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0))
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,

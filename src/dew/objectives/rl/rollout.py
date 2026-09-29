@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,7 @@ import numpy as np
 from dew.artifacts import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
@@ -93,6 +95,8 @@ class SampledRollout:
     `score`, train it on its reward) decides whether it trains.
     `old_log_probs` holds the raw likelihoods the cached model recorded at
     each sampled action, and `behavior_log_probs` the sampling ones.
+    `metrics` holds the latest call's mean reward, mean completion length
+    and truncated share, which the trainer logs as `rollout/<name>`.
     """
 
     objective: LMObjective
@@ -103,6 +107,9 @@ class SampledRollout:
     estimator: str = "group"
     truncation: str = "score"
     sampling: Sampling = Sampling()
+    metrics: dict[str, float] = dataclasses.field(default_factory=dict, init=False, compare=False)
+    shown: ClassVar[Mapping[str, Shown]] = {"reward/mean": Shown(better="higher"),
+                                             "status/truncated": Shown(better="lower", percent=True)}
 
     def __post_init__(self) -> None:
         if type(self.groups) is not int or self.groups < 2:
@@ -174,4 +181,6 @@ class SampledRollout:
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())
+        self.metrics.update({"reward/mean": float(rewards.mean()), "length/mean": float(lengths.mean()),
+                             "status/truncated": float(1 - terminated.mean())})
         return packed
