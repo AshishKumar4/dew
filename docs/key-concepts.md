@@ -52,17 +52,17 @@ print(tokenizer.decode(out.tokens[0]))
 Output on four cores of a workstation CPU:
 
 ```text
-Training from step 0 to 100 on 1 × cpu, 147,840 parameters
-step  25/100  loss 0.0306  ce 0.0306  perplexity 1.0311  token_accuracy 1.0000  10.1 ms/step  789 samples/s  0:00:01 left
-step  50/100  loss 0.0102  ce 0.0102  perplexity 1.0102  token_accuracy 1.0000  7.7 ms/step  1,033 samples/s  0:00:00 left
-step  75/100  loss 0.0067  ce 0.0067  perplexity 1.0067  token_accuracy 1.0000  7.9 ms/step  1,017 samples/s  0:00:00 left
-step 100/100  loss 0.0051  ce 0.0051  perplexity 1.0051  token_accuracy 1.0000  7.5 ms/step  1,068 samples/s  0:00:00 left
-Trained 100 steps in 0:00:02: first step after 1.53 s, then 129.8 step/s
-33.3% of the wall time in steps, final loss 0.0051
+Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
+step  25/100  loss 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 48.39  samples_per_sec 165.3  accepted 100.0%  0:00:02 left
+step  50/100  loss 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 41.47  samples_per_sec 192.9  accepted 100.0%  0:00:02 left
+step  75/100  loss 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 37.81  samples_per_sec 211.6  accepted 100.0%  0:00:01 left
+step 100/100  loss 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 40.84  samples_per_sec 195.9  accepted 100.0%
+Trained 100 steps in 0:00:07: first step after 2.71 s, then 24.6 step/s
+59.7% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
-Each `step` line shows the loss and the objective's metrics (for `LMObjective`: cross entropy, perplexity and token accuracy) of that step, and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
+This is the output with stdout piped to a file; on a terminal, `fit` draws the same numbers as one live panel with a progress bar and a sparkline per metric. Each `step` line shows the loss and the objective's metrics of that step (for `LMObjective`, perplexity and token accuracy; its cross entropy equals the loss and is left out), and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
 
 ## Model
 
@@ -77,7 +77,7 @@ An objective implements two methods:
 - `init(key, variables=None)` returns the model's variables.
 - `loss(variables, batch, step)` returns the loss as a `Mean(total, mass)` and an `Aux` with metrics to log.
 
-It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA) in its `ema` attribute.
+It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA) in its `ema` attribute. Its `shown` attribute maps metric names to `Shown` values that tell the training display how to show them: `Shown(better="higher", percent=True)`, for an accuracy, colours a rise as progress and prints the value as a percentage.
 
 Dew ships objectives for autoregressive language modeling (`LMObjective`), image and video diffusion (`DiffusionObjective`), masked and block diffusion over tokens (`MaskedDiffusionObjective`, `BlockDiffusionObjective`), JEPA (`JepaObjective`), preference and reinforcement learning (`DPOObjective`, `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective`) and distillation (`DistillationObjective`). A new kind of model is a new module; a new kind of training is a new objective. [Custom objectives](concepts/objectives.md) writes one.
 

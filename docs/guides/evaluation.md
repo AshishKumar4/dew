@@ -33,13 +33,13 @@ assert int(state.step) == 10
 ```
 
 ```text
-Training from step 0 to 10 on 1 × cpu, 2,688 parameters
-step  5/10  loss 0.6666  ce 0.6666  perplexity 1.9475  token_accuracy 0.7500  9.0 ms/step  893 samples/s  0:00:00 left
-eval val at step 5: perplexity 5.2828 (8 records in 0.35 s)
-step 10/10  loss 0.2373  ce 0.2373  perplexity 1.2678  token_accuracy 0.8750  70.8 ms/step  113 samples/s  0:00:00 left
-eval val at step 10: perplexity 5.2215 (8 records in 0.00 s)
-Trained 10 steps in 0:00:02: first step after 1.20 s, then 402.9 step/s
-1.4% of the wall time in steps, final loss 0.2373
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+step  5/10  loss 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 10.40  samples_per_sec 769.0  accepted 100.0%
+eval val at step 5: perplexity 5.283 (8 records in 0.56 s)
+step 10/10  loss 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 120.3  samples_per_sec 66.49  accepted 100.0%
+eval val at step 10: perplexity 5.221 ↓ 1.2% (8 records in 0.01 s)
+Trained 10 steps in 0:00:03: first step after 2.64 s, then 117.3 step/s
+2.3% of the wall time in steps, final loss 0.2373
 ```
 
 Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation reads the EMA weights, which this short run has barely moved. This cyclic task does not measure general language ability.
@@ -156,14 +156,14 @@ print(min(trials, key=lambda trial: trial.value).overrides)
 
 ```text
 Experiment_Name: lm-rate/trial-0
-Local tracking: /mnt/scratch/dew/tmp/docs4-run/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-0/tracking
-Training from step 0 to 10 on 1 × cpu, 2,688 parameters
-Trained 10 steps in 0:00:01: first step after 0.94 s, then 911.7 step/s
+Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-0/tracking
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+Trained 10 steps in 0:00:02: first step after 1.77 s, then 543.3 step/s
 0.9% of the wall time in steps, final loss 0.2373
 Experiment_Name: lm-rate/trial-1
-Local tracking: /mnt/scratch/dew/tmp/docs4-run/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-1/tracking
-Training from step 0 to 10 on 1 × cpu, 2,688 parameters
-Trained 10 steps in 0:00:02: first step after 1.88 s, then 1300.4 step/s
+Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-1/tracking
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+Trained 10 steps in 0:00:04: first step after 3.34 s, then 912.2 step/s
 0.3% of the wall time in steps, final loss 0.6440
 {'optim.learning_rate': 0.01}
 ```
