@@ -5,8 +5,8 @@ source mode. Every step is guarded, so a second run re-creates nothing, but
 the `uv pip install` lines resolve against PyPI each time. A checkout is
 installed alone with its `tpu` extra, the libtpu for the jax the checkout
 pins, since a jax[tpu] from PyPI beside the pin can't be resolved with it. A
-release installs after jax[tpu], so a jax[tpu] or dew-ml release since the
-last run is installed; `setup --version` pins the dew-ml side.
+release installs after jax[tpu], so a jax[tpu] or dewml release since the
+last run is installed; `setup --version` pins the dewml side.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ MOUNT_PATH = "$HOME/gcs_mount"
 DISK_MOUNT = "/mnt/persist"
 
 JAX_SPEC = "jax[tpu]"
-PACKAGE = "dew-ml"
+PACKAGE = "dewml"
 
 _ENV_LINES = (
     'export PATH="$HOME/dew-venv/bin:$HOME/.local/bin:$PATH"',

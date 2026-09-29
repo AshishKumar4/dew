@@ -209,7 +209,7 @@ def client(imported):
     """`OllamaCompletion` bound to the imported model and an injected SDK
     client. The SDK is the `inference-clients` extra, so a checkout without
     it skips rather than fails."""
-    ollama = pytest.importorskip("ollama", reason="pip install dew-ml[inference-clients]")
+    ollama = pytest.importorskip("ollama", reason="pip install dewml[inference-clients]")
     name, _, _ = imported
     return OllamaCompletion(name, ollama.Client(host=daemon_url()))
 
