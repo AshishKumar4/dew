@@ -251,7 +251,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
     """How the display shows the metrics `loss` reports, by the names it
-    reports them under."""
+    reports them under, and the loss itself, under `loss`, where the
+    trainer's default (lower is better) does not hold."""
 
     def held_variables(self) -> Variables | None:
         """The arrays this objective starts from, or None when it draws them.
