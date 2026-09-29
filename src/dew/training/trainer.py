@@ -1170,9 +1170,9 @@ class Trainer(Generic[Loss, Effects]):
     def _closed(self, run: _FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
         """`fit`'s cleanup however the run ended: the preemption notice, the
-        stream and a trace window closed, the checkpoints waited on, and the
-        outcome reported. Returns the error to raise when the run itself
-        raised none.
+        stream, a trace window and the display closed, the checkpoints
+        waited on, and the outcome reported. Returns the error to raise when
+        the run itself raised none.
 
         Each teardown step runs even when an earlier one failed, and a later
         failure becomes a note on the first, so one broken sink cannot hide
@@ -1193,6 +1193,7 @@ class Trainer(Generic[Loss, Effects]):
             ("Training iterator", close),
             ("Profiler", stop_trace),
             ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+            ("Display", self._display.close),
         ):
             if cleanup is None:
                 continue
@@ -1208,7 +1209,6 @@ class Trainer(Generic[Loss, Effects]):
         run.source = run.train = None
         close = stop_trace = cleanup = None
         run.other += time.perf_counter() - paused
-        self._display.close()
         return self._reported_outcome(error, run)
 
     def _opened(self, plan: _FitPlan, run: _FitRun, state: TrainState, position) -> bool:

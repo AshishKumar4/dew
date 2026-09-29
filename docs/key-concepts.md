@@ -53,12 +53,12 @@ On four cores of a workstation CPU, with its output piped to a file, it prints t
 
 ```text
 Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
-step  25/100  loss 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 16.87  samples_per_sec 474.2  accepted 100.0%
-step  50/100  loss 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 12.33  samples_per_sec 649.0  accepted 100.0%  0:00:01 left
-step  75/100  loss 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 11.21  samples_per_sec 713.8  accepted 100.0%  0:00:00 left
-step 100/100  loss 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 11.77  samples_per_sec 679.8  accepted 100.0%
-Trained 100 steps in 0:00:03: first step after 1.32 s, then 81.2 step/s
-48.1% of the wall time in steps, final loss 0.005113
+step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 25.40  samples_per_sec 315.0  accepted 100.0%  0:00:01 left
+step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 21.08  samples_per_sec 379.6  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 19.82  samples_per_sec 403.7  accepted 100.0%  0:00:01 left
+step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 25.04  samples_per_sec 319.5  accepted 100.0%
+Trained 100 steps in 0:00:05: first step after 2.35 s, then 45.7 step/s
+47.9% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
