@@ -1,6 +1,6 @@
 # Coming from FlaxDiff
 
-FlaxDiff was this project's earlier library, built around diffusion. Dew separates model construction, data loading, objectives and training, so the same trainer also runs language models and representation learning. This page maps FlaxDiff's modules to Dew's and describes the one FlaxDiff checkpoint format Dew loads. Dew's names are not import aliases; code does not migrate by search and replace.
+FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew separates model construction, data loading, objectives and training, so the same trainer also runs language models and representation learning. This page maps FlaxDiff's modules to Dew's and describes the one FlaxDiff checkpoint format Dew loads. Dew's names are not import aliases; code does not migrate by search and replace.
 
 ## Module map
 
