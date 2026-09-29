@@ -199,6 +199,8 @@ class DiffusionRunConfig(RunConfig):
     """Describe a run, plus the diffusion objective's own knobs."""
 
     objective: str = "diffusion"
+    """The objective `build` returns, `flow_grpo` under `rl` and `diffusion`
+    otherwise; it follows `rl`, so a saved record names what trained."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
@@ -241,6 +243,7 @@ class DiffusionRunConfig(RunConfig):
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+        object.__setattr__(self, "objective", "diffusion" if self.rl is None else "flow_grpo")
         from dew.diffusion.presets import EDM
 
         if self.pretrained is not None:

@@ -17,11 +17,10 @@ import numpy as np
 import optax
 import pytest
 
-from dew.config import ModelConfig
+from dew.config import ModelConfig, TrainerConfig
 from dew.data import OxfordFlowers
 from dew.objectives import Step
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-from dew.objectives.diffusion.config import FlowGRPO
+from dew.objectives.diffusion import DiffusionRunConfig, FlowGRPO, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import presets, samplers
 from dew.training import Trainer
@@ -153,28 +152,61 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     assert value(objective, state.params, batch) < before
 
 
-def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
-    """`rl` builds the Flow-GRPO objective and its rollout: groups of SDE
-    samples per prompt, scored by PSNR against the prompt's own image, and
-    one policy step on the transitions the rollout cut."""
-    config = DiffusionRunConfig(
+def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRunConfig:
+    return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2}, dtype="float32", attention_impl="xla"),
         data=OxfordFlowers(image_size=4), preset=presets.Flow(), sampler=samplers.Euler(),
         guidance=None, sampling_steps=2, val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        rl=FlowGRPO(reward="psnr", groups=2, rollout_steps=3, clip_range=0.2))
-    objective = config.build()
-    assert isinstance(objective, FlowGRPOObjective)
-    rollout = config.rollout(objective)
-    batch = batch_for(objective, 4)
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.PRNGKey(1), rollout=rollout)
+        rl=FlowGRPO(reward="psnr", groups=2, rollout_steps=3, clip_range=0.2, beta=beta))
+
+
+def grpo_step(objective, rollout, **trainer):
+    """One rollout over a batch and the policy step on its transitions."""
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(1), rollout=rollout,
+                      **trainer)
     initial = trainer.initial_state()
-    prepared = rollout(initial, batch, jax.random.PRNGKey(2))
-    assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
-    assert np.all(np.isfinite(prepared["rewards"]))
+    prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2))
     started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.params["params"])]
     state, _, _, _, accepted = trainer.compile(initial, prepared)(initial, prepared)
     assert bool(accepted)
+    return prepared, started, state
+
+
+def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
+    """`rl` builds the Flow-GRPO objective and its rollout: groups of SDE
+    samples per prompt, scored by PSNR against the prompt's own image, and
+    one policy step on the transitions the rollout cut."""
+    config = grpo_run()
+    objective = config.build()
+    assert isinstance(objective, FlowGRPOObjective)
+    prepared, started, state = grpo_step(objective, config.rollout(objective))
+    assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
+    assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
         jax.tree.leaves(state.params["params"]), started, strict=True))
+
+
+def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
+    """With a KL term the EMA slot holds the frozen initial model. The run's
+    task restores the trained policy under `from_run`'s default `ema=None`,
+    the weights the objective's own pipeline publishes."""
+    from dew.checkpoints import Checkpoints
+    from dew.sampling.pipelines import TextToImage
+
+    config = grpo_run(beta=0.1, directory=str(tmp_path))
+    objective = config.build()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    _, started, state = grpo_step(objective, config.rollout(objective), checkpoints=checkpoints)
+    checkpoints.save(1, state, None, {})
+    checkpoints.wait()
+    config.save(str(tmp_path / "run"))
+
+    restored = jax.tree.leaves(TextToImage.from_run(str(tmp_path / "run")).params["params"])
+    published = jax.tree.leaves(objective.pipeline(state).params["params"])
+    for got, want in zip(restored, published, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert any(not np.array_equal(np.asarray(got), before)
+               for got, before in zip(restored, started, strict=True))

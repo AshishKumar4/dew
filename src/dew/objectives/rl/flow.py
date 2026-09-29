@@ -68,15 +68,18 @@ class FlowGRPOObjective(DiffusionObjective):
     [N, K]. K is the selected transition count. The denominator counts kept
     stochastic transitions. Deterministic intervals contribute no policy loss.
 
-    beta > 0 freezes the initial denoiser in the existing EMA slot. Evaluation
-    and previews always use the live policy. sampler and steps configure
-    evaluation; sde specifies both rollout and rescoring. pretrained is the
-    whole variables tree the policy starts from, as `DiffusionObjective`
-    takes it: the model's collections, `encoders` and any `autoencoder`.
+    beta > 0 freezes the initial denoiser in the existing EMA slot, which is
+    then a reference rather than an average (`_ema_is_reference`): the
+    task a run publishes and restores, its evaluation and its previews are
+    the live policy. sampler and steps configure evaluation; sde specifies
+    both rollout and rescoring. pretrained is the whole variables tree the
+    policy starts from, as `DiffusionObjective` takes it: the model's
+    collections, `encoders` and any `autoencoder`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
     shown = {"loss": Shown(), "reward": Shown(better="higher")}
+    _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
                  sde: FlowSDE = FlowSDE(), beta: float = 0.0,
