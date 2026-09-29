@@ -20,7 +20,7 @@ import optax
 
 from dew.artifacts import Representations
 from dew.eval.common import metric_device
-from dew.objectives.base import mean_of_totals, merge_totals
+from dew.objectives.base import Shown, mean_of_totals, merge_totals
 from dew.registry import metrics
 
 type ProbeParams = dict[str, jax.Array]
@@ -97,6 +97,7 @@ class LinearProbe:
     weight_decay: float = 1e-4
 
     name = "batch_linear_probe_accuracy"
+    shown = Shown(better="higher", percent=True)
     reads = Representations
 
     def __call__(self, representations: Representations, batch) -> tuple[float, float]:
@@ -121,6 +122,7 @@ class KnnProbe:
     k: int = 20
 
     name = "batch_knn_probe_accuracy"
+    shown = Shown(better="higher", percent=True)
     reads = Representations
 
     def __call__(self, representations: Representations, batch) -> tuple[float, float]:

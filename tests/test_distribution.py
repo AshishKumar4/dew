@@ -514,11 +514,22 @@ def test_a_pool_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_
         pool = start("--processes-per-host", "2", "--", sys.executable, str(WORKER),
                      "--mesh", json.dumps({"fsdp": 2}), *arguments, devices=1)
         if stop:
-            return stopped_by_sigterm(pool, "] step 2: loss")
+            return stopped_by_sigterm(pool, "] step 2/")
         done = finished(pool, timeout=300)
         return done.returncode, done.stdout + done.stderr
 
     resumed_where_it_stopped(tmp_path, run)
+
+
+@pytest.mark.mesh(devices=2)
+def test_only_rank_zero_of_a_pool_prints_the_runs_progress(tmp_path):
+    """Every rank runs the same fit; were each to print, a pool of two would
+    show every step twice."""
+    done = launch("--processes-per-host", "2", "--", sys.executable, str(WORKER),
+                  "--out", str(tmp_path / "x.json"), "--mesh", json.dumps({"fsdp": 2}), devices=1)
+    assert done.returncode == 0, done.stdout + done.stderr
+    ranks = re.findall(r"^\[(\d+)\] (?:Training |step \d+/|Trained )", done.stdout, re.M)
+    assert ranks and set(ranks) == {"0"}, done.stdout
 
 
 @pytest.mark.mesh(devices=1)
@@ -545,7 +556,7 @@ def test_a_lone_process_stopped_by_sigterm_checkpoints_and_resumes_where_it_stop
                                    cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
         if stop:
-            return stopped_by_sigterm(process, "step 2: loss")
+            return stopped_by_sigterm(process, "step 2/")
         done = finished(process, timeout=300)
         return done.returncode, done.stdout + done.stderr
 

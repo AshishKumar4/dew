@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 
 from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
+from dew.objectives.base import Shown
 from dew.registry import metrics
 
 from .common import metric_device
@@ -269,6 +270,7 @@ class FID:
     weights: str | None = None
     name = "fid"
     reads = ImageGrid
+    shown = Shown(better="lower")
 
     def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
         with metric_device():
