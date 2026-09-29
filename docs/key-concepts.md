@@ -49,16 +49,16 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-On four cores of a workstation CPU it prints:
+On four cores of a workstation CPU, with its output piped to a file, it prints the lines below. On a terminal, `fit` draws the same numbers as one live panel instead: a progress bar, a sparkline for each metric and the latest evaluations.
 
 ```text
-Training from step 0 to 100 on 1 × cpu, 147,840 parameters
-step  25/100  loss 0.0306  ce 0.0306  perplexity 1.0311  token_accuracy 1.0000  12.2 ms/step  657 samples/s  0:00:01 left
-step  50/100  loss 0.0102  ce 0.0102  perplexity 1.0102  token_accuracy 1.0000  8.0 ms/step  996 samples/s  0:00:00 left
-step  75/100  loss 0.0067  ce 0.0067  perplexity 1.0067  token_accuracy 1.0000  8.5 ms/step  943 samples/s  0:00:00 left
-step 100/100  loss 0.0051  ce 0.0051  perplexity 1.0051  token_accuracy 1.0000  7.9 ms/step  1,009 samples/s  0:00:00 left
-Trained 100 steps in 0:00:03: first step after 1.80 s, then 117.9 step/s
-31.9% of the wall time in steps, final loss 0.0051
+Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
+step  25/100  loss 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 16.87  samples_per_sec 474.2  accepted 100.0%
+step  50/100  loss 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 12.33  samples_per_sec 649.0  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 11.21  samples_per_sec 713.8  accepted 100.0%  0:00:00 left
+step 100/100  loss 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 11.77  samples_per_sec 679.8  accepted 100.0%
+Trained 100 steps in 0:00:03: first step after 1.32 s, then 81.2 step/s
+48.1% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
@@ -72,7 +72,7 @@ Dew's modules name the logical axes of their parameters, such as `embed`, `heads
 
 ## The objective says what is learned
 
-An objective implements `init(key)`, which returns the model's variables, and `loss(variables, batch, step)`, which returns the loss and any metrics to log. It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA).
+An objective implements `init(key)`, which returns the model's variables, and `loss(variables, batch, step)`, which returns the loss and any metrics to log. It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA). Its `shown` attribute says how the training display shows each metric: `Shown(better="higher", percent=True)` for an accuracy, for instance, colours a rise as progress and prints the value as a percentage.
 
 Dew ships objectives for autoregressive language modeling (`LMObjective`), image and video diffusion (`DiffusionObjective`), masked and block diffusion over tokens (`MaskedDiffusionObjective`, `BlockDiffusionObjective`), JEPA (`JepaObjective`), preference and reinforcement learning (`DPOObjective`, `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective`) and distillation (`DistillationObjective`). A new kind of model is a new module; a new kind of training is a new objective. [Write a custom objective](concepts/objectives.md) walks through one.
 

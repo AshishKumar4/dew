@@ -56,6 +56,7 @@ from dew.objectives.base import (
     Mean,
     Metric,
     Objective,
+    Shown,
     Step,
     Variables,
     select,
@@ -142,7 +143,8 @@ class Rollout(Protocol):
 
     A rollout may hold `metrics`, a mapping of names to floats describing
     its latest call (rewards, lag, truncation); each logging interval sends
-    them to the tracker and the display as `rollout/<name>`."""
+    them to the tracker and the display as `rollout/<name>`. It may declare
+    how the display shows them in `shown`, as an objective does."""
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
@@ -197,6 +199,17 @@ def learning_rate(opt_state: optax.OptState) -> float | None:
              for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
              if isinstance(node, injected) and "learning_rate" in node.hyperparams]
     return float(rates[0]) if len(rates) == 1 else None
+
+
+# How the display shows the metrics the trainer itself logs; an objective,
+# a rollout and a validation metric declare their own (`Shown`).
+TRAINER_SHOWN = {"loss": Shown(better="lower"),
+                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "accepted": Shown(percent=True, group="optimizer"),
+                 "step_time_ms": Shown(better="lower", group="throughput"),
+                 "samples_per_sec": Shown(better="higher", group="throughput"),
+                 "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "rollout_seconds": Shown(better="lower", group="throughput")}
 
 
 def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
@@ -1233,9 +1246,11 @@ class Trainer(Generic[Loss, Effects]):
         precision = "/".join(stored)
         if compute is not None and [str(jnp.dtype(compute))] != stored:
             precision += f" parameters, {jnp.dtype(compute)} compute"
+        shown = {**TRAINER_SHOWN, **self.objective.shown, **getattr(self.rollout, "shown", {}),
+                 **{metric.name: metric.shown for metric in plan.metrics if hasattr(metric, "shown")}}
         agreed("training announcement", functools.partial(
             self._display.start, started, model=type(model).__name__,
-            batch=plan.dataset.batch, precision=precision))
+            batch=plan.dataset.batch, precision=precision, shown=shown))
         return False
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,

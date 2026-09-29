@@ -1,18 +1,21 @@
 """What `Trainer.fit` shows while it runs.
 
-On a terminal, one live panel: a title with the model, its size, where it
-trains, the global batch and the precision; a progress bar with the step, the
-rate, the time elapsed and the time left; the phase the run is in; the
-learning rate and the throughput; every scalar the objective and the rollout
-report, grouped by the prefix of their names, each with its value, a
-sparkline of its recent values and the change across them; and the latest
-evaluation of each split. Evaluations and notes also print above the panel,
-where they stay in the scrollback, and the run ends with a summary panel.
+On a terminal, one live panel: a title with the model; a header with its
+size, where it trains, the global batch and the precision; a progress bar
+with the step, the rate, the time elapsed and the time left; every scalar the
+trainer, the objective and the rollout log, grouped, each with its value, a
+sparkline of its recent values and the change across them; the latest
+evaluation of each split; and, in the bottom border, the phase the run is
+in. Evaluations and notes also print above the panel, where they stay in the
+scrollback, and the run ends with a summary panel.
 
 Anywhere else (a pipe, a log file, CI, a notebook) the same numbers are
 printed as one line per logging interval. Only process zero shows anything.
 
-Nothing here knows a workload: the rows are whatever scalars are logged.
+Nothing here knows a workload. The rows are whatever scalars are logged,
+grouped by the prefix of their names (`train`, `rollout`, ...), and how one
+is shown comes from the `Shown` its reporter declares for it, found by the
+name after that prefix.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ import datetime
 import math
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import jax
 from rich import box
@@ -35,25 +38,27 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
 
-# Scalars shown on the rate line rather than as metrics.
-RATES = ("train/learning_rate", "train/step_time_ms", "train/samples_per_sec", "train/mfu")
-# Logged, but only meaningful to a tracker.
-HIDDEN = ("train/accepted",)
 # How many logged values a metric keeps for its sparkline; the terminal's
 # width decides how many of them it shows.
 TREND = 48
 BLOCKS = "▁▂▃▄▅▆▇█"
-# Two mid-tone ends of the bar's gradient, which read on dark and light
-# backgrounds alike; the sparklines take the first. Labels are dim, values
-# plain, and red is kept for problems.
+# The palette: two mid-tone ends of a gradient for the bar, the border and
+# the sparklines, and a green and a red for a change that is progress or
+# regress. Mid-tones read on dark and light backgrounds alike; labels are
+# dim and values in the terminal's own colour.
 START, END = Color.parse("#2aa7c9").get_truecolor(), Color.parse("#8b6cd9").get_truecolor()
 ACCENT = Style(color=Color.from_triplet(START))
 LABEL = Style(dim=True)
+GROUP = Style(color=Color.from_triplet(END), bold=True)
+BETTER = Style(color="#3fae6a")
+WORSE = Style(color="#d9534f")
+PLAIN = Shown()
 # The panel's width on a wide terminal; a narrower one gets all of its own.
-WIDEST = 112
+WIDEST = 120
 
 
 def terminal(console: Console) -> bool:
@@ -68,13 +73,21 @@ def mesh_text(mesh: Mapping[str, int]) -> str:
     return " × ".join(f"{axis} {size}" for axis, size in mesh.items() if size > 1)
 
 
-def number(value: float) -> str:
-    """A metric value to four decimal places, or in scientific notation."""
-    if value == 0 or 1e-3 <= abs(value) < 1e5:
-        return f"{value:.4f}"
+def number(value: float, shown: Shown = PLAIN) -> str:
+    """A value to four significant digits, grouped in thousands from a
+    thousand, in scientific notation outside [1e-3, 1e7), or as a
+    percentage where `shown` asks for one."""
     if not math.isfinite(value):
         return str(value)
-    return f"{value:.3e}"
+    if shown.percent:
+        return f"{value:.1%}"
+    if value == 0:
+        return "0"
+    if not 1e-3 <= abs(value) < 1e7:
+        return f"{value:.3e}"
+    if abs(value) >= 1000:
+        return f"{value:,.0f}"
+    return f"{value:#.4g}"
 
 
 def duration(seconds: float) -> str:
@@ -89,7 +102,11 @@ def count(parameters: int) -> str:
     return f"{parameters:,}"
 
 
-def sparkline(values) -> Text:
+def gradient(fraction: float) -> Style:
+    return Style(color=Color.from_triplet(blend_rgb(START, END, fraction)))
+
+
+def sparkline(values: Sequence[float]) -> Text:
     """One block per finite value, its height between the values' own
     minimum and maximum, on a log scale when all are positive, since a loss
     falls by factors; coloured from START for the oldest to END for the
@@ -103,51 +120,36 @@ def sparkline(values) -> Text:
     scale = (len(BLOCKS) - 1) / (high - low) if high > low else 0.0
     text = Text()
     for index, value in enumerate(values):
-        colour = blend_rgb(START, END, index / max(len(values) - 1, 1))
-        text.append(BLOCKS[round((value - low) * scale)], Style(color=Color.from_triplet(colour)))
+        text.append(BLOCKS[round((value - low) * scale)], gradient(index / max(len(values) - 1, 1)))
     return text
 
 
-def change(values) -> str:
-    """The change from the first of `values` to the last: an arrow and the
-    relative size, or the factor once it is ten or more."""
-    first, last = values[0], values[-1]
-    if len(values) < 2 or not (math.isfinite(first) and math.isfinite(last)):
-        return ""
+def change(first: float, last: float, shown: Shown = PLAIN) -> Text:
+    """The change from `first` to `last`: an arrow and its size, relative,
+    as a factor once that is ten or more, or in points for a percentage;
+    green where it is progress and red where it is regress. A change of
+    ten times its start or more, as through zero, shows only its arrow."""
+    if not (math.isfinite(first) and math.isfinite(last)):
+        return Text()
     if first == last:
-        return "→"
-    arrow = "↑" if last > first else "↓"
-    if first * last > 0 and not 0.1 < last / first < 10:
-        return f"{arrow} {max(last / first, first / last):.0f}×"
-    if first == 0:
-        return arrow
-    return f"{arrow} {abs(last - first) / abs(first):.0%}"
-
-
-def rates(scalars: Mapping[str, float]) -> list[tuple[str, str]]:
-    """The learning rate and the throughput, as (label, value) pairs."""
-    parts = []
-    if "train/learning_rate" in scalars:
-        parts.append(("lr", f"{scalars['train/learning_rate']:.2e}"))
-    if "train/step_time_ms" in scalars:
-        parts.append(("step", f"{scalars['train/step_time_ms']:.1f} ms"))
-    if "train/samples_per_sec" in scalars:
-        parts.append(("samples/s", f"{scalars['train/samples_per_sec']:,.0f}"))
-    if "train/mfu" in scalars:
-        parts.append(("MFU", f"{scalars['train/mfu']:.1%}"))
-    return parts
-
-
-def scores_text(evaluation: Evaluation) -> str:
-    return "  ".join(f"{name.removeprefix(evaluation.split + '/')} {number(value)}"
-                     for name, value in evaluation.scores.items())
-
-
-def evaluation_text(evaluation: Evaluation) -> str:
-    counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
-    if evaluation.uneven_shards:
-        counts += ", uneven shards"
-    return f"eval {evaluation.split} at step {evaluation.step}: {scores_text(evaluation)} ({counts})"
+        return Text("→", LABEL)
+    rising = last > first
+    arrow = "↑" if rising else "↓"
+    relative = abs(last - first) / abs(first) if first else math.inf
+    if shown.percent:
+        size = f" {abs(last - first) * 100:.1f} pt"
+    elif first * last > 0 and not 0.1 < last / first < 10:
+        factor = max(last / first, first / last)
+        size = f" {factor:,.0f}×" if factor < 1e4 else f" {factor:.0e}×"
+    elif relative >= 10:
+        size = ""
+    else:
+        size = f" {relative:.1%}" if relative < 0.1 else f" {relative:.0%}"
+    if shown.better is None:
+        style = LABEL
+    else:
+        style = BETTER if rising == (shown.better == "higher") else WORSE
+    return Text(arrow + size, style)
 
 
 def bar(fraction: float, width: int) -> Text:
@@ -157,14 +159,22 @@ def bar(fraction: float, width: int) -> Text:
     whole = int(filled)
     text = Text()
     for cell in range(whole):
-        colour = blend_rgb(START, END, cell / max(width - 1, 1))
-        text.append("━", Style(color=Color.from_triplet(colour)))
+        text.append("━", gradient(cell / max(width - 1, 1)))
     if whole < width:
-        head = "╸" if filled - whole >= 0.5 else ""
-        if head:
-            text.append(head, Style(color=Color.from_triplet(blend_rgb(START, END, whole / max(width - 1, 1)))))
-        text.append("━" * (width - whole - len(head)), LABEL)
+        if filled - whole >= 0.5:
+            text.append("╸", gradient(whole / max(width - 1, 1)))
+        text.append("━" * (width - len(text)), LABEL)
     return text
+
+
+@dataclasses.dataclass
+class Row:
+    """One metric the panel shows: its name within its group, how it is
+    shown, and its recent values."""
+
+    name: str
+    shown: Shown
+    values: collections.deque
 
 
 @dataclasses.dataclass
@@ -180,49 +190,53 @@ class TrainingDisplay:
 
     title: str = ""
     header: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+    shown: Mapping[str, Shown] = dataclasses.field(default_factory=dict)
     total: int = 0
     first: int | None = None
     current: int = 0
     started: float = 0.0
     # (time, step) pairs a few tenths of a second apart, for the rate.
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
-    history: dict[str, collections.deque] = dataclasses.field(default_factory=dict)
-    latest: dict[str, float] = dataclasses.field(default_factory=dict)
-    evaluations: dict[str, Evaluation] = dataclasses.field(default_factory=dict)
+    # Metrics by group, then by logged name, in the order first logged.
+    groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
+    # The latest evaluation of each split, and the one before it.
+    evaluations: dict[str, tuple[Evaluation, Evaluation | None]] = dataclasses.field(default_factory=dict)
     phase: str = ""
     ended: bool = False
-    spinner: Spinner | None = None
+    spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT))
     live: Live | None = None
 
     @property
-    def shown(self) -> bool:
+    def shown_here(self) -> bool:
         return jax.process_index() == 0
 
-    def start(self, started: FitStarted, *, model: str, batch: int, precision: str) -> None:
+    def start(self, started: FitStarted, *, model: str, batch: int, precision: str,
+              shown: Mapping[str, Shown]) -> None:
         """Open the display with the run's header: the model, its size, where
-        it trains, the global batch and the precision."""
+        it trains, the global batch and the precision. `shown` holds how
+        each metric is shown, by its name after its group's prefix."""
         self.first = self.current = started.start_step
         self.total = started.target_steps
         self.started = time.perf_counter()
-        if not self.shown:
+        self.shown = shown
+        if not self.shown_here:
             return
         mesh = mesh_text(started.mesh)
         where = f"{started.devices} × {started.device_kind}"
         if started.processes > 1:
-            where += f", {started.processes} processes"
+            where += f" in {started.processes} processes"
         self.title = model
-        self.header = [("parameters", count(started.parameters)), ("on", where)]
+        self.header = [("", f"{count(started.parameters)} parameters"), ("on", where)]
         if mesh:
             self.header.append(("mesh", mesh))
-        self.header += [("batch", str(batch)), ("precision", precision)]
+        self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
         if not terminal(console):
             self.note(f"Training {model} from step {started.start_step} to {started.target_steps}: "
-                      + ", ".join(f"{label} {value}" for label, value in self.header))
+                      + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
-        self.spinner = Spinner("dots", style=ACCENT)
-        self.live = Live(self, console=console, refresh_per_second=10, vertical_overflow="visible")
+        self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
 
     # --------------------------------------------------------------
@@ -232,8 +246,6 @@ class TrainingDisplay:
     def step(self, step: int) -> None:
         """Advance to a step dispatched to the devices."""
         self.current = step
-        if self.live is None:
-            return
         if self.phase == "compiling":
             self.phase = ""
         now = time.perf_counter()
@@ -247,32 +259,35 @@ class TrainingDisplay:
 
     def interval(self, step: int, scalars: Mapping[str, float]) -> None:
         """Record one logging interval's scalars, which the host has read."""
-        if not self.shown:
+        if not self.shown_here:
             return
-        self.latest = dict(scalars)
         for name, value in scalars.items():
-            if name in self.history:
-                self.history[name].append(value)
-            elif name not in RATES and name not in HIDDEN:
-                self.history[name] = collections.deque([value], maxlen=TREND)
+            prefix, _, rest = name.partition("/")
+            shown = self.shown.get(rest or prefix, PLAIN)
+            rows = self.groups.setdefault(shown.group or prefix, {})
+            if name not in rows:
+                rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
+            rows[name].values.append(value)
         if self.live is None:
             line = f"step {step:>{len(str(self.total))}}/{self.total}  " + "  ".join(
-                f"{name} {number(values[-1])}" for _, name, values in self.metrics())
-            for label, value in rates(scalars):
-                line += f"  {label} {value}"
-            if "train/step_time_ms" in scalars:
-                left = (self.total - step) * scalars["train/step_time_ms"] / 1000
-                line += f"  {duration(left)} left"
+                f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
+            if (rate := self.rate()) and step < self.total:
+                line += f"  {duration((self.total - step) / rate)} left"
             print(line, flush=True)
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
-        self.evaluations[evaluation.split] = evaluation
-        self.note(evaluation_text(evaluation), style=LABEL)
+        previous = self.evaluations.get(evaluation.split, (None,))[0]
+        self.evaluations[evaluation.split] = (evaluation, previous)
+        counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
+        if evaluation.uneven_shards:
+            counts += ", uneven shards"
+        self.note(f"eval {evaluation.split} at step {evaluation.step}: "
+                  f"{self.scores(evaluation).plain} ({counts})", style=LABEL)
 
     def note(self, text: str, *, style: Style | str | None = None) -> None:
         """Print a line above the live panel, or on its own."""
-        if not self.shown:
+        if not self.shown_here:
             return
         if self.live is not None:
             self.live.console.print(Text(text, style=style or ""))
@@ -289,9 +304,9 @@ class TrainingDisplay:
     def summary(self, step: int, seconds: float, goodput: Mapping[str, float],
                 loss: float | None) -> None:
         """Say how the run went once it has ended at `step`: its steps, the
-        time to the first, the rate after it, the goodput and the last
-        step's loss."""
-        if not self.shown:
+        time to the first, the rate after it, the goodput, the last step's
+        loss and the latest evaluations."""
+        if not self.shown_here:
             return
         steps = 0 if self.first is None else step - self.first
         if not steps:
@@ -311,50 +326,55 @@ class TrainingDisplay:
             self.note(timing)
             self.note(fraction + ("" if loss is None else f", final loss {number(loss)}"))
             return
-        rows = [("trained", f"{steps} steps in {duration(seconds)}")]
+        rows: list[tuple[str, RenderableType]] = [("trained", f"{steps} steps in {duration(seconds)}")]
         if first is not None:
             rows.append(("first step", f"after {first:.2f} s"))
         if rate is not None:
-            rows.append(("rate", f"{rate:.1f} step/s after the first"))
+            rows.append(("then", f"{rate:.1f} step/s"))
         rows.append(("goodput", fraction))
         if loss is not None:
-            rows.append(("final loss", number(loss)))
+            rows.append(("final loss", Text(number(loss), "bold")))
+        for split, (evaluation, _) in self.evaluations.items():
+            rows.append((f"{split} at {evaluation.step}", self.scores(evaluation)))
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=LABEL)
+        table.add_column(style=LABEL, justify="right")
         table.add_column()
         for label, value in rows:
             table.add_row(label, value)
-        for split, evaluation in self.evaluations.items():
-            table.add_row(f"eval {split}", scores_text(evaluation))
         console.print(Panel(table, box=box.ROUNDED, border_style=ACCENT, expand=False,
-                            title=Text.assemble(" ", ("✓ ", ACCENT), (self.title, "bold"), " "),
+                            title=Text.assemble(" ", ("✓ ", BETTER), (self.title, "bold"), " "),
                             title_align="left", padding=(0, 1)))
 
     # --------------------------------------------------------------
     # The panel
     # --------------------------------------------------------------
 
-    def metrics(self) -> list[tuple[str, str, list[float]]]:
-        """The metrics to show as (group, name, recent values), in the order
-        they were first logged. The group is the prefix of the logged name
-        (`train`, `rollout`, ...). A metric whose values are the loss's own,
-        an objective's alias for it, is left out."""
-        logged = [(name, list(values)) for name, values in list(self.history.items())]
-        loss = dict(logged).get("train/loss")
-        shown = []
-        for name, values in logged:
-            if name != "train/loss" and values == loss:
-                continue
-            group, _, rest = name.partition("/")
-            shown.append((group, rest or group, values))
-        return shown
+    def rows(self) -> list[tuple[str, Row]]:
+        """The metrics to show as (group, row) pairs, grouped in the order
+        each group was first logged. A metric whose values are those of the
+        first one logged, the loss, is an alias for it and is left out."""
+        rows = [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
+        return rows[:1] + [(group, row) for group, row in rows[1:] if row.values != rows[0][1].values]
+
+    def scores(self, evaluation: Evaluation) -> Text:
+        """An evaluation's scores, each with its change since the split's
+        previous evaluation."""
+        previous = self.evaluations.get(evaluation.split, (None, None))[1]
+        text = Text()
+        for index, (name, value) in enumerate(evaluation.scores.items()):
+            bare = name.removeprefix(evaluation.split + "/")
+            shown = self.shown.get(bare, PLAIN)
+            text.append("   " if index else "").append(f"{bare} ", LABEL).append(number(value, shown), "bold")
+            if previous is not None and name in previous.scores:
+                text.append(" ").append_text(change(previous.scores[name], value, shown))
+        return text
 
     def rate(self) -> float | None:
         """Steps a second over the last few seconds of steps."""
         if len(self.pace) < 2:
             return None
         (began, first), (now, last) = self.pace[0], self.pace[-1]
-        if not self.ended and time.perf_counter() - now > 5:
+        if self.live is not None and not self.ended and time.perf_counter() - now > 5:
             # A long pause, an evaluation or a checkpoint: no rate to show.
             return None
         return (last - first) / (now - began) if now > began else None
@@ -365,103 +385,112 @@ class TrainingDisplay:
         parts: list[RenderableType] = []
 
         header = Text()
-        for index, (label, value) in enumerate(self.header):
-            header.append("   " if index else "").append(f"{label} ", LABEL).append(value)
+        for label, value in self.header:
+            if header:
+                header.append("  ·  ", LABEL)
+            header.append(f"{label} " if label else "", LABEL).append(value)
         parts += [header, Text()]
 
         # The bar, with the step, the percentage, the rate and the times.
         rate = self.rate()
         elapsed = time.perf_counter() - self.started
+        fraction = self.current / max(self.total, 1)
         stats = Text()
-        stats.append(f"{self.current:>{len(str(self.total))}}").append(f"/{self.total}", LABEL)
-        stats.append(f"  {self.current / max(self.total, 1):>4.0%}")
+        stats.append(f"{self.current:>{len(str(self.total))}}", "bold").append(f"/{self.total}", LABEL)
+        stats.append(f"  {fraction:>4.0%}")
         if rate:
             stats.append(f"  {rate:.1f}" if rate >= 1 else f"  {1 / rate:.1f}")
             stats.append(" step/s" if rate >= 1 else " s/step", LABEL)
-        stats.append(f"  {duration(elapsed)}").append(" elapsed", LABEL)
+        stats.append(f"  {duration(elapsed)}")
         if rate and self.current < self.total:
-            stats.append(f"  {duration((self.total - self.current) / rate)}").append(" left", LABEL)
+            stats.append(" + ", LABEL).append(duration((self.total - self.current) / rate))
+            stats.append(" left", LABEL)
         room = inner - len(stats) - 2
-        fraction = self.current / max(self.total, 1)
-        if room >= 12:
+        if room >= 16:
             parts.append(Text.assemble(bar(fraction, room), "  ", stats))
         else:
             parts += [bar(fraction, inner), stats]
 
-        # The phase, with a spinner while it lasts.
-        if self.ended or self.spinner is None:
-            done = self.current >= self.total
-            parts.append(Text.assemble(("✓ " if done else "■ ", ACCENT if done else "red"),
-                                       ("finished" if done else f"stopped at step {self.current}", LABEL)))
-        else:
-            self.spinner.update(text=Text(self.phase or "training", LABEL))
-            parts.append(self.spinner)
-
-        if speeds := rates(self.latest):
-            line = Text()
-            for index, (label, value) in enumerate(speeds):
-                line.append("   " if index else "").append(f"{label} ", LABEL).append(value)
-            parts.append(line)
-
-        metrics = self.metrics()
-        if metrics:
-            parts.append(Text())
-            parts.append(self._metrics_table(metrics, inner))
+        if rows := self.rows():
+            # What the rest of the panel takes: the borders, the header, the
+            # bar and the evaluations, with the blank lines between them.
+            around = len(parts) + 4 + (len(self.evaluations) + 1 if self.evaluations else 0)
+            parts += [Text(), self.metrics(rows, inner, options.size.height - around)]
 
         if self.evaluations:
             parts.append(Text())
             table = Table.grid(padding=(0, 2))
-            table.add_column(style=LABEL)
-            table.add_column(style=LABEL, justify="right")
+            table.add_column(style=GROUP, no_wrap=True)
+            table.add_column(style=LABEL, justify="right", no_wrap=True)
             table.add_column()
-            for split, evaluation in self.evaluations.items():
-                table.add_row(f"eval {split}", f"step {evaluation.step}", scores_text(evaluation))
+            for split, (evaluation, _) in self.evaluations.items():
+                table.add_row(split, f"step {evaluation.step}", self.scores(evaluation))
             parts.append(table)
 
-        title = Text.assemble(" ", ("dew", ACCENT + Style(bold=True)), "  ", (self.title, "bold"), " ")
+        title = Text.assemble(" ", ("dew", Style(color=Color.from_triplet(END), bold=True)),
+                              (" · ", LABEL), (self.title, "bold"), " ")
         yield Panel(Group(*parts), box=box.ROUNDED, border_style=ACCENT, title=title,
-                    title_align="left", width=width, padding=(0, 1))
+                    title_align="left", subtitle=self.state(), subtitle_align="right",
+                    width=width, padding=(0, 1))
 
-    def _metrics_table(self, metrics: list[tuple[str, str, list[float]]], inner: int) -> Table:
-        """The metrics in rows of name, value, sparkline and change, grouped
-        under their prefixes, in two columns when there are many and the
-        terminal is wide enough."""
-        groups = len({group for group, _, _ in metrics}) > 1
-        rows: list[tuple[str, str, list[float]] | str] = []
-        previous = None
-        for group, name, values in metrics:
-            if groups and (not rows or group != previous):
-                rows.append(group)
-            previous = group
-            rows.append((group, name, values))
-        name_width = max(len(name) for _, name, _ in metrics)
-        columns = 2 if len(rows) > 8 and inner >= 2 * (name_width + 34) else 1
-        # name, value (10), change (6), paddings: whatever is left is the sparkline's.
-        spark = max(8, min(TREND, (inner // columns) - name_width - 10 - 6 - 8 - (columns - 1) * 3))
-        table = Table.grid(padding=(0, 2))
-        for column in range(columns):
-            if column:
-                table.add_column(width=1)
-            table.add_column(style=LABEL, no_wrap=True)
-            table.add_column(justify="right", no_wrap=True)
-            table.add_column(style=ACCENT, no_wrap=True)
-            table.add_column(style=LABEL, justify="right", no_wrap=True)
-        height = -(-len(rows) // columns)
-        for index in range(height):
-            cells: list[RenderableType] = []
-            for column in range(columns):
-                if column:
-                    cells.append("")
-                position = column * height + index
-                row = rows[position] if position < len(rows) else None
-                if row is None:
-                    cells += ["", "", "", ""]
-                elif isinstance(row, str):
-                    cells += [Text(row, Style(bold=True, dim=True)), "", "", ""]
-                else:
-                    _, name, values = row
-                    shown = values[-spark:]
-                    cells += [f"  {name}" if groups else name, Text(number(values[-1]), "bold"),
-                              sparkline(shown), change(shown)]
-            table.add_row(*cells)
-        return table
+    def state(self) -> Text:
+        """The phase for the bottom border, with a spinner while it lasts."""
+        if self.ended:
+            if self.current >= self.total:
+                return Text.assemble(" ", ("✓ ", BETTER), ("finished", LABEL), " ")
+            return Text.assemble(" ", ("■ ", WORSE), (f"stopped at step {self.current}", LABEL), " ")
+        frame = self.spinner.render(time.perf_counter() - self.started)
+        assert isinstance(frame, Text)
+        return Text.assemble(" ", frame, " ", (self.phase or "training", LABEL), " ")
+
+    def metrics(self, rows: list[tuple[str, Row]], inner: int, lines: int) -> Table:
+        """The metrics under their groups' headings, each as its name, its
+        value, a sparkline and its change across the sparkline; those that
+        have held one value share a line per group. Groups stay whole, and
+        fill two columns where one would be taller than `lines` or where
+        there are many rows and the room for them."""
+        groups: dict[str, list[Row]] = {}
+        for group, row in rows:
+            groups.setdefault(group, []).append(row)
+        name_width = min(24, max(len(row.name) for _, row in rows) + 2)
+        fixed = name_width + 10 + 9 + 3 * 2
+        # One line a group for its heading and one for its steady values.
+        height = len(rows) + 2 * len(groups)
+        fits = inner >= 2 * (fixed + 8) + 4
+        roomy = inner >= 2 * (fixed + 16) + 4
+        columns = 2 if len(groups) > 1 and fits and (height > lines or (roomy and height > 8)) else 1
+        column_width = (inner - (columns - 1) * 4) // columns
+        # As wide as the room, or as the longest history while it is shorter.
+        spark = min(TREND, column_width - fixed, max(len(row.values) for _, row in rows))
+
+        # Whole groups, in order, into columns of about equal height.
+        stacks: list[list[RenderableType]] = [[] for _ in range(columns)]
+        filled = 0
+        for group, named in groups.items():
+            stack = stacks[min(columns - 1, filled * columns // height)]
+            filled += len(named) + 2
+            table = Table.grid(padding=(0, 2))
+            table.add_column(width=name_width, no_wrap=True, overflow="ellipsis")
+            table.add_column(justify="right", no_wrap=True, width=10)
+            table.add_column(no_wrap=True, width=spark)
+            table.add_column(justify="right", no_wrap=True, width=9)
+            steady = Text(overflow="fold")
+            for row in named:
+                values = list(row.values)[-spark:]
+                value = Text(number(values[-1], row.shown), "bold")
+                if len(values) >= 3 and min(values) == max(values):
+                    steady.append("   " if steady else "  ").append(f"{row.name} ", LABEL).append_text(value)
+                    continue
+                table.add_row(Text(f"  {row.name}", LABEL), value, sparkline(values),
+                              change(values[0], values[-1], row.shown) if len(values) > 1 else Text())
+            stack.append(Text(group, GROUP))
+            if table.row_count:
+                stack.append(table)
+            if steady:
+                stack.append(steady)
+
+        outer = Table.grid(padding=(0, 4))
+        for _ in range(columns):
+            outer.add_column(width=column_width)
+        outer.add_row(*(Group(*stack) for stack in stacks))
+        return outer
