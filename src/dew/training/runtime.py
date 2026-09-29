@@ -183,7 +183,7 @@ def _pool_keys_alike() -> bool:
     it and waited for ever for their shares of its sharded autotuning. Dew
     pins a jax that hashes every process's fingerprint. A jax installed
     around the pin, such as an image's own or a `--no-deps` install, may
-    lack it.
+    lack it, so the private module is asked at this boundary.
     """
     from jax._src import cache_key
 

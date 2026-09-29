@@ -412,7 +412,6 @@ def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
 
 def chain_lengths(sessions: Sequence[Session], width: int, *, truncation: str) -> list[int]:
     """The length of every chain `pack` builds from `sessions` under `truncation`."""
-    check_truncation(truncation)
     return [len(chain.tokens) for chain in _built(sessions, width, truncation)]
 
 
@@ -598,7 +597,6 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     Trainer-versus-engine mismatch is the loss's own metric (`mismatch/*`),
     computed where the proximal policy is known.
     """
-    check_truncation(truncation)
     rewards_of = [_trained_reward(session, truncation) for session in sessions]
     metrics: dict[str, float] = {}
     total = max(len(sessions), 1)

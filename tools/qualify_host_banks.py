@@ -159,6 +159,66 @@ def leaf_digests(tree) -> dict[str, dict[str, str]]:
     return values
 
 
+def _offload_accounting(plain, case: Case) -> dict:
+    """The store's bytes per memory kind, accounted before any weight exists:
+    the real init shapes, cast to the dtype the store holds, under the layout
+    that would offload them, whether or not this case is the offloaded one,
+    so both halves of a pair refuse a shape that overruns."""
+    offloaded = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
+    abstract = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(
+            leaf.shape, jnp.dtype(case.dtype)
+            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype),
+        jax.eval_shape(lambda key: plain.init(
+            key, jax.ShapeDtypeStruct((case.batch, case.prompt), jnp.int32)),
+            jax.random.key(case.seed)))
+    return stored_bytes(abstract, offloaded.offloaded(build_mesh(MeshSpec()), abstract))
+
+
+def _record_decode(record: dict, model, store, cache, logits, case: Case) -> None:
+    """Compile the one-token decode step against the prefilled cache, run
+    `case.new_tokens` greedy steps timing each, and record the plan, each
+    step's logits and cache digests, the tokens and the latencies."""
+    step = jax.jit(lambda held, cached, token, position: model.apply(
+        {**held, "cache": cached}, token, decode=True, mutable=["cache"],
+        positions=position))
+    token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
+    position = jnp.full((case.batch, 1), case.prompt, jnp.int32)
+    started = time.perf_counter()
+    stepped = step.lower(store, cache, token, position).compile()
+    record["decode_compile_seconds"] = time.perf_counter() - started
+    record["decode_plan"] = plan(stepped)
+    record["decode_spaces"] = entry_spaces(stepped)
+    produced, latencies, scored, steps = [], [], [], []
+    for _ in range(case.new_tokens):
+        at = time.perf_counter()
+        logits, changed = jax.block_until_ready(stepped(store, cache, token, position))
+        latencies.append(time.perf_counter() - at)
+        # The hash is taken after the measurement it would otherwise be
+        # inside, so the timings are the step's and not the hash's.
+        scored.append(logits)
+        cache = changed["cache"]
+        # After the latency is recorded, so the timing is the step's: one
+        # step's cache hashed leaf by leaf, which is what tells a first-step
+        # difference from one the whole loop accumulated.
+        steps.append(leaf_digests(cache))
+        token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
+        produced.append(int(token[0, 0]))
+        position = position + 1
+    record["decode_logits_digests"] = [digest(step) for step in scored]
+    del scored
+    record["cache_per_step"] = steps
+    record["cache_after_decode"] = leaf_digests(cache)
+    record["decode_tokens"] = produced
+    record["decode_latencies_seconds"] = latencies
+    record["decode_median_seconds"] = float(np.median(latencies))
+    record["decode_tokens_per_second"] = case.batch / float(np.median(latencies))
+    if record["owned_host_bytes"]:
+        record["owned_host_bytes_per_token"] = record["owned_host_bytes"]
+        record["implied_bytes_per_second"] = (
+            record["owned_host_bytes"] / float(np.median(latencies)))
+
+
 def main(case: Case) -> None:
     enforced = preflight()
     if min(case.batch, case.prompt, case.new_tokens) < 1:
@@ -176,19 +236,7 @@ def main(case: Case) -> None:
     plain = models.build("causal_transformer", **with_precision(
         "causal_transformer", {**fields, "scan_layers": False}, dtype=case.dtype,
         attention_impl="xla"))
-    # The store is accounted for before any weight exists: the real init
-    # shapes, cast to the dtype the store holds, under the layout that would
-    # offload them, whether or not this case is the offloaded one, so both
-    # halves of a pair refuse a shape that overruns.
-    offloaded = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
-    abstract = jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(
-            leaf.shape, jnp.dtype(case.dtype)
-            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype),
-        jax.eval_shape(lambda key: plain.init(
-            key, jax.ShapeDtypeStruct((case.batch, case.prompt), jnp.int32)),
-            jax.random.key(case.seed)))
-    accounting = stored_bytes(abstract, offloaded.offloaded(build_mesh(MeshSpec()), abstract))
+    accounting = _offload_accounting(plain, case)
     selected = accounting.get("pinned_host", 0)
     tokens = jnp.asarray(np.random.default_rng(case.seed).integers(
         1, SHAPE["vocab_size"], size=(case.batch, case.prompt)), jnp.int32)
@@ -273,44 +321,7 @@ def main(case: Case) -> None:
     record["prefill_last_logits"] = np.asarray(logits[0, -1], np.float32).tolist()
     record["cache_after_prefill"] = leaf_digests(changed["cache"])
 
-    step = jax.jit(lambda held, cached, token, position: model.apply(
-        {**held, "cache": cached}, token, decode=True, mutable=["cache"],
-        positions=position))
-    token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
-    position = jnp.full((case.batch, 1), case.prompt, jnp.int32)
-    started = time.perf_counter()
-    stepped = step.lower(store, changed["cache"], token, position).compile()
-    record["decode_compile_seconds"] = time.perf_counter() - started
-    record["decode_plan"] = plan(stepped)
-    record["decode_spaces"] = entry_spaces(stepped)
-    cache, produced, latencies, scored, steps = changed["cache"], [], [], [], []
-    for _ in range(case.new_tokens):
-        at = time.perf_counter()
-        logits, changed = jax.block_until_ready(stepped(store, cache, token, position))
-        latencies.append(time.perf_counter() - at)
-        # The hash is taken after the measurement it would otherwise be
-        # inside, so the timings are the step's and not the hash's.
-        scored.append(logits)
-        cache = changed["cache"]
-        # After the latency is recorded, so the timing is the step's: one
-        # step's cache hashed leaf by leaf, which is what tells a first-step
-        # difference from one the whole loop accumulated.
-        steps.append(leaf_digests(cache))
-        token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
-        produced.append(int(token[0, 0]))
-        position = position + 1
-    record["decode_logits_digests"] = [digest(step) for step in scored]
-    del scored
-    record["cache_per_step"] = steps
-    record["cache_after_decode"] = leaf_digests(cache)
-    record["decode_tokens"] = produced
-    record["decode_latencies_seconds"] = latencies
-    record["decode_median_seconds"] = float(np.median(latencies))
-    record["decode_tokens_per_second"] = case.batch / float(np.median(latencies))
-    if record["owned_host_bytes"]:
-        record["owned_host_bytes_per_token"] = record["owned_host_bytes"]
-        record["implied_bytes_per_second"] = (
-            record["owned_host_bytes"] / float(np.median(latencies)))
+    _record_decode(record, model, store, changed["cache"], logits, case)
 
     greedy = generate(model, store, tokens, case.new_tokens, seed=case.seed,
                       sampling=Sampling(temperature=0.0))

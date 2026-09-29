@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.backbones.causal_transformer import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
 from dew.nn.inputs import LayerInputs
 from dew.nn.mixers import AttentionMixer, MixerContext

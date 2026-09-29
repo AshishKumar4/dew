@@ -77,16 +77,24 @@ class FitStarted:
 
 
 @dataclasses.dataclass(frozen=True)
+class AxisLink:
+    """A mesh axis's link as a compiled step used it: the bandwidth its
+    all-gather measured (None on a CPU mesh or a device the peak table does
+    not name) and whether a projection ran split over the axis
+    (`dew.nn.sharding.down_projection`, `split_positions`)."""
+    bytes_per_second: float | None
+    spread: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class StepCompiled:
     """A training step compiled for a new batch shape, the remat it compiled
     under, which is the model's own or a stronger rung the trainer moved to
-    because the step did not fit, and the tensor axis's placement: the
-    bandwidth its all-gather measured (None where the axis splits nothing)
-    and whether a down-projection ran on each tensor shard's own tokens."""
+    because the step did not fit, and the links of the tensor and sequence
+    axes the mesh splits, by axis name."""
     seconds: float
     remat: JSON
-    tensor_bytes_per_second: float | None
-    tensor_spread: bool
+    links: Mapping[str, AxisLink]
 
 
 @dataclasses.dataclass(frozen=True)

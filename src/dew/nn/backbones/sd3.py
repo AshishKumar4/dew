@@ -29,6 +29,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -321,7 +322,7 @@ class SD3Transformer(nn.Module):
         image = image.reshape(image.shape[0], rows * columns, self.features)
         image = image + self.position(rows, columns).astype(image.dtype)
 
-        times = sinusoidal_time(time, 256).astype(conditioning.pooled.dtype)
+        times = sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype)).astype(conditioning.pooled.dtype)
         timing = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
                           name="timestep_embedder_linear_1")(times)
         timing = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,

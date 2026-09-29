@@ -123,19 +123,26 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
 
 def test_memory_follows_the_selection_not_the_sequence():
     """At 2048 keys and a top-k of 64 the masked kernel holds `[B, H, S, T]`
-    logits; the selection's temporaries are a fraction of that. Both measured
-    from the compiled executables."""
+    logits; the selection holds `[B, S, H, K]` of them a block of queries at a
+    time, so all it holds is less than that one tensor. Both measured from the
+    compiled executables."""
     length, top_k = 2048, 64
     q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length, batch=1)
     indices = causal_selection(scores, top_k)
     args = (q_nope, q_rot, latent, rot, key_weight, value_weight)
     mask = selection_mask(indices, length)
 
-    def temporaries(fn, *inputs):
-        return jax.jit(fn).lower(*inputs).compile().memory_analysis().temp_size_in_bytes
+    def held(fn, *inputs):
+        stats = jax.jit(fn).lower(*inputs).compile().memory_analysis()
+        assert stats is not None
+        # A TPU executable reports its temporaries only inside the peak (its
+        # temp_size_in_bytes is 0); the CPU backend's peak leaves them out.
+        if jax.default_backend() == "tpu":
+            return stats.peak_memory_in_bytes
+        return stats.argument_size_in_bytes + stats.output_size_in_bytes + stats.temp_size_in_bytes
 
-    dense = temporaries(expanded_reference, *args, mask)
-    selected = temporaries(lambda *a: sparse_latent_attention(
-        *a, scale=1.0), *args, indices)
-    assert dense >= HEADS * length * length * 4
-    assert selected * 8 < dense
+    dense = held(expanded_reference, *args, mask)
+    selected = held(lambda *a: sparse_latent_attention(*a, scale=1.0), *args, indices)
+    logits = HEADS * length * length * 4
+    assert dense >= logits
+    assert selected < logits

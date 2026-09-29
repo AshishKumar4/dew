@@ -358,7 +358,7 @@ def make_objective(case: Case, model, encoder):
         return JepaObjective(model, models.build("jepa_predictor", **case.predictor),
                              MASK, sample=sample)
     inputs = InputSpec(sample, {"textcontext": Condition(encoder, field="text")})
-    return DiffusionObjective(model, presets.EDM()(), inputs, steps=SAMPLER_STEPS,
+    return DiffusionObjective(model, presets.EDM(regime="pixel")(), inputs, steps=SAMPLER_STEPS,
                               guidance=CFG(2.0), sampler=Euler())
 
 

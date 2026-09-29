@@ -307,17 +307,16 @@ class RolloutScheduler:
             self._submit(group, [(index, 0) for index in range(width)])
 
     def _publish(self, state: TrainState, updates: int) -> None:
-        """Push the weights when the served version is `sync_every` behind, twice if the first did not take.
+        """Push the weights when the served version is `sync_every` behind.
 
         A served version ahead of `updates` is out of date as well: a fit
         restored from an earlier checkpoint must not sample from weights
         newer than its own.
         """
-        for _ in range(2):
-            if 0 <= updates - self.weights.version < self.sync_every:
-                return
-            self.weights.load(state.params, updates)
-        if not 0 <= updates - self.weights.version < self.sync_every:
+        if 0 <= updates - self.weights.version < self.sync_every:
+            return
+        self.weights.load(state.params, updates)
+        if self.weights.version != updates:
             raise RuntimeError(f"the weights pushed at update {updates} did not take: the engines still "
                                f"serve version {self.weights.version}")
 

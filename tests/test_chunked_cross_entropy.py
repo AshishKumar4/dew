@@ -141,6 +141,36 @@ def test_the_prediction_is_the_int32_column_under_x64():
         assert jnp.array_equal(predicted, reference(hidden, head, targets)[1])
 
 
+def float32_values(jaxpr) -> int:
+    """How many values of float32 `jaxpr`, and every jaxpr it holds, makes."""
+    made = sum(any(getattr(getattr(var, "aval", None), "dtype", None) == jnp.float32
+                   for var in eqn.outvars) for eqn in jaxpr.eqns)
+    return made + sum(float32_values(inner) for eqn in jaxpr.eqns
+                      for inner in jax.extend.core.jaxprs_in_params(eqn.params))
+
+
+@pytest.mark.parametrize("tile", [(3, 16), None], ids=["tiled", "whole"])
+def test_float64_states_and_head_compute_nothing_in_float32(tile):
+    """A float64 reference's loss (tools/layout_parity.py `--anchor`, a
+    float64 twin) is float64 forward and backward: the logits, log Z, the
+    tile carries and both gradients, softcapped and predicting. Pinned to
+    float32, the reference shared the float32 run's roundings of the head,
+    so the run's distance from it understated the run's own rounding. It
+    traces on the CPU backend, since a TPU has no float64."""
+    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+        hidden, head, targets = jax.tree.map(
+            lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+            inputs())
+
+        def loss(hidden, head):
+            losses, _, log_z = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4,
+                                                     softcap=30.0, tile=tile)
+            return jnp.sum(losses) + jnp.sum(log_z ** 2)
+
+        jaxpr = jax.make_jaxpr(jax.value_and_grad(loss, argnums=(0, 1)))(hidden, head)
+    assert float32_values(jaxpr.jaxpr) == 0
+
+
 # --- the mutations, each one a loss that would still train ------------------
 
 def mutating_chunk_terms(monkeypatch, mutate):
@@ -723,8 +753,6 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
     assert tables == [((64, 16), False)], tables
 
 
-@pytest.mark.skipif(jax.default_backend() == "cpu",
-                    reason="a CPU dot runs the bf16 algorithm without rounding")
 def test_the_bf16_head_carries_its_logits_cotangent_in_fp32():
     """The bf16 algorithm rounds each operand to bf16, and the logits'
     cotangent was one of them: a 4-GPU run's gradients then moved past the
@@ -805,3 +833,18 @@ def test_a_pass_with_no_backward_never_holds_the_logits_whole():
 
     assert temporaries(None) <= temporaries((1024, 8192))
     assert temporaries(None) < 4096 * 32768 * 4 // 4
+
+
+def test_the_split_cotangent_reaches_its_products_in_bf16():
+    """The bf16 head's backward splits the fp32 logits' cotangent into a bf16
+    high half and the rest, and both reach the products as bf16 arrays, the
+    rest rounded as a GPU's bf16 algorithm rounds an fp32 operand: split as
+    fp32 they wrote twice the bytes and the products read twice the bytes,
+    10 ms of a 168 ms step at Qwen3-0.6B's head on an RTX 4080."""
+    cotangent = jnp.ones((16, 64), jnp.float32)
+    operand = jnp.ones((64, 8), jnp.float32)
+    program = jax.make_jaxpr(lambda c, m: chunked._cotangent_product('tv,vd->td', c, m, chunked.BF16))(
+        cotangent, operand)
+    dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
+    assert len(dots) == 2
+    assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots

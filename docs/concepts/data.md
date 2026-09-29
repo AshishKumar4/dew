@@ -38,7 +38,7 @@ print(data.steps_per_epoch)
 
 The example uses the same records for both splits only to show the two iterators; a validation result needs records the model does not train on.
 
-`train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store.
+`train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails, and a training step's exception kept after the run does not keep its closed prefetch iterator alive.
 
 The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`), and the built-in readers read only that share.
 
@@ -111,7 +111,7 @@ Image sources can need network access the first time. Token-window sources read 
 
 ## TFDS and Hugging Face datasets
 
-`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. `preprocess(record, rng)` turns one provider record into batch fields and is required, because every provider's rows have their own structure. `dataset=` takes a Hugging Face split that is already in memory:
+`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. `preprocess(record, rng)` turns one provider record into batch fields. Without it, the provider's records are the batch fields as they come; there is no default conversion, because every provider's rows have their own structure. `dataset=` takes a Hugging Face split that is already in memory:
 
 ```python
 import datasets

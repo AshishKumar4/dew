@@ -15,7 +15,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
@@ -86,6 +86,10 @@ _INSTRUCTION = re.compile(
 _COMPUTATION = re.compile(r'^\s*(?:ENTRY\s+)?%?(?P<name>[\w.\-]+)\s*\(.*\)\s*->.*\{\s*$')
 _DIMS = re.compile(r'[a-z][\w]*\[([\d,]*)\]')
 _TRIP_COUNT = re.compile(r'"known_trip_count":\s*\{\s*"n":\s*"(\d+)"')
+_INTEGER = re.compile(r'(-?\d+)\)')
+_ELEMENT = re.compile(r'\s*([a-z]\w*)\[')
+_INTEGER_TYPE = re.compile(r'([su])(8|16|32|64)$')
+_INDEX = re.compile(r', index=(\d+)')
 _NAME = re.compile(r'%([\w.\-]+)')
 _CALLS = re.compile(r'(?:calls|to_apply|select|scatter|condition|body)=%([\w.\-]+)')
 _BRANCHES = re.compile(r'branch_computations=\{([^}]*)\}')
@@ -111,10 +115,15 @@ class _Instruction:
 
 @dataclass
 class _Computation:
-    """One HLO computation: its instructions and their result shapes."""
+    """One HLO computation: its instructions by name, their result shapes and
+    element types, its root, and the value of each integer scalar constant it
+    defines."""
 
-    instructions: list[_Instruction]
-    shapes: dict[str, tuple[int, ...]]
+    instructions: dict[str, _Instruction] = field(default_factory=dict)
+    shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    elements: dict[str, str] = field(default_factory=dict)
+    root: str | None = None
+    constants: dict[str, int] = field(default_factory=dict)
 
 
 def _dims(text: str) -> tuple[int, ...]:
@@ -148,7 +157,7 @@ def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
         header = _COMPUTATION.match(line)
         if header and ' = ' not in stripped:
             current = header.group('name')
-            computations[current] = _Computation([], {})
+            computations[current] = _Computation()
             if stripped.startswith('ENTRY'):
                 entry = current
             continue
@@ -158,12 +167,20 @@ def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
         match = _INSTRUCTION.match(line)
         if match is None or current is None:
             continue
+        name = match.group('name')
         operands, attributes = _split_operands(match.group('rest'))
         dims = _dims(match.group('shape'))
         computation = computations[current]
-        computation.shapes[match.group('name')] = dims
-        computation.instructions.append(
-            _Instruction(match.group('op'), dims, operands, attributes))
+        computation.shapes[name] = dims
+        element = _ELEMENT.match(match.group('shape'))
+        computation.elements[name] = element.group(1) if element else ''
+        computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes)
+        if stripped.startswith('ROOT'):
+            computation.root = name
+        literal = _INTEGER.match(match.group('rest'))
+        integer = _INTEGER_TYPE.match(computation.elements[name])
+        if match.group('op') == 'constant' and not dims and literal and integer:
+            computation.constants[name] = int(literal.group(1))
     return computations, entry
 
 
@@ -297,25 +314,113 @@ def _instruction_flops(instruction: _Instruction,
     return 0.0
 
 
-def _call_counts(instruction: _Instruction) -> dict[str, float]:
+def _call_counts(instruction: _Instruction, caller: _Computation,
+                 computations: dict[str, _Computation]) -> dict[str, float]:
     """The computations this instruction runs, and how often it runs each.
 
-    A loop body runs once per iteration, which XLA states as
-    `known_trip_count` whenever the length is known, and every `jax.lax.scan`
-    is such a loop. An unknown trip count becomes infinite, and the caller
-    then reports no count. A conditional runs one of its branches, so
-    counting every branch bounds it.
+    A loop body runs once per iteration. The CPU backend states the count as
+    `known_trip_count`; a v6e executable states none, so a loop without it is
+    read off its counter (`_counted_trips`). A loop whose count neither gives
+    becomes infinite, and the caller then reports no count. A conditional
+    runs one of its branches, so counting every branch bounds it.
     """
     counts = dict.fromkeys(_CALLS.findall(instruction.attributes), 1.0)
     branches = _BRANCHES.search(instruction.attributes)
     if branches is not None:
         counts.update(dict.fromkeys(_NAME.findall(branches.group(1)), 1.0))
     if instruction.op == 'while':
-        body = re.search(r'body=%([\w.\-]+)', instruction.attributes)
+        body = _called(instruction, 'body')
         trip = _TRIP_COUNT.search(instruction.attributes)
-        if body is not None:
-            counts[body.group(1)] = float(trip.group(1)) if trip else math.inf
+        if body:
+            counts[body] = (float(trip.group(1)) if trip
+                            else _counted_trips(instruction, caller, computations))
     return counts
+
+
+def _counted_trips(loop: _Instruction, caller: _Computation,
+                   computations: dict[str, _Computation]) -> float:
+    """The trip count of a loop that counts one integer tuple element from a
+    constant start, by a constant positive step, while it is below a constant
+    bound: the loop every `fori_loop` and `scan` with static bounds lowers
+    to, and the form XLA's own trip-count analysis reads. Infinite for any
+    other loop, and for one whose last step overflows the counter's type,
+    since a wrapped counter need never reach the bound."""
+    condition = computations.get(_called(loop, 'condition'))
+    body = computations.get(_called(loop, 'body'))
+    if condition is None or body is None or not loop.operands:
+        return math.inf
+    compare = condition.instructions.get(condition.root or '')
+    if (compare is None or compare.op != 'compare' or 'direction=LT' not in compare.attributes
+            or len(compare.operands) != 2):
+        return math.inf
+    counter = _INTEGER_TYPE.match(condition.elements.get(_origin(condition, compare.operands[0]), ''))
+    index = _element_index(condition, compare.operands[0])
+    bound = _constant(condition, compare.operands[1])
+    if counter is None or index is None or bound is None:
+        return math.inf
+    start = _constant(caller, _tuple_element(caller, loop.operands[0], index))
+    step = _increment(body, _tuple_element(body, body.root, index), index)
+    if start is None or step is None or step <= 0:
+        return math.inf
+    trips = max(0, -(-(bound - start) // step))
+    signed, bits = counter.group(1) == 's', int(counter.group(2))
+    if start + trips * step > (1 << (bits - signed)) - 1:
+        return math.inf
+    return float(trips)
+
+
+def _called(instruction: _Instruction, key: str) -> str:
+    """The computation an instruction names under `key`, or ''."""
+    match = re.search(key + r'=%([\w.\-]+)', instruction.attributes)
+    return match.group(1) if match else ''
+
+
+def _origin(computation: _Computation, name: str | None) -> str:
+    """The name of the instruction `name` copies, through any chain of copies."""
+    name = name or ''
+    while name in computation.instructions and computation.instructions[name].op == 'copy':
+        name = computation.instructions[name].operands[0]
+    return name
+
+
+def _source(computation: _Computation, name: str | None) -> _Instruction | None:
+    """The instruction `name` copies, through any chain of copies."""
+    return computation.instructions.get(_origin(computation, name))
+
+
+def _constant(computation: _Computation, name: str | None) -> int | None:
+    """The integer scalar constant `name` holds, through copies, or None."""
+    return computation.constants.get(_origin(computation, name))
+
+
+def _element_index(computation: _Computation, name: str | None) -> int | None:
+    """Which element of the computation's tuple parameter `name` reads, or None."""
+    read = _source(computation, name)
+    if read is None or read.op != 'get-tuple-element' or not read.operands:
+        return None
+    tuple_ = computation.instructions.get(read.operands[0])
+    index = _INDEX.search(read.attributes)
+    return int(index.group(1)) if tuple_ is not None and tuple_.op == 'parameter' and index else None
+
+
+def _tuple_element(computation: _Computation, name: str | None, index: int) -> str | None:
+    """The operand at `index` of the tuple `name` builds, or None."""
+    built = _source(computation, name)
+    if built is None or built.op != 'tuple' or index >= len(built.operands):
+        return None
+    return built.operands[index]
+
+
+def _increment(body: _Computation, name: str | None, index: int) -> int | None:
+    """The constant the body adds to element `index` of its parameter to make
+    `name`, or None when `name` is anything else."""
+    added = _source(body, name)
+    if added is None or added.op != 'add' or len(added.operands) != 2:
+        return None
+    for counter, step in (added.operands, added.operands[::-1]):
+        if _element_index(body, counter) == index:
+            return _constant(body, step)
+    return None
 
 
 def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, float]:
@@ -326,7 +431,7 @@ def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, flo
     Anything the entry cannot reach keeps a count of zero.
     """
     calls = {
-        name: _merged_call_counts(computation)
+        name: _merged_call_counts(computation, computations)
         for name, computation in computations.items()}
     callers = dict.fromkeys(computations, 0)
     for callees in calls.values():
@@ -348,11 +453,12 @@ def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, flo
     return weights
 
 
-def _merged_call_counts(computation: _Computation) -> dict[str, float]:
+def _merged_call_counts(computation: _Computation,
+                        computations: dict[str, _Computation]) -> dict[str, float]:
     """Per call of this computation, how often each computation it names runs."""
     merged: dict[str, float] = {}
-    for instruction in computation.instructions:
-        for name, times in _call_counts(instruction).items():
+    for instruction in computation.instructions.values():
+        for name, times in _call_counts(instruction, computation, computations).items():
             merged[name] = merged.get(name, 0.0) + times
     return merged
 
@@ -365,8 +471,9 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     cuBLAS, cuDNN convolution and cuDNN fused-attention custom calls a GPU
     backend hands them to. Backward passes count because they are in there;
     remat counts the forward it recomputes twice, because the card runs it
-    twice. None comes back when the module contains a loop whose length XLA
-    does not state, since the count would then be the body's, not the run's.
+    twice. None comes back when the module contains a loop whose length
+    neither XLA states nor its counter gives, since the count would then be
+    the body's, not the run's.
     """
     text = compiled.as_text()
     return None if text is None else hlo_flops(text)
@@ -381,7 +488,7 @@ def hlo_flops(text: str) -> float | None:
     total = 0.0
     for name, computation in computations.items():
         instructions = sum(_instruction_flops(instruction, computation.shapes)
-                           for instruction in computation.instructions)
+                           for instruction in computation.instructions.values())
         if not instructions or not weights[name]:
             continue
         total += weights[name] * instructions

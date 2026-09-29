@@ -35,7 +35,8 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _specified_layer_types,
 )
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
 

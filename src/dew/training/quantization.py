@@ -26,10 +26,10 @@ and `patterns` its `quant_cfg_path`, written inline as the regexes Qwix
 matches; the backward fields are Qwix's finer-grained version of the same
 idea.
 
-Three of its knobs have no equivalent and are refused with the reason.
-Static activation scaling (`fp8_full`) needs a calibration pass Dew has no
-seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache quantization has no
-reader here since the cache holds the compute dtype.
+Three of its knobs have no equivalent, and `dtype` takes neither of the
+first two. Static activation scaling (`fp8_full`) needs a calibration pass
+Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
+quantization has no reader here since the cache holds the compute dtype.
 
 Qwix is not a dependency. The import sits inside `apply_quantization`, and
 without the package the call raises naming it, the way the tokamax branch of
@@ -89,15 +89,6 @@ class Quantization:
     (`qwix/_src/providers/qt.py:361`); unset rounds deterministically."""
 
     def __post_init__(self) -> None:
-        if self.dtype == "fp8_full":
-            raise ValueError(
-                "fp8_full is static activation scaling, which needs a "
-                "calibration pass Dew has no seam for; Dew's fp8 is dynamic "
-                "range")
-        if self.dtype == "nanoo_fp8":
-            raise ValueError(
-                "nanoo_fp8 is kernels for AMD MI300 and MI325, which this "
-                "hardware cannot run")
         if self.dtype not in ("int8", "fp8"):
             raise ValueError(
                 f"quantization trains in int8 or fp8, got {self.dtype!r}")
@@ -144,9 +135,6 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     Construction already refused what the value cannot ask for; without the
     package the call raises naming it.
     """
-    if not isinstance(spec, Quantization):
-        raise ValueError(
-            f"quantization is a Quantization value, got {spec!r}")
     qwix = importlib.import_module("qwix")
     rules = [
         qwix.QtRule(

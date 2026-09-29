@@ -10,6 +10,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 import dew.diffusion.schedules as schedulers
@@ -18,7 +19,6 @@ from dew.diffusion import (
     KarrasPredictionTransform,
     MinSNR,
     Process,
-    ScheduleWeighting,
     VPredictionTransform,
     broadcast_rates,
     expand,
@@ -232,6 +232,15 @@ def test_discrete_p2_default_makes_the_v_loss_an_x0_loss():
                         1.0, rtol=1e-4)
 
 
+def test_small_beta_p2_weights_agree_with_the_reported_snr():
+    """A rounded alpha-bar of one must not erase a nonzero training weight."""
+    schedule = schedulers.DiscreteNoiseScheduler(np.array([1e-10, 1e-7, .01], np.float32))
+    steps = jnp.arange(3)
+    expected = 1 / (1 + np.asarray(schedule.snr(steps), np.float64))
+    # The independently rounded rates, SNR and weight allow a few fp32 operations.
+    np.testing.assert_allclose(schedule.weight(steps), expected,
+                               rtol=8 * np.finfo(np.float32).eps, atol=0)
+
 ############################################################################################################
 # min-SNR-gamma loss weighting (Hang et al. 2023), through Process
 ############################################################################################################
@@ -283,45 +292,99 @@ def test_min_snr_gamma_infinity_is_the_unweighted_case():
 
 def test_the_schedule_weight_is_the_default():
     process = Process(CosineNoiseScheduler(1000), VPredictionTransform())
-    assert jnp.allclose(process.weight(MIN_SNR_STEPS), process.schedule.weight(MIN_SNR_STEPS))
+    snr = process.schedule.snr(MIN_SNR_STEPS)
+    assert jnp.allclose(process.weight(MIN_SNR_STEPS), 1 / (1 + snr), rtol=1e-5)
 
 
 ############################################################################################################
 # Presets
 ############################################################################################################
 
-@pytest.mark.parametrize("preset", [presets.Cosine, presets.EDM, presets.Karras, presets.Flow, presets.Sqrt],
-                         ids=lambda cls: cls.__name__)
-def test_preset_weights_the_training_schedule_with_min_snr(preset):
-    """min_snr_gamma on a preset is the MinSNR weighting of its process; left
-    unset, the process keeps the schedule's own weight."""
-    assert preset(min_snr_gamma=5.0)().weighting == MinSNR(5.0)
-    assert preset()().weighting == ScheduleWeighting()
+@pytest.mark.parametrize("preset, scale, ordinary", [
+    (presets.Cosine, lambda snr: snr + 1, lambda snr: 1 / (snr + 1)),
+    (presets.EDM, lambda snr: snr + 4, lambda snr: snr + 4),
+    (presets.Karras, lambda snr: snr + 4, lambda snr: snr + 4),
+    (presets.Flow, lambda snr: (1 + jnp.sqrt(snr)) ** 2, jnp.ones_like),
+    (presets.Sqrt, jnp.ones_like, jnp.ones_like),
+], ids=["cosine", "edm", "karras", "flow", "sqrt"])
+def test_preset_weights_the_training_schedule_with_min_snr(preset, scale, ordinary):
+    """The capped x_0 loss is converted to each preset's prediction space.
+
+    Without the cap: P2 for cosine, EDM lambda for Karras preconditioning,
+    and the unweighted velocity/x_0 loss for flow/square-root.
+    """
+    fields = {"regime": "pixel"} if preset is presets.EDM else {}
+    capped, standard = preset(min_snr_gamma=5.0, **fields)(), preset(**fields)()
+    times = jnp.array([0.05, 0.25, 0.5, 0.75, 0.95]) * capped.schedule.T
+    snr = capped.schedule.snr(times)
+    assert jnp.allclose(capped.weight(times), jnp.minimum(snr, 5.0) / scale(snr), rtol=1e-5)
+    assert jnp.allclose(standard.weight(times), ordinary(snr), rtol=1e-5)
+
+
+@pytest.mark.parametrize("fields, mean, std", [
+    ({"regime": "pixel"}, -1.2, 1.2),
+    ({"regime": "latent"}, -0.4, 1.0),
+    ({"regime": "pixel", "P_mean": 0.2}, 0.2, 1.2),
+    ({"regime": "latent", "P_std": 0.7}, -0.4, 0.7),
+    ({"regime": "pixel", "P_mean": -0.8, "P_std": 0.7}, -0.8, 0.7),
+], ids=["pixel", "latent", "mean_override", "std_override", "both_override"])
+def test_edm_draws_the_sigmas_of_the_space_it_denoises(rng, fields, mean, std):
+    schedule = presets.EDM(**fields)().schedule
+    log_sigma = jnp.log(schedule.sigmas(schedule.sample_t(rng, 20000)))
+    assert abs(float(jnp.mean(log_sigma)) - mean) < 0.05
+    assert abs(float(jnp.std(log_sigma)) - std) < 0.05
+
+
+def test_edm_refuses_an_unspecified_training_distribution():
+    with pytest.raises(ValueError):
+        presets.EDM()()
+
+
+def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
+    from dew.objectives.diffusion.config import DiffusionRunConfig, StableDiffusionAutoencoder
+
+    for config, mean, std in (
+        (DiffusionRunConfig(), -1.2, 1.2),
+        (DiffusionRunConfig(autoencoder=StableDiffusionAutoencoder()), -0.4, 1.0),
+        (DiffusionRunConfig(preset=presets.EDM(P_mean=-0.8, P_std=0.7)), -0.8, 0.7),
+    ):
+        schedule = config.preset().schedule
+        log_sigma = jnp.log(schedule.sigmas(schedule.sample_t(rng, 20000)))
+        assert abs(float(jnp.mean(log_sigma)) - mean) < 0.05
+        assert abs(float(jnp.std(log_sigma)) - std) < 0.05
 
 
 def test_edm_preset_samples_on_the_karras_grid():
     """Training draws log-normal sigmas; inference walks the rho-spaced grid
     with the same sigma range and sigma_data."""
-    process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7)()
-    assert isinstance(process.schedule, EDMNoiseScheduler)
-    assert isinstance(process.sampler_schedule, KarrasVENoiseScheduler)
+    process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7, regime="pixel")()
     # Eq. 5 at rho 5: the endpoints are the preset's sigma range and the
     # midpoint pins the spacing, 2.99 here against 2.02 at the default rho 7.
     midpoint = ((40.0 ** 0.2 + 0.01 ** 0.2) / 2) ** 5
     assert process.sampler_schedule.sigmas(jnp.array([0.0, 0.5, 1.0])).tolist() == (
         pytest.approx([0.01, midpoint, 40.0], rel=1e-5))
-    assert process.prediction.sigma_data == 0.7
+    sigmas = jnp.array([0.01, midpoint, 40.0])
+    times = process.schedule.t_of_sigma(sigmas)
+    assert jnp.allclose(process.weight(times), 1 / 0.7**2 + 1 / sigmas**2, rtol=1e-5)
+    assert jnp.allclose(process.prediction.get_input_scale(process.schedule.rates(times)),
+                        1 / jnp.sqrt(sigmas**2 + 0.7**2), rtol=1e-5)
 
 
-def test_presets_rebuild_from_their_fields():
-    """What run.json stores is the preset's fields; building the registry
-    member from them is the same process."""
+def test_presets_rebuild_from_their_fields(rng):
+    """Recorded flow fields control the rebuilt rates and training draws."""
     import dataclasses
 
     from dew.registry import presets as registry
-    preset = registry.Flow(shift=3.0, logit_mean=0.5)
-    rebuilt = registry.build("flow", **dataclasses.asdict(preset))
-    assert rebuilt == preset
-    assert rebuilt().schedule.shift == 3.0
-    with pytest.raises(ValueError, match="no field"):
+    preset = registry.Flow(shift=3.0, logit_mean=0.5, logit_std=0.7)
+    process = registry.build("flow", **dataclasses.asdict(preset))()
+    times = jnp.array([0.05, 0.5, 0.95])
+    alpha, sigma = process.schedule.rates(times)
+    expected = 3 * times / (1 + 2 * times)
+    assert jnp.allclose(sigma, expected, rtol=1e-6)
+    assert jnp.allclose(alpha, 1 - expected, rtol=1e-6)
+    draws = process.schedule.sample_t(rng, 20000)
+    logits = jnp.log(draws / (1 - draws))
+    assert abs(float(jnp.mean(logits)) - 0.5) < 0.05
+    assert abs(float(jnp.std(logits)) - 0.7) < 0.05
+    with pytest.raises(ValueError):
         registry.build("flow", shfit=3.0)

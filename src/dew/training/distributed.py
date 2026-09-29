@@ -180,37 +180,39 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     return Mesh(hybrid_devices(spec, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
 
 
-def tensor_bandwidth(mesh: Mesh, size: int = 1 << 28) -> float:
+def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     """What one device receives a second in an all-gather over `mesh`'s
-    tensor axis of a `size`-byte result, with every tensor group gathering
-    at once as a step's do: (T - 1) / T of the result over the median of five
-    gathers, after two that warm the collective. Every process takes the
-    pool's lowest figure, so every process decides from the same number and
-    compiles the same program; the slowest group bounds the step anyway.
+    `axis` of a `size`-byte result, with every group along the axis
+    gathering at once as a step's do: (N - 1) / N of the result over the
+    median of five gathers, after two that warm the collective. Every
+    process takes the pool's lowest figure, so every process decides from
+    the same number and compiles the same program; the slowest group bounds
+    the step anyway.
 
-    `dew.nn.sharding.down_projection` reads it to decide whether a
-    down-projection of the residual runs on each tensor shard's own tokens.
+    `dew.nn.sharding.down_projection` reads the tensor axis's to decide
+    whether a down-projection of the residual runs on each tensor shard's
+    own tokens, and `dew.nn.sharding.split_positions` the sequence axis's.
     The default result, 256 MiB, of which a device receives at least half,
-    is the size of the collectives that decision prices where it matters
+    is the size of the collectives those decisions price where they matter
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
     NVLink pair's all-gather moved 8.2 GB/s a device at 4 MiB and 31.0 at
     128 MiB."""
-    tensor = mesh.shape[TENSOR_AXIS]
-    count = size // 4 // tensor * tensor
-    sharding = NamedSharding(mesh, P(TENSOR_AXIS))
+    ways = mesh.shape[axis]
+    count = size // 4 // ways * ways
+    sharding = NamedSharding(mesh, P(axis))
     source = jax.make_array_from_callback(
         (count,), sharding, lambda index: np.zeros(sharding.shard_shape((count,)), np.float32))
     gather = jax.jit(jax.shard_map(
-        lambda shard: jax.lax.all_gather(shard, TENSOR_AXIS, tiled=True), mesh=mesh,
-        in_specs=P(TENSOR_AXIS), out_specs=P(), axis_names={TENSOR_AXIS}, check_vma=False))
+        lambda shard: jax.lax.all_gather(shard, axis, tiled=True), mesh=mesh,
+        in_specs=P(axis), out_specs=P(), axis_names={axis}, check_vma=False))
     seconds = []
     for attempt in range(7):
         began = time.perf_counter()
         jax.block_until_ready(gather(source))
         if attempt >= 2:
             seconds.append(time.perf_counter() - began)
-    received = (tensor - 1) / tensor * count * 4 / statistics.median(seconds)
+    received = (ways - 1) / ways * count * 4 / statistics.median(seconds)
     if jax.process_count() == 1:
         return received
     return float(np.min(multihost_utils.process_allgather(np.asarray(received, np.float32))))
@@ -218,7 +220,8 @@ def tensor_bandwidth(mesh: Mesh, size: int = 1 << 28) -> float:
 
 def _slice(device) -> int:
     """The slice a device sits on; one outside any process pool, such as a
-    lone CPU process's, carries no slice_index and sits on the one there is."""
+    lone CPU process's, carries no slice_index and sits on the one there is.
+    jax's Device declares no such field, so it is read at this boundary."""
     return device.slice_index if hasattr(device, "slice_index") else 0
 
 
@@ -804,8 +807,6 @@ class DevicePrefetchIterator:
         if timeout is None:
             seconds = self._iterator.stop_seconds if isinstance(self._iterator, Budgeted) else None
             timeout = 5.0 if seconds is None else float(seconds)
-        if timeout < 0:
-            raise ValueError("close timeout must be nonnegative")
         error = None
         try:
             self._cancel()

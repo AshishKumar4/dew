@@ -105,7 +105,7 @@ def train():
     )
     objective = DiffusionObjective(
         model,
-        EDM()(),
+        EDM(regime="pixel")(),
         InputSpec(Field("image", (64, 64, 3))),
     )
     trainer = Trainer(
@@ -152,7 +152,7 @@ trainer = Trainer(
 Set `ema_decay` when you construct the objective. A value closer to 1 averages weights over more updates:
 
 ```python
-process = EDM()()
+process = EDM(regime="pixel")()
 objective = DiffusionObjective(
     model,
     process,
@@ -214,7 +214,7 @@ Import model classes directly when writing Python: `from dew.nn.backbones import
 
 The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` holds PPO's advantage estimators and loss terms as separate functions, so you can build your own policy loop from them.
 
-`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention), or `"auto"`. With `"auto"`, each trace picks cuDNN on a supported GPU, splash attention on a TPU when the kernel can tile the shapes and the sequence is at least 512 tokens, and XLA everywhere else. The choice never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
+`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention), or `"auto"`. With `"auto"`, each trace takes the reference path when the call asks for arithmetic no fused kernel performs (a matmul precision above default, a softmax outside fp32, or a compute dtype other than the inputs'), has float64 inputs, or runs bf16 on a GPU older than sm80, then picks cuDNN on a supported GPU when the call has no attention sinks, splash attention on a TPU for a call it qualifies (lengths it can tile of at least 512 tokens, a mask it can describe, no additive bias and whole sequences at the kernel), and XLA everywhere else. The choice never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
 
 ## Models
 
@@ -713,7 +713,8 @@ import numpy as np
 import optax
 
 from dew import Checkpoints, Dataset, Trainer
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
@@ -1057,7 +1058,7 @@ config = DiffusionRunConfig(
         loading=Loading(workers=0, threads=1, read_buffer=2),
     ),
     trainer=TrainerConfig(checkpoint_dir=str(run), batch_size=16, steps=20, keep=1),
-    preset=presets.EDM(),
+    preset=presets.EDM(regime="pixel"),
     text=None,
 )
 
@@ -1423,7 +1424,7 @@ Add the extra for your hardware; its accelerator build of JAX matches the JAX De
 
 Installing from the repository without a checkout works the same way: `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Take the accelerator build from these extras, not from `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]`. Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)). pip can't resolve PyPI's jax extras beside that pin in one install, and a later `-U "jax[...]"` would replace the pin with any newer PyPI jax. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
-The optional extras are `av`, `cuda12`, `cuda13`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 

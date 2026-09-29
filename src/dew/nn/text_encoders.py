@@ -384,8 +384,6 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
     text = records.record(hf_config.get("text_config", hf_config), "text_config")
 
     activation = records.text(text.get("hidden_act", "quick_gelu"), "hidden_act")
-    if activation not in ("quick_gelu", "gelu", "gelu_pytorch_tanh"):
-        raise ValueError(f"Unsupported CLIP text activation: {activation}")
     eos_token_id = text.get("eos_token_id", 49407)
     if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
         raise ValueError(
@@ -659,9 +657,9 @@ def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = T
     repos also carry torch, TensorFlow and Flax copies of the same weights,
     and a pipeline's encoders their fp16 variants, which are never fetched.
     """
-    from dew.interop.hf_decoders import _snapshot
+    from dew.interop.sources import snapshot
 
-    return _snapshot(name_or_dir, revision, weights=weights)
+    return snapshot(name_or_dir, revision, weights=weights)
 
 
 def _read_config(directory: Path) -> Mapping[str, object]:

@@ -62,7 +62,7 @@ The built-in metrics reduce their batches as follows:
 - Perplexity sums weighted losses and target weights, then exponentiates.
 - Image means weight each image once. Video PSNR and SSIM weight each frame once.
 - Paired image metrics and CLIP need as many generated rows as reference or prompt rows.
-- FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches it is fed, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k. With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes: bilinear resize to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` holds them to 1e-4 absolute on features and 1e-5 relative on the distance. The values compare with pytorch-fid's, not with clean-fid's (antialiased bicubic resize) or the TF1 TTUR code's.
+- FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches it is fed, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k. With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes: bilinear resize to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` holds them to 1e-4 absolute on features and 1e-5 relative on the distance. The values compare with pytorch-fid's, not with clean-fid's (antialiased bicubic resize) or the TF1 TTUR code's. On TPU the feature extractor puts an optimization barrier before each strided 2D convolution, which keeps XLA's space-to-batch rewrite from miscompiling it at small per-device batches; no images are added to the batch, and CPU and GPU compile the barrier away.
 - JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split and are not a probe over the full dataset.
 
 Training metrics are named under `train/`, and reduced validation metrics under `val/`. Metric names must be unique within a pass.
@@ -99,8 +99,9 @@ Reporting has no background queue and never drops a report, so the I/O costs tim
 |---|---|
 | `RunRecord` | The resolved model, data and optimizer configuration, and package versions. |
 | `FitStarted` | The fit began. |
+| `StepCompiled` | A training step compiled for a new batch shape, with the seconds it took, the remat it compiled under, and the per-axis link bandwidths and projection-spreading choices. |
 | `CheckpointRequested` | A checkpoint save was submitted asynchronously; it does not mean the checkpoint is durable. |
-| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. A standalone `dew.profile` capture reports no record. |
+| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.profile` capture reports no record. |
 | `FitEnded` | The fit ended, with its status. |
 | `TrialFinished` | One sweep trial. |
 

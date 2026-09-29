@@ -41,8 +41,6 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     shrinks to the latent grid by torch's nearest rule, as diffusers'
     inpainting pipelines shrink it (`prepare_mask_latents`).
     """
-    if autoencoder is None:
-        raise ValueError("Masked-image conditioning requires an autoencoder")
     mask = jnp.asarray(mask, jnp.float32)
     if mask.shape != (*pixels.shape[:-1], 1):
         raise ValueError("Image and mask geometry must match, with one mask channel")

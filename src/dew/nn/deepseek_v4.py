@@ -58,6 +58,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
@@ -70,6 +71,7 @@ from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
@@ -86,8 +88,10 @@ pool's entries. One name each, since every layer reads the latest (section
 2.3.1)."""
 
 
-def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None):
-    """cos/sin per pair over the rope width, `[..., rope_dim // 2]`.
+def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None, *,
+               dtype: DTypeLike):
+    """cos/sin per pair over the rope width, `[..., rope_dim // 2]`, in `dtype`
+    (`at_least_fp32` of the activations it rotates).
 
     V4's rotary scales neither table: its YaRN entry forces
     `attention_factor` to 1.0 (configuration_deepseek_v4.py:294-320) and
@@ -95,9 +99,9 @@ def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None)
     ramp changes the frequencies alone.
     """
     if yarn is None:
-        return rotary_freqs(positions, rope_dim, theta)
-    inv_freq = yarn_inv_freq(rope_dim, theta, yarn)
-    angles = jnp.asarray(positions, jnp.float32)[..., None] * inv_freq
+        return rotary_freqs(positions, rope_dim, theta, dtype=dtype)
+    inv_freq = yarn_inv_freq(rope_dim, theta, yarn, dtype=dtype)
+    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
     return jnp.cos(angles), jnp.sin(angles)
 
 
@@ -117,7 +121,7 @@ def rotate_trailing(x, cos, sin):
         sin = jnp.broadcast_to(sin, (lead[0], *sin.shape))
     if x.ndim == 4:
         cos, sin = cos[:, :, None, :], sin[:, :, None, :]
-    rope = x[..., -2 * pairs:].astype(jnp.float32).reshape(*lead, pairs, 2)
+    rope = x[..., -2 * pairs:].astype(at_least_fp32(x.dtype)).reshape(*lead, pairs, 2)
     first, second = rope[..., 0], rope[..., 1]
     rotated = jnp.stack([first * cos - second * sin, second * cos + first * sin], axis=-1)
     return jnp.concatenate([x[..., :-2 * pairs], rotated.reshape(*lead, 2 * pairs).astype(x.dtype)], axis=-1)
@@ -151,7 +155,7 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
             [jnp.full_like(gate[:, :1, :, :width], -jnp.inf), gate[:, :-1, :, :width]], axis=1)
         kv = jnp.concatenate([previous_kv, kv[..., width:]], axis=2)
         gate = jnp.concatenate([previous_gate, gate[..., width:]], axis=2)
-    weights = jax.nn.softmax(gate.astype(jnp.float32), axis=2).astype(kv.dtype)
+    weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=2).astype(kv.dtype)
     return jnp.sum(kv * weights, axis=2)
 
 
@@ -196,7 +200,8 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             if old is not None:
                 window_key = jnp.concatenate([old[0], window_key[..., width:]], axis=1)
                 window_gate = jnp.concatenate([old[1], window_gate[..., width:]], axis=1)
-            weights = jax.nn.softmax(window_gate.astype(jnp.float32), axis=1).astype(window_key.dtype)
+            weights = jax.nn.softmax(window_gate.astype(at_least_fp32(window_gate.dtype)),
+                                     axis=1).astype(window_key.dtype)
             entry = jnp.sum(window_key * weights, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
             values = write_cache(values, entry[:, None], at)
@@ -309,7 +314,8 @@ class CompressedEntries(nn.Module):
 
     def rotate(self, latents, windows):
         """Rotate each entry at its window's first position, `window * rate`."""
-        cos, sin = rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn)
+        cos, sin = rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
+                              dtype=at_least_fp32(latents.dtype))
         return rotate_trailing(latents, cos, sin)
 
     def entries(self, x):
@@ -383,13 +389,15 @@ class IndexScorer(nn.Module):
 
 
 def _index_scores(query, keys, weights, precision=None):
-    """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32,
-    over keys `[B, T, D]` every query shares or `[B, S, T, D]` per query."""
+    """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32
+    (`at_least_fp32`), over keys `[B, T, D]` every query shares or
+    `[B, S, T, D]` per query."""
     heads, width = query.shape[-2:]
+    wide = at_least_fp32(query.dtype)
     shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
-    scores = jnp.maximum(jnp.einsum(shared, query.astype(jnp.float32),
-                                    keys.astype(jnp.float32), precision=precision), 0) * width ** -0.5
-    return jnp.einsum('bsht,bsh->bst', scores, weights.astype(jnp.float32) * heads ** -0.5,
+    scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
+                                    keys.astype(wide), precision=precision), 0) * width ** -0.5
+    return jnp.einsum('bsht,bsh->bst', scores, weights.astype(wide) * heads ** -0.5,
                       precision=precision)
 
 
@@ -647,7 +655,7 @@ class DeepseekV4Attention(nn.Module):
                 self.compress = CompressedEntries(
                     width=self.head_dim, rate=rate, overlap=False,
                     rope_dim=self.rope_dim, rope_theta=self.rope_theta, yarn=self.yarn,
-                    norm_eps=self.norm_eps, position_bias=False, pool_dtype=jnp.float32,
+                    norm_eps=self.norm_eps, position_bias=False, pool_dtype=at_least_fp32(self.dtype),
                     quantized=self.kv_qat,
                     dtype=self.dtype, precision=self.precision, name='compressor')
             if not self.kv_shared:
@@ -690,14 +698,16 @@ class DeepseekV4Attention(nn.Module):
             entries, latents = self.compress.entries_and_latents(x)
             windows = jnp.arange(latents.shape[1])
             keys = self.indexer.keys(latents, *rope_freqs(windows * rate, self.rope_dim,
-                                                          self.rope_theta, self.yarn))
+                                                          self.rope_theta, self.yarn,
+                                                          dtype=at_least_fp32(latents.dtype)))
         else:
             slots, capacity, allocated = cache
             entries, latents, windows = self.compress.cached_entries(x, slots, capacity, allocated)
             held = self.variable('cache', 'index_keys', jnp.zeros,
                                  (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
             fresh = self.indexer.keys(latents, *rope_freqs(windows * rate, self.rope_dim,
-                                                           self.rope_theta, self.yarn))
+                                                           self.rope_theta, self.yarn,
+                                                           dtype=at_least_fp32(latents.dtype)))
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
@@ -754,7 +764,8 @@ class DeepseekV4Attention(nn.Module):
             positions = jnp.arange(length) if valid is None else jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
         positions = jnp.asarray(positions)
         rows = jnp.arange(length)
-        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn)
+        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
+                              dtype=at_least_fp32(x.dtype))
 
         # The query latent and the shared key head project the residual down,
         # where `down_projection` places them: on each tensor shard's own
@@ -813,7 +824,8 @@ class DeepseekV4Attention(nn.Module):
         # One shared key/value head under every query head, the per-head
         # sink beside the logits, softmax in fp32 and the sink dropped
         # (:708-736).
-        logits = jnp.einsum('bshd,btd->bhst', query.astype(jnp.float32), keys.astype(jnp.float32),
+        wide = at_least_fp32(query.dtype)
+        logits = jnp.einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
                             precision=self.precision) * self.head_dim ** -0.5
         logits = jnp.where(allowed[:, None], logits, -jnp.inf)
         sinks = jnp.broadcast_to(self.sinks[None, :, None, None], (batch, self.num_heads, length, 1))
@@ -864,7 +876,8 @@ class DSparkAttention(DeepseekV4Attention):
                                                     store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
-                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn),
+                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
+                                          dtype=at_least_fp32(main.dtype)),
                         down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
@@ -873,14 +886,16 @@ class DSparkAttention(DeepseekV4Attention):
                              f"from kv_store[{DRAFT_CONTEXT!r}]")
         else:
             main_keys = self._window_keys(main, *rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
-                                                            self.rope_theta, self.yarn),
+                                                            self.rope_theta, self.yarn,
+                                                            dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
             last = jnp.full((batch,), main.shape[1] - 1)
         length = x.shape[1]
         if length == 0:
             return x
         positions = last[:, None] + 1 + jnp.arange(length)
-        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn)
+        cos, sin = rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
+                              dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
         q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
         query = self.q_b_proj(constrain(q_resid, RESIDUAL)).reshape(

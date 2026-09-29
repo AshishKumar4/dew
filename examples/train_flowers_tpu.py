@@ -109,7 +109,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         data=ArrayRecordImages(path=str(out / "data"), image_size=16, augmentation="none",
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),
-        preset=EDM(),
+        preset=EDM(regime="pixel"),
         sampler=Heun(),
         guidance=CFG(2.0),
         sampling_steps=2,
@@ -136,7 +136,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(config.model), dtype="bfloat16"),
         data=replace(prepared, image_size=config.image_size, val_batches=4),
-        preset=EDM(),
+        preset=EDM(regime="pixel"),
         sampler=Heun(),
         guidance=CFG(config.guidance),
         sampling_steps=config.sampling_steps,

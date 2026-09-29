@@ -314,7 +314,15 @@ def test_bfloat16_keeps_the_state_in_f32_and_rounds_the_output_the_same(monkeypa
 
 
 def test_the_kernel_is_refused_on_cpu():
-    assert not ssd_kernel_runs(256, 64, 128, "cpu")
+    assert not ssd_kernel_runs(256, 64, 128, "cpu", dtype=jnp.float32)
+
+
+def test_a_float64_scan_takes_the_xla_path():
+    """The kernel computes in float32, so a float64 scan (a float64
+    reference's, under x64) takes the XLA path at a geometry the kernel
+    takes, which computes in the scan's own dtype."""
+    assert ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float32)
+    assert not ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float64)
 
 
 @pytest.mark.parametrize(("chunk_size", "head_dim", "state_size", "runs"), [
@@ -326,15 +334,15 @@ def test_the_kernel_is_refused_on_cpu():
     (1024, 128, 128, False),                    # past the tpu budget
 ])
 def test_the_geometry_decides_the_tpu_kernel(chunk_size, head_dim, state_size, runs):
-    assert ssd_kernel_runs(chunk_size, head_dim, state_size, "tpu") is runs
+    assert ssd_kernel_runs(chunk_size, head_dim, state_size, "tpu", dtype=jnp.float32) is runs
 
 
 def test_a_gpu_is_never_chosen():
     """The Triton kernel measured slower than XLA on sm89 wherever it
     compiled, so a GPU takes the XLA path at every geometry."""
-    assert ssd_kernel_runs(256, 64, 128, "tpu")
-    assert not ssd_kernel_runs(64, 64, 64, "gpu")
-    assert not ssd_kernel_runs(128, 64, 64, "gpu")
+    assert ssd_kernel_runs(256, 64, 128, "tpu", dtype=jnp.float32)
+    assert not ssd_kernel_runs(64, 64, 64, "gpu", dtype=jnp.float32)
+    assert not ssd_kernel_runs(128, 64, 64, "gpu", dtype=jnp.float32)
 
 
 def kernels_in(jaxpr) -> int:
@@ -369,8 +377,8 @@ def test_the_choice_is_logged_once_per_geometry(monkeypatch, caplog):
     on_backend(monkeypatch, "tpu")
     with caplog.at_level("INFO", logger="dew.nn.kernels.ssd"):
         for _ in range(3):
-            ssd_kernel_platform(256, 64, 128)
-        ssd_kernel_platform(256, 6, 5)
+            ssd_kernel_platform(256, 64, 128, dtype=jnp.float32)
+        ssd_kernel_platform(256, 6, 5, dtype=jnp.float32)
 
     lines = [record.getMessage() for record in caplog.records]
     assert len(lines) == 2
@@ -380,12 +388,12 @@ def test_the_choice_is_logged_once_per_geometry(monkeypatch, caplog):
 
 def test_the_platform_is_the_backend_the_kernel_runs_on(monkeypatch):
     on_backend(monkeypatch, "tpu")
-    assert ssd_kernel_platform(128, 64, 64) == "tpu"
-    assert ssd_kernel_platform(128, 6, 5) is None
+    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) == "tpu"
+    assert ssd_kernel_platform(128, 6, 5, dtype=jnp.float32) is None
     on_backend(monkeypatch, "gpu")
-    assert ssd_kernel_platform(128, 64, 64) is None
+    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) is None
     on_backend(monkeypatch, "cpu")
-    assert ssd_kernel_platform(128, 64, 64) is None
+    assert ssd_kernel_platform(128, 64, 64, dtype=jnp.float32) is None
 
 
 @pytest.mark.parametrize("platform", KERNELS)
@@ -470,7 +478,7 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     in the assertion message rather than bounded: at TF32 it scales with the
     operands, not with fp32's epsilon."""
     batch, _, heads, head_dim, state_size, _ = shape
-    assert ssd_kernel_runs(chunk_size, head_dim, state_size, jax.default_backend())
+    assert ssd_kernel_runs(chunk_size, head_dim, state_size, jax.default_backend(), dtype=jnp.float32)
     platform = jax.default_backend()
     x, dt, A, B, C, _, state = mixer_operands(shape)
     operands = blocks(x, dt, A, B, C, state, chunk_size)

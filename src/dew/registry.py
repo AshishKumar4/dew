@@ -189,10 +189,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
     @property
     def union(self) -> type[Built] | types.UnionType:
         """Return `Union[...]` of the members, for a tyro subcommand over the table."""
-        members = list(self._members.values())
-        if not members:
-            raise ValueError(f"the {self.kind} registry is empty")
-        return functools.reduce(operator.or_, members)
+        return functools.reduce(operator.or_, self._members.values())
 
 
 class Named(Protocol):
@@ -478,6 +475,24 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     return fields
 
 
+def float64_twin(config: Mapping[str, object]) -> Mapping[str, object]:
+    """`config`, a model config `with_precision` wrote, computing in float64:
+    its dtype and the dtype `precision_fields` wrote into each stage of the
+    UNets' `attention_configs`, the only nested dtypes the policy writes.
+    Under x64 the model computes in float64 throughout
+    (`dew.nn.precision.at_least_fp32`): the twin a float64 reference runs. A
+    run's dtype knob names no float64; only a reference computes in it."""
+    twin: dict[str, object] = {**config, "dtype": jnp.float64}
+    stages = config.get("attention_configs")
+    if isinstance(stages, list | tuple):
+        twin["attention_configs"] = [
+            {**stage, "dtype": jnp.float64} if isinstance(stage, Mapping)
+            else dataclasses.replace(stage, dtype=jnp.float64)
+            if dataclasses.is_dataclass(stage) and not isinstance(stage, type) else stage
+            for stage in stages]
+    return twin
+
+
 def with_precision(name: str, config: Mapping[str, object], *,
                    dtype: str, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
@@ -504,6 +519,6 @@ schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", rec
 REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors, schedules)
 
-__all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "metrics", "mixers", "models",
-           "objectives", "presets", "projectors", "resolve_dtype", "samplers", "schedules", "towers",
+__all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "float64_twin", "metrics", "mixers",
+           "models", "objectives", "presets", "projectors", "resolve_dtype", "samplers", "schedules", "towers",
            "with_precision"]

@@ -29,7 +29,8 @@ import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
@@ -519,6 +520,28 @@ def test_the_grouped_matmul_matches_a_per_expert_loop():
     # Largest observed difference 1.19e-07 at fp32 on CPU.
     assert np.max(np.abs(np.asarray(output) - reference)) < 1e-6
 
+
+def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
+    """Enabling a float64 oracle must not prevent the float32 model running.
+
+    bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
+    group sizes. Exercise the routed experts, not just a hand-typed count.
+    """
+    with jax.enable_x64(False):
+        experts, variables, x, weights, indices = routed_experts(top_k=2)
+
+    def step(variables, x):
+        output = experts.apply(variables, x, weights, indices)
+        return jnp.square(output).sum(), output
+
+    results = []
+    for enabled in (False, True):
+        with jax.enable_x64(enabled):
+            results.append(jax.device_get(jax.jit(
+                jax.value_and_grad(step, argnums=(0, 1), has_aux=True))(variables, x)))
+    for expected, actual in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
+        assert actual.dtype == expected.dtype == np.float32
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 def random_routing(key, tokens, top_k, num_experts=8):
     """Distinct experts per token, as a router chooses them, under random

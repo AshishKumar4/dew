@@ -15,7 +15,8 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inference.pages import Pages
 from dew.inference.pipeline import place
 from dew.inference.serving import PagedRows, Server
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.kv_cache import KVCache
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling

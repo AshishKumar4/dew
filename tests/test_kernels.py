@@ -322,6 +322,7 @@ def test_tpu_runs_needs_the_tpu_backend(monkeypatch):
     because the interpreter that runs splash elsewhere is far slower than the
     XLA attention 'auto' falls back to."""
     query, key, _ = qkv((2, SPLASH_MIN_LENGTH, 8, 128))
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     assert not tpu_runs(query, key)
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     assert tpu_runs(query, key)

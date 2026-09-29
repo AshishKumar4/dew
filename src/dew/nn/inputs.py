@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from jax.core import Tracer
 from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
@@ -417,9 +418,13 @@ def prompt_major(tree):
 def mesh_of(tree) -> jax.sharding.Mesh | None:
     """The mesh the tree's leaves sit on, or None for single-device arrays."""
     for leaf in jax.tree.leaves(tree):
-        mesh = getattr(getattr(leaf, "sharding", None), "mesh", None)
-        if mesh is not None and not mesh.empty:
-            return mesh
+        # A tracer has no sharding to read; an abstract leaf may carry one.
+        if isinstance(leaf, Tracer):
+            continue
+        sharding = leaf.sharding if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) else None
+        if (isinstance(sharding, jax.sharding.NamedSharding) and isinstance(sharding.mesh, jax.sharding.Mesh)
+                and not sharding.mesh.empty):
+            return sharding.mesh
     return None
 
 

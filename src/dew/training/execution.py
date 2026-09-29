@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.inference.banks import bank_sites, entry_tree, in_namespace, layer_index, narrowed, one_layer
-from dew.nn.backbones.causal_transformer import group_name
+from dew.nn.backbones.layer_plan import group_name
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer

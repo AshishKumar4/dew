@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the FlaxDiff fixture tests/test_flaxdiff.py checks Dew's SimpleUDiT against.
+"""Write the DiT fixtures tests/test_flaxdiff.py checks Dew against.
 
 FlaxDiff (github.com/AshishKumar4/FlaxDiff) is the project Dew grew out of,
 and `dew.interop.flaxdiff` loads its checkpoints. The reference is FlaxDiff's
@@ -24,6 +24,12 @@ included, so every path of the block reaches the output.
     git -C /tmp/flaxdiff checkout 3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a
     python tools/flaxdiff_reference.py --flaxdiff-path /tmp/flaxdiff \\
         --out tests/fixtures/flaxdiff
+
+For hybrid_dit, use commit 94d2d21caeb79aba48a505fa79d9a1a974751234
+(run cmbd8bia, flaxdiff 0.2.10), JAX 0.5.3 and Flax 0.10.6, and pass
+`--architecture hybrid_dit --out tests/fixtures/flaxdiff/hybrid_dit`.
+The run's saved diff changes resource limits in training.py only. Its
+model code is the committed ssm_dit.py, not the later shared-block rewrite.
 """
 
 import argparse
@@ -37,6 +43,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
+HYBRID_COMMIT = "94d2d21caeb79aba48a505fa79d9a1a974751234"
 
 # The model entry of a FlaxDiff run config, at a size a fixture can hold.
 MODEL = {"output_channels": 4, "patch_size": 2, "emb_features": 32, "num_layers": 4,
@@ -50,7 +57,8 @@ BATCH, SIZE, TEXT_TOKENS, TEXT_WIDTH, REAL_TOKENS = 2, 8, 7, 16, (3, 5)
 def arguments(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--flaxdiff-path", required=True,
-                        help=f"a FlaxDiff checkout at {COMMIT}, the directory holding flaxdiff/")
+                        help="the directory holding flaxdiff/ at the architecture's reference commit")
+    parser.add_argument("--architecture", choices=("simple_udit", "hybrid_dit"), default="simple_udit")
     parser.add_argument("--out", default="tests/fixtures/flaxdiff")
     return parser.parse_args(argv)
 
@@ -59,11 +67,17 @@ def main(argv=None) -> None:
     args = arguments(argv)
     sys.path.insert(0, args.flaxdiff_path)
     from flaxdiff.models.common import FourierEmbedding
-    from flaxdiff.models.simple_vit import SimpleUDiT
+    if args.architecture == "hybrid_dit":
+        from flaxdiff.models.ssm_dit import HybridSSMAttentionDiT as Model
+        model_config = {**MODEL, "ssm_state_dim": 8, "ssm_attention_ratio": "3:1",
+                        "use_2d_fusion": True, "use_zigzag": True}
+        commit = HYBRID_COMMIT
+    else:
+        from flaxdiff.models.simple_vit import SimpleUDiT as Model
+        model_config, commit = MODEL, COMMIT
 
-    model = SimpleUDiT(**{key: value for key, value in MODEL.items()
-                          if key not in ("activation", "dtype", "precision")},
-                       dtype=jnp.float32)
+    model = Model(**{key: value for key, value in model_config.items()
+                     if key not in ("activation", "dtype", "precision")}, dtype=jnp.float32)
     rng = np.random.default_rng(0)
     x = rng.standard_normal((BATCH, SIZE, SIZE, MODEL["output_channels"]), dtype=np.float32)
     # log(sigma) / 4 over the Karras grid's range, which is what EDM hands the model
@@ -81,7 +95,8 @@ def main(argv=None) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(
-        {"flaxdiff_commit": COMMIT, "architecture": "simple_udit", "model": MODEL}, indent=1) + "\n")
+        {"flaxdiff_commit": commit, "architecture": args.architecture, "model": model_config,
+         "jax_version": jax.__version__}, indent=1) + "\n")
     arrays = {f"params/{name}": np.asarray(leaf)
               for name, leaf in flatten_dict(params["params"], sep="/").items()}
     np.savez(out / "reference.npz", **arrays, fourier_table=table, x=x, temb=temb, text=text,

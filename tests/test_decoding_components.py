@@ -457,7 +457,7 @@ def test_lowered_scalar_policies_preserve_direct_values_and_dtype(policy, dtype)
     state = rows([[1]], [[]])
     logits = jnp.asarray([[-3.0, -1.0, 0.0, 2.0]], dtype)
     expected = jax.jit(lambda s, x: policy(s, x))(state, logits)
-    lowered = decoding.components((policy,), "logits")[0]
+    lowered = decoding.components((policy,))[0]
     actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
     assert actual.dtype == expected.dtype == dtype
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
@@ -477,7 +477,7 @@ def test_lowered_top_p_preserves_host_subtraction_at_the_probability_boundary():
     assert bool(jnp.any((probability > np.float32(excluded)) & (probability <= device_excluded)))
     policy = decoding.TopP(p)
     expected = jax.jit(lambda s, x: policy(s, x))(state, logits)
-    lowered = decoding.components((policy,), "logits")[0]
+    lowered = decoding.components((policy,))[0]
     actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
@@ -489,6 +489,6 @@ def test_policy_subclasses_keep_their_own_callable_behavior():
 
     state = rows([[1]], [[]])
     logits = jnp.asarray([[-1.0, 0.0, 2.0]], jnp.float32)
-    lowered = decoding.components((ShiftedTemperature(1.0),), "logits")[0]
+    lowered = decoding.components((ShiftedTemperature(1.0),))[0]
     actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(logits + 3.0))

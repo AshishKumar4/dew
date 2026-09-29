@@ -8,9 +8,14 @@ tracker, and what a failure does to the run.
 """
 
 import dataclasses
+import gc
 import json
 import os
 import re
+import subprocess
+import sys
+import weakref
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +24,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from flax import linen as nn
+from flax.errors import ScopeParamShapeError
 
 from dew import position
 from dew.artifacts import Representations
@@ -145,6 +151,32 @@ class RecordingTracker:
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
+    refs = []
+
+    class ObservedPrefetch(trainer_module.DevicePrefetchIterator):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            refs.append(weakref.ref(self))
+
+    class WrongWidth(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            if self.index == 4:
+                batch = {**batch, "x": np.concatenate([batch["x"], batch["x"][:, :1]], axis=1)}
+            return batch
+
+    monkeypatch.setattr(trainer_module, "DevicePrefetchIterator", ObservedPrefetch)
+    with pytest.raises(ScopeParamShapeError) as failure:
+        make_trainer().fit(Data(train=WrongWidth), steps=10, log_every=100)
+    # A caller may retain the error for reporting; its traceback must not
+    # retain the closed worker and its queue after fit has relinquished it.
+    assert failure.value.__traceback__ is not None
+    gc.collect()
+    assert len(refs) == 1
+    assert refs[0]() is None
 
 
 def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
@@ -1218,46 +1250,60 @@ def test_accumulation_must_be_positive():
         make_trainer(accumulation=0)
 
 
-@pytest.mark.parametrize("generation,flags,ssd,off", [
-    ("sm80", "", False, True), ("sm80", "", True, False),
-    ("sm80", "--xla_gpu_enable_triton_gemm=true", False, False),
-    ("sm89", "", False, False), ("v6e", "", False, False)])
-def test_the_step_turns_triton_gemm_off_where_it_was_measured_to_lose(
-        monkeypatch, generation, flags, ssd, off):
-    """sm80 compiles a training step with XLA's Triton GEMM fusions off,
-    except for a model with an SSD mixer, whose scan lost 7.7% without them,
-    and except where the run set the flag itself."""
-    from types import SimpleNamespace
+@pytest.mark.parametrize("tokens", [4096, 8192, 16384])
+def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
+    """Compare real Trainer steps with the measured recipe: unfused whole
+    logits at 4096 tokens, fused whole logits at 8192, and a 4096-row tile
+    at 16384. Fresh processes keep conftest's deterministic XLA flags out
+    of the measurement; those flags change which whole-logits step fits.
+    The ABBA order and warmed step medians allow 4% noise, below the old
+    8%, 18%, and 3x regressions. Children need room for a preallocated pool.
+    """
+    devices = jax.devices()
+    if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
+        pytest.skip("measured on one 16 GiB RTX 4080")
+    if "xla_gpu_enable_triton_gemm" in os.environ.get("XLA_FLAGS", ""):
+        pytest.skip("an explicit Triton option overrides the measured default")
+    # Freed arrays can still occupy the parent's growable BFC pool. Check
+    # physical free VRAM, not just JAX's live arrays or its preallocation flag.
+    fraction = 0.85
+    memory = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True, timeout=10).stdout.splitlines()
+    if len(memory) != 1:
+        pytest.skip("the isolated benchmark needs one physical GPU")
+    total, free = (int(value) for value in memory[0].split(","))
+    if free < fraction * total:
+        pytest.skip(f"{free} MiB free VRAM; the child pool needs {fraction * total:.0f} MiB")
+    root = Path(__file__).resolve().parents[1]
+    case = {"architecture": "causal_transformer", "config": {
+        "vocab_size": 151936, "emb_features": 1024, "num_layers": 2, "num_heads": 16,
+        "num_kv_heads": 8, "head_dim": 128, "mlp_features": 3072, "max_seq_len": 1024,
+        "tie_embeddings": True}, "dtype": "bfloat16", "batch_size": tokens // 1024,
+        "seq_len": 1024}
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_gpu_deterministic_ops"))
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
+                   "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+    samples = ([], [])
+    for index, reference in enumerate((False, True, True, False)):
+        objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
+        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        record = tmp_path / f"step-{index}.json"
+        done = subprocess.run(
+            [sys.executable, "tools/benchmark_step.py", "--cases",
+             json.dumps([{**case, "objective": objective}]), "--warmup", "6", "--steps", "20",
+             "--json-out", str(record)], cwd=root,
+            env={**environment, "XLA_FLAGS": flags + options}, capture_output=True, text=True, timeout=180)
+        assert done.returncode == 0, done.stdout + done.stderr
+        row, = json.loads(record.read_text())
+        assert row["finite"], row
+        samples[int(reference)].append(row["p50_ms"])
+    measured, baseline = (float(np.median(values)) for values in samples)
+    assert measured < baseline * 1.04, (tokens, measured, baseline)
 
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.mixers.mamba2 import Mamba2Mixer
-    from dew.training import trainer as module
-
-    monkeypatch.setattr(module, "device_generation", lambda: generation)
-    monkeypatch.setenv("XLA_FLAGS", flags)
-    decoder = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
-                                mlp_features=16, max_seq_len=8,
-                                mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=8, n_groups=1) if ssd else None)
-    options = module.step_compiler_options(SimpleNamespace(model=decoder))
-    assert options == ({"xla_gpu_enable_triton_gemm": False} if off else None)
-
-
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
-def test_an_sm80_step_compiles_its_dots_to_cublas():
-    """On sm80 the compiled training step holds no Triton GEMM fusion: every
-    dot is a cuBLAS call. Elsewhere the step asks XLA for nothing, whether
-    or not XLA fuses GEMMs with Triton on that GPU."""
-    from dew.nn.kernels.generation import device_generation
-    from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS
-    from dew.training.trainer import step_compiler_options
-
-    trainer, _, _ = held_lm_trainer()
-    if device_generation() not in TRITON_GEMM_OFF_GENERATIONS:
-        assert step_compiler_options(trainer.objective) is None
-        return
-    state, _, _ = trainer.place()
-    trainer.compile(state, {"text": jnp.zeros((2, 5), jnp.int32)})
-    assert "__triton_gemm" not in trainer.executable.as_text()
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
@@ -1278,16 +1324,23 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+    from dew.objectives.base import Step, scalar_loss
 
-    assert trainer.executable is not None
+    compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+    batch = {"text": jnp.zeros((8, 5), jnp.int32)}
+    expected, _ = scalar_loss(trainer.objective, state.params, batch,
+                              Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
+    advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
+    assert loss == pytest.approx(float(expected), rel=1e-6)
+    assert int(advanced.step) == 1 and bool(finite)
 
 
-def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
-    """The step's first call runs the program `compile` built. Through the
-    jit it traced and compiled a second one, without the step's compiler
-    options: 25 s of an A100's cold start, and a step that ran with Triton
-    GEMM on where it was off."""
+def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
+    """The first execution requests no compilation after the public compile
+    call, including a second program retrieved from the persistent cache.
+    """
+    from jax import monitoring
+
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
@@ -1295,7 +1348,29 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, caplog):
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    step = trainer.compile(state, batch)
-    with caplog.at_level("WARNING"), jax.log_compiles():
+    events = []
+
+    def record(event, **metadata):
+        if event == "/jax/compilation_cache/compile_requests_use_cache":
+            events.append(event)
+
+    previous_dir = jax.config.jax_compilation_cache_dir
+    previous_enabled = jax.config.jax_enable_compilation_cache
+    monitoring.register_event_listener(record)
+    try:
+        jax.config.update("jax_compilation_cache_dir", str(tmp_path))
+        jax.config.update("jax_enable_compilation_cache", True)
+        step = trainer.compile(state, batch)
+        assert events, "the public compile must reach the compilation event listener"
+        # Input placement is separate from executing the compiled transaction.
+        assert trainer.executable is not None
+        state, batch = jax.device_put((state, batch), trainer.executable.input_shardings[0])
+        jax.block_until_ready((state, batch))
+        events.clear()
         jax.block_until_ready(step(state, batch))
-    assert not [record for record in caplog.records if "jit(step)" in record.getMessage()]
+        assert not events, events
+    finally:
+        monitoring.unregister_event_listener(record)
+        jax.config.update("jax_compilation_cache_dir", previous_dir)
+        jax.config.update("jax_enable_compilation_cache", previous_enabled)
+

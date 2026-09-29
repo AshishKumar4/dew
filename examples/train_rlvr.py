@@ -74,7 +74,7 @@ from dew.inference import (
 )
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
-from dew.nn.backbones.causal_transformer import remat_policy
+from dew.nn.backbones.decoder_block import remat_policy
 from dew.objectives.rl import (
     Action,
     CodeReward,
