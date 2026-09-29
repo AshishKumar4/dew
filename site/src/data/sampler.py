@@ -6,4 +6,5 @@ result = pipe(
     sampler=DPMSolverMultistep(),
     guidance=CFG(5.0),
 )
-Image.fromarray(uint8_pixels(result.host().images)[0])
+images = uint8_pixels(result.host().images)
+Image.fromarray(images[0])
