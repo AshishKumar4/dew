@@ -12,6 +12,11 @@ condition (`text:None` for an unconditional run) and the autoencoder
 --model.config as one JSON object, straight to the registry. The run spec is
 `dew.objectives.diffusion.DiffusionRunConfig`, saved as run.json next to the
 checkpoints, and training and inference both build from `config.build()`.
+
+`--pretrained stabilityai/stable-diffusion-3.5-medium preset:none` fine-tunes a
+published pipeline (SD3, Flux, Qwen-Image or a UNet) on its own conditioning,
+autoencoder and convention; `rl:flow-grpo --rl.reward clip_score` trains the
+model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
 import hashlib
@@ -34,11 +39,11 @@ def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -
     sample = config.sample_field()
     return {
         **fields,
-        "architecture": config.model.architecture,
+        "architecture": config.pretrained or config.model.architecture,
         "dataset": datasets.name_of(type(config.data)),
         "image_size": sample.shape[-2],
         "batch_size": config.trainer.batch_size,
-        "preset": presets.name_of(type(config.preset)),
+        "preset": "source" if config.preset is None else presets.name_of(type(config.preset)),
         "learning_rate": config.optim.learning_rate,
         "arguments_hash": arguments_hash,
         "date": run_timestamp(),
@@ -67,12 +72,14 @@ def main(config: DiffusionRunConfig) -> TrainState:
                     layout=config.trainer.layout)
     print(f"Local devices: {jax.local_devices()}")
 
+    config = config.pinned()
     # The objective first: its conditions are what read the dataset's
     # captions, so the encoder the run names decides the tokens.
     objective = config.build()
     data = config.data.load(batch=config.trainer.batch_size,
                             tokenize=objective.inputs.tokenize)
-    fields = config.model_fields(objective.autoencoder)
+    # A pretrained pipeline's fields are its checkpoint's, which it records.
+    fields = {} if config.pretrained is not None else config.model_fields(objective.autoencoder)
 
     # hash() is randomized per process; identical configs must map to the same
     # experiment
@@ -81,7 +88,7 @@ def main(config: DiffusionRunConfig) -> TrainState:
     summary = run_summary(config, fields, arguments_hash)
     return config.train(
         objective, data, name=experiment_name(config, summary),
-        metrics=config.build_eval_metrics(),
+        metrics=config.build_eval_metrics(), rollout=config.rollout(objective),
         summary={"model": fields, "arguments": summary,
                  "dataset": {"name": summary["dataset"], "records": data.records,
                              "steps_per_epoch": data.steps_per_epoch}})

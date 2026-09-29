@@ -142,6 +142,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     t5: T5Segment | None = None
     guidance: float | None = None
     param_dtype: str = "float32"
+    keyword: ClassVar[str] = "conditioning"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
@@ -367,6 +368,7 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
     width: int
     tokens: int = 512
     param_dtype: str = "float32"
+    keyword: ClassVar[str] = "conditioning"
     drop: int = field(init=False)
     """The system turn's token count, which the pipeline derives the same way."""
 
