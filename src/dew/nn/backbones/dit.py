@@ -50,6 +50,10 @@ class SimpleDiT(nn.Module):
     `Router` gathers and scatters them. The kept tokens stay in sequence
     order and rotate at their own positions. The draw reads the `dropout`
     stream. Sampling runs every token through every block.
+
+    `patch_bottleneck` is JiT's bottleneck patch embedding (Li & He 2025,
+    "Back to Basics: Let Denoising Generative Models Denoise"), for large
+    pixel patches: 128 in its models.
     """
     output_channels: int = 3
     patch_size: int = 16
@@ -69,6 +73,7 @@ class SimpleDiT(nn.Module):
     adaln_silu: bool = True
     text_pooling: Literal["real", "all"] = "real"
     routes: Sequence[Sequence[float]] = ()
+    patch_bottleneck: int | None = None
 
 
     def setup(self):
@@ -78,6 +83,7 @@ class SimpleDiT(nn.Module):
             scan_order=self.scan_order,
             dtype=self.dtype,
             precision=self.precision,
+            bottleneck=self.patch_bottleneck,
         )
         self.conditioning = ConditioningEmbed(
             emb_features=self.emb_features,

@@ -502,6 +502,11 @@
   "resolution_shift": null,
   "shift": 1.0
  },
+ "dew.diffusion.presets.JiT": {
+  "logit_mean": 0.8,
+  "logit_std": 0.8,
+  "t_eps": 0.05
+ },
  "dew.diffusion.presets.Karras": {
   "min_snr_gamma": null,
   "rho": 7.0,
