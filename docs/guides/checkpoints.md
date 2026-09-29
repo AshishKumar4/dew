@@ -136,7 +136,7 @@ Every process of a pool writes its own shards of a persistent checkpoint, proces
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not write `run.json`; recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. The record carries a version: `RunConfig.load` brings a record an older Dew wrote forward to the current fields, one version at a time (`dew.config.migrations`), and refuses a record a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service. Record those in the experiment metadata.
+`Checkpoints` does not write `run.json`; recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. `RunConfig.load` reads a record an older Dew wrote: a field the record lacks takes its default, which is what runs recorded before the field existed did. It refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service. Record those in the experiment metadata.
 
 ## Limits
 
