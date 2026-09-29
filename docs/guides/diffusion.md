@@ -79,6 +79,6 @@ config = DiffusionRunConfig(autoencoder=PretrainedAutoencoder(
 
 On the published SANA 1.1 weights and a 256x384 batch, the DC-AE port matches diffusers 0.34.0's `AutoencoderDC` to 9e-6 of the largest latent value and 3e-6 of the largest decoded pixel.
 
-The Wan VAE compresses time as well as space: a clip of 1 + 4k frames encodes to 1 + k latent frames, each 8 times smaller on a side with 16 channels, and a `VideoDataset` run's clips need that length. Each frame reads only the frames before it, so the first frame encodes alone and an image is a one-frame clip. On `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` and a 9-frame 128x192 clip, the port matches diffusers 0.34.0's `AutoencoderKLWan` to 1.6e-6 of the largest latent value and 7.7e-6 of the largest decoded pixel.
+The Wan VAE compresses time as well as space: a clip of 1 + 4k frames encodes to 1 + k latent frames, each 8 times smaller on a side with 16 channels, and a `VideoDataset` run's clips need that length. Each frame reads only the frames before it, so the first frame encodes alone and an image is a one-frame clip. On `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` and a 9-frame 128x192 clip, the port matches diffusers 0.34.0's `AutoencoderKLWan` to 1.5e-6 of the largest latent value and 8.8e-6 of the largest decoded pixel (`tests/test_wan_vae.py`, a `network` test).
 
 Use [training recipes](../recipes.md) for runs on real datasets. [Supported models](../models.md) lists the published checkpoints that load.

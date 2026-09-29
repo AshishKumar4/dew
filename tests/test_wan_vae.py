@@ -121,6 +121,37 @@ def test_the_decode_matches_the_source(loaded, reference):
     assert float(jnp.abs(pixels).max()) <= 1.0
 
 
+@pytest.mark.network
+def test_the_published_vae_matches_the_source():
+    """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, encodes a smooth
+    nine-frame 128x192 clip and decodes its posterior mean as diffusers'
+    `AutoencoderKLWan` does."""
+    torch = pytest.importorskip("torch")
+    diffusers = pytest.importorskip("diffusers")
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", allow_patterns=["vae/*"])
+    t, y, x = np.mgrid[0:9, 0:128, 0:192] / np.array([4.0, 32.0, 32.0])[:, None, None, None]
+    video = np.stack([np.sin(x + y + t), np.cos(2 * x - y - 0.5 * t), np.sin(3 * y + t) * np.cos(x)])[None]
+    video = (0.8 * video + 0.05 * np.random.default_rng(0).standard_normal(video.shape)).astype(np.float32)
+    with torch.no_grad():
+        source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").eval()
+        expected_mean = source.encode(torch.from_numpy(video)).latent_dist.mean
+        expected_pixels = source.decode(expected_mean).sample.numpy()
+        expected_mean = expected_mean.numpy()
+    del source
+
+    autoencoder, params, _, _ = load_wan_vae(path, jnp.float32)
+    model = autoencoder.model
+    mean = model.apply({"params": params}, channels_last(video), method=model.encode)
+    pixels = model.apply({"params": params}, channels_last(expected_mean), method=model.decode)
+    gaps = {"mean": scaled_gap(mean, channels_last(expected_mean)),
+            "pixels": scaled_gap(pixels, channels_last(expected_pixels))}
+    print(f"published VAE gaps {gaps}")
+    assert mean.shape == (1, 3, 16, 24, 16)
+    assert max(gaps.values()) < FORWARD, gaps
+
+
 def test_encoder_gradients_match_the_source(loaded, reference):
     autoencoder, params, layouts, _ = loaded
     model = autoencoder.model
