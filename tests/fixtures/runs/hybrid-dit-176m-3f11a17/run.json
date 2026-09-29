@@ -1,0 +1,284 @@
+{
+  "autoencoder": {
+    "dtype": "bfloat16",
+    "latent_scale": null,
+    "latent_shift": null,
+    "modelname": "pcuenq/sd-vae-ft-mse-flax",
+    "revision": "main"
+  },
+  "data": {
+    "fields": {
+      "augmentation": "flip_jitter",
+      "count": null,
+      "image_size": 256,
+      "loading": {
+        "read_buffer": 128,
+        "threads": 64,
+        "worker_buffer": 2,
+        "workers": 32
+      },
+      "path": null,
+      "seed": 0,
+      "shards": [
+        "arrayrecord2/laion12m_coco"
+      ],
+      "val_batches": 4,
+      "val_split": null
+    },
+    "name": "laion12m_coco"
+  },
+  "ema_decay": 0.999,
+  "guidance": {
+    "interval": [
+      0.0,
+      1.0
+    ],
+    "rescale": 0.0,
+    "scale": 5.0
+  },
+  "lora": null,
+  "model": {
+    "architecture": "hybrid_dit",
+    "attention_impl": "auto",
+    "config": {
+      "adaln_silu": false,
+      "emb_features": 768,
+      "mlp_ratio": 4,
+      "norm_epsilon": 1e-05,
+      "num_heads": 12,
+      "num_layers": 16,
+      "patch_size": 2,
+      "scan_order": "zigzag",
+      "ssm_attention_ratio": "3:1",
+      "ssm_state_dim": 64,
+      "text_pooling": "all",
+      "use_2d_fusion": true
+    },
+    "dtype": "float32",
+    "matmul_precision": null,
+    "param_dtype": null
+  },
+  "objective": "diffusion",
+  "optim": {
+    "clip_grads": 0.0,
+    "learning_rate": 0.0001,
+    "optimizer": "adamw",
+    "optimizer_opts": {},
+    "param_groups": [],
+    "schedule": null,
+    "state_dtype": "float32",
+    "weight_decay": null
+  },
+  "preset": {
+    "fields": {
+      "P_mean": -0.4,
+      "P_std": 1.0,
+      "min_snr_gamma": null,
+      "rho": 7.0,
+      "sigma_data": 0.5,
+      "sigma_max": 80.0,
+      "sigma_min": 0.002
+    },
+    "name": "edm"
+  },
+  "sampler": {
+    "fields": {
+      "algorithm": "dpmsolver++",
+      "euler_at_final": false,
+      "lower_order_final": true,
+      "order": 2,
+      "solver_type": "midpoint"
+    },
+    "name": "dpmsolver_multistep"
+  },
+  "sampling_steps": 20,
+  "text": {
+    "checkpoint": "openai/clip-vit-large-patch14",
+    "dtype": "bfloat16",
+    "encoder": "clip_text",
+    "field": "text",
+    "max_length": null,
+    "param_dtype": "float32",
+    "revision": null,
+    "unconditional": ""
+  },
+  "trainer": {
+    "accumulation": 1,
+    "batch_ramp": null,
+    "batch_size": 128,
+    "checkpoint_dir": "run",
+    "checkpoint_every": "epoch",
+    "compilation_cache_dir": "/mnt/scratch/dew/xla",
+    "dynamic_scale": false,
+    "epochs": null,
+    "eval_every": "epoch",
+    "keep": 1,
+    "layout": {
+      "host": [],
+      "host_parameters": [],
+      "min_shard": 65536,
+      "rules": [
+        [
+          "vocab",
+          [
+            "fsdp",
+            "tensor"
+          ]
+        ],
+        [
+          "mlp",
+          "tensor"
+        ],
+        [
+          "mlp",
+          "fsdp"
+        ],
+        [
+          "modulation",
+          "fsdp"
+        ],
+        [
+          "attention",
+          "tensor"
+        ],
+        [
+          "attention",
+          "fsdp"
+        ],
+        [
+          "linear",
+          "fsdp"
+        ],
+        [
+          "embed",
+          "fsdp"
+        ],
+        [
+          "head_dim",
+          "fsdp"
+        ],
+        [
+          "heads",
+          [
+            "fsdp",
+            "tensor"
+          ]
+        ],
+        [
+          "kv",
+          [
+            "fsdp",
+            "tensor"
+          ]
+        ],
+        [
+          "index",
+          "fsdp"
+        ],
+        [
+          "kvlora",
+          "fsdp"
+        ],
+        [
+          "qlora",
+          "fsdp"
+        ],
+        [
+          "output",
+          "fsdp"
+        ],
+        [
+          "exp",
+          "expert"
+        ],
+        [
+          "heads",
+          "tensor"
+        ],
+        [
+          "kv",
+          "tensor"
+        ],
+        [
+          "activation_batch",
+          [
+            "data",
+            "expert",
+            "fsdp"
+          ]
+        ],
+        [
+          "activation_length",
+          "sequence"
+        ],
+        [
+          "activation_spread",
+          [
+            "sequence",
+            "tensor"
+          ]
+        ],
+        [
+          "activation_spread",
+          "sequence"
+        ],
+        [
+          "activation_heads",
+          "tensor"
+        ],
+        [
+          "activation_kv",
+          "tensor"
+        ],
+        [
+          "activation_mlp",
+          "tensor"
+        ],
+        [
+          "activation_vocab",
+          "tensor"
+        ],
+        [
+          "pages",
+          [
+            "data",
+            "expert",
+            "fsdp"
+          ]
+        ],
+        [
+          "activation_batch",
+          [
+            "data",
+            "expert"
+          ]
+        ],
+        [
+          "activation_batch",
+          "data"
+        ]
+      ],
+      "tolerance": 0.02
+    },
+    "log_every": 100,
+    "mesh": {
+      "expert": 1,
+      "fsdp": 1,
+      "microbatches": null,
+      "replicas": 1,
+      "sequence": 1,
+      "stage": 1,
+      "tensor": 1
+    },
+    "multi_host": null,
+    "name": "text-to-image-176m",
+    "profile": null,
+    "quantization": null,
+    "seed": 0,
+    "steps": 1350000,
+    "wandb": null,
+    "xla_flags": null
+  },
+  "unconditional_prob": 0.12,
+  "val_metrics": []
+}

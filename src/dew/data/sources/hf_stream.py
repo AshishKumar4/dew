@@ -223,10 +223,6 @@ class HFRows(pygrain.IterDataset):
                  seed: int, rank: int, world_size: int, shuffle_buffer: int,
                  epochs: int | None, given: bool):
         super().__init__()
-        if world_size < 1 or not 0 <= rank < world_size:
-            raise ValueError(f"rank {rank} is not one of {world_size} processes")
-        if epochs is not None and epochs < 1:
-            raise ValueError("a streamed pass count is positive or None for endless")
         if shuffle_buffer < 0:
             raise ValueError("a shuffle buffer holds no rows or more")
         self._open_split = open_split

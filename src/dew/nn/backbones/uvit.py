@@ -27,6 +27,7 @@ from ..dit import (
     RematChoice,
     remat_block,
 )
+from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from ..sharding import logical_axes
@@ -92,7 +93,7 @@ class UViT(nn.Module):
                                        (1, max_patches, self.emb_features))
 
         self.time_embed = nn.Sequential([
-            FourierEmbedding(features=self.emb_features),
+            FourierEmbedding(features=self.emb_features, dtype=self.dtype),
             TimeProjection(features=self.emb_features,
                            dtype=self.dtype, precision=self.precision)
         ], name="time_embed")
@@ -145,7 +146,7 @@ class UViT(nn.Module):
             self.final_norm_conv = norm(name="final_norm_conv")
             self.final_conv2 = Conv(
                 features=self.output_channels, kernel_size=(3, 3), strides=(1, 1),
-                dtype=jnp.float32,
+                dtype=at_least_fp32(self.dtype),
                 precision=self.precision, name="final_conv2"
             )
 
@@ -166,7 +167,7 @@ class UViT(nn.Module):
             1], f"Number of patches {num_patches} exceeds max_len {self.pos_encoding.shape[1]} in positional encoding"
         x_patches = x_patches + self.pos_encoding[:, :num_patches, :]
 
-        time_token = self.time_embed(temb.astype(jnp.float32))
+        time_token = self.time_embed(temb.astype(at_least_fp32(self.dtype)))
         time_token = jnp.expand_dims(time_token.astype(self.dtype), axis=1)
 
         if textcontext is not None:
@@ -311,7 +312,7 @@ class SimpleUDiT(nn.Module):
 
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = rotary_freqs(jnp.arange(x_seq.shape[1]), self.emb_features // self.num_heads,
-                                 ROPE_THETA)
+                                 ROPE_THETA, dtype=at_least_fp32(x_seq.dtype))
 
         skips = []
         for i in range(self.num_layers // 2):

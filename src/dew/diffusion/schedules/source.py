@@ -125,6 +125,23 @@ def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]
                      f"this class supports {', '.join(allowed)}")
 
 
+def _published_linspace(start: float, end: float, count: int) -> np.ndarray:
+    """The source's float32 endpoints and step, spaced from each end.
+
+    NumPy spaces the original double endpoints. Those different roundings
+    change the beta table and accumulate in alpha-bar. Widen the rounded
+    operands so the position's multiply-add is rounded only once to float32,
+    rather than introducing another rounding at its intermediate product.
+    """
+    first, last = float(np.float32(start)), float(np.float32(end))
+    if count == 1:
+        return np.asarray([first], np.float32)
+    step = float(np.float32((last - first) / (count - 1)))
+    index = np.arange(count, dtype=np.float64)
+    return np.where(index < count // 2, first + index * step,
+                    last - (count - 1 - index) * step).astype(np.float32)
+
+
 def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
                     trained: JSON | np.ndarray, zero_snr: bool,
                     schedules: tuple[str, ...]) -> np.ndarray:
@@ -149,11 +166,11 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
         final = records.number(end, "beta_end")
         kind = _choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
-            betas = np.linspace(first, final, length, dtype=np.float32)
+            betas = _published_linspace(first, final, length)
         elif kind == "scaled_linear":
-            betas = np.linspace(first ** 0.5, final ** 0.5, length, dtype=np.float32) ** 2
+            betas = _published_linspace(first ** 0.5, final ** 0.5, length) ** 2
         elif kind == "sigmoid":
-            ramp = np.linspace(-6, 6, length, dtype=np.float32)
+            ramp = _published_linspace(-6, 6, length)
             betas = 1 / (1 + np.exp(-ramp)) * (final - first) + first
         else:
             steps = np.arange(length + 1, dtype=np.float64) / length

@@ -472,7 +472,7 @@ class EpisodeRollout:
         expected = np.full(width, self.sampling.pad_id, np.int32)
         expected[-len(context):] = context
         if (tokens.shape != (width + self.max_new_tokens,)
-                or not np.issubdtype(tokens.dtype, np.integer) or np.any(tokens < 0)
+                or not np.issubdtype(tokens.dtype, np.integer)
                 or not np.array_equal(tokens[:width], expected)):
             raise ValueError("inference must retain the exact requested context in integer tokens")
         if (lengths.ndim != 1 or not np.issubdtype(lengths.dtype, np.integer)
@@ -631,8 +631,6 @@ class EpisodeRollout:
                 raise ValueError("an episode batch must share one policy snapshot and attempt")
             if episode.status not in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED) or episode.reward is None:
                 raise ValueError("only verified completed or truncated episodes may train")
-            if not math.isfinite(episode.reward):
-                raise ValueError("episode rewards must be finite")
             if len(episode.transitions) > self.max_turns:
                 raise ValueError("episode exceeds max_turns")
             group_start = episodes[index - index % self.groups]
@@ -655,8 +653,6 @@ def session_of(episode: Episode, *, group: str) -> Session:
     ended on EOS and `length` otherwise. An environment-reported error is an
     infrastructure failure; how well the agent did is the verifier's reward.
     """
-    if episode.status == EpisodeStatus.RUNNING:
-        raise ValueError("a running episode has not ended, so it is no session yet")
     status = {EpisodeStatus.COMPLETED: Status.COMPLETED, EpisodeStatus.TRUNCATED: Status.TRUNCATED,
               EpisodeStatus.ERROR: Status.INFRA_ERROR, EpisodeStatus.CANCELLED: Status.CANCELLED}[episode.status]
     calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,

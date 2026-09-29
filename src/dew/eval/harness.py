@@ -73,8 +73,6 @@ def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def _batches(count: int, size: int) -> list[range]:
     """Yield `count` indices in runs of at most `size`, in order."""
-    if type(size) is not int or size < 1:
-        raise ValueError(f"batch_size is a positive integer, got {size!r}")
     return [range(start, min(start + size, count)) for start in range(0, count, size)]
 
 
@@ -101,16 +99,16 @@ class DewLM(TemplateLM):
 
     def __init__(self, task: TextGeneration, *, batch_size: int = 1) -> None:
         super().__init__()
-        if not isinstance(task, TextGeneration):
-            raise TypeError(
-                f"the harness scores next-token likelihoods, which is what a "
-                f"TextGeneration holds; {type(task).__name__} is a different task")
-        if task.processor is None:
+        processor = task.processor
+        if processor is None:
             raise ValueError(
                 "the harness hands over text, so the task needs the processor that "
                 "turns it into tokens; load the run through dew.pipeline")
-        _batches(0, batch_size)
+        # A negative size would score nothing and return no answers.
+        if batch_size < 1:
+            raise ValueError(f"batch_size is a positive integer, got {batch_size!r}")
         self.task = task
+        self._processor = processor
         self.batch_size = batch_size
 
     @classmethod
@@ -203,13 +201,6 @@ class DewLM(TemplateLM):
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
-
-    @property
-    def _processor(self):
-        processor = self.task.processor
-        if processor is None:
-            raise ValueError("this task lost its processor; a harness model needs one")
-        return processor
 
     def _loglikelihood_tokens(self, requests: Sequence[TokenRequest],
                               disable_tqdm: bool = False,

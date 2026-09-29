@@ -32,6 +32,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 
 # The reference floors the magnitude a projected copy is rescaled by
@@ -68,13 +69,18 @@ def gaussian_topk(x, sparsity: float):
     row is Gaussian: the cutoff is the row's mean plus `norm.ppf(sparsity)`
     of its population standard deviation, and what is above it is kept as
     its distance above (modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk).
+
+    The quantile is computed in fp32, as the reference's icdf of a float32
+    tensor is, or in the row's own dtype where it is wider (`at_least_fp32`).
+    Of a Python float it was computed in the default float width, which x64
+    widens, so a float32 model's cutoff moved with the process's x64 flag.
     """
     if not 0 < sparsity < 1:
         raise ValueError(
             f"activation sparsity is the fraction of gate activations dropped, "
             f"within (0, 1), got {sparsity}")
-    multiplier = jnp.asarray(math.sqrt(2.0) * jax.scipy.special.erfinv(2.0 * sparsity - 1.0),
-                             x.dtype)
+    quantile = jax.scipy.special.erfinv(jnp.asarray(2.0 * sparsity - 1.0, at_least_fp32(x.dtype)))
+    multiplier = (math.sqrt(2.0) * quantile).astype(x.dtype)
     mean = jnp.mean(x, axis=-1, keepdims=True)
     std = jnp.sqrt(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
     return nn.relu(x - (mean + std * multiplier))
@@ -181,7 +187,7 @@ class AltUpLayer(nn.Module):
     def modalities(self, x):
         routed = self.modality_router(
             self.router_norm(x) * jnp.asarray(1.0 / self.emb_features, x.dtype))
-        return jnp.tanh(routed.astype(jnp.float32)).astype(x.dtype)
+        return jnp.tanh(routed.astype(at_least_fp32(routed.dtype))).astype(x.dtype)
 
     def predict(self, stream, train: bool = False):
         n = self.spec.num_inputs
@@ -204,7 +210,8 @@ class AltUpLayer(nn.Module):
         return (corrected + predictions).astype(activated.dtype)
 
     def scale_corrected_output(self, corrected):
-        return (corrected.astype(jnp.float32) * self.correct_output_scale).astype(corrected.dtype)
+        return (corrected.astype(at_least_fp32(corrected.dtype))
+                * self.correct_output_scale).astype(corrected.dtype)
 
 
 __all__ = [

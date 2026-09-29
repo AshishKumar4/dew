@@ -169,7 +169,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == config
     assert config.to_dict()["preset"] == {"name": "edm", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
-        "P_mean": -0.4, "P_std": 1.0, "min_snr_gamma": None}}
+        "regime": "pixel", "P_mean": None, "P_std": None, "min_snr_gamma": None}}
     assert config.model_fields(None)["output_channels"] == 3
     assert (tmp_path / "run" / "2").is_dir()
 

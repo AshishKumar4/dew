@@ -63,6 +63,7 @@ from dew.objectives.base import (
     Objective,
     PathFilter,
     Prediction,
+    Shown,
     Step,
     Variables,
     freeze,
@@ -467,9 +468,100 @@ def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable
 
 @objectives("lm")
 class LMObjective(Objective[Mean | LMStatistics, Variables]):
-    """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews."""
+    """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews.
+
+    `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
+    auxiliary term below is off until its argument is set; the rest trade
+    memory against time.
+
+    `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
+    `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
+    objective that keeps the whole logits (`keeps_whole_logits`) and
+    the generation's tile on one that does not. Whole logits are the
+    fastest head where they fit: on one A100, a Qwen3-0.6B
+    step at 4 x 1024 tokens took 142 ms against 163 ms tiled, for 5.3 GiB
+    more peak. A trainer whose compiled step does not fit the devices
+    moves it to the generation's tile (`chunked.chunked_tile`) before it
+    recomputes any block. A pass with no backward (evaluation, scoring)
+    runs the tiled forward either way, so it never holds the logits
+    whole.
+
+    `head_chunks` is how many vocabulary slices a tiled head scores in:
+    four costs 2.2% of the step and saves 1.2 GiB of peak memory at
+    vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one is
+    the full pass. It also slices the forward that an evaluation or a
+    scoring pass runs.
+
+    `pretrained` is a variables dict to start from instead of a fresh
+    init, as `dew.interop.load_pretrained(...).variables` returns for a
+    Hugging Face checkpoint. The trainer takes its whole initial state
+    from `init`, so continued pretraining starts here.
+
+    `balance_rate` moves each sparse layer's routing bias against its
+    load by this much every step, which is DeepSeek's aux-loss-free
+    balancing. The model has to keep that bias, `bias=True` on the
+    CausalTransformer's mixture. Unset leaves the bias where it is.
+
+    `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
+    (`dew.nn.moe.deepseek_v2_aux_loss`), summed over every sparse
+    layer, and `seq_aux` chooses its per-sequence form. The released V2
+    configs carry both under these names. Unset adds nothing.
+
+    `loss_role` counts only the targets whose `text_roles` entry matches
+    it, for SFT on the chat data path (`dew.data.chat.Role`). None
+    counts every target the pad and segment weights keep. A batch
+    without the `text_roles` column raises.
+
+    `mtp_weight` scales DeepSeek V3's multi-token prediction loss
+    (arXiv 2412.19437, eq. 24). The loss adds this weight times the
+    mean cross entropy over the model's prediction depths, so the
+    model needs `num_nextn_predict_layers` above zero. Unset leaves
+    the term out and the depths untrained.
+
+    `qk_stats` opens the `qk` collection the attention layers sow their
+    per-head logit maxima under, and reports them for the optimizer's
+    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset
+    leaves the collection closed, which costs no extra matmul.
+
+    `indexer` trains DeepSeek-V3.2's lightning indexer, one
+    `IndexerTraining` phase at a time, on a model whose mla mixer
+    carries the indexer. The warm-up phase keeps only the indexer in
+    the `params` collection and the rest of the model under `frozen`,
+    which is what `init` returns and a checkpoint stores. A
+    `pretrained` tree for that phase may omit the indexer's weights, as
+    a dense checkpoint does, and the fresh init fills them. The sparse
+    phase reads a whole tree, either layout. The warm-up trains nothing
+    but the indexer, so the terms of the main loss (`balance_rate`,
+    `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
+
+    `z_loss` adds PaLM's auxiliary to the cross entropy: this
+    coefficient times the squared log partition of every counted
+    prediction (MaxText's `z_loss_multiplier`; PaLM used 1e-4). It
+    keeps the logits from drifting away from normalised log
+    probabilities. Zero adds nothing.
+
+    `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
+    2202.08906): this coefficient times the squared log partition of
+    every router's gate logits, averaged over the positions each router
+    saw in the step and summed over the routers (`router_z_terms`). It
+    sits beside the balance loss; lm-engine's MoE adds 0.1 of it to its
+    switch loss before `router_aux_loss_coef`, which is
+    `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
+
+    `trainable` selects the parameter leaves the optimizer moves, by
+    their full path (`dew.objectives.base.PathFilter`). The rest of the
+    tree is kept under `frozen`, the split the warm-up uses for the
+    indexer, so `init` returns it and a checkpoint stores it. An
+    adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
+    trains every leaf.
+
+    `token_accuracy` reports the argmax accuracy; False skips the pass
+    over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+    """
 
     artifact = TokenScores
+    shown = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
+             "token_accuracy": Shown(better="higher", percent=True)}
 
     keeps_whole_logits: ClassVar[bool] = True
     """Whether the head's default (`head_tile` None) keeps the whole fp32
@@ -502,94 +594,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         trainable: PathFilter | None = None,
         token_accuracy: bool = True,
     ):
-        """Build a next-token objective over `model` for `seq_len`-token rows.
-
-        Every auxiliary term below is off until its argument is set; the
-        rest trade memory against time.
-
-        `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
-        `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
-        objective that keeps the whole logits (`keeps_whole_logits`) and
-        the generation's tile on one that does not. Whole logits are the
-        fastest head where they fit: on one A100, a Qwen3-0.6B
-        step at 4 x 1024 tokens took 142 ms against 163 ms tiled, for 5.3 GiB
-        more peak. A trainer whose compiled step does not fit the devices
-        moves it to the generation's tile (`chunked.chunked_tile`) before it
-        recomputes any block. A pass with no backward (evaluation, scoring)
-        runs the tiled forward either way, so it never holds the logits
-        whole.
-
-        `head_chunks` is how many vocabulary slices a tiled head scores in:
-        four costs 2.2% of the step and saves 1.2 GiB of peak memory at
-        vocabulary 50,304 on one RTX 4080 (docs/benchmarks.md), and one is
-        the full pass. It also slices the forward that an evaluation or a
-        scoring pass runs.
-
-        `pretrained` is a variables dict to start from instead of a fresh
-        init, as `dew.interop.load_pretrained(...).variables` returns for a
-        Hugging Face checkpoint. The trainer takes its whole initial state
-        from `init`, so continued pretraining starts here.
-
-        `balance_rate` moves each sparse layer's routing bias against its
-        load by this much every step, which is DeepSeek's aux-loss-free
-        balancing. The model has to keep that bias, `bias=True` on the
-        CausalTransformer's mixture. Unset leaves the bias where it is.
-
-        `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
-        (`dew.nn.moe.deepseek_v2_aux_loss`), summed over every sparse
-        layer, and `seq_aux` chooses its per-sequence form. The released V2
-        configs carry both under these names. Unset adds nothing.
-
-        `loss_role` counts only the targets whose `text_roles` entry matches
-        it, for SFT on the chat data path (`dew.data.chat.Role`). None
-        counts every target the pad and segment weights keep. A batch
-        without the `text_roles` column raises.
-
-        `mtp_weight` scales DeepSeek V3's multi-token prediction loss
-        (arXiv 2412.19437, eq. 24). The loss adds this weight times the
-        mean cross entropy over the model's prediction depths, so the
-        model needs `num_nextn_predict_layers` above zero. Unset leaves
-        the term out and the depths untrained.
-
-        `qk_stats` opens the `qk` collection the attention layers sow their
-        per-head logit maxima under, and reports them for the optimizer's
-        QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset
-        leaves the collection closed, which costs no extra matmul.
-
-        `indexer` trains DeepSeek-V3.2's lightning indexer, one
-        `IndexerTraining` phase at a time, on a model whose mla mixer
-        carries the indexer. The warm-up phase keeps only the indexer in
-        the `params` collection and the rest of the model under `frozen`,
-        which is what `init` returns and a checkpoint stores. A
-        `pretrained` tree for that phase may omit the indexer's weights, as
-        a dense checkpoint does, and the fresh init fills them. The sparse
-        phase reads a whole tree, either layout. The warm-up trains nothing
-        but the indexer, so the terms of the main loss (`balance_rate`,
-        `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
-
-        `z_loss` adds PaLM's auxiliary to the cross entropy: this
-        coefficient times the squared log partition of every counted
-        prediction (MaxText's `z_loss_multiplier`; PaLM used 1e-4). It
-        keeps the logits from drifting away from normalised log
-        probabilities. Zero adds nothing.
-
-        `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
-        2202.08906): this coefficient times the squared log partition of
-        every router's gate logits, averaged over the positions each router
-        saw in the step and summed over the routers (`router_z_terms`). It
-        sits beside the balance loss; lm-engine's MoE adds 0.1 of it to its
-        switch loss before `router_aux_loss_coef`, which is
-        `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
-
-        `trainable` selects the parameter leaves the optimizer moves, by
-        their full path (`dew.objectives.base.PathFilter`). The rest of the
-        tree is kept under `frozen`, the split the warm-up uses for the
-        indexer, so `init` returns it and a checkpoint stores it. An
-        adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
-        trains every leaf.
-
-        `token_accuracy` reports the argmax accuracy; False skips the pass
-        over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e)."""
+        """Build the objective; the class docstring describes each argument."""
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -858,8 +863,6 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             return -self.token_scores(params, tokens).losses
         prepared = _prepared(tokens)
         padding = jnp.asarray(left_padding, jnp.int32)
-        if padding.shape != (prepared.tokens.shape[0],):
-            raise ValueError("left_padding must have one count per token row")
         aligned = prepared.align_left(padding)
         losses = self.token_scores(params, aligned).losses
         restored, valid = _unpadded(losses, padding)
@@ -1220,6 +1223,7 @@ class Perplexity:
 
     name = "perplexity"
     reads = TokenScores
+    shown = Shown(better="lower")
 
     def __call__(self, scores: TokenScores, batch) -> tuple[float, float]:
         weights = np.asarray(scores.weights, dtype=np.float64)

@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 from dew.inference.banks import HeldBanks, host_banked
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import router_counts

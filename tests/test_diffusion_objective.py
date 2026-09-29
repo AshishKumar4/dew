@@ -76,7 +76,9 @@ def make_objective(*, guidance: CFG | None = CFG(2.0)):
     model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
-    return DiffusionObjective(model, presets.EDM()(), inputs, steps=3, guidance=guidance, sampler=Euler())
+    # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
+    return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0)(), inputs, steps=3, guidance=guidance,
+                              sampler=Euler())
 
 
 def make_batch(count=8):
@@ -146,7 +148,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     c_skip x_t, the target is x_0, and the loss is the EDM lambda weighted
     mean of the l2 error, with t and the noise drawn from the step's key in
     the objective's order."""
-    process = presets.EDM()()
+    process = presets.EDM(regime="pixel")()
     inputs = InputSpec(Field("image", (RES, RES, 3)))
     objective = DiffusionObjective(Zero(), process, inputs)
     params = objective.init(jax.random.PRNGKey(0))
@@ -326,7 +328,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     from dew.nn.autoencoders import SimpleAutoEncoder
     autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(8,))
     inputs = InputSpec(Field("image", (RES, RES, 3)))
-    objective = DiffusionObjective(Zero(), presets.EDM()(), inputs,
+    objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel")(), inputs,
                                    autoencoder=autoencoder)
     params = objective.init(jax.random.PRNGKey(0))
     assert set(params) == {"params", "encoders", "autoencoder"}
@@ -344,7 +346,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
             params = dict(params, autoencoder=autoencoder.params)
             return super().loss(params, batch, step)
 
-    leaky = Leaky(Zero(), presets.EDM()(), inputs, autoencoder=autoencoder)
+    leaky = Leaky(Zero(), presets.EDM(regime="pixel")(), inputs, autoencoder=autoencoder)
     assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
 
 
@@ -450,7 +452,7 @@ def conditional_mmdit():
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
     model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
-    process = presets.EDM(sigma_max=1.0)()
+    process = presets.EDM(sigma_max=1.0, regime="pixel")()
     objective = DiffusionObjective(model, process, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
     variables = objective.init(jax.random.key(0))
     # The initialized zero output head otherwise hides conditioning gradients.

@@ -1,8 +1,8 @@
 """LoRA SFT of DiffusionGemma on chat data, with the base weights host-streamed.
 
 The adapter is the only thing the optimizer moves, and `Layout(host=("params",))`
-keeps the whole train state on the host between steps, so a 26B-A4B base fits
-beside its factors on one accelerator:
+keeps the whole train state on the host between steps, with the scanned stack
+fetching one layer at a time. The 26B-A4B base has not been run through it:
 
     python examples/sft_diffusion_gemma.py \\
         --model google/diffusiongemma-26B-A4B-it \\
@@ -10,9 +10,10 @@ beside its factors on one accelerator:
 
 `--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of
 conversations, which is what `dew.data.ChatMessages` reads and renders with
-the checkpoint's own chat template. The run writes two things: the PEFT adapter
-directory `LoRA.save` produces, which transformers loads, and the merged
-checkpoint in the source's own layout, which `dew.pipeline` generates from.
+the checkpoint's own chat template. The run writes the PEFT adapter directory
+`LoRA.save` produces, which transformers loads, then loads the base again
+through `dew.pipeline`, merges the adapter into it and writes the decoded
+canvases to `samples.txt`.
 
     JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 """

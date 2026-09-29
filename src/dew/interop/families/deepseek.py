@@ -63,13 +63,12 @@ def _deepseek_rope(hf_config: Mapping[str, object], used: set
         plain = _rope_theta(dict(entry, rope_theta=entry.get(
             'rope_theta', theta)), field)
         return plain or theta, None
-    if rope_type == 'yarn':
-        entry_theta = float(entry.get('rope_theta', theta))
-        return entry_theta, _yarn_record(
-            dict(entry, rope_theta=entry_theta), field, entry_theta, max_pos)
-    _refuse(f"rope scaling (rope_type {rope_type!r})",
-            "the mixer applies plain or YaRN rotary positions")
-    raise AssertionError("unreachable")
+    if rope_type != 'yarn':
+        _refuse(f"rope scaling (rope_type {rope_type!r})",
+                "the mixer applies plain or YaRN rotary positions")
+    entry_theta = float(entry.get('rope_theta', theta))
+    return entry_theta, _yarn_record(
+        dict(entry, rope_theta=entry_theta), field, entry_theta, max_pos)
 
 
 def _deepseek_mixture(hf_config: Mapping[str, object], layers: int,

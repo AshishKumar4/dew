@@ -17,6 +17,7 @@ from collections.abc import Callable
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
@@ -31,17 +32,19 @@ from dew.nn.attention import (
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import RopeScaling, apply_rotary_interleave, rotary_freqs
 from dew.nn.sharding import logical_axes
 
 
-def temperature_scale(positions, floor_scale: float, attn_scale: float):
+def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
     """The query multiplier of a global layer at each absolute position.
 
-    `log1p(floor((p + 1) / floor_scale)) * attn_scale + 1`, computed in fp32
-    as the reference does, so the first `floor_scale` positions scale by 1.
+    `log1p(floor((p + 1) / floor_scale)) * attn_scale + 1`, computed in
+    `dtype`, fp32 as the reference does (the queries' own dtype where it is
+    wider, `at_least_fp32`), so the first `floor_scale` positions scale by 1.
     """
-    positions = jnp.asarray(positions, jnp.float32)
+    positions = jnp.asarray(positions, dtype)
     return jnp.log1p(jnp.floor((positions + 1.0) / floor_scale)) * attn_scale + 1.0
 
 
@@ -124,7 +127,8 @@ class Llama4Attention(nn.Module):
         rotary_positions = positions if logical_positions is None else logical_positions
         if self.use_rope:
             freqs_cos, freqs_sin = rotary_freqs(rotary_positions, self.head_dim, self.rope_theta,
-                                                rope_scaling=self.rope_scaling)
+                                                rope_scaling=self.rope_scaling,
+                                                dtype=at_least_fp32(query.dtype))
             query = apply_rotary_interleave(query, freqs_cos, freqs_sin)
             key = apply_rotary_interleave(key, freqs_cos, freqs_sin)
             if self.use_qk_norm:
@@ -133,7 +137,8 @@ class Llama4Attention(nn.Module):
                 # orders agree to rounding.
                 query, key = self.qk_l2_norm(query), self.qk_l2_norm(key)
         elif self.attn_temperature_tuning:
-            scale = temperature_scale(positions, self.floor_scale, self.attn_scale)
+            scale = temperature_scale(positions, self.floor_scale, self.attn_scale,
+                                      dtype=at_least_fp32(query.dtype))
             query = (query * scale[..., :, None, None].astype(query.dtype)
                      if scale.ndim == 2 else query * scale[None, :, None, None].astype(query.dtype))
 

@@ -15,7 +15,10 @@ cost the step memory and time the comparison does not ask about.
 
     python tools/reference_runs/dew_lm.py --model <hf dir> --data windows.npz \\
         --batch 4 --dtype bfloat16 --out dew-bf16.json
-    python tools/reference_runs/dew_lm.py ... --mesh fsdp --devices 4
+    python tools/reference_runs/dew_lm.py ... --mesh fsdp
+
+The mesh axis spans every device the process sees (`jax.device_count()`);
+choose them the way jax does, with CUDA_VISIBLE_DEVICES or JAX_PLATFORMS.
 """
 
 import argparse

@@ -101,9 +101,6 @@ def inverse_permutation(order: np.ndarray) -> np.ndarray:
 
 def patchify(x: jnp.ndarray, patch_size: int) -> jnp.ndarray:
     """`[B, H, W, C]` to row-major patches `[B, (H/p) * (W/p), p * p * C]`."""
-    _, H, W, _ = x.shape
-    if H % patch_size != 0 or W % patch_size != 0:
-        raise ValueError(f"Image dimensions ({H}, {W}) must be divisible by patch_size ({patch_size})")
     return einops.rearrange(
         x, 'b (h p1) (w p2) c -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size)
 
@@ -111,8 +108,6 @@ def patchify(x: jnp.ndarray, patch_size: int) -> jnp.ndarray:
 def unpatchify(x: jnp.ndarray, patch_size: int, H: int, W: int, C: int) -> jnp.ndarray:
     """Row-major patches `[B, (H/p) * (W/p), p * p * C]` back to `[B, H, W, C]`."""
     H_P, W_P = H // patch_size, W // patch_size
-    assert x.shape[1] == H_P * W_P, \
-        f"Number of patches ({x.shape[1]}) does not match expected ({H_P * W_P}) for H={H}, W={W}, patch_size={patch_size}"
     return einops.rearrange(
         x, 'b (h w) (p1 p2 c) -> b (h p1) (w p2) c', h=H_P, w=W_P, p1=patch_size, p2=patch_size, c=C)
 

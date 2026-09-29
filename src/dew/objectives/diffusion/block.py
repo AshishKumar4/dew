@@ -403,14 +403,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
         def denoise(sc_logits):
-            predicted = model.apply(
+            return model.apply(
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=train, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
-            if not isinstance(predicted, jax.Array):
-                raise TypeError("a diffusion forward must return its final states")
-            return predicted
 
         zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
         # The conditioning pass carries no gradient, so its states stop it

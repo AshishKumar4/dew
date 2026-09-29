@@ -55,6 +55,7 @@ from dew.nn.scatter import DROPPED
 
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 CHUNK_SIZE = 64
@@ -262,9 +263,9 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     is the forward substitution that inverts `I - A` for a strictly lower
     triangular A, which `strictly_lower_inverse` sums as a series.
     """
-    dtype = query.dtype
+    dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
-        x.astype(jnp.float32) for x in (query, key, value, g, beta))
+        x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
     pad = (chunk_size - S % chunk_size) % chunk_size
@@ -301,8 +302,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
     k_cumdecay = inv @ (kb_c * jnp.exp(gc)[..., None])
 
-    state = (jnp.zeros((B, H, Dk, Dv), jnp.float32) if state is None
-             else state.astype(jnp.float32))
+    state = (jnp.zeros((B, H, Dk, Dv), work) if state is None
+             else state.astype(work))
 
     def one_chunk(carry, step):
         s = carry
@@ -339,9 +340,9 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
     `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
     gated delta rule decays per head, one decay over every key dimension.
     """
-    dtype = query.dtype
+    dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
-        x.astype(jnp.float32) for x in (query, key, value, g, beta))
+        x.astype(work) for x in (query, key, value, g, beta))
     query = query * (key.shape[-1] ** -0.5)
 
     def one_token(s, step):
@@ -354,9 +355,9 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None):
     # The scan stacks along the first axis, so the operands go time-major.
     if state is None:
         state = jnp.zeros((query.shape[0], query.shape[-2], key.shape[-1],
-                           value.shape[-1]), jnp.float32)
+                           value.shape[-1]), work)
     state, out = jax.lax.scan(
-        one_token, state.astype(jnp.float32),
+        one_token, state.astype(work),
         {name: jnp.moveaxis(x, 1, 0) for name, x in
          (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta))})
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
@@ -519,9 +520,11 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
-        # underflow to -inf (modeling_qwen3_next.py:652-653).
+        # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
+        # so a float64 model's stays float64 (`at_least_fp32`).
+        wide = at_least_fp32(query.dtype)
         conv_input = jnp.moveaxis(
-            jnp.concatenate([query, key, value], axis=-1).astype(jnp.float32),
+            jnp.concatenate([query, key, value], axis=-1).astype(wide),
             2, 1)  # [B, D, S], the conv's channel-major layout
         taps, _ = self.conv1d()
         recurrent = None
@@ -532,11 +535,11 @@ class GatedDeltaNet(nn.Module):
             allocated = self.has_variable('cache', 'recurrent_state')
             conv_state = self.variable(
                 'cache', 'conv_state', jnp.zeros,
-                (B, self.conv_features, self.conv_kernel - 1), jnp.float32)
+                (B, self.conv_features, self.conv_kernel - 1), wide)
             recurrent = self.variable(
                 'cache', 'recurrent_state', jnp.zeros,
                 (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                jnp.float32)
+                wide)
             if not allocated:
                 # Allocation only: the caller's first real forward, not this
                 # call, starts the state.
@@ -560,9 +563,9 @@ class GatedDeltaNet(nn.Module):
         key = self._expand_kv(self._split_heads(key, self.head_k_dim))
         value = self._split_heads(value, self.head_v_dim)
 
-        beta = nn.sigmoid(b.astype(jnp.float32))
-        g = -jnp.exp(self.A_log.astype(jnp.float32)) * nn.softplus(
-            a.astype(jnp.float32) + self.dt_bias.astype(jnp.float32))
+        beta = nn.sigmoid(b.astype(wide))
+        g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(
+            a.astype(wide) + self.dt_bias.astype(wide))
 
         query = l2norm(query)
         key = l2norm(key)
@@ -614,8 +617,9 @@ class DepthwiseConv1d(nn.Module):
             'kernel_init'], (self.features, 1, self.kernel))
         bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
                 if self.use_bias else None)
-        return (jnp.asarray(weight[:, 0, :], jnp.float32),
-                None if bias is None else jnp.asarray(bias, jnp.float32))
+        wide = at_least_fp32(weight.dtype)
+        return (jnp.asarray(weight[:, 0, :], wide),
+                None if bias is None else jnp.asarray(bias, wide))
 
 
 class RMSNormGated(nn.Module):
@@ -633,13 +637,14 @@ class RMSNormGated(nn.Module):
     @nn.compact
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
-        y = x.astype(jnp.float32)
+        wide = at_least_fp32(x.dtype)
+        y = x.astype(wide)
         y = y * jax.lax.rsqrt(
             jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
         scale = self.param('weight', nn.initializers.ones,
                            (x.shape[-1],), jnp.float32)
-        y = y * scale.astype(jnp.float32)
-        gate = gate.astype(jnp.float32)
+        y = y * scale.astype(wide)
+        gate = gate.astype(wide)
         gated = (nn.silu(gate) if self.activation == 'silu'
                  else nn.sigmoid(gate))
         return (y * gated).astype(dtype)

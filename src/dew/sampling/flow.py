@@ -85,13 +85,6 @@ class GaussianTransition:
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
-def checked_noise_level(noise_level: float) -> float:
-    """`noise_level` itself, refusing a rate that is not finite and non-negative."""
-    if not math.isfinite(noise_level) or noise_level < 0:
-        raise ValueError("noise_level must be finite and non-negative")
-    return noise_level
-
-
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
                     sigma_next: ArrayLike, *, noise_level: float = 0.7) -> GaussianTransition:
     """Euler-Maruyama over the physical noise rate, with 0 <= sigma_next <= sigma <= 1.
@@ -103,7 +96,8 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
     produce non-finite transitions. At zero noise or zero elapsed rate the
     result is deterministic.
     """
-    checked_noise_level(noise_level)
+    if not math.isfinite(noise_level) or noise_level < 0:
+        raise ValueError("noise_level must be finite and non-negative")
     x = jnp.asarray(x, jnp.float32)
     velocity = jnp.asarray(velocity, jnp.float32)
     if x.ndim < 2 or velocity.shape != x.shape:
@@ -134,9 +128,6 @@ class FlowSDE:
     """
 
     noise_level: float = 0.7
-
-    def __post_init__(self) -> None:
-        checked_noise_level(self.noise_level)
 
     def validate(self, process: Process) -> None:
         schedule = process.sampler_schedule
@@ -196,7 +187,6 @@ def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
     if steps < 2:
         raise ValueError("a trajectory needs at least two time points")
     process = denoise.process
-    solver.validate(process)
     predict = denoise if guidance is None else guidance(denoise)
     times = process.times(steps)
     x_T = jnp.asarray(x_T, jnp.float32)

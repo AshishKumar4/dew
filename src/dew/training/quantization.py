@@ -16,6 +16,12 @@ the Muon parameter split and Hugging Face loading are unchanged. The
 quantization lives in the forward and backward matmuls, with a
 straight-through estimator on the backward pass.
 
+Serving is not fake-quantized. `quantize_for_serving` runs Qwix's
+post-training quantization: the returned variables hold each matched kernel
+as int8 or fp8 values with their scales, and the returned module's matmuls
+read them. `TextToImage.quantized` applies it to a text-to-image task's
+denoiser.
+
 The vocabulary head stays fp32 with the rest of Dew's fp32 zones. Its einsum
 lives in the objective's chunked cross entropy, outside any model method
 Qwix wraps.
@@ -26,18 +32,20 @@ and `patterns` its `quant_cfg_path`, written inline as the regexes Qwix
 matches; the backward fields are Qwix's finer-grained version of the same
 idea.
 
-Three of its knobs have no equivalent and are refused with the reason.
-Static activation scaling (`fp8_full`) needs a calibration pass Dew has no
-seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache quantization has no
-reader here since the cache holds the compute dtype.
+Three of its knobs have no equivalent, and `dtype` takes neither of the
+first two. Static activation scaling (`fp8_full`) needs a calibration pass
+Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
+quantization has no reader here since the cache holds the compute dtype.
 
-Qwix is not a dependency. The import sits inside `apply_quantization`, and
-without the package the call raises naming it, the way the tokamax branch of
+Qwix is not a dependency. The import sits inside the calls that need it,
+and without the package they raise naming it, the way the tokamax branch of
 `dew.nn.moe` behaves.
 """
 import dataclasses
+import functools
 import importlib
 import re
+from collections.abc import Mapping, Sequence
 from typing import Literal, Protocol, runtime_checkable
 
 import jax
@@ -69,6 +77,10 @@ class Quantization:
 
     dtype: QuantizedDtype = "int8"
     """The dtype weights and activations quantize to, in the forward pass."""
+    weight_only: bool = False
+    """Quantize the weights alone and keep activations in the compute dtype.
+    Convolutions stay unquantized under it, since Qwix's serving provider
+    refuses a convolution whose activations stay in float."""
     patterns: tuple[str, ...] = (".*",)
     """Module-path regexes the rules apply to, in Qwix precedence order: the
     first rule whose regex full-matches a module's `/`-joined scope path wins.
@@ -89,15 +101,6 @@ class Quantization:
     (`qwix/_src/providers/qt.py:361`); unset rounds deterministically."""
 
     def __post_init__(self) -> None:
-        if self.dtype == "fp8_full":
-            raise ValueError(
-                "fp8_full is static activation scaling, which needs a "
-                "calibration pass Dew has no seam for; Dew's fp8 is dynamic "
-                "range")
-        if self.dtype == "nanoo_fp8":
-            raise ValueError(
-                "nanoo_fp8 is kernels for AMD MI300 and MI325, which this "
-                "hardware cannot run")
         if self.dtype not in ("int8", "fp8"):
             raise ValueError(
                 f"quantization trains in int8 or fp8, got {self.dtype!r}")
@@ -135,6 +138,143 @@ def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
     return jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
 
 
+def _group_scales(lhs: jax.Array, dimension_numbers: jax.lax.ConvDimensionNumbers,
+                  groups: int) -> jax.Array:
+    """Each example's absolute maximum in each feature group of a
+    convolution's input, `[batch, groups]`, with 1 standing in for an
+    all-zero group."""
+    batch, feature = dimension_numbers.lhs_spec[:2]
+    moved = jnp.moveaxis(lhs, (batch, feature), (0, -1))
+    grouped = moved.reshape(*moved.shape[:-1], groups, moved.shape[-1] // groups)
+    peak = jnp.max(jnp.abs(grouped), axis=(*range(1, moved.ndim - 1), moved.ndim))
+    return jax.lax.stop_gradient(jnp.where(peak > 0, peak, 1).astype(lhs.dtype))
+
+
+def _per_feature(scales: jax.Array, ndim: int, batch: int, feature: int, features: int) -> jax.Array:
+    """`[batch, groups]` scales repeated over each group's `features // groups`
+    contiguous features, laid out to broadcast against an array of rank
+    `ndim` with its batch and feature axes where the arguments say."""
+    repeated = jnp.repeat(scales, features // scales.shape[1], axis=1)
+    shape = [1] * ndim
+    shape[batch], shape[feature] = repeated.shape
+    return (repeated if batch < feature else repeated.T).reshape(shape)
+
+
+class _GroupScaledConvolution:
+    """Quantizes a grouped convolution's input with one scale per feature
+    group, where Qwix (0.1.8 `conv_general.get_how_to_quantize`) takes one
+    per example across every feature.
+
+    A grouped convolution contracts each group's features on their own, so
+    one group's range has no bearing on another's rounding. With one scale
+    across all of them a depthwise convolution rounds each channel against
+    the loudest. The hybrid DiT's spatial fusion, whose channel peaks span
+    36x, came out 4.1% off in int8 against 1.0% with a scale per group, and
+    quantizing it alone dropped the 176M text-to-image model's CLIP score
+    from 0.248 to 0.124.
+    Dividing each group by its own peak before Qwix quantizes, and
+    multiplying each output group by it after, gives the per-group scales
+    exactly: the convolution is linear and keeps groups apart, and every
+    group then peaks at 1, so Qwix's single scale is each group's own.
+    """
+
+    def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
+                             padding: str | Sequence[tuple[int, int]],
+                             lhs_dilation: Sequence[int] | None = None,
+                             rhs_dilation: Sequence[int] | None = None,
+                             dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+                             feature_group_count: int = 1, batch_group_count: int = 1,
+                             precision: jax.lax.PrecisionLike = None,
+                             preferred_element_type: jax.typing.DTypeLike | None = None,
+                             out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+        convolve = functools.partial(
+            super().conv_general_dilated,  # pyright: ignore[reportAttributeAccessIssue]
+            rhs=rhs, window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
+            rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
+            feature_group_count=feature_group_count, batch_group_count=batch_group_count,
+            precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
+        rule, _ = self._get_current_rule_and_op_id(  # pyright: ignore[reportAttributeAccessIssue]
+            "conv_general_dilated", only_rule=True)
+        if feature_group_count == 1 or rule is None or rule.act_qtype is None:
+            return convolve(lhs=lhs)
+        numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+        scales = _group_scales(lhs, numbers, feature_group_count)
+        batch, feature = numbers.lhs_spec[:2]
+        out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
+        batch, feature = numbers.out_spec[:2]
+        return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
+
+
+def _real(*operands: object) -> bool:
+    """Whether no operand is complex; Qwix quantizes real values only."""
+    return not any(jnp.iscomplexobj(operand) for operand in operands)
+
+
+@functools.cache
+def _providers() -> tuple[type, type]:
+    """Qwix's quantized-training and serving providers with Dew's grouped
+    convolution; importing Qwix here keeps it optional.
+
+    The serving provider also passes complex matmuls through unquantized,
+    as the training provider does (`numerics.should_quantize`); Qwix 0.1.8's
+    PTQ raises on them instead, and the hybrid DiT's S5 scan multiplies
+    complex states. And it casts a quantized kernel's scales to the dtype a
+    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
+    through: a bf16 module then multiplied bf16 activations by fp32
+    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080)."""
+    qwix = importlib.import_module("qwix")
+    quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
+
+    class QtProvider(_GroupScaledConvolution, qwix.QtProvider):
+        pass
+
+    class PtqProvider(_GroupScaledConvolution, qwix.PtqProvider):
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            if _real(lhs, rhs):
+                return super().dot_general(lhs, rhs, dimension_numbers, precision,
+                                           preferred_element_type, out_sharding=out_sharding)
+            return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                       preferred_element_type=preferred_element_type,
+                                       out_sharding=out_sharding)
+
+        def einsum(self, einsum_str, *operands, **kwargs):
+            if _real(*operands):
+                return super().einsum(einsum_str, *operands, **kwargs)
+            return jnp.einsum(einsum_str, *operands, **kwargs)
+
+        def promote_dtype(self, *args, **kwargs):
+            # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8
+            # (`flax_util.update_boxed` accepts boxes and arrays only).
+            promoted = super().promote_dtype(*args, **kwargs)
+            dtype = kwargs.get("dtype")
+            if dtype is None:
+                return promoted
+            return [value.replace(array=nn.unbox(value.array).astype(dtype))
+                    if isinstance(value, quantized) else value for value in promoted]
+
+    return QtProvider, PtqProvider
+
+
+def _rules(spec: Quantization, training: bool) -> list:
+    """One Qwix rule per pattern of `spec`, in its order: quantized-training
+    rules with the backward fields, or serving rules. A weight-only rule
+    names the matmul ops alone (`Quantization.weight_only`)."""
+    qwix = importlib.import_module("qwix")
+    rule, fields = qwix.QuantizationRule, {}
+    if training:
+        rule, fields = qwix.QtRule, {
+            "bwd_qtype": None if spec.bwd_qtype is None else _qtype(spec.bwd_qtype),
+            "bwd_stochastic_rounding": spec.bwd_stochastic_rounding}
+    if spec.weight_only:
+        fields["op_names"] = ("dot_general", "einsum", "dot")
+    return [rule(module_path=pattern, weight_qtype=_qtype(spec.dtype),
+                 act_qtype=None if spec.weight_only else _qtype(spec.dtype),
+                 tile_size=spec.tile_size, weight_calibration_method=spec.calibration, **fields)
+            for pattern in spec.patterns]
+
+
 def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
 
@@ -144,24 +284,35 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     Construction already refused what the value cannot ask for; without the
     package the call raises naming it.
     """
-    if not isinstance(spec, Quantization):
-        raise ValueError(
-            f"quantization is a Quantization value, got {spec!r}")
-    qwix = importlib.import_module("qwix")
-    rules = [
-        qwix.QtRule(
-            module_path=pattern,
-            weight_qtype=_qtype(spec.dtype),
-            act_qtype=_qtype(spec.dtype),
-            tile_size=spec.tile_size,
-            weight_calibration_method=spec.calibration,
-            bwd_qtype=None if spec.bwd_qtype is None else _qtype(spec.bwd_qtype),
-            bwd_stochastic_rounding=spec.bwd_stochastic_rounding,
-        )
-        for pattern in spec.patterns
-    ]
+    rules = _rules(spec, training=True)
     methods = tuple(method for method in METHODS if hasattr(model, method))
-    return qwix.quantize_model(model, qwix.QtProvider(rules), methods=methods)
+    return importlib.import_module("qwix").quantize_model(model, _providers()[0](rules), methods=methods)
+
+
+def quantize_for_serving(model: nn.Module, variables: Mapping[str, object], spec: Quantization,
+                         *args: object, **kwargs: object) -> tuple[nn.Module, dict[str, object]]:
+    """`model` and `variables` with the weights `spec` names stored quantized.
+
+    This is Qwix's post-training quantization. The returned variables hold
+    each matched kernel as int8 or fp8 values with their scales, in place of
+    the float kernel, so the weights take about a quarter of fp32's memory, and the
+    returned module computes with them. Unless `spec.weight_only`, its
+    activations quantize at each matmul from their own range, as training
+    under `apply_quantization` does, and a matmul of two quantized operands
+    runs in the quantized dtype. `args` and `kwargs` are one example call of
+    the model, which Qwix traces abstractly to find the kernels its
+    matmuls read. `spec`'s backward fields have nothing to do here.
+
+    A weight-only spec leaves convolutions in float: Qwix 0.1.8's serving
+    provider quantizes a convolution's weights only together with its
+    activations.
+    """
+    rules = _rules(spec, training=False)
+    qwix = importlib.import_module("qwix")
+    methods = tuple(method for method in METHODS if hasattr(model, method))
+    served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
+    abstract = jax.eval_shape(functools.partial(served.init, jax.random.key(0), *args, **kwargs))
+    return served, {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
 
 
 @runtime_checkable

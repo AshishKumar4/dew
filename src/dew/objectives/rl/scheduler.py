@@ -95,7 +95,7 @@ from jax.sharding import Mesh
 from dew.artifacts import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
 from dew.nn.inputs import local_rows, mesh_of
-from dew.objectives.base import Variables
+from dew.objectives.base import Shown, Variables
 from dew.training.distributed import first_reader_batch, shard_batch
 from dew.training.state import TrainState
 
@@ -219,8 +219,12 @@ class RolloutScheduler:
     truncation policy, and `support_capacity` its per-row support length,
     which a filtered-sampling source requires. `log`, when given,
     receives a `SchedulerRecord` per call, of this process's rollouts; a
-    share's later readers sample none and log nothing.
+    share's later readers sample none and log nothing. `metrics` holds the
+    latest record's numbers, which the trainer logs as `rollout/<name>`.
     """
+    shown = {"reward/mean": Shown(better="higher"), "lag/mean": Shown(better="lower"),
+             "pack/fill": Shown(better="higher", percent=True),
+             **{f"status/{status.value}": Shown(percent=True) for status in Status}}
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
@@ -251,6 +255,7 @@ class RolloutScheduler:
         self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
         self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
         self.support_capacity = support_capacity
+        self.metrics: dict[str, float] = {}
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
@@ -307,17 +312,16 @@ class RolloutScheduler:
             self._submit(group, [(index, 0) for index in range(width)])
 
     def _publish(self, state: TrainState, updates: int) -> None:
-        """Push the weights when the served version is `sync_every` behind, twice if the first did not take.
+        """Push the weights when the served version is `sync_every` behind.
 
         A served version ahead of `updates` is out of date as well: a fit
         restored from an earlier checkpoint must not sample from weights
         newer than its own.
         """
-        for _ in range(2):
-            if 0 <= updates - self.weights.version < self.sync_every:
-                return
-            self.weights.load(state.params, updates)
-        if not 0 <= updates - self.weights.version < self.sync_every:
+        if 0 <= updates - self.weights.version < self.sync_every:
+            return
+        self.weights.load(state.params, updates)
+        if self.weights.version != updates:
             raise RuntimeError(f"the weights pushed at update {updates} did not take: the engines still "
                                f"serve version {self.weights.version}")
 
@@ -453,13 +457,18 @@ class RolloutScheduler:
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)
         packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed, mesh) * packed[RESPONSE_MASK_KEY]
-        if self.log is not None and sampling:
+        if sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)
             metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
                                       truncation=self.truncation)
-            self.log(SchedulerRecord(updates, oldest, updates - oldest, groups, dict(tally.resubmitted),
-                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics))
+            record = SchedulerRecord(updates, oldest, updates - oldest, groups, dict(tally.resubmitted),
+                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics)
+            self.metrics = {**metrics, "lag": float(record.lag), "groups": float(groups),
+                            "resubmitted": float(sum(record.resubmitted.values())),
+                            "waited_seconds": waited}
+            if self.log is not None:
+                self.log(record)
         return packed
 
     def _admitted(self, batch: Batch, updates: int) -> tuple[list[Session], list[float], int, _Tally, float]:

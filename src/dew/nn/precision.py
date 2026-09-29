@@ -18,10 +18,26 @@ preset for exactly this reason (jax-ml/jax#24047).
 """
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
+
+
+def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
+    """The dtype arithmetic Dew keeps from rounding below float32 runs in:
+    float32 for float32, every narrower float and a module's unset dtype
+    (None), and `dtype` itself where it is wider.
+
+    Norm statistics, softmaxes, rotary and time-embedding angles, the
+    vocabulary head's product and the reductions a loss sums read it, so a
+    bfloat16 model reduces in float32 and a float64 model, under x64,
+    computes in float64 throughout. Pinned to float32 instead, a float64
+    model rounded those steps to float32, the same roundings its float32
+    twin makes, and a bound taken from the twin missed them."""
+    return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
 def precision_names(precision: PrecisionLike) -> frozenset[str]:
@@ -74,12 +90,13 @@ def bf16_operand_precision(dtype: Dtype | None,
 
 
 def fp32_result_dot_general(precision: PrecisionLike = None):
-    """A flax layer's `dot_general` for a head whose result stays fp32.
+    """A flax layer's `dot_general` for a head whose result stays at least
+    fp32.
 
     The layer has already promoted both operands when this runs - to its own
     `dtype`, or to the activations' where it carries none - so the compute
-    dtype is the operands' own. Only the accumulation and the result are
-    fp32.
+    dtype is the operands' own. Only the accumulation and the result widen,
+    to `at_least_fp32` of it.
     """
     requested = precision
 
@@ -89,7 +106,7 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
         return jax.lax.dot_general(
             lhs, rhs, dimension_numbers,
             precision=bf16_operand_precision(lhs.dtype, requested),
-            preferred_element_type=jnp.float32)
+            preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -101,7 +118,7 @@ def scaled(x: jax.Array, factor: float) -> jax.Array:
     bf16 first would shrink every product by a systematic 0.12%."""
     if factor == 1.0:
         return x
-    return (x.astype(jnp.promote_types(x.dtype, jnp.float32)) * factor).astype(x.dtype)
+    return (x.astype(at_least_fp32(x.dtype)) * factor).astype(x.dtype)
 
 
 def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
@@ -161,13 +178,14 @@ def _algorithm_operand(value: jax.Array) -> jax.Array:
 
 
 def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
-    """A flax layer's `dot_general` for a vocabulary head: an fp32 result
-    whose operands are the compute dtype's values, in both directions.
+    """A flax layer's `dot_general` for a vocabulary head: a result at
+    least fp32 whose operands are the compute dtype's values, in both
+    directions.
 
     `dtype` is the model's compute dtype, not the layer's: the layer
-    promotes the states to fp32. Under bf16 compute at the default precision
-    both operands multiply as bf16 (`head_product`); otherwise the product
-    is the layer's own fp32 one.
+    promotes the states to at least fp32. Under bf16 compute at the default
+    precision both operands multiply as bf16 (`head_product`); otherwise the
+    product is the layer's own, in the operands' dtype.
     """
     resolved = bf16_operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -178,7 +196,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
         if rounds:
             rhs = _algorithm_operand(rhs)
         return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
-                                   preferred_element_type=jnp.float32)
+                                   preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -186,7 +204,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
 def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
                  precision: PrecisionLike = None) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
-    it, with fp32 accumulation and an fp32 result.
+    it, with accumulation and a result at least fp32.
 
     The product follows the compute dtype, the states' dtype, as torch
     autocast and MaxText (`logits_dot_in_fp32=False`) run it: bf16 states
@@ -197,5 +215,40 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
         return jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
                           precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                           preferred_element_type=jnp.float32)
-    return jnp.einsum(subscripts, hidden.astype(jnp.float32), head,
-                      precision=precision, preferred_element_type=jnp.float32)
+    wide = at_least_fp32(hidden.dtype)
+    return jnp.einsum(subscripts, hidden.astype(wide), head,
+                      precision=precision, preferred_element_type=wide)
+
+
+def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
+    """`fn` traced, forward and backward, under the default matmul precision.
+
+    Mosaic's TPU kernels refuse a 16-bit matmul at HIGHEST ("Bad lhs type"),
+    and a Pallas kernel's dots read the precision from the configuration
+    when they are traced, which `jax_default_matmul_precision=highest` sets
+    for the whole process. A kernel's dots of 16-bit operands are exact at
+    any precision and accumulate in fp32, so those are unchanged. A dot a
+    kernel runs in fp32 takes one bf16 pass on a TPU at the default instead
+    of HIGHEST's several: splash's forward multiplies the fp32 probabilities
+    by the values cast up to fp32 (splash_attention_kernel.py), so under a
+    HIGHEST setting its P·V now rounds P to bf16, as every default-precision
+    run does. The kernels take no per-dot precision, and their bf16 q·k in
+    the same trace needs the default, so there is no other setting. The
+    backward is traced after the forward returns, so it is held under the
+    same setting by hand: a context manager around the call alone would
+    leave it at HIGHEST."""
+    @jax.custom_vjp
+    def run(*args):
+        with jax.default_matmul_precision('default'):
+            return fn(*args)
+
+    def forward(*args):
+        with jax.default_matmul_precision('default'):
+            return jax.vjp(fn, *args)
+
+    def backward(pullback, cotangent):
+        with jax.default_matmul_precision('default'):
+            return pullback(cotangent)
+
+    run.defvjp(forward, backward)
+    return run

@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
+from dew.nn.conv import Conv
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
@@ -188,14 +189,78 @@ def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_sec
     PCIe card and NVLink 4 for the SXM one. A device the peak table does not
     name, and a step with no measured link, keep the projection on every
     token; a CPU mesh spreads."""
-    from dew.nn.sharding import RESIDUAL, SPREAD, TensorLink, down_projection, tensor_link
+    from dew.nn.sharding import RESIDUAL, SPREAD, TENSOR_AXIS, Link, down_projection, measured_links
 
     mesh = build_mesh(MeshSpec(tensor=4), jax.devices()[:4])
     residual = jax.ShapeDtypeStruct((4, 4096, 7168), jnp.bfloat16)
-    link = None if platform is None else TensorLink(bytes_per_second, peak, platform)
-    with jax.set_mesh(mesh), tensor_link(link):
+    link = None if platform is None else Link(bytes_per_second, peak, platform)
+    with jax.set_mesh(mesh), measured_links({} if link is None else {TENSOR_AXIS: link}):
         assert down_projection(residual, 1536 + 512 + 64) == (SPREAD if spreads else RESIDUAL)
     assert link is None or link.spread == spreads
+
+
+@pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
+    (1, 1, 4, 60e9, None),
+    (13, 1, 4, 60e9, 80e9),
+    (13, 2, 4, 75e9, 90e9),
+    (13, 2, 1, 90e9, 100e9),
+], ids=["one-position", "sequence", "tensor-sequence", "indivisible-heads"])
+def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
+        length, tensor_shards, heads, slow, fast):
+    """An indivisible context's projection trades redundant FLOPs for bytes.
+
+    Two rows of 13 positions, width 96, projected to 128 key/value features
+    need 71.8 GB/s at a 1 TFLOP/s peak: each shard saves nine positions,
+    not twelve, because three padded positions add work. The links straddle
+    that crossover. Splitting four heads over tensor2 raises it to 78.7 GB/s;
+    one head cannot split, and its smaller projection needs 92.6 GB/s.
+    A one-position context saves no work even on a CPU link.
+    """
+    from dew.nn.attention import NormalAttention
+    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links
+    from dew.telemetry.instrumentation import compiled_flops
+
+    model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
+    query = jax.random.normal(jax.random.key(21), (2, 8, 64))
+    context = jax.random.normal(jax.random.key(22), (2, length, 96))
+    params = model.init(jax.random.key(23), query, context)["params"]
+
+    def compiled(sequence, tensor, link):
+        mesh = build_mesh(MeshSpec(sequence=sequence, tensor=tensor), jax.devices()[:sequence * tensor])
+        whole = NamedSharding(mesh, P())
+        inputs = jax.tree.map(lambda value: jax.device_put(value, whole), (params, query, context))
+
+        def loss(weights, x, tokens):
+            output = model.apply({"params": weights}, x, tokens)
+            return jnp.mean(jnp.square(output)), output
+
+        with jax.set_mesh(mesh), measured_links({SEQUENCE_AXIS: link}):
+            step = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))
+            executable = step.lower(*inputs).compile()
+        result = jax.device_get(executable(*inputs))
+        flops = compiled_flops(executable)
+        assert flops is not None
+        moved = 0
+        for line in executable.as_text().splitlines():
+            match = COLLECTIVE.match(line)
+            if match:
+                moved += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
+                             for dtype, dims in TYPED.findall(match["shape"]))
+        return result, flops * sequence * tensor, moved
+
+    expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
+    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12, "gpu"))
+    link = Link(fast, 1e12, "gpu") if fast is not None else Link(None, None, "cpu")
+    split, split_flops, split_bytes = compiled(4, tensor_shards, link)
+    for actual in (kept, split):
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+    if length > 1:
+        assert split_flops < kept_flops
+        assert split_bytes > kept_bytes
+    else:
+        assert split_flops == kept_flops
+        assert split_bytes == kept_bytes
 
 
 def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
@@ -666,6 +731,36 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     for got, want, size in zip(jax.tree.leaves(split), jax.tree.leaves(alone),
                                jax.tree.leaves(magnitude), strict=True):
         np.testing.assert_array_less(np.abs(got - want), terms * np.finfo(np.float32).eps * size)
+
+
+def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devices_output():
+    """A 3x3 convolution of an 8x8 image under fsdp x tensor, its kernel's
+    input channels split over fsdp as the layout stores the UNet's (fsdp
+    takes the first of two equal widths), and its image rows split over
+    tensor by `Conv`'s placement. XLA's partitioner computed another result
+    (openxla/xla, a 3x3 convolution with a halo and a kernel split on its
+    input features): the UNet's second level's conv2 came out 13.4 off an
+    output of 4.5, so a UNet on fsdp2 x tensor2 trained on a loss 6.5e-3 off
+    one device's and gradients up to 2.6e5 times their bound."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(4, 8, 8, 64)).astype(np.float32)
+    conv = Conv(64, (3, 3))
+    params = conv.init(jax.random.key(0), x[:1])["params"]
+    alone = conv.apply({"params": params}, x)
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        stored = {"kernel": jax.device_put(params["kernel"], NamedSharding(mesh, P(None, None, "fsdp"))),
+                  "bias": params["bias"]}
+        split = jax.jit(conv.apply)({"params": stored}, jax.device_put(x, NamedSharding(mesh, P("fsdp"))))
+
+    # Each output sums one product per tap and input channel; any order of
+    # that sum lands within their count times fp32 epsilon times the sum of
+    # the products' magnitudes, which the same convolution of |x| and
+    # |kernel| is (the bias adds one term).
+    terms = 3 * 3 * x.shape[-1] + 1
+    magnitude = conv.apply({"params": jax.tree.map(np.abs, params)}, np.abs(x))
+    np.testing.assert_array_less(np.abs(np.asarray(split) - np.asarray(alone)),
+                                 terms * np.finfo(np.float32).eps * np.asarray(magnitude))
 
 
 def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():

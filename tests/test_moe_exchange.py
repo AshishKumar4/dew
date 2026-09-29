@@ -13,7 +13,8 @@ import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
 from dew.training import DEFAULT_RULES, MeshSpec, build_mesh
 

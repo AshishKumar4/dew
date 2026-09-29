@@ -54,16 +54,11 @@ def _observation(value: object) -> Observation:
     context, status, detail = value.get("context"), value.get("status"), value.get("detail", "")
     if not isinstance(context, list) or not isinstance(status, str) or not isinstance(detail, str):
         raise ValueError("sandbox observation needs context ids, a status name and string detail")
-    ids: list[int] = []
-    for token in context:
-        if type(token) is not int:
-            raise ValueError("sandbox context must contain integer token ids")
-        ids.append(token)
     try:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
-    return Observation(tuple(ids), state, detail)
+    return Observation(tuple(context), state, detail)
 
 
 def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:

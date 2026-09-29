@@ -38,6 +38,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.typing import DTypeLike
 
 _log = logging.getLogger(__name__)
 
@@ -70,8 +71,11 @@ def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
             + head_dim * state_size)
 
 
-def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str) -> bool:
-    """Whether the SSD kernel is chosen for this geometry: a tpu backend, a
+def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str, *,
+                    dtype: DTypeLike) -> bool:
+    """Whether the SSD kernel is chosen for this geometry and the scan's
+    `dtype`: a tpu backend, a float32 scan (the kernel computes in float32,
+    so a wider one takes the XLA path, which computes in its own dtype), a
     chunk long enough to pay for a program, three widths that are powers of
     two so that Mosaic's tiling throws no lanes away, and a tile inside the
     per-program budget.
@@ -84,7 +88,7 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     `chunk_ssd` asks this at trace time and takes the XLA path when it says
     no, the way attention's 'auto' asks `cudnn_runs`.
     """
-    if backend != 'tpu':
+    if backend != 'tpu' or jnp.dtype(dtype) != jnp.float32:
         return False
     widths = (chunk_size, head_dim, state_size)
     if any(width < MIN_WIDTH or width & (width - 1) for width in widths):
@@ -104,10 +108,12 @@ def _announce(backend: str, chunk_size: int, head_dim: int, state_size: int,
         _log.info("mamba2 ssd scan on %s: the pallas kernel (%s)", platform, geometry)
 
 
-def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int) -> str | None:
-    """The backend to build this scan's kernel for, or None for the XLA path."""
+def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
+                        dtype: DTypeLike) -> str | None:
+    """The backend to build this `dtype` scan's kernel for, or None for the XLA path."""
     backend = jax.default_backend()
-    platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend) else None
+    platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
+                                          dtype=dtype) else None
     _announce(backend, chunk_size, head_dim, state_size, platform)
     return platform
 

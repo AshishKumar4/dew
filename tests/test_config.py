@@ -427,7 +427,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
 def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
     import jax
 
-    from dew.nn.backbones.causal_transformer import LayerKind
+    from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers import AttentionMixer
     from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 

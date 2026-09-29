@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import jax
@@ -33,16 +33,18 @@ from termcolor import colored
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
-from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, RematPolicy
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
 from dew.nn.sharding import (
+    SEQUENCE_AXIS,
     STAGE_AXIS,
     TENSOR_AXIS,
     LayoutRefused,
+    Link,
     Schedule,
-    TensorLink,
+    measured_links,
     pipeline_microbatches,
-    tensor_link,
 )
 from dew.objectives.base import (
     FROZEN,
@@ -54,6 +56,7 @@ from dew.objectives.base import (
     Mean,
     Metric,
     Objective,
+    Shown,
     Step,
     Variables,
     select,
@@ -64,6 +67,7 @@ from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
+    AxisLink,
     CheckpointRequested,
     FitEnded,
     FitStarted,
@@ -71,6 +75,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
+from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
     DevicePrefetchIterator,
     Layout,
@@ -80,8 +85,8 @@ from dew.training.distributed import (
     batch_shardings,
     build_mesh,
     data_partition,
+    link_bandwidth,
     shard_batch,
-    tensor_bandwidth,
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -134,7 +139,12 @@ class Rollout(Protocol):
     trainer calls the rollout with the state, the prefetched batch and a key
     folded from the run key and the step, then reshards what comes back with
     `shard_batch`. The returned batch must hold arrays in fixed shapes, so
-    the step still compiles once per run."""
+    the step still compiles once per run.
+
+    A rollout may hold `metrics`, a mapping of names to floats describing
+    its latest call (rewards, lag, truncation); each logging interval sends
+    them to the tracker and the display as `rollout/<name>`. It may declare
+    how the display shows them in `shown`, as an objective does."""
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
@@ -179,6 +189,29 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
     return interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run)
 
 
+def learning_rate(opt_state: optax.OptState) -> float | None:
+    """The learning rate in `opt_state`, where the optimizer carries one:
+    under `optax.inject_hyperparams`, the way optax exposes a schedule's
+    value. None for a rate the optimizer closes over, or for parameter
+    groups that carry several."""
+    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+    rates = [node.hyperparams["learning_rate"]
+             for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
+             if isinstance(node, injected) and "learning_rate" in node.hyperparams]
+    return float(rates[0]) if len(rates) == 1 else None
+
+
+# How the display shows the metrics the trainer itself logs; an objective,
+# a rollout and a validation metric declare their own (`Shown`).
+TRAINER_SHOWN = {"loss": Shown(better="lower"),
+                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "accepted": Shown(percent=True, group="optimizer"),
+                 "step_time_ms": Shown(better="lower", group="throughput"),
+                 "samples_per_sec": Shown(better="higher", group="throughput"),
+                 "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "rollout_seconds": Shown(better="lower", group="throughput")}
+
+
 def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
     """Compute the two goodput numbers from MaxText's report that need no
     cluster telemetry.
@@ -207,14 +240,56 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
             or xla_flag('xla_gpu_enable_triton_gemm') is not None):
         return None
-    model = getattr(objective, 'model', None)
-    if model is None:
-        return None
-    mixers = [getattr(model, 'mixer', None)]
-    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
-    if any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers):
+    model = _model_of(objective)
+    if model is None or _keeps_triton_gemm(model):
         return None
     return {'xla_gpu_enable_triton_gemm': False}
+
+
+def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
+                    mesh: Mesh) -> tuple[jax.stages.Compiled, bool]:
+    """Fall back to the step compiled under XLA's default options where it
+    fits and the one compiled under `step_compiler_options` does not.
+    Returns the step to run and whether it fits.
+
+    The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
+    (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
+    keep their whole logits in 13.1 GiB with them and run 178.7 ms, while
+    without them the step does not fit, tiles its head and runs 211.2 ms. So
+    the fusions come back before the ladder's first rung."""
+    default = program.compile()
+    if not step_fits(default, mesh):
+        return executable, False
+    print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
+                  "compiling it with them", "yellow"), file=sys.stderr)
+    return default, True
+
+
+def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
+    """The one module an objective trains, or None. `Objective` declares no
+    model, since some train none (JEPA's pair, the RL actors' wrappers), so
+    the trainer reads it at this boundary: LM, diffusion and masked
+    objectives name theirs `model`."""
+    return getattr(objective, 'model', None)
+
+
+def _keeps_triton_gemm(model: nn.Module) -> bool:
+    """Whether a mixer of the model keeps XLA's Triton GEMM fusions
+    (`MixerBase.keeps_triton_gemm`). Any flax module arrives here, so its
+    mixer fields are read at this boundary: a decoder names its mixer and its
+    layer kinds', and a model without them keeps no mixer."""
+    mixers = [getattr(model, 'mixer', None)]
+    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
+    return any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers)
+
+
+def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
+    """The model's remat setting, read at the boundary with any flax module:
+    a decoder's `RematPolicy`, a diffusion backbone's bool or name, and
+    None for a model with no remat field."""
+    return getattr(model, 'remat', None)
+
+
 # What a model recomputes in its backward pass when its step does not fit,
 # weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
 # jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
@@ -232,7 +307,10 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | N
     temporaries and new outputs are placed, None where the executable or a
     device reports no memory. The arguments, the state and the batch, are
     already resident and counted in use; the donated state's buffers are
-    reused for the outputs that alias them."""
+    reused for the outputs that alias them.
+
+    This compares against the allocator's limit; a growable allocator
+    (XLA_PYTHON_CLIENT_PREALLOCATE=false) can fragment below it."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
@@ -303,10 +381,12 @@ def recompute_more(objective) -> bool:
         print(colored(f"the step does not fit the devices with the whole logits kept; "
                       f"compiling it again with {moved}", "yellow"), file=sys.stderr)
         return True
-    model = getattr(objective, 'model', None)
+    model = _model_of(objective)
     if model is None:
         return False
-    current = getattr(model, 'remat', ...)
+    # A decoder always has a remat field; any other model climbs only a
+    # bool or named policy, so a missing field and None both stay put.
+    current = _remat_of(model)
     ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
               else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
     current = 'dots' if current is True else current
@@ -317,6 +397,97 @@ def recompute_more(objective) -> bool:
                   f"compiling it again under {stronger!r}", "yellow"), file=sys.stderr)
     objective.model = model.clone(remat=stronger)
     return True
+
+
+@dataclasses.dataclass(frozen=True)
+class _FitPlan:
+    """What one `Trainer.fit` call was asked for."""
+
+    dataset: Dataset
+    steps: int
+    log_every: int
+    eval_every: int | None
+    checkpoint_every: int | None
+    local_every: int | None
+    metrics: Sequence[Metric]
+    preview: bool
+
+
+@dataclasses.dataclass
+class _FitRun:
+    """One `Trainer.fit` call's progress: what its loop carries from step
+    to step and what its cleanup reads however the run ends."""
+
+    started: float
+    current: int = 0
+    loss: jax.Array | None = None
+    source: Iterator[Batch] | None = None
+    train: DevicePrefetchIterator | None = None
+    tracing: bool = False
+    traced: int = 0
+    other: float = 0.0
+    first_step: float | None = None
+    preempted: int | None = None
+    notice: PreemptionNotice | None = None
+
+
+@dataclasses.dataclass
+class _Interval:
+    """What `fit` sums between logs and between checkpoints.
+
+    `book` is the loss summed since the last checkpoint and both bad-loss
+    counters, on device, so the loop never blocks on a result, and they move
+    together in one dispatch; the host reads them at the logging cadence.
+    `steps` counts since the last checkpoint, the rest since the last log.
+    The records and FLOPs are summed per step rather than taken off the
+    dataset's batch, so a ramped interval reports the records it read and
+    their FLOPs. `rollout_seconds` is the time spent sampling, logged under
+    train/rollout_seconds when a rollout is set."""
+
+    book: Book
+    last_log_time: float
+    last_saved: int | None
+    steps: int = 0
+    since_log: int = 0
+    samples: int = 0
+    flops: float | None = 0.0
+    rollout_seconds: float = 0.0
+
+    def count(self, batch: Batch, flops: float | None, loss: jax.Array, finite: jax.Array) -> None:
+        """Add one step: its records, its FLOPs and its loss."""
+        self.since_log += 1
+        self.steps += 1
+        self.samples += rows_of(batch)
+        self.flops = None if self.flops is None or flops is None else self.flops + flops
+        self.book = bookkeep(self.book, loss, finite)
+
+    def check_finite(self, step: int, display: TrainingDisplay) -> None:
+        """Raise RuntimeError once the loss has been non-finite for
+        BAD_LOSS_STEPS steps, and start the longest streak over.
+
+        Deferred to the logging cadence so the step loop never synchronises;
+        detection is late by at most that many steps, never missed.
+        """
+        loss, bad_run, worst_bad_run = self.book
+        streak = int(worst_bad_run)
+        if streak >= BAD_LOSS_STEPS:
+            raise RuntimeError(
+                f"Loss has been non-finite for {streak} consecutive steps "
+                f"ending near step {step}, stopping")
+        if streak:
+            display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
+        self.book = (loss, bad_run, jnp.zeros((), jnp.int32))
+
+    def logged(self, now: float) -> None:
+        """Start the next logging interval at `now`."""
+        self.last_log_time, self.since_log, self.samples = now, 0, 0
+        self.flops, self.rollout_seconds = 0.0, 0.0
+
+    def saved(self, step: int) -> None:
+        """Start the next checkpoint interval after the one saved at `step`."""
+        loss, bad_run, worst_bad_run = self.book
+        self.last_saved, self.steps = step, 0
+        self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -374,11 +545,12 @@ class Trainer(Generic[Loss, Effects]):
         self.flops_per_step = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
-        # Whether a down-projection of the step ran on each tensor shard's own
-        # tokens (`dew.nn.sharding.down_projection`), which the link of its
-        # mesh's tensor axis decides, and each mesh's measured bandwidth.
-        self.tensor_spread = False
-        self._tensor_bandwidths: dict[Mesh, float | None] = {}
+        # The links the last compiled step decided its projections by, which
+        # say whether one spread over each axis (`dew.nn.sharding.Link`), and
+        # each mesh axis's measured bandwidth.
+        self.links: dict[str, Link] = {}
+        self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
+        self._display = TrainingDisplay()
 
     @classmethod
     def from_config(
@@ -568,7 +740,7 @@ class Trainer(Generic[Loss, Effects]):
                                               share=data_partition(self.device_mesh))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
-        print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
+        self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
     def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
@@ -750,37 +922,38 @@ class Trainer(Generic[Loss, Effects]):
             pending = jax.jit(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
-
-    def _default_step(self, shapes):
-        return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
-
-    def _tensor_link(self, mesh: Mesh) -> TensorLink | None:
-        """The tensor axis's link on `mesh` for one trace. Every process lists
-        the mesh's devices alike and `tensor_bandwidth` agrees one figure
-        across the pool, so every process decides alike and compiles the same
-        program. The peak is the fastest device's, on which the FLOPs a spread
-        saves take the least time. The bandwidth is measured once per mesh,
-        and not at all on a CPU mesh or for a device the peak table does not
-        name, where it decides nothing."""
-        if mesh.shape[TENSOR_AXIS] == 1:
-            return None
+    def _links(self, mesh: Mesh) -> dict[str, Link]:
+        """The links of `mesh`'s tensor and sequence axes, those it splits,
+        for one trace. Every process lists the mesh's devices alike and
+        `link_bandwidth` agrees one figure across the pool, so every process
+        decides alike and compiles the same program. The peak is the fastest
+        device's, on which the FLOPs a spread saves take the least time. Each
+        axis's bandwidth is measured once per mesh, and not at all on a CPU
+        mesh or for a device the peak table does not name, where it decides
+        nothing."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := peak_flops(device.device_kind)) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
         platform = devices[0].platform
-        if mesh not in self._tensor_bandwidths:
-            self._tensor_bandwidths[mesh] = (
-                None if platform == 'cpu' or peak is None else tensor_bandwidth(mesh))
-        return TensorLink(self._tensor_bandwidths[mesh], peak, platform)
+        links = {}
+        for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
+            if mesh.shape[axis] == 1:
+                continue
+            if (mesh, axis) not in self._bandwidths:
+                self._bandwidths[mesh, axis] = (
+                    None if platform == 'cpu' or peak is None else link_bandwidth(mesh, axis))
+            links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
+        return links
 
     @contextlib.contextmanager
-    def _traced_on(self, mesh: Mesh, link: TensorLink | None = None) -> Iterator[Schedule]:
+    def _traced_on(self, mesh: Mesh, links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
-        parameters, and the tensor axis's link, where the step measured one."""
+        parameters, and the links of the axes the step measured, none by
+        default."""
         with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches) as schedule,
-              nn.logical_axis_rules(self.layout.axis_rules), tensor_link(link)):
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
@@ -804,8 +977,8 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
-        link = self._tensor_link(mesh)
-        with self._traced_on(mesh, link) as schedule:
+        links = self._links(mesh)
+        with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
                 raise LayoutRefused(
@@ -819,8 +992,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             while True:
-                body = (self.step(self.objective, self.optimizer) if self.step is not None
-                        else self._default_step(shapes))
+                body = (self.step(self.objective, self.optimizer) if self.step is not None else
+                        Transaction(self.objective, self.optimizer, self.accumulation, shapes).step())
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
@@ -834,11 +1007,15 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                self.executable = self.program.compile(step_compiler_options(self.objective))
-                if step_fits(self.executable, mesh) or not recompute_more(self.objective):
+                options = step_compiler_options(self.objective)
+                self.executable = self.program.compile(options)
+                fits = step_fits(self.executable, mesh)
+                if not fits and options is not None:
+                    self.executable, fits = fitting_default(self.program, self.executable, mesh)
+                if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
-            self.tensor_spread = link is not None and link.spread
+            self.links = links
         # The program compiled above, not the jit: a call through the jit
         # traces and compiles its own, without the step's compiler options,
         # which was 25 s of an A100's cold start.
@@ -911,233 +1088,246 @@ class Trainer(Generic[Loss, Effects]):
         """
         self._check_validation_is_read(eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
-        started = time.perf_counter()
+        run = _FitRun(time.perf_counter())
+        # A display of this fit's own: one before it may have run other steps.
+        self._display = TrainingDisplay()
         profile, checkpoints = self.profile, self.checkpoints
-        source = train = None
-        tracing, traced = False, 0
-        loss = None
-        other = 0.0
-        current = 0
-        first_step = None
-        preempted: int | None = None
-        notice: PreemptionNotice | None = None
-        process_zero = jax.process_index() == 0
         profiler = self._own_profile_window()
-        outer = telemetry_profile.active_profile()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
-        tracer = profiler if profiler is not None else outer
+        tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            mesh = self.device_mesh
-            self._check_pipelined_batch(dataset.batch, mesh)
-
+            self._check_pipelined_batch(dataset.batch, self.device_mesh)
+            plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
+                            None if checkpoints is None else checkpoints.local_every, metrics, preview)
             state, shardings, position = self.place()
-            current = int(state.step)
-            self._report(FitStarted(current, steps,
-                checkpoints.source(current) if checkpoints is not None and position is not None else None,
-                sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-                jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape)), current)
-            if current > steps:
-                raise ValueError(f"the run is at step {current}, past the {steps} asked for")
-
-            if checkpoint_every and checkpoints is None:
-                raise ValueError(
-                    "checkpoint_every asks for checkpoints and this trainer has no "
-                    "checkpointer; pass Checkpoints(directory) to write any")
-            if current == steps and checkpoints is not None and checkpoints.latest is not None:
+            if self._opened(plan, run, state, position):
                 return state
-            local_every = None if checkpoints is None else checkpoints.local_every
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            # Rebound once the step is compiled, so the first tick measures steps,
-            # not the compile.
-            last_log_time = time.time()
-            last_saved = current if checkpoints is not None and checkpoints.latest is not None else None
-            interval_steps = 0
-            steps_since_log = 0
-            # Summed per step rather than taken off the dataset's batch, so a
-            # ramped interval reports the records it read and their FLOPs.
-            interval_samples = 0
-            interval_flops: float | None = 0.0
-            # Seconds spent sampling this interval, logged under
-            # train/rollout_seconds when a rollout is set.
-            rollout_seconds = 0.0
-            # The interval's loss and both bad-loss counters live on device,
-            # so the loop never blocks on a result, and they move together in
-            # one dispatch. The host reads them at the logging cadence.
-            book = fresh_book()
+            interval = _Interval(fresh_book(), time.time(), last_saved=(
+                run.current if checkpoints is not None and checkpoints.latest is not None else None))
             seen = 0
-            first_step = None
-
-            if current < steps:
-                source = dataset.train(data_partition(mesh))
-                self._check_stream(source, mesh,
-                                   checkpointing=bool(checkpoint_every or local_every))
-                train = DevicePrefetchIterator(source, mesh, source_state=position)
-                source = None  # Lifetime transferred to the prefetch worker.
-
-            def announce() -> None:
-                if process_zero:
-                    print(f"Training from step {current} to {steps} on "
-                          f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
-
-            agreed("training announcement", announce)
-            notice = PreemptionNotice()
-            while current < steps:
-                assert train is not None
+            run.notice = PreemptionNotice()
+            while run.current < steps:
+                # Read through `run` each time: a local alias would keep the
+                # closed iterator reachable from a failed run's traceback.
+                assert run.train is not None
                 # The window's capture opens before this iteration's first
                 # read, so the step row records the read it waits on rather
                 # than a compile that ran before capture began.
                 if (profiler is not None and profile is not None
-                        and not tracing and traced == 0
+                        and not run.tracing and run.traced == 0
                         and seen >= profile.warmup):
-                    tracing = self._start_window(profiler)
+                    self._start_window(profiler)
+                    run.tracing = True
                 capturing = tracer is not None and tracer.running
-                step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=current)
+                step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                               if capturing else contextlib.nullcontext())
                 with step_scope:
                     with region("input.wait"):
-                        batch = next(train)
+                        batch = next(run.train)
                     if self.rollout is not None:
-                        batch, sampled = self._rolled_out(state, batch, mesh)
-                        rollout_seconds += sampled
+                        batch, sampled = self._rolled_out(state, batch)
+                        interval.rollout_seconds += sampled
                     first_compile = not compiled
                     train_step, measured_flops = self._compiled_for(compiled, state, batch)
                     if first_compile:
                         # Rebound once the step is compiled, so the first tick
                         # measures steps, not the compile.
-                        last_log_time = time.time()
+                        interval.last_log_time = time.time()
                     with region("train.step"):
                         state, loss, aux, finite, accepted = train_step(state, batch)
-                    position = train.source_state
-                    current += 1
+                    run.loss = loss
+                    position = run.train.source_state
+                    run.current += 1
+                    self._display.step(run.current)
                     seen += 1
-                    steps_since_log += 1
-                    interval_steps += 1
-                    interval_samples += rows_of(batch)
-                    interval_flops = (None if interval_flops is None or measured_flops is None
-                                      else interval_flops + measured_flops)
-                    book = bookkeep(book, loss, finite)
-                    if first_step is None:
+                    interval.count(batch, measured_flops, loss, finite)
+                    if run.first_step is None:
                         loss.block_until_ready()
-                        first_step = time.perf_counter() - started
-
-                    if current % log_every == 0:
-                        interval_loss, _, worst_bad_run = book
-                        self._check_finite(worst_bad_run, current)
-                        book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                        now = self._log_interval(
-                            current, loss, aux, accepted, state, since=last_log_time,
-                            steps=steps_since_log, samples=interval_samples,
-                            flops=interval_flops, rollout_seconds=rollout_seconds,
-                            process_zero=process_zero)
-                        if now is not None:
-                            last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
-                            interval_samples, interval_flops = 0, 0.0
-
-                    if eval_every and current % eval_every == 0 and current < steps:
-                        other += self._timed_evaluation(
-                            state, shardings, dataset, metrics, preview, mesh)
-
-                    # On its own clock, not the logging one, so that a cadence
-                    # which does not divide log_every still fires.
-                    if (checkpoint_every and checkpoints is not None
-                            and current % checkpoint_every == 0 and current < steps):
-                        other += self._saved_checkpoint(checkpoints, current, state, position,
-                                                        book, interval_steps)
-                        last_saved = current
-                        book = (jnp.zeros_like(book[0]), book[1], book[2])
-                        interval_steps = 0
-                    if (local_every and checkpoints is not None
-                            and current % local_every == 0 and current < steps):
-                        other += self._saved_local_checkpoint(
-                            checkpoints, current, state, position)
-                    # Asked at every step on every process, as JAX's agreement
-                    # needs; the last step ends the run on its own.
-                    if current < steps and notice.reached(current):
-                        if checkpoints is not None and last_saved != current:
-                            other += self._saved_checkpoint(checkpoints, current, state, position,
-                                                            book, interval_steps)
-                            last_saved = current
-                        preempted = current
+                        run.first_step = time.perf_counter() - run.started
+                    if self._between_steps(plan, run, interval, state, shardings, position,
+                                           loss, aux, accepted):
                         break
                 # The step row is complete once its scope exits; closing the
                 # window here keeps the last iteration inside the capture.
-                if tracing and profile is not None:
-                    traced += 1
-                    if traced == profile.steps:
-                        tracing = False
+                if run.tracing and profile is not None:
+                    run.traced += 1
+                    if run.traced == profile.steps:
+                        run.tracing = False
                         assert profiler is not None
-                        self._stop_trace(traced, loss, profile, profiler, step=current)
-
-
-            if notice is not None:
-                notice.close()
-            paused = time.perf_counter()
-            if train is not None:
-                train.close()
-                train = None
-            other += time.perf_counter() - paused
-            if preempted is not None:
-                stopped_at = preempted
-
-                def announce_preemption() -> None:
-                    if process_zero:
-                        print(f"Preempted at step {stopped_at}: " + (
-                            f"its checkpoint and data position go to {checkpoints.directory}, "
-                            "where the next run resumes" if checkpoints is not None
-                            else "the trainer has no checkpointer, so nothing is written"))
-
-                agreed("preemption announcement", announce_preemption)
-            if tracing and profile is not None:
-                tracing = False
-                # The window outlived the run, and a trace left running takes the
-                # next one down with it.
-                assert profiler is not None
-                self._stop_trace(traced, loss, profile, profiler, step=current)
-            interval_loss, _, worst_bad_run = book
-            self._check_finite(worst_bad_run, current)
-            if loss is not None:
-                # The last step has to land before the wall time is read.
-                loss.block_until_ready()
-            paused = time.perf_counter()
-            if eval_every and preempted is None:
-                self._evaluate(state, shardings, dataset, metrics, preview, mesh)
-            if checkpoints is not None and last_saved != current:
-                # The in-loop saves are conditional, so the state the run ends
-                # on may never have been written. It goes out under its real
-                # step: a step-0 checkpoint holding the final weights would
-                # make a resume restart the schedule from the beginning.
-                checkpoints.save(
-                    current, state, position,
-                    {"loss": float(interval_loss / interval_steps)} if interval_steps else None,
-                    share=data_partition(mesh))
-                self._report(CheckpointRequested(checkpoints.directory), current)
-            other += time.perf_counter() - paused
+                        self._stop_trace(run, profile, profiler)
+            self._wind_down(plan, run, interval, state, shardings, position, profiler)
         finally:
-            paused = time.perf_counter()
             primary = sys.exception()
-            if notice is not None:
-                notice.close()
-            close = (train.close if train is not None else
-                     source.close if isinstance(source, Closeable) else None)
-            stop_trace: Callable[[], None] | None = None
-            if tracing and profile is not None:
-                tracing = False
-                assert profiler is not None
-                stop_trace = functools.partial(
-                    self._stop_trace, traced, loss, profile, profiler, step=current)
-            error = self._cleaned_up(primary, close, stop_trace, checkpoints)
-            # The traceback of a failed run holds this frame, and with it
-            # whatever these names still point at.
-            source = train = close = stop_trace = None
-            other += time.perf_counter() - paused
-            error = self._reported_outcome(error, started, first_step, other, current,
-                                           process_zero=process_zero, preempted=preempted is not None)
+            error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
-        if preempted is not None:
-            raise Preempted(preempted)
+        if run.preempted is not None:
+            raise Preempted(run.preempted)
         return state
+
+    def _closed(self, run: _FitRun, primary: BaseException | None,
+                profiler: Profiler | None) -> BaseException | None:
+        """`fit`'s cleanup however the run ended: the preemption notice, the
+        stream, a trace window and the display closed, the checkpoints
+        waited on, and the outcome reported. Returns the error to raise when
+        the run itself raised none.
+
+        Each teardown step runs even when an earlier one failed, and a later
+        failure becomes a note on the first, so one broken sink cannot hide
+        the error that ended the run."""
+        paused = time.perf_counter()
+        profile, checkpoints = self.profile, self.checkpoints
+        if run.notice is not None:
+            run.notice.close()
+        close = (run.train.close if run.train is not None else
+                 run.source.close if isinstance(run.source, Closeable) else None)
+        stop_trace = None
+        if run.tracing and profile is not None:
+            run.tracing = False
+            assert profiler is not None
+            stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
+        error = primary
+        for label, cleanup in (
+            ("Training iterator", close),
+            ("Profiler", stop_trace),
+            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+            ("Display", self._display.close),
+        ):
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+                else:
+                    error.add_note(f"{label} cleanup failed: {failure!r}")
+        # The traceback of a failed run holds fit's frame and this one, and
+        # with them whatever these names still point at.
+        run.source = run.train = None
+        close = stop_trace = cleanup = None
+        run.other += time.perf_counter() - paused
+        return self._reported_outcome(error, run)
+
+    def _opened(self, plan: _FitPlan, run: _FitRun, state: TrainState, position) -> bool:
+        """Start `fit` from the placed state: report it, refuse a run already
+        past its steps or a checkpoint cadence with no checkpointer, and open
+        the training stream on its prefetch worker. Returns whether the run
+        is already complete, a checkpoint at its last step having been
+        written, so there is nothing to do."""
+        mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
+        run.current = current = int(state.step)
+        started = FitStarted(current, steps,
+            checkpoints.source(current) if checkpoints is not None and position is not None else None,
+            sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape))
+        self._report(started, current)
+        if current > steps:
+            raise ValueError(f"the run is at step {current}, past the {steps} asked for")
+
+        if plan.checkpoint_every and checkpoints is None:
+            raise ValueError(
+                "checkpoint_every asks for checkpoints and this trainer has no "
+                "checkpointer; pass Checkpoints(directory) to write any")
+        if current == steps and checkpoints is not None and checkpoints.latest is not None:
+            return True
+        if current < steps:
+            run.source = plan.dataset.train(data_partition(mesh))
+            self._check_stream(run.source, mesh,
+                               checkpointing=bool(plan.checkpoint_every or plan.local_every))
+            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
+            run.source = None  # Lifetime transferred to the prefetch worker.
+
+        model = getattr(self.objective, "model", self.objective)
+        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.params["params"])})
+        compute = getattr(model, "dtype", None)
+        precision = "/".join(stored)
+        if compute is not None and [str(jnp.dtype(compute))] != stored:
+            precision += f" parameters, {jnp.dtype(compute)} compute"
+        shown = {**TRAINER_SHOWN, **self.objective.shown, **getattr(self.rollout, "shown", {}),
+                 **{metric.name: metric.shown for metric in plan.metrics if hasattr(metric, "shown")}}
+        agreed("training announcement", functools.partial(
+            self._display.start, started, model=type(model).__name__,
+            batch=plan.dataset.batch, precision=precision, shown=shown))
+        return False
+
+    def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
+                       shardings: Placement[TrainState], position, loss: jax.Array,
+                       aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
+        """The cadenced work after one step of `fit`: the log, the validation,
+        the checkpoints, and the preemption notice. Returns whether the
+        notice stops the run at this step, whose checkpoint is then written."""
+        current, steps, checkpoints = run.current, plan.steps, self.checkpoints
+        if current % plan.log_every == 0:
+            interval.check_finite(current, self._display)
+            self._log_interval(current, loss, aux, accepted, state, interval)
+
+        if plan.eval_every and current % plan.eval_every == 0 and current < steps:
+            with region("evaluate"):
+                run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
+
+        # On its own clock, not the logging one, so that a cadence
+        # which does not divide log_every still fires.
+        if (plan.checkpoint_every and checkpoints is not None
+                and current % plan.checkpoint_every == 0 and current < steps):
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
+        if (plan.local_every and checkpoints is not None
+                and current % plan.local_every == 0 and current < steps):
+            run.other += self._saved_local_checkpoint(
+                checkpoints, current, state, position)
+        # Asked at every step on every process, as JAX's agreement
+        # needs; the last step ends the run on its own.
+        assert run.notice is not None
+        if current < steps and run.notice.reached(current):
+            if checkpoints is not None and interval.last_saved != current:
+                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
+            run.preempted = current
+            return True
+        return False
+
+    def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
+                   shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
+        """`fit` after its last step: the stream closed, a preemption
+        announced, the trace window stopped, the final validation (skipped on
+        a preemption) and the checkpoint of the state the run ends on."""
+        profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
+        if run.notice is not None:
+            run.notice.close()
+        paused = time.perf_counter()
+        if run.train is not None:
+            run.train.close()
+            run.train = None
+        run.other += time.perf_counter() - paused
+        if run.preempted is not None:
+            stopped_at = run.preempted
+
+            def announce_preemption() -> None:
+                self._display.note(f"Preempted at step {stopped_at}: " + (
+                    f"its checkpoint and data position go to {checkpoints.directory}, "
+                    "where the next run resumes" if checkpoints is not None
+                    else "the trainer has no checkpointer, so nothing is written"))
+
+            agreed("preemption announcement", announce_preemption)
+        if run.tracing and profile is not None:
+            run.tracing = False
+            # The window outlived the run, and a trace left running takes the
+            # next one down with it.
+            assert profiler is not None
+            self._stop_trace(run, profile, profiler)
+        interval.check_finite(current, self._display)
+        if loss is not None:
+            # The last step has to land before the wall time is read.
+            loss.block_until_ready()
+        if plan.eval_every and run.preempted is None:
+            run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
+        if checkpoints is not None and interval.last_saved != current:
+            # The in-loop saves are conditional, so the state the run ends
+            # on may never have been written. It goes out under its real
+            # step: a step-0 checkpoint holding the final weights would
+            # make a resume restart the schedule from the beginning.
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
@@ -1241,8 +1431,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
                 f"holds a batch that is a multiple of {divisor}")
 
-    def _start_window(self, profiler: Profiler) -> bool:
-        """Open the profiler's capture on every rank, and say it is capturing.
+    def _start_window(self, profiler: Profiler) -> None:
+        """Open the profiler's capture on every rank.
 
         A peer that failed to start raises here. A capture this rank did
         start is closed first, so no live trace outlives the aborted run.
@@ -1263,9 +1453,8 @@ class Trainer(Generic[Loss, Effects]):
                 except BaseException as failure:
                     primary.add_note(f"Profiler stop failed: {failure!r}")
             raise
-        return capturing
 
-    def _rolled_out(self, state: TrainState, batch: Batch, mesh: Mesh) -> tuple[Batch, float]:
+    def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.
 
         Host-side and untraceable: sampling, scoring, advantages. The key
@@ -1276,7 +1465,7 @@ class Trainer(Generic[Loss, Effects]):
         began = time.perf_counter()
         assert self.rollout is not None
         key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-        batch = shard_batch(mesh, self.rollout(state, batch, key))
+        batch = shard_batch(self.device_mesh, self.rollout(state, batch, key))
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, float | None]],
@@ -1291,36 +1480,28 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-            model = getattr(self.objective, 'model', None)
-            self._report(StepCompiled(time.perf_counter() - began,
-                                      remat_record(getattr(model, 'remat', None)),
-                                      self._tensor_bandwidths.get(self.device_mesh), self.tensor_spread),
-                         int(state.step))
+            seconds = time.perf_counter() - began
+            remat = _remat_of(_model_of(self.objective))
+            links = {axis: AxisLink(link.bytes_per_second, link.spread)
+                     for axis, link in self.links.items()}
+            self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
         return compiled[shapes]
 
-    def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],
-                          dataset: Dataset, metrics: Sequence[Metric], preview: bool,
-                          mesh) -> float:
-        """Score the validation split, returning the seconds it took.
-
-        Those seconds are the run's, but not its steps', which is what the
-        goodput fraction is measured against."""
-        paused = time.perf_counter()
-        with region("evaluate"):
-            self._evaluate(state, shardings, dataset, metrics, preview, mesh)
-        return time.perf_counter() - paused
-
     def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
-                          position: bytes | None, book: Book, interval_steps: int) -> float:
-        """Write one checkpoint with the interval's mean loss, and report it.
+                          position: bytes | None, interval: _Interval) -> float:
+        """Write one checkpoint with the interval's mean loss, report it and
+        start the next interval.
 
         Returns the seconds it took, the reading of the interval's loss
         included: that read waits on the device, and the wait is time the
         steps did not have."""
         paused = time.perf_counter()
-        checkpoints.save(step, state, position, {"loss": float(book[0] / interval_steps)},
-                         share=data_partition(self.device_mesh))
+        self._display.status("writing a checkpoint")
+        metadata = {"loss": float(interval.book[0] / interval.steps)} if interval.steps else None
+        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(checkpoints.directory), step)
+        interval.saved(step)
+        self._display.status("")
         return time.perf_counter() - paused
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int,
@@ -1330,73 +1511,49 @@ class Trainer(Generic[Loss, Effects]):
         Returns the seconds it took. The local copy carries no metadata; it
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
+        self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
+        self._display.status("")
         return time.perf_counter() - paused
 
     def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, *, since: float, steps: int,
-                      samples: int, flops: float | None, rollout_seconds: float,
-                      process_zero: bool) -> float | None:
-        """Report one logging interval, returning the clock the next one starts from.
+                      accepted: jax.Array, state: TrainState, interval: _Interval) -> None:
+        """Report one logging interval and start the next.
 
-        Rank zero builds the row and returns the time it read; every other
-        rank has nothing to report and returns None. The report is agreed, so
-        a tracker that failed on rank zero stops its peers here rather than
-        at their next collective.
+        Rank zero builds the row; every other rank has nothing to report.
+        The report is agreed, so a tracker that failed on rank zero stops its
+        peers here rather than at their next collective.
         """
-        def report() -> float | None:
-            if not process_zero:
-                return None
+        def report() -> None:
+            if jax.process_index() != 0:
+                return
             # The interval's numbers need the loss on the host, so this is
             # where the loop waits on the device.
             loss.block_until_ready()
             now = time.time()
             scalars = {"train/loss": float(loss),
                        **{f"train/{k}": float(v) for k, v in aux.items()},
-                       **self._throughput(now - since, steps, samples, flops)}
+                       **self._throughput(now - interval.last_log_time, interval.since_log,
+                                          interval.samples, interval.flops)}
             scalars["train/accepted"] = float(accepted)
+            if (rate := learning_rate(state.opt_state)) is not None:
+                scalars["train/learning_rate"] = rate
             if state.scale is not None:
                 scalars["train/loss_scale"] = float(state.scale.scale)
             if self.rollout is not None:
-                scalars["train/rollout_seconds"] = rollout_seconds
-            print(f"step {step}: loss {scalars['train/loss']:.4f}")
+                scalars["train/rollout_seconds"] = interval.rollout_seconds
+                scalars.update({f"rollout/{name}": float(value)
+                                for name, value in getattr(self.rollout, "metrics", {}).items()})
+            self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)
-            return now
+            interval.logged(now)
 
         with region("log"):
-            return agreed("training reporting", report)
+            agreed("training reporting", report)
 
-    def _cleaned_up(self, primary: BaseException | None, close: Callable[[], None] | None,
-                    stop_trace: Callable[[], None] | None,
-                    checkpoints: Checkpoints | None) -> BaseException | None:
-        """Run every teardown step, returning the failure the run ends on.
-
-        Each step runs even when an earlier one failed, and a later failure
-        becomes a note on the first, so one broken sink cannot hide the error
-        that ended the run.
-        """
-        error = primary
-        for label, cleanup in (
-            ("Training iterator", close),
-            ("Profiler", stop_trace),
-            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
-        ):
-            if cleanup is None:
-                continue
-            try:
-                cleanup()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f"{label} cleanup failed: {failure!r}")
-        return error
-
-    def _reported_outcome(self, error: BaseException | None, started: float,
-                          first_step: float | None, other: float, step: int, *,
-                          process_zero: bool, preempted: bool) -> BaseException | None:
+    def _reported_outcome(self, error: BaseException | None, run: _FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.
 
         Every rank reaches the cleanup agreement, so a rank that failed alone
@@ -1410,19 +1567,22 @@ class Trainer(Generic[Loss, Effects]):
                 error = failure
         if error is None:
             def report_goodput() -> None:
-                if process_zero:
-                    scalars = goodput(time.perf_counter() - started, first_step, other)
-                    print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
-                          f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
+                if jax.process_index() == 0:
+                    wall = time.perf_counter() - run.started
+                    scalars = goodput(wall, run.first_step, run.other)
+                    self._display.summary(run.current, wall, scalars,
+                                          None if run.loss is None else float(run.loss))
                     if self.tracker is not None:
-                        self.tracker.log(scalars, step)
+                        self.tracker.log(scalars, run.current)
 
             try:
                 agreed("goodput reporting", report_goodput)
             except BaseException as failure:
                 error = failure
         try:
-            self._report(FitEnded.outcome(time.perf_counter() - started, error, preempted=preempted), step)
+            outcome = FitEnded.outcome(time.perf_counter() - run.started, error,
+                                       preempted=run.preempted is not None)
+            self._report(outcome, run.current)
         except BaseException as failure:
             if error is None:
                 error = failure
@@ -1447,40 +1607,43 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
-                  metrics: Sequence[Metric], preview: bool, mesh) -> None:
-        """Score the validation split with this state's variables and report it.
+                  metrics: Sequence[Metric], preview: bool) -> float:
+        """Score the validation split with this state's variables and report
+        it, returning the seconds it took: the run's, but not its steps',
+        which is what the goodput fraction is measured against.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
-        params = state.params
+        paused = time.perf_counter()
+        self._display.status("evaluating")
+        mesh, params = self.device_mesh, state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
             from dew.training.execution import HostExecution
-            execution = HostExecution(self.objective, self.layout, self.device_mesh, self.state_mesh)
+            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh)
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `evaluate` scores under the mesh
-        # itself, and previews decode outside it.
+        # The rules and the microbatch count; `evaluate` scores under the
+        # mesh itself, and previews decode outside it.
         with (pipeline_microbatches(self.mesh.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), tensor_link(self._tensor_link(mesh))):
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = evaluate(
                 self.objective, params, dataset.val, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh)
         self._report_evaluation(evaluation)
+        return time.perf_counter() - paused
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
         """Print one evaluation on rank zero and log its previews and scores."""
         def report() -> None:
             if jax.process_index() != 0:
                 return
-            print(f"Evaluation {advanced.split} at step {advanced.step}: "
-                  f"{advanced.coordinated_batches} coordinated batches, {advanced.records} records, "
-                  f"uneven_shards={advanced.uneven_shards}, event_key={advanced.event_key}: {advanced.scores}")
+            self._display.evaluation(advanced)
             if self.tracker is not None:
                 for artifact in advanced.previews:
                     self.tracker.artifact(artifact, advanced.step)
@@ -1495,13 +1658,14 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: ProfileWindow,
-                    profiler: Profiler, *, step: int) -> None:
+    def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture, then report it on process zero.
 
         The core Profiler drains the backend and exports the native reports
-        on `stop`. The loss's block only orders the primary's failure ahead
-        of the profiler's own drain."""
+        on `stop`. The run's last loss is blocked on only to order the
+        primary's failure ahead of the profiler's own drain."""
+        loss, traced = run.loss, run.traced
+
         def stop() -> None:
             try:
                 if loss is not None:
@@ -1516,26 +1680,11 @@ class Trainer(Generic[Loss, Effects]):
                     primary.add_note(f"Profiler stop failed: {failure!r}")
 
         def announce() -> None:
-            if jax.process_index() == 0:
-                print(f"Wrote profile for {traced} steps to {profile.directory}")
+            self._display.note(f"Wrote profile for {traced} steps to {profile.directory}")
 
         agreed("profile stop", stop)
-        self._report(ProfileWindowRecord(profile.directory, traced), step)
+        self._report(ProfileWindowRecord(profile.directory, traced), run.current)
         agreed("profile announcement", announce)
-
-    def _check_finite(self, worst_bad_run, step: int):
-        """Raise RuntimeError once the loss has been non-finite for BAD_LOSS_STEPS steps.
-
-        Deferred to the logging cadence so the step loop never synchronises;
-        detection is late by at most that many steps, never missed.
-        """
-        streak = int(worst_bad_run)
-        if streak >= BAD_LOSS_STEPS:
-            raise RuntimeError(
-                f"Loss has been non-finite for {streak} consecutive steps "
-                f"ending near step {step}, stopping")
-        if streak:
-            print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
 
     def _throughput(self, elapsed: float, steps: int, samples: int,
                     flops: float | None) -> dict[str, float]:

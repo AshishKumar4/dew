@@ -1,0 +1,945 @@
+{
+  "model": "dewml/hybrid-dit-176m",
+  "device": "NVIDIA GeForce RTX 4080",
+  "negative": null,
+  "batches": [
+    {
+      "sampler": "heun40",
+      "seed": 0,
+      "images": 6,
+      "seconds": 18.98
+    },
+    {
+      "sampler": "heun40",
+      "seed": 1,
+      "images": 6,
+      "seconds": 1.76
+    },
+    {
+      "sampler": "heun40",
+      "seed": 2,
+      "images": 6,
+      "seconds": 1.75
+    },
+    {
+      "sampler": "heun40",
+      "seed": 3,
+      "images": 6,
+      "seconds": 1.75
+    },
+    {
+      "sampler": "dpm2m20",
+      "seed": 0,
+      "images": 6,
+      "seconds": 14.1
+    },
+    {
+      "sampler": "dpm2m20",
+      "seed": 1,
+      "images": 6,
+      "seconds": 0.51
+    },
+    {
+      "sampler": "dpm2m20",
+      "seed": 2,
+      "images": 6,
+      "seconds": 0.51
+    },
+    {
+      "sampler": "dpm2m20",
+      "seed": 3,
+      "images": 6,
+      "seconds": 0.5
+    },
+    {
+      "sampler": "ea100",
+      "seed": 0,
+      "images": 6,
+      "seconds": 19.42
+    },
+    {
+      "sampler": "ea100",
+      "seed": 1,
+      "images": 6,
+      "seconds": 2.24
+    },
+    {
+      "sampler": "ea100",
+      "seed": 2,
+      "images": 6,
+      "seconds": 2.24
+    },
+    {
+      "sampler": "ea100",
+      "seed": 3,
+      "images": 6,
+      "seconds": 2.26
+    }
+  ],
+  "images": [
+    {
+      "file": "heun40/p0_s0.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p1_s0.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p2_s0.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p3_s0.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p4_s0.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 0,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p0_s1.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p1_s1.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p2_s1.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p3_s1.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p4_s1.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 1,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p0_s2.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p1_s2.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p2_s2.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p3_s2.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p4_s2.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 2,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p0_s3.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p1_s3.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p2_s3.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p3_s3.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p4_s3.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "heun40/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 3,
+      "sampler": "Heun",
+      "steps": 40,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s0.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p1_s0.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p2_s0.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p3_s0.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p4_s0.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 0,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s1.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p1_s1.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p2_s1.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p3_s1.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p4_s1.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 1,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s2.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p1_s2.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p2_s2.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p3_s2.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p4_s2.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 2,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p0_s3.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p1_s3.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p2_s3.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p3_s3.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p4_s3.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "dpm2m20/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 3,
+      "sampler": "DPMSolverMultistep",
+      "steps": 20,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s0.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s0.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s0.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s0.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s0.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s0.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 0,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s1.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s1.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s1.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s1.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s1.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s1.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 1,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s2.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s2.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s2.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s2.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s2.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s2.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 2,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p0_s3.webp",
+      "prompt": "a tropical beach with palm trees and turquoise water",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p1_s3.webp",
+      "prompt": "a colorful hot air balloon over a green valley",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p2_s3.webp",
+      "prompt": "a red fox in a snowy forest",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p3_s3.webp",
+      "prompt": "a stained glass window with geometric patterns",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p4_s3.webp",
+      "prompt": "a bowl of ramen with an egg and green onions",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "file": "ea100/p5_s3.webp",
+      "prompt": "the northern lights over a frozen lake at night",
+      "seed": 3,
+      "sampler": "EulerAncestral",
+      "steps": 100,
+      "guidance": 5.0,
+      "guidance_interval": [
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}

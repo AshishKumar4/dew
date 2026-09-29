@@ -9,7 +9,7 @@ micro-batches into one update. It ends by exporting the trained weights to
 the Hugging Face layout, so transformers and `load_pretrained` both read
 them, and the run directory itself scores through the harness:
 
-    python -m dew.eval --model dew --model_args run=runs/gemma4-sft/gemma4-sft \\
+    python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
 `dew.data.ChatMessages` reads the Hub dataset itself, so the id on the

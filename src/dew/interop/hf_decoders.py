@@ -22,7 +22,6 @@ raises a ValueError naming it.
 
 import dataclasses
 import json
-import logging
 import operator
 import os
 from dataclasses import asdict, dataclass, field
@@ -48,14 +47,16 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop import mamba2, pickles
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, read_weights, weight_files
+from dew.interop import mamba2
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture, RematPolicy
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer
@@ -69,7 +70,6 @@ from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, mixers, towers
-from dew.telemetry.instrumentation import dew_cache_dir
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -946,14 +946,13 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(text)
 
 
-def _wrapper_image_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
-    """Return the image token id under either of its spellings."""
+def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
+    """Return a placeholder token id under the first of its spellings that is set."""
     for name in names:
         if hf_config.get(name) is not None:
             used.add(name)
             return records.integer(hf_config[name], name)
-    _refuse("image_token_id",
-            f"the image positions are marked by {list(names)}, none is set")
+    _refuse(names[0], f"the placeholder positions are marked by {list(names)}, none is set")
 
 
 # Every wrapper record carries the audio fields; families without an audio
@@ -985,11 +984,11 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_siglip_vision_config(hf_config)
     used.add("vision_config")
-    mm = hf_config.get("mm_tokens_per_image")
+    mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = vision_nn.translate_gemma_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"), mm)
-    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     return {
         "model_type": "gemma3",
@@ -1010,7 +1009,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
     ratio = _record_float(tower, "pixel_shuffle_ratio")
@@ -1060,7 +1059,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
             "norm_eps": encoder.rms_norm_eps}))}
     return {"audio": {"kind": records.text(audio["model_type"], "audio_config model_type"),
                       **asdict(encoder)},
-            "audio_token_id": _wrapper_image_id(hf_config, used, "audio_token_id"),
+            "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
 
 
@@ -1071,7 +1070,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
+    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
@@ -1100,7 +1099,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
@@ -1126,13 +1125,18 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     count = _record_int(tower, "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
-    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
     return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
             "tower": tower, "projector": projector, "image_token_id": image,
             "tokens_per_image": count,
             **_wrapper_audio(hf_config, used, _record_int(text, "emb_features"))}
+
+
+_WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
+    "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
+    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -1145,22 +1149,15 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     embedders also embed their hard vocabulary ranges.
     """
     model_type = hf_config.get("model_type")
-    used = {"model_type"}
-    if model_type == "gemma3":
-        record = _gemma3_wrapper(hf_config, used)
-    elif model_type == "llama4":
-        record = _llama4_wrapper(hf_config, used)
-    elif model_type == "gemma4":
-        record = _gemma4_wrapper(hf_config, used)
-    elif model_type == "qwen3_5":
-        record = _qwen35_wrapper(hf_config, used)
-    elif model_type == "gemma3n":
-        record = _gemma3n_wrapper(hf_config, used)
-    elif isinstance(model_type, str) and model_type in _FAMILIES and (read := _FAMILIES[model_type].wrapper):
-        record = read(hf_config, used)
-    else:
+    read = None
+    if isinstance(model_type, str):
+        bundled = _bundled(model_type)
+        read = _WRAPPERS.get(model_type, None if bundled is None else bundled.wrapper)
+    if read is None:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
+    used = {"model_type"}
+    record = read(hf_config, used)
     unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
                - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
@@ -1170,42 +1167,48 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     return record
 
 
-# Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
-_WRAPPER_AUDIO_PREFIX = "audio_tower."
-_WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
+def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
+    """Return the wrapper component a source tensor belongs to, and its name there.
+
+    One leading `model.` comes off first, which is the released nesting. Gemma
+    4 keeps its embedder under `embed_vision` and Qwen 3.5 its merger inside
+    the vision model, so the projector prefix runs before the tower's. Gemma
+    3n and Gemma 4 nest their audio encoder and embedder beside the vision
+    ones. A family that reads its media bundle whole keeps the decoder's
+    tensors unprefixed.
+    """
+    tower_prefix = vision_nn.TOWER_PREFIX[_kind_name(record, "tower")]
+    projector_prefix = vision_nn.PROJECTOR_PREFIX[_kind_name(record, "projector")]
+    audio = record.get("audio") is not None
+    bundled = _bundled(record["model_type"])
+    bare = name.removeprefix("model.")
+    if bare.startswith("language_model."):
+        tail = bare[len("language_model."):]
+        return "language_model", tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+    if bare.startswith(projector_prefix):
+        return "projector", bare[len(projector_prefix):]
+    if bare.startswith(tower_prefix):
+        return "tower", bare[len(tower_prefix):]
+    if audio and bare.startswith("embed_audio."):
+        return "audio_projector", bare[len("embed_audio."):]
+    if audio and bare.startswith("audio_tower."):
+        return "audio_tower", bare[len("audio_tower."):]
+    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+        return "language_model", bare
+    if bundled is not None:
+        return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
+    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record):
     """Route source names once, checking any names that claim one local leaf.
     The table retains names, not decoded arrays, so read can be a codec accessor.
     """
-    tower_prefix = vision_nn.TOWER_PREFIX[record["tower"]["kind"]]
-    projector_prefix = vision_nn.PROJECTOR_PREFIX[record["projector"]["kind"]]
-    audio = record.get("audio")
-    bundled = _bundled(record["model_type"])
     sources: dict[str, dict[str, str]] = {name: {} for name in (
         "language_model", "tower", "projector", "audio_tower", "audio_projector")}
     aliases: list[tuple[str, str]] = []
     for name in names:
-        bare = name.removeprefix("model.")
-        if bare.startswith("language_model."):
-            tail = bare[len("language_model."):]
-            local = tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
-            group = "language_model"
-        elif bare.startswith(projector_prefix):
-            group, local = "projector", bare[len(projector_prefix):]
-        elif bare.startswith(tower_prefix):
-            group, local = "tower", bare[len(tower_prefix):]
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PROJECTOR_PREFIX):
-            group, local = "audio_projector", bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
-            group, local = "audio_tower", bare[len(_WRAPPER_AUDIO_PREFIX):]
-        elif (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
-            group, local = "language_model", bare
-        elif bundled is not None:
-            group, local = ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
-        else:
-            raise ValueError(f"unknown tensor name {name!r}")
+        group, local = _wrapper_route(name, record)
         previous = sources[group].get(local)
         if previous is not None:
             if not np.array_equal(read(previous), read(name)):
@@ -1334,47 +1337,30 @@ def translate_wrapper_weights(
 ) -> Variables:
     """Map wrapper weights into language, tower, projector and audio trees.
 
-    One leading `model.` comes off every name first, which is the released
-    nesting; what stays routes by prefix. The language half rides the text
-    family's own map, including the top-level tied head copy, and the tower
-    and projector halves ride theirs. Gemma 4 keeps its embedder under
-    `embed_vision`, and Qwen 3.5 keeps its merger inside the vision model, so
-    the projector prefix runs before the tower's. A record with an audio
-    tower routes `audio_tower` and `embed_audio` too, and a Qwen 3.5 record
-    routes the `mtp.` prediction layers a wrapper keeps outside its language
-    model. A prefix outside those raises ValueError with the tensor name.
-    `lazy` leaves the language model's leaves unread (`translate_weights`);
-    the towers and projectors are small and read whole.
+    Each name routes by prefix (`_wrapper_route`). The language half rides
+    the text family's own map, including the top-level tied head copy, and
+    the tower and projector halves ride theirs. `lazy` leaves the language
+    model's leaves unread (`translate_weights`); the towers and projectors
+    are small and read whole.
     """
-    tower_kind = _kind_name(record, "tower")
-    projector_kind = _kind_name(record, "projector")
-    audio = record.get("audio")
     sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
-    text_tensors = tables["language_model"]
-    tower_tensors = tables["tower"]
-    projector_tensors = tables["projector"]
-    audio_tensors = tables["audio_tower"]
-    audio_projector_tensors = tables["audio_projector"]
     variables = {
-        "language_model": translate_weights(
-            text_tensors, record["text"], param_dtype=param_dtype, lazy=lazy
-        ),
-        "tower": vision_nn.tower_variables(tower_kind, tower_tensors, param_dtype),
-        "projector": {
-            "params": vision_nn.projector_variables(
-                projector_kind, projector_tensors, param_dtype
-            )
-        },
+        "language_model": translate_weights(tables["language_model"], record["text"],
+                                            param_dtype=param_dtype, lazy=lazy),
+        "tower": vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"], param_dtype),
+        "projector": {"params": vision_nn.projector_variables(
+            _kind_name(record, "projector"), tables["projector"], param_dtype)},
     }
+    audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder, param_dtype=param_dtype)
+        variables["audio_tower"] = audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
         variables["audio_projector"] = {"params": vision_nn.projector_variables(
-            _kind_name(record, "audio_projector"), audio_projector_tensors, param_dtype)}
+            _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
     return variables
 
 
@@ -1723,173 +1709,6 @@ def translate_denoiser_weights(
     }
 
 
-def _load_shards(directory: Path) -> dict[str, np.ndarray]:
-    """Read a checkpoint directory's weights, mapped in their stored dtype:
-    the shards its index names, or its one model.safetensors. A directory
-    with transformers' PyTorch pickles instead reads their safetensors
-    conversion (`pickles.converted`)."""
-    files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-    def read(name: str) -> records.JSON:
-        return json.loads((directory / name).read_text())
-
-    if weight_files(files, "", read):
-        return read_weights(directory)
-    pickled = weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX)
-    if not pickled:
-        raise FileNotFoundError(_missing_weights(str(directory), files))
-    return read_weights(pickles.converted(directory, pickled))
-
-
-_PICKLES = (".bin", ".pt", ".pth")
-
-_log = logging.getLogger(__name__)
-
-
-def _missing_weights(source: str, files: Collection[str]) -> str:
-    """Say what a source without safetensors weights or transformers'
-    PyTorch pickles ships instead, and what loads."""
-    gguf = sorted(name for name in files if name.endswith(".gguf"))
-    pickled = sorted(name for name in files if "/" not in name and name.endswith(_PICKLES))
-    if pickled:
-        return (f"{source} ships PyTorch pickles ({', '.join(pickled[:3])}) but no pytorch_model.bin or "
-                "pytorch_model.bin.index.json, the names Dew converts; save the state dict under one of "
-                f"those, or convert the repo to safetensors at {pickles.CONVERT_SPACE}")
-    if gguf:
-        return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
-                f"load_pretrained(..., gguf_file={gguf[0]!r})")
-    return f"{source} has no model.safetensors or model.safetensors.index.json"
-
-
-_CONVERSION_TITLE = "Adding `safetensors` variant of this model"
-
-
-def _conversion_revision(name: str, commit: str) -> str | None:
-    """Return SFconvertbot's open safetensors pull request on `commit`, or None.
-
-    transformers' rule (safetensors_conversion.py, `previous_pr` and
-    `get_conversion_pr_reference`): an open pull request by SFconvertbot
-    under this title whose parent is the commit being loaded. Only looked
-    up; nothing is converted or opened.
-    """
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    for discussion in api.get_repo_discussions(name, author="SFconvertbot",
-                                               discussion_type="pull_request",
-                                               discussion_status="open"):
-        if discussion.title != _CONVERSION_TITLE or discussion.git_reference is None:
-            continue
-        commits = api.list_repo_commits(name, revision=discussion.git_reference)
-        if len(commits) > 1 and commits[1].commit_id == commit:
-            return discussion.git_reference
-    return None
-
-
-_METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
-"""Configs, indexes, tokenizer and chat-template files: everything a load reads but weights."""
-
-
-def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
-    """The local path of `filename` in a directory, or `filename` downloaded
-    from the repo at the snapshot's commit.
-
-    `directory` is the snapshot the metadata fetch resolved, named by its
-    commit, so the file comes from that commit even if the branch moves. A
-    missing file is refused, naming the files of its kind that are there.
-    """
-    suffix = Path(filename).suffix
-    if os.path.isdir(name_or_dir):
-        path = directory / filename
-        if not path.is_file():
-            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}"))
-            raise FileNotFoundError(f"{path} does not exist; the {suffix} files in {directory} are {present}")
-        return path
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
-
-    try:
-        return Path(hf_hub_download(str(name_or_dir), filename, revision=directory.name))
-    except EntryNotFoundError as error:
-        present = sorted(name for name in _repo_files(str(name_or_dir), directory) if name.endswith(suffix))
-        raise FileNotFoundError(f"{name_or_dir} at {directory.name} has no {filename!r}; "
-                                f"its {suffix} files are {present}") from error
-
-
-def _repo_files(name: str, directory: Path) -> set[str]:
-    """Every file of the snapshot's commit, by repo-relative name.
-
-    A dry run lists the Hub tree the metadata fetch has just cached. Offline
-    it cannot: without a cached tree it raises DryRunError, and with one it
-    raises LocalEntryNotFoundError for the first listed file that was never
-    downloaded. The cache is then all a load can read anyway, so the
-    snapshot directory's own files are the listing.
-    """
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import DryRunError, LocalEntryNotFoundError
-
-    try:
-        return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
-    except (DryRunError, LocalEntryNotFoundError):
-        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-
-def _snapshot(name_or_dir: str, revision: str | None, *,
-              weights: bool | tuple[str, ...] = True) -> Path:
-    """Resolve a snapshot with the root's (True), no (False) or the named
-    components' weights.
-
-    A local directory is returned as it is. From the Hub the metadata comes
-    first, then `weight_files` picks, from the commit's listing and the
-    indexes just fetched, the exact files that hold the weights, and only
-    those download, at the commit the first fetch resolved. Other formats of
-    the same weights beside them (Mistral's consolidated.safetensors,
-    diffusers' fp16 variants and root single-file checkpoints) stay on the
-    Hub. A commit with only transformers' PyTorch pickles resolves to
-    SFconvertbot's safetensors pull request on it where one is open, and
-    otherwise downloads the pickles, which `_load_shards` converts.
-    """
-    if os.path.isdir(name_or_dir):
-        return Path(name_or_dir)
-    from huggingface_hub import snapshot_download
-
-    directory = Path(snapshot_download(name_or_dir, revision=revision,
-                                       allow_patterns=_METADATA_PATTERNS))
-    if weights is False:
-        return directory
-    files = _repo_files(name_or_dir, directory)
-
-    def read(name: str) -> records.JSON:
-        return json.loads((directory / name).read_text())
-
-    selected = [name for folder in (("",) if weights is True else weights)
-                for name in weight_files(files, folder, read)]
-    if weights is True and not selected:
-        from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
-
-        selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
-        if not selected:
-            raise FileNotFoundError(_missing_weights(f"{name_or_dir} at {directory.name}", files))
-        # The conversion a lookup found is recorded, so the same load offline
-        # reads the conversion it cached rather than pickles it never fetched.
-        record = Path(dew_cache_dir()) / "conversions" / name_or_dir / directory.name
-        try:
-            conversion = _conversion_revision(name_or_dir, directory.name)
-        except (HfHubHTTPError, OfflineModeIsEnabled):
-            conversion = record.read_text() if record.is_file() else None
-        else:
-            if conversion is not None:
-                record.parent.mkdir(parents=True, exist_ok=True)
-                record.write_text(conversion)
-        if conversion is not None:
-            _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
-                         "that commit at revision %s", name_or_dir, directory.name, conversion)
-            return _snapshot(name_or_dir, conversion)
-    if selected:
-        snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
-    return directory
-
-
 class ExportTokenizer(Protocol):
     """A tokenizer that writes its own HF files. The byte vocabulary has none, so it is recorded by name only."""
 
@@ -2019,10 +1838,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'the attention output gate, a partial rotary and a mixer other than attention '
             'have no counterpart in this dense tensor encoder')
-    model_type = config['model_type']
-    if not isinstance(model_type, str):
-        raise ValueError('model_type must name a decoder family')
-    family = _FAMILIES[model_type]
+    family = _FAMILIES[records.text(config['model_type'], 'model_type')]
     if model.mixture is not None and family.export_path is _hf_name:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
     params = variables.get('params', variables)
