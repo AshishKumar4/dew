@@ -32,7 +32,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Shown, Step, Variables, under
 from dew.registry import objectives
 
 from .masking import MultiBlockMask
@@ -83,8 +83,10 @@ class JepaObjective(Objective[Mean]):
     Evaluation returns the pooled target-encoder embeddings of a batch with
     its labels, which the probe metrics score.
     """
-
     artifact = Representations
+    # A collapsing encoder's spread falls to zero; a redundant one's
+    # off-diagonal covariance rises.
+    shown = {"repr_std": Shown(better="higher"), "repr_cov_offdiag": Shown(better="lower")}
 
     def __init__(
         self,

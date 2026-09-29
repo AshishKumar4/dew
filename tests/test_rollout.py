@@ -210,6 +210,23 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     assert len(ticks) == 2
     assert all("train/rollout_seconds" not in tick for tick in ticks)
 
+
+def test_a_rollouts_metrics_log_as_of_its_latest_call():
+    """Each tick carries the rollout's `metrics` under `rollout/`, as they
+    stood after the call that made the tick's last batch."""
+    class Counting(Recorder):
+        metrics: dict[str, float]
+
+        def __call__(self, state, batch, key):
+            self.metrics = {"reward/mean": float(state.step) + 0.5}
+            return super().__call__(state, batch, key)
+
+    tracking = Logging()
+    make_trainer(rollout=Counting(), tracker=tracking).fit(Data(), steps=4, log_every=2)
+    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
+
+
 class TinyHead(nn.Module):
     """A position-wise map with the backbone's scoring contract, standing in
     for the causal stack: int32 ids in, float32 logits out, the head split

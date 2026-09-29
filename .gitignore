@@ -6,6 +6,8 @@ __pycache__
 .ipynb_checkpoints
 checkpoints
 !src/dew/checkpoints
+# where the examples and README snippets write their output by default
+/runs/
 good models
 *(old).ipynb
 .env

@@ -41,6 +41,10 @@ dependencies = [
     # close budget; 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
     "termcolor",
+    # dew.training.display: the live training display. flax already depends
+    # on rich, so this names a package every install has; 13 has the
+    # progress columns the display uses.
+    "rich>=13",
     "tyro",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
@@ -199,8 +203,9 @@ split-on-trailing-comma = false
 "tools/**" = ["T20"]
 "recipes/**" = ["T20"]
 "examples/**" = ["T20"]
-# The progress line the README documents ("step N: loss ..."), the device count
-# and the resume banner are the trainer's user-facing output, not logging.
+# The training display's lines off a terminal, the trainer's remat warnings and
+# the device count are the user-facing output of a run, not logging.
+"src/dew/training/display.py" = ["T201"]
 "src/dew/training/trainer.py" = ["T201"]
 "src/dew/training/runtime.py" = ["T201"]
 # `dew config show` prints the resolved configuration for a person to read.

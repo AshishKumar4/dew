@@ -9,6 +9,7 @@ tracker, and what a failure does to the run.
 
 import dataclasses
 import gc
+import io
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import orbax.checkpoint as ocp
 import pytest
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
+from rich.console import Console
 
 from dew import position
 from dew.artifacts import Representations
@@ -37,6 +39,7 @@ from dew.training import (
     MeshSpec,
     ProfileWindow,
     Trainer,
+    display,
     ema_update,
     trainer as trainer_module,
     write_back,
@@ -177,6 +180,37 @@ def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     gc.collect()
     assert len(refs) == 1
     assert refs[0]() is None
+
+
+def test_off_a_terminal_fit_prints_one_line_per_logging_interval(capsys):
+    """Piped to a log, the run's progress is plain lines at the logging
+    cadence, not a live display's redraws."""
+    make_trainer().fit(Data(endless), steps=7, log_every=2)
+    output = capsys.readouterr().out
+
+    assert [int(step) for step in re.findall(r"^step\s+(\d+)/7\b", output, re.M)] == [2, 4, 6], output
+    assert "\x1b" not in output, "terminal control codes went to a pipe"
+
+
+def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path, capsys):
+    """Seven steps logged every two end on a step no interval read, and a
+    fit asked again for the step the run is at trains nothing."""
+    tracker = RecordingTracker()
+    make_trainer(tracker=tracker).fit(Data(), steps=7, log_every=1)
+    losses = {step: scalars["train/loss"] for step, scalars in tracker.scalars if "train/loss" in scalars}
+    capsys.readouterr()
+
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=7, log_every=2)
+    summary = re.search(r"Trained (\d+) steps.*final loss (\S+)", capsys.readouterr().out, re.S)
+    assert summary is not None
+    assert int(summary[1]) == 7
+    # Printed to four significant digits: within half a unit of the last.
+    assert abs(float(summary[2]) - losses[7]) <= 5e-4 * abs(losses[7])
+    assert abs(float(summary[2]) - losses[6]) > 5e-4 * abs(losses[7])
+
+    trainer.fit(Data(), steps=7, log_every=2)
+    assert re.search(r"Trained \d+ steps", capsys.readouterr().out) is None
 
 
 def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
@@ -792,6 +826,23 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     assert scored[-1][1]["val/spread"] == pytest.approx(expected, rel=1e-6)
     # The first batch's artifact of each pass reaches the tracker.
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [2, 4]
+
+
+@pytest.mark.parametrize("width", [30, 120])
+def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch):
+    """The live panel lays itself out for the terminal it has: one too
+    narrow for the sparklines still shows each metric's name and value,
+    through the evaluations, to the last frame."""
+    screen = io.StringIO()
+    monkeypatch.setattr(display, "terminal", lambda console: True)
+    monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
+                                                            force_terminal=True, color_system=None))
+    make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
+                                           metrics=(Spread([]),))
+
+    last = screen.getvalue().rpartition("dew · ")[2]
+    for name in ("loss", "step_time_ms", "spread"):
+        assert re.search(rf" {name} +\S", last), last
 
 
 def test_a_failing_metric_fails_the_validation_pass():

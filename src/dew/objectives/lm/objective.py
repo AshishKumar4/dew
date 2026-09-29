@@ -63,6 +63,7 @@ from dew.objectives.base import (
     Objective,
     PathFilter,
     Prediction,
+    Shown,
     Step,
     Variables,
     freeze,
@@ -559,6 +560,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     """
 
     artifact = TokenScores
+    shown = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
+             "token_accuracy": Shown(better="higher", percent=True)}
 
     keeps_whole_logits: ClassVar[bool] = True
     """Whether the head's default (`head_tile` None) keeps the whole fp32
@@ -1220,6 +1223,7 @@ class Perplexity:
 
     name = "perplexity"
     reads = TokenScores
+    shown = Shown(better="lower")
 
     def __call__(self, scores: TokenScores, batch) -> tuple[float, float]:
         weights = np.asarray(scores.weights, dtype=np.float64)

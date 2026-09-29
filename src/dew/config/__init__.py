@@ -11,8 +11,10 @@ turns into a subcommand (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
-so inference rebuilds a run from what training was built from. A field the
-class does not have, or one the file lacks, raises.
+so inference rebuilds a run from what training was built from. The record
+carries its version, and an older one is migrated to today's fields
+(`dew.config.migrations`); after that a field the class does not have, or one
+the file lacks, raises.
 """
 
 import dataclasses
@@ -38,6 +40,7 @@ import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.config import migrations
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
 from dew.lora import LoRA, attach
@@ -475,19 +478,21 @@ class RunConfig:
     adapts the objective's module and freezes every other leaf."""
 
     def to_dict(self) -> dict[str, JSON]:
-        """Return a JSON-safe record of the run.
+        """Return a JSON-safe record of the run and its record version
+        (`dew.config.migrations`).
 
         A registered member is written as its name and its fields.
         """
-        return {field.name: _to_json(getattr(self, field.name),
-                                     _declared_type(type(self), field.name))
-                for field in dataclasses.fields(self)}
+        return {"version": migrations.VERSION,
+                **{field.name: _to_json(getattr(self, field.name), _declared_type(type(self), field.name))
+                   for field in dataclasses.fields(self)}}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Read back what `to_dict` wrote, for subclasses too. An unknown or a missing
+        """Read back what `to_dict` wrote, for subclasses too. An older record
+        is migrated to today's fields first; then an unknown or a missing
         field raises."""
-        return _built(cls, values)
+        return _built(cls, migrations.migrate(cls, values))
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.

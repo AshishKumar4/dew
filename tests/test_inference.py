@@ -28,9 +28,10 @@ from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
+from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
+from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -111,6 +112,23 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
         pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images)
 
 
+def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
+    """`pil()` drops the rows a row plan padded, maps [-1, 1] to [0, 255],
+    and refuses a result that kept only latents or holds video."""
+    pixels = jnp.stack([jnp.full((2, 3, 3), -1.0), jnp.full((2, 3, 3), 1.0), jnp.zeros((2, 3, 3))])
+    pictures = Images(pixels, rows=2, latents=jnp.zeros((3, 1, 1, 4))).pil()
+    assert [picture.size for picture in pictures] == [(3, 2), (3, 2)]
+    assert [picture.mode for picture in pictures] == ["RGB", "RGB"]
+    np.testing.assert_array_equal(np.asarray(pictures[0]), np.zeros((2, 3, 3), np.uint8))
+    np.testing.assert_array_equal(np.asarray(pictures[1]), np.full((2, 3, 3), 255, np.uint8))
+    gray = Images(jnp.ones((1, 2, 3, 1)), rows=1).pil()[0]
+    assert gray.mode == "L" and gray.size == (3, 2) and np.all(np.asarray(gray) == 255)
+    with pytest.raises(ValueError, match="decode"):
+        Images(None, rows=1, latents=jnp.zeros((1, 2, 2, 4))).pil()
+    with pytest.raises(ValueError, match="shape"):
+        Images(jnp.zeros((1, 4, 2, 3, 3)), rows=1).pil()
+
+
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     """The EMA copy is what a run publishes; `ema=False` reads the live ones."""
     objective, state = make_run(tmp_path)
@@ -130,6 +148,24 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     np.testing.assert_array_equal(
         np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
+
+
+def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path):
+    """A published run may hold its weights once, with no average beside
+    them; the default reads that copy, and asking for an average it does not
+    keep is refused."""
+    _, state = make_run(tmp_path / "kept")
+    single = tmp_path / "single"
+    checkpoints = Checkpoints(str(single), keep=1)
+    checkpoints.save(int(state.step), state.replace(ema=None), None)
+    checkpoints.wait()
+    dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
+
+    expected = TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, seed=0).host().images
+    np.testing.assert_array_equal(TextToImage.from_run(str(single))(["a lily"], steps=3, seed=0).host().images,
+                                  expected)
+    with pytest.raises(ValueError, match="keeps no EMA"):
+        TextToImage.from_run(str(single), ema=True)
 
 
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
@@ -315,7 +351,7 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
     record with that revision."""
     config = dataclasses.replace(
         run_config(tmp_path),
-        autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
+        autoencoder=PretrainedAutoencoder(revision="flax", latent_scale=0.5))
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
 
 
@@ -575,8 +611,8 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     with pytest.raises(ValueError, match="no EMA"):
         objective.pipeline(state)
     with pytest.raises(ValueError, match="no EMA"):
-        dew.pipeline(str(tmp_path))
-    restored = dew.pipeline(str(tmp_path), ema=False)
+        dew.pipeline(str(tmp_path), ema=True)
+    restored = dew.pipeline(str(tmp_path))
     live = objective.pipeline(state, ema=False, processor=restored.processor)
     np.testing.assert_array_equal(restored("the ", seed=7).host().tokens,
                                   live("the ", seed=7).host().tokens)
@@ -712,7 +748,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         model=ModelConfig("simple_dit", {**MODEL, "patch_size": 2},
                           dtype="float32", attention_impl="reference"),
         text=TextCondition(encoder="clip_text", checkpoint=str(fixtures / "clip/tiny"), dtype="float32"),
-        autoencoder=StableDiffusionAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
+        autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
     params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
