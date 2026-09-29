@@ -219,7 +219,8 @@ class RolloutScheduler:
     truncation policy, and `support_capacity` its per-row support length,
     which a filtered-sampling source requires. `log`, when given,
     receives a `SchedulerRecord` per call, of this process's rollouts; a
-    share's later readers sample none and log nothing.
+    share's later readers sample none and log nothing. `metrics` holds the
+    latest record's numbers, which the trainer logs as `rollout/<name>`.
     """
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
@@ -251,6 +252,7 @@ class RolloutScheduler:
         self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
         self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
         self.support_capacity = support_capacity
+        self.metrics: dict[str, float] = {}
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
@@ -452,13 +454,18 @@ class RolloutScheduler:
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)
         packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed, mesh) * packed[RESPONSE_MASK_KEY]
-        if self.log is not None and sampling:
+        if sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)
             metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
                                       truncation=self.truncation)
-            self.log(SchedulerRecord(updates, oldest, updates - oldest, groups, dict(tally.resubmitted),
-                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics))
+            record = SchedulerRecord(updates, oldest, updates - oldest, groups, dict(tally.resubmitted),
+                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics)
+            self.metrics = {**metrics, "lag": float(record.lag), "groups": float(groups),
+                            "resubmitted": float(sum(record.resubmitted.values())),
+                            "waited_seconds": waited}
+            if self.log is not None:
+                self.log(record)
         return packed
 
     def _admitted(self, batch: Batch, updates: int) -> tuple[list[Session], list[float], int, _Tally, float]:
