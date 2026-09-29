@@ -179,6 +179,36 @@ def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     assert refs[0]() is None
 
 
+def test_off_a_terminal_fit_prints_one_line_per_logging_interval(capsys):
+    """Piped to a log, the run's progress is plain lines at the logging
+    cadence, not a live display's redraws."""
+    make_trainer().fit(Data(endless), steps=7, log_every=2)
+    output = capsys.readouterr().out
+
+    assert [int(step) for step in re.findall(r"^step\s+(\d+)/7\b", output, re.M)] == [2, 4, 6], output
+    assert "\x1b" not in output, "terminal control codes went to a pipe"
+
+
+def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path, capsys):
+    """Seven steps logged every two end on a step no interval read, and a
+    fit asked again for the step the run is at trains nothing."""
+    tracker = RecordingTracker()
+    make_trainer(tracker=tracker).fit(Data(), steps=7, log_every=1)
+    last = next(scalars["train/loss"] for step, scalars in tracker.scalars
+                if step == 7 and "train/loss" in scalars)
+    capsys.readouterr()
+
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=7, log_every=2)
+    summary = re.search(r"Trained (\d+) steps.*final loss (\S+)", capsys.readouterr().out, re.S)
+    assert summary is not None
+    assert int(summary[1]) == 7
+    assert float(summary[2]) == pytest.approx(last, abs=1e-4)
+
+    trainer.fit(Data(), steps=7, log_every=2)
+    assert re.search(r"Trained \d+ steps", capsys.readouterr().out) is None
+
+
 def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
     trainer = make_trainer(tmp_path)
     first = trainer.fit(Data(), steps=3, log_every=1)
