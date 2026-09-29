@@ -283,11 +283,19 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--sl-color-white);
 }
 
+.band-lede {
+	max-width: 44rem;
+	margin: -1rem 0 2rem;
+	font-size: 1.05rem;
+	line-height: 1.6;
+	color: var(--sl-color-gray-2);
+}
+
 .landing .expressive-code .frame {
 	box-shadow: none;
 }
 
-/* Run it: the page's script and what it printed, side by side. */
+/* The page's script above what it printed; a tutorial cell beside its output. */
 
 .run-grid,
 .shown-grid {
@@ -327,21 +335,15 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--dew-accent-text);
 }
 
+/* A training log's lines are as long as a terminal's, so they scroll rather than wrap. */
 .hero-output-text {
 	flex: 1;
 	margin: 0;
 	padding: 0.8rem 0.9rem;
-	min-height: 12rem;
-	overflow: auto;
+	overflow-x: auto;
 	font: 0.78rem/1.65 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-}
-
-.hero-output-text .line:last-child {
-	color: var(--sl-color-white);
-	font-weight: 600;
+	white-space: pre;
 }
 
 .hero-output-meta {
@@ -355,35 +357,6 @@ html[data-has-hero][data-past-hero] header.header {
 
 .hero-output-meta a {
 	color: inherit;
-}
-
-.run-live {
-	display: inline-flex;
-	align-items: center;
-	gap: 0.45rem;
-	padding: 0.35rem 0.75rem;
-	border-radius: 0.45rem;
-	border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
-	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
-	color: var(--sl-color-white);
-	font: 600 0.78rem var(--__sl-font);
-	cursor: pointer;
-}
-
-.run-live:hover {
-	background: color-mix(in srgb, var(--dew-accent-fill) 22%, transparent);
-}
-
-.run-live .dot {
-	width: 0.45rem;
-	height: 0.45rem;
-	border-radius: 50%;
-	background: var(--dew-accent-fill);
-	box-shadow: 0 0 0 3px var(--dew-glow);
-}
-
-[data-hero-output][data-state='running'] .run-live .dot {
-	animation: dew-pulse 1s ease-in-out infinite alternate;
 }
 
 /* Text to image: sampling trajectories that run as they scroll past. */
@@ -451,6 +424,113 @@ html[data-has-hero][data-past-hero] header.header {
 	}
 }
 
+/* Sample it yourself: the setup cell, the editable cell, and what it drew on a live kernel. */
+
+.live-sampler {
+	display: grid;
+	gap: 1rem;
+	max-width: 52rem;
+}
+
+.live-sampler .expressive-code {
+	margin: 0;
+}
+
+.sampler-editor {
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+	background: var(--dew-output-bg);
+	overflow: hidden;
+}
+
+.sampler-editor-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 1rem;
+	padding: 0.45rem 0.6rem 0.45rem 0.9rem;
+	border-bottom: 1px solid var(--dew-rule);
+	font: 500 0.75rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+}
+
+.sampler-editor-actions {
+	display: flex;
+	gap: 0.5rem;
+}
+
+.sampler-editor-actions button {
+	padding: 0.3rem 0.8rem;
+	border-radius: 0.45rem;
+	border: 1px solid var(--dew-rule);
+	background: transparent;
+	color: var(--sl-color-gray-2);
+	font: 600 0.78rem var(--__sl-font);
+	cursor: pointer;
+}
+
+.sampler-editor-actions .sampler-run {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+	color: var(--sl-color-white);
+}
+
+.sampler-editor-actions button:disabled {
+	opacity: 0.55;
+	cursor: progress;
+}
+
+.sampler-editor textarea {
+	display: block;
+	width: 100%;
+	margin: 0;
+	padding: 0.8rem 0.9rem;
+	border: 0;
+	resize: vertical;
+	background: transparent;
+	color: var(--sl-color-white);
+	font: 0.8rem/1.65 var(--__sl-font-mono);
+	white-space: pre;
+	overflow-x: auto;
+}
+
+.sampler-editor textarea:focus-visible {
+	outline: 2px solid var(--dew-accent-fill);
+	outline-offset: -2px;
+}
+
+.sampler-output:empty {
+	display: none;
+}
+
+.sampler-output img {
+	display: block;
+	width: min(100%, 24rem);
+	height: auto;
+	border-radius: 0.5rem;
+}
+
+.sampler-output pre {
+	margin: 0.5rem 0 0;
+	padding: 0.8rem 0.9rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+	background: var(--dew-output-bg);
+	font: 0.75rem/1.6 var(--__sl-font-mono);
+	white-space: pre-wrap;
+}
+
+.sampler-status {
+	margin: 0;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
+}
+
+.sampler-status a {
+	color: inherit;
+}
+
 /* Shown: cells from the tutorials and what they printed. */
 
 .shown {
@@ -493,6 +573,100 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--sl-color-gray-2);
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
+}
+
+/* Figures the examples wrote. The MoE drawing carries its own light background. */
+
+.example-figure {
+	margin: 0;
+}
+
+/* The MoE drawing is a wide figure; below its readable width it scrolls sideways. */
+.figure-scroll {
+	overflow-x: auto;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+}
+
+.figure-scroll img {
+	display: block;
+	width: 100%;
+	min-width: 48rem;
+	height: auto;
+	background: #fff;
+}
+
+/* The sampling example: one grid per sampler, a row per prompt and a column per seed. */
+
+.sampler-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	margin-bottom: 1.25rem;
+}
+
+.sampler-tabs label {
+	padding: 0.35rem 0.8rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 999px;
+	font: 500 0.78rem var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+	cursor: pointer;
+}
+
+.sampler-tabs label:has(input:checked) {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+	color: var(--sl-color-white);
+}
+
+.sampler-tabs label:has(input:focus-visible) {
+	outline: 2px solid var(--dew-accent-fill);
+	outline-offset: 2px;
+}
+
+.sampler-tabs input {
+	position: absolute;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.sampler-row {
+	max-width: 52rem;
+	margin-bottom: 1rem;
+}
+
+.sampler-prompt {
+	margin: 0 0 0.4rem;
+	font: 0.8rem/1.5 var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+}
+
+.sampler-images {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 0.4rem;
+}
+
+.sampler-images img {
+	display: block;
+	width: 100%;
+	height: auto;
+	border-radius: 0.3rem;
+}
+
+.sampler-settings {
+	margin: 0;
+	font-size: 0.8rem;
+	color: var(--dew-muted);
+}
+
+.example-figure figcaption {
+	max-width: 48rem;
+	margin-top: 0.8rem;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
 }
 
 /* Tutorials. */
@@ -583,15 +757,6 @@ html[data-has-hero][data-past-hero] header.header {
 }
 
 @media (min-width: 62rem) {
-	.run-grid {
-		grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
-		align-items: start;
-	}
-	/* The output stays beside the code as you read down the script. */
-	.run-grid .hero-output {
-		position: sticky;
-		top: calc(var(--sl-nav-height) + 1.5rem);
-	}
 	.shown-grid {
 		grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
 	}
@@ -609,28 +774,4 @@ html[data-has-hero][data-past-hero] header.header {
 	transition:
 		opacity 700ms ease,
 		translate 700ms cubic-bezier(0.2, 0.7, 0.2, 1);
-}
-
-@media (prefers-reduced-motion: no-preference) {
-	.hero-output-text .line.streamed {
-		animation: dew-fade 150ms ease-out both;
-	}
-}
-
-@keyframes dew-fade {
-	from {
-		opacity: 0;
-	}
-	to {
-		opacity: 1;
-	}
-}
-
-@keyframes dew-pulse {
-	from {
-		opacity: 0.35;
-	}
-	to {
-		opacity: 1;
-	}
 }
