@@ -194,8 +194,7 @@ def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path
     fit asked again for the step the run is at trains nothing."""
     tracker = RecordingTracker()
     make_trainer(tracker=tracker).fit(Data(), steps=7, log_every=1)
-    last = next(scalars["train/loss"] for step, scalars in tracker.scalars
-                if step == 7 and "train/loss" in scalars)
+    losses = {step: scalars["train/loss"] for step, scalars in tracker.scalars if "train/loss" in scalars}
     capsys.readouterr()
 
     trainer = make_trainer(tmp_path)
@@ -203,7 +202,9 @@ def test_the_summary_gives_the_last_steps_loss_and_only_this_fits_steps(tmp_path
     summary = re.search(r"Trained (\d+) steps.*final loss (\S+)", capsys.readouterr().out, re.S)
     assert summary is not None
     assert int(summary[1]) == 7
-    assert float(summary[2]) == pytest.approx(last, abs=1e-4)
+    # Printed to four significant digits: within half a unit of the last.
+    assert abs(float(summary[2]) - losses[7]) <= 5e-4 * abs(losses[7])
+    assert abs(float(summary[2]) - losses[6]) > 5e-4 * abs(losses[7])
 
     trainer.fit(Data(), steps=7, log_every=2)
     assert re.search(r"Trained \d+ steps", capsys.readouterr().out) is None

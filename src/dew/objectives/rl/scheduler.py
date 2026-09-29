@@ -95,7 +95,7 @@ from jax.sharding import Mesh
 from dew.artifacts import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
 from dew.nn.inputs import local_rows, mesh_of
-from dew.objectives.base import Variables
+from dew.objectives.base import Shown, Variables
 from dew.training.distributed import first_reader_batch, shard_batch
 from dew.training.state import TrainState
 
@@ -222,6 +222,9 @@ class RolloutScheduler:
     share's later readers sample none and log nothing. `metrics` holds the
     latest record's numbers, which the trainer logs as `rollout/<name>`.
     """
+    shown = {"reward/mean": Shown(better="higher"), "lag/mean": Shown(better="lower"),
+             "pack/fill": Shown(better="higher", percent=True),
+             **{f"status/{status.value}": Shown(percent=True) for status in Status}}
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
