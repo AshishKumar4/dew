@@ -47,7 +47,7 @@ def json_value(value: object) -> JSON:
 
 def packages_installed() -> dict[str, str]:
     versions = {'python': platform.python_version()}
-    for name in ('dew-ml', 'jax', 'jaxlib', 'flax', 'optax', 'orbax-checkpoint', 'grain', 'numpy'):
+    for name in ('dewml', 'jax', 'jaxlib', 'flax', 'optax', 'orbax-checkpoint', 'grain', 'numpy'):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

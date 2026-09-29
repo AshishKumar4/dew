@@ -335,13 +335,14 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--dew-accent-text);
 }
 
-/* A training log's lines are as long as a terminal's, so they scroll rather than wrap. */
+/* A terminal's lines are as long as its columns, so they scroll rather than
+   wrap, and sit as close as a terminal's so its box edges join. */
 .hero-output-text {
 	flex: 1;
 	margin: 0;
 	padding: 0.8rem 0.9rem;
 	overflow-x: auto;
-	font: 0.78rem/1.65 var(--__sl-font-mono);
+	font: 0.78rem/1.25 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
 	white-space: pre;
 }
@@ -357,6 +358,39 @@ html[data-has-hero][data-past-hero] header.header {
 
 .hero-output-meta a {
 	color: inherit;
+}
+
+/* The terminal's colours, in the site's palette for either theme. */
+.hero-output-text .t-bold {
+	font-weight: 700;
+	color: var(--sl-color-white);
+}
+.hero-output-text .t-red {
+	color: var(--sl-color-red);
+}
+.hero-output-text .t-green {
+	color: var(--sl-color-green);
+}
+.hero-output-text .t-yellow {
+	color: var(--sl-color-orange);
+}
+.hero-output-text .t-blue {
+	color: var(--sl-color-blue);
+}
+.hero-output-text .t-magenta {
+	color: var(--sl-color-purple);
+}
+.hero-output-text .t-cyan {
+	color: var(--dew-accent-text);
+}
+.hero-output-text .t-white {
+	color: var(--sl-color-white);
+}
+.hero-output-text .t-black {
+	color: var(--sl-color-gray-5);
+}
+.hero-output-text .t-dim {
+	opacity: 0.6;
 }
 
 /* Text to image: sampling trajectories that run as they scroll past. */
@@ -424,16 +458,44 @@ html[data-has-hero][data-past-hero] header.header {
 	}
 }
 
-/* Sample it yourself: the setup cell, the editable cell, and what it drew on a live kernel. */
+/* The live sampler: the editable cell (with the setup cell folded under it)
+   beside a figure that keeps its size through a run. */
 
 .live-sampler {
 	display: grid;
-	gap: 1rem;
-	max-width: 52rem;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 1.25rem;
+	max-width: 64rem;
 }
 
-.live-sampler .expressive-code {
-	margin: 0;
+@media (min-width: 62rem) {
+	.live-sampler {
+		grid-template-columns: minmax(0, 1fr) 24rem;
+		align-items: start;
+	}
+
+	.sampler-log,
+	.sampler-colab {
+		grid-column: 1 / -1;
+	}
+}
+
+.sampler-code {
+	display: grid;
+	gap: 0.75rem;
+	min-width: 0;
+}
+
+.sampler-setup summary,
+.sampler-log summary {
+	cursor: pointer;
+	font: 500 0.75rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+}
+
+.sampler-setup .expressive-code,
+.sampler-log > div {
+	margin-top: 0.5rem;
 }
 
 .sampler-editor {
@@ -499,18 +561,135 @@ html[data-has-hero][data-past-hero] header.header {
 	outline-offset: -2px;
 }
 
-.sampler-output:empty {
+.sampler-stage {
+	margin: 0;
+	display: grid;
+	gap: 0.6rem;
+	min-width: 0;
+}
+
+/* The frame's shape is fixed: the model draws 256 by 256. */
+.sampler-frame {
+	position: relative;
+	aspect-ratio: 1;
+	width: min(100%, 24rem);
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.6rem;
+	background: var(--dew-output-bg);
+	overflow: hidden;
+}
+
+.sampler-frame img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}
+
+.sampler-frame [hidden] {
 	display: none;
 }
 
-.sampler-output img {
-	display: block;
-	width: min(100%, 24rem);
-	height: auto;
-	border-radius: 0.5rem;
+/* A step's preview is the model's guess at the finished image, drawn from the latent at
+   32 by 32 and blurred rather than shown as blocks; the result fades in over it. */
+.sampler-frame [data-preview] {
+	filter: blur(6px);
+	scale: 1.08;
 }
 
-.sampler-output pre {
+.sampler-frame [data-final] {
+	animation: sampler-arrive 450ms ease-out;
+	transition: opacity 300ms ease;
+}
+
+/* The last run's image stays, faded, until the next run's first preview replaces it. */
+.sampler-stage:is([data-stage='starting'], [data-stage='sampling']) [data-final] {
+	opacity: 0.35;
+}
+
+@keyframes sampler-arrive {
+	from {
+		opacity: 0;
+	}
+}
+
+.sampler-frame-empty {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	margin: 0;
+	padding: 1rem;
+	text-align: center;
+	font-size: 0.85rem;
+	color: var(--dew-muted);
+}
+
+/* A hairline under the frame: filled by the steps done, or a moving segment while the length of a wait is unknown. */
+.sampler-bar {
+	position: relative;
+	width: min(100%, 24rem);
+	height: 2px;
+	border-radius: 1px;
+	background: var(--dew-rule);
+	overflow: hidden;
+}
+
+.sampler-bar span {
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: calc(var(--progress, 0) * 100%);
+	background: var(--dew-accent-fill);
+	transition: width 250ms ease;
+}
+
+.sampler-stage:is([data-stage='idle'], [data-stage='error']) .sampler-bar span {
+	width: 0;
+}
+
+.sampler-stage:not([data-stage='idle'], [data-stage='error']) .sampler-bar[data-determinate='false'] span {
+	width: 30%;
+	animation: sampler-wait 1.4s ease-in-out infinite;
+}
+
+@keyframes sampler-wait {
+	from {
+		translate: -100% 0;
+	}
+	to {
+		translate: 340% 0;
+	}
+}
+
+.sampler-stage figcaption {
+	min-height: 2.6rem;
+}
+
+.sampler-status,
+.sampler-detail,
+.sampler-colab {
+	margin: 0;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
+}
+
+.sampler-status {
+	color: var(--sl-color-gray-2);
+}
+
+.sampler-stage[data-stage='error'] .sampler-status {
+	color: var(--dew-error);
+}
+
+.sampler-detail {
+	font-family: var(--__sl-font-mono);
+	font-size: 0.75rem;
+	font-variant-numeric: tabular-nums;
+}
+
+.sampler-log pre {
 	margin: 0.5rem 0 0;
 	padding: 0.8rem 0.9rem;
 	border: 1px solid var(--dew-rule);
@@ -520,21 +699,23 @@ html[data-has-hero][data-past-hero] header.header {
 	white-space: pre-wrap;
 }
 
-.sampler-status {
-	margin: 0;
-	font-size: 0.85rem;
-	line-height: 1.55;
-	color: var(--dew-muted);
+.sampler-colab a {
+	color: inherit;
 }
 
-.sampler-status a {
-	color: inherit;
+@media (prefers-reduced-motion: reduce) {
+	.sampler-frame [data-final],
+	.sampler-bar span {
+		animation: none;
+		transition: none;
+	}
 }
 
 /* Shown: cells from the tutorials and what they printed. */
 
 .shown {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	gap: clamp(3rem, 8vh, 5rem);
 }
 
@@ -671,7 +852,8 @@ html[data-has-hero][data-past-hero] header.header {
 
 /* Tutorials. */
 
-.tutorial-list {
+.tutorial-list,
+.try-list {
 	display: grid;
 	grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
 	gap: 0.75rem;
@@ -680,11 +862,13 @@ html[data-has-hero][data-past-hero] header.header {
 	list-style: none;
 }
 
-.tutorial-list li {
+.tutorial-list li,
+.try-list li {
 	margin: 0;
 }
 
-.tutorial-link {
+.tutorial-link,
+.try-link {
 	display: grid;
 	grid-template-columns: auto 1fr auto;
 	align-items: baseline;
@@ -701,7 +885,8 @@ html[data-has-hero][data-past-hero] header.header {
 		transform 150ms ease;
 }
 
-.tutorial-link:hover {
+.tutorial-link:hover,
+.try-link:hover {
 	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
 	color: var(--sl-color-white);
 }
@@ -721,6 +906,25 @@ html[data-has-hero][data-past-hero] header.header {
 	font: 500 0.68rem var(--__sl-font-mono);
 	letter-spacing: 0.06em;
 	color: var(--dew-muted);
+}
+
+/* Try it: a name over what the link offers. */
+
+.try-link {
+	grid-template-columns: minmax(0, 1fr);
+	gap: 0.35rem;
+}
+
+.try-name {
+	font-weight: 560;
+	font-size: 1rem;
+	letter-spacing: -0.01em;
+}
+
+.try-what {
+	font-size: 0.85rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-2);
 }
 
 /* The footer. */

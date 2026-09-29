@@ -1,7 +1,16 @@
 ---
-// Sample from the text-to-image model on a live kernel: the setup cell runs once
-// when the kernel starts, and the reader edits and runs the sampling cell. The
-// live client loads when Run is first pressed.
+// Sample from the text-to-image model on a live kernel: the kernel runs the setup
+// cell itself before it reports ready (shown here, folded, for reading), and the
+// reader edits and runs the sampling cell. The live client loads when Run is
+// first pressed.
+//
+// The figure beside the editor keeps its size through a run: a status line and
+// a bar say which stage the run is in (the bot check, the kernel starting and
+// loading the model, each sampler step, the decode), each step's preview replaces
+// the last, and the finished image fades in over them. The kernel reports a
+// step as a display output whose text is {"dew-progress": {"step": k,
+// "steps": n}} with a small PNG preview, and the decode as {"dew-progress":
+// {"stage": "decode"}}; any other image is the cell's result.
 import { Code } from '@astrojs/starlight/components';
 import { live } from '../../live.mjs';
 
@@ -14,90 +23,204 @@ const { setup, cell, colab } = Astro.props;
 const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 ---
 
-<div class="live-sampler" data-live-sampler data-setup={setup}>
-	<Code code={setup.trimEnd()} lang="python" title="Runs once, when the kernel starts" />
-	<div class="sampler-editor">
-		<div class="sampler-editor-bar">
-			<span>sample.py, editable</span>
-			<span class="sampler-editor-actions">
-				{
-					liveEnabled && (
-						<button type="button" class="sampler-run" data-run>
-							Run
-						</button>
-					)
-				}
-				<button type="button" class="sampler-reset" data-reset>Reset</button>
-			</span>
+<div class="live-sampler" data-live-sampler>
+	<div class="sampler-code">
+		<div class="sampler-editor">
+			<div class="sampler-editor-bar">
+				<span>sample.py, editable</span>
+				<span class="sampler-editor-actions">
+					<button type="button" class="sampler-reset" data-reset>Reset</button>
+					{
+						liveEnabled && (
+							<button type="button" class="sampler-run" data-run>
+								Run
+							</button>
+						)
+					}
+				</span>
+			</div>
+			<textarea
+				data-cell
+				spellcheck="false"
+				autocapitalize="off"
+				autocomplete="off"
+				aria-label="The sampling cell"
+				rows={cell.trimEnd().split('\n').length + 1}>{cell.trimEnd()}</textarea
+			>
 		</div>
-		<textarea data-code spellcheck="false" autocapitalize="off" autocomplete="off" rows={cell.trimEnd().split('\n').length + 1}
-			>{cell.trimEnd()}</textarea
-		>
+		<details class="sampler-setup">
+			<summary>Runs once, when the kernel starts</summary>
+			<Code code={setup.trimEnd()} lang="python" />
+		</details>
 	</div>
-	<div class="sampler-output" data-output aria-live="polite"></div>
-	<p class="sampler-status" data-status aria-live="polite">
-		{
-			liveEnabled
-				? 'Run starts a kernel on a 4-vCPU Cloudflare container, with JAX on the CPU. It loads the model once, then runs your cell.'
-				: 'Live kernels are not set up for this build of the site.'
-		}
-	</p>
-	<p class="sampler-status">
+
+	<figure class="sampler-stage" data-stage="idle">
+		<div class="sampler-frame">
+			<img data-preview alt="" hidden />
+			<img data-final alt="" hidden />
+			<p class="sampler-frame-empty" data-empty>
+				{liveEnabled ? 'The image appears here.' : 'Live kernels are not set up for this build of the site.'}
+			</p>
+		</div>
+		<div class="sampler-bar" data-bar aria-hidden="true"><span></span></div>
+		<figcaption>
+			<p class="sampler-status" data-status aria-live="polite">
+				{liveEnabled && 'Run starts a kernel on a 4-vCPU Cloudflare container, with JAX on the CPU.'}
+			</p>
+			<p class="sampler-detail" data-detail></p>
+		</figcaption>
+	</figure>
+
+	<details class="sampler-log" data-log hidden>
+		<summary>Kernel output</summary>
+		<div data-output></div>
+	</details>
+	<p class="sampler-colab">
 		Or <a href={colab} target="_blank" rel="noopener">open it in Colab</a> to run it on a GPU and change anything.
 	</p>
 	<div class="turnstile-holder" data-turnstile></div>
 </div>
 
 <script>
-	import type { LiveSession } from '../../scripts/live';
+	import type { LiveSession, Output } from '../../scripts/live';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-sampler]');
 	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
 	if (panel && run) {
-		const editor = panel.querySelector<HTMLTextAreaElement>('[data-code]')!;
-		const output = panel.querySelector<HTMLElement>('[data-output]')!;
-		const status = panel.querySelector<HTMLElement>('[data-status]')!;
-		const holder = panel.querySelector<HTMLElement>('[data-turnstile]')!;
+		const q = <T extends HTMLElement>(selector: string) => panel.querySelector<T>(selector)!;
+		const editor = q<HTMLTextAreaElement>('textarea[data-cell]');
+		const stage = q<HTMLElement>('.sampler-stage');
+		const preview = q<HTMLImageElement>('[data-preview]');
+		const final = q<HTMLImageElement>('[data-final]');
+		const empty = q<HTMLElement>('[data-empty]');
+		const bar = q<HTMLElement>('[data-bar] span');
+		const status = q<HTMLElement>('[data-status]');
+		const detail = q<HTMLElement>('[data-detail]');
+		const log = q<HTMLDetailsElement>('[data-log]');
+		const output = q<HTMLElement>('[data-output]');
+		const holder = q<HTMLElement>('[data-turnstile]');
 		const original = editor.value;
-		let session: LiveSession | undefined;
-		const say = (text: string) => (status.textContent = text);
 
-		panel.querySelector('[data-reset]')!.addEventListener('click', () => (editor.value = original));
+		let session: LiveSession | undefined;
+		let running = false;
+		let stopping = false;
+		let started = 0;
+		let ticker: number | undefined;
+
+		/** Enter a stage: its name styles the figure, `text` is the status line, `fraction` fills the bar (none: indeterminate). */
+		const show = (name: string, text: string, fraction?: number) => {
+			stage.dataset.stage = name;
+			status.textContent = text;
+			stage.style.setProperty('--progress', fraction === undefined ? '' : String(fraction));
+			bar.parentElement!.dataset.determinate = fraction === undefined ? 'false' : 'true';
+		};
+		/** Count the seconds of a wait next to its status line. */
+		const tick = (text: string) => {
+			window.clearInterval(ticker);
+			const since = performance.now();
+			const update = () => (detail.textContent = `${text} ${Math.round((performance.now() - since) / 1000)} s`);
+			update();
+			ticker = window.setInterval(update, 1000);
+		};
+		const untick = () => {
+			window.clearInterval(ticker);
+			detail.textContent = '';
+		};
+		const seconds = () => ((performance.now() - started) / 1000).toFixed(1);
+		const image = (png: string) => `data:image/png;base64,${png}`;
+
+		const onOutput = (message: Output) => {
+			if (message.type === 'display') {
+				let report: { step?: number; steps?: number; stage?: string } | undefined;
+				try {
+					report = message.text ? JSON.parse(message.text)['dew-progress'] : undefined;
+				} catch {
+					report = undefined;
+				}
+				if (report?.step !== undefined && report.steps) {
+					untick();
+					show('sampling', `Step ${report.step} of ${report.steps}`, report.step / report.steps);
+					if (message.png) {
+						preview.src = image(message.png);
+						preview.hidden = false;
+						final.hidden = true;
+						empty.hidden = true;
+					}
+					return;
+				}
+				if (report?.stage === 'decode') {
+					show('decoding', 'Decoding the latent into pixels', 1);
+					return;
+				}
+				if (message.png) {
+					final.src = image(message.png);
+					final.alt = 'The image the cell returned.';
+					final.hidden = false;
+					empty.hidden = true;
+					return;
+				}
+			}
+			if (stopping) return;
+			if (message.type === 'error') log.open = true;
+			if (message.type !== 'clear') log.hidden = false;
+			import('../../scripts/live').then(({ renderOutput }) => renderOutput(output, message));
+		};
 
 		const execute = async () => {
-			run.disabled = true;
+			running = true;
+			stopping = false;
+			run.textContent = 'Stop';
+			output.replaceChildren();
+			log.hidden = true;
+			log.open = false;
 			try {
-				const { LiveSession, renderOutput } = await import('../../scripts/live');
+				const { LiveSession } = await import('../../scripts/live');
 				if (!session) {
-					session = await LiveSession.open(holder, say);
+					show('starting', 'Checking that you are not a bot');
+					tick('Waiting');
+					const opened = await LiveSession.open(holder, (text) => show('starting', text.replace(/…$/, '')));
+					if (stopping) {
+						opened.close();
+						throw new Error('Stopped.');
+					}
+					session = opened;
 					session.onClose = (message) => {
 						session = undefined;
-						say(`${message} Press Run to start a new one.`);
+						if (!running) show('idle', `${message} Press Run to start a new one.`);
 					};
-					say('Loading the model…');
-					const loaded = await session.run(panel.dataset.setup ?? '', (out) => {
-						if (out.type === 'error') renderOutput(output, out);
-					});
-					if (loaded.status !== 'ok') throw new Error('The model did not load on the live kernel.');
 				}
-				say('Sampling…');
-				output.replaceChildren();
-				const started = performance.now();
-				const done = await session.run(editor.value, (out) => renderOutput(output, out));
-				const seconds = ((performance.now() - started) / 1000).toFixed(1);
-				say(done.status === 'ok' ? `Ran in ${seconds} s on the live kernel.` : 'The cell stopped with an error; the output above says why.');
+				started = performance.now();
+				show('sampling', 'Sampling');
+				tick('Running');
+				const done = await session.run(editor.value, onOutput);
+				untick();
+				if (stopping || done.status === 'aborted') show('idle', 'Stopped.');
+				else if (done.status === 'ok') show('done', `The cell ran in ${seconds()} s on the live kernel.`, 1);
+				else show('error', 'The cell stopped with an error; the kernel output below says why.');
 			} catch (error) {
+				untick();
 				session?.close();
 				session = undefined;
-				say(error instanceof Error ? error.message : String(error));
+				show(stopping ? 'idle' : 'error', stopping ? 'Stopped.' : error instanceof Error ? error.message : String(error));
 			} finally {
+				running = false;
+				run.textContent = 'Run';
 				run.disabled = false;
 			}
 		};
 
-		run.addEventListener('click', execute);
+		// Stopping interrupts the cell; before the kernel is ready it lets the start finish and closes it.
+		const stop = () => {
+			stopping = true;
+			run.disabled = true;
+			show(stage.dataset.stage ?? 'idle', 'Stopping');
+			session?.interrupt();
+		};
+
+		q<HTMLButtonElement>('[data-reset]').addEventListener('click', () => (editor.value = original));
+		run.addEventListener('click', () => (running ? stop() : void execute()));
 		editor.addEventListener('keydown', (event) => {
-			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !run.disabled) {
+			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {
 				event.preventDefault();
 				void execute();
 			}

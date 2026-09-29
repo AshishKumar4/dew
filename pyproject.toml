@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dew-ml"
+name = "dewml"
 dynamic = ["version"]
 description = "A JAX/Flax framework for training diffusion, JEPA and other large models from scratch"
 readme = "README.md"
@@ -58,7 +58,7 @@ license = "MIT"
 dew = "dew.cli.main:main"
 
 [project.optional-dependencies]
-# The accelerator builds of the pinned jax, installed as `dew-ml[cuda13]`. pip
+# The accelerator builds of the pinned jax, installed as `dewml[cuda13]`. pip
 # can't satisfy PyPI's jax[cuda12], jax[cuda13] or jax[tpu] against the pinned
 # jax's archive URL (ResolutionImpossible), so these repeat the pinned jax's own
 # extras of the same names; jaxlib comes from jax itself. They move with the
@@ -87,7 +87,7 @@ test = [
     # library accepts this release and later; the reference suite pins it.
     "transformers==5.16.1",
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
-    # unbounded so the suite runs the release `pip install dew-ml[streaming]`
+    # unbounded so the suite runs the release `pip install dewml[streaming]`
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.
     "datasets",
     # The MLflow, TensorBoard and Optuna adapters are proven against the real

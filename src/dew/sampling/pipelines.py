@@ -193,13 +193,17 @@ class TextToImage:
 
         `ema` None reads the averaged weights when the run kept them and the
         live ones when it kept none; True requires the averaged ones and False
-        reads the live ones. With `mesh`
-        the weights restore straight onto that mesh under `layout`, the way
-        the trainer places them; without one the default mesh uses the current pool.
+        reads the live ones. A run whose average is a reference policy rather
+        than the trained one (Flow-GRPO's frozen KL reference) reads its live
+        policy. With `mesh` the weights restore straight onto that mesh under
+        `layout`, the way the trainer places them; without one the default
+        mesh uses the current pool.
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
+        import dew.objectives.rl.flow  # noqa: F401 registers the flow_grpo a record names
         from dew.objectives.diffusion import DiffusionRunConfig
+        from dew.registry import objectives
 
         config = DiffusionRunConfig.load(directory)
         compute = dtype_name(resolve_dtype(dtype))
@@ -209,7 +213,8 @@ class TextToImage:
                              audio=None if config.audio is None else replace(config.audio, dtype=compute),
                              autoencoder=None if config.autoencoder is None else
                              replace(config.autoencoder, dtype=compute))
-        params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+        averaged = False if objectives[config.objective]._ema_is_reference else ema
+        params = restore_variables(directory, ema=averaged, step=step, mesh=mesh, layout=layout,
                                    param_dtype=param_dtype, parameter_roots=config.parameter_roots)
         objective = config.build(variables=params)
         return cls.from_objective(objective, _with_drawn_tables(objective, params))
@@ -240,11 +245,7 @@ class TextToImage:
         """The per-example shape the model denoises: the sample field's, or
         its latent when an autoencoder sits in front of the model."""
         shape = self.inputs.sample.shape
-        if self.autoencoder is None:
-            return shape
-        *lead, height, width, _ = shape
-        factor = self.autoencoder.downscale_factor
-        return (*lead, height // factor, width // factor, self.autoencoder.latent_channels)
+        return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
     @property
     def _conditions(self) -> tuple[tuple[str, object], ...]:

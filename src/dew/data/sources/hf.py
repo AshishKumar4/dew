@@ -32,7 +32,7 @@ from ..dataset import Batch, json_argument
 
 _STREAMING_HINT = (
     "reading Hugging Face datasets needs the streaming extra: "
-    "pip install 'dew-ml[streaming]'"
+    "pip install 'dewml[streaming]'"
 )
 
 

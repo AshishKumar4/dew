@@ -1,19 +1,19 @@
 # Key concepts
 
-A training run in Dew is four objects: a Flax model, an objective, a dataset and a trainer. Each owns one part of the work, and the boundaries between them are the API. Once you know which object owns what, you know where a change goes.
+A Dew training run is built from four objects. Each owns one part of the work:
 
-| Object | What it owns | When you write your own |
+| Object | Owns | Written by you when |
 |---|---|---|
-| Model, a `flax.linen.Module` | The forward computation and the shape of its variables | For a new architecture. `models.build(name, ...)` builds a registered one. |
-| `Objective` | Initializing the variables, the loss, evaluation outputs, and which weights keep a moving average | For a loss Dew does not have. |
-| `Dataset` | The iterators that yield training and validation batches | When your data does not fit a built-in reader. |
-| `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | You configure it; you do not subclass it. |
+| Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. `models.build(name, ...)` builds a registered one. |
+| `Objective` | Initializing the variables, the loss, evaluation outputs, and which weights keep a moving average | You need a loss Dew does not have. |
+| `Dataset` | The iterators that yield training and validation batches | Your data does not fit a built-in reader. |
+| `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | Never; it is configured, not subclassed. |
 
-`Trainer.fit` returns a `TrainState`, which holds everything a run needs to continue: the variables, the optimizer state, the root random key, the step counters and the moving-average copy.
+`Trainer.fit` returns a `TrainState`, the numerical state of the run: the variables, the optimizer state, the root random key, the step counters and the moving-average copy. Continuing a run also needs the data position, which checkpoints store beside the state, and the configuration that built the objective and trainer (a recipe writes it to `run.json`).
 
-## One run, end to end
+## Example
 
-This trains a small decoder on one repeated sentence and then generates from it. It downloads nothing and runs on a CPU in about twenty seconds.
+This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
 import itertools
@@ -49,47 +49,58 @@ out = generate(model, state.params, prompt, max_new_tokens=40,
 print(tokenizer.decode(out.tokens[0]))
 ```
 
-On four cores of a workstation CPU, with its output piped to a file, it prints the lines below. On a terminal, `fit` draws the same numbers as one live panel instead: a progress bar, a sparkline for each metric and the latest evaluations.
+Output on four cores of a workstation CPU:
 
 ```text
 Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
-step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 25.40  samples_per_sec 315.0  accepted 100.0%  0:00:01 left
-step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 21.08  samples_per_sec 379.6  accepted 100.0%  0:00:01 left
-step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 19.82  samples_per_sec 403.7  accepted 100.0%  0:00:01 left
-step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 25.04  samples_per_sec 319.5  accepted 100.0%
-Trained 100 steps in 0:00:05: first step after 2.35 s, then 45.7 step/s
-47.9% of the wall time in steps, final loss 0.005113
+step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 10.88  samples_per_sec 735.3  accepted 100.0%
+step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 8.713  samples_per_sec 918.2  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 8.472  samples_per_sec 944.3  accepted 100.0%  0:00:00 left
+step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 9.332  samples_per_sec 857.3  accepted 100.0%
+Trained 100 steps in 0:00:02: first step after 0.94 s, then 115.5 step/s
+47.6% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
-Each row holds 65 byte ids: `LMObjective(seq_len=64)` feeds the first 64 to the model and predicts the 64 that follow, one position later. The loss falls from 0.031 at step 25 to 0.005 at step 100, and the model continues the prompt with the sentence it learned. `records` is the number of training examples and `batch` the global batch size. `generate` returns the prompt followed by the new tokens, and `temperature=0` picks the most likely token at every step.
+This is the output with stdout piped to a file; on a terminal, `fit` draws the same numbers as one live panel with a progress bar and a sparkline per metric. Each `step` line shows the loss and the objective's metrics of that step (for `LMObjective`: cross entropy, perplexity and token accuracy), and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
 
-## Models are plain Flax modules
+## Model
 
-A model knows nothing about training. It is a `flax.linen.Module` with `init` and `apply`, and its variables are an ordinary nested dictionary of arrays. `models.build("causal_transformer", ...)` looks the class up in a registry by name, which is how recipes and saved runs rebuild a model from a configuration file. Importing the class gives the same module: `from dew.nn.backbones import CausalTransformer`.
+A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. `models.build("causal_transformer", ...)` looks the class up in a registry by name, which is how recipes and saved runs rebuild a model from a configuration file. Importing the class gives the same module: `from dew.nn.backbones import CausalTransformer`.
 
-Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto devices, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) explains the mapping.
+Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 
-## The objective says what is learned
+## Objective
 
-An objective implements `init(key)`, which returns the model's variables, and `loss(variables, batch, step)`, which returns the loss and any metrics to log. It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA). Its `shown` attribute says how the training display shows each metric: `Shown(better="higher", percent=True)` for an accuracy, for instance, colours a rise as progress and prints the value as a percentage.
+An objective implements two methods:
 
-Dew ships objectives for autoregressive language modeling (`LMObjective`), image and video diffusion (`DiffusionObjective`), masked and block diffusion over tokens (`MaskedDiffusionObjective`, `BlockDiffusionObjective`), JEPA (`JepaObjective`), preference and reinforcement learning (`DPOObjective`, `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective`) and distillation (`DistillationObjective`). A new kind of model is a new module; a new kind of training is a new objective. [Write a custom objective](concepts/objectives.md) walks through one.
+- `init(key, variables=None)` returns the model's variables.
+- `loss(variables, batch, step)` returns the loss as a `Mean(total, mass)` and an `Aux` with metrics to log.
 
-## A dataset is a pair of iterator factories
+It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA) in its `ema` attribute. Its `shown` attribute maps metric names to `Shown` values that tell the training display how to show them: `Shown(better="higher", percent=True)`, for an accuracy, colours a rise as progress and prints the value as a percentage.
 
-`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless, shuffled stream of batches; `val(partition)` opens one pass over the held-out records and then stops. `partition` says which share of each global batch this process reads, which matters once several processes train together.
+Dew ships objectives for autoregressive language modeling (`LMObjective`), image and video diffusion (`DiffusionObjective`), masked and block diffusion over tokens (`MaskedDiffusionObjective`, `BlockDiffusionObjective`), JEPA (`JepaObjective`), preference and reinforcement learning (`DPOObjective`, `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective`) and distillation (`DistillationObjective`). A new kind of model is a new module; a new kind of training is a new objective. [Custom objectives](concepts/objectives.md) writes one.
 
-The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, describe a dataset and build a `Dataset` with `.load(batch=...)`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint can resume the data stream where it stopped. [Supply training data](concepts/data.md) covers the details.
+## Dataset
 
-## The trainer runs the loop
+`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens an endless stream of training batches; `val(partition)` opens one pass over the validation records. `partition` is a `DataPartition` that says which share of each global batch this process reads, which matters when several processes train together.
 
-`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` initializes the variables on the devices, compiles one training step, and runs it until the step counter reaches `steps`. Along the way it updates the moving average, logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the `Trainer` was given `checkpoints=Checkpoints(directory)`.
+The built-in readers, such as `TokenWindows` for tokenized text and `HFImages` for image datasets on the Hugging Face Hub, are specifications whose `.load(batch=...)` returns a `Dataset`. Images arrive as `uint8` arrays in `[0, 255]` and token windows as `int32` ids under the key `"text"`. Readers built on Grain record their position, so a checkpoint resumes the data stream where it stopped. [Training data](concepts/data.md) covers the details.
+
+![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-light.svg)
+![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-dark.svg)
+
+## Trainer
+
+`Trainer(objective, optimizer, key=...)` takes an Optax optimizer and a JAX random key. `fit(dataset, steps=...)` places the variables on the devices, compiles one training step and runs it until the step counter reaches `steps`. Between steps it logs every `log_every` steps, evaluates every `eval_every` steps, and writes a checkpoint every `checkpoint_every` steps when the trainer was given `checkpoints=Checkpoints(directory)`.
+
+![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-light.svg)
+![Trainer.fit: the state is placed on the mesh, the dataset's iterator feeds a prefetcher, and each compiled step runs the loss, the gradient, the optimizer update and the EMA update; logging, evaluation and checkpoints run on the host between steps.](assets/training-loop-dark.svg)
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
 
 ## Training state
 
-`TrainState` counts three things separately. `step` counts attempts, and together with the root key it decides the next random draw. `microstep` counts accepted microbatches. `updates` counts optimizer updates, which differs from `microstep` when you accumulate gradients. `state.params` holds the live variables, and `state.averaged` holds the same tree with the EMA weights in place, which usually sample better.
+`TrainState` keeps three counters. `step` counts attempts, and together with the root key it determines the next random draw. `microstep` counts accepted microbatches. `updates` counts optimizer updates, which differs from `microstep` when gradients are accumulated. `state.params` holds the live variables, and `state.averaged` holds the same tree with the EMA weights in place.
 
-After training, `objective.pipeline(state)` wraps the weights in an inference task, such as text generation or text-to-image, and `Pretrained.save` writes a checkpoint in its source's own format. [Save and resume](guides/checkpoints.md) lists which artifact continues what.
+After training, `objective.pipeline(state)` wraps the weights in an inference task, such as text generation or text-to-image, and `Pretrained.save` writes a checkpoint in its source's own format. [Checkpoints](guides/checkpoints.md) lists which artifact continues what.

@@ -19,11 +19,12 @@ function sidebarItem(item) {
 	return { label: item.label, slug: item.slug };
 }
 
-const sidebar = groups.map((group) => ({
-	label: group.label,
-	collapsed: group.collapsed ?? false,
-	items: [...(group.items ?? []), ...(group.generated ? generated(group.generated) : [])].map(sidebarItem),
-}));
+// An unlabeled group's pages sit at the top level; a labeled group is a section
+// that Starlight opens when it holds the current page.
+const sidebar = groups.flatMap((group) => {
+	const items = [...(group.items ?? []), ...(group.generated ? generated(group.generated) : [])].map(sidebarItem);
+	return group.label ? [{ label: group.label, collapsed: true, items }] : items;
+});
 
 export default defineConfig({
 	site: 'https://dewml.dev',
@@ -66,6 +67,7 @@ export default defineConfig({
 				Hero: './src/components/starlight/Hero.astro',
 				Head: './src/components/starlight/Head.astro',
 				PageTitle: './src/components/starlight/PageTitle.astro',
+				Sidebar: './src/components/starlight/Sidebar.astro',
 			},
 			head: [
 				{ tag: 'meta', attrs: { name: 'theme-color', content: '#0a1113', media: '(prefers-color-scheme: dark)' } },
@@ -74,6 +76,7 @@ export default defineConfig({
 				{ tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
 			],
 			sidebar,
+			routeMiddleware: './src/route-data.mjs',
 			plugins: [
 				starlightLinksValidator({
 					errorOnFallbackPages: true,

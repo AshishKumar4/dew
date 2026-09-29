@@ -341,20 +341,24 @@ class _Flow:
         slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
         return tokens * slope + self.base_shift - slope * self.base_tokens
 
-    def shifted(self, sigmas: np.ndarray, tokens: int | None) -> np.ndarray:
-        """The sigmas after this file's shift.
+    def base(self, tokens: int | None) -> float:
+        """The shift this file names at `tokens` latent tokens.
 
         The static and the dynamic forms are the same map with a different
         base. shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
         base = shift, and the dynamic base is exp(mu) or mu itself.
         """
         if not self.dynamic:
-            return self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+            return self.shift
         if tokens is None:
             raise ValueError("Dynamic shifting needs the latent token count; bind the "
                              "geometry through the task's grid")
         mu = self.mu(tokens)
-        base = np.exp(mu) if self.kind == "exponential" else mu
+        return float(np.exp(mu)) if self.kind == "exponential" else mu
+
+    def shifted(self, sigmas: np.ndarray, tokens: int | None) -> np.ndarray:
+        """The sigmas after this file's shift."""
+        base = self.base(tokens)
         return base * sigmas / (1 + (base - 1) * sigmas)
 
     def stretched(self, sigmas: np.ndarray) -> np.ndarray:
@@ -521,16 +525,22 @@ class SourceSchedule:
         table's length wherever the class tabulates one."""
         return self.policy.train_steps
 
-    def training_process(self) -> Process:
-        """The process the checkpoint was trained under.
+    def training_process(self, tokens: int | None = None) -> Process:
+        """The process the checkpoint was trained under, at `tokens` latent
+        tokens.
 
         Every class but the EDM one tabulates a VP beta table and trains on
         it. EDM's convention has no beta table and no VP law. Its training
         process is EDM's own log-normal sigma draw, over the preconditioning
-        the sampler reads.
+        the sampler reads. A flow file trains at the shift its sampler walks
+        at the same geometry, as SD3 shifts both by resolution (Esser et al.
+        2024, section 5.3.2), so a dynamic file needs `tokens`. The terminal
+        stretch is a sampling grid's alone.
         """
         if self.policy.family == "flow":
-            return Process(FlowMatchingScheduler(), self.prediction)
+            flow = self.policy.flow
+            shift = 1.0 if flow is None else flow.base(tokens)
+            return Process(FlowMatchingScheduler(shift=shift), self.prediction)
         if self.policy.family == "edm":
             schedule = EDMNoiseScheduler(sigma_min=self.policy.sigma_min or 0.002,
                                          sigma_max=self.policy.sigma_max or 80.0,
