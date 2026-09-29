@@ -22,10 +22,11 @@ import dataclasses
 import fnmatch
 import functools
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from dew.nn.sharding import LogicalAxes, declared_axes
@@ -400,6 +401,56 @@ def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
                       decay=optax.add_decayed_weights(weight_decay, mask))
 
 
+class PowerProfilesState(NamedTuple):
+    """The state `power_profiles` keeps beside its solver's."""
+    count: jax.Array
+    """Updates made, the t of the averages' profiles."""
+    stds: jax.Array
+    """The relative standard deviation of each average."""
+    averages: tuple[optax.Params, ...]
+    inner: optax.OptState
+
+
+def power_profiles(solver: optax.GradientTransformation,
+                   stds: Sequence[float]) -> optax.GradientTransformationExtraArgs:
+    """`solver`, keeping one power-function average of the parameters it
+    produces per relative standard deviation in `stds`, for post-hoc EMA
+    (`dew.training.posthoc`).
+
+    Update t keeps (1 - 1/t)^(γ + 1) of each average and blends in the rest
+    of the parameters it just made (Karras et al. 2024, Eq. 127). The
+    averages ride in the optimizer state, so they are sharded, placed,
+    checkpointed and skipped on a rejected step exactly as its moments are,
+    and every checkpoint save keeps a snapshot of them
+    (`Checkpoints.profile_steps`). Each std is rounded to fp32 first, the
+    precision the state records it in.
+    """
+    from dew.training.posthoc import power_decay
+    from dew.training.transaction import ema_update
+
+    stds = tuple(float(np.float32(std)) for std in stds)
+    if not stds:
+        raise ValueError("power_profiles tracks at least one average; name its relative std")
+    decays = tuple(power_decay(std) for std in stds)
+    solver = optax.with_extra_args_support(solver)
+
+    def init_fn(params):
+        return PowerProfilesState(count=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
+                                  averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds),
+                                  inner=solver.init(params))
+
+    def update_fn(updates, state, params=None, **extra_args):
+        if params is None:
+            raise ValueError("power_profiles averages the parameters, so its update needs them")
+        updates, inner = solver.update(updates, state.inner, params, **extra_args)
+        produced = optax.apply_updates(params, updates)
+        averages = tuple(ema_update(average, produced, decay(state.count))
+                         for average, decay in zip(state.averages, decays, strict=True))
+        return updates, PowerProfilesState(state.count + 1, state.stds, averages, inner)
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
 # The optimizers `OptimConfig.state_dtype='bfloat16'` builds: optax.adam and
 # optax.adamw with the moments stored in bf16, their other options kept.
 BF16_STATE_OPTIMIZERS = {'adam': _bf16_adam, 'adamw': _bf16_adamw}
@@ -664,4 +715,6 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
+    if config.ema_profiles:
+        solver = power_profiles(solver, config.ema_profiles)
     return solver

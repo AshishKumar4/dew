@@ -147,6 +147,12 @@ class OptimConfig:
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
     (`dew.training.optim.bf16_moments`), for adam and adamw
     only: half the optimizer state and less of the update's memory traffic."""
+    ema_profiles: tuple[float, ...] = ()
+    """Relative standard deviations of the power-function EMAs a run keeps
+    for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
+    et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
+    `dew.training.posthoc.reconstruct` builds an average of any other
+    relative standard deviation from the snapshots. Empty keeps none."""
 
 
 @dataclasses.dataclass(frozen=True)
