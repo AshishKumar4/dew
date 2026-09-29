@@ -51,6 +51,23 @@ def test_apg_walks_diffusers_adaptive_projected_guidance(name):
     assert_as_exact_as_the_reference(walked, arrays[f"{name}.result32"], arrays[f"{name}.result"], name)
 
 
+def test_apg_momentum_rests_where_guidance_is_off():
+    """Diffusers updates the momentum buffer only while guidance is on: the
+    steps past the interval leave the running average as it was."""
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    denoise = process.denoiser(Velocity(), {}, {"label": jnp.full((2,), 0.7)}, {"label": jnp.zeros((2,))})
+    walk = APG(6.0, eta=0.2, norm_threshold=0.8, momentum=-0.5, interval=(0.0, 0.5)).walk(denoise)
+    x = jax.random.normal(jax.random.PRNGKey(0), (2, 3, 4))
+    average = walk.init(x)
+    history = []
+    for t in np.asarray(process.times(7))[:-1]:
+        _, average = walk.step(x, jnp.full((2,), t), average)
+        history.append(np.asarray(average))
+    assert not np.array_equal(history[1], history[0])
+    for rest in history[4:]:
+        np.testing.assert_array_equal(rest, history[3])
+
+
 def test_apg_momentum_needs_a_walk():
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     with pytest.raises(ValueError, match="momentum"):

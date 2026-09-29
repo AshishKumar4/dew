@@ -163,7 +163,10 @@ class APG:
     0 keeps none), its norm over everything but the batch axis is clipped at
     `norm_threshold` (0 clips nothing), and its component parallel to the
     conditional output is scaled by `eta`: uncond + scale (orthogonal + eta
-    parallel). eta 1 without clipping or momentum is CFG.
+    parallel). eta 1 without clipping or momentum is CFG. Where guidance is
+    off (outside `interval`, or at scale 1) the average rests, as Diffusers'
+    buffer does; Diffusers' interval counts steps, [int(start N), int(stop
+    N)), where this one is closed in progress, so the two agree without one.
     """
 
     scale: float
@@ -187,9 +190,13 @@ class APG:
         parallel = jnp.sum(direction * unit, axis=axes, keepdims=True) * unit
         update = direction - parallel + self.eta * parallel
         scale = _scale(denoise, self.scale, self.interval, x, t)
-        # Outside the interval the reference returns the conditional output.
-        combined = jnp.where(scale == 1.0, output, unconditional + scale * update)
-        return denoise.convert(x, t, combined), output - unconditional + self.momentum * average
+        # Where guidance is off, outside the interval or at scale 1, the
+        # reference returns the conditional output and leaves its momentum
+        # buffer as it was.
+        off = scale == 1.0
+        combined = jnp.where(off, output, unconditional + scale * update)
+        running = jnp.where(off, average, output - unconditional + self.momentum * average)
+        return denoise.convert(x, t, combined), running
 
     def __call__(self, denoise: Denoiser) -> Predict:
         if self.momentum:
