@@ -195,3 +195,21 @@ def test_an_unsupported_config_is_refused(source, change):
     dc_ae_fields(config)
     with pytest.raises(ValueError):
         dc_ae_fields({**config, **change})
+
+
+def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
+    """`PretrainedAutoencoder` reads the checkpoint's own config: a DC-AE
+    builds as one, and a run's saved params bind without the weights."""
+    from dew.nn.autoencoders.dc_ae import DCAutoencoder
+    from dew.objectives.diffusion import PretrainedAutoencoder
+
+    shutil.copytree(source / "conv", tmp_path / "dc-ae")
+    spec = PretrainedAutoencoder(modelname=str(tmp_path / "dc-ae"), dtype="float32", latent_scale=0.5)
+    built = spec.build()
+    assert isinstance(built, DCAutoencoder) and built.latent_scale == 0.5
+    image = channels_last(dict(np.load(source / "conv" / "reference.npz"))["image"])
+    expected = np.asarray(built.encode(built.params, image))
+
+    (tmp_path / "dc-ae" / "diffusion_pytorch_model.safetensors").unlink()
+    rebound = spec.build(params=built.params)
+    np.testing.assert_array_equal(np.asarray(rebound.encode(rebound.params, image)), expected)
