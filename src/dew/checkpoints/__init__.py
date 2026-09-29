@@ -7,6 +7,16 @@ either global, and readable by any partition of the data, or one share's
 own offset, and readable only by a reader of that share; `dew.position` is
 the difference and `read_position` acts on it.
 
+The EMA copy is stored as its difference from the weights: each EMA leaf
+with its weight's floating dtype and shape as the XOR of the two, split
+into byte planes (a leading uint8 axis, least significant byte first). An
+average agrees with the weights it follows in its leading bits, and zstd,
+which orbax applies to every array, stores the runs of zeros that leaves
+for little: the EMA of a 176M-parameter DiT at step 1.35M takes 25% fewer
+bytes. The step's custom metadata records which leaves are stored so;
+`restore` and `stored` hand them back as they were trained, bit for bit,
+and a checkpoint that records none reads as it was written.
+
 Beside the persistent directory a run may keep a local checkpoint on every
 host, written more often, so a preempted pod resumes from its own disks
 instead of from storage. That is orbax's emergency checkpointing
@@ -28,6 +38,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, overload
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 from etils import epath
@@ -210,6 +221,156 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     return {jax.tree_util.keystr(path): str(leaf.sharding)
             for path, leaf in leaves
             if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) and leaf.sharding is not None}
+
+
+# The EMA copy is stored as byte planes of its difference from the weights.
+_UNSIGNED = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
+
+
+def _delta_planes(average: jax.Array, live: jax.Array) -> jax.Array:
+    """Return `average` XOR `live` split into byte planes, least significant first.
+
+    An average agrees with the weights it follows in its sign, exponent and
+    leading mantissa bits, so their XOR is zero there, and a plane of each
+    byte position hands zstd those zeros as long runs. Shifts, not a bitcast
+    to bytes, fix the plane order whatever the platform's byte order.
+    """
+    width = average.dtype.itemsize
+    delta = average.view(_UNSIGNED[width]) ^ live.view(_UNSIGNED[width])
+    return jnp.stack([(delta >> (8 * plane)).astype(jnp.uint8) for plane in range(width)])
+
+
+def _from_delta_planes(planes, live):
+    """Invert `_delta_planes`: the average whose difference from `live` is
+    `planes`. Works on numpy arrays and on jax arrays alike."""
+    kind = _UNSIGNED[live.dtype.itemsize]
+    delta = planes[0].astype(kind)
+    for plane in range(1, len(planes)):
+        delta = delta | (planes[plane].astype(kind) << (8 * plane))
+    return (delta ^ live.view(kind)).view(live.dtype)
+
+
+def _encode_deltas(averages: list[jax.Array], lives: list[jax.Array]) -> list[jax.Array]:
+    return [_delta_planes(average, live) for average, live in zip(averages, lives, strict=True)]
+
+
+@jax.jit(static_argnums=2)
+def _decode_deltas(stacks: list[jax.Array], lives: list[jax.Array], dtypes: tuple) -> list[jax.Array]:
+    return [_from_delta_planes(planes, live).astype(dtype)
+            for planes, live, dtype in zip(stacks, lives, dtypes, strict=True)]
+
+
+def _planes_sharding(sharding):
+    """Where a leaf's byte planes go: the leaf's placement, with the plane axis
+    whole on every device, in device memory."""
+    if isinstance(sharding, jax.sharding.NamedSharding):
+        return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(None, *sharding.spec),
+                                          memory_kind="device")
+    return sharding if sharding is None else sharding.with_memory_kind("device")
+
+
+def _stored_as_delta(average, live) -> bool:
+    """Whether the EMA leaf `average` is written as its difference from `live`.
+
+    Both have to be device arrays of one floating dtype and shape, placed
+    by a sharding the planes' can be derived from. An average in pinned
+    host memory is written as itself: orbax writes it from its own buffer
+    (`_written_in_place`), and differencing it would hold a second copy of
+    it in the memory it was put there to spare.
+    """
+    return (isinstance(average, jax.Array) and isinstance(live, jax.Array)
+            and average.dtype == live.dtype and average.shape == live.shape
+            and jnp.issubdtype(average.dtype, jnp.floating)
+            and isinstance(average.sharding, (jax.sharding.NamedSharding,
+                                              jax.sharding.SingleDeviceSharding))
+            and "pinned_host" not in (average.sharding.memory_kind, live.sharding.memory_kind))
+
+
+def _at(tree, path: jax.tree_util.KeyPath):
+    for key in path:
+        tree = tree[key.key]
+    return tree
+
+
+def _find(tree, path: jax.tree_util.KeyPath):
+    """The leaf of `tree` at `path`, or None where `tree` has none."""
+    for key in path:
+        if not isinstance(tree, Mapping) or key.key not in tree:
+            return None
+        tree = tree[key.key]
+    return tree
+
+
+def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], list[str]]:
+    """Return `state_tree` with its EMA leaves, where `_stored_as_delta` allows,
+    as byte planes of their difference from the weights, and the paths of
+    those leaves in the EMA tree, which the checkpoint's metadata records.
+
+    The planes are computed on the devices the EMA sits on, sharded as it
+    is, so a save holds one more EMA-sized buffer there until orbax has
+    copied it to the host. A save runs between steps, when the buffers a
+    step holds beside the state, among them a gradient as large as the
+    weights, are free.
+    """
+    ema = state_tree['ema']
+    if ema is None:
+        return state_tree, []
+    paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
+    leaves = [leaf for _, leaf in paths_leaves]
+    lives = [_at(state_tree['params'], path) for path, _ in paths_leaves]
+    chosen = [index for index, (average, live) in enumerate(zip(leaves, lives))
+              if _stored_as_delta(average, live)]
+    if not chosen:
+        return state_tree, []
+    planes = jax.jit(_encode_deltas, out_shardings=[_planes_sharding(leaves[index].sharding)
+                                                    for index in chosen])(
+        [leaves[index] for index in chosen], [lives[index] for index in chosen])
+    for index, stack in zip(chosen, planes, strict=True):
+        leaves[index] = stack
+    return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
+            [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
+
+
+def _ema_deltas(metadata, custom: Mapping | None) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
+    """The EMA leaves the checkpoint stores as byte planes, by path, each with
+    the shape and dtype of the weight it is the difference from, which are
+    its own. `custom` is the step's custom metadata, where a save records
+    those paths; a checkpoint written before the EMA was stored so records
+    none."""
+    recorded = set((custom or {}).get('ema_deltas', ()))
+    if not recorded:
+        return {}
+    deltas = {}
+    for path, _ in jax.tree_util.tree_flatten_with_path(dict(metadata['ema']))[0]:
+        if jax.tree_util.keystr(path) in recorded:
+            live = _at(metadata['params'], path)
+            deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
+    return deltas
+
+
+def _plane_template(ema, deltas):
+    """Return the EMA template with each leaf `deltas` names as the plane stack
+    the checkpoint holds, and those leaves as the template had them, by path."""
+    targets = {}
+
+    def planes(path, leaf):
+        if path not in deltas:
+            return leaf
+        targets[path] = leaf
+        return jax.ShapeDtypeStruct((np.dtype(deltas[path].dtype).itemsize, *leaf.shape), np.uint8,
+                                    sharding=_planes_sharding(getattr(leaf, "sharding", None)))
+    return jax.tree_util.tree_map_with_path(planes, ema), targets
+
+
+def _nested(leaves: Mapping[jax.tree_util.KeyPath, StateLeaf]) -> dict:
+    """The tree holding each of `leaves` at its path."""
+    tree = {}
+    for path, leaf in leaves.items():
+        node = tree
+        for key in path[:-1]:
+            node = node.setdefault(key.key, {})
+        node[path[-1].key] = leaf
+    return tree
 
 
 def _check_template(template, metadata, stored) -> None:
@@ -431,10 +592,11 @@ class Checkpoints:
         lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
         7B parameters, on hosts that keep the state there for want of room.
         """
-        state_tree = self._item(state, saved, share)
+        state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         persistent = self._open()
         with region("checkpoint.submit"):
-            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True)
+            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
+                            custom_metadata={'ema_deltas': deltas})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
@@ -448,13 +610,15 @@ class Checkpoints:
         reading shards from directories that do not hold them."""
         state_tree = self._item(state, saved, share)
         written = placement(state_tree)
+        state_tree, deltas = _with_ema_deltas(state_tree)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
         local = self._open_local()
         with region("checkpoint.submit_local"):
             local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
-                       custom_metadata={'processes': jax.process_count(), 'placement': written})
+                       custom_metadata={'processes': jax.process_count(), 'placement': written,
+                                        'ema_deltas': deltas})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()
@@ -483,9 +647,14 @@ class Checkpoints:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         metadata = checkpointer.item_metadata(step)
-        return {name: None if value is None else
-                jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
-                for name, value in dict(metadata).items()}
+        stored = {name: None if value is None else
+                  jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
+                  for name, value in dict(metadata).items()}
+        deltas = _ema_deltas(metadata, checkpointer.metadata(step).custom_metadata)
+        if deltas:
+            stored['ema'] = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: deltas.get(path, leaf), stored['ema'])
+        return stored
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
@@ -546,6 +715,7 @@ class Checkpoints:
                 f"persistent checkpoint at {self.path(step)}")
         metadata = checkpointer.item_metadata(step)
         stored = metadata.keys()
+        deltas = _ema_deltas(metadata, checkpointer.metadata(step).custom_metadata)
         _check_template(template, metadata, stored)
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
@@ -558,11 +728,19 @@ class Checkpoints:
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
+            if deltas:
+                restored = dict(restored)
+                restored['ema'] = jax.tree_util.tree_map_with_path(
+                    lambda path, leaf: _from_delta_planes(leaf, _at(restored['params'], path))
+                    if path in deltas else leaf, restored['ema'])
         else:
             state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
             if from_local:
                 self._check_placement(step, state_tree)
+            targets = {}
+            if deltas and state_tree.get('ema') is not None:
+                state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             restore_args = jax.tree.map(
                 lambda leaf: ocp.ArrayRestoreArgs(
                     sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
@@ -593,11 +771,54 @@ class Checkpoints:
                     f"which this run's state has: the checkpoint was written by a model "
                     f"or objective without them. Restore it with the model it was "
                     f"written with.")
+            if targets:
+                restored = {**restored, 'ema': self._averages(checkpointer, step, restored,
+                                                              targets, deltas)}
         restored = dict(restored)
         table = restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(template, restored, step)
         return restored, saved
+
+    @staticmethod
+    def _averages(checkpointer: ocp.CheckpointManager, step: int, restored,
+                  targets: dict, deltas: dict) -> Variables:
+        """Return the restored EMA tree with each plane stack of `targets` turned
+        back into the leaf it holds, typed and placed as the template has it.
+
+        Undoing a difference takes the weight it was taken from, in its
+        stored dtype. The weights the restore has just read serve where the
+        template asked for them in that dtype, off pinned host memory; the
+        rest are read here, placed as the leaves they undo.
+        """
+        lives, unread = {}, {}
+        for path, target in targets.items():
+            held = _find(restored.get('params'), path)
+            if (isinstance(held, jax.Array) and held.dtype == deltas[path].dtype
+                    and held.sharding.memory_kind != "pinned_host"):
+                lives[path] = held
+            else:
+                sharding = getattr(target, "sharding", None)
+                unread[path] = jax.ShapeDtypeStruct(
+                    deltas[path].shape, deltas[path].dtype,
+                    sharding=None if sharding is None else sharding.with_memory_kind("device"))
+        if unread:
+            item = {'params': _nested(unread)}
+            read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+                item=item, partial_restore=True, restore_args=jax.tree.map(
+                    lambda leaf: ocp.ArrayRestoreArgs(sharding=leaf.sharding), item)))
+            lives.update({path: _at(read['params'], path) for path in unread})
+
+        paths = list(targets)
+        values = _decode_deltas([_at(restored['ema'], path) for path in paths],
+                                [lives[path] for path in paths],
+                                tuple(np.dtype(targets[path].dtype) for path in paths))
+        averages = {}
+        for path, value in zip(paths, values, strict=True):
+            sharding = getattr(targets[path], "sharding", None)
+            averages[path] = value if sharding is None else jax.device_put(value, sharding)
+        return jax.tree_util.tree_map_with_path(lambda path, leaf: averages.get(path, leaf),
+                                                restored['ema'])
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
