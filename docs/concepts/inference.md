@@ -102,6 +102,17 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
+`TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`uv pip install qwix`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB, and in bf16 with int8 weights and activations its denoiser forward takes 21% less time, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). On that card (sm_89) XLA:GPU computes the model's depthwise convolutions wrongly in int8 and cannot compile them in fp8, so there they stay out:
+
+```python
+from dew.sampling import TextToImage
+from dew.training.quantization import Quantization
+
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
+served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
+images = served(["a red fox in a snowy forest"], steps=20, seed=0).host().images
+```
+
 ## Placement
 
 Weights are placed with `Layout.shardings` and its replication check, as the trainer places them. Checkpoint restore gets explicit shardings for the current devices; it does not reuse the topology the writer recorded.
@@ -123,6 +134,8 @@ A call takes exactly one of `seed` and `key`; `seed=n` means `jax.random.key(n)`
 Building a task from source defaults raises if an unsupported control is active, such as a repetition penalty or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` holds a default solver, guidance and step count; a call can override any of them, and `guidance=None` turns off classifier-free guidance.
 
 Every result array has `n` rows per prompt, in prompt order. `result.rows` is this process's real prompts times `n`. `Generation.text` returns one string per row in the same order, and each row has its own length, termination flag and likelihoods (`behavior_log_probs`, and `raw_log_probs` for the raw policy). `Generation.text` and `CanvasGeneration.text` decode the first time they are read and cache the strings; a result with no processor raises when asked for text. A tokenizer without a pad token needs no change: Dew tokenizes without padding, then pads the numeric rows and masks at the boundary `RunProcessor` uses.
+
+A `TextToImage` result's `pil()` returns the same real rows of an image batch as a list of 8-bit PIL images (RGB, or grayscale for one channel), quantized as `dew.artifacts.uint8_pixels` quantizes them. It refuses a video batch, and a result from `decode=False`, which has no images.
 
 Each prompt is prepared, tokenized and prefilled once for all its continuations, and its media goes through the processor once per call. The continuations then run one after another on the device, so decode time grows with `n`; the cache working memory of one continuation is reused by the next, so only the output arrays grow. Continuation zero draws with the prompt's own key, so `n=1` and continuation zero of a larger request are the same draw. Continuation `j` folds `j` into the key, so asking for more continuations does not change the ones already drawn.
 

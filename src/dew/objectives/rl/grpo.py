@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, Mean, Variables, mean_loss
+from dew.objectives.base import Aux, Mean, Shown, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
@@ -133,6 +133,10 @@ class GRPOObjective(LMObjective):
     section 3.1). `sampling_temperature` is the engine's when its reported
     likelihoods are processed ones; raw ones need 1.0.
     """
+
+    # The loss is a policy-gradient surrogate: its value is no measure of
+    # progress, so it is shown without a direction.
+    shown = {"loss": Shown()}
 
     _ema_is_reference = True
 

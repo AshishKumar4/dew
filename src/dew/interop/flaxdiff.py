@@ -225,7 +225,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
     from dew.nn.text_encoders import check_tree
-    from dew.objectives.diffusion.config import StableDiffusionAutoencoder, TextCondition
+    from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
     from dew.registry import resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 
@@ -254,7 +254,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     # FlaxDiff's encoders ran in bfloat16, and it read the VAE's main branch.
     condition = TextCondition(checkpoint=clip, dtype="bfloat16", unconditional=unconditional).build()
-    vae = StableDiffusionAutoencoder(modelname=records.text(options["modelname"], "modelname"),
+    vae = PretrainedAutoencoder(modelname=records.text(options["modelname"], "modelname"),
                                      revision="main").build()
     encoder = condition.encoder
     context = encoder.encode(encoder.params, encoder.tokenize([unconditional]))

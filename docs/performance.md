@@ -534,6 +534,52 @@ nothing raises an error. The losses go down (2.44 bf16 against 2.68 fp8 at
 width 256, 0.009 against 0.011 at width 1024, each after 14 steps from the
 same init). On this card, at these sizes, fp8 gives no speedup to adopt.
 
+## Quantized serving of the 176M text-to-image model, 2026-09-28
+
+`TextToImage.quantized` serves the denoiser with its kernels stored as int8
+or fp8 values and their scales, through Qwix's post-training quantization
+(`dew.training.quantization.quantize_for_serving`). `int8` and `fp8`
+quantize weights and activations, so a matmul of two quantized operands runs
+in the quantized dtype; `int8w` and `fp8w` quantize weights only and
+dequantize them into the compute dtype. The model is dewml/hybrid-dit-176m.
+Each row is one process of `tools/benchmark_quantized_serving.py`: forward
+is the warm guided denoiser call over 12 prompts (batch 24, median of 5),
+sample is the warm wall time of 12 images with 20 DPM-Solver++(2M) steps at
+guidance 5 including text encoding and decoding, CLIP is the mean ViT-L/14
+cosine over 12 prompts at seeds 0 and 1, and memory is the denoiser's weight
+bytes and the compiled forward's temporaries, in MiB.
+
+RTX 4080 16 GiB, jax 0.11.2, Qwix 0.1.8:
+
+| compute | precision | forward ms | sample s | CLIP | weights MiB | temporaries MiB |
+|---|---|---:|---:|---:|---:|---:|
+| fp32 | none | 53.3 | 1.24 | 0.2474 | 670 | 182 |
+| fp32 | int8w | 52.0 | 1.26 | 0.2489 | 183 | 183 |
+| fp32 | fp8w | 53.8 | 1.27 | 0.2462 | 183 | 183 |
+| fp32 | int8, fusion in fp32 | 34.7 | 0.95 | 0.2470 | 183 | 158 |
+| fp32 | fp8, fusion in fp32 | 32.5 | 0.87 | 0.2471 | 183 | 173 |
+| bf16 | none | 36.0 | 0.82 | 0.2481 | 670 | 128 |
+| bf16 | int8w | 34.8 | 0.81 | 0.2483 | 183 | 110 |
+| bf16 | fp8w | 34.8 | 0.87 | 0.2472 | 183 | 110 |
+| bf16 | int8, fusion in bf16 | 28.3 | 0.72 | 0.2490 | 183 | 108 |
+| bf16 | fp8, fusion in bf16 | 28.3 | 0.78 | 0.2464 | 183 | 106 |
+
+Weight-only quantization saves memory, not time: the kernels take 27% of
+their fp32 bytes and the forward runs as fast as the unquantized one in the
+same compute dtype. Weights and activations in int8 or fp8 take 21% off the
+bf16 forward's time (28.3 ms against 36.0) and 35% to 39% off the fp32
+one's (34.7 and 32.5 ms against 53.3). Every
+quantized row keeps CLIP within 0.002 of fp32.
+
+The spatial fusion's depthwise convolutions stay unquantized on this card
+(`--float spatial_fusion`), because XLA:GPU gets them wrong in both
+dtypes. In int8, a convolution with one or two input channels per group
+returns wrong values without an error: the whole-model int8 row runs in
+42.3 ms and scores CLIP 0.1391. In fp8 the same convolutions fail to
+compile (`Failed to get configs for: 36 out of 126 instructions`, one per
+depthwise convolution). Both are XLA:GPU defects with plain-JAX
+reproductions; Dew does not work around them.
+
 ## Kernel choices per generation, 2026-09-22
 
 Each choice below is made in one place per kernel and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...); a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.

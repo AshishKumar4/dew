@@ -10,12 +10,12 @@ same file.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
-from dew.data import ImageDataset, OnlineImages, OxfordFlowers, VideoDataset
+from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
@@ -103,8 +103,37 @@ class TextCondition:
 
 
 @dataclasses.dataclass(frozen=True)
-class StableDiffusionAutoencoder:
-    """Run latent diffusion behind the vendored Stable Diffusion VAE."""
+class AudioCondition:
+    """Condition the model on each clip's audio, through the video dataset's
+    own audio model.
+
+    The dataset's `audio_model` names the `hf_audio` tower, whose feature
+    extractor already wrote the batch's `audio` field, and the dataset's
+    clip length sets the waveform length every clip and the silent
+    unconditional input are encoded at, so the two can never disagree.
+    """
+
+    encoder: ClassVar[str] = "hf_audio"
+    dtype: DtypeName | None = None
+    """The tower's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """Storage precision when loading source weights; supplied params retain theirs."""
+
+    def build(self, clips: VideoDataset, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Bind supplied tower params without a source weight load or storage cast."""
+        return Condition(
+            rebuild(self.encoder, {"checkpoint": clips.audio_model, "seconds": clips.audio_seconds,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
+                                   "param_dtype": self.param_dtype}, params=params),
+            field="audio", unconditional=0.0)
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedAutoencoder:
+    """Run latent diffusion behind a published autoencoder: a Stable
+    Diffusion AutoencoderKL, or a DC-AE where the checkpoint's config names
+    `AutoencoderDC` (`dew.nn.autoencoders.pretrained.load_autoencoder`)."""
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
@@ -114,14 +143,13 @@ class StableDiffusionAutoencoder:
     """Per-dataset latent statistics; None keeps the checkpoint's."""
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
-        """Bind supplied VAE params while reconstructing its model metadata."""
-        from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+        """Bind supplied params while reconstructing the model from its config."""
+        from dew.nn.autoencoders.pretrained import load_autoencoder
         from dew.registry import resolve_dtype
 
-        return StableDiffusionVAE(self.modelname, revision=self.revision,
-                                  dtype=resolve_dtype(self.dtype),
-                                  latent_shift=self.latent_shift, latent_scale=self.latent_scale,
-                                  params=params)
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=resolve_dtype(self.dtype),
+                                latent_shift=self.latent_shift, latent_scale=self.latent_scale,
+                                params=params)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,8 +174,12 @@ class DiffusionRunConfig(RunConfig):
     """None disables EMA; 1.0 retains a frozen copy."""
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
     """The text condition, under the models' `textcontext` keyword; None
-    trains unconditionally."""
-    autoencoder: StableDiffusionAutoencoder | None = None
+    trains unconditionally, or on `audio`."""
+    audio: AudioCondition | None = None
+    """The audio condition, under the same `textcontext` keyword in place of
+    text, so it needs `text` None and a `VideoDataset`, whose clips carry the
+    audio."""
+    autoencoder: PretrainedAutoencoder | None = None
     """Set for latent diffusion; None trains in pixel space."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
@@ -172,14 +204,24 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError(
                 f"val_metrics names {unknown}, which no metric is registered under; "
                 f"the registered metrics are {sorted(metrics)}")
+        if self.audio is not None and self.text is not None:
+            raise ValueError(
+                "the models take one context under textcontext, and this run names both "
+                "text and audio; set text to None to condition on audio")
+        if self.audio is not None and not isinstance(self.data, VideoDataset):
+            raise ValueError(
+                f"audio conditioning reads the audio of a VideoDataset's clips, and "
+                f"{datasets.name_of(type(self.data))} carries none")
 
     def sample_field(self) -> Field:
         """The batch field the model generates, at the resolution the data comes in."""
         spec = self.data
-        if isinstance(spec, (ImageDataset, OnlineImages)):
-            return Field("image", (spec.image_size, spec.image_size, 3))
         if isinstance(spec, VideoDataset):
             return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
+        if isinstance(spec, OnlineVideos):
+            return Field("video", (spec.frames, spec.image_size, spec.image_size, 3))
+        if isinstance(spec, (ImageDataset, OnlineImages)):
+            return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(
             f"the diffusion recipe trains on image or video datasets, not "
             f"{datasets.name_of(type(spec))}")
@@ -194,12 +236,17 @@ class DiffusionRunConfig(RunConfig):
         return fields
 
     @property
+    def context(self) -> TextCondition | AudioCondition | None:
+        """The condition the model reads under `textcontext`, if any."""
+        return self.text if self.text is not None else self.audio
+
+    @property
     def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
         """Parameter ownership in the variables tree this config builds."""
         roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
-        if self.text is not None:
+        if self.context is not None:
             prefix = ("encoders", "textcontext")
-            collections = encoders[self.text.encoder].parameter_collections
+            collections = encoders[self.context.encoder].parameter_collections
             roots.extend((prefix,) if collections is None else
                          ((*prefix, collection) for collection in collections))
         if self.autoencoder is not None:
@@ -213,16 +260,22 @@ class DiffusionRunConfig(RunConfig):
         the VAE read only configuration/tokenizer metadata and bind their
         respective subtrees without a source weight load or storage cast.
         """
-        if self.text is None and self.model.architecture in TEXT_STREAM_MODELS:
+        if self.context is None and self.model.architecture in TEXT_STREAM_MODELS:
             raise ValueError(
                 f"an unconditional run needs a model that attends without text, and "
                 f"{self.model.architecture!r} runs the text as a second stream through "
                 "every block")
         autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
             params=None if variables is None else variables["autoencoder"]))
-        conditions = {} if self.text is None else {"textcontext": self.text.build(
-            params=None if variables is None else variables["encoders"]["textcontext"],
-            dtype=self.model.dtype)}
+        params = (None if variables is None or self.context is None
+                  else variables["encoders"]["textcontext"])
+        if self.text is not None:
+            conditions = {"textcontext": self.text.build(params=params, dtype=self.model.dtype)}
+        elif self.audio is not None and isinstance(self.data, VideoDataset):
+            conditions = {"textcontext": self.audio.build(self.data, params=params,
+                                                          dtype=self.model.dtype)}
+        else:
+            conditions = {}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
         model = models.build(self.model.architecture, self.model_fields(autoencoder))
         process = self.preset()

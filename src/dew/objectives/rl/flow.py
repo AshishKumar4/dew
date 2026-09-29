@@ -27,7 +27,7 @@ from dew.artifacts import agree_process_phase, broadcast_from_process_zero, coll
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Mean, Step, Variables
+from dew.objectives.base import Aux, Batch, Mean, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
@@ -74,6 +74,9 @@ class FlowGRPOObjective(DiffusionObjective):
     model variables dict, as returned by model.init; encoders and an optional
     autoencoder are supplied through the existing diffusion input contract.
     """
+
+    # The loss is a policy-gradient surrogate, shown without a direction.
+    shown = {"loss": Shown(), "reward": Shown(better="higher")}
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
                  sde: FlowSDE = FlowSDE(), beta: float = 0.0,

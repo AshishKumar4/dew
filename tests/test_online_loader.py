@@ -29,7 +29,7 @@ import PIL.Image
 import pytest
 
 from dew.data import DataPartition, Loading, online_loader
-from dew.data.online_loader import Fetch, ImageStream
+from dew.data.online_loader import Fetch, UrlStream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -47,15 +47,14 @@ def _sample(index, size=8):
 
 
 def _stream(monkeypatch, producer, queue_timeout=0.05, **settings):
-    """An ImageStream fed by `producer` instead of the fetcher pool.
+    """A UrlStream fed by `producer` instead of the fetcher pool.
 
     The stream binds the producer from the module global as it is built, so
     patching the name keeps the real one, and its process pool, out of reach.
     """
     monkeypatch.setattr(online_loader, "fetch_rows", producer)
-    return ImageStream(_StubRows(64), batch=BATCH, size=8, min_size=4, workers=1,
-                       threads=1, timeout=1, retries=0, prefetch=4,
-                       queue_timeout=queue_timeout, **settings)
+    return UrlStream(_StubRows(64), batch=BATCH, fetch=Fetch(size=8, min_size=4, timeout=1, retries=0),
+                     workers=1, threads=1, prefetch=4, queue_timeout=queue_timeout, **settings)
 
 
 class _StubRows:
@@ -489,8 +488,8 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
     from dew.data import OnlineImages
 
     monkeypatch.setattr(online_loader, "fetch_rows", exhausted)
-    monkeypatch.setattr(online_loader, "ImageStream",
-                        functools.partial(ImageStream, queue_timeout=0.05))
+    monkeypatch.setattr(online_loader, "UrlStream",
+                        functools.partial(UrlStream, queue_timeout=0.05))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(4))
     with closing(OnlineImages(sources=("fake_online",), image_size=4,
                           loading=Loading(workers=1)).load(batch=4).train(DataPartition())) as loader:
@@ -558,9 +557,8 @@ def test_abandoned_full_image_queue_releases_real_spawned_workers(tmp_path):
         pixels = np.random.default_rng(index).integers(0, 256, (64, 64, 3), np.uint8)
         (tmp_path / f"{index}.jpg").write_bytes(_png(pixels))
     before = {child.pid for child in multiprocessing.active_children()}
-    stream = ImageStream(_StubRows(12, passes=10000, root=str(tmp_path)),
-                         batch=1, size=64, min_size=32, workers=1, threads=1,
-                         timeout=1, retries=0, prefetch=1)
+    stream = UrlStream(_StubRows(12, passes=10000, root=str(tmp_path)),
+                       batch=1, fetch=FETCH, workers=1, threads=1, prefetch=1)
     try:
         batch = next(stream)
         assert batch["image"].shape == (1, 64, 64, 3)
@@ -582,9 +580,9 @@ def _cancel_image_packet_probe(directory):
     import multiprocessing
     from multiprocessing.connection import Connection
 
-    stream = ImageStream(_StubRows(12, passes=10000, root=directory),
-                         batch=1, size=256, min_size=32, workers=1, threads=1,
-                         timeout=1, retries=0, prefetch=1)
+    stream = UrlStream(_StubRows(12, passes=10000, root=directory),
+                       batch=1, fetch=Fetch(size=256, min_size=32, timeout=1, retries=0),
+                       workers=1, threads=1, prefetch=1)
     header, resume = threading.Event(), threading.Event()
     failures = []
     original_recv = Connection._recv
@@ -668,14 +666,108 @@ def test_closed_consumer_only_image_queue_releases_pipe_descriptors(monkeypatch)
         return
 
     monkeypatch.setattr(online_loader, "fetch_rows", exhausted)
-    stream = ImageStream(_StubRows(1), batch=1, size=8, min_size=4, workers=1,
-                         threads=1, timeout=1, retries=0, prefetch=1)
+    stream = UrlStream(_StubRows(1), batch=1, fetch=Fetch(size=8, min_size=4, timeout=1, retries=0),
+                       workers=1, threads=1, prefetch=1)
     stream.close()
     gc.collect()
     after = len(list(descriptors.iterdir()))
     assert after == before
-    print(f"retained closed ImageStream: pipe descriptor baseline={before}, after={after}")
+    print(f"retained closed UrlStream: pipe descriptor baseline={before}, after={after}")
     # Keep the closed stream alive: deleting the owner must not be necessary.
     with pytest.raises(StopIteration):
         next(stream)
 
+
+# ---------------------------------------------------------------------------------
+# Video clips by url, served over HTTP from tmp_path
+# ---------------------------------------------------------------------------------
+
+CLIP_FPS = 25
+CLIP_FRAMES = 20
+CLIP_GREY_STEP = 10
+
+
+def _video(path, frames=CLIP_FRAMES, side=32):
+    """A lossless clip whose frame f is a flat grey of CLIP_GREY_STEP * f,
+    written by the ffmpeg the `av` extra bundles."""
+    moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
+    import subprocess
+
+    pixels = np.stack([np.full((side, side, 3), CLIP_GREY_STEP * index, np.uint8)
+                       for index in range(frames)])
+    raw = path.with_suffix(".raw")
+    raw.write_bytes(pixels.tobytes())
+    subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", "-f", "rawvideo",
+                    "-pix_fmt", "rgb24", "-s", f"{side}x{side}", "-r", str(CLIP_FPS),
+                    "-i", str(raw), "-c:v", "ffv1", str(path)], check=True)
+    raw.unlink()
+
+
+@contextmanager
+def _served(directory):
+    """`directory` over HTTP on a free local port, yielding its base url."""
+    import http.server
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
+    handler.log_message = lambda *args: None
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def clips(tmp_path):
+    _video(tmp_path / "clip.mkv")
+    _video(tmp_path / "short.mkv", frames=3)
+    _video(tmp_path / "small.mkv", side=16)
+    (tmp_path / "still.png").write_bytes(_png(np.full((32, 32, 3), 40, np.uint8)))
+    (tmp_path / "junk.mp4").write_bytes(b"not a video at all")
+    with _served(tmp_path) as base:
+        yield base
+
+
+def test_a_fetched_video_reaches_the_queue_as_consecutive_frames(clips, monkeypatch):
+    """A clip url yields `frames` consecutive frames at the stream's size; a
+    still image, bytes that are no video, a video shorter than the clip, one
+    under the minimum size and a missing url are each dropped as their url."""
+    monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
+    fetch = Fetch(size=24, min_size=32, timeout=5, retries=0, frames=4)
+    sink = queue.Queue()
+
+    for name in ("clip.mkv", "still.png", "junk.mp4", "short.mkv", "small.mkv", "gone.mkv"):
+        online_loader.fetch_one(f"{clips}/{name}", name, sink, fetch)
+
+    clip, caption = sink.get_nowait()
+    assert caption == "clip.mkv" and clip.shape == (4, 24, 24, 3) and clip.dtype == np.uint8
+    indices = [round(int(frame[12, 12, 0]) / CLIP_GREY_STEP) for frame in clip]
+    assert indices == list(range(indices[0], indices[0] + 4))
+    assert [sink.get_nowait() for _ in range(5)] == [
+        f"{clips}/{name}" for name in ("still.png", "junk.mp4", "short.mkv", "small.mkv", "gone.mkv")]
+
+
+def test_the_online_video_spec_streams_clips_through_the_real_pool(clips):
+    """OnlineVideos over a table of HTTP urls, fetched by the spawned pool:
+    a batch is clips under `video` with their captions, which is the field
+    and shape a diffusion run over the spec generates."""
+    hf = pytest.importorskip("datasets")
+    from dew.data import OnlineVideos
+    from dew.objectives.diffusion.config import DiffusionRunConfig
+
+    spec = OnlineVideos(sources=("served",), image_size=16, min_image_size=16, frames=4,
+                        timeout=5, retries=0, loading=Loading(workers=1, threads=2, worker_buffer=1))
+    rows = hf.Dataset.from_dict({"url": [f"{clips}/clip.mkv", f"{clips}/junk.mp4"],
+                                 "caption": ["a grey ramp", "junk"]})
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(online_loader, "load_rows", lambda sources: rows)
+        dataset = spec.load(batch=2, tokenize=lambda captions: {"caption": np.asarray(captions)})
+    with closing(dataset.train(DataPartition())) as loader:
+        batch = next(loader)
+
+    assert batch["video"].shape == (2, 4, 16, 16, 3)
+    assert list(batch["caption"]) == ["a grey ramp", "a grey ramp"]
+    assert DiffusionRunConfig(data=spec, text=None).sample_field().shape == (4, 16, 16, 3)
