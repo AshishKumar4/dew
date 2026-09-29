@@ -170,7 +170,7 @@ def test_a_missing_tensor_is_refused(source, tmp_path):
     tensors = load_file(weights)
     del tensors["encoder.down_blocks.2.1.attn.to_qkv_multiscale.0.proj_out.weight"]
     save_file(tensors, weights)
-    with pytest.raises(ValueError, match="proj_out"):
+    with pytest.raises(ValueError, match="down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
         load_dc_ae(tmp_path / "vae")
 
 
@@ -213,3 +213,14 @@ def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
     (tmp_path / "dc-ae" / "diffusion_pytorch_model.safetensors").unlink()
     rebound = spec.build(params=built.params)
     np.testing.assert_array_equal(np.asarray(rebound.encode(rebound.params, image)), expected)
+
+
+def test_every_parameter_takes_a_layout_the_sharding_rules_can_place(variant):
+    """Placement reads a leaf's axes from its module's name; a DC-AE name
+    that matched another module's declaration of fewer axes (a bare
+    `proj_out`, a 2-D projection) left a run unable to place its variables."""
+    from dew.nn.sharding import declared_axes
+
+    _, (_, params, _, _), _ = variant
+    for path, leaf in jax.tree_util.tree_leaves_with_path({"autoencoder": params}):
+        declared_axes(path, np.ndim(leaf))
