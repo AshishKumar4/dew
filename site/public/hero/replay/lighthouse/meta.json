@@ -1,6 +1,6 @@
 {
- "prompt": "the northern lights over a frozen lake at night",
- "seed": 0,
+ "prompt": "a lighthouse at sunset, oil painting",
+ "seed": 1,
  "sampler": "DPMSolverMultistep",
  "steps": 30,
  "cfg": 5.0,
@@ -48,9 +48,9 @@
  "columns": 8,
  "crop": [
   0,
-  39,
+  42,
   256,
-  210
+  213
  ],
  "width": 256,
  "height": 171

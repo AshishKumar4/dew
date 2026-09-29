@@ -46,6 +46,8 @@ MAX_OUTPUT = 2_000_000  # characters of output from one cell; the rest is droppe
 MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well under the relay's 32 MiB
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
+SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+               "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "XLA_FLAGS")
 
 
 class SandboxedKernelManager(AsyncKernelManager):
@@ -65,6 +67,9 @@ class SandboxedKernelManager(AsyncKernelManager):
             # PyTorch, and no ipywidgets for tqdm's notebook progress bars.
             "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
             "PYTHONWARNINGS": "ignore:IProgress not found",
+            # The text-to-image model and the compiled programs the image was built
+            # with (see the Dockerfile), read without a network.
+            **{name: os.environ[name] for name in SAMPLER_ENV},
         }
         await super()._async_launch_kernel(
             limited, **{**kw, "env": env, "cwd": WORKDIR},

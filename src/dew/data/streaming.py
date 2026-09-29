@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .online_loader import Fetch
 
 
+@datasets("online_images")
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
     """Fetches images by url as they are read, an endless stream.
