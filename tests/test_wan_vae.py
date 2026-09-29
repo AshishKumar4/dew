@@ -214,3 +214,33 @@ def test_an_unsupported_config_is_refused(source, change):
     wan_vae_fields(config)
     with pytest.raises(ValueError):
         wan_vae_fields({**config, **change})
+
+
+def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
+    """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
+    for clips of 1 + 4k, trains, and samples clips of the length it read."""
+    import optax
+    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import Dataset, VideoDataset
+    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+    from dew.registry import samplers
+    from dew.training import Trainer
+
+    config = DiffusionRunConfig(
+        model=ModelConfig("video_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
+                          dtype="float32", attention_impl="reference"),
+        data=VideoDataset(frame_size=32, frames=9), trainer=TrainerConfig(batch_size=8, steps=1),
+        sampler=samplers.Euler(), sampling_steps=2, val_metrics=(),
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"))
+    objective = config.build()
+    assert objective.latent_shape == (3, 4, 4, 4)
+    clips = (np.random.default_rng(0).random((8, 9, 32, 32, 3)) * 255).astype(np.uint8)
+    batch = {"video": clips, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
+        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        steps=1, log_every=100)
+    sampled = objective.pipeline(state)(["a", "b"], seed=0).host()
+    assert sampled.images.shape == (2, 9, 32, 32, 3)
