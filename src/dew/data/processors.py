@@ -46,11 +46,10 @@ class AutoTextTokenizer:
 
 
 class AutoAudioProcessor:
-    """Turns raw waveforms into the inputs of any HF audio model.
+    """Runs a Hugging Face audio feature extractor.
 
-    Whatever keys the model's feature extractor emits (`input_values` for
-    wav2vec2/HuBERT, `input_features` for Whisper/AST, ...) pass through
-    unchanged, so switching audio models needs no change here.
+    Returns its arrays unchanged: `input_values` for wav2vec2,
+    `input_features` for Whisper.
     """
 
     def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
