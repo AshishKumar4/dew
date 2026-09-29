@@ -24,7 +24,7 @@ the step count `num_batches_tracked` affects nothing in eval and is not read.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -268,13 +268,14 @@ class _Encoder(nn.Module):
         if layers[0] > 0:
             x = _conv(channels[0], 3, self.dtype, "conv_in")(image)
         else:
-            x = _Down(self.image_channels, channels[1], self.unshuffle, False, self.dtype, name="conv_in")(image)
+            x = _Down(self.image_channels, channels[1], self.unshuffle, shortcut=False, dtype=self.dtype,
+                      name="conv_in")(image)
         for level, (features, count) in enumerate(zip(channels, layers, strict=True)):
             for index in range(count):
                 x = _block(self.blocks[level], features, self.head_dim, self.scales[level], "rms_norm", "silu",
                            self.dtype, f"down_blocks_{level}_{index}")(x)
             if level < len(channels) - 1 and count > 0:
-                x = _Down(features, channels[level + 1], self.unshuffle, True, self.dtype,
+                x = _Down(features, channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
         return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(x, self.latent_channels)
 
@@ -301,7 +302,7 @@ class _Decoder(nn.Module):
             count = layers[level]
             upsampled = level < len(channels) - 1 and count > 0
             if upsampled:
-                x = _Up(channels[level + 1], channels[level], self.interpolate, True, self.dtype,
+                x = _Up(channels[level + 1], channels[level], self.interpolate, shortcut=True, dtype=self.dtype,
                         name=f"up_blocks_{level}_0")(x)
             for index in range(count):
                 x = _block(self.blocks[level], channels[level], self.head_dim, self.scales[level],
@@ -311,7 +312,8 @@ class _Decoder(nn.Module):
         x = nn.relu(_RMSNorm(features, self.dtype, name="norm_out")(x))
         if layers[0] > 0:
             return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
-        return _Up(features, self.image_channels, self.interpolate, False, self.dtype, name="conv_out")(x)
+        return _Up(features, self.image_channels, self.interpolate, shortcut=False, dtype=self.dtype,
+                   name="conv_out")(x)
 
 
 class DCAEFields(TypedDict):
