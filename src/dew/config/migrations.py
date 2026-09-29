@@ -12,27 +12,26 @@ A change that adds, renames or removes a recorded field appends one step.
 from __future__ import annotations
 
 import copy
-import dataclasses
 from collections.abc import Callable, Mapping
 
 type Record = dict[str, object]
 
 
-def _declares(cls: type, name: str) -> bool:
-    return any(field.name == name for field in dataclasses.fields(cls))
-
-
 def _before_versions(cls: type, record: Record) -> Record:
-    """Version 0 to 1. Records written before versions lack the fields that
-    came after them:
+    """Version 0 to 1. A `DiffusionRunConfig` record written before versions
+    lacks the fields that came after it:
 
-    - `audio` (`DiffusionRunConfig`, fa22d91b): the run conditioned on no
-      audio, None.
+    - `audio` (fa22d91b): the run conditioned on no audio, None.
     - EDM's `regime` (d9f9a26c): the record stores `P_mean` and `P_std`,
       which override any regime, so it has none, None.
+
+    Any other run's record is as it was.
     """
-    if _declares(cls, "audio"):
-        record.setdefault("audio", None)
+    from dew.objectives.diffusion.config import DiffusionRunConfig
+
+    if not issubclass(cls, DiffusionRunConfig):
+        return record
+    record.setdefault("audio", None)
     preset = record.get("preset")
     if isinstance(preset, dict) and preset.get("name") == "edm" and isinstance(preset.get("fields"), dict):
         preset["fields"].setdefault("regime", None)
