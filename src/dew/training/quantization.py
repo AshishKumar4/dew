@@ -171,6 +171,28 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
     return not any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes)
 
 
+def _refuse_grouped_on_gpu() -> None:
+    """Refuse a grouped convolution with quantized activations on a GPU,
+    where XLA:GPU (jax 0.11.2) computes one wrongly or not at all.
+
+    In int8, with one or two input channels per group and the int32 result
+    scaled in float, plain JAX returns wrong values without an error on the
+    RTX 4080 (75% and 50% of the outputs), and on the A100 quantizing the
+    176M text-to-image model's depthwise convolutions dropped its CLIP score
+    from 0.247 to 0.137. With four per group Dew's int8 convolution failed
+    to compile on the RTX 4080, as a plain int8 convolution with int32
+    results does there at every group width. In fp8, one or two input
+    channels per group fail to compile on the RTX 4080, whose fp8 is
+    native."""
+    if jax.default_backend() == "gpu":
+        raise ValueError(
+            "XLA:GPU computes a grouped convolution with int8 or fp8 activations wrongly or not at "
+            "all, depending on the GPU, the dtype and the channels per group, so Dew refuses to "
+            "quantize one; leave it out of Quantization.patterns, as "
+            "patterns=('^(?!.*spatial_fusion).*',) does for the hybrid DiT's depthwise "
+            "convolutions, or quantize weights only (weight_only=True)")
+
+
 @functools.cache
 def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
@@ -223,6 +245,7 @@ def _providers() -> tuple[type, type]:
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             if feature_group_count == 1 or rule is None or rule.act_qtype is None:
                 return convolve(lhs=lhs)
+            _refuse_grouped_on_gpu()
             numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             scales = _group_scales(lhs, numbers, feature_group_count)
             batch, feature = numbers.lhs_spec[:2]
