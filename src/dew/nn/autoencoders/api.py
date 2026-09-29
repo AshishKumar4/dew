@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew.objectives.base import Variables
@@ -11,20 +12,22 @@ class AutoEncoder(ABC):
     """An encoder and decoder pair a latent diffusion model trains behind.
 
     A subclass encodes and decodes one batch of frames, `[B, H, W, C]` to
-    `[B, h, w, c]` and back; `encode` and `decode` here flatten video
-    `[B, T, H, W, C]` to frames around that and apply the latent
+    `[B, h, w, c]` and back; `encode` and `decode` here take video
+    `[B, T, H, W, C]` frame by frame unless the subclass encodes time itself
+    (`encode_video`, `decode_video`, `latent_shape`), and apply the latent
     normalization. Latents are normalized as (z - latent_shift) * latent_scale
-    on the way out and inverted on the way in, the SD3 convention. The
-    defaults are the identity; set them to the dataset's own latent mean and
-    1/std so the diffusion model sees roughly unit-variance, zero-mean inputs.
+    on the way out and inverted on the way in, the SD3 convention; each is
+    one number or one per latent channel. The defaults are the identity; set
+    them to the dataset's own latent mean and 1/std so the diffusion model
+    sees roughly unit-variance, zero-mean inputs.
 
     The weights are an argument, as a `ConditionEncoder`'s are: `params` holds
     what a run loaded, and every call takes the tree to use, so the layout
     places the weights and the checkpoint carries them.
     """
 
-    latent_shift: float = 0.0
-    latent_scale: float = 1.0
+    latent_shift: float | np.ndarray = 0.0
+    latent_scale: float | np.ndarray = 1.0
     params: Variables
 
     @abstractmethod
@@ -47,27 +50,39 @@ class AutoEncoder(ABC):
     def latent_channels(self) -> int:
         """c, the channels of a latent."""
 
+    def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        """The latent shape of one example of `shape`: `(H, W, C)` or, for
+        video, `(T, H, W, C)`."""
+        *lead, height, width, _ = shape
+        factor = self.downscale_factor
+        return (*lead, height // factor, width // factor, self.latent_channels)
+
+    def encode_video(self, params, x: jnp.ndarray, key: jax.Array | None = None) -> jnp.ndarray:
+        """Video `[B, T, H, W, C]` to raw latents, frame by frame."""
+        batch_size, seq_len, height, width, channels = x.shape
+        latent = self.encode_batch(params, x.reshape(-1, height, width, channels), key=key)
+        return latent.reshape(batch_size, seq_len, *latent.shape[1:])
+
+    def decode_video(self, params, z: jnp.ndarray) -> jnp.ndarray:
+        """Raw latents `[B, t, h, w, c]` to video, frame by frame."""
+        batch_size, seq_len, height, width, channels = z.shape
+        decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
+        return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
+
     def encode(self, params, x: jnp.ndarray,
                key: jax.Array | None = None) -> jnp.ndarray:
         """Images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized
-        latents with the same leading axes."""
-        if x.ndim == 5:
-            batch_size, seq_len, height, width, channels = x.shape
-            latent = self.encode_batch(params, x.reshape(-1, height, width, channels), key=key)
-            latent = latent.reshape(batch_size, seq_len, *latent.shape[1:])
-        else:
-            latent = self.encode_batch(params, x, key=key)
-        return (latent - self.latent_shift) * self.latent_scale
+        latents."""
+        latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
+        shift, scale = (jnp.asarray(value, latent.dtype) for value in (self.latent_shift, self.latent_scale))
+        return (latent - shift) * scale
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
-        """Normalized latents `[B, h, w, c]` or `[B, T, h, w, c]` back to
+        """Normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to
         images or video."""
-        z = z / self.latent_scale + self.latent_shift
-        if z.ndim == 5:
-            batch_size, seq_len, height, width, channels = z.shape
-            decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
-            return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
-        return self.decode_batch(params, z)
+        shift, scale = (jnp.asarray(value, z.dtype) for value in (self.latent_shift, self.latent_scale))
+        z = z / scale + shift
+        return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
                  key: jax.Array | None = None) -> jnp.ndarray:

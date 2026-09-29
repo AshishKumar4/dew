@@ -208,11 +208,7 @@ class TextToImage:
         """The per-example shape the model denoises: the sample field's, or
         its latent when an autoencoder sits in front of the model."""
         shape = self.inputs.sample.shape
-        if self.autoencoder is None:
-            return shape
-        *lead, height, width, _ = shape
-        factor = self.autoencoder.downscale_factor
-        return (*lead, height // factor, width // factor, self.autoencoder.latent_channels)
+        return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
     @property
     def _conditions(self) -> tuple[tuple[str, object], ...]:
