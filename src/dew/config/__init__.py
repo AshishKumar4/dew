@@ -11,10 +11,11 @@ turns into a subcommand (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
-so inference rebuilds a run from what training was built from. The record
-carries its version, and an older one is migrated to today's fields
-(`dew.config.migrations`); after that a field the class does not have, or one
-the file lacks, raises.
+so inference rebuilds a run from what training was built from. A field the
+file lacks takes its declared default, so a field added later must default to
+what runs recorded before it did; tests/fixtures/record_defaults.json holds
+every recorded field's default to that. A field the class does not have
+raises.
 """
 
 import dataclasses
@@ -40,7 +41,6 @@ import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.config import migrations
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
 from dew.lora import LoRA, attach
@@ -389,18 +389,27 @@ def _recorded(field: dataclasses.Field) -> bool:
     return field.init and field.metadata.get("record", True)
 
 
+def _has_default(field: dataclasses.Field) -> bool:
+    return field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
+
+
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
+    """The record's fields as `cls` declares them. A field the record lacks
+    takes its declared default, which says what runs recorded before the
+    field existed did (tests/fixtures/record_defaults.json holds every
+    default to that); a field `cls` does not declare, or a required one the
+    record lacks, raises."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
-    declared = [f.name for f in dataclasses.fields(cls) if _recorded(f)]
-    unknown = sorted(set(values) - set(declared))
-    missing = [name for name in declared if name not in values]
+    declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
+    unknown = sorted(set(values) - {f.name for f in declared})
+    missing = [f.name for f in declared if f.name not in values and not _has_default(f)]
     if unknown or missing:
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {name: _rebuild(_declared_type(cls, name), registry.configured(values[name]))
-            for name in declared}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
+            for f in declared if f.name in values}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
@@ -484,21 +493,19 @@ class RunConfig:
     adapts the objective's module and freezes every other leaf."""
 
     def to_dict(self) -> dict[str, JSON]:
-        """Return a JSON-safe record of the run and its record version
-        (`dew.config.migrations`).
+        """Return a JSON-safe record of the run.
 
         A registered member is written as its name and its fields.
         """
-        return {"version": migrations.VERSION,
-                **{field.name: _to_json(getattr(self, field.name), _declared_type(type(self), field.name))
-                   for field in dataclasses.fields(self)}}
+        return {field.name: _to_json(getattr(self, field.name),
+                                     _declared_type(type(self), field.name))
+                for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Read back what `to_dict` wrote, for subclasses too. An older record
-        is migrated to today's fields first; then an unknown or a missing
-        field raises."""
-        return _built(cls, migrations.migrate(cls, values))
+        """Read back what `to_dict` wrote, for subclasses too. A field the
+        record lacks takes its default; an unknown field raises."""
+        return _built(cls, values)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
