@@ -253,16 +253,13 @@ def _pulled(repo_id: str) -> str:
 
 
 def run_record(directory: str) -> Mapping[str, object]:
-    """Read the `run.json` a run directory publishes beside its checkpoints,
-    brought forward to today's fields (`dew.config.migrations`)."""
+    """Read the `run.json` a run directory publishes beside its checkpoints."""
     import json
 
     from etils import epath
 
     from dew.checkpoints import RUN_FILE
-    from dew.config import RunConfig, migrations
-    raw = json.loads((epath.Path(directory) / RUN_FILE).read_text())
-    return named_fields(migrations.migrate(RunConfig, raw), RUN_FILE)
+    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
 
 
 def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
