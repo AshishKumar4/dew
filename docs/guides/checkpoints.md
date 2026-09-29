@@ -74,16 +74,16 @@ with tempfile.TemporaryDirectory(prefix="dew-checkpoint-") as directory:
 
 ```text
 Training Dense from step 0 to 5: 2 parameters, on 1 × cpu, batch 8, float32
-Trained 5 steps in 0:00:00: first step after 0.21 s, then 668.3 step/s
-2.2% of the wall time in steps, final loss 0.2252
+Trained 5 steps in 0:00:00: first step after 0.20 s, then 506.0 step/s
+3.3% of the wall time in steps, final loss 0.2252
 latest: 5
 ['5']
-Resumed from step 5 in /tmp/dew-checkpoint-em_5j96m
+Resumed from step 5 in /tmp/dew-checkpoint-ryuexi2c
 restored step: 5 data position: b'5'
-Resumed from step 5 in /tmp/dew-checkpoint-em_5j96m
+Resumed from step 5 in /tmp/dew-checkpoint-ryuexi2c
 Training Dense from step 5 to 10: 2 parameters, on 1 × cpu, batch 8, float32
-Trained 5 steps in 0:00:00: first step after 0.10 s, then 2356.7 step/s
-1.4% of the wall time in steps, final loss 0.02705
+Trained 5 steps in 0:00:00: first step after 0.10 s, then 1501.2 step/s
+2.1% of the wall time in steps, final loss 0.02705
 final step: 10 latest: 10
 ```
 

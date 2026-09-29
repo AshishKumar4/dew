@@ -100,14 +100,14 @@ JAX_PLATFORMS=cpu python train.py
 
 ```text
 Training Dense from step 0 to 100: 2 parameters, on 1 × cpu, batch 32, float32
-step  50/100  loss 2.228e-04  step_time_ms 0.6956  samples_per_sec 46,001  accepted 100.0%
-step 100/100  loss 1.416e-07  step_time_ms 0.2582  samples_per_sec 123,957  accepted 100.0%
-Trained 100 steps in 0:00:00: first step after 0.34 s, then 3614.2 step/s
-7.4% of the wall time in steps, final loss 1.416e-07
+step  50/100  loss 2.228e-04  mse 2.228e-04  step_time_ms 0.5490  samples_per_sec 58,283  accepted 100.0%
+step 100/100  loss 1.416e-07  mse 1.416e-07  step_time_ms 0.5323  samples_per_sec 60,117  accepted 100.0%
+Trained 100 steps in 0:00:00: first step after 0.20 s, then 2009.5 step/s
+20.0% of the wall time in steps, final loss 1.416e-07
 Final mean squared error: 0.000000
 ```
 
-The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The `mse` metric is left out because its values are the loss's. The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. Other backends and library versions print slightly different numbers.
+The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. Other backends and library versions print slightly different numbers.
 
 `fit` returns a `TrainState`. `state.params` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
 

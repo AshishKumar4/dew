@@ -53,16 +53,16 @@ Output on four cores of a workstation CPU:
 
 ```text
 Training CausalTransformer from step 0 to 100: 147,840 parameters, on 1 × cpu, batch 8, float32
-step  25/100  loss 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 48.39  samples_per_sec 165.3  accepted 100.0%  0:00:02 left
-step  50/100  loss 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 41.47  samples_per_sec 192.9  accepted 100.0%  0:00:02 left
-step  75/100  loss 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 37.81  samples_per_sec 211.6  accepted 100.0%  0:00:01 left
-step 100/100  loss 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 40.84  samples_per_sec 195.9  accepted 100.0%
-Trained 100 steps in 0:00:07: first step after 2.71 s, then 24.6 step/s
-59.7% of the wall time in steps, final loss 0.005113
+step  25/100  loss 0.03061  ce 0.03061  perplexity 1.031  token_accuracy 100.0%  step_time_ms 10.88  samples_per_sec 735.3  accepted 100.0%
+step  50/100  loss 0.01018  ce 0.01018  perplexity 1.010  token_accuracy 100.0%  step_time_ms 8.713  samples_per_sec 918.2  accepted 100.0%  0:00:01 left
+step  75/100  loss 0.006710  ce 0.006710  perplexity 1.007  token_accuracy 100.0%  step_time_ms 8.472  samples_per_sec 944.3  accepted 100.0%  0:00:00 left
+step 100/100  loss 0.005113  ce 0.005113  perplexity 1.005  token_accuracy 100.0%  step_time_ms 9.332  samples_per_sec 857.3  accepted 100.0%
+Trained 100 steps in 0:00:02: first step after 0.94 s, then 115.5 step/s
+47.6% of the wall time in steps, final loss 0.005113
 dew trains jax models. dew trains jax model
 ```
 
-This is the output with stdout piped to a file; on a terminal, `fit` draws the same numbers as one live panel with a progress bar and a sparkline per metric. Each `step` line shows the loss and the objective's metrics of that step (for `LMObjective`, perplexity and token accuracy; its cross entropy equals the loss and is left out), and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
+This is the output with stdout piped to a file; on a terminal, `fit` draws the same numbers as one live panel with a progress bar and a sparkline per metric. Each `step` line shows the loss and the objective's metrics of that step (for `LMObjective`: cross entropy, perplexity and token accuracy), and the step time and throughput over the interval since the previous line. Each row holds 65 byte ids. `LMObjective(seq_len=64)` feeds the first 64 to the model and scores its predictions of the 64 that follow, shifted by one position. `generate` returns the prompt followed by the new tokens; `temperature=0` picks the most likely token at every step.
 
 ## Model
 

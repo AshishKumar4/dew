@@ -70,11 +70,11 @@ Number of devices: 1
 Experiment_Name: byte-demo
 Local tracking: /tmp/dew-first-recipe/runs/byte-demo/tracking
 Training CausalTransformer from step 0 to 2: 6,720 parameters, on 1 × cpu, batch 8, float32
-step 1/2  loss 5.738  perplexity 310.4  token_accuracy 0.8%  step_time_ms 57.44  samples_per_sec 139.3  accepted 100.0%
-step 2/2  loss 5.713  perplexity 302.9  token_accuracy 0.0%  step_time_ms 38.27  samples_per_sec 209.0  accepted 100.0%
-eval val at step 2: perplexity 314.7 (16 records in 0.27 s)
-Trained 2 steps in 0:00:02: first step after 1.63 s, then 24.1 step/s
-1.9% of the wall time in steps, final loss 5.713
+step 1/2  loss 5.738  ce 5.738  perplexity 310.4  token_accuracy 0.8%  step_time_ms 22.96  samples_per_sec 348.5  accepted 100.0%
+step 2/2  loss 5.713  ce 5.713  perplexity 302.9  token_accuracy 0.0%  step_time_ms 6.611  samples_per_sec 1,210  accepted 100.0%
+eval val at step 2: perplexity 314.7 (16 records in 0.10 s)
+Trained 2 steps in 0:00:01: first step after 0.49 s, then 137.6 step/s
+1.1% of the wall time in steps, final loss 5.713
 ```
 
 The first update includes compilation. The run logs a loss at steps 1 and 2 and a validation perplexity at step 2, and writes a checkpoint to `runs/byte-demo/2` with `runs/byte-demo/run.json` beside it. The checkpoint holds the training state and the data position ([Checkpoints](guides/checkpoints.md)). `--sample-tokens 0` turns off text sampling, so validation only scores tokens. A longer run can ask for sample continuations with `--sample-prompt "The number after" --sample-tokens 32`; sampling uses the EMA weights, and the recipe makes the decoder's context long enough for the prompt plus the new tokens. Early in training, random bytes may decode to replacement characters.

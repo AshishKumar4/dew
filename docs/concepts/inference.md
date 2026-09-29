@@ -41,9 +41,9 @@ print(result.lengths, result.terminated)
 
 ```text
 Training CausalTransformer from step 0 to 150: 147,904 parameters, on 1 × cpu, batch 16, float32
-step 150/150  loss 0.009061  perplexity 1.009  token_accuracy 99.6%  step_time_ms 26.82  samples_per_sec 596.7  accepted 100.0%
-Trained 150 steps in 0:00:06: first step after 1.71 s, then 38.2 step/s
-69.5% of the wall time in steps, final loss 0.009061
+step 150/150  loss 0.009061  ce 0.009061  perplexity 1.009  token_accuracy 99.6%  step_time_ms 59.83  samples_per_sec 267.4  accepted 100.0%
+Trained 150 steps in 0:00:11: first step after 2.49 s, then 17.0 step/s
+77.9% of the wall time in steps, final loss 0.009061
 ', Lily saw a big dog'
 ', Lily saw a big dog'
 ' play. One day, Lily'
