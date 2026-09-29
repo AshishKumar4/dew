@@ -72,6 +72,22 @@ RUN_FILE = "run.json"
 """The run record `RunConfig.save` writes into the run directory, beside the
 step directories, and `dew.io.publish` ships with a step."""
 
+PROFILES = "profiles"
+"""The subdirectory of the run directory holding a snapshot of the run's
+power-function EMAs at every checkpoint step (`dew.training.posthoc`)."""
+
+
+def _power_profiles(opt_state):
+    """The `PowerProfilesState` inside `opt_state`, or None where the solver keeps none."""
+    from dew.training.optim import PowerProfilesState
+
+    def found(node):
+        return isinstance(node, PowerProfilesState)
+    held = [node for node in jax.tree.leaves(opt_state, is_leaf=found) if found(node)]
+    if len(held) > 1:
+        raise ValueError(f"the optimizer state holds {len(held)} power_profiles; wrap the solver once")
+    return held[0] if held else None
+
 
 def is_uri(path: str) -> bool:
     """Return whether a path names a `<scheme>://` location, such as a gs:// bucket."""
@@ -460,6 +476,7 @@ class Checkpoints:
         self.local_every = local_every
         self._manager = None
         self._local_manager = None
+        self._profiles_manager = None
 
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
@@ -477,6 +494,20 @@ class Checkpoints:
                 self.directory, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler())
         return self._manager
+
+    def _open_profiles(self) -> ocp.CheckpointManager:
+        """The manager of the EMA snapshots under `profiles/`, which keeps every step."""
+        if self._profiles_manager is None:
+            _check_shared(self.directory)
+            # Its own barrier prefix: it writes at the steps the persistent
+            # manager writes.
+            multiprocessing = MultiprocessingOptions(barrier_sync_key_prefix='profiles')
+            options = ocp.CheckpointManagerOptions(
+                create=True, enable_async_checkpointing=True, multiprocessing_options=multiprocessing)
+            self._profiles_manager = ocp.CheckpointManager(
+                str(epath.Path(self.directory) / PROFILES), options=options,
+                item_handlers=ocp.PyTreeCheckpointHandler())
+        return self._profiles_manager
 
     @property
     def local_path(self) -> str:
@@ -581,6 +612,43 @@ class Checkpoints:
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
+        profiles = _power_profiles(state.opt_state)
+        if profiles is not None:
+            self._save_profiles(step, profiles)
+
+    def _save_profiles(self, step: int, profiles) -> None:
+        """Keep a snapshot of the power-function EMAs of `profiles`, a
+        `PowerProfilesState`, beside the checkpoint of `step`, where no
+        pruning of checkpoints reaches it."""
+        snapshots = self._open_profiles()
+        averages = {'averages': tuple(profiles.averages)}
+        with region("checkpoint.submit_profiles"):
+            snapshots.save(step, args=ocp.args.PyTreeSave(averages), force=True, custom_metadata={
+                'updates': int(profiles.count),
+                'stds': [float(std) for std in np.asarray(profiles.stds)]})
+        if _written_in_place(averages):
+            with region("checkpoint.write_in_place"):
+                snapshots.wait_until_finished()
+
+    def profile_steps(self) -> list[int]:
+        """The steps holding a snapshot of the run's power-function EMAs, oldest first."""
+        return sorted(self._open_profiles().all_steps())
+
+    def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
+        """The updates the EMA snapshot at `step` had seen, and the relative
+        standard deviation of each of its averages, without reading them."""
+        custom = self._open_profiles().metadata(step).custom_metadata
+        return int(custom['updates']), tuple(custom['stds'])
+
+    def restore_profiles(self, step: int) -> tuple[Variables, ...]:
+        """The averages of the EMA snapshot at `step`, as host arrays, in the
+        order of `profile_metadata`'s relative standard deviations."""
+        snapshots = self._open_profiles()
+        metadata = snapshots.item_metadata(step)
+        host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+        restored = snapshots.restore(step, args=ocp.args.PyTreeRestore(
+            restore_args=jax.tree.map(lambda _: host, dict(metadata))))
+        return tuple(restored['averages'])
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
                    share: DataPartition | None = None) -> None:
@@ -837,7 +905,7 @@ class Checkpoints:
         """
         with region("checkpoint.wait"):
             error = None
-            for checkpointer in (self._manager, self._local_manager):
+            for checkpointer in (self._manager, self._local_manager, self._profiles_manager):
                 if checkpointer is not None:
                     try:
                         checkpointer.wait_until_finished()
