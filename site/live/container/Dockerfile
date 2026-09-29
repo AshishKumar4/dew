@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r /opt/live/requirements.txt
 # dew-commit holds the full SHA of the Dew commit to install; deploy.mjs writes it.
 COPY dew-commit /opt/live/
 RUN grep -Eq '^[0-9a-f]{40}$' /opt/live/dew-commit \
-	&& pip install --no-cache-dir "dew-ml @ git+https://github.com/AshishKumar4/dew@$(cat /opt/live/dew-commit)"
+	&& pip install --no-cache-dir "dewml @ git+https://github.com/AshishKumar4/dew@$(cat /opt/live/dew-commit)"
 
 # Cells run as this user, which cannot signal or trace the server.
 RUN useradd --create-home --uid 1001 --shell /usr/sbin/nologin kernel

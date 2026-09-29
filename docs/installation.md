@@ -9,10 +9,10 @@ The commands below use a POSIX shell and need [uv](https://docs.astral.sh/uv/get
 ```bash
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
+uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-The package is called `dew-ml`, and you import it as `dew`. This command installs whatever revision the repository has today. If you need to reproduce a run later, pin a Git commit in your experiment environment. Dew pins JAX and Flax to builds from GitHub that carry fixes it needs, until releases ship them; `pyproject.toml` names the commits.
+The package is called `dewml`, and you import it as `dew`. This command installs whatever revision the repository has today. If you need to reproduce a run later, pin a Git commit in your experiment environment. Dew pins JAX and Flax to builds from GitHub that carry fixes it needs, until releases ship them; `pyproject.toml` names the commits.
 
 If you plan to edit the code, clone it instead:
 
@@ -52,13 +52,13 @@ The plain install brings JAX for the CPU. For an accelerator, add the extra that
 
 | Hardware | Command |
 |---|---|
-| NVIDIA GPU, CUDA 13 driver | `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"` |
-| NVIDIA GPU, CUDA 12 driver | `uv pip install "dew-ml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
-| Google TPU VM | `uv pip install "dew-ml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
+| NVIDIA GPU, CUDA 13 driver | `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"` |
+| NVIDIA GPU, CUDA 12 driver | `uv pip install "dewml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
+| Google TPU VM | `uv pip install "dewml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
 
-Extras combine, as in `dew-ml[cuda13,interop,streaming]`, and a checkout takes them the same way: `uv pip install -e ".[cuda12]"`. Each one installs the accelerator build of the JAX that Dew pins, a build of 0.11.2 from GitHub that fixes its compilation cache for pools of processes on different GPUs. pip cannot resolve PyPI's JAX extras, such as `jax[cuda13]`, beside that pin in one install, and once PyPI has a JAX newer than the pin, a later `-U "jax[...]"` with pip or uv replaces the pin with it. Use Dew's extras instead.
+Extras combine, as in `dewml[cuda13,interop,streaming]`, and a checkout takes them the same way: `uv pip install -e ".[cuda12]"`. Each one installs the accelerator build of the JAX that Dew pins, a build of 0.11.2 from GitHub that fixes its compilation cache for pools of processes on different GPUs. pip cannot resolve PyPI's JAX extras, such as `jax[cuda13]`, beside that pin in one install, and once PyPI has a JAX newer than the pin, a later `-U "jax[...]"` with pip or uv replaces the pin with it. Use Dew's extras instead.
 
-The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install `dew-ml[cuda13]`.
+The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install `dewml[cuda13]`.
 
 On NVIDIA hardware, check that JAX lists a CUDA device before you run a GPU example. Dew can use cuDNN attention for the GPU shapes and dtypes that support it, but whether it is available depends on your JAX and CUDA install. A TPU needs its own runtime setup. [The TPU guide](tpu.md) describes Dew's provisioning commands. Creating a cloud resource can cost money, so it is not part of this quickstart.
 
@@ -83,14 +83,14 @@ The plain install already includes Transformers, Hugging Face Hub, and the image
 For example:
 
 ```bash
-uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
 ```
 
 For HF vision processors, install matching CPU PyTorch and torchvision wheels first, then add Dew's `vision` extra. The image preprocessing then runs on the host, and no CUDA PyTorch packages sit next to JAX's accelerator runtime. I checked the native Gemma4 processor path with torch 2.14.0+cpu and torchvision 0.29.0+cpu. Without the extra, the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install 'dew-ml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
 Qwix quantization and tokamax kernels need their own packages, and Dew has no extra for either. `uv pip install qwix` adds Qwix.
