@@ -35,7 +35,7 @@ Every process supplies its own rows. All cooperating processes must supply the s
 
 Results hold global arrays sharded by row, including any filler rows added so the batch divides across devices. `result.host()` returns the same record with NumPy arrays for this process's real rows. It does not gather rows from other processes. Filler rows are added as prompts, before any continuation exists. So all continuations of a prompt stay on the process that asked for them, and the rows `host()` drops belong only to filler prompts. Token generation and image prior noise use keys per global row. Canvas refinement and an explicitly sampled VAE posterior use keys for the whole batch, so changing the placed batch shape can change their draws.
 
-`TextToImage` results also have `pil()`, which returns the same real rows as a list of 8-bit RGB PIL images, quantized as `dew.artifacts.uint8_pixels` quantizes them. A result from `decode=False` has no images and raises.
+`TextToImage` results also have `pil()`, which returns the same real rows of an image batch as a list of 8-bit PIL images (RGB, or grayscale for one channel), quantized as `dew.artifacts.uint8_pixels` quantizes them. It refuses a video batch, and a result from `decode=False`, which has no images.
 
 ```python
 from dew.training import Layout, MeshSpec

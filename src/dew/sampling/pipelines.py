@@ -89,10 +89,11 @@ class DenoisingInputs:
 
 @struct.dataclass
 class Images(Generic[ArrayT]):
-    """Decoded samples in [-1, 1], NHWC, keeping the placement the task ran with.
+    """Decoded samples in [-1, 1], NHWC (NTHWC for a video field), keeping the
+    placement the task ran with.
 
     ``host()`` reads this process's ``rows`` real rows back as a host array;
-    ``pil()`` reads them back as 8-bit images.
+    ``pil()`` reads an image batch's back as 8-bit images.
     """
 
     images: ArrayT | None
@@ -105,13 +106,18 @@ class Images(Generic[ArrayT]):
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
     def pil(self) -> list[PILImage]:
-        """This process's real rows as RGB images, their pixels quantized by
+        """This process's real rows of an NHWC image batch as RGB images (or
+        grayscale, for one channel), their pixels quantized by
         `dew.artifacts.uint8_pixels`."""
         from PIL import Image
 
         if self.images is None:
             raise ValueError("these samples kept only their latents; call the task with decode=True")
-        return [Image.fromarray(row) for row in uint8_pixels(self.host().images)]
+        if self.images.ndim != 4 or self.images.shape[-1] not in (1, 3):
+            raise ValueError(f"pil() takes [N, H, W, 3] or [N, H, W, 1] images, not samples of shape "
+                             f"{self.images.shape}")
+        pixels = uint8_pixels(local_rows(self.images)[:self.rows])
+        return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 
 @dataclass(frozen=True, eq=False)
