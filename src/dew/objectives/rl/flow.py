@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -68,15 +68,18 @@ class FlowGRPOObjective(DiffusionObjective):
     [N, K]. K is the selected transition count. The denominator counts kept
     stochastic transitions. Deterministic intervals contribute no policy loss.
 
-    beta > 0 freezes the initial denoiser in the existing EMA slot. Evaluation
-    and previews always use the live policy. sampler and steps configure
-    evaluation; sde specifies both rollout and rescoring. pretrained is a
-    model variables dict, as returned by model.init; encoders and an optional
-    autoencoder are supplied through the existing diffusion input contract.
+    beta > 0 freezes the initial denoiser in the existing EMA slot, which is
+    then a reference rather than an average (`_ema_is_reference`): the
+    task a run publishes and restores, its evaluation and its previews are
+    the live policy. sampler and steps configure evaluation; sde specifies
+    both rollout and rescoring. pretrained is the whole variables tree the
+    policy starts from, as `DiffusionObjective` takes it: the model's
+    collections, `encoders` and any `autoencoder`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
     shown = {"loss": Shown(), "reward": Shown(better="higher")}
+    _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
                  sde: FlowSDE = FlowSDE(), beta: float = 0.0,
@@ -94,32 +97,16 @@ class FlowGRPOObjective(DiffusionObjective):
         if steps < 2:
             raise ValueError("evaluation needs at least two time points")
         if pretrained is not None and "params" not in pretrained:
-            raise ValueError("pretrained must be a model variables dict with a params collection")
+            raise ValueError("pretrained must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, sampler=sampler,
-                         guidance=guidance, steps=steps)
+                         guidance=guidance, steps=steps, pretrained=pretrained)
         if beta == 0:
             self.ema = None
         self.sde = sde
         self.beta = beta
         self.clip_range = clip_range
         self.adv_clip_max = adv_clip_max
-        self.pretrained = pretrained
-
-    def held_variables(self) -> Variables:
-        held: dict[str, Any] = dict(super().held_variables())
-        if self.pretrained is not None:
-            held["pretrained"] = self.pretrained
-        return held
-
-    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        held = self.held_variables() if variables is None else variables
-        if "pretrained" not in held:
-            return super().init(key, held)
-        state: dict[str, Any] = {**held["pretrained"], "encoders": held["encoders"]}
-        if "autoencoder" in held:
-            state["autoencoder"] = held["autoencoder"]
-        return state
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:
         """Build the denoiser this batch's conditions select, guidance included."""
