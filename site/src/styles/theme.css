@@ -170,6 +170,14 @@ h1#_top,
 	font-variant-numeric: tabular-nums;
 }
 
+/* A table wider than a phone's column scrolls on its own, not the page with it. */
+@media (max-width: 50rem) {
+	.sl-markdown-content table {
+		display: block;
+		overflow-x: auto;
+	}
+}
+
 .sl-markdown-content :is(th, td) {
 	border: 0;
 	border-bottom: 1px solid var(--dew-rule);
