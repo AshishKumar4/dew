@@ -447,6 +447,103 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         attention_impl=attention_impl)
 
 
+
+class Flux2Fields(TypedDict):
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    num_single_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    timestep_guidance_channels: int
+    mlp_ratio: float
+    axes_dims_rope: tuple[int, ...]
+    rope_theta: float
+    eps: float
+    guidance_embeds: bool
+    dtype: object
+    attention_impl: str
+
+
+def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+                 attention_impl="auto") -> Flux2Fields:
+    """Read a published `Flux2Transformer2DModel` config into native model
+    fields, refusing a patch size the pipeline does not use."""
+    from dew.interop.pretrained import resolve_dtype
+
+    if records.integer(config.get("patch_size", 1), "patch_size") != 1:
+        raise ValueError("FLUX.2's pipeline folds its latent 2x2 itself; the transformer's patch_size is 1")
+    channels = records.integer(config.get("in_channels", 128), "in_channels")
+    out_channels = config.get("out_channels")
+    axes = config.get("axes_dims_rope", (32, 32, 32, 32))
+    heads = records.integer(config.get("num_attention_heads", 48), "num_attention_heads")
+    head_dim = records.integer(config.get("attention_head_dim", 128), "attention_head_dim")
+    if not isinstance(axes, (list, tuple)) or any(type(size) is not int or size % 2 for size in axes):
+        raise ValueError("axes_dims_rope must be a sequence of even channel counts")
+    if sum(axes) != head_dim or len(axes) != 4:
+        raise ValueError(f"axes_dims_rope {tuple(axes)} must split the {head_dim} head channels over the "
+                         f"four axes the pipeline's ids carry")
+    return Flux2Fields(
+        in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        num_layers=records.integer(config.get("num_layers", 8), "num_layers"),
+        num_single_layers=records.integer(config.get("num_single_layers", 48), "num_single_layers"),
+        heads=heads, head_dim=head_dim,
+        joint_attention_dim=records.integer(config.get("joint_attention_dim", 15360), "joint_attention_dim"),
+        timestep_guidance_channels=records.integer(config.get("timestep_guidance_channels", 256),
+                                                   "timestep_guidance_channels"),
+        mlp_ratio=float(config.get("mlp_ratio", 3.0)), axes_dims_rope=tuple(axes),
+        rope_theta=float(config.get("rope_theta", 2000)), eps=float(config.get("eps", 1e-6)),
+        guidance_embeds=records.boolean(config.get("guidance_embeds", True), "guidance_embeds"),
+        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+
+
+_FLUX2_EMBEDDERS = {
+    "x_embedder": ("x_embedder",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "double_stream_modulation_img.linear": ("double_stream_modulation_img", "linear"),
+    "double_stream_modulation_txt.linear": ("double_stream_modulation_txt", "linear"),
+    "single_stream_modulation.linear": ("single_stream_modulation", "linear"),
+    "time_guidance_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_guidance_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_guidance_embed.guidance_embedder.linear_1": ("guidance_embedder_linear_1",),
+    "time_guidance_embed.guidance_embedder.linear_2": ("guidance_embedder_linear_2",),
+}
+
+
+def _flux2_path(name: str) -> tuple[str, ...]:
+    """Return the `Flux2Transformer` path for a published FLUX.2 tensor name."""
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _FLUX2_EMBEDDERS:
+        return (*_FLUX2_EMBEDDERS[stem], _dit_leaf(leaf))
+    if len(parts) > 3 and parts[1].isdigit():
+        block, rest = (f"{parts[0]}_{parts[1]}",), parts[2:-1]
+        if parts[0] == "transformer_blocks":
+            if len(rest) == 2 and rest[0] in ("ff", "ff_context") and rest[1] in ("linear_in", "linear_out"):
+                return (*block, *rest, _dit_leaf(leaf))
+            if len(rest) > 1 and rest[0] == "attn":
+                return _dit_attention(block, "attn", rest[1:], leaf, name, joint=True)
+        # A single block's fused maps and head norms sit under `attn` in the
+        # source, whose parallel attention holds the feed-forward too; here
+        # they are the block's own, the output map named as Flux's is.
+        if parts[0] == "single_transformer_blocks" and rest[:1] == ["attn"] and len(rest) == 2:
+            if rest[1] in ("to_qkv_mlp_proj", "to_out"):
+                return (*block, "proj_fused" if rest[1] == "to_out" else rest[1], _dit_leaf(leaf))
+            if rest[1] in ("norm_q", "norm_k") and leaf == "weight":
+                return (*block, rest[1], "scale")
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_flux2_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+                            ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+    """Map FLUX.2 tensors into a parameter tree and the layouts that invert
+    it; its rotary tables are computed from ids, so it stores no buffer."""
+    return record_layouts("transformer", tensors, _flux2_path, ("params",), param_dtype=param_dtype)
+
 _FLUX_EMBEDDERS = {
     "x_embedder": ("x_embedder",),
     "context_embedder": ("context_embedder",),
