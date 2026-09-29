@@ -618,13 +618,13 @@ distribution.
 
 Coupling argument for the subpackage. Every RL objective needs
 `dew.objectives.base.Objective`, `dew.sampling`, `dew.nn` and the trainer's EMA
-mechanism. A separate distribution would depend on `dew-ml` for all four, so the
+mechanism. A separate distribution would depend on `dewml` for all four, so the
 dependency does not disappear, it only gains a release boundary. Meanwhile the
 core needs exactly one thing from RL, the `rollout` method, and that method is
 in the core anyway because it is useful without RL: self-distillation and
 curriculum filtering are non-RL objectives that want to modify their own batch.
 
-Cost of the subpackage: `dew-ml` gains optional dependencies for environments.
+Cost of the subpackage: `dewml` gains optional dependencies for environments.
 That is handled the way the repository already handles five other optional
 groups (`pyproject.toml:42-53`): an `rl` extra holding `mujoco_mjx` and
 `mujoco_playground`, imported lazily inside the adapter, exactly as

@@ -123,7 +123,7 @@ def read_only_builder(directory: epath.Path, *, builder: str | None,
     except ImportError as missing:
         raise ImportError(
             "reading prepared TFDS data needs the tfds extra: "
-            "pip install 'dew-ml[tfds]'") from missing
+            "pip install 'dewml[tfds]'") from missing
     reader = tfds.builder_from_directory(directory)
     dataset_info = reader.info
     if dataset_info.file_format != tfds.core.FileFormat.ARRAY_RECORD:

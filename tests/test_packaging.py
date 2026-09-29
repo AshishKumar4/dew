@@ -10,9 +10,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_the_accelerator_extras_install_what_the_pinned_jax_asks_for():
-    """`dew-ml[cuda12]`, `[cuda13]` and `[tpu]` are how an install gets the
+    """`dewml[cuda12]`, `[cuda13]` and `[tpu]` are how an install gets the
     pinned jax's accelerator build. pip can't satisfy PyPI's jax[cuda13]
-    against the pinned jax's archive URL, so `pip install "dew-ml @ git+..."
+    against the pinned jax's archive URL, so `pip install "dewml @ git+..."
     "jax[cuda13]"` failed with ResolutionImpossible. Each extra asks for the
     packages the installed jax's extra of the same name asks for, at the same
     versions, apart from jaxlib, which jax pins itself; a pin that moves
