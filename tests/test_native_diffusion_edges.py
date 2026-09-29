@@ -60,6 +60,13 @@ def test_unimplemented_active_scheduler_controls_do_not_change_meaning(edges, ca
     ("DDPMScheduler", {"variance_type": "fixed_large_log"}),
     ("DDPMScheduler", {"variance_type": "learned"}),
     ("DPMSolverSDEScheduler", {"use_karras_sigmas": True, "use_beta_sigmas": True}),
+    # On flow sigmas the published step turns velocity into a clean
+    # prediction only, and the classes no flow pipeline ships stay refused.
+    ("DPMSolverMultistepScheduler", {"use_flow_sigmas": True, "prediction_type": "flow_prediction",
+                                     "algorithm_type": "dpmsolver", "final_sigmas_type": "sigma_min"}),
+    ("UniPCMultistepScheduler", {"use_flow_sigmas": True, "prediction_type": "flow_prediction",
+                                 "predict_x0": False}),
+    ("DEISMultistepScheduler", {"use_flow_sigmas": True, "prediction_type": "flow_prediction"}),
 ])
 def test_controls_the_published_step_does_not_read_are_refused(scheduler, controls):
     config = {"_class_name": scheduler, "num_train_timesteps": 20, "beta_start": 0.00085,

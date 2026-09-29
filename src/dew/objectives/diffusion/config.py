@@ -245,7 +245,7 @@ class DiffusionRunConfig(RunConfig):
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         object.__setattr__(self, "objective", "diffusion" if self.rl is None else "flow_grpo")
-        from dew.diffusion.presets import EDM
+        from dew.diffusion.presets import EDM, Flow
 
         if self.pretrained is not None:
             scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
@@ -270,6 +270,12 @@ class DiffusionRunConfig(RunConfig):
             latent = self.autoencoder is not None or self.pretrained is not None
             object.__setattr__(self, "preset", dataclasses.replace(
                 self.preset, regime="latent" if latent else "pixel"))
+        # A resolution shift is the data's: the token count of its images.
+        if (isinstance(self.preset, Flow) and self.preset.resolution_shift is not None
+                and self.preset.resolution_shift.tokens is None):
+            height, width = self.sample_field().shape[-3:-1]
+            object.__setattr__(self, "preset", dataclasses.replace(
+                self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
         unknown = [name for name in self.val_metrics if name not in metrics]
         if unknown:
             raise ValueError(
