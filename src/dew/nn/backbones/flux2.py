@@ -218,7 +218,7 @@ class Flux2Transformer(nn.Module):
         if x.ndim != 4:
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
-        dense = dict(use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
         image = nn.Dense(self.features, name="x_embedder", **dense)(x.reshape(batch, rows * columns, -1))
         context = nn.Dense(self.features, name="context_embedder", **dense)(conditioning.context)
         embedded = self._embedding(time, conditioning.guidance, image.dtype)
@@ -234,8 +234,8 @@ class Flux2Transformer(nn.Module):
                                       theta=self.rope_theta)
         cos, sin = jnp.asarray(cosines, image.dtype), jnp.asarray(sines, image.dtype)
         hidden = int(self.features * self.mlp_ratio)
-        block = dict(epsilon=self.eps, dtype=self.dtype, precision=self.precision,
-                     attention_impl=self.attention_impl)
+        block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
+                     "attention_impl": self.attention_impl}
         for index in range(self.num_layers):
             image, context = Flux2Block(self.features, self.heads, self.head_dim, hidden,
                                         name=f"transformer_blocks_{index}", **block)(

@@ -35,9 +35,9 @@ import numpy as np
 import torch
 
 DIFFUSERS = "0.40.0"
-BASE = dict(patch_size=1, in_channels=8, num_layers=2, num_single_layers=2, attention_head_dim=16,
-            num_attention_heads=2, joint_attention_dim=12, timestep_guidance_channels=32, mlp_ratio=3.0,
-            axes_dims_rope=(4, 4, 4, 4), rope_theta=2000, eps=1e-6, guidance_embeds=True)
+BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
+            "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32, "mlp_ratio": 3.0,
+            "axes_dims_rope": (4, 4, 4, 4), "rope_theta": 2000, "eps": 1e-6, "guidance_embeds": True}
 TOKENS = 5
 SEED = 29
 
@@ -56,8 +56,8 @@ CASES: dict[str, Case] = {
     "dev": Case(),
     "rect": Case(grid=(3, 5)),
     # FLUX.2 [klein]'s base models embed no guidance.
-    "unguided": Case(dict(guidance_embeds=False, num_layers=1, num_single_layers=3)),
-    "narrow": Case(dict(mlp_ratio=2.0, eps=1e-3, out_channels=4, rope_theta=10000), grid=(2, 6)),
+    "unguided": Case({"guidance_embeds": False, "num_layers": 1, "num_single_layers": 3}),
+    "narrow": Case({"mlp_ratio": 2.0, "eps": 1e-3, "out_channels": 4, "rope_theta": 10000}, grid=(2, 6)),
 }
 
 
