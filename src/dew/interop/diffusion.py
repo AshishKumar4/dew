@@ -641,7 +641,9 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
     """Map a component's tensors into a parameter tree and the layouts that invert it.
 
     `path_of` gives each tensor's tree path, or None to skip it. Kernels are
-    transposed and the transpose is recorded in the layout, so `WeightLayout.export`
+    transposed from torch's `[out, in, *window]` to Flax's `[*window, in, out]`
+    (a linear layer's, a 2-D or a 3-D convolution's) and the transpose is
+    recorded in the layout, so `WeightLayout.export`
     writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
     the transpose; buffers and scoring state are the caller's to keep in FP32.
     """
@@ -657,8 +659,9 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
         array = checkpoint_array(tensor, param_dtype)
         transpose = None
         if path[-1] == "kernel":
-            transpose = (3, 2, 0, 1) if array.ndim == 4 else (1, 0)
-            array = array.transpose(2, 3, 1, 0) if array.ndim == 4 else array.T
+            order = (*range(2, array.ndim), 1, 0)
+            transpose = tuple(int(axis) for axis in np.argsort(order))
+            array = array.transpose(order)
         insert(parameters, path, np.ascontiguousarray(array), name)
         layouts.append(WeightLayout(f"{component}/{name}", ((*prefix, *path),), tensor.shape, transpose))
     return parameters, tuple(layouts)

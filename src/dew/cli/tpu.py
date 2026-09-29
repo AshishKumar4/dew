@@ -675,7 +675,7 @@ class Setup(Base):
     from_source: bool = False
     """Sync the working tree and install it in editable mode."""
     version: Release = ""
-    """Release of dew-ml to install. The newest by default."""
+    """Release of dewml to install. The newest by default."""
     extras: Extras = ""
     """Extras to install, for example tfds,av."""
     gcs_bucket: Bucket = None

@@ -41,16 +41,22 @@ Qwix is not a dependency. The import sits inside the calls that need it,
 and without the package they raise naming it, the way the tokamax branch of
 `dew.nn.moe` behaves.
 """
+from __future__ import annotations
+
 import dataclasses
 import functools
 import importlib
 import re
-from collections.abc import Mapping, Sequence
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+
+if TYPE_CHECKING:
+    from dew.diffusion.process import Conditioning
+    from dew.objectives.base import Variables
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -160,54 +166,9 @@ def _per_feature(scales: jax.Array, ndim: int, batch: int, feature: int, feature
     return (repeated if batch < feature else repeated.T).reshape(shape)
 
 
-class _GroupScaledConvolution:
-    """Quantizes a grouped convolution's input with one scale per feature
-    group, where Qwix (0.1.8 `conv_general.get_how_to_quantize`) takes one
-    per example across every feature.
-
-    A grouped convolution contracts each group's features on their own, so
-    one group's range has no bearing on another's rounding. With one scale
-    across all of them a depthwise convolution rounds each channel against
-    the loudest. The hybrid DiT's spatial fusion, whose channel peaks span
-    36x, came out 4.1% off in int8 against 1.0% with a scale per group, and
-    quantizing it alone dropped the 176M text-to-image model's CLIP score
-    from 0.248 to 0.124.
-    Dividing each group by its own peak before Qwix quantizes, and
-    multiplying each output group by it after, gives the per-group scales
-    exactly: the convolution is linear and keeps groups apart, and every
-    group then peaks at 1, so Qwix's single scale is each group's own.
-    """
-
-    def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
-                             padding: str | Sequence[tuple[int, int]],
-                             lhs_dilation: Sequence[int] | None = None,
-                             rhs_dilation: Sequence[int] | None = None,
-                             dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
-                             feature_group_count: int = 1, batch_group_count: int = 1,
-                             precision: jax.lax.PrecisionLike = None,
-                             preferred_element_type: jax.typing.DTypeLike | None = None,
-                             out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
-        convolve = functools.partial(
-            super().conv_general_dilated,  # pyright: ignore[reportAttributeAccessIssue]
-            rhs=rhs, window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
-            rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
-            feature_group_count=feature_group_count, batch_group_count=batch_group_count,
-            precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
-        rule, _ = self._get_current_rule_and_op_id(  # pyright: ignore[reportAttributeAccessIssue]
-            "conv_general_dilated", only_rule=True)
-        if feature_group_count == 1 or rule is None or rule.act_qtype is None:
-            return convolve(lhs=lhs)
-        numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
-        scales = _group_scales(lhs, numbers, feature_group_count)
-        batch, feature = numbers.lhs_spec[:2]
-        out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
-        batch, feature = numbers.out_spec[:2]
-        return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
-
-
-def _real(*operands: object) -> bool:
-    """Whether no operand is complex; Qwix quantizes real values only."""
-    return not any(jnp.iscomplexobj(operand) for operand in operands)
+def _real(*dtypes: jax.typing.DTypeLike) -> bool:
+    """Whether no dtype is complex; Qwix quantizes real values only."""
+    return not any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes)
 
 
 @functools.cache
@@ -226,13 +187,56 @@ def _providers() -> tuple[type, type]:
     qwix = importlib.import_module("qwix")
     quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
 
-    class QtProvider(_GroupScaledConvolution, qwix.QtProvider):
+    class GroupScaledConvolution(qwix.QuantizationProvider):
+        """Quantizes a grouped convolution's input with one scale per feature
+        group, where Qwix (0.1.8 `conv_general.get_how_to_quantize`) takes one
+        per example across every feature.
+
+        A grouped convolution contracts each group's features on their own, so
+        one group's range has no bearing on another's rounding. With one scale
+        across all of them a depthwise convolution rounds each channel against
+        the loudest. The hybrid DiT's spatial fusion, whose channel peaks span
+        36x, came out 4.1% off in int8 against 1.0% with a scale per group, and
+        quantizing it alone dropped the 176M text-to-image model's CLIP score
+        from 0.248 to 0.124.
+        Dividing each group by its own peak before Qwix quantizes, and
+        multiplying each output group by it after, gives the per-group scales
+        exactly: the convolution is linear and keeps groups apart, and every
+        group then peaks at 1, so Qwix's single scale is each group's own.
+        """
+
+        def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
+                                 padding: str | Sequence[tuple[int, int]],
+                                 lhs_dilation: Sequence[int] | None = None,
+                                 rhs_dilation: Sequence[int] | None = None,
+                                 dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+                                 feature_group_count: int = 1, batch_group_count: int = 1,
+                                 precision: jax.lax.PrecisionLike = None,
+                                 preferred_element_type: jax.typing.DTypeLike | None = None,
+                                 out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+            convolve = functools.partial(
+                super().conv_general_dilated,
+                rhs=rhs, window_strides=window_strides, padding=padding, lhs_dilation=lhs_dilation,
+                rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
+                feature_group_count=feature_group_count, batch_group_count=batch_group_count,
+                precision=precision, preferred_element_type=preferred_element_type, out_sharding=out_sharding)
+            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
+            if feature_group_count == 1 or rule is None or rule.act_qtype is None:
+                return convolve(lhs=lhs)
+            numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+            scales = _group_scales(lhs, numbers, feature_group_count)
+            batch, feature = numbers.lhs_spec[:2]
+            out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
+            batch, feature = numbers.out_spec[:2]
+            return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
+
+    class QtProvider(GroupScaledConvolution, qwix.QtProvider):
         pass
 
-    class PtqProvider(_GroupScaledConvolution, qwix.PtqProvider):
+    class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
-            if _real(lhs, rhs):
+            if _real(lhs.dtype, rhs.dtype):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision,
                                            preferred_element_type, out_sharding=out_sharding)
             return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
@@ -240,7 +244,7 @@ def _providers() -> tuple[type, type]:
                                        out_sharding=out_sharding)
 
         def einsum(self, einsum_str, *operands, **kwargs):
-            if _real(*operands):
+            if _real(*(operand.dtype for operand in operands)):
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
 
@@ -289,8 +293,8 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     return importlib.import_module("qwix").quantize_model(model, _providers()[0](rules), methods=methods)
 
 
-def quantize_for_serving(model: nn.Module, variables: Mapping[str, object], spec: Quantization,
-                         *args: object, **kwargs: object) -> tuple[nn.Module, dict[str, object]]:
+def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantization,
+                         *args: Conditioning, **kwargs: Conditioning) -> tuple[nn.Module, Variables]:
     """`model` and `variables` with the weights `spec` names stored quantized.
 
     This is Qwix's post-training quantization. The returned variables hold

@@ -99,13 +99,13 @@ def test_a_key_holding_the_separator_is_refused(tmp_path):
 
 def test_missing_safetensors_names_the_extra(params, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors", None)
-    with pytest.raises(ImportError, match=r"dew-ml\[interop\]"):
+    with pytest.raises(ImportError, match=r"dewml\[interop\]"):
         save_params(params, tmp_path / "model.safetensors")
 
 
 def test_missing_safetensors_reader_names_the_extra(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors", None)
-    with pytest.raises(ImportError, match=r"dew-ml\[interop\]"):
+    with pytest.raises(ImportError, match=r"dewml\[interop\]"):
         read_file(tmp_path / "model.safetensors")
 
 

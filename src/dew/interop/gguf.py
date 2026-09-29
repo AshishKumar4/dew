@@ -190,7 +190,7 @@ def read(path: str | os.PathLike[str]) -> tuple[Mapping[str, object], dict[str, 
         from gguf import GGUFReader
     except ImportError as missing:
         raise ImportError("reading a GGUF file needs the gguf extra: "
-                          "pip install 'dew-ml[gguf]'") from missing
+                          "pip install 'dewml[gguf]'") from missing
     reader = GGUFReader(path)
     architecture, config = _config(reader)
     layers = config.get("num_hidden_layers")
