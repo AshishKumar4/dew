@@ -1,16 +1,16 @@
 # Installation
 
-Dew's package name is `dew-ml` and its import name is `dew`; it is installed from the GitHub repository. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
+Dew's package name is `dewml` and its import name is `dew`; it is installed from the GitHub repository. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
 
 ## Installing from GitHub
 
 ```bash
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
+uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dew-ml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew pins JAX and Flax to GitHub builds that carry fixes it needs; `pyproject.toml` names the commits.
+This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew pins JAX and Flax to GitHub builds that carry fixes it needs; `pyproject.toml` names the commits.
 
 The plain install runs JAX on the CPU, which is enough for the [Quickstart](getting-started.md).
 
@@ -35,11 +35,11 @@ Add the extra that matches the hardware:
 
 | Hardware | Command |
 |---|---|
-| NVIDIA GPU, CUDA 13 driver | `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"` |
-| NVIDIA GPU, CUDA 12 driver | `uv pip install "dew-ml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
-| Google TPU VM | `uv pip install "dew-ml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
+| NVIDIA GPU, CUDA 13 driver | `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"` |
+| NVIDIA GPU, CUDA 12 driver | `uv pip install "dewml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
+| Google TPU VM | `uv pip install "dewml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
 
-Each extra installs the accelerator build of the JAX version Dew pins (a GitHub build of 0.11.2 with a compilation-cache fix for process pools on different GPUs). Use these extras rather than PyPI's `jax[cuda13]` or `jax[tpu]`: pip cannot resolve those beside the pin, and a later `-U "jax[...]"` replaces the pinned build. Extras combine, as in `dew-ml[cuda13,interop,streaming]`.
+Each extra installs the accelerator build of the JAX version Dew pins (a GitHub build of 0.11.2 with a compilation-cache fix for process pools on different GPUs). Use these extras rather than PyPI's `jax[cuda13]` or `jax[tpu]`: pip cannot resolve those beside the pin, and a later `-U "jax[...]"` replaces the pinned build. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
@@ -69,14 +69,14 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `test` | The test suite's dependencies and pinned reference libraries |
 
 ```bash
-uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
 ```
 
 The `vision` extra expects CPU builds of PyTorch and torchvision, installed first, so that no CUDA PyTorch sits beside JAX's accelerator runtime. Without it the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install 'dew-ml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
+uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
 Qwix quantization and tokamax kernels have no extra; `uv pip install qwix` adds Qwix.

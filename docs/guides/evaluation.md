@@ -78,12 +78,12 @@ The trainer calls `Objective.preview` once per evaluation event, only when `fit(
 | Tracker | Writes | Install |
 |---|---|---|
 | `LocalTracker(path)` | JSONL journals of scalars and typed records, written synchronously, plus preview files. | |
-| `WandbTracker` | Weights & Biases; `offline=True` opens no online session. | `dew-ml[wandb]` |
-| `MLflowTracker(experiment, name, uri=store)` | One MLflow run through `MlflowClient`. | `dew-ml[mlflow]` |
-| `TensorBoardTracker(path)` | One event file through TensorBoard's own `EventFileWriter`, without TensorFlow. | `dew-ml[tensorboard]` |
+| `WandbTracker` | Weights & Biases; `offline=True` opens no online session. | `dewml[wandb]` |
+| `MLflowTracker(experiment, name, uri=store)` | One MLflow run through `MlflowClient`. | `dewml[mlflow]` |
+| `TensorBoardTracker(path)` | One event file through TensorBoard's own `EventFileWriter`, without TensorFlow. | `dewml[tensorboard]` |
 | `Trackers(*trackers)` | Every tracker receives each report even if another fails; the first failure is raised. | |
 
-`LocalTracker` never overwrites a recipe's `run.json`. Recipes create a local tracker under their checkpoint directory; a run whose checkpoints live at a URI prints its local tracking path. Recipes keep a configured W&B preview request, but do not turn previews on when the only reporting is local. The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`; a perfect PSNR stays positive infinity. Read these fields with `float(value)`. Plots are opt-in: install `dew-ml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display, and nothing is plotted during training. Non-finite points are marked and left out of the curve segments; their exact values stay in the journal.
+`LocalTracker` never overwrites a recipe's `run.json`. Recipes create a local tracker under their checkpoint directory; a run whose checkpoints live at a URI prints its local tracking path. Recipes keep a configured W&B preview request, but do not turn previews on when the only reporting is local. The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`; a perfect PSNR stays positive infinity. Read these fields with `float(value)`. Plots are opt-in: install `dewml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display, and nothing is plotted during training. Non-finite points are marked and left out of the curve segments; their exact values stay in the journal.
 
 `MLflowTracker` never touches MLflow's global active run. Scalars become the run's metrics. Each record becomes a JSON artifact at `records/<type>-<step>.json`, rather than a param, because MLflow refuses a second value for a param and a run reports several records of the same type. A preview is uploaded as the files the local renderers write. A `FitEnded` record whose status is not "completed" ends the run as `FAILED`. `uri` can be any store MLflow reads; from MLflow 3.16 on, a local file store also needs `MLFLOW_ALLOW_FILE_STORE=true`.
 
@@ -117,7 +117,7 @@ A space maps dotted paths into the run record to the values a trial can take. `o
 |---|---|
 | `random_search` | Draws each field independently, reproducibly from the trial number. |
 | `grid_search` | Walks the cartesian product in order. |
-| `optuna_search` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dew-ml[hpo]`. |
+| `optuna_search` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]`. |
 
 A finished trial is written to the ledger before it is reported, so rerunning an interrupted sweep continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
