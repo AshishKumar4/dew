@@ -1,7 +1,7 @@
 """Generate the supported-models page from the registries in Dew's source.
 
 The families come from the code, not from a list kept by hand: the decoder
-table `_FAMILY_ENTRIES` and the branches of `translate_wrapper_config` in
+table `_FAMILY_ENTRIES` and the wrapper table `_WRAPPERS` in
 `dew/interop/hf_decoders.py`, the diffusers pipelines in
 `dew/interop/pretrained.py`, and the classes registered with `@models(...)`.
 DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
