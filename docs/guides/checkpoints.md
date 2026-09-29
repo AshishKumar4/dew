@@ -88,7 +88,7 @@ The save has to fit in the scheduler's grace: a step and one checkpoint write. `
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not write `run.json`. Recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. The record carries a version: `RunConfig.load` brings a record an older Dew wrote forward to today's fields, one step per version (`dew.config.migrations`), and refuses one a newer Dew wrote. A checkpoint also does not save your source code, package versions, tokenizer files, dataset revision, or the state of any external service. Record those in your experiment metadata.
+`Checkpoints` does not write `run.json`. Recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. `RunConfig.load` reads a record an older Dew wrote: a field the record lacks takes its default, which is what runs recorded before the field existed did. It refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save your source code, package versions, tokenizer files, dataset revision, or the state of any external service. Record those in your experiment metadata.
 
 A plain Python generator usually cannot report its position. To continue the data sequence, use a built-in source that supports checkpointing, or give your iterator both `get_state` and `set_state` as the example does. If you rebuild an iterator from the start instead, it may replay records even though the model weights restore correctly.
 
