@@ -164,6 +164,10 @@ class FlowGRPO:
     The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document
     them; `reward` names a registered image metric measured per sample
     against its own prompt, and higher must be better (`clip_score`).
+
+    Under it the run's `ema_decay` and `unconditional_prob` go unused: the
+    EMA slot holds the frozen KL reference when `beta` > 0 and nothing
+    otherwise, and no training row drops its condition.
     """
 
     reward: str = "clip_score"
