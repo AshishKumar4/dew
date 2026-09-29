@@ -53,12 +53,13 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
                      latent_shift: float | None = None, latent_scale: float | None = None,
                      params: Variables | None = None) -> AutoEncoder:
     """The autoencoder `modelname` publishes: a DC-AE where its config names
-    `AutoencoderDC`, Wan 2.1's video VAE where it names `AutoencoderKLWan`,
-    and otherwise a Stable Diffusion AutoencoderKL.
+    `AutoencoderDC`, Wan 2.1's video VAE where it names `AutoencoderKLWan`, a
+    representation autoencoder where it names `AutoencoderRAE`, and otherwise
+    a Stable Diffusion AutoencoderKL.
 
     `modelname` is a local directory or a Hub repo; `revision` is as
-    `load_pretrained_vae` reads it, so a DC-AE or a Wan VAE takes `main` or a
-    commit. Supplied `params` are bound unchanged and only metadata is read.
+    `load_pretrained_vae` reads it, so a DC-AE, a Wan VAE or an RAE takes
+    `main` or a commit. Supplied `params` are bound unchanged and only metadata is read.
     `latent_shift` and `latent_scale` replace the checkpoint's own
     normalization where given.
     """
@@ -71,6 +72,10 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
         from .wan import load_wan_vae
 
         autoencoder, *_ = load_wan_vae(modelname, dtype, revision=revision, subfolder=subfolder or "", params=params)
+    elif class_name == "AutoencoderRAE":
+        from .rae import load_rae
+
+        autoencoder, *_ = load_rae(modelname, dtype, revision=revision, subfolder=subfolder or "", params=params)
     else:
         from .sd_vae import StableDiffusionVAE
 
