@@ -1,11 +1,12 @@
 ---
-// Sample from the text-to-image model on a live kernel: the setup cell runs once
-// when the kernel starts, and the reader edits and runs the sampling cell. The
-// live client loads when Run is first pressed.
+// Sample from the text-to-image model on a live kernel: the kernel runs the setup
+// cell itself before it reports ready (shown here, folded, for reading), and the
+// reader edits and runs the sampling cell. The live client loads when Run is
+// first pressed.
 //
 // The figure beside the editor keeps its size through a run: a status line and
-// a bar say which stage the run is in (the bot check, the kernel starting, the
-// model loading, each sampler step, the decode), each step's preview replaces
+// a bar say which stage the run is in (the bot check, the kernel starting and
+// loading the model, each sampler step, the decode), each step's preview replaces
 // the last, and the finished image fades in over them. The kernel reports a
 // step as a display output whose text is {"dew-progress": {"step": k,
 // "steps": n}} with a small PNG preview, and the decode as {"dew-progress":
@@ -22,7 +23,7 @@ const { setup, cell, colab } = Astro.props;
 const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 ---
 
-<div class="live-sampler" data-live-sampler data-setup={setup}>
+<div class="live-sampler" data-live-sampler>
 	<div class="sampler-code">
 		<div class="sampler-editor">
 			<div class="sampler-editor-bar">
@@ -39,7 +40,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				</span>
 			</div>
 			<textarea
-				data-code
+				data-cell
 				spellcheck="false"
 				autocapitalize="off"
 				autocomplete="off"
@@ -87,7 +88,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
 	if (panel && run) {
 		const q = <T extends HTMLElement>(selector: string) => panel.querySelector<T>(selector)!;
-		const editor = q<HTMLTextAreaElement>('[data-code]');
+		const editor = q<HTMLTextAreaElement>('textarea[data-cell]');
 		const stage = q<HTMLElement>('.sampler-stage');
 		const preview = q<HTMLImageElement>('[data-preview]');
 		const final = q<HTMLImageElement>('[data-final]');
@@ -172,7 +173,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			output.replaceChildren();
 			log.hidden = true;
 			log.open = false;
-			started = performance.now();
 			try {
 				const { LiveSession } = await import('../../scripts/live');
 				if (!session) {
@@ -188,17 +188,14 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 						session = undefined;
 						if (!running) show('idle', `${message} Press Run to start a new one.`);
 					};
-					show('loading', 'Loading the 176M model');
-					tick('Loading');
-					const loaded = await session.run(panel.dataset.setup ?? '', onOutput);
-					if (loaded.status !== 'ok') throw new Error('The model did not load on the live kernel.');
 				}
+				started = performance.now();
 				show('sampling', 'Sampling');
 				tick('Running');
 				const done = await session.run(editor.value, onOutput);
 				untick();
 				if (stopping || done.status === 'aborted') show('idle', 'Stopped.');
-				else if (done.status === 'ok') show('done', `Done in ${seconds()} s on the live kernel.`, 1);
+				else if (done.status === 'ok') show('done', `The cell ran in ${seconds()} s on the live kernel.`, 1);
 				else show('error', 'The cell stopped with an error; the kernel output below says why.');
 			} catch (error) {
 				untick();
