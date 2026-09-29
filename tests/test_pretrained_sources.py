@@ -19,7 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.interop import codecs, hf_decoders, pretrained
+from dew.interop import codecs, hf_decoders, pretrained, sources
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
@@ -85,7 +85,7 @@ def test_a_decoder_downloads_only_the_shards_its_index_names(hub, name, repo):
     bytes) and then failed on `unknown tensor name`."""
     fake = hub(name)
 
-    directory = hf_decoders._snapshot(repo, None)
+    directory = sources.snapshot(repo, None)
 
     assert directory == fake.snapshot
     assert sorted(fake.fetched) == [f"model-0000{shard}-of-00003.safetensors" for shard in (1, 2, 3)]
@@ -125,7 +125,7 @@ def test_a_local_checkpoint_reads_the_indexed_shards_and_not_a_consolidated_copy
     write_index(tmp_path, {"model.embed_tokens.weight": "model-00001-of-00002.safetensors",
                            "model.norm.weight": "model-00002-of-00002.safetensors"})
 
-    tensors = hf_decoders._load_shards(tmp_path)
+    tensors = sources.load_shards(tmp_path)
 
     assert sorted(tensors) == ["model.embed_tokens.weight", "model.norm.weight"]
 
@@ -136,7 +136,7 @@ def test_a_tensor_in_two_shards_is_refused_by_name(tmp_path):
     write_index(tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"})
 
     with pytest.raises(ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"):
-        hf_decoders._load_shards(tmp_path)
+        sources.load_shards(tmp_path)
 
 
 def test_a_text_encoder_reads_its_weights_and_not_the_fp16_variant_beside_them(tmp_path):
@@ -214,7 +214,7 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
         pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main)(repo_id, revision=revision, **kwargs))
 
     with caplog.at_level("WARNING"):
-        directory = hf_decoders._snapshot("state-spaces/mamba2-130m", None)
+        directory = sources.snapshot("state-spaces/mamba2-130m", None)
 
     assert directory == pull.snapshot
     assert (main.fetched, pull.fetched) == ([], ["model.safetensors"])
@@ -227,7 +227,7 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
         raise OfflineModeIsEnabled("offline")
 
     monkeypatch.setattr(huggingface_hub.HfApi, "get_repo_discussions", offline)
-    assert hf_decoders._snapshot("state-spaces/mamba2-130m", None) == pull.snapshot
+    assert sources.snapshot("state-spaces/mamba2-130m", None) == pull.snapshot
     assert main.fetched == []
 
 
@@ -236,7 +236,7 @@ def test_without_a_conversion_of_its_commit_a_pickle_repo_fetches_its_pickles(hu
     fake = hub("mamba2-130m-ssm")
     conversion["refs/pr/1"] = "0" * 40
 
-    assert hf_decoders._snapshot("state-spaces/mamba2-130m", None) == fake.snapshot
+    assert sources.snapshot("state-spaces/mamba2-130m", None) == fake.snapshot
     assert fake.fetched == ["pytorch_model.bin"]
 
 
@@ -287,7 +287,7 @@ def test_an_integer_format_without_its_code_width_is_refused_by_name():
     config = fixture_config("qwen3-8b-fp8")
     config["quantization_config"] = {"quant_method": "awq", "group_size": 128, "version": "gemm"}
 
-    with pytest.raises(ValueError, match="awq quantization_config has no bits"):
+    with pytest.raises(ValueError, match="awq bits=None"):
         codecs.source_quantization(config)
 
 @pytest.mark.parametrize("name, inert", [
@@ -367,7 +367,7 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
 
     scaling = YarnScaling(**record["yarn"])
     assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
-    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling)) - expected.numpy())) < 1e-7
+    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy())) < 1e-7
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
 
 
@@ -375,7 +375,7 @@ def bf16_source(tmp_path, **stated):
     """qwen3-tiny with its tensors stored in bfloat16 and `stated` as its dtype fields."""
     source = tmp_path / "source"
     shutil.copytree(FIXTURES / "qwen3-tiny", source)
-    tensors = hf_decoders._load_shards(source)
+    tensors = sources.load_shards(source)
     safetensors_numpy.save_file({name: np.asarray(value, np.float32).astype(ml_dtypes.bfloat16)
                                  for name, value in tensors.items()}, str(source / "model.safetensors"))
     config = {key: value for key, value in fixture_config("qwen3-tiny").items()

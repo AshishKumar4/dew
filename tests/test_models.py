@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
@@ -22,6 +23,7 @@ from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.unet import Unet
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
+from dew.nn.conv import Conv
 from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
@@ -91,6 +93,134 @@ def _simple_encoder():
 def _simple_decoder():
     model = SimpleDecoder(out_channels=3, feature_depths=(16, 32), dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 4, 4, 4), jnp.bfloat16),), {}
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("backward", [False, True], ids=["encode", "vjp"])
+def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
+    """The full jitted encoder, not an isolated downsampler, and its VJP.
+
+    XLA:TPU's stride-two rewrite moved the batch-one output by 40%. Compare
+    both paths to a float64 host evaluation, allowing only the host fp32
+    reference's rounding (the shared reference_error rule).
+    """
+    model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
+                        norm_num_groups=8, double_z=True)
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    rng = np.random.default_rng(43)
+    image = rng.standard_normal((batch, 17, 17, 3)).astype(np.float32)
+    cotangent = rng.standard_normal((batch, 8, 8, 8)).astype(np.float32)
+    with jax.default_device(host):
+        variables = jax.tree.map(np.asarray, model.init(jax.random.key(0), image[:1]))
+
+    def evaluate(dtype, target):
+        network = model.clone(dtype=dtype)
+        arguments = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                                  (variables, image, cotangent))
+
+        def run(params, x, cot):
+            if backward:
+                return jax.grad(lambda p, a: jnp.sum(network.apply(p, a) * cot),
+                                argnums=(0, 1))(params, x)
+            return network.apply(params, x)
+
+        with jax.default_device(target):
+            return jax.tree.map(np.asarray, jax.jit(run)(*arguments))
+
+    reference = evaluate(np.float32, host)
+    with jax.enable_x64():
+        truth = evaluate(np.float64, host)
+    actual = evaluate(np.float32, device)
+    if backward:
+        # Treat the complete parameter/input VJP as one vector rather than
+        # scaling a cancelling bias leaf by its near-zero norm.
+        actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
+                                    for value in (actual, reference, truth)]
+    assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
+
+
+@pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
+def test_strided_convolution_linearizations_keep_host_precision(transform):
+    """Random filters expose a tangent chain just as they expose the primal.
+
+    A boundary whose JVP drops the barrier leaves the same miscompiled
+    convolution chain in the tangent-only program.
+    """
+    def network(dtype):
+        return nn.Sequential([
+            Conv(12, (1, 1), use_bias=False, dtype=dtype, precision=jax.lax.Precision.HIGHEST),
+            Conv(8, (3, 3), strides=2, padding="VALID", use_bias=False,
+                 dtype=dtype, precision=jax.lax.Precision.HIGHEST),
+        ])
+
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    rng = np.random.default_rng(23)
+    image, direction = (rng.standard_normal((1, 17, 17, 3)).astype(np.float32) for _ in range(2))
+    cotangent = rng.standard_normal((1, 8, 8, 8)).astype(np.float32)
+    with jax.default_device(host):
+        variables = jax.tree.map(np.asarray, network(np.float32).init(jax.random.key(0), image))
+
+    def evaluate(dtype, target):
+        model = network(dtype)
+        args = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                             (variables, image, direction, cotangent))
+
+        def run(params, x, tangent, cot):
+            forward = lambda value: model.apply(params, value)
+            if transform == "jvp":
+                return jax.jvp(forward, (x,), (tangent,))[1]
+            if transform == "transpose":
+                return jax.linear_transpose(forward, x)(cot)[0]
+            if transform == "forward_over_reverse":
+                return jax.jvp(jax.grad(lambda value: jnp.sum(forward(value)**2)),
+                               (x,), (tangent,))[1]
+            return jax.grad(lambda value: jnp.sum(
+                jax.jvp(forward, (value,), (tangent,))[1] * forward(value)))(x)
+
+        with jax.default_device(target):
+            return np.asarray(jax.jit(run)(*args))
+
+    reference = evaluate(np.float32, host)
+    with jax.enable_x64():
+        truth = evaluate(np.float64, host)
+    actual = evaluate(np.float32, device)
+    assert_as_exact_as_the_reference(actual, reference, truth, transform)
+
+
+def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
+    """Small integer operands make every product/sum exact in fp32.
+
+    The largest possible sum in this two-convolution VJP is below 2**24,
+    so a mapped axis or tangent lost by the TPU barrier cannot hide in a
+    tolerance. The host evaluates the same six images as one batch.
+    """
+    model = nn.Sequential([
+        Conv(4, (1, 1), use_bias=False, precision=jax.lax.Precision.HIGHEST),
+        Conv(2, (3, 3), strides=2, padding="VALID", use_bias=False,
+             precision=jax.lax.Precision.HIGHEST),
+    ])
+    image = (np.arange(2 * 3 * 17 * 17 * 3).reshape(2, 3, 17, 17, 3) % 7).astype(np.float32)
+    cotangent = (np.arange(2 * 3 * 8 * 8 * 2).reshape(2, 3, 8, 8, 2) % 5 - 2).astype(np.float32)
+    host, device = jax.devices("cpu")[0], jax.devices()[0]
+    with jax.default_device(host):
+        variables = jax.tree.map(jnp.ones_like, model.init(jax.random.key(0), image[0, 0]))
+
+    def mapped(params, x):
+        return jax.vmap(jax.vmap(lambda item: model.apply(params, item)))(x)
+
+    results = []
+    for forward, target in ((model.apply, host), (mapped, device)):
+        arguments = jax.tree.map(lambda x: jax.device_put(x, target), (variables, image, cotangent))
+
+        def loss(params, x, cot):
+            return jnp.sum(forward(params, x) * cot)
+
+        with jax.default_device(target):
+            values = jax.jit(forward)(*arguments[:2])
+            gradients = jax.jit(jax.grad(loss, argnums=(0, 1)))(*arguments)
+            results.append(jax.tree.map(np.asarray, (values, gradients)))
+    for actual, expected in zip(jax.tree.leaves(results[1]), jax.tree.leaves(results[0]), strict=True):
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("build", [

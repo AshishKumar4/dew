@@ -116,6 +116,7 @@ SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
 # bank_layers.
 SHAPES = {
     "dense": dict(num_layers=4),
+    "narrow": dict(num_layers=8, emb_features=4, num_heads=1, num_kv_heads=1, mlp_features=8),
     "moe": dict(num_layers=4, mixture={"experts": 4, "top_k": 2, "bias": True}),
     "gated_delta_net": dict(num_layers=4, layer_types=("linear_attention",) * 4,
                             kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}),
@@ -136,11 +137,18 @@ SHAPES = {
     "capped_banks": dict(num_layers=6, bank_layers=2),
 }
 
-# The scanned stack against the plain loop, which is the bound
-# tests/test_layer_stack.py states for the same comparison. A fetched run
-# reassociates nothing the scan does not; what it must not do is differ from
-# the same banks on the device, which every case asserts bitwise.
-SCAN_BOUND = 1e-5
+# The scanned stack against the plain loop. Both are fp32 evaluations of the
+# same logits, so they can differ by the sum of their errors against the
+# exact values. Measured against a float64 evaluation of the same weights on
+# CPU, the narrow shape's scanned logits are off by up to 7.3e-06 and its
+# plain ones by up to 4.7e-06, depending on the ISA XLA compiles for
+# (--xla_cpu_max_isa SSE4_2, AVX, AVX2); an AVX-512 CI runner measured a
+# difference of 1.03e-05 between them. Twice the larger error, 1.5e-05,
+# rounded up, is the bound.
+# A fetched run reassociates nothing the scan does not; what it must not do
+# is differ from the same banks on the device, which every case asserts
+# bitwise.
+SCAN_BOUND = 2e-5
 
 
 def pair(**overrides):
@@ -338,8 +346,8 @@ def test_a_store_holding_a_leaf_in_both_a_bank_and_its_layers_is_refused():
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
     mixed = {"params": {**on_host["params"],
-                        "layers_0": variables["params"]["layers_0"]}}
-    with pytest.raises(ValueError, match="a leaf is read from one"):
+                        "layers_2": variables["params"]["layers_2"]}}
+    with pytest.raises(ValueError, match="in its layer layers_2;"):
         scanned.apply(mixed, tokens)
 
 
@@ -362,40 +370,50 @@ def compiled_forward(scanned, store, cache, tokens):
             store, cache, tokens).compile()
 
 
-def staged_plan(depth: int) -> tuple[int, int, int]:
-    """The host parameters, the bank leaves and the device temporaries past
-    the cache of one compiled fetched forward pass."""
+def staged_plan(depth: int) -> tuple[int, int, int, int]:
+    """Cached host placement, cache-free parameter-staging workspace, and one
+    layer's parameter bytes."""
     _, scanned, variables, tokens = pair(num_layers=depth)
     resident, on_host = stores(scanned, variables)
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     compiled = compiled_forward(scanned, on_host, cache, tokens)
     assert host_parameters_in_plan(compiled_forward(scanned, resident, cache, tokens)) == 0
-    cache_bytes = sum(leaf.nbytes for leaf in jax.tree.leaves(cache))
-    analysis = compiled.memory_analysis()
+    uncached = jax.jit(lambda held, ids: scanned.apply(held, ids)).lower(on_host, tokens).compile()
+    analysis = uncached.memory_analysis()
     assert analysis is not None
+    banks = {name: tree for name, tree in on_host["params"].items() if name.startswith("layers_")}
+    layer = sum(leaf.nbytes for leaf in jax.tree.leaves(banks)) // depth
     return (host_parameters_in_plan(compiled), bank_leaves(on_host),
-            analysis.temp_size_in_bytes - cache_bytes)
+            analysis.temp_size_in_bytes, layer)
 
 
 def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer():
-    """The compiled module's own memory-space assignment, and what its device
-    temporaries cost.
+    """Parameter staging, not total cached-decode workspace, is depth-bounded.
 
-    Every leaf of every bank is a host parameter of the compiled forward and
-    no other parameter is, at either depth, while the same forward over
-    resident banks has none. The device temporaries past the cache are the
-    staging, and doubling the layers does not grow them: the loop holds the
-    layer it computes with and the one it fetched, never the stack.
+    The cached forward still assigns every bank leaf to host memory, unlike
+    its resident counterpart. The cache-free public forward isolates the
+    parameter-staging cost: it holds the current and prefetched layers, not
+    the whole stack, so eight more layers add less than one layer's bytes to
+    its temporaries, where staging the stack would add eight layers'. The
+    bound is not zero: with deterministic ops on an RTX 4080 and an A100 the
+    sixteen-layer plan's temporaries are 256 bytes over the eight-layer
+    plan's, and on the 4080 the resident plan's grow by the same 256. Both
+    plans hold the same temporaries apart from a loop's s32[depth - 1]; XLA
+    packs them into its temporary allocation differently. Cached decode has
+    depth-dependent KV-bank tiling and output formatting on TPU; subtracting
+    logical cache nbytes from physical temporaries cannot remove that cost.
+    Separate decode tests check values.
     """
     shallow, deep = staged_plan(8), staged_plan(16)
     assert shallow[0] == shallow[1] and deep[0] == deep[1]
-    assert deep[2] <= shallow[2], (shallow, deep)
+    assert deep[2] - shallow[2] < shallow[3], (shallow, deep)
 
 
 def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     """A run's saved weights read one bank at a time, against the same
     checkpoint read into resident banks."""
-    plain, scanned, _, tokens = pair(num_layers=4, bank_layers=2)
+    plain, scanned, _, tokens = pair(num_layers=8, bank_layers=4, emb_features=2,
+                                      num_heads=1, num_kv_heads=1, mlp_features=4)
     directory = str(tmp_path / "run")
     checkpoints = Checkpoints(directory, keep=1)
     trainer = Trainer(LMObjective(plain, SHAPE["max_seq_len"] - 1, head_chunks=1),
@@ -411,7 +429,7 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
 
     resident = host_banked(scanned, CheckpointBanks(directory), layout=DEVICE)
     on_host = host_banked(scanned, CheckpointBanks(directory), layout=BANKS)
-    assert memory_kinds(on_host["params"]["layers_0_1"]) == {"pinned_host"}
+    assert memory_kinds(on_host["params"]["layers_0_3"]) == {"pinned_host"}
     assert np.array_equal(np.asarray(scanned.apply(on_host, tokens)),
                           np.asarray(scanned.apply(resident, tokens)))
     trained = StackView(scanned.bind({}).groups).unstack(resident)

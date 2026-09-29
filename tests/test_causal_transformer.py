@@ -479,7 +479,8 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     block's output is checked against that equation computed from its own
     sublayers, and against the pre-norm block on the same weights, which
     normalises the input instead and lands elsewhere."""
-    from dew.nn.backbones.causal_transformer import BlockWiring, DecoderBlock, GatedMLP, RMSNorm
+    from dew.nn.backbones.causal_transformer import RMSNorm
+    from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
     from dew.nn.mixers import AttentionMixer, MixerContext
 
     features, ids = 32, tokens(rng)
@@ -1084,7 +1085,7 @@ def test_lm_engine_init_draws_each_matrix_at_its_std():
     """initializer_range 0.02 under m_width 4 and depth scaling: embeddings
     at 0.02, hidden projections at 0.01, output projections at
     0.01 / sqrt(2 * layers), norms at one."""
-    from dew.nn.backbones.causal_transformer import Mixture
+    from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=512, emb_features=128, num_layers=2, num_heads=4,
                               qk_norm=False, mixture=Mixture(experts=4, top_k=2, expert_features=64),
                               logits_scaling=4.0, initializer_range=0.02, depth_scaled_init=True)
@@ -1119,7 +1120,7 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
     """Only the grouped-query mixer rotates by rope and subtracts its own
     value, so the switches live on it and a mixer that cannot honour them
     cannot be handed them."""
-    from dew.nn.backbones.causal_transformer import LayerKind
+    from dew.nn.backbones.layer_plan import LayerKind
     ids = tokens(jax.random.key(0), length=8)
     record = {"kind": "attention", "nope": True, "exclusive_self_attention": True}
     kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})

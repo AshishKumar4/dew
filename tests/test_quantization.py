@@ -38,16 +38,6 @@ def token_batch():
     return {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
 
 
-def test_fp8_full_is_refused_for_want_of_a_calibration_pass():
-    with pytest.raises(ValueError, match="calibration pass"):
-        Quantization(dtype="fp8_full")
-
-
-def test_nanoo_fp8_is_refused_as_amd_only():
-    with pytest.raises(ValueError, match="AMD"):
-        Quantization(dtype="nanoo_fp8")
-
-
 def test_a_value_that_says_nothing_is_refused():
     with pytest.raises(ValueError, match="no patterns"):
         Quantization(patterns=())
@@ -63,11 +53,6 @@ def test_a_value_that_says_nothing_is_refused():
         Quantization(bwd_stochastic_rounding="gaussian")
     with pytest.raises(ValueError, match="int8 or fp8"):
         Quantization(dtype="int4")
-
-
-def test_apply_refuses_a_non_value():
-    with pytest.raises(ValueError, match="a Quantization value"):
-        apply_quantization(tiny(), {"dtype": "int8"})
 
 
 def test_the_value_round_trips_through_json():

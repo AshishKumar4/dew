@@ -12,6 +12,7 @@ read, and `sparse_latent_attention` attends it without that mask.
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
 from dew.nn.scatter import DROPPED
 
 
@@ -30,7 +31,7 @@ def top_k_selection(scores, keep, top_k: int):
     """
     batch, length, total = scores.shape
     keep = jnp.broadcast_to(keep, (batch, length, total))
-    ranked = jnp.where(keep, scores, jnp.finfo(jnp.float32).min)
+    ranked = jnp.where(keep, scores, jnp.finfo(at_least_fp32(scores.dtype)).min)
     chosen = jax.lax.top_k(ranked, min(top_k, total), is_stable=True)[1]
     return jnp.where(jnp.take_along_axis(keep, chosen, axis=-1), chosen, -1)
 
@@ -104,11 +105,12 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
         q_latent, q_rot, at = pieces
         allowed, at = at >= 0, jnp.maximum(at, 0)
         keys, rots = gathered(latent, at), gathered(rot, at)
+        wide = at_least_fp32(q_latent.dtype)
         logits = (jnp.einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
-                             preferred_element_type=jnp.float32)
+                             preferred_element_type=wide)
                   + jnp.einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
-                               preferred_element_type=jnp.float32)) * scale
-        logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(jnp.float32).min)
+                               preferred_element_type=wide)) * scale
+        logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(wide).min)
         weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
         return jnp.einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
 

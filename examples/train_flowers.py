@@ -46,7 +46,7 @@ def main(config: Config):
         dtype=jnp.bfloat16,
         attention_impl="auto",
     )
-    process = EDM()()
+    process = EDM(regime="pixel")()
     objective = DiffusionObjective(
         model,
         process,

@@ -8,6 +8,7 @@ tree, the logits, the decode path, the loss and the gradients to the plain
 loop's, with the largest observed difference written beside each bound.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     reference = np.load(directory / "logits.npy")
 
-    
+
     plain = np.asarray(model.apply(variables, ids))
     logits = np.asarray(scanned.apply(variables, ids))
 
@@ -168,19 +169,30 @@ def widened(tree):
 
 def judged(single, double, candidate) -> tuple[float, str]:
     """The worst leaf of `candidate` against `single`, as a fraction of
-    FLOOR_FACTOR times `single`'s distance from `double`, and its path. A
-    leaf's floor is never below one fp32 rounding of its largest value, so a
-    leaf the float64 run happens to match exactly still has a bound."""
+    FLOOR_FACTOR times `single`'s distance from `double`, and its path.
+
+    A leaf's floor is never below one fp32 rounding of the largest value in
+    its part (the logits, the loss or the gradients), as
+    tools/layout_parity.py measures a leaf against the rounding of the whole
+    step (`leaf_errors`): a sum's rounding scales with its terms, not with
+    the sum, so a leaf whose terms cancel sits below its part's rounding and
+    its own distance from float64 is noise. gemma3n's altup correction
+    coefficients are such leaves: on a TPU v6e at full fp32 matmuls, the
+    plain loop landed 2.3 of the leaf's own fp32 roundings from float64 and
+    the scanned stack 19, which read 2.0 of a floor taken from the leaf
+    alone."""
     worst = (0.0, "")
-    for (path, reference), exact, other in zip(
-            jax.tree_util.tree_leaves_with_path(single), jax.tree.leaves(double),
-            jax.tree.leaves(candidate), strict=True):
-        reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
-        floor = max(float(np.max(np.abs(reference - exact))),
-                    float(np.finfo(np.float32).eps * np.max(np.abs(exact))))
-        difference = float(np.max(np.abs(other - reference)))
-        ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
-        worst = max(worst, (ratio, jax.tree_util.keystr(path)))
+    for part in single:
+        scale = float(np.finfo(np.float32).eps) * max(
+            float(np.max(np.abs(np.asarray(leaf, np.float64)))) for leaf in jax.tree.leaves(double[part]))
+        for (path, reference), exact, other in zip(
+                jax.tree_util.tree_leaves_with_path(single[part]), jax.tree.leaves(double[part]),
+                jax.tree.leaves(candidate[part]), strict=True):
+            reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
+            floor = max(float(np.max(np.abs(reference - exact))), scale)
+            difference = float(np.max(np.abs(other - reference)))
+            ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
+            worst = max(worst, (ratio, f"['{part}']{jax.tree_util.keystr(path)}"))
     return worst
 
 
@@ -334,11 +346,11 @@ def token_batch(rows: int = BATCH):
 PIPELINED_ROWS = 16
 
 
-def loss_and_grads(objective, spec, variables, batch):
-    """The objective's loss, metrics and gradients on `spec`'s mesh, with the
-    pipeline's schedule in context the way the trainer's compiled step
-    puts it there."""
-    mesh = build_mesh(spec)
+def loss_and_grads(objective, spec, variables, batch, devices=None):
+    """The objective's loss, metrics and gradients on `spec`'s mesh over
+    `devices` (every device by default), with the pipeline's schedule in
+    context the way the trainer's compiled step puts it there."""
+    mesh = build_mesh(spec, devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
     batch = shard_batch(mesh, batch)
@@ -475,6 +487,34 @@ def test_a_pipeline_refuses_a_schedule_that_does_not_fit_the_batch():
         MeshSpec(microbatches=4)
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [MeshSpec(stage=4, microbatches=4),
+                                  MeshSpec(stage=2, sequence=2, microbatches=4)],
+                         ids=["stage4", "stage2_sequence2"])
+def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spec):
+    """On four devices, four stages, or two beside a sequence axis of two,
+    leave no mesh axis for the rows: every device holds all eight, so any
+    microbatch count that divides them takes a share of every device's
+    rows, and the pipeline runs. The refusal of microbatches that miss a
+    device read the first axis of the rows' spec, which is empty there, and
+    raised IndexError instead (layout_parity's stage4 and stage2_sequence2
+    rows on four GPUs; eight devices put the rest on data and never showed
+    it). Largest observed differences on CPU: loss 0.0, gradients 1.4e-07
+    on leaves of order 0.1."""
+    model = tiny(max_seq_len=16)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32))
+    rng = np.random.default_rng(0)
+    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, 17)).astype(np.int32)}
+    objective, four = LMObjective(model, 16), jax.devices()[:4]
+
+    loss, _, grads = loss_and_grads(objective, MeshSpec(), variables, batch, four)
+    piped, _, piped_grads = loss_and_grads(objective, spec, variables, batch, four)
+
+    assert abs(loss - piped) < 1e-5, (loss, piped)
+    difference = largest_difference(grads, piped_grads)
+    assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
+
+
 @mesh_lane
 def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
     """Eight rows over fsdp=4 hold two a device. Four microbatches cannot
@@ -557,3 +597,22 @@ def test_the_layers_of_a_run_draw_their_own_weights():
                for index in range(4)]
     assert all(not np.array_equal(kernels[i], kernels[j])
                for i in range(4) for j in range(i + 1, 4))
+
+
+def test_a_scanned_glm5_next_computes_its_unrolled_forward():
+    """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
+    hyper-connections) scan as one run under `scan_layers`. The scanned
+    forward is the unrolled one's, call after call. On XLA:CPU it was off by
+    8.7, 10.1 or NaN depending on the process, exact without jit and on a
+    GPU: the compiled program is identical across processes, so the bad
+    values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
+    loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
+    tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
+    unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
+    scanned = dataclasses.replace(loaded.model, scan_layers=True)
+    # Each compilation drew the fault afresh, about 60% of the time, so the
+    # scan compiles eight times over: a regression shows in 99% of runs.
+    for _ in range(8):
+        jax.clear_caches()
+        got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
+        assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()

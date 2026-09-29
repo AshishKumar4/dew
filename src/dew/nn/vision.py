@@ -42,16 +42,18 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
 from dew.nn.text_encoders import MLP, CLIPEncoderLayer, ParamTree, checkpoint_array, checkpoint_leaf, insert
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
-from .mobilenet import MobileNetV5Encoder
+from .mobilenet import _ARCHITECTURE, MobileNetV5Encoder
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -199,16 +201,6 @@ class SiglipVision(TowerBase):
                              channels=self.num_channels)
 
 
-def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """The complex rotation on real pairs, one shared angle per pair."""
-    pairs = values.reshape(*values.shape[:-1], -1, 2)
-    first, second = pairs[..., 0], pairs[..., 1]
-    table, turn = cos[:, None, :], sin[:, None, :]
-    rotated = jnp.stack([first * table - second * turn,
-                         first * turn + second * table], axis=-1)
-    return rotated.reshape(values.shape)
-
-
 class GemmaProjectorModule(nn.Module):
     """Patch features into soft tokens: block average, norm, map to text width.
 
@@ -268,7 +260,8 @@ class GemmaProjector(ProjectorBase):
             tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
 
 
-def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.Array, jax.Array]:
+def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
+                          dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The complex rotary tables of the Llama 4 vision attention, as cos/sin.
 
     Positions are the patch grid in row-major order with the class token last
@@ -282,12 +275,21 @@ def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.A
     kinds = jnp.where(positions == grid * grid, -2, positions)
     safe = jnp.where(kinds < 0, 0, kinds)
     freq_dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, freq_dim)
+    inv_freq = inverse_frequencies(theta, freq_dim, dtype=dtype)
     angles = jnp.concatenate([(safe % grid + 1)[:, None] * inv_freq[None, :],
                               (safe // grid + 1)[:, None] * inv_freq[None, :]], axis=1)
     angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
     return jnp.cos(angles), jnp.sin(angles)
 
+
+def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """The complex rotation on real pairs, one shared angle per pair."""
+    pairs = values.reshape(*values.shape[:-1], -1, 2)
+    first, second = pairs[..., 0], pairs[..., 1]
+    table, turn = cos[:, None, :], sin[:, None, :]
+    rotated = jnp.stack([first * table - second * turn,
+                         first * turn + second * table], axis=-1)
+    return rotated.reshape(values.shape)
 
 
 class Llama4VisionAttention(nn.Module):
@@ -315,7 +317,8 @@ class Llama4VisionAttention(nn.Module):
         query = self.q_proj(hidden_states).reshape(heads)
         key = self.k_proj(hidden_states).reshape(heads)
         value = self.v_proj(hidden_states).reshape(heads)
-        cos, sin = _llama4_vision_tables(self.grid, head_dim, self.rope_theta)
+        cos, sin = _llama4_vision_tables(self.grid, head_dim, self.rope_theta,
+                                         dtype=at_least_fp32(query.dtype))
         query = _llama4_vision_rope(query, cos, sin)
         key = _llama4_vision_rope(key, cos, sin)
         attended = scaled_dot_product_attention(
@@ -364,9 +367,6 @@ def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
     """
     batch, count, channels = patches.shape
     side = round(count ** 0.5)
-    if side * side != count:
-        raise ValueError(
-            f"{count} patches are not a square grid, so no shuffle ratio tiles them")
     grown = round(channels / ratio ** 2)
     if abs(grown * ratio ** 2 - channels) > 1e-6:
         raise ValueError(
@@ -397,6 +397,24 @@ class Llama4VisionAdapterMLP(nn.Module):
         # (modeling_llama4.py, Llama4VisionMLP2.forward).
         gelu = functools.partial(jax.nn.gelu, approximate=False)
         return gelu(self.fc2(gelu(self.fc1(hidden_states))))
+
+
+class Llama4VisionAdapter(nn.Module):
+    """Pixel shuffle into the adapter MLP, the tower's last stage."""
+
+    ratio: float
+    input_dim: int
+    output_dim: int
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    def setup(self):
+        self.mlp = Llama4VisionAdapterMLP(
+            self.input_dim, self.output_dim, dtype=self.dtype,
+            precision=self.precision, name="mlp")
+
+    def __call__(self, encoded_patches) -> jax.Array:
+        return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
 
 
 class Llama4VisionTransformer(nn.Module):
@@ -482,24 +500,6 @@ class Llama4VisionTransformer(nn.Module):
         return self.vision_adapter(hidden_states)
 
 
-class Llama4VisionAdapter(nn.Module):
-    """Pixel shuffle into the adapter MLP, the tower's last stage."""
-
-    ratio: float
-    input_dim: int
-    output_dim: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        self.mlp = Llama4VisionAdapterMLP(
-            self.input_dim, self.output_dim, dtype=self.dtype,
-            precision=self.precision, name="mlp")
-
-    def __call__(self, encoded_patches) -> jax.Array:
-        return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
-
-
 @towers("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Vision(TowerBase):
@@ -560,8 +560,9 @@ class Llama4Projector(ProjectorBase):
     def build(self) -> nn.Module:
         return Llama4ProjectorModule(text_width=self.text_width)
 
+
 def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
-                        theta: float) -> tuple[jax.Array, jax.Array]:
+                        theta: float, *, dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of the Gemma 4 vision attention, as cos/sin.
 
     Each spatial dim carries its own frequencies over half the head
@@ -570,8 +571,8 @@ def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
     the dims concatenate, so `positions` [B, P, 2] yields [B, P, head_dim].
     """
     spatial = head_dim // 2
-    inv_freq = inverse_frequencies(theta, spatial)
-    angles = positions.astype(jnp.float32)[:, :, :, None] * inv_freq
+    inv_freq = inverse_frequencies(theta, spatial, dtype=dtype)
+    angles = positions.astype(dtype)[:, :, :, None] * inv_freq
     doubled = jnp.concatenate([angles, angles], axis=-1)
     cos = jnp.concatenate([jnp.cos(doubled[:, :, 0]), jnp.cos(doubled[:, :, 1])],
                           axis=-1)
@@ -617,7 +618,6 @@ class Gemma4ClippableLinear(nn.Dense):
             high = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf, jnp.float32))
             output = jnp.clip(output, low.value.astype(output.dtype), high.value.astype(output.dtype))
         return output
-
 
 
 class Gemma4VisionAttention(nn.Module):
@@ -808,11 +808,12 @@ class Gemma4VisionTransformer(nn.Module):
 
     def __call__(self, pixel_values, pixel_position_ids=None) -> jax.Array:
         pixels = jnp.asarray(pixel_values)
+        kernel = self.pooling_kernel_size
         if pixels.ndim == 4:
             if pixel_position_ids is not None:
                 raise ValueError("position IDs accompany patch pixels, not NCHW images")
             batch, channels, height, width = pixels.shape
-            stride = self.patch_size * self.pooling_kernel_size
+            stride = self.patch_size * kernel
             if channels != 3 or height % stride or width % stride:
                 raise ValueError(f"Gemma4 images must have three channels and sides divisible by {stride}")
             rows, columns = height // self.patch_size, width // self.patch_size
@@ -827,18 +828,18 @@ class Gemma4VisionTransformer(nn.Module):
             raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
         if not jnp.issubdtype(pixel_position_ids.dtype, jnp.integer):
             raise ValueError("pixel_position_ids must be integers")
+        if pixels.shape[1] % kernel ** 2:
+            raise ValueError("patch count must divide into whole pooling blocks")
         valid = (pixel_position_ids >= 0).all(axis=-1)
         safe = jnp.maximum(pixel_position_ids, 0)
         hidden_states = self.patch_embed(2 * (pixels - 0.5))
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta)
+        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta,
+                                       dtype=at_least_fp32(hidden_states.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, cos, sin, valid)
-        kernel = self.pooling_kernel_size
-        if pixels.shape[1] % kernel ** 2:
-            raise ValueError("patch count must divide into whole pooling blocks")
         output_length = pixels.shape[1] // kernel ** 2
         width = safe[..., 0].max(axis=-1, keepdims=True) + 1
         indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)
@@ -850,7 +851,6 @@ class Gemma4VisionTransformer(nn.Module):
         if self.standardize:
             pooled = (pooled - self.std_bias.value) * self.std_scale.value
         return pooled.astype(hidden_states.dtype)
-
 
 
 @towers("gemma4")
@@ -923,6 +923,7 @@ class Gemma4Projector(ProjectorBase):
     def build(self) -> nn.Module:
         return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
 
+
 def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:
     """Bilinear taps into a `side`-long table for positions along one axis.
 
@@ -954,8 +955,8 @@ def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
     return (table[indices] * weights[..., None]).sum(axis=-2)
 
 
-def _grid_rope_tables(positions: jax.Array, head_dim: int,
-                      theta: float = 10000.0) -> tuple[jax.Array, jax.Array]:
+def _grid_rope_tables(positions: jax.Array, head_dim: int, theta: float = 10000.0, *,
+                      dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of a patch grid's attention, as cos/sin.
 
     Heights then widths share one frequency table over half the head
@@ -963,8 +964,8 @@ def _grid_rope_tables(positions: jax.Array, head_dim: int,
     vision.py:8-15), doubled the way the text rope doubles its pairs.
     """
     dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, dim)
-    flat = (positions.astype(jnp.float32)[..., None] * inv_freq).reshape(
+    inv_freq = inverse_frequencies(theta, dim, dtype=dtype)
+    flat = (positions.astype(dtype)[..., None] * inv_freq).reshape(
         *positions.shape[:-1], -1)
     doubled = jnp.concatenate([flat, flat], axis=-1)
     return jnp.cos(doubled), jnp.sin(doubled)
@@ -1110,14 +1111,14 @@ class Qwen35VisionTransformer(nn.Module):
         hidden_states = self.patch_embed(pixels)
         table = jnp.asarray(self.position_table.embedding, hidden_states.dtype)
         hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
-        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads)
+        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads,
+                                     dtype=at_least_fp32(hidden_states.dtype))
         valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
         frames = jnp.arange(length)[None, :] // area
         keep = (frames[:, :, None] == frames[:, None, :]) & valid[:, None, :]
         for block in self.blocks:
             hidden_states = block(hidden_states, cos, sin, keep[:, None])
         return hidden_states
-
 
 
 @towers("qwen3_5")
@@ -1265,7 +1266,8 @@ class DeepseekV41VisionTransformer(nn.Module):
                                  name="patch_embed")(patches.reshape(images, rows * columns, -1))
         grid = jnp.stack(jnp.meshgrid(jnp.arange(rows), jnp.arange(columns), indexing="ij"), axis=-1)
         cos, sin = _grid_rope_tables(grid.reshape(1, rows * columns, 2),
-                                     self.hidden_size // self.num_attention_heads, self.rope_theta)
+                                     self.hidden_size // self.num_attention_heads, self.rope_theta,
+                                     dtype=at_least_fp32(hidden_states.dtype))
         for index in range(self.num_hidden_layers):
             hidden_states = DeepseekV41VisionBlock(
                 self.hidden_size, self.num_attention_heads, self.intermediate_size,
@@ -1366,23 +1368,21 @@ _SIGLIP_TENSORS = {
     "post_layernorm.weight": ("post_layernorm", "scale"),
     "post_layernorm.bias": ("post_layernorm", "bias"),
 }
-_SIGLIP_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
-_SIGLIP_NORMS = ("layer_norm1", "layer_norm2")
 
 
-def _siglip_layer_path(parts) -> tuple[str, ...] | None:
-    """`encoder.layers.N...` into the layer's path."""
-    if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
+def _encoder_layer_path(parts, root: str, norms: tuple[str, ...],
+                        projections: tuple[str, ...]) -> tuple[str, ...] | None:
+    """`<root>.layers.N...` into the path of a CLIP-style encoder layer: two
+    layer norms, biased attention maps and a biased fc1/fc2 MLP."""
+    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
+            or parts[-1] not in ("weight", "bias")):
         return None
     layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in _SIGLIP_NORMS and leaf in ("weight", "bias"):
+    if len(parts) == 5 and module in norms:
         return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and leaf in ("weight", "bias"):
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in _SIGLIP_PROJECTIONS:
-            return (layer, module, sublayer, "kernel" if leaf == "weight" else "bias")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "kernel" if leaf == "weight" else "bias")
+    if len(parts) == 6 and ((module == "self_attn" and parts[4] in projections)
+                            or (module == "mlp" and parts[4] in ("fc1", "fc2"))):
+        return (layer, module, parts[4], "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -1393,16 +1393,14 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     head some checkpoints carry maps to nothing: the Gemma path reads the
     trunk sequence alone. Anything else unknown raises ValueError.
     """
-    if hf_name == "embeddings.position_ids":
+    if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
         return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _siglip_layer_path(hf_name.split("."))
-    if path is not None:
-        return path
-    if hf_name.split(".")[0] == "head":
-        # The attention pooling head some checkpoints carry. The Gemma path
-        # reads the trunk sequence alone, so its tensors map to nothing.
-        return None
-    raise ValueError(f"unknown tensor name {hf_name!r}")
+    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(
+        hf_name.split("."), "encoder", ("layer_norm1", "layer_norm2"),
+        ("q_proj", "k_proj", "v_proj", "out_proj"))
+    if path is None:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    return path
 
 
 def translate_siglip_vision_weights(
@@ -1423,38 +1421,13 @@ _LLAMA4_VISION_TENSORS = {
     "vision_adapter.mlp.fc1.weight": ("vision_adapter", "mlp", "fc1", "kernel"),
     "vision_adapter.mlp.fc2.weight": ("vision_adapter", "mlp", "fc2", "kernel"),
 }
-_LLAMA4_VISION_LAYERS = {
-    "input_layernorm": "input_layernorm",
-    "post_attention_layernorm": "post_attention_layernorm",
-}
-
-
-def _llama4_vision_layer_path(parts) -> tuple[str, ...] | None:
-    """`model.layers.N...` into the layer's path."""
-    if len(parts) < 5 or parts[:2] != ["model", "layers"] or not parts[2].isdigit():
-        return None
-    layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in _LLAMA4_VISION_LAYERS and leaf in ("weight", "bias"):
-        return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and leaf == "weight":
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            return (layer, module, sublayer, "kernel")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "kernel")
-    if len(parts) == 6 and leaf == "bias":
-        sublayer = parts[4]
-        if module == "self_attn" and sublayer in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            return (layer, module, sublayer, "bias")
-        if module == "mlp" and sublayer in ("fc1", "fc2"):
-            return (layer, module, sublayer, "bias")
-    return None
 
 
 def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Llama 4 vision tensor name into its path in a trunk tree."""
-    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _llama4_vision_layer_path(
-        hf_name.split("."))
+    path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
+        hf_name.split("."), "model", ("input_layernorm", "post_attention_layernorm"),
+        ("q_proj", "k_proj", "v_proj", "o_proj"))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
@@ -1505,7 +1478,6 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
     return _PROJECTOR_PATHS[kind][name]
 
 
-
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
@@ -1542,9 +1514,7 @@ def _image_size(value: object, field: str) -> int:
             raise ValueError(
                 f"{field} {list(value)!r} is not square, this trunk tiles squares")
         value = value[0]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} is {value!r}, an image side is an int")
-    return value
+    return records.integer(value, field)
 
 
 def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1556,13 +1526,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     """
     vision = _vision_section(hf_config)
     hidden = records.integer(vision["hidden_size"], "hidden_size")
-    image = vision.get("image_size", 224)
     patch = vision.get("patch_size", 16)
-    if isinstance(image, (list, tuple)):
-        if len(image) != 2 or image[0] != image[1]:
-            raise ValueError(
-                f"image_size {list(image)!r} is not square, this trunk tiles squares")
-        image = image[0]
     if isinstance(patch, (list, tuple)):
         patch = patch[0]
     activation = str(vision.get("hidden_act", vision.get("hidden_activation",
@@ -1579,7 +1543,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": records.integer(image, "image_size"),
+        "image_size": _image_size(vision.get("image_size", 224), "image_size"),
         "patch_size": records.integer(patch, "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "hidden_act": activation,
@@ -1605,12 +1569,8 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         raise ValueError(
             f"vision_feature_layer {vision.get('vision_feature_layer')!r} reads a "
             "middle layer this trunk never returns")
-    rope = vision.get("rope_parameters") or {}
-    if not isinstance(rope, Mapping):
-        raise ValueError(f"rope_parameters is {rope!r}, not a config")
-    theta = rope.get("rope_theta", vision.get("rope_theta", 10000.0))
-    if theta is None or isinstance(theta, (Mapping, bool)):
-        raise ValueError(f"rope_theta is {theta!r}, not a frequency")
+    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    theta = records.number(rope.get("rope_theta", vision.get("rope_theta", 10000.0)), "rope_theta")
     if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(vision.get("projector_dropout", 0.0), "projector_dropout"):
         raise ValueError("attention_dropout/projector_dropout is training-time")
     if vision.get("multi_modal_projector_bias", False):
@@ -1630,7 +1590,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
         "layer_norm_eps": records.number(vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"),
-        "rope_theta": float(theta),
+        "rope_theta": theta,
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
         "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),
@@ -1672,6 +1632,7 @@ def translate_llama4_projector_config(vision: Mapping[str, object],
         "text_width": int(text_width),
     }
 
+
 _GEMMA4_VISION_TENSORS = {
     "patch_embedder.input_proj.weight": ("patch_embed", "kernel"),
     "patch_embedder.position_embedding_table": ("position_table",),
@@ -1707,6 +1668,7 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
         return (layer, "self_attn", parts[4], "scale")
     return None
 
+
 def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Gemma 4 vision tensor name into its collection and trunk path.
 
@@ -1741,21 +1703,6 @@ def translate_gemma4_projector_weights(
     return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
-def _gemma4_rope_theta(vision: Mapping[str, object]) -> float:
-    """The vision rope theta, defaulting the way the config class does."""
-    rope = vision.get("rope_parameters") or {}
-    if not isinstance(rope, Mapping):
-        raise ValueError(f"rope_parameters is {rope!r}, not a config")
-    if rope.get("rope_type", "default") != "default":
-        raise ValueError(
-            f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
-            "runs the default 2D rotary")
-    theta = rope.get("rope_theta", vision.get("rope_theta", 100.0))
-    if theta is None or isinstance(theta, (Mapping, bool)):
-        raise ValueError(f"rope_theta is {theta!r}, not a frequency")
-    return float(theta)
-
-
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
@@ -1786,6 +1733,11 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
             "projector width this record leaves to the text width")
+    rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError(
+            f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
+            "runs the default 2D rotary")
     return {
         "kind": "gemma4",
         "hidden_size": hidden,
@@ -1798,7 +1750,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "position_embedding_size": records.integer(vision.get("position_embedding_size", 10240), "position_embedding_size"),
         "hidden_act": activation,
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": _gemma4_rope_theta(vision),
+        "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }
@@ -1816,27 +1768,22 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
 
 
 _QWEN35_VISION_TENSORS = {
+    "patch_embed.proj.weight": ("patch_embed", "kernel"),
+    "patch_embed.proj.bias": ("patch_embed", "bias"),
     "pos_embed.weight": ("position_table", "embedding"),
 }
-_QWEN35_VISION_BLOCK_NORMS = ("norm1", "norm2")
-_QWEN35_VISION_MLP = ("linear_fc1", "linear_fc2")
 
 
 def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
-    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit():
+    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit() or parts[-1] not in ("weight", "bias"):
         return None
-    block = f"blocks_{parts[1]}"
-    if len(parts) == 4 and parts[2] in _QWEN35_VISION_BLOCK_NORMS and parts[3] in (
-            "weight", "bias"):
-        return (block, parts[2], "scale" if parts[3] == "weight" else "bias")
-    if len(parts) == 5 and parts[4] in ("weight", "bias"):
-        leaf = "kernel" if parts[4] == "weight" else "bias"
-        if parts[2] == "attn" and parts[3] in ("qkv", "proj"):
-            return (block, "attn", parts[3], leaf)
-        if parts[2] == "mlp" and parts[3] in _QWEN35_VISION_MLP:
-            return (block, "mlp", {"linear_fc1": "fc1", "linear_fc2": "fc2"}[parts[3]],
-                    leaf)
+    block, leaf = f"blocks_{parts[1]}", parts[-1]
+    if len(parts) == 4 and parts[2] in ("norm1", "norm2"):
+        return (block, parts[2], "scale" if leaf == "weight" else "bias")
+    if len(parts) == 5 and (parts[2], parts[3]) in (("attn", "qkv"), ("attn", "proj"),
+                                                     ("mlp", "linear_fc1"), ("mlp", "linear_fc2")):
+        return (block, parts[2], parts[3].removeprefix("linear_"), "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -1849,10 +1796,6 @@ def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name.split(".")[0] == "merger":
         return None
-    if hf_name == "patch_embed.proj.weight":
-        return ("patch_embed", "kernel")
-    if hf_name == "patch_embed.proj.bias":
-        return ("patch_embed", "bias")
     path = _QWEN35_VISION_TENSORS.get(hf_name) or _qwen35_vision_block_path(
         hf_name.split("."))
     if path is None:
@@ -1872,8 +1815,6 @@ def translate_qwen35_vision_weights(
     rest = {name: tensor for name, tensor in hf_tensors.items()
             if name != "patch_embed.proj.weight"}
     params = _translate(rest, qwen35_vision_path, param_dtype)
-    if "patch_embed.proj.weight" not in hf_tensors:
-        raise ValueError("patch_embed.proj.weight is missing, the trunk reads it")
     conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
     params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
         conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
@@ -1885,15 +1826,6 @@ def translate_qwen35_projector_weights(
 ) -> Variables:
     """A Qwen 3.5 merger's tensors at the requested storage precision."""
     return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
-
-
-def _qwen35_patch_field(vision: Mapping[str, object], field: str) -> int:
-    """A patch-size field as an int; a pair has no square form here."""
-    value = vision[field]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(
-            f"{field} is {value!r}, the trunk tiles square patches of one size")
-    return value
 
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -1926,9 +1858,9 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_heads": records.integer(vision["num_heads"], "num_heads"),
         "in_channels": records.integer(vision.get("in_channels", 3), "in_channels"),
-        "patch_size": _qwen35_patch_field(vision, "patch_size"),
+        "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": _qwen35_patch_field(vision, "temporal_patch_size"),
+        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "out_hidden_size": records.integer(vision["out_hidden_size"], "out_hidden_size"),
         "num_position_embeddings": table,
     }
@@ -2138,8 +2070,6 @@ class Gemma3nProjector(ProjectorBase):
 
 def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     """A timm MobileNet-v5 weight into the corresponding Linen module."""
-    from .mobilenet import _ARCHITECTURE
-
     bare = hf_name.removeprefix("timm_model.")
     parts = tuple(bare.split("."))
     prefix: tuple[str, ...] = ()
@@ -2203,7 +2133,8 @@ def translate_gemma3n_projector_weights(
 
 def _gemma3n_vision_record(
         hf_config: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """Validate the whole vision record before either component consumes it."""
+    """The vision embedder's fields and the encoder's model_args, the whole
+    record validated before either component consumes it."""
     vision = _vision_section(hf_config)
     if vision.get("model_type", "gemma3n_vision") != "gemma3n_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not gemma3n_vision")
@@ -2221,27 +2152,23 @@ def _gemma3n_vision_record(
         raise ValueError(f"vision_config fields {sorted(unknown)} have no counterpart")
     if vision.get("architecture", "mobilenetv5_300m_enc") != "mobilenetv5_300m_enc":
         raise ValueError(f"architecture {vision.get('architecture')!r} is not the MobileNet-v5 encoder")
-    for name, default in (("hidden_size", 2048), ("vocab_size", 128), ("vocab_offset", 262144)):
-        value = vision.get(name, default)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"vision_config.{name} must be an integer")
-    epsilon = vision.get("rms_norm_eps", 1e-6)
-    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
-        raise ValueError("vision_config.rms_norm_eps must be a number")
-    if records.integer(vision.get("hidden_size", 2048), "hidden_size") != 2048:
+    embedder = {
+        "vision_width": records.integer(vision.get("hidden_size", 2048), "hidden_size"),
+        "vocab_size": records.integer(vision.get("vocab_size", 128), "vocab_size"),
+        "vocab_offset": records.integer(vision.get("vocab_offset", 262144), "vocab_offset"),
+        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+    }
+    if embedder["vision_width"] != 2048:
         raise ValueError("hidden_size must be 2048; timm's MobileNet-v5 encoder fixes its adapter width")
     if vision.get("do_pooling", False):
         raise ValueError("do_pooling=True requests a classifier head the encoder does not have")
     options = vision.get("model_args")
-    if options is None:
-        options = {}
-    if not isinstance(options, Mapping):
-        raise ValueError("model_args must be a mapping")
+    options = records.record({} if options is None else options, "model_args")
     allowed = {field.name for field in dataclasses.fields(Gemma3nVision)}
     unknown = set(options) - allowed
     if unknown:
         raise ValueError(f"MobileNet-v5 model_args {sorted(unknown)} are not supported")
-    return vision, options
+    return embedder, options
 
 
 def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -2252,13 +2179,8 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Mapping[
 
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Mapping[str, object]:
-    vision, _ = _gemma3n_vision_record(hf_config)
-    value: Gemma3nProjector = from_record(Gemma3nProjector, {
-        "vision_width": vision.get("hidden_size", 2048), "text_width": text_width,
-        "vocab_size": vision.get("vocab_size", 128),
-        "vocab_offset": vision.get("vocab_offset", 262144),
-        "norm_eps": vision.get("rms_norm_eps", 1e-6),
-    })
+    embedder, _ = _gemma3n_vision_record(hf_config)
+    value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
     return {"kind": "gemma3n", **dataclasses.asdict(value)}
 
 

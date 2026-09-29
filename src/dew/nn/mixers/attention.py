@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.precision import scaled
+from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
     RopeScaling,
     YarnScaling,
@@ -76,6 +77,21 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     ("v_proj",): ("embed", "kv"),
     ("o_proj",): ("attention", "embed"),
 })
+class _Masking(NamedTuple):
+    """`CausalSelfAttention._masking`'s result: the kernel's operands and
+    the visibility they are read under."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    causal: bool
+    window: int | None
+    mask: jax.Array | None
+    documents: jax.Array | None
+    implementation: str
+    cursor: jax.Array | None
+
+
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
@@ -201,8 +217,9 @@ class CausalSelfAttention(nn.Module):
                 f"head dims, got {factor} of head_dim {self.head_dim}")
         return rot_dim
 
-    def _multimodal_rotary(self, positions: jax.Array):
-        """Qwen's interleaved temporal/height/width rotary frequency selection."""
+    def _multimodal_rotary(self, positions: jax.Array, dtype: jnp.dtype):
+        """Qwen's interleaved temporal/height/width rotary frequency selection,
+        its angles in `dtype`."""
         rotated = self._rot_dim() or self.head_dim
         if self.mrope_section is None:
             raise ValueError("multimodal rotary requires mrope_section")
@@ -214,8 +231,8 @@ class CausalSelfAttention(nn.Module):
             axes = jnp.where((indices % 3 == axis) & (indices < self.mrope_section[axis] * 3), axis, axes)
         selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
         # transformers' 1 / theta ** (2i / dim) (Qwen2VLRotaryEmbedding), on the host.
-        inv = inverse_frequencies(self.rope_theta, rotated)
-        angles = selected.astype(jnp.float32) * inv
+        inv = inverse_frequencies(self.rope_theta, rotated, dtype=dtype)
+        angles = selected.astype(dtype) * inv
         return jnp.cos(angles), jnp.sin(angles)
 
     def _shared_kv(self, kv_store):
@@ -253,24 +270,27 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
-    def _rotary_angles(self, rotary_positions):
-        """Build the rotary cos and sin this layer rotates its heads by.
+    def _rotary_angles(self, rotary_positions, heads: jax.Array):
+        """Build the rotary cos and sin this layer rotates its heads by, in
+        the arithmetic `apply_rotary` rotates `heads` in.
 
         Interleaved mRoPE, YaRN and the plain rope each build their own
         angles; YaRN rotates whole heads at its own frequencies, so it
         takes neither a partial rotary nor a Llama 3.1 ramp.
         """
+        dtype = at_least_fp32(heads.dtype)
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
-            return self._multimodal_rotary(rotary_positions)
+            return self._multimodal_rotary(rotary_positions, dtype)
         if self.yarn is None:
             return rotary_freqs(
                 rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
+                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling,
+                dtype=dtype)
         if self.partial_rotary_factor is not None or self.rope_scaling is not None:
             raise ValueError(
                 "yarn rotates whole heads at its own frequencies, so it takes "
                 "neither partial_rotary_factor nor rope_scaling")
-        return yarn_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn)
+        return yarn_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn, dtype=dtype)
 
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
                        batch: int, length: int, key_length: int, decode: bool):
@@ -338,7 +358,7 @@ class CausalSelfAttention(nn.Module):
         B, S, _ = x.shape
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
-        # policy saves or offloads (causal_transformer.RESIDUALS).
+        # policy saves or offloads (decoder_block.RESIDUALS).
         projected = checkpoint_name(self.q_proj(x), 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
@@ -366,13 +386,65 @@ class CausalSelfAttention(nn.Module):
         # heads; o_proj's sum returns to the residual placement in the block.
         query = constrain(query, HEADS)
 
-        # The cache slot carries position while decoding, so the rotation and
-        # the mask both read it and not the row index of the token. A packed
-        # batch supplies the position inside its document in place of the
-        # row index, and RoPE restarts at every boundary.
+        kv_len = key.shape[-3]
+        positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
+                                                         decode, S)
+        rotary_positions = positions if logical_positions is None else logical_positions
+        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
+            rotary_positions = attention_metadata.rotary_positions
+        freqs_cos = freqs_sin = None
+        if self.nope:
+            # NoPE rotates nothing; the query still carries the logit scale
+            # the checkpoint asks for, which apply_rotary folds in otherwise.
+            if self.attention_scale is not None:
+                query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
+        else:
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
+            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
+            # query carries the ratio to the scale the checkpoint asks for.
+            query = apply_rotary(
+                query, freqs_cos, freqs_sin,
+                scale=(None if self.attention_scale is None
+                       else self.attention_scale * math.sqrt(self.head_dim)))
+        own_value = value
+        if not self.kv_shared:
+            if freqs_cos is not None and freqs_sin is not None:
+                key = apply_rotary(key, freqs_cos, freqs_sin)
+            if kv_store is not None and self.kv_store_key is not None:
+                # Post-norm, post-rope, the same tensors the reference hands
+                # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
+                kv_store[self.kv_store_key] = (key, value, positions)
+        sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
+                 if self.attention_sinks else None)
+        if self._runs_local(attention_metadata, decode):
+            attention = checkpoint_name(local_attention(
+                query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
+                positions=None if logical_positions is None else positions,
+                segment_ids=segment_ids,
+                valid=None if attention_metadata is None else attention_metadata.valid,
+                dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl, sinks=sinks,
+                softcap=self.attn_logit_softcap), 'context')
+            return self._output(attention, gate, B, S, own_value)
+        masking = self._masking(query, key, value, positions, rotary_positions, append, prefix, kv_len,
+                                kv_store, segment_ids, attention_metadata, decode)
+        attention = self._attended(masking, positions, append, sinks)
+        return self._output(attention, gate, B, S, own_value)
+
+    def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
+                        decode: bool, S: int):
+        """The positions the rotation and the mask read, the cache append
+        that writes a decode step's keys, and a bidirectional canvas's
+        frozen encoder prefix.
+
+        The cache slot carries position while decoding, so the rotation and
+        the mask both read it and not the row index of the token. A packed
+        batch supplies the position inside its document in place of the
+        row index, and RoPE restarts at every boundary.
+        """
         append = None
         prefix = None
-        kv_len = key.shape[-3]
         if decode:
             if self.causal:
                 if not self.kv_shared:
@@ -403,44 +475,16 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.arange(S)
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
-        rotary_positions = positions if logical_positions is None else logical_positions
-        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
-            rotary_positions = attention_metadata.rotary_positions
-        freqs_cos = freqs_sin = None
-        if self.nope:
-            # NoPE rotates nothing; the query still carries the logit scale
-            # the checkpoint asks for, which apply_rotary folds in otherwise.
-            if self.attention_scale is not None:
-                query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
-        else:
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
-            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-            # query carries the ratio to the scale the checkpoint asks for.
-            query = apply_rotary(
-                query, freqs_cos, freqs_sin,
-                scale=(None if self.attention_scale is None
-                       else self.attention_scale * math.sqrt(self.head_dim)))
-        own_value = value
-        if not self.kv_shared:
-            if freqs_cos is not None and freqs_sin is not None:
-                key = apply_rotary(key, freqs_cos, freqs_sin)
-            if kv_store is not None and self.kv_store_key is not None:
-                # Post-norm, post-rope, the same tensors the reference hands
-                # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
-                kv_store[self.kv_store_key] = (key, value, positions)
-        sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
-                 if self.attention_sinks else None)
-        if self._runs_local(attention_metadata, decode):
-            attention = checkpoint_name(local_attention(
-                query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
-                positions=None if logical_positions is None else positions,
-                segment_ids=segment_ids,
-                valid=None if attention_metadata is None else attention_metadata.valid,
-                dtype=self.dtype, precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                implementation=self.attention_impl, sinks=sinks,
-                softcap=self.attn_logit_softcap), 'context')
-            return self._output(attention, gate, B, S, own_value)
+        return positions, append, prefix
+
+    def _masking(self, query, key, value, positions, rotary_positions, append, prefix, kv_len: int,
+                 kv_store, segment_ids, attention_metadata: AttentionMetadata | None, decode: bool) -> _Masking:
+        """What the kernel reads beside the rotated query and keys: the keys
+        and values with the cache's or the prefix's joined, and the causal
+        flag, window, mask, document ids and kernel the layer's visibility
+        comes to (the canvas prefix, a shared or cached decode step, packed
+        documents, metadata, a pairwise mask, a chunk)."""
+        B, S = query.shape[:2]
         causal, mask, documents = self.causal, None, None
         implementation = self.attention_impl
         masked = kernel_for_materialized_mask(
@@ -531,6 +575,15 @@ class CausalSelfAttention(nn.Module):
             mask = chunked if base is None else base & chunked
             causal, window = False, None
             implementation = masked
+        return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
+
+    def _attended(self, masking: _Masking, positions, append, sinks):
+        """The attention output through the kernel the masking chose: the
+        paged kernel or a per-row key count for a plain decode step, the
+        general kernel otherwise, with the per-head logit maxima sown for
+        QK-Clip when a caller opened that collection."""
+        query, key, value, causal, window, mask, documents, implementation, cursor = masking
+        B, S = query.shape[:2]
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
@@ -567,7 +620,7 @@ class CausalSelfAttention(nn.Module):
                 implementation=implementation, causal=causal,
                 sliding_window=window, mask=mask, sinks=sinks,
                 softcap=self.attn_logit_softcap, segment_ids=documents), 'context')
-        return self._output(attention, gate, B, S, own_value)
+        return attention
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.

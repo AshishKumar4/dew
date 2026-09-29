@@ -168,41 +168,6 @@ def load_params(path) -> ParamTree:
     return _unflatten(tensors)
 
 
-def _tensor_offsets(path: str, header: object) -> dict[str, int]:
-    """Return each tensor's byte offset from the start of the data region.
-
-    safe_open already validated the container, so a malformed entry here is a
-    file whose header the official parser accepted and then disagreed with;
-    it fails by name rather than falling back to a whole-file copy.
-    """
-    if not isinstance(header, dict):
-        raise ValueError(f"{path} is not a safetensors file: its header is not a table")
-    offsets: dict[str, int] = {}
-    for key, entry in header.items():
-        if key == "__metadata__":
-            continue
-        if not isinstance(key, str):
-            raise ValueError(f"{path} holds a malformed tensor name {key!r}")
-        name: str = key
-        if not isinstance(entry, dict):
-            raise ValueError(f"tensor {name!r} in {path} has a malformed header entry")
-        span = entry.get("data_offsets")
-        if not isinstance(span, list) or len(span) != 2:
-            raise ValueError(f"tensor {name!r} in {path} has malformed data_offsets")
-        start, end = span
-        if (
-            not isinstance(start, int)
-            or isinstance(start, bool)
-            or not isinstance(end, int)
-            or isinstance(end, bool)
-            or start < 0
-            or end < start
-        ):
-            raise ValueError(f"tensor {name!r} in {path} has malformed data_offsets")
-        offsets[name] = start
-    return offsets
-
-
 WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
 """The weights file stems of a diffusers model and a transformers model."""
 
@@ -304,7 +269,6 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
             header = json.loads(stream.read(length))
         mapping = np.memmap(filename, mode="c" if copy_on_write else "r", dtype=np.uint8)
         metadata = reader.metadata() or {}
-        offsets = _tensor_offsets(filename, header)
         names = reader.keys()
         for name in names:
             view = reader.get_slice(name)
@@ -323,11 +287,9 @@ def read_file(path, copy_on_write: bool = False) -> tuple[dict[str, np.ndarray],
                     raise ValueError(
                         f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
                     ) from error
-            offset = offsets.get(name)
-            if offset is None:
-                raise ValueError(f"tensor {name!r} in {filename} has no header entry")
+            # safe_open has validated the header's offsets, so they are read as stored.
             tensors[name] = np.ndarray(
-                shape, dtype=dtype, buffer=mapping, offset=8 + length + offset
+                shape, dtype=dtype, buffer=mapping, offset=8 + length + header[name]["data_offsets"][0]
             )
     return tensors, metadata
 

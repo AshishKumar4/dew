@@ -7,7 +7,7 @@ cuda. GPU runs set XLA_PYTHON_CLIENT_PREALLOCATE=false. For example:
     python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256
     python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256 --remat full
 
-`--remat` takes a name from `causal_transformer.REMAT_POLICIES`; absent, the
+`--remat` takes a name from `decoder_block.REMAT_POLICIES`; absent, the
 blocks keep every residual.
 
 The timed operation is a donated AdamW update on next-token cross entropy.
@@ -42,15 +42,17 @@ import time
 
 import flax
 import jax
-from jax.core import ShapedArray
 import jax.numpy as jnp
 import numpy as np
 import optax
+
 # This is the shape analysis behind jax.ad_checkpoint.print_saved_residuals,
 # read directly so the measurement need not parse printed shapes or HLO text.
 from jax._src.ad_checkpoint import saved_residuals
+from jax.core import ShapedArray
 
-from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
 from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

@@ -336,8 +336,6 @@ class MultimodalTransformer(nn.Module):
                 self.audio_conditioner.initialize_parameters()
         if conditioning is None and (image_indices is not None or audio_indices is not None):
             raise ValueError("media indices require conditioning payloads")
-        if conditioning is not None and image_indices is None and audio_indices is None:
-            raise ValueError("conditioned inputs require image_indices or audio_indices")
         if conditioning is None and self.family != "gemma3n":
             return self.language_model.hidden_states(
                 tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,

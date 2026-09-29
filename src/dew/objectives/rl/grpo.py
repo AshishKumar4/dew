@@ -22,6 +22,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Mean, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
@@ -189,9 +190,6 @@ class GRPOObjective(LMObjective):
         every chain start and all padding. The loss and a proximal rescoring
         read this one function.
         """
-        for key in (IDS_KEY, SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
-            if key not in batch:
-                raise ValueError(f"a packed GRPO batch carries {key}; the batch has {sorted(batch)}")
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
@@ -206,8 +204,8 @@ class GRPOObjective(LMObjective):
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
-        scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32),
-                                  sampled.astype(jnp.float32)], axis=1)
+        wide = at_least_fp32(sampled.dtype)
+        scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), wide), sampled.astype(wide)], axis=1)
         return jnp.where(mask != 0, scored, 0.0)
 
     def _terms(self, params, batch) -> _Terms:
@@ -216,9 +214,6 @@ class GRPOObjective(LMObjective):
         The old policy is `old_log_probs` when a rescoring or the sampler
         supplied it, and the recorded behavior otherwise.
         """
-        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY):
-            if key not in batch:
-                raise ValueError(f"a GRPO batch carries {key} from pack; the batch has {sorted(batch)}")
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
         for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, SESSION_WEIGHTS_KEY):
             if key in batch and jnp.shape(batch[key]) != mask.shape:
@@ -331,18 +326,8 @@ class GRPOObjective(LMObjective):
         weights, taken off the row's `prompt_length`. Pads predict nothing
         and count nothing.
         """
-        try:
-            prompts = jnp.asarray(batch[PROMPT_KEY])
-        except KeyError:
-            raise ValueError(
-                f"GRPO validation scores {PROMPT_KEY} batches; "
-                f"the batch has {sorted(batch)}") from None
-        try:
-            lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
-        except KeyError:
-            raise ValueError(
-                f"GRPO validation weights with {LENGTH_KEY}; "
-                f"the batch has {sorted(batch)}") from None
+        prompts = jnp.asarray(batch[PROMPT_KEY])
+        lengths = jnp.asarray(batch[LENGTH_KEY]).reshape(-1)
         if prompts.shape[1] < 2:
             raise ValueError(
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")

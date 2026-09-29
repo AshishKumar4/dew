@@ -6,6 +6,11 @@ any of them would invalidate checkpoints or change what a run converges to.
 
 import contextlib
 import io
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -236,7 +241,8 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     does not name."""
     from types import SimpleNamespace
 
-    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.training.trainer import recompute_more
 
     decoder = SimpleNamespace(tile_head=lambda: None, model=CausalTransformer(
@@ -255,57 +261,119 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
 
 
-def test_the_headroom_is_the_tightest_devices_free_memory_less_what_the_step_adds():
-    """Outputs that alias the donated state take no new memory; the rest of
-    the outputs and the temporaries do. The arguments, the state and the
-    batch, are resident already and counted in use, so they are not counted
-    again as the step's (8d578658: they were, against the whole limit). A
-    device or an executable that reports no memory leaves the answer
-    unknown."""
-    from types import SimpleNamespace
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs GPU allocator memory statistics")
+def test_compilation_counts_memory_kept_alive_outside_its_state():
+    """A fresh 2 GiB allocator isolates the accounting regression from
+    fragmentation left by earlier GPU tests. Its real held buffers force
+    the compiler to fit the remaining memory, then the step runs there.
+    """
+    if jax.device_count() != 1 or shutil.which("nvidia-smi") is None:
+        pytest.skip("needs one NVIDIA GPU with memory reporting")
+    rows = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True, timeout=10).stdout.splitlines()
+    if len(rows) != 1:
+        pytest.skip("the isolated allocator experiment needs one physical GPU")
+    name, total, free = (value.strip() for value in rows[0].split(","))
+    if name != jax.devices()[0].device_kind:
+        pytest.skip("cannot identify the current GPU's physical memory")
+    pool_mib, runtime_mib = 2048, 1024
+    if int(free) < pool_mib + runtime_mib:
+        pytest.skip("needs 2 GiB for the child pool and 1 GiB for its CUDA runtime")
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda",
+                   "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "tests"))),
+                   "XLA_PYTHON_CLIENT_ALLOCATOR": "bfc",
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(pool_mib / int(total)),
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+    done = subprocess.run(
+        [sys.executable, "-c", "from test_remat import _resident_memory_step; _resident_memory_step()"],
+        cwd=root, env=environment, capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stdout + done.stderr
 
-    from dew.training.trainer import step_headroom
 
-    step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
-        argument_size_in_bytes=700, output_size_in_bytes=100, alias_size_in_bytes=40,
-        temp_size_in_bytes=50))
-
-    def device(in_use):
-        return SimpleNamespace(memory_stats=lambda: {'bytes_limit': 1000, 'bytes_in_use': in_use})
-
-    assert step_headroom(step, [device(800), device(850)]) == 150 - 110
-    assert step_headroom(step, [device(800), SimpleNamespace(memory_stats=lambda: None)]) is None
-    assert step_headroom(SimpleNamespace(memory_analysis=lambda: None), [device(800)]) is None
-
-
-def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch):
-    """The first compile leaves no headroom, so the trainer tiles the head;
-    the second leaves none either, so it compiles the step again under
-    'minimal', which fits, and stops there. A memory-tight step takes the
-    tiled head before any block is recomputed."""
+def _resident_memory_step():
+    """Compile and run with real external buffers in the bounded child pool."""
     import optax
 
-    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    device = jax.devices()[0]
+    model = CausalTransformer(vocab_size=65536, emb_features=64, num_layers=1,
+                              num_heads=2, mlp_features=128, max_seq_len=256,
+                              dtype=jnp.bfloat16)
+    objective = LMObjective(model, seq_len=256)
+    trainer = Trainer(objective, optax.adam(1e-4), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.zeros((4, 257), jnp.int32)}
+    trainer.compile(state, batch)
+    assert objective.head_tile is None, "the unconstrained step must keep the whole logits"
+
+    def additional_bytes():
+        assert trainer.executable is not None
+        stats = trainer.executable.memory_analysis()
+        assert stats is not None
+        return stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
+
+    memory = device.memory_stats()
+    assert memory is not None
+    reserve = memory["bytes_limit"] - memory["bytes_in_use"] - additional_bytes() // 2
+    assert reserve > 0
+    allocate = jax.jit(lambda value, size: jnp.broadcast_to(value, (size,)), static_argnums=1)
+    block = 64 * 2**20
+    zero = jnp.asarray(0, jnp.uint8)
+    held = [allocate(zero, min(block, reserve - start)) for start in range(0, reserve, block)]
+    jax.block_until_ready(held)
+    step = trainer.compile(state, batch)
+    memory = device.memory_stats()
+    assert memory is not None
+    assert additional_bytes() <= memory["bytes_limit"] - memory["bytes_in_use"]
+    _, loss, _, finite, _ = jax.block_until_ready(step(state, batch))
+    assert bool(finite), float(loss)
+    jax.block_until_ready(held)
+
+
+
+@pytest.mark.parametrize('options', [None, {'xla_embed_ir_in_executable': False}],
+                         ids=['default', 'step_options'])
+def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, options):
+    """A step that does not fit tiles the head first, then compiles again
+    under 'minimal', which fits, and stops there: a memory-tight step takes
+    the tiled head before any block is recomputed.
+
+    Where the device has step compiler options (the Triton GEMM fusions off
+    on sm80 and sm89), a step that does not fit is compiled once more under
+    XLA's defaults before it climbs (`fitting_default`). So the headroom
+    answers by the rung it was compiled at, not by how many compiles came
+    before it."""
+    import optax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer, trainer as trainer_module
 
-    headrooms = iter([-1, -1, 0])
     compiled = []
 
     def headroom(executable, devices):
-        compiled.append(executable)
-        return next(headrooms)
+        rung = (trainer.objective.head_tile is not None,
+                trainer_module.remat_record(trainer.objective.model.remat))
+        compiled.append(rung)
+        return 0 if rung[1] == 'minimal' else -1
 
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
     trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert len(compiled) == 3
-    assert trainer.objective.head_tile is not None
+    # Each rung that does not fit is compiled once, or twice with options.
+    tries = 1 if options is None else 2
+    assert compiled == [(False, None)] * tries + [(True, None)] * tries + [(True, 'minimal')]
     assert trainer.objective.model.remat == REMAT_POLICIES['minimal']
-    assert trainer_module.remat_record(trainer.objective.model.remat) == 'minimal'
 
 
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])

@@ -109,12 +109,12 @@ def test_yarn_matches_the_reference_derivation():
     yarn = yarn_of(CONFIG["v3"])
 
     np.testing.assert_allclose(
-        np.asarray(yarn_inv_freq(8, 10000.0, yarn)), tensors["inv_freq"],
+        np.asarray(yarn_inv_freq(8, 10000.0, yarn, dtype=np.float32)), tensors["inv_freq"],
         rtol=1e-6, atol=1e-7)
     assert yarn_attention_factor(yarn) == pytest.approx(
         float(tensors["attention_scaling"]), rel=1e-6)
     cos, sin = yarn_rope_freqs(
-        jnp.arange(CONFIG["length"]), 8, 10000.0, yarn)
+        jnp.arange(CONFIG["length"]), 8, 10000.0, yarn, dtype=np.float32)
     half = tensors["cos"].shape[-1] // 2
     # The reference batches identical position rows; the first row compares.
     np.testing.assert_allclose(np.asarray(cos), tensors["cos"][0, ..., :half],

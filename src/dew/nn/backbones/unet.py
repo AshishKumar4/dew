@@ -26,7 +26,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     their names are the same either way, which lets a 2D checkpoint inflate
     into the 3D model.
     """
-    temb = FourierEmbedding(features=model.emb_features)(temb)
+    temb = FourierEmbedding(features=model.emb_features, dtype=model.dtype)(temb)
     temb = TimeProjection(features=model.emb_features, dtype=model.dtype,
                           precision=model.precision)(temb)
 

@@ -45,13 +45,14 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 
 def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
-                   max_seq_len, *, valid=None):
+                   max_seq_len: int, *, valid=None):
     """Open a compact per-row decode cache of two tensors, `first` and `second`
     under `names`, and of the sparse indexer's keys when `index_keys` is given.
 
@@ -62,8 +63,6 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
     writes the new rows and returns the whole cache, the index keys last or
     None.
     """
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
     batch, length = first.shape[:2]
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a cache of {max_seq_len}.")
@@ -80,8 +79,6 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
             for variable, rows in zip(cached, (new_first, new_second), strict=True):
                 variable.value = write_cache(variable.value, rows, positions)
             if cached_index is not None:
-                if new_index_keys is None:
-                    raise ValueError("the indexer scores, so decode must append its keys")
                 cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
         return cached[0].value, cached[1].value, full_index
@@ -226,11 +223,12 @@ class SparseIndexer(nn.Module):
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [self._rotate(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+        wide = at_least_fp32(query.dtype)
         scores = jnp.matmul(
-            query.astype(jnp.float32),
-            jnp.expand_dims(keys.astype(jnp.float32).transpose(0, 2, 1), -3))
+            query.astype(wide),
+            jnp.expand_dims(keys.astype(wide).transpose(0, 2, 1), -3))
         scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
-        weights = self.weights_proj(hidden).astype(jnp.float32)
+        weights = self.weights_proj(hidden).astype(wide)
         weights = weights * (self.n_heads ** -0.5)
         return jnp.matmul(weights[..., None, :], scores).squeeze(-2)
 
@@ -454,7 +452,7 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (causal_transformer.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
@@ -493,7 +491,8 @@ class MultiHeadLatentAttention(nn.Module):
         if not self.rotary:
             return q_rot, rot, None, None
         freqs_cos, freqs_sin = yarn_rope_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
+            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn,
+            dtype=at_least_fp32(q_rot.dtype))
         return (self._rotate(q_rot, freqs_cos, freqs_sin),
                 self._rotate(rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)
@@ -531,48 +530,8 @@ class MultiHeadLatentAttention(nn.Module):
             queries, [self.qk_nope_head_dim], axis=-1)
         latent, rot = self._latents(x, place)
         if decode:
-            if segment_ids is not None:
-                raise ValueError("decode accepts row validity, not packed segment_ids")
-            # The cache hands out the slots first, because the rope heads
-            # rotate at absolute positions: the queries at this step's slots
-            # and the appended latents at theirs, while the cached ones keep
-            # the angles of the slots they were written at.
-            if self.sparse:
-                # The cache is shaped by the expansion; its values are
-                # recomputed after rotation below, so only shapes flow here.
-                shape_key, shape_value = self._expand(latent, rot)
-                index_keys = self.indexer.keys(x) if self.indexed else None
-                positions, append = open_mla_cache(
-                    self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
-                    self.max_seq_len, valid=valid)
-                q_rot, rot, freqs_cos, freqs_sin = self._rotated(
-                    q_rot, rot,
-                    positions if logical_positions is None else logical_positions)
-                if index_keys is not None:
-                    index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
-                key, value, index_full = append(
-                    *self._expand(latent, rot), index_keys)
-                index_scores = None
-                if self.indexed:
-                    assert q_resid is not None
-                    index_scores = self.indexer.scores(
-                        x, q_resid, index_full, freqs_cos, freqs_sin)
-                keep = causal_attention_mask(
-                    positions, key.shape[1],
-                    key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
-                mask = selection_mask(self._select(index_scores, keep, kv_store),
-                                      key.shape[1])[:, None]
-            else:
-                positions, append = open_mla_cache(
-                    self, ("cached_latent", "cached_rot"), latent, rot, None,
-                    self.max_seq_len, valid=valid)
-                q_rot, rot, _, _ = self._rotated(
-                    q_rot, rot,
-                    positions if logical_positions is None else logical_positions)
-                latent, rot, _ = append(latent, rot, None)
-                key, value = self._expand(latent, rot)
-                mask = causal_attention_mask(
-                    positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+            q_rot, key, value, mask = self._decode_step(
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store)
             causal = False
         else:
             if positions is None:
@@ -649,6 +608,55 @@ class MultiHeadLatentAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=implementation, causal=causal, mask=mask)
         return self._output(attention, x)
+
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, segment_ids, kv_store):
+        """One decode step's rotated query heads, its keys and values with the
+        cache's joined, and the mask over them: the expanded keys and the
+        indexer's selection under the sparse layout, or the latents expanded
+        after the append under the dense one."""
+        if segment_ids is not None:
+            raise ValueError("decode accepts row validity, not packed segment_ids")
+        # The cache hands out the slots first, because the rope heads
+        # rotate at absolute positions: the queries at this step's slots
+        # and the appended latents at theirs, while the cached ones keep
+        # the angles of the slots they were written at.
+        if self.sparse:
+            # The cache is shaped by the expansion; its values are
+            # recomputed after rotation below, so only shapes flow here.
+            shape_key, shape_value = self._expand(latent, rot)
+            index_keys = self.indexer.keys(x) if self.indexed else None
+            positions, append = open_mla_cache(
+                self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
+                self.max_seq_len, valid=valid)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            if index_keys is not None:
+                index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
+            key, value, index_full = append(
+                *self._expand(latent, rot), index_keys)
+            index_scores = None
+            if self.indexed:
+                assert q_resid is not None
+                index_scores = self.indexer.scores(
+                    x, q_resid, index_full, freqs_cos, freqs_sin)
+            keep = causal_attention_mask(
+                positions, key.shape[1],
+                key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+            mask = selection_mask(self._select(index_scores, keep, kv_store),
+                                  key.shape[1])[:, None]
+        else:
+            positions, append = open_mla_cache(
+                self, ("cached_latent", "cached_rot"), latent, rot, None,
+                self.max_seq_len, valid=valid)
+            q_rot, rot, _, _ = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            latent, rot, _ = append(latent, rot, None)
+            key, value = self._expand(latent, rot)
+            mask = causal_attention_mask(
+                positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
+        return q_rot, key, value, mask
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")

@@ -35,7 +35,8 @@ from dew.interop.hf_decoders import (
     _specified_layer_types,
     translate_config,
 )
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer
 

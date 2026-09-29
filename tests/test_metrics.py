@@ -192,13 +192,12 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
 
     The committed fixture is this module's own InceptionV3 at a sixteenth of
     every channel width, its parameters drawn rather than trained, so the
-    values are its own and not the published checkpoint's. What a distance
-    promises is the ordering, and that holds: a population against itself is
-    zero to the rounding in the matrix square root (observed -3.2e-09), the
-    same pixels brightened by 40 counts sit above it (0.064), and a flat gray
-    field sits twenty times further out (1.3). The registered metric reads the
-    same file and lands on the same number. `source.json` says how wide the
-    features it pools are, and the extractor agrees.
+    values are its own and not the published checkpoint's. For these images,
+    a population against itself scores zero to matrix-square-root rounding;
+    brightening the pixels by 40 counts scores above it, and a flat gray
+    field further out. The registered metric reads the same file and lands
+    on the same number. `source.json` states the feature width, and the
+    extractor agrees.
     """
     from dew.eval.fid import _get_activations
     from dew.inputs import unit_range
@@ -237,6 +236,30 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
     features = np.asarray(_get_activations(str(INCEPTION_TINY))(images))
     reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
     np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
+
+
+def test_fid_extraction_is_independent_of_small_batch_boundaries():
+    """The mean of repeated copies of one image is that image's feature.
+
+    Compare these public FID statistics across the batch-eight boundary.
+    Unlike a relative covariance check, this tests the extracted features
+    themselves: centering nearly constant features magnifies their rounding.
+    """
+    from dew.inputs import unit_range
+
+    images, brighter = fid_sets()
+    metric = FID(weights=str(INCEPTION_TINY))
+
+    def extract(rows):
+        return metric(ImageGrid(unit_range(np.repeat(brighter[:1], rows, axis=0))),
+                      {"image": np.repeat(images[:1], rows, axis=0)})
+
+    reference = extract(8)
+    for rows in (1, 3, 7, 9):
+        actual = extract(rows)
+        for part, whole in ((actual.generated, reference.generated), (actual.real, reference.real)):
+            assert part.count == rows
+            np.testing.assert_allclose(part.mean, whole.mean, rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.network

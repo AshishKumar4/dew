@@ -9,10 +9,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import HEADS, constrain, logical_axes, split_positions
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -34,8 +37,9 @@ class UNetStage:
     cross_only: bool = False
 
 
-def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool = True):
-    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`.
+def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
+    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`,
+    computed in `dtype` (`at_least_fp32` of the model's).
 
     `cosine_first` puts the cosines in the leading half, as SD1/2 and SDXL
     store them. `shift` moves the lowest frequency, the reference's
@@ -47,9 +51,10 @@ def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool
     # Scale the whole exponent before dividing, as the published models do;
     # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
     # the host in float64 so the table does not vary with the backend.
-    exponent = np.arange(half, dtype=np.float32) * np.float32(-math.log(10000.0)) / np.float32(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(np.float32))
-    phase = jnp.asarray(time, jnp.float32).reshape(-1, 1) * frequencies[None]
+    width = np.dtype(dtype).type
+    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
+    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
+    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
     first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
     return jnp.concatenate([first, second], axis=-1)
 
@@ -67,11 +72,22 @@ class _TimeMLP(nn.Module):
         return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(nn.silu(x))
 
 
+@logical_axes({(sublayer, projection): ("embed", "heads", "head_dim")
+               for sublayer in ("self_attention", "cross_attention") for projection in ("q", "k", "v")}
+              | {(sublayer, "output"): ("heads", "head_dim", "embed")
+                 for sublayer in ("self_attention", "cross_attention")})
 class _Attention(nn.Module):
     """Attend over `[B, S, features]` tokens, against `context` when given.
 
     The head width is `features // heads`. The projections carry no bias,
-    which is what the SD checkpoints hold.
+    which is what the SD checkpoints hold. Under a tensor axis each shard
+    computes its heads, as Megatron splits an attention: the query, key and
+    value projections by their output heads and the output projection by
+    its input heads. Left whole, every tensor shard projected the whole text
+    context into keys and values (4 times one device's FLOPs for those
+    projections at tensor=4). Under a sequence axis each sequence shard
+    projects its share of the context's tokens where the axis's link pays
+    for it (`split_positions`).
     """
 
     features: int
@@ -86,12 +102,14 @@ class _Attention(nn.Module):
         context = x if context is None else context
         depth = self.features // self.heads
         def project(value, name):
-            return nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
-                                   precision=self.precision, name=name)(value)
-        attended = scaled_dot_product_attention(project(x, "q"), project(context, "k"), project(context, "v"),
+            return constrain(nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
+                                             precision=self.precision, name=name)(value), HEADS)
+        keys, values = split_positions(context, (self.heads, depth),
+                                       lambda tokens: (project(tokens, "k"), project(tokens, "v")))
+        attended = scaled_dot_product_attention(project(x, "q"), keys, values,
             dtype=self.dtype, precision=self.precision, implementation=self.attention_impl)
         output = nn.DenseGeneral(self.features, axis=(-2, -1), dtype=self.dtype,
-                                 precision=self.precision, name="output")(attended)
+                                 precision=self.precision, name="output")(constrain(attended, HEADS))
         return nn.Dropout(self.dropout)(output, deterministic=not train) if self.dropout else output
 
 
@@ -257,13 +275,15 @@ class UNet2DCondition(nn.Module):
         if x.shape[-1] != self.in_channels:
             raise ValueError(f"UNet input has {x.shape[-1]} channels; expected {self.in_channels}")
         first = self.stages[0].features
-        time = sinusoidal_time(time, first, shift=self.frequency_shift, cosine_first=self.cosine_first)
+        time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
+                               cosine_first=self.cosine_first)
         time = _TimeMLP(first * 4, self.dtype, self.precision, name="time")(time)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
             ids = sinusoidal_time(conditioning.time_ids.reshape(-1), self.additional_time_features,
-                                  shift=self.frequency_shift, cosine_first=self.cosine_first)
+                                  dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
+                                  cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
             time = time + _TimeMLP(first * 4, self.dtype, self.precision, name="additional_time")(extra)
         x = Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)

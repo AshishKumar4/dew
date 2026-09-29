@@ -190,34 +190,20 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     return _bound(fields, fixed)
 
 
-def _ollama_body(model: str, kind: Literal["generate", "chat"],
-                 fields: Mapping[str, object]) -> Mapping[str, object]:
-    """Build the keyword arguments for the SDK method.
-
-    The SDK owns image, message and tool serialization.
-    """
-    body = _bound(fields, {"model": model})
-    unknown = body.keys() - _ollama_request_names(kind)
-    if unknown:
-        raise ValueError(f"fields {sorted(unknown)} are not accepted by this Ollama SDK's {kind}")
-    return body
-
-
 def _ollama_result(responses: Sequence[OllamaResponse]) -> Completion:
     # The SDK exposes no raw-response hook, so these are its parsed values: it
-    # rejects non-integral counts and non-text responses; negatives fail here.
+    # rejects non-integral counts, non-text reasons and non-text responses;
+    # negative counts fail here.
     texts: list[str] = []
     counts: list[int | None] = []
-    reasons: list[str | None] = []
     for response in responses:
         if not isinstance(response.response, str):
             raise ValueError("Ollama text completion is missing its response text")
         texts.append(response.response)
         counts.append(_count(response.eval_count, "eval_count"))
-        reasons.append(_reason(response.done_reason))
     unreported = (None,) * len(texts)
-    return Completion(tuple(texts), tuple(reasons), tuple(counts), None, tuple(responses),
-                      unreported, unreported)
+    return Completion(tuple(texts), tuple(response.done_reason for response in responses), tuple(counts),
+                      None, tuple(responses), unreported, unreported)
 
 
 @dataclass(frozen=True)
@@ -246,13 +232,12 @@ class OllamaCompletion:
             raise TypeError("async methods require ollama.AsyncClient")
         return self.client
 
-    def _request(self, kind: Literal["generate", "chat"], supplied: Mapping[str, object],
-                 fixed: Mapping[str, object], seed: int | None,
+    def _request(self, supplied: Mapping[str, object], fixed: Mapping[str, object], seed: int | None,
                  max_new_tokens: int) -> Mapping[str, object]:
         fields = dict(supplied)
         fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed,
                                            fields.pop("sampling", None))
-        return _ollama_body(self.model, kind, _bound(fields, fixed))
+        return _bound(fields, {**fixed, "model": self.model})
 
     def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                  seed: int | None = None, **parameters: RequestField) -> Completion:
@@ -260,7 +245,7 @@ class OllamaCompletion:
         client = self._sync()
         responses = []
         for index, prompt in enumerate(rows):
-            body = self._request("generate", parameters, {"prompt": prompt, "stream": False},
+            body = self._request(parameters, {"prompt": prompt, "stream": False},
                                  None if seed is None else seed + index, max_new_tokens)
             responses.append(_invoke(client.generate, body))
         return _ollama_result(responses)
@@ -268,13 +253,13 @@ class OllamaCompletion:
     def stream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
                **parameters: RequestField) -> Iterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
-        body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return _invoke(self._sync().generate, body)
 
     def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
              stream: bool = False, **parameters: RequestField) -> OllamaChat | Iterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
-        body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
         return _invoke(self._sync().chat, body)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
@@ -283,7 +268,7 @@ class OllamaCompletion:
         client = self._async()
         responses = []
         for index, prompt in enumerate(rows):
-            body = self._request("generate", parameters, {"prompt": prompt, "stream": False},
+            body = self._request(parameters, {"prompt": prompt, "stream": False},
                                  None if seed is None else seed + index, max_new_tokens)
             responses.append(await _ainvoke(client.generate, body))
         return _ollama_result(responses)
@@ -291,13 +276,13 @@ class OllamaCompletion:
     async def astream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
-        body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return await _ainvoke(self._async().generate, body)
 
     async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
                     stream: bool = False, **parameters: RequestField) -> OllamaChat | AsyncIterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
-        body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
         return await _ainvoke(self._async().chat, body)
 
 

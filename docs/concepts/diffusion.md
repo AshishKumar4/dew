@@ -57,11 +57,11 @@ Three methods serve sampling. `process.noise(key, shape)` draws the starting noi
 
 ## Presets
 
-A preset is a frozen dataclass of the numbers that define a published convention, and calling it builds the process: `EDM()` is the configuration and `EDM()()` the `Process`. A run's `run.json` stores the preset's fields, so sampling always rebuilds the convention the model was trained with.
+A preset is a frozen dataclass of the numbers that define a published convention, and calling it builds the process: `EDM(regime="pixel")` is the configuration and `EDM(regime="pixel")()` the `Process`. EDM's regime chooses the training noise levels: Karras et al. 2022's for pixels or EDM2's for latents. Explicit `P_mean` and `P_std` values override the regime; supplying both also works without a regime, so old run records retain their training distribution. Otherwise a preset without a regime refuses to build, and a run config fills it from whether the run has an autoencoder. A run's `run.json` stores the preset's fields, so sampling rebuilds the convention the model was trained with.
 
 | Preset | Convention |
 |---|---|
-| `EDM` | Karras et al. (2022): log-normal training noise, the EDM preconditioning and weighting, sampled on the rho-spaced Karras grid |
+| `EDM` | Log-normal training noise (Karras et al. 2022 for pixels, EDM2 for latents), the EDM preconditioning and weighting, sampled on the rho-spaced Karras grid |
 | `Karras` | The EDM preconditioning, trained on noise levels drawn uniformly along the grid it samples on |
 | `Cosine` | The cosine beta table with v-prediction; its default P2 weight makes the loss an unweighted $x_0$ loss |
 | `Flow` | Rectified flow on the linear path: velocity prediction, logit-normal times and SD3's resolution shift |

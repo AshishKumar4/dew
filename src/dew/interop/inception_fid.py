@@ -151,26 +151,11 @@ def _upstream(path: tuple[str, ...]) -> tuple[str, ...]:
     `BasicConv2d_0/Conv_0/kernel`.
     """
     module, *rest = path
-    if module not in _MODULES:
-        raise ValueError(
-            f"the extractor has a {module} the jax-fid weights never named, at "
-            f"{SEPARATOR.join(path)}")
     names = [_MODULES[module]]
     if len(rest) > 2:
         branch, *rest = rest
-        block = module.rsplit('_', 1)[0]
-        order = _BRANCHES.get(block, ())
-        index = int(branch.rsplit('_', 1)[1])
-        if index >= len(order):
-            raise ValueError(
-                f"{SEPARATOR.join(path)}: {block} builds more convolutions than the "
-                f"{len(order)} branches jax-fid named for it")
-        names.append(order[index])
-    leaf = _LEAVES.get((rest[0], rest[1])) if len(rest) == 2 else None
-    if leaf is None:
-        raise ValueError(
-            f"{SEPARATOR.join(path)}: jax-fid stored no {SEPARATOR.join(rest)}")
-    return (*names, *leaf)
+        names.append(_BRANCHES[module.rsplit('_', 1)[0]][int(branch.rsplit('_', 1)[1])])
+    return (*names, *_LEAVES[(rest[0], rest[1])])
 
 
 def _module_leaves() -> list[tuple[str, ...]]:

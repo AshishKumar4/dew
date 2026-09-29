@@ -89,7 +89,7 @@ def abstract() -> dict[str, object]:
     import numpy as np
     from huggingface_hub import get_safetensors_metadata
 
-    from dew.interop import hf_decoders, pretrained
+    from dew.interop import pretrained, sources
     from dew.interop.streaming import SourceLeaf
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import build_mesh
@@ -101,9 +101,9 @@ def abstract() -> dict[str, object]:
              for shard in metadata.files_metadata.values() for name, info in shard.tensors.items()}
     report: dict[str, object] = {"tensors": len(table),
                                  "checkpoint_gb": round(sum(t.dtype.itemsize * t.size for t in table.values()) / 1e9, 1)}
-    snapshot = hf_decoders._snapshot
-    hf_decoders._load_shards = lambda directory: table
-    hf_decoders._snapshot = lambda name, revision, weights=True: snapshot(name, revision, weights=False)
+    snapshot = sources.snapshot
+    sources.load_shards = lambda directory: table
+    sources.snapshot = lambda name, revision, weights=True: snapshot(name, revision, weights=False)
 
     def placement(variables, mesh, layout):
         device_mesh = build_mesh(mesh)

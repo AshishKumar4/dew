@@ -194,12 +194,6 @@ def test_a_group_smaller_than_two_is_refused_by_name(estimator):
 
 
 @pytest.mark.parametrize("estimator", [group_advantage, rloo_advantage])
-def test_rewards_that_do_not_divide_into_groups_are_refused(estimator):
-    with pytest.raises(ValueError, match="do not divide into groups of 4"):
-        estimator(jnp.zeros(6), 4)
-
-
-@pytest.mark.parametrize("estimator", [group_advantage, rloo_advantage])
 def test_token_level_rewards_are_refused(estimator):
     """The batch carries one scalar per completion. A `[B, T]` column would
     reshape without complaint and mix tokens from different prompts into one

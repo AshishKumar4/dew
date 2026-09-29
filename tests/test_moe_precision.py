@@ -57,8 +57,23 @@ def shardings(mesh, rows: bool):
 
 @pytest.fixture(scope='module')
 def x64():
+    # XLA's TPU rewrites float64 into pairs of float32 op by op, and has no
+    # rewrite for a ragged dot ("While rewriting computation to not contain
+    # X64 element types ... ragged-dot"); the fp64 oracle cases run on CPU
+    # and GPU.
+    if jax.default_backend() == "tpu":
+        pytest.skip("XLA's TPU has no float64 ragged dot")
     with jax.enable_x64():
         yield
+
+
+@pytest.fixture(autouse=True)
+def float64_needs_a_backend_that_has_it(request):
+    """A float64 case computes in float64 on the default device, which a TPU
+    does not have ("X64 element types" at compile); it runs on CPU and GPU."""
+    params = getattr(getattr(request.node, "callspec", None), "params", {})
+    if jax.default_backend() == "tpu" and any(value is jnp.float64 for value in params.values()):
+        pytest.skip("a TPU has no float64 arithmetic")
 
 
 ROUND_ONCE_FORWARD_KERNEL = np.zeros((8, 16, 8), np.float32)
@@ -529,3 +544,77 @@ def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
     np.testing.assert_array_equal(np.asarray(d_kernel[0], np.float64), expected[1])
     np.testing.assert_array_equal(np.asarray(d_kernel[1:], np.float64), 0)
     np.testing.assert_array_equal(np.asarray(d_x, np.float64), expected[2])
+
+
+@pytest.mark.parametrize('implementation', ['xla', 'pallas-fallback'])
+def test_rows_past_the_groups_stay_zero_where_the_ragged_dot_writes_them(monkeypatch,
+                                                                        implementation):
+    """XLA's TPU ragged dot writes values into the rows past the groups (48 of
+    384 entries on a v6e, up to 2.3), where CPU and GPU write zeros. Every
+    path that runs it, the grouped matmul and the Pallas kernels' fallback,
+    zeroes those rows in the output and in the input gradient. Simulated
+    here with a ragged dot that writes into them."""
+    from dew.nn.kernels.grouped_matmul import grouped_projection
+
+    stock = jax.lax.ragged_dot
+
+    def writes_past_the_groups(lhs, rhs, group_sizes, **kwargs):
+        out = stock(lhs, rhs, group_sizes, **kwargs)
+        past = jnp.arange(out.shape[0])[:, None] >= jnp.sum(group_sizes)
+        return jnp.where(past, jnp.asarray(7.0, out.dtype), out)
+
+    monkeypatch.setattr(jax.lax, 'ragged_dot', writes_past_the_groups)
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.normal(size=(24, 16)), jnp.bfloat16)
+    kernel = jnp.asarray(rng.normal(size=(8, 16, 16)), jnp.float32)
+    sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
+
+    def project(x, kernel):
+        if implementation == 'xla':
+            return jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
+        return grouped_projection(x, kernel, sizes, jnp.bfloat16, False)
+
+    y, pullback = jax.vjp(project, x, kernel)
+    dx, _ = pullback(jnp.ones_like(y))
+    assert not np.any(np.asarray(y[21:], np.float32)), np.asarray(y[21:, :4], np.float32)
+    assert not np.any(np.asarray(dx[21:], np.float32)), np.asarray(dx[21:, :4], np.float32)
+
+
+def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
+    """XLA's TPU ragged dot refuses a 16-bit operand at HIGHEST ("Bad lhs
+    type"), which the suite sets and a user may. Two 16-bit operands multiply
+    at DEFAULT, exact either way; one beside an fp32 operand is widened to it,
+    exactly, so the fp32 side keeps HIGHEST. Every ragged dot the grouped
+    matmul and the kernels' fallback trace, forward and backward, obeys that.
+    Read off the traced program, since only a TPU refuses."""
+    from dew.nn.kernels.grouped_matmul import grouped_projection
+
+    x = jnp.ones((24, 16), jnp.bfloat16)
+    kernel = jnp.ones((8, 16, 16), jnp.float32)
+    sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
+    projections = {
+        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
+        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, False),
+    }
+    for name, project in projections.items():
+        def loss(x, kernel, project=project):
+            return jnp.sum(jnp.asarray(project(x, kernel)).astype(jnp.float32))
+        with jax.default_matmul_precision("highest"):
+            program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, kernel)
+        refused = []
+
+        def walk(jaxpr):
+            for equation in jaxpr.eqns:
+                if equation.primitive.name.startswith("ragged_dot"):
+                    kinds = {jnp.dtype(v.aval.dtype) for v in equation.invars[:2]}
+                    precision = str(equation.params.get("precision"))
+                    if jnp.dtype(jnp.bfloat16) in kinds and "HIGHEST" in precision:
+                        refused.append((sorted(map(str, kinds)), precision))
+                for value in equation.params.values():
+                    for branch in value if isinstance(value, tuple | list) else (value,):
+                        inner = getattr(branch, "jaxpr", branch)
+                        if hasattr(inner, "eqns"):
+                            walk(inner)
+
+        walk(program.jaxpr)
+        assert not refused, (name, refused)

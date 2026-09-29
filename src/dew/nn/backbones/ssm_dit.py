@@ -45,6 +45,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
                 dtype=self.dtype,
                 precision=self.precision,
                 norm_epsilon=self.norm_epsilon,
+                adaln_silu=self.adaln_silu,
                 **fields,
             )
 
