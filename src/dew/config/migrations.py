@@ -38,7 +38,20 @@ def _before_versions(cls: type, record: Record) -> Record:
     return record
 
 
-STEPS: tuple[Callable[[type, Record], Record], ...] = (_before_versions,)
+def _before_weight_only(cls: type, record: Record) -> Record:
+    """Version 1 to 2. `Quantization.weight_only` (8c0caa2b) did not exist:
+    a quantized run quantized weights and activations, so the field is
+    False. The spec sits in `trainer.quantization`, or at the top level of
+    records from before the knob moved into the trainer.
+    """
+    trainer = record.get("trainer")
+    for holder in (trainer, record):
+        if isinstance(holder, dict) and isinstance(holder.get("quantization"), dict):
+            holder["quantization"]["weight_only"] = False
+    return record
+
+
+STEPS: tuple[Callable[[type, Record], Record], ...] = (_before_versions, _before_weight_only)
 VERSION = len(STEPS)
 """The version `to_dict` writes."""
 

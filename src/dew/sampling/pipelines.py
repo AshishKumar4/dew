@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training.distributed import Layout, MeshSpec
+    from dew.training.quantization import Quantization
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.
@@ -162,6 +163,19 @@ class TextToImage:
     def bind(self, variables: Variables) -> TextToImage:
         """Bind another variables snapshot without rebuilding the model or encoders."""
         return replace(self, params=variables)
+
+    def quantized(self, spec: Quantization) -> TextToImage:
+        """This task with its denoiser's weights stored quantized as `spec`
+        says and its matmuls computing with them
+        (`dew.training.quantization.quantize_for_serving`). The encoders and
+        the autoencoder keep their weights."""
+        from dew.training.quantization import quantize_for_serving
+
+        example = self.prepare("", seed=0, steps=1)
+        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
+        model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
+                                                jnp.zeros(example.noise.shape[:1]), **example.conditions)
+        return replace(self, model=model, params={**self.params, **variables})
 
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
