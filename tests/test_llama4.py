@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from dew.nn.attention import chunk_mask
-from dew.nn.backbones.causal_transformer import GatedMLP
+from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.llama4 import Llama4Attention, temperature_scale
 from dew.nn.moe import SparseMLP
 
@@ -79,7 +79,7 @@ def test_the_chunk_mask_and_temperature_follow_the_reference_formulas():
     positions = jnp.arange(6)
     mask = chunk_mask(positions, positions, 4)[0, 0]
     assert mask.tolist() == [[p // 4 == k // 4 for k in range(6)] for p in range(6)]
-    scale = temperature_scale(jnp.asarray([0, 3, 4, 7, 8]), 4.0, 0.1)
+    scale = temperature_scale(jnp.asarray([0, 3, 4, 7, 8]), 4.0, 0.1, dtype=jnp.float32)
     expected = np.log1p(np.floor((np.array([0, 3, 4, 7, 8]) + 1) / 4)) * 0.1 + 1
     np.testing.assert_allclose(np.asarray(scale), expected, rtol=1e-6)
 

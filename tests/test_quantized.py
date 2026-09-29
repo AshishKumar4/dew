@@ -528,7 +528,7 @@ def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
     """A source tensor that was quantized and is missing from the export
     would otherwise be written dense under a config that calls it
     quantized, which is the lie this whole path exists to avoid."""
-    with pytest.raises(ValueError, match="up_proj.weight was quantized"):
+    with pytest.raises(KeyError, match="up_proj.weight"):
         fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
                                           ("model.layers.0.mlp.up_proj.weight",))
 
@@ -584,8 +584,8 @@ def reexport(request, tmp_path_factory):
     parameters V3.2's `scale_fmt`. Run once per format for the tests below,
     which take the pipeline apart rather than run it again.
     """
-    from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import read_file
+    from dew.interop.sources import load_shards
     ue8m0 = request.param
     root = tmp_path_factory.mktemp("fp8-reexport")
     directory, destination = root / "source", root / "reexport"
@@ -601,7 +601,7 @@ def reexport(request, tmp_path_factory):
             shipped[name], REEXPORT_BLOCK, ue8m0=ue8m0)
     write_safetensors(directory / "model.safetensors", shipped)
 
-    names = scaled_names(_load_shards(directory))
+    names = scaled_names(load_shards(directory))
     loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)

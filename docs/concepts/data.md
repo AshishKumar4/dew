@@ -23,7 +23,7 @@ np.testing.assert_array_equal(first["target"], y)
 
 This example uses the same records for both splits only to show how the iterators are built. For a real validation result, use records the model does not train on. The training iterator must yield enough batches for the number of steps you ask for. The validation iterator must end after one pass.
 
-`train` is a callable so that each new or resumed run gets a fresh iterator by calling it. If it returned the same, partly consumed iterator, the run could see different records. The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is right for a single process; in a pool of processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`). The iterator belongs to whoever opened it. Close it when you are done if it has a `close` method, and never close the shared dataset or its backing store. I have not finished reviewing iterator lifetime and cancellation, so for now run repeated, isolated smoke runs in separate processes.
+`train` is a callable so that each new or resumed run gets a fresh iterator by calling it. If it returned the same, partly consumed iterator, the run could see different records. The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is right for a single process; in a pool of processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`). The iterator belongs to whoever opened it. Close it when you are done if it has a `close` method, and never close the shared dataset or its backing store. `Trainer.fit` closes the streams it owns on success and failure. A retained training-step exception does not keep its closed prefetch iterator alive.
 
 ## Match the objective's fields
 
@@ -48,7 +48,7 @@ Image sources can need network access the first time you use them. Token-window 
 
 ## Read a dataset a provider already holds
 
-For data that TFDS or Hugging Face already holds, `dew.data.load("<provider>/<name>", batch=...)` returns the same kind of `Dataset` a specification returns. You must pass `preprocess(record, rng)` to turn a provider record into batch fields. There is no default, because each provider's rows have their own shape.
+For data that TFDS or Hugging Face already holds, `dew.data.load("<provider>/<name>", batch=...)` returns the same kind of `Dataset` a specification returns. Pass `preprocess(record, rng)` to turn a provider record into batch fields. Without it, the provider's records are the batch fields as they come: there is no default conversion, because each provider's rows have their own shape.
 
 ```python
 import dew.data

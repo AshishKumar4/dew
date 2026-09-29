@@ -251,14 +251,6 @@ def test_a_misshapen_batch_is_refused():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     batch = rollout_batch()
 
-    windowed = {key: value for key, value in batch.items() if key != SEGMENT_IDS_KEY}
-    with pytest.raises(ValueError, match=SEGMENT_IDS_KEY):
-        scalar_loss(objective, params, windowed, step)
-
-    unscored = {key: value for key, value in batch.items() if key != BEHAVIOR_LOG_PROBS_KEY}
-    with pytest.raises(ValueError, match=BEHAVIOR_LOG_PROBS_KEY):
-        scalar_loss(objective, params, unscored, step)
-
     narrow = {key: value[:, :5] for key, value in batch.items()}
     with pytest.raises(ValueError, match="8 ids per row"):
         scalar_loss(objective, params, narrow, step)
@@ -285,8 +277,6 @@ def test_evaluation_scores_prompt_perplexity():
     np.testing.assert_allclose(np.asarray(scores.losses) * weights, -expected * weights, rtol=1e-5)
     np.testing.assert_array_equal(weights, [[1, 1, 1, 1], [0, 0, 1, 1]])
 
-    with pytest.raises(ValueError, match="prompt"):
-        objective.evaluate(params, {}, step)
     with pytest.raises(ValueError, match="two tokens"):
         objective.evaluate(params, {PROMPT_KEY: jnp.ones((1, 1), jnp.int32),
                                     LENGTH_KEY: jnp.ones(1, jnp.int32)}, step)

@@ -61,6 +61,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
@@ -189,7 +190,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     `x` `[B, S, H, P]`, `dt` `[B, S, H]` already through softplus and the
     limit, `A` `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns
     `(output [B, S, H, P], state [B, H, P, N])`, fp32 throughout as the
-    reference, cast back to the input's dtype.
+    reference (the input's own dtype where it is wider, `at_least_fp32`),
+    cast back to the input's dtype.
 
     `starts` `[B, S]` marks the tokens that open a packed document: the
     state entering such a token is dropped, so no document reads another's.
@@ -198,8 +200,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     takes the backend and the geometry, and on `xla_chunk_scan` everywhere
     else. The two agree to fp32 tolerance (tests/test_ssd_kernel.py).
     """
-    dtype = x.dtype
-    x, dt, A, B, C, D = (jnp.asarray(t, jnp.float32) for t in (x, dt, A, B, C, D))
+    dtype, work = x.dtype, at_least_fp32(x.dtype)
+    x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
     state_size = B.shape[-1]
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
@@ -219,9 +221,9 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    carried = (jnp.zeros((batch, heads, head_dim, state_size), jnp.float32) if state is None
-               else jnp.asarray(state, jnp.float32))
-    platform = ssd_kernel_platform(chunk_size, head_dim, state_size)
+    carried = (jnp.zeros((batch, heads, head_dim, state_size), work) if state is None
+               else jnp.asarray(state, work))
+    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
                       ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
     output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
@@ -230,14 +232,15 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     """One token at a time, `mamba2_selective_state_update`
-    (modeling_mamba2.py:192-251) as a scan over time, in fp32. Operands as
-    `chunk_ssd` takes them; a token `starts` marks sees a zero state."""
-    dtype = x.dtype
-    x, dt, A, B, C, D = (jnp.asarray(t, jnp.float32) for t in (x, dt, A, B, C, D))
+    (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
+    own dtype where it is wider). Operands as `chunk_ssd` takes them; a
+    token `starts` marks sees a zero state."""
+    dtype, work = x.dtype, at_least_fp32(x.dtype)
+    x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
     B, C = _expand_groups(B, heads), _expand_groups(C, heads)
     if state is None:
-        state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), jnp.float32)
+        state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
     if starts is None:
         starts = jnp.zeros((batch, length), jnp.bool_)
 
@@ -248,14 +251,14 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         return s, jnp.einsum('bhps,bhs->bhp', s, C_t) + x_t * D[None, :, None]
 
     final, out = jax.lax.scan(
-        one_token, jnp.asarray(state, jnp.float32),
+        one_token, jnp.asarray(state, work),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
     return jnp.moveaxis(out, 0, 1).astype(dtype), final.astype(dtype)
 
 
 class MambaRMSNormGated(nn.Module):
     """`MambaRMSNormGated` (modeling_mamba2.py:105-121): the gate first, the
-    norm over the whole width after, both in fp32, the weight applied to the
+    norm over the whole width after, both in fp32 (`at_least_fp32`), the weight applied to the
     cast-back values."""
 
     epsilon: float = 1e-5
@@ -264,7 +267,8 @@ class MambaRMSNormGated(nn.Module):
     @nn.compact
     def __call__(self, x, gate):
         dtype = self.dtype if self.dtype is not None else x.dtype
-        y = x.astype(jnp.float32) * nn.silu(gate.astype(jnp.float32))
+        wide = at_least_fp32(x.dtype)
+        y = x.astype(wide) * nn.silu(gate.astype(wide))
         y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
         scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
         return (scale.astype(dtype) * y.astype(dtype)).astype(dtype)
@@ -386,11 +390,13 @@ class Mamba2(nn.Module):
         gate, mixed, dt = jnp.split(
             projected, [self.intermediate_size, self.intermediate_size + self.conv_features], axis=-1)
         # The conv and the scan run in fp32, as the reference's torch path
-        # casts them (modeling_mamba2.py:271, 305).
-        mixed, dt = mixed.astype(jnp.float32), dt.astype(jnp.float32)
+        # casts them (modeling_mamba2.py:271, 305), or in the model's own
+        # dtype where it is wider (`at_least_fp32`).
+        wide = at_least_fp32(mixed.dtype)
+        mixed, dt = mixed.astype(wide), dt.astype(wide)
         taps, bias = self.conv1d()
-        heads = (jnp.asarray(self.dt_bias, jnp.float32), -jnp.exp(self.A_log.astype(jnp.float32)),
-                 jnp.asarray(self.D, jnp.float32))
+        heads = (jnp.asarray(self.dt_bias, wide), -jnp.exp(self.A_log.astype(wide)),
+                 jnp.asarray(self.D, wide))
         scan = functools.partial(
             _ssd, num_heads=self.num_heads, head_dim=self.head_dim, n_groups=self.n_groups,
             state_size=self.state_size, chunk_size=self.chunk_size,
@@ -426,9 +432,9 @@ class Mamba2(nn.Module):
         if decode:
             allocated = self.has_variable('cache', 'ssm_state')
             conv_state = self.variable('cache', 'conv_state', jnp.zeros,
-                                       (batch, self.conv_features, self.conv_kernel - 1), jnp.float32)
+                                       (batch, self.conv_features, self.conv_kernel - 1), mixed.dtype)
             ssm = self.variable('cache', 'ssm_state', jnp.zeros,
-                                (batch, self.num_heads, self.head_dim, self.state_size), jnp.float32)
+                                (batch, self.num_heads, self.head_dim, self.state_size), mixed.dtype)
             if not allocated:
                 return None
         mixed, history = self._conv(mixed, taps, bias, valid,

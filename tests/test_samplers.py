@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -890,10 +891,13 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     A stochastic class integrates the exact draws `sample` folds per step, and
     `DPMSolverSDEScheduler`'s walk integrates the draws its own `torchsde`
     tree answered, whose interval the reconstruction is checked to prepare.
-    Every native walk and VJP runs in float32. Gradients compare directly to
-    the actual source float32 VJP at the same 1e-4 bound as trajectories.
-    The retained float64 source gradients provide additional diagnostic data;
-    they never select a tolerance or change native execution precision.
+    Every native walk and VJP runs in float32.
+
+    The VJP is held to twice the source's own RMS distance from its
+    float64 evaluation, using reference_error's common rounding rule.
+    The source fixture widens every scheduler table and retains that
+    gradient in float64, so its oracle shares no float32 arithmetic with
+    the reference whose rounding it measures.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -933,7 +937,8 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
 
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     (gradient,) = jax.vjp(final, x_T)[1](cotangent)
-    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad_float32"][None]) < 1e-4
+    assert_as_exact_as_the_reference(
+        gradient, SOURCE_ARRAYS[f"{name}.grad_float32"], SOURCE_ARRAYS[f"{name}.grad"], name)
 
 
 @pytest.mark.parametrize("config", [

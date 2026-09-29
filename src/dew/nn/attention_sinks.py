@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from .precision import at_least_fp32
+
 
 def attention_with_sinks(
     query: jax.Array,
@@ -30,8 +32,6 @@ def attention_with_sinks(
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     batch, length, heads, width = query.shape
     kv_heads = key.shape[-2]
-    if heads % kv_heads:
-        raise ValueError("attention sinks require query heads divisible by key/value heads")
     if sinks.shape != (heads,):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
     groups = heads // kv_heads
@@ -45,7 +45,7 @@ def attention_with_sinks(
     sink_logits = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:-1], 1))
     combined = jnp.concatenate((logits, sink_logits), axis=-1)
     if force_fp32_for_softmax:
-        combined = combined.astype(jnp.float32)
+        combined = combined.astype(at_least_fp32(combined.dtype))
     combined = combined - jnp.max(combined, axis=-1, keepdims=True)
     scores = jax.nn.softmax(combined, axis=-1)[..., :-1].astype(value.dtype)
     scores = scores.reshape(batch, kv_heads, groups, length, key.shape[1])

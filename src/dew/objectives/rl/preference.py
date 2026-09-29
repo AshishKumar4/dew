@@ -60,18 +60,8 @@ class DPOObjective(LMObjective):
         two pairs. Flat stacks, misaligned masks and rows outside the
         window are refused.
         """
-        try:
-            ids = jnp.asarray(batch[IDS_KEY])
-        except KeyError:
-            raise ValueError(
-                f"a DPO batch carries {IDS_KEY} with one pair per row; "
-                f"the batch has {sorted(batch)}") from None
-        try:
-            mask = jnp.asarray(batch[MASK_KEY])
-        except KeyError:
-            raise ValueError(
-                f"a DPO batch carries {MASK_KEY} marking the completion tokens; "
-                f"the batch has {sorted(batch)}") from None
+        ids = jnp.asarray(batch[IDS_KEY])
+        mask = jnp.asarray(batch[MASK_KEY])
         if ids.ndim != 3 or ids.shape[1] != 2:
             raise ValueError(
                 f"a DPO batch holds pairs [{IDS_KEY} shape (batch, 2, length)], "

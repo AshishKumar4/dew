@@ -180,7 +180,7 @@ The dataset was Oxford Flowers 102 from local TFDS array_record files: 8189
 records, resized to 64px, with flip and jitter augmentation and CLIP
 tokenization per record. On current main `OxfordFlowers` reads only prepared
 ArrayRecords and raises an error without `--data.path`
-(`src/dew/data/images.py:358-363`), so the command above passes it.
+(`src/dew/data/images.py:406-411`), so the command above passes it.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|
@@ -202,4 +202,4 @@ threads. Oxford Flowers is also only 8189 small records, far from a sharded
 Correction, 2026-09-22: `tools/benchmark_data.py` on current main has no
 read-thread setting of its own. It reads with the dataset spec's `Loading`,
 whose defaults are 32 workers and 64 threads
-(`src/dew/data/dataset.py:187-188`), and `--data.loading.threads` changes it.
+(`src/dew/data/dataset.py:295-296`), and `--data.loading.threads` changes it.

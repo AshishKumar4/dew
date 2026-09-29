@@ -283,8 +283,8 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
     Every per-token field is continued past the prompt's last real token: a
     logical position counts on from it, a rotary coordinate counts on from
     the largest on each axis, the attention mask marks the response valid for
-    rows that hold a prompt, and a segment id repeats. A field with no rule
-    here is filled with -1.
+    rows that hold a prompt, and a segment id repeats. `_validate_request`
+    admits no other field.
     """
     batch, prompt = inputs.tokens.shape
     valid = jnp.asarray(inputs.token_fields.get("attention_mask", jnp.ones((batch, prompt), bool)), bool)
@@ -305,10 +305,8 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
                                     (batch, width, *value.shape[2:]))
         elif name == "attention_mask":
             tail = jnp.broadcast_to(active[:, None], (batch, width))
-        elif name == "segment_ids":
-            tail = jnp.broadcast_to(value[jnp.arange(batch), last_slot, None], (batch, width))
         else:
-            tail = jnp.full((batch, width, *value.shape[2:]), -1, value.dtype)
+            tail = jnp.broadcast_to(value[jnp.arange(batch), last_slot, None], (batch, width))
         fields[name] = jnp.concatenate([value, tail.astype(value.dtype)], axis=1)
     tokens = jnp.concatenate([inputs.tokens, jnp.full((batch, width), mask_id, jnp.int32)], axis=1)
     mutable = jnp.concatenate([jnp.zeros((batch, prompt), bool),

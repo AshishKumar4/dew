@@ -186,6 +186,54 @@ condition=%condition, body=%body
 """
 
 
+def counted_loop(counter: str = "s32", start: int = 0, step: int = 1, bound: int = 4,
+                 against: str = "bound") -> str:
+    """A loop in the form a TPU executable prints a `fori_loop` or a `scan`:
+    no `known_trip_count`, a `counter`-typed element starting from a copied
+    constant `start` and stepping by `step` through a copy, below `against`:
+    the constant `bound`, or `limit.1`, a value the loop carries. Modelled on
+    the loop a v6e compiled from the diffusion_gemma step's chunked
+    vocabulary loss."""
+    return f"""HloModule counted
+
+%body (carry: ({counter}[], f32[8,32], f32[32,32], s32[])) -> ({counter}[], f32[8,32], f32[32,32], s32[]) {{
+  %one = {counter}[]{{:T(128)}} constant({step})
+  %carry = ({counter}[]{{:T(128)}}, f32[8,32]{{1,0}}, f32[32,32]{{1,0}}, s32[]{{:T(128)}}) parameter(0)
+  %counter = {counter}[]{{:T(128)}} get-tuple-element(%carry), index=0
+  %moved = {counter}[]{{:T(128)S(6)}} copy(%counter)
+  %next = {counter}[]{{:T(128)}} add(%moved, %one), metadata={{op_name="jit(step)/while/body/add"}}
+  %values = f32[8,32]{{1,0}} get-tuple-element(%carry), index=1
+  %kernel = f32[32,32]{{1,0}} get-tuple-element(%carry), index=2
+  %limit = s32[]{{:T(128)}} get-tuple-element(%carry), index=3
+  %product = f32[8,32]{{1,0}} dot(%values, %kernel), lhs_contracting_dims={{1}}, \
+rhs_contracting_dims={{0}}
+  ROOT %result = ({counter}[]{{:T(128)}}, f32[8,32]{{1,0}}, f32[32,32]{{1,0}}, s32[]{{:T(128)}}) \
+tuple(%next, %product, %kernel, %limit)
+}}
+
+%condition (carry.1: ({counter}[], f32[8,32], f32[32,32], s32[])) -> pred[] {{
+  %bound = {counter}[]{{:T(128)}} constant({bound})
+  %carry.1 = ({counter}[]{{:T(128)}}, f32[8,32]{{1,0}}, f32[32,32]{{1,0}}, s32[]{{:T(128)}}) parameter(0)
+  %counter.1 = {counter}[]{{:T(128)}} get-tuple-element(%carry.1), index=0
+  %limit.1 = s32[]{{:T(128)}} get-tuple-element(%carry.1), index=3
+  ROOT %below = pred[]{{:T(512)}} compare(%counter.1, %{against}), direction=LT
+}}
+
+ENTRY %main (values.2: f32[8,32], kernel.2: f32[32,32], limit.2: s32[]) -> f32[8,32] {{
+  %zero = {counter}[]{{:T(128)}} constant({start})
+  %values.2 = f32[8,32]{{1,0}} parameter(0)
+  %kernel.2 = f32[32,32]{{1,0}} parameter(1)
+  %limit.2 = s32[]{{:T(128)}} parameter(2)
+  %start = {counter}[]{{:T(128)}} copy(%zero)
+  %initial = ({counter}[]{{:T(128)}}, f32[8,32]{{1,0}}, f32[32,32]{{1,0}}, s32[]{{:T(128)}}) \
+tuple(%start, %values.2, %kernel.2, %limit.2)
+  %loop = ({counter}[]{{:T(128)}}, f32[8,32]{{1,0}}, f32[32,32]{{1,0}}, s32[]{{:T(128)}}) \
+while(%initial), condition=%condition, body=%body
+  ROOT %out = f32[8,32]{{1,0}} get-tuple-element(%loop), index=1
+}}
+"""
+
+
 def test_throughput_metrics_are_consistent():
     metrics = make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=None)
     assert metrics["train/step_time_ms"] == pytest.approx(200.0)
@@ -360,6 +408,37 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
         jnp.ones((width, width)), jnp.ones((rows, width))).compile()
     assert compiled_flops(executable) == pytest.approx(
         steps * 2 * rows * width * width)
+
+
+ONE_PRODUCT = 2 * 8 * 32 * 32
+
+
+@pytest.mark.parametrize("start,step,bound,trips", [
+    (0, 1, 4, 4),
+    (1, 3, 11, 4),  # 1, 4, 7, 10
+    (5, 1, 5, 0),
+    (2147483644, 1, 2147483647, 3),  # the last step reaches the largest s32
+])
+def test_a_loop_without_a_stated_trip_count_counts_every_iteration_of_its_counter(
+        start, step, bound, trips):
+    """A TPU executable states no `known_trip_count`, so a static loop's count
+    is read off its counter: from `start` by `step` while below `bound`."""
+    assert hlo_flops(counted_loop(start=start, step=step, bound=bound)) == trips * ONE_PRODUCT
+
+
+@pytest.mark.parametrize("loop", [
+    counted_loop(against="limit.1"),
+    # A float32 counter at 2**24 adds 1 and stays where it is.
+    counted_loop(counter="f32", start=16777216, bound=16777220),
+    # The last step wraps an s32 counter to -2**31, which never reaches the odd bound.
+    counted_loop(start=2147483646, step=2, bound=2147483647),
+    counted_loop(counter="u8", start=250, step=4, bound=255),
+], ids=["carried-bound", "float-counter", "s32-wraps", "u8-wraps"])
+def test_a_loop_whose_counter_does_not_state_its_length_reports_no_flops(loop):
+    """A counter compared against a value the loop carries, one that is not
+    an integer, or one whose last step overflows its type runs a number of
+    times the module does not state."""
+    assert hlo_flops(loop) is None
 
 
 def test_no_flops_are_reported_for_a_loop_of_unknown_length():

@@ -14,20 +14,24 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     the table, so T is the number of entries. The loss weight is the P2 weight
     of Choi et al. 2022, (k + SNR)^-gamma. At the defaults k = 1, gamma = 1 it
     is 1 / (1 + SNR), which on a v-prediction loss (whose error is 1 + SNR
-    times the x_0 error) is exactly an unweighted x_0 loss.
+    times the x_0 error) is exactly an unweighted x_0 loss. All fixed tables,
+    including the weight, are prepared in host float64 and rounded once.
     """
 
     def __init__(self, betas: np.ndarray,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
         self.T = len(betas)
-        alpha_cumprod = jnp.cumprod(1 - betas, axis=0)
+        # The table is fixed at construction. Device float32 prefix products
+        # and roots introduce backend-dependent error into every later step.
+        alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)
 
-        self.alpha_cumprod = alpha_cumprod.astype(jnp.float32)
-        self.sqrt_alpha_cumprod = jnp.sqrt(alpha_cumprod).astype(jnp.float32)
-        self.sqrt_one_minus_alpha_cumprod = jnp.sqrt(1 - alpha_cumprod).astype(jnp.float32)
-        self.p2_loss_weights = (
-            p2_loss_weight_k + self.alpha_cumprod / (1 - self.alpha_cumprod)
-        ) ** -p2_loss_weight_gamma
+        self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
+        self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
+        self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
+        noise_variance = 1 - alpha_cumprod
+        # This form of (k + SNR)^-gamma also preserves the zero-noise limit.
+        weights = (noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)) ** p2_loss_weight_gamma
+        self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
 
     def index(self, t) -> jax.Array:
         """`t` as a table index; a time grid may reach T itself, which is the

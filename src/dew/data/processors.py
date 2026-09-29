@@ -4,6 +4,7 @@ These run inside grain's workers, so the device only ever sees ready tensors.
 `transformers` is imported on construction, not on import.
 """
 
+import inspect
 from typing import Protocol, runtime_checkable
 
 from .text import load_tokenizer
@@ -45,11 +46,10 @@ class AutoTextTokenizer:
 
 
 class AutoAudioProcessor:
-    """Turns raw waveforms into the inputs of any HF audio model.
+    """Runs a Hugging Face audio feature extractor.
 
-    Whatever keys the model's feature extractor emits (`input_values` for
-    wav2vec2/HuBERT, `input_features` for Whisper/AST, ...) pass through
-    unchanged, so switching audio models needs no change here.
+    Returns its arrays unchanged: `input_values` for wav2vec2,
+    `input_features` for Whisper.
     """
 
     def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
@@ -59,10 +59,17 @@ class AutoAudioProcessor:
         self.tensor_type = tensor_type
         stated = self.processor.sampling_rate if isinstance(self.processor, Sampled) else 16000
         self.sampling_rate = sampling_rate or stated
+        # An extractor that pads to a fixed window by default (Whisper's 30
+        # seconds, which its encoder is built for) keeps that; one that pads
+        # nothing by default (wav2vec2's) pads a batch to its longest
+        # waveform, so rows of several lengths still stack.
+        padding = inspect.signature(self.processor.__call__).parameters.get("padding")
+        self.padding = {} if padding is None else {"padding": padding.default or True}
 
     def __call__(self, audio):
+        """The extractor's arrays for one waveform or a batch of them."""
         features = self.processor(audio, sampling_rate=self.sampling_rate,
-                                  padding=True, return_tensors=self.tensor_type)
+                                  return_tensors=self.tensor_type, **self.padding)
         return dict(features)
 
     def __repr__(self):

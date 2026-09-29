@@ -167,8 +167,6 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
 
 def as_pytree(value: Strategy) -> Strategy:
     """The strategy as data for `jax.jit`, by `decoding.as_pytree`'s rule."""
-    if not callable(value):
-        raise TypeError(f"a strategy must be callable, got {type(value).__name__}")
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 

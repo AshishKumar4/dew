@@ -17,7 +17,7 @@ from flax.core import freeze
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.artifacts import agreed
+from dew.artifacts import agreed, uint8_pixels
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
@@ -30,8 +30,11 @@ from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import active_profile
 
 if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
+
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training.distributed import Layout, MeshSpec
+    from dew.training.quantization import Quantization
 
 class _Default(Enum):
     """The sentinel that tells `guidance=None` from an omitted `guidance=`.
@@ -87,9 +90,11 @@ class DenoisingInputs:
 
 @struct.dataclass
 class Images(Generic[ArrayT]):
-    """Decoded samples in [-1, 1], NHWC, keeping the placement the task ran with.
+    """Decoded samples in [-1, 1], NHWC (NTHWC for a video field), keeping the
+    placement the task ran with.
 
-    ``host()`` reads this process's ``rows`` real rows back as a host array.
+    ``host()`` reads this process's ``rows`` real rows back as a host array;
+    ``pil()`` reads an image batch's back as 8-bit images.
     """
 
     images: ArrayT | None
@@ -100,6 +105,20 @@ class Images(Generic[ArrayT]):
         """This process's real rows as host arrays, without the padding a
         row plan added to fill the devices."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+
+    def pil(self) -> list[PILImage]:
+        """This process's real rows of an NHWC image batch as RGB images (or
+        grayscale, for one channel), their pixels quantized by
+        `dew.artifacts.uint8_pixels`."""
+        from PIL import Image
+
+        if self.images is None:
+            raise ValueError("these samples kept only their latents; call the task with decode=True")
+        if self.images.ndim != 4 or self.images.shape[-1] not in (1, 3):
+            raise ValueError(f"pil() takes [N, H, W, 3] or [N, H, W, 1] images, not samples of shape "
+                             f"{self.images.shape}")
+        pixels = uint8_pixels(local_rows(self.images)[:self.rows])
+        return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 
 @dataclass(frozen=True, eq=False)
@@ -145,6 +164,19 @@ class TextToImage:
         """Bind another variables snapshot without rebuilding the model or encoders."""
         return replace(self, params=variables)
 
+    def quantized(self, spec: Quantization) -> TextToImage:
+        """This task with its denoiser's weights stored quantized as `spec`
+        says and its matmuls computing with them
+        (`dew.training.quantization.quantize_for_serving`). The encoders and
+        the autoencoder keep their weights."""
+        from dew.training.quantization import quantize_for_serving
+
+        example = self.prepare("", seed=0, steps=1)
+        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
+        model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
+                                                jnp.zeros(example.noise.shape[:1]), **example.conditions)
+        return replace(self, model=model, params={**self.params, **variables})
+
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
         """The objective's model over `variables`, sampling the way its evaluation does."""
@@ -153,13 +185,15 @@ class TextToImage:
                    blank=objective.blank_conditions)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`).
 
-        `ema` reads the averaged weights when the run kept them. With `mesh`
+        `ema` None reads the averaged weights when the run kept them and the
+        live ones when it kept none; True requires the averaged ones and False
+        reads the live ones. With `mesh`
         the weights restore straight onto that mesh under `layout`, the way
         the trainer places them; without one the default mesh uses the current pool.
         dtype overrides computation in the model, encoders and VAE. param_dtype
@@ -172,6 +206,7 @@ class TextToImage:
         if compute is not None:
             config = replace(config, model=replace(config.model, dtype=compute),
                              text=None if config.text is None else replace(config.text, dtype=compute),
+                             audio=None if config.audio is None else replace(config.audio, dtype=compute),
                              autoencoder=None if config.autoencoder is None else
                              replace(config.autoencoder, dtype=compute))
         params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
@@ -180,7 +215,7 @@ class TextToImage:
         return cls.from_objective(objective, _with_drawn_tables(objective, params))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool = True, mesh: MeshSpec | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: str | None = None,
                         param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
@@ -561,7 +596,7 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
-def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: MeshSpec | None,
+def restore_variables(directory: str, *, ema: bool | None, step: int | None, mesh: MeshSpec | None,
                       layout: Layout | None, param_dtype: str | None,
                       parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
     """A run's published variables, restored onto the current mesh under a layout.
@@ -569,6 +604,8 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     The checkpoint is its own template. Owner-declared parameter roots select
     floating weights for param_dtype; other leaves keep their stored dtype.
     EMA uses the live tree's selection, restricted to the leaves it contains.
+    `ema` None takes the averaged weights when the run kept them; True
+    requires them.
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
@@ -580,7 +617,7 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     template = {"params": stored["params"]}
     if ema and stored.get("ema") is None:
         raise ValueError("the run keeps no EMA; request the live policy with ema=False")
-    averaged = ema
+    averaged = stored.get("ema") is not None if ema is None else ema
     if averaged:
         template["ema"] = stored["ema"]
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)

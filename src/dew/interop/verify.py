@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import records
-from dew.interop import hf_decoders as decoders
+from dew.interop import hf_decoders as decoders, sources
 from dew.registry import models, with_precision
 
 if TYPE_CHECKING:
@@ -289,7 +289,7 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
                           f"({type(error).__name__}: {error})") from error
         with tempfile.TemporaryDirectory() as scratch:
             reference.save_pretrained(scratch)
-            tensors = decoders._load_shards(Path(scratch))
+            tensors = sources.load_shards(Path(scratch))
             unmapped = _unmapped(tensors, record)
             if unmapped:
                 raise _refuse(model_type, f"the tensors {unmapped[:8]} have no Llama-convention path")

@@ -20,6 +20,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from dew.nn.conv import Conv
+
 
 def _avg_pool(x: jax.Array, window_shape: tuple[int, int], strides: tuple[int, int],
               padding: str) -> jax.Array:
@@ -80,12 +82,12 @@ class BasicConv2d(nn.Module):
         # declared, and so is the precision: pytorch-fid's features are fp32
         # convolutions, and a TPU's DEFAULT is one bf16 pass. The norm below
         # takes its shape from the input.
-        x = nn.Conv(features=max(self.out_channels // self.channel_divisor, 1),
-                    kernel_size=self.kernel_size,
-                    strides=self.strides,
-                    padding=self.padding,
-                    use_bias=False,
-                    precision=jax.lax.Precision.HIGHEST)(x)
+        x = Conv(features=max(self.out_channels // self.channel_divisor, 1),
+                 kernel_size=self.kernel_size,
+                 strides=self.strides,
+                 padding=self.padding,
+                 use_bias=False,
+                 precision=jax.lax.Precision.HIGHEST)(x)
         x = nn.BatchNorm(use_running_average=True, epsilon=0.001)(x)
         return jax.nn.relu(x)
 

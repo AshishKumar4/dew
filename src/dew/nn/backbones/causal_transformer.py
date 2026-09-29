@@ -24,7 +24,7 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, NamedTuple, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 import flax.core
 import jax
@@ -32,197 +32,49 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.registry import from_record, mixers, models
 
 from ..attention import RMSNorm
-from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, sources
+from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
-from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
+from ..gemma3n import AltUp, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
     Carried,
-    HyperConnection,
     HyperConnections,
     HyperHead,
     collapse_by,
     collapse_streams,
     expand_streams,
     first_stream,
-    mix_streams,
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
 from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
-from ..precision import head_dot_general, head_product, scaled
+from ..moe import GatedActivation, Situ, SparseMLP
+from ..precision import at_least_fp32, head_dot_general, head_product, scaled
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import (
-    MLP_HIDDEN,
     RESIDUAL,
     STAGE_AXIS,
     LayoutRefused,
     constrain,
     logical_axes,
-    logical_spec,
-    mesh_axes,
     microbatches,
     pipeline_stages,
+    row_axes,
 )
-
-
-@dataclasses.dataclass(frozen=True)
-class LayerKind:
-    """What the layers of one kind in the pattern do differently.
-
-    The pattern names each layer's kind, and this is what the kind means: a
-    windowed kind is the "sliding attention" of the reference configs, and
-    `rope_theta` and `head_dim` are the model's unless this kind states its
-    own. Rotary positions rotate every dimension of a windowed kind; Gemma 4
-    puts its partial rotary on the global layers and its sliding layers
-    rotate whole.
-
-    `mixer` is this kind's token mixer, a value from the `mixers` registry;
-    None rides the model's mixer. A hybrid stack names its per-layer mixers
-    here, keyed by the names already in the pattern.
-    """
-
-    window: int | None = None
-    """Keys a layer of this kind attends, its own included; None attends all."""
-    chunk: int | None = None
-    """Chunked local attention: a layer of this kind reads only the keys at
-    or before each query whose position shares the query's
-    `position // chunk`, MaxText's `chunk_attn_window_size` and Llama 4's
-    `attention_chunk_size`. None attends all; a kind sets a window or a
-    chunk, not both."""
-    num_kv_heads: int | None = None
-    """This kind's key/value head count; None takes the model's. Gemma 4's
-    global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
-    rope_theta: float | None = None  # set: this kind takes this base over the model's
-    rope_scaling: RopeScaling | None = None
-    """This kind's llama3 ramp or its record; None rides the model's."""
-    yarn: YarnScaling | None = None
-    """This kind's YaRN ramp or its record; None rides the model's. OLMo 3
-    scales its full-attention layers alone (configuration_olmo3.py:110-113),
-    so a YaRN ramp is a kind's as much as the model's."""
-    head_dim: int | None = None
-    mixer: MixerBase | None = None
-    """This kind's mixer value or its record; None is the model's mixer."""
-
-    def __post_init__(self):
-        # A kind's mixer and ramp arrive as values from code and as records
-        # from a config, like the model's own; anything else is neither.
-        if isinstance(self.mixer, Mapping):
-            object.__setattr__(self, "mixer", mixers.from_record(self.mixer))
-        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
-            raise ValueError(
-                f"a kind's mixer is a mixer value, its record, or None, "
-                f"not {self.mixer!r}")
-        if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
-        if isinstance(self.yarn, Mapping):
-            object.__setattr__(self, "yarn", YarnScaling(**self.yarn))
-
-
-@dataclasses.dataclass(frozen=True)
-class ResolvedKind:
-    """One kind of layer with the model's defaults filled in.
-
-    `LayerKind` is what a config states, so a field it leaves to the model is
-    None there. This is what the model resolved it to, so `rope_theta` and
-    `head_dim` are numbers; only the window stays optional, because attending
-    the whole sequence is what a kind without one does. `mixer` passes
-    through: it needs no resolution, only the model's default when unset.
-    """
-
-    window: int | None
-    chunk: int | None
-    num_kv_heads: int
-    rope_theta: float
-    rope_scaling: RopeScaling | None
-    yarn: YarnScaling | None
-    head_dim: int
-    mixer: MixerBase | None
-
-
-@dataclasses.dataclass(frozen=True)
-class LayerSpec:
-    """What one layer of the stack is, resolved: everything its block's
-    parameters and computation depend on that the layers do not share.
-
-    Two layers with equal specs have parameters of the same shapes and run
-    the same program, so a scan can run them as iterations of one body and a
-    pipeline can run them at the same position of different stages.
-    Everything the whole model sets (norms, the attention dials, per-layer
-    inputs, AltUp) is the same for every layer and so is not repeated here.
-    """
-
-    layer_type: str
-    kind: ResolvedKind
-    routed: bool
-    """The feed-forward routes to the mixture's experts."""
-    hash_routed: bool
-    """The routed feed-forward selects its experts by the token table."""
-    width: int
-    """The dense feed-forward width, doubled on a sharing layer when the model asks."""
-    sparsity: float
-    """The gaussian top-k fraction on the feed-forward gate, 0 for none."""
-    kv_shared: bool
-    """The layer reads its keys and values from an earlier layer's."""
-    provider: int | None
-    """The layer's own index when a later layer reads what it leaves in the
-    kv_store, its keys and values or a CSA2 layer's publications; such a
-    layer runs unrolled, since what it stashes leaves the stack's loop."""
-    residual_site: ResidualSite | None
-    """The layer's place among Kimi K3's blocks of attention residuals, None
-    without them. It differs at every block boundary, so a scanned run never
-    crosses one."""
-    engram: int | None = None
-    """The layer's place among the engram layers, whose bucket ids it reads
-    before its attention; None for a layer without a lookup."""
-    prediction_slot: int | None = None
-    """The layer's place among the DSpark drafter's target layers, whose
-    input streams' mean it records; None for the rest."""
-
-
-def scan_groups(specs: Sequence[LayerSpec],
-                bank_layers: int | None = None) -> tuple[tuple[int, int], ...]:
-    """The stack as runs of layers, `(first, count)` each, in order.
-
-    Consecutive layers with equal specs form one run, which a scan runs as
-    iterations of one body; a layer with no equal neighbour is a run of one,
-    which stays unrolled. The grouping is read off the specs, never written
-    by hand, so a model's pattern decides what scans.
-
-    `bank_layers` caps how many layers one run holds, which is how many a
-    parameter bank stacks: a longer run splits into consecutive runs of at
-    most that many layers. A host-resident bank is built and read one bank
-    at a time, so the cap is what bounds the memory either costs.
-    """
-    if bank_layers is not None and bank_layers < 1:
-        raise ValueError(f"bank_layers counts the layers one run holds, got {bank_layers}")
-    groups: list[tuple[int, int]] = []
-    for index, spec in enumerate(specs):
-        if groups and specs[groups[-1][0]] == spec and groups[-1][1] != bank_layers:
-            first, count = groups[-1]
-            groups[-1] = (first, count + 1)
-        else:
-            groups.append((index, 1))
-    return tuple(groups)
-
-
-def group_name(first: int, count: int) -> str:
-    """The module name of a scanned run: `layers_3_7` runs layers 3 through 7."""
-    return f'layers_{first}_{first + count - 1}'
+from .decoder_block import BlockWiring, DecoderBlock, GatedMLP, Mixture, MTPBlock, RematPolicy, remat_policy
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 
 def _merged(bank: Mapping, rows: Mapping) -> dict:
@@ -235,24 +87,8 @@ def _merged(bank: Mapping, rows: Mapping) -> dict:
     return merged
 
 
-def group_layers(name: str) -> range | None:
-    """The layers a stack module name runs: `layers_3_7` as range(3, 8),
-    `layers_3` as range(3, 4), anything else as None. The inverse of
-    `group_name`, for a reader keyed by single layers that meets the run."""
-    if not name.startswith("layers_"):
-        return None
-    parts = name[len("layers_"):].split("_")
-    if not all(part.isdigit() for part in parts) or len(parts) > 2:
-        return None
-    first, last = int(parts[0]), int(parts[-1])
-    return range(first, last + 1)
-
-
 INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
-
-STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
-"""Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
 def layer_outputs(module: nn.Module, method: str) -> bool:
@@ -276,846 +112,6 @@ def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]],
     return kept["__call__"][0]
 
 
-@dataclasses.dataclass(frozen=True)
-class Mixture:
-    """The experts some layers route to, and how the router chooses.
-
-    `experts` is what the rest depends on, so they live together: a top_k, a
-    cadence or a balancing bias says nothing about a model with no experts.
-    `layers` names the sparse layers by index, or `every` makes every nth
-    layer sparse counting from the end of the first group, the meaning of
-    Qwen3-MoE's decoder_sparse_step; neither makes every layer sparse, which
-    is Mixtral.
-
-    The routing fields pass straight through to `Router`; that class
-    documents each one.
-
-    `parallel` is Gemma 4's placement (`enable_moe_block`). The experts run
-    beside the dense feed-forward on the same residual, and the two are
-    summed after a norm each, under `Gemma4TextRouter`. That router replaces
-    the routing fields above, which are refused with it.
-
-    `expert_features` is the routed experts' width, None for the model's
-    `mlp_features`; DeepSeek sizes its experts apart from its dense layers.
-    `shared_features` is the width of the one dense gated MLP every token
-    takes beside the routed experts, 0 for none. `DeepseekV3MoE` builds its
-    `n_shared_experts` as a single MLP of that many times its expert width,
-    so the product is the whole record of them. `shared_gate` multiplies
-    that branch's output by a learned scalar sigmoid per token, as Qwen3.5
-    MoE does.
-
-    `implementation` is the grouped matmul the experts run on, one of
-    `moe.grouped_matmul`'s, the way `attention_impl` names an attention
-    kernel. It changes which kernel computes the same contraction and
-    nothing about the routing.
-
-    `dispatch='exchange'` is expert parallelism: each device trades its
-    selected tokens with the expert shards that own them, in bounded
-    all-to-all rounds, on an expert mesh axis larger than one that divides
-    the expert count. The default `'global'` sorts and gathers where the
-    tokens are. Both share the projection precision and the differentiation
-    contract.
-
-    `capacity_factor` drops slots past each sequence's per-expert capacity,
-    GShard's and MaxText's token dropping (`moe.capacity_positions`); None,
-    the default, keeps every selected slot. Both dispatches drop the same
-    slots on any placement, and the exchange then runs one round.
-
-    `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
-    token table instead of the scores (`DeepseekV4HashRouter`). Their router
-    holds `tid2eid` over the vocabulary in place of the balancing bias, and
-    the block hands it the token ids.
-
-    `latent_features` is Kimi K3's latent MoE: the routed experts run at that
-    width between a down and an up projection, with the model's RMSNorm on
-    their weighted sum when `latent_norm` is set (`SparseMLP`). None runs
-    them at the model width.
-
-    `media_bias` gives every router DeepSeek-V4.1's second balancing bias,
-    which selects for an image span's tokens (`Router`); the block hands it
-    the media mask.
-    """
-
-    experts: int
-    top_k: int = 2
-    layers: tuple[int, ...] | None = None
-    every: int | None = None
-    score_function: str = 'softmax'
-    norm_topk_prob: bool = True
-    scaling: float = 1.0
-    groups: int = 1
-    groups_per_token: int = 1
-    group_score: str = 'top2'
-    bias: bool = False
-    scale_inputs: bool = False
-    parallel: bool = False
-    expert_features: int | None = None
-    shared_features: int = 0
-    shared_gate: bool = False
-    implementation: str = 'auto'
-    dispatch: str = 'global'
-    capacity_factor: float | None = None
-    hash_layers: tuple[int, ...] | None = None
-    latent_features: int | None = None
-    latent_norm: bool = False
-    media_bias: bool = False
-
-    def __post_init__(self):
-        if self.layers is not None:
-            object.__setattr__(self, "layers", tuple(self.layers))
-        if self.hash_layers is not None:
-            object.__setattr__(self, "hash_layers", tuple(int(index) for index in self.hash_layers))
-            if self.groups != 1 or self.parallel:
-                raise ValueError(
-                    "hash routing selects by the token table alone, so it has no "
-                    "expert groups and is not Gemma 4's parallel branch")
-        if self.experts < 1:
-            raise ValueError(
-                f"a mixture needs experts to route to, got {self.experts}; a "
-                "dense model has no mixture at all")
-        if self.layers is not None and self.every is not None:
-            raise ValueError(
-                f"layers ({self.layers}) and every ({self.every}) both choose the "
-                "sparse layers, so only one of them can be set")
-        if self.every is not None and self.every < 1:
-            raise ValueError(f"every must be positive, got {self.every}")
-        if self.expert_features is not None and self.expert_features < 1:
-            raise ValueError(
-                f"expert_features is the routed experts' width, got "
-                f"{self.expert_features}; None takes the model's mlp_features")
-        if self.shared_features < 0:
-            raise ValueError(
-                f"shared_features is the shared branch's width, got "
-                f"{self.shared_features}; 0 is a layer without one")
-        if self.shared_gate and not self.shared_features:
-            raise ValueError("shared_gate requires shared_features")
-        if self.latent_norm and self.latent_features is None:
-            raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
-        if self.implementation not in GROUPED_MATMULS:
-            raise ValueError(
-                f"implementation is the experts' grouped matmul, one of "
-                f"{list(GROUPED_MATMULS)}, got {self.implementation!r}")
-        if self.dispatch not in EXPERT_DISPATCHES:
-            raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
-        if self.capacity_factor is not None and not self.capacity_factor > 0:
-            raise ValueError(
-                f"capacity_factor scales each expert's share of a sequence, so it is "
-                f"positive, got {self.capacity_factor}; None keeps every slot")
-        if self.parallel and (
-                self.score_function != 'softmax' or not self.norm_topk_prob
-                or self.scaling != 1.0 or self.groups != 1 or self.bias
-                or self.scale_inputs or self.shared_features or self.latent_features is not None):
-            raise ValueError(
-                "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, input scaling "
-                "or shared branch to set")
-
-
-@logical_axes({
-    ("gate_proj",): ("embed", "mlp"),
-    ("up_proj",): ("embed", "mlp"),
-    ("down_proj",): ("mlp", "embed"),
-})
-class GatedMLP(nn.Module):
-    """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
-    the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
-    the erf form (HF's gelu, which Gemma's released config names). A `Situ`
-    in place of the name is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`).
-
-    Bias-free, like the gated MLP of every open decoder this loads.
-
-    activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
-    nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
-    swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
-    activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
-    gate capped at the limit from above and the up projection on both sides.
-    None is the plain gated MLP.
-    """
-    hidden_features: int
-    out_features: int
-    activation: GatedActivation = 'swiglu'
-    activation_sparsity: float = 0.0
-    swiglu_limit: float | None = None
-    init_std: float | None = None  # gate/up normal std; None: lecun normal
-    output_init_std: float | None = None  # down normal std; None follows init_std
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        if not 0 <= self.activation_sparsity < 1:
-            raise ValueError(
-                f"activation_sparsity is the fraction of gate activations dropped, "
-                f"within [0, 1), got {self.activation_sparsity}")
-        dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-            **normal_kernel(self.init_std))
-        self.gate_proj = dense(self.hidden_features, name='gate_proj')
-        self.up_proj = dense(self.hidden_features, name='up_proj')
-        self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
-
-    def __call__(self, x):
-        # Column-parallel under a tensor axis: the hidden width splits and
-        # down_proj's sum returns to the residual placement in the block.
-        gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
-        up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-        if self.swiglu_limit is not None:
-            gate = jnp.minimum(gate, self.swiglu_limit)
-            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
-        if self.activation_sparsity:
-            gate = gaussian_topk(gate, self.activation_sparsity)
-        return checkpoint_name(self.down_proj(gated_product(self.activation)(gate, up)), 'down_proj')
-
-
-@dataclasses.dataclass(frozen=True)
-class BlockWiring:
-    """How a block norms its two residuals, and whether it scales its output.
-
-    `pre_norms` norms each sublayer's input and `output_norms` its output.
-    The input pair alone is the plain pre-norm block, both pairs Gemma's
-    sandwich block, and the output pair alone OLMo 3's post-norm block
-    (modeling_olmo3.py:249-266), where each sublayer reads the residual
-    stream as it is and its output is normed before it is added. The output
-    pair norms the sublayer outputs and not their inputs, so the input norms
-    keep their names and their places, and a checkpoint without the output
-    pair loads into the same tree minus two leaves per layer. `layer_scalar`
-    selects the reference's frozen or trainable output scalar. One wiring serves
-    every layer, so it stays off the per-layer specs the scan groups by.
-    """
-
-    pre_norms: bool = True
-    output_norms: bool = False
-    layer_scalar: Literal["frozen", "trainable"] | None = None
-
-    def __post_init__(self):
-        if self.layer_scalar not in (None, "frozen", "trainable"):
-            raise ValueError("layer_scalar must be None, frozen or trainable")
-
-
-QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
-MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)
-"""The values a block names as it runs, each after the projection that
-produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's output before `o_proj`, and the MLP names cover the
-dense MLP and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
-
-
-@dataclasses.dataclass(frozen=True)
-class RematPolicy:
-    """What a recomputed block keeps for its backward pass, and where.
-
-    A block under remat saves its inputs and recomputes its forward when the
-    backward pass asks. `save` names the residuals (`RESIDUALS`) it keeps in
-    device memory instead, `offload` the ones it moves to pinned host memory
-    after the forward pass and fetches back for the backward; everything
-    else is recomputed. Both empty is MaxText's `full`, which recomputes the
-    whole block. `REMAT_POLICIES` holds MaxText's named recipes under this
-    decoder's names: MaxText's `query_proj`/`key_proj`/`value_proj`/
-    `out_proj` are `q_proj`/`k_proj`/`v_proj`/`o_proj` and its `mlpwi_0`/
-    `mlpwi_1`/`mlpwo` are `gate_proj`/`up_proj`/`down_proj`. Its fused
-    `qkv_proj`/`mlpwi` name projections this decoder does not fuse, and its
-    `quantization` names AQT intermediates Qwix does not produce. A config
-    gives a policy by name or as a record of the two lists.
-    """
-    save: tuple[str, ...] = ()
-    offload: tuple[str, ...] = ()
-
-    def __post_init__(self):
-        object.__setattr__(self, 'save', tuple(self.save))
-        object.__setattr__(self, 'offload', tuple(self.offload))
-        unknown = sorted(set(self.save + self.offload) - set(RESIDUALS))
-        if unknown:
-            raise ValueError(
-                f"a remat policy names residuals from {list(RESIDUALS)}, got {unknown}")
-        both = sorted(set(self.save) & set(self.offload))
-        if both:
-            raise ValueError(
-                f"a residual is saved on device or offloaded to the host, not both: {both}")
-
-    def checkpoint_policy(self):
-        """The policy `nn.remat` runs the block under; None recomputes everything."""
-        if self.offload:
-            return jax.checkpoint_policies.save_and_offload_only_these_names(
-                names_which_can_be_saved=self.save,
-                names_which_can_be_offloaded=self.offload,
-                offload_src='device', offload_dst='pinned_host')
-        if self.save:
-            return jax.checkpoint_policies.save_only_these_names(*self.save)
-        return None
-
-
-REMAT_POLICIES: Mapping[str, RematPolicy] = {
-    'full': RematPolicy(),
-    'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
-    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
-    'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
-    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context')),
-    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, 'down_proj')),
-    'save_qkv_proj': RematPolicy(save=QKV_RESIDUALS),
-    'save_out_proj': RematPolicy(save=('o_proj',)),
-    'minimal_offloaded': RematPolicy(offload=ATTENTION_RESIDUALS + MLP_RESIDUALS),
-    'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
-}
-"""MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
-largest first. `full` keeps nothing but the block's inputs."""
-
-
-def remat_policy(
-        value: RematPolicy | str | Mapping[str, Sequence[str]] | None) -> RematPolicy | None:
-    """`value` as the policy it names: a `RematPolicy`, a name in
-    `REMAT_POLICIES`, a record of `save`/`offload` names, or None for no
-    recomputation at all. A config's record arrives here untyped, so a
-    value of another kind is refused rather than passed on."""
-    if value is None or isinstance(value, RematPolicy):
-        return value
-    if isinstance(value, str):
-        if value not in REMAT_POLICIES:
-            raise ValueError(
-                f"remat names one of {sorted(REMAT_POLICIES)} or is a record of "
-                f"save/offload residual names, got {value!r}")
-        return REMAT_POLICIES[value]
-    if isinstance(value, Mapping):
-        unknown = sorted(set(value) - {'save', 'offload'})
-        if unknown:
-            raise ValueError(
-                f"a remat record holds 'save' and 'offload' residual names, got {unknown}")
-        return RematPolicy(save=tuple(value.get('save', ())),
-                           offload=tuple(value.get('offload', ())))
-    raise ValueError(
-        f"remat is a RematPolicy, its name, its record, or None, not {value!r}")
-
-
-@logical_axes({
-    ("per_layer_input_gate",): ("embed", "mlp"),
-    ("per_layer_projection",): ("mlp", "embed"),
-})
-class _Plain(NamedTuple):
-    """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
-    predictions of every copy when the block runs AltUp."""
-
-    x: jax.Array
-    predictions: jax.Array | None
-
-
-class _Streams(NamedTuple):
-    """mHC's streams `[B, S, hc_mult, D]` inside a block, and under Single-Pass
-    the fp32 `pre` the next site collapses them by."""
-
-    streams: jax.Array
-    pre: jax.Array | None
-
-
-class _Depth(NamedTuple):
-    """Kimi K3's depth state inside a block: the block slots `[B, S, blocks, D]`,
-    the partial sum `[B, S, D]` and how many slots are finished.
-
-    `finished` is a Python int, static per layer (`ResidualSite.finished`), so
-    a `_Depth` lives only inside one block's forward and never crosses a jax
-    transform, where it would become a traced leaf."""
-
-    blocks: jax.Array
-    partial: jax.Array
-    finished: int
-
-
-_BlockState = _Plain | _Streams | _Depth
-
-
-class DecoderBlock(nn.Module):
-    """Pre-norm decoder block: token mixer, then feed-forward, both residual.
-
-    `mixer` and `feedforward` are factories taking only a name. What `mixer`
-    builds lands in the tree as self_attn and has to accept (x, decode=...,
-    positions=..., segment_ids=...), the last two None outside a packed batch.
-    What `feedforward` builds lands there as mlp and takes the normalized
-    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share;
-    a `hash_routed` block hands it the token ids too, which the metadata
-    carries down the stack for DeepSeek V4's hash router. A `feedforward` of
-    None is a block of the mixer alone, norm, mixer, residual, which is
-    Mamba-2's (`Mamba2Block`, modeling_mamba2.py:608-632): no
-    post_attention_layernorm, no mlp, no output norm for either.
-
-    `wiring` places the block's norms: the input pair alone is the plain
-    pre-norm block, both pairs Gemma's sandwich block, and the output pair
-    alone OLMo 3's post-norm block (modeling_olmo3.py:249-266), where each
-    sublayer reads the residual stream as it is and its output is normed
-    before it is added. The output pair norms the sublayer outputs and not
-    their inputs, so the input norms keep their names and their places, and
-    a checkpoint without the output pair loads into the same tree minus two
-    leaves per layer.
-
-    kv_store threads one dict down the layer stack so a KV-sharing mixer
-    reads its provider's keys and values; a mixer without a kv_store keyword
-    fails loudly when a run shares. per_layer_input is the layer's slice of
-    `LayerInputs`: its input signal for the per-layer residual, and on a
-    `routed` block the replayed experts its router uses (`dew.nn.moe.Routes`),
-    None when the model reads neither.
-
-    altup makes the block take and return Gemma 3n's stack of residual
-    copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
-    active prediction, corrects every copy by what it computed, and adds the
-    per-layer residual to the copies past the first and not to its own
-    output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
-    adds the LAuReL block over the attention's normed input, averaged with
-    the attention residual over sqrt(2).
-
-    hyper_connections makes the block take and return the mHC stack of
-    residual streams, `[B, S, hc_mult, D]`: each sublayer reads the collapse
-    its site's mapping chooses and writes back into every stream over the
-    Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
-    block otherwise (modeling_glm5_next.py:1293-1327). Under the Single-Pass
-    schedule the block takes and returns `Carried(streams, pre)`, each
-    sublayer collapsing by the `pre` the site before it computed.
-
-    residual_site makes the block take and return Kimi K3's depth state,
-    `[B, S, blocks + 1, D]`: the finished blocks and the partial sum
-    (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
-    of the finished blocks and the partial its site holds, as a plain
-    pre-norm block reads the residual, and adds its output to the partial.
-
-    Every form runs one forward (`_forward`): `_enter` turns the residual
-    the block receives into its state, each sublayer `_read`s its input
-    from that state and `_write`s its output back, and `_leave` hands the
-    next block its residual. The model's `_expand` and `_collapse` turn the
-    embeddings into the first block's residual and the last block's back.
-
-    engram writes the layer's n-gram lookup into the streams before anything
-    else reads them (V4.1 inference/model.py:1261-1263); `engram_index` is
-    which of the metadata's `engram_ids` it reads. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads as
-    `prediction_inputs/draft_context` (:1264-1266).
-    """
-    mixer: Callable[..., nn.Module]
-    feedforward: Callable[..., nn.Module] | None
-    emb_features: int
-    wiring: BlockWiring
-    norm_eps: float = 1e-5
-    scale_offset: bool = False
-    scale_after_cast: bool = False
-    per_layer_input_dim: int = 0
-    gate_activation: GatedActivation = 'swiglu'
-    """The per-layer residual's gated product, which Gemma 3n/4 share with the
-    feed-forward's own (modeling_gemma4.py, Gemma4TextDecoderLayer)."""
-    parallel: Callable[..., nn.Module] | None = None
-    """A branch summed with the feed-forward's output before its output norm,
-    called with the residual and that output (Gemma 4's routed experts)."""
-    altup: AltUp | None = None  # Gemma 3n's stack of residual copies
-    laurel_rank: int | None = None  # Gemma 3n's learned augmented residual
-    hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams
-    hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
-    residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
-    residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
-    routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
-    media_routed: bool = False  # the feed-forward routes a media span by its own bias
-    engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
-    engram_index: int | None = None
-    prediction_slot: int | None = None  # records its input's stream mean for DSpark
-    dropout_rate: float = 0.0
-    remat: RematPolicy | None = None
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        if self.wiring.pre_norms:
-            self.input_layernorm = norm(name='input_layernorm')
-        self.self_attn = self.mixer(name='self_attn')
-        if self.wiring.pre_norms and self.feedforward is not None:
-            self.post_attention_layernorm = norm(name='post_attention_layernorm')
-        if self.wiring.output_norms:
-            self.attention_output_norm = norm(name='attention_output_norm')
-            if self.feedforward is not None:
-                self.mlp_output_norm = norm(name='mlp_output_norm')
-        if self.feedforward is not None:
-            self.mlp = self.feedforward(name='mlp')
-        elif self.parallel is not None or self.laurel_rank is not None:
-            raise ValueError(
-                "a block without a feed-forward has no branch for a parallel "
-                "routed one to sum with and no LAuReL residual to average")
-        if self.parallel is not None:
-            self.moe = self.parallel(name='moe')
-        if self.wiring.layer_scalar == "frozen":
-            self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
-        elif self.wiring.layer_scalar == "trainable":
-            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
-        if self.per_layer_input_dim:
-            dense = functools.partial(
-                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-            self.per_layer_input_gate = dense(self.per_layer_input_dim,
-                                              name='per_layer_input_gate')
-            self.per_layer_projection = dense(self.emb_features,
-                                              name='per_layer_projection')
-            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
-        if self.altup is not None:
-            if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
-                raise ValueError(
-                    "altup runs Gemma 3n's block, which has its pre-norms and "
-                    "neither a parallel branch nor a layer scalar")
-            self.altup_layer = AltUpLayer(
-                spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
-                dtype=self.dtype, precision=self.precision, name='altup')
-        if self.laurel_rank is not None:
-            if self.laurel_rank < 1 or not self.wiring.pre_norms:
-                raise ValueError(
-                    f"laurel_rank is the width of the learned augmented residual "
-                    f"over the attention's normed input, got {self.laurel_rank} "
-                f"with {self.wiring}")
-            self.laurel = LaurelBlock(
-                rank=self.laurel_rank, emb_features=self.emb_features,
-                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
-                name='laurel')
-        if self.hyper_connections is not None:
-            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
-                    or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim
-                    or self.residual_multiplier != 1.0):
-                raise ValueError(
-                    "hyper_connections runs the mHC block, a plain pre-norm block whose "
-                    "residual is the stream stack: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel, per-layer inputs or residual multiplier")
-            site = functools.partial(HyperConnection, spec=self.hyper_connections,
-                                     emb_features=self.emb_features, norm_eps=self.norm_eps)
-            self.attn_hc = site(name='attn_hc')
-            self.ffn_hc = site(name='ffn_hc')
-        if self.residual_site is not None:
-            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
-                    or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim
-                    or self.hyper_connections is not None or self.residual_multiplier != 1.0):
-                raise ValueError(
-                    "attention residuals run Kimi K3's block, a plain pre-norm block whose "
-                    "residual is the depth mixture: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
-            site = functools.partial(DepthAttention, emb_features=self.emb_features, norm_eps=self.norm_eps)
-            self.attention_res = site(name='attention_res')
-            if self.feedforward is not None:
-                self.mlp_res = site(name='mlp_res')
-        if self.engram is not None:
-            if self.hyper_connections is None or self.engram_index is None:
-                raise ValueError("an engram lookup gates into mHC's residual streams and reads "
-                                 "one engram layer's bucket ids, so it needs both")
-            self.engram_layer = self.engram(name='engram')
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, x, train: bool = False, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
-                 per_layer_input=None, attention_metadata=None,
-                 prediction_phase: PredictionPhase = "ordinary"):
-        if self.remat is None or self.is_initializing() or decode:
-            return self._forward(x, train, decode, positions, segment_ids,
-                                 kv_store, per_layer_input, attention_metadata, prediction_phase)
-
-        def run(module, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata):
-            # Providers write K/V into a dict; scanned consumers only read it.
-            # Return writes explicitly, keeping consumer values out of the
-            # scan result so its tracers cannot replace the outer store.
-            store = None if kv_store is None else dict(kv_store)
-            out = module._forward(
-                x, train, decode=False, positions=positions, segment_ids=segment_ids,
-                kv_store=store, per_layer_input=per_layer_input,
-                attention_metadata=attention_metadata, prediction_phase=prediction_phase)
-            changed = {} if kv_store is None or store is None else {
-                name: value for name, value in store.items()
-                if value is not kv_store.get(name)}
-            return out, changed
-        # Unlike DiT remat_block, this boundary returns the sharing store.
-        # The policy decides which named residuals the backward pass reads
-        # back instead of recomputing; train stays a static closure value and
-        # Linen lifts variables and RNGs with the call.
-        out, store = nn.remat(run, policy=self.remat.checkpoint_policy())(
-            self, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata)
-        if kv_store is not None:
-            kv_store.update(store)
-        return out
-
-    def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
-        """The block's one forward over whichever residual form it runs.
-
-        The form (`_enter`, `_read`, `_write`, `_leave`) decides what the
-        residual is and how each sublayer reads it and writes back into it:
-        the plain `[B, S, D]` stream, Gemma 3n's AltUp copies, mHC's streams
-        with or without the Single-Pass schedule, or Kimi K3's depth state.
-        The sublayers themselves, their norms and their branches run the same
-        for every form.
-        """
-        state = self._enter(x, train, attention_metadata)
-        state, read, site = self._read(state, "attention")
-        normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
-        if self.wiring.output_norms:
-            mixed = self.attention_output_norm(mixed)
-        state = self._write(state, "attention", self._branch(mixed, train), site)
-        if self.laurel_rank is not None:
-            # Only the plain form admits LAuReL (setup refuses the rest).
-            assert isinstance(state, _Plain)
-            state = state._replace(x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype))
-        if self.feedforward is not None:
-            routes = self._routes(per_layer_input)
-            state, read, site = self._read(state, "mlp")
-            hidden = self.mlp(self.post_attention_layernorm(read) if self.wiring.pre_norms else read,
-                              **self._feedforward_inputs(attention_metadata),
-                              **({} if self.parallel is not None else routes))
-            if self.parallel is not None:
-                hidden = self.moe(read, hidden, **routes)
-            if self.wiring.output_norms:
-                hidden = self.mlp_output_norm(hidden)
-            state = self._write(state, "mlp", self._branch(hidden, train), site)
-        return self._leave(state, train, per_layer_input)
-
-    def _branch(self, output, train: bool):
-        """A sublayer's output as it joins the residual: times
-        `residual_multiplier` (lm-engine's m_residual, GraniteMoeHybrid's
-        residual_multiplier) in its own dtype, then dropped out."""
-        return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
-
-    def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:
-        """The residual the block received, as the state its sublayers read."""
-        if self.hyper_connections is not None:
-            streams, pre = residual if self.hyper_connections.single_pass else (residual, None)
-            if self.engram is not None:
-                if attention_metadata is None or attention_metadata.engram_ids is None:
-                    raise ValueError("an engram layer reads the bucket ids the model hashes into "
-                                     "attention_metadata.engram_ids")
-                # A media position takes no engram contribution (V4.1 model.py:351-365), and
-                # the lookup lands before anything reads the streams (:1261-1263).
-                streams = self.engram_layer(
-                    streams, attention_metadata.engram_ids[:, :, self.engram_index],
-                    None if attention_metadata.media is None else ~attention_metadata.media)
-            if (self.prediction_slot is not None and not self.is_initializing()
-                    and self.is_mutable_collection('prediction_inputs')):
-                # DSpark reads each target layer's attention input, after its
-                # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
-                mean = jnp.mean(streams, axis=2)
-                self.sow('prediction_inputs', 'draft_context', mean,
-                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
-            return _Streams(constrain(streams, STREAMS), pre)
-        if self.residual_site is not None:
-            return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
-        predictions = None if self.altup is None else self.altup_layer.predict(residual, train=train)
-        x = residual if self.altup is None or predictions is None else predictions[self.altup.active_idx]
-        # The residual stream sits where the batch does, before and after
-        # each sublayer: fsdp gathers weights rather than sum partial
-        # products, and a row-parallel projection's sum scatters back.
-        return _Plain(constrain(x, RESIDUAL), predictions)
-
-    def _read(self, state: _BlockState, site: Literal["attention", "mlp"]):
-        """What the sublayer at `site` reads, as `(state, input, mapping)`;
-        `mapping` is what `_write` needs from the read (mHC's post and comb)."""
-        if isinstance(state, _Plain):
-            return state, state.x, None
-        if isinstance(state, _Streams):
-            spec = self.hyper_connections
-            assert spec is not None
-            pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
-            # Under Single-Pass, a site collapses by the `pre` the site before
-            # it computed and hands its own on (V4.1 inference/model.py:968-994).
-            by = state.pre if spec.single_pass else pre
-            return (_Streams(state.streams, pre if spec.single_pass else None),
-                    collapse_by(by, state.streams), (post, comb))
-        site_spec = self.residual_site
-        assert site_spec is not None
-        if site == "mlp":
-            return state, self.mlp_res(sources(state.blocks, state.finished, state.partial)), None
-        # The attention reads the mixture of the blocks finished before this
-        # layer with the partial it received, or that partial alone before any
-        # block is finished (KimiDecoderLayer._forward_attn_residual,
-        # modeling_kimi_linear.py:973-1046).
-        if not state.finished:
-            if self.is_initializing():
-                # Layer 0 carries the site like every layer and never reads it
-                # (the reference skips it on an empty block list, :987-993); the
-                # tree holds it so the checkpoint's tensors have a leaf.
-                self.attention_res(state.partial[:, :, None])
-            read = state.partial
-        else:
-            read = self.attention_res(sources(state.blocks, state.finished, state.partial))
-        if site_spec.opens:
-            # A layer that opens a block closes the partial it received into
-            # the next slot, and its attention output starts the new partial.
-            state = _Depth(state.blocks.at[:, :, state.finished].set(state.partial), state.partial,
-                           state.finished + 1)
-        return state, read, None
-
-    def _write(self, state: _BlockState, site: Literal["attention", "mlp"], output, mapping) -> _BlockState:
-        """The state after the sublayer at `site` adds `output` to it."""
-        if isinstance(state, _Plain):
-            return state._replace(x=constrain(state.x + output, RESIDUAL))
-        if isinstance(state, _Streams):
-            post, comb = mapping
-            return state._replace(streams=constrain(mix_streams(post, comb, output, state.streams), STREAMS))
-        site_spec = self.residual_site
-        assert site_spec is not None
-        opens = site == "attention" and site_spec.opens
-        return state._replace(partial=output if opens else state.partial + output)
-
-    def _leave(self, state: _BlockState, train: bool, per_layer_input):
-        """The residual the block hands the next one."""
-        if isinstance(state, _Streams):
-            spec = self.hyper_connections
-            assert spec is not None
-            if not spec.single_pass:
-                return state.streams
-            assert state.pre is not None
-            return Carried(state.streams, state.pre)
-        if isinstance(state, _Depth):
-            return jnp.concatenate([state.blocks, state.partial[:, :, None]], axis=2)
-        x = state.x
-        embeddings = None if per_layer_input is None else per_layer_input.embeddings
-        if self.altup is not None and state.predictions is not None:
-            corrected = self.altup_layer.correct(state.predictions, x, train=train)
-            if self.per_layer_input_dim and embeddings is not None:
-                first = corrected[self.altup.active_idx]
-                if self.altup.correct_scale:
-                    first = self.altup_layer.scale_corrected_output(first)
-                # The per-layer residual lands on the copies past the first,
-                # the active one left as corrected.
-                corrected = corrected.at[1:].add(self._per_layer_residual(first, embeddings))
-            return corrected
-        if self.per_layer_input_dim and embeddings is not None:
-            x = x + self._per_layer_residual(x, embeddings)
-        if self.wiring.layer_scalar:
-            x = x * self.output_scalar.astype(x.dtype)
-        return x
-
-    def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase):
-        """The token mixer over `x`. The store, the metadata and a prediction
-        phase other than ordinary reach it only when the call carries them,
-        since a mixer with no use for one does not take it."""
-        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
-                              **({} if kv_store is None else {"kv_store": kv_store}),
-                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
-
-    def _feedforward_inputs(self, attention_metadata) -> dict:
-        """The token ids for a hash-routed feed-forward, the media mask, when
-        the call has one, for one that routes a media span apart, nothing for
-        the rest."""
-        if self.media_routed:
-            media = None if attention_metadata is None else attention_metadata.media
-            return {} if media is None else {"media": media}
-        if not self.hash_routed:
-            return {}
-        if attention_metadata is None or attention_metadata.token_ids is None:
-            raise ValueError(
-                "a hash-routed layer selects its experts by the token ids, which the "
-                "model passes down the stack as attention_metadata.token_ids")
-        return {"tokens": attention_metadata.token_ids}
-
-    def _routes(self, per_layer_input: LayerInputs | None) -> dict:
-        """The replayed experts for a routed feed-forward, nothing otherwise."""
-        if not self.routed or per_layer_input is None or per_layer_input.experts is None:
-            return {}
-        return {"routes": (per_layer_input.experts, per_layer_input.routed)}
-
-    def _per_layer_residual(self, x, per_layer_input):
-        """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
-        Gemma4TextDecoderLayer): the layer's own gate over x, activated like
-        its feed-forward, multiplied by the layer's input signal, projected
-        back and normed."""
-        gated = gated_product(self.gate_activation)(self.per_layer_input_gate(x), per_layer_input)
-        projected = self.per_layer_projection(gated)
-        return self.post_per_layer_input_norm(projected)
-
-
-@logical_axes({
-    # The input is two embed-width vectors concatenated, which no single name
-    # describes and the rules must not split twice; the output side shards.
-    ("eh_proj",): (None, "embed"),
-    ("e_proj",): (None, "embed"),
-    ("h_proj",): (None, "embed"),
-})
-class MTPBlock(nn.Module):
-    """One multi-token-prediction depth: the next depth's hidden states.
-
-    The depth norms the token embeddings with `enorm` and the previous
-    hidden states with `hnorm`, projects the pair concatenated in that
-    order back to the model width, and runs one decoder block over it. That
-    composition is what the released MTP weights were trained for, which
-    the engines state (vLLM deepseek_mtp.py, glm4_moe_mtp.py and
-    qwen3_5_mtp.py). Training shifts complete sequences through this block;
-    prediction steps may use an independently allocated KV cache.
-    """
-    mixer: Callable[..., nn.Module]
-    feedforward: Callable[..., nn.Module] | None
-    emb_features: int
-    wiring: BlockWiring
-    hyper_connections: HyperConnections | None = None
-    norm_eps: float = 1e-5
-    scale_offset: bool = False
-    scale_after_cast: bool = False
-    dropout_rate: float = 0.0
-    remat: RematPolicy | None = None
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        self.enorm = norm(name='enorm')
-        self.hnorm = norm(name='hnorm')
-        dense = functools.partial(nn.Dense, self.emb_features, use_bias=False,
-                                   dtype=self.dtype, precision=self.precision)
-        if self.hyper_connections is None:
-            self.eh_proj = dense(name='eh_proj')
-        else:
-            # Official V4 inference/model.py MTPBlock.forward: project the
-            # embedding once and broadcast over independently projected raw
-            # residual streams; the trunk's collapsed/normed state is not read.
-            self.e_proj = dense(name='e_proj')
-            self.h_proj = dense(name='h_proj')
-            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
-                                     norm_eps=self.norm_eps, name='hc_head')
-        self.block = DecoderBlock(
-            mixer=self.mixer, feedforward=self.feedforward,
-            emb_features=self.emb_features,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            wiring=self.wiring,
-            hyper_connections=self.hyper_connections,
-            dropout_rate=self.dropout_rate,
-            remat=self.remat,
-            dtype=self.dtype, precision=self.precision, name='block')
-        self.final_norm = norm(name='final_norm')
-
-    def __call__(self, hidden, embeds, train: bool = False, positions=None,
-                 segment_ids=None, attention_metadata=None, decode: bool = False,
-                 prediction_phase: PredictionPhase = "ordinary"):
-        return self.states(hidden, embeds, train=train, positions=positions, segment_ids=segment_ids,
-                           attention_metadata=attention_metadata, decode=decode,
-                           prediction_phase=prediction_phase)[0]
-
-    def states(self, hidden, embeds, train: bool = False, positions=None,
-               segment_ids=None, attention_metadata=None, decode: bool = False,
-               prediction_phase: PredictionPhase = "ordinary"):
-        """The normalized head input and the state a subsequent prediction reads."""
-        if self.hyper_connections is None:
-            fused = self.eh_proj(jnp.concatenate(
-                [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
-        else:
-            if hidden.ndim != 4 or hidden.shape[-2] != self.hyper_connections.hc_mult:
-                raise ValueError("mHC prediction needs the trunk's uncollapsed residual streams")
-            fused = self.e_proj(self.enorm(embeds))[:, :, None, :] + self.h_proj(self.hnorm(hidden))
-        predicted = self.block(
-            fused, train=train, positions=positions, segment_ids=segment_ids,
-            attention_metadata=attention_metadata, decode=decode,
-            prediction_phase=prediction_phase)
-        streams = predicted
-        if self.hyper_connections is not None:
-            predicted = self.hc_head(predicted)
-        normalized = self.final_norm(predicted)
-        return normalized, normalized if self.hyper_connections is None else streams
-
-
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
 build their layers from, so one factory describes every view of them."""
@@ -1131,6 +127,17 @@ def _fetched(tree):
     resident reads the same way and gives the same values.
     """
     return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
+
+
+def _fetched_layer(tree, index):
+    """Copy the layer with its bank axis intact; squeeze only in device memory.
+
+    TPU host tiles cannot in general be bitcast to the lower-rank shape.
+    The bank's layer-major physical layout also keeps the copied tile valid.
+    """
+    return jax.tree.map(
+        lambda leaf: jax.lax.squeeze(jax.device_put(jax.lax.dynamic_index_in_dim(leaf, index, 0),
+                                                    jax.memory.Space.Device), (0,)), tree)
 
 
 def _on_host(tree) -> bool:
@@ -1155,6 +162,39 @@ WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
 router, its attention and its sparse indexer sow. A run whose parameters are
 fetched is applied in a scope of its own, so these are the names whose values
 the loop has to carry back out to the scope that asked for them."""
+
+
+def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
+                  train: bool, decode: bool, positions, segment_ids, kv_store, per_layer_input,
+                  attention_metadata):
+    """`run_stack` without the inference prefetch: each run of one layer
+    called as the plain loop calls it, and each longer run under flax's
+    scan. Training through host-resident banks scans with the fetch mapped
+    onto each row under remat (`run_stack`)."""
+    for run, (first, count) in zip(runs, groups, strict=True):
+        inputs = None if per_layer_input is None else per_layer_input.span(first, count)
+        store = kv_store if count == 1 or specs[first].kv_shared else None
+
+        def step(layer, carry, per_layer_input):
+            return layer(carry, train=train, decode=decode, positions=positions,
+                         segment_ids=segment_ids, kv_store=store,
+                         per_layer_input=per_layer_input,
+                         attention_metadata=attention_metadata), None
+
+        if fetching:
+            # Scan variables are xs, not closed-over bank slices. Native
+            # transposition stacks host cotangent rows instead of adding
+            # a whole-bank device accumulator. Remat retains the original
+            # host operand and refetches only this layer in backward
+            # (MaxText layers/decoders.py:544-565).
+            step = nn.remat(nn.map_variables(
+                step, True, trans_in_fn=_fetched, init=False, mutable=True))
+        if count == 1:
+            x, _ = step(run, x, None if inputs is None else inputs.layer(0))
+        else:
+            x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+                           in_axes=2, length=count)(run, x, inputs)
+    return x
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
@@ -1198,36 +238,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             for first, count in groups]
     fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
-        for run, (first, count) in zip(runs, groups, strict=True):
-            inputs = None if per_layer_input is None else per_layer_input.span(first, count)
-            if count == 1 and not fetching:
-                x = run(x, train=train, decode=decode, positions=positions,
-                        segment_ids=segment_ids, kv_store=kv_store,
-                        per_layer_input=None if inputs is None else inputs.layer(0),
-                        attention_metadata=attention_metadata)
-                continue
-            store = kv_store if count == 1 or specs[first].kv_shared else None
-
-            def step(layer, carry, per_layer_input):
-                return layer(carry, train=train, decode=decode, positions=positions,
-                             segment_ids=segment_ids, kv_store=store,
-                             per_layer_input=per_layer_input,
-                             attention_metadata=attention_metadata), None
-
-            if fetching:
-                # Scan variables are xs, not closed-over bank slices. Native
-                # transposition stacks host cotangent rows instead of adding
-                # a whole-bank device accumulator. Remat retains the original
-                # host operand and refetches only this layer in backward
-                # (MaxText layers/decoders.py:544-565).
-                step = nn.remat(nn.map_variables(
-                    step, True, trans_in_fn=_fetched, init=False, mutable=True))
-            if count == 1:
-                x, _ = step(run, x, None if inputs is None else inputs.layer(0))
-            else:
-                x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
-                               in_axes=2, length=count)(run, x, inputs)
-        return x
+        return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
+                             positions=positions, segment_ids=segment_ids, kv_store=kv_store,
+                             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
@@ -1247,7 +260,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if index >= len(runs):
             return None
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held if groups[index][1] == 1 else _layer_slice(held, 0))
+        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
     staged = first_of(0)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
@@ -1257,12 +270,6 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
         def layer(read, cache, hidden, per_layer_slice):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
-            if not mutable:
-                return run.apply(
-                    variables, hidden, train=train, decode=decode, positions=positions,
-                    segment_ids=segment_ids, kv_store=store,
-                    per_layer_input=per_layer_slice,
-                    attention_metadata=attention_metadata), {}
             hidden, changed = run.apply(
                 variables, hidden, mutable=mutable, train=train, decode=decode,
                 positions=positions, segment_ids=segment_ids, kv_store=store,
@@ -1304,7 +311,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     """
     def body(carry, index):
         hidden, current, held = carry
-        staged = _fetched(_layer_slice(banks, index + 1))
+        staged = _fetched_layer(banks, index + 1)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
@@ -1772,31 +779,21 @@ class CausalTransformer(nn.Module):
         if self.activation_sparsity_pattern is not None:
             object.__setattr__(self, "activation_sparsity_pattern",
                                tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
-        if isinstance(self.altup, Mapping):
-            object.__setattr__(self, "altup", AltUp(**self.altup))
-        if isinstance(self.hyper_connections, Mapping):
-            object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
-        if isinstance(self.attention_residuals, Mapping):
-            object.__setattr__(self, "attention_residuals", AttentionResiduals(**self.attention_residuals))
-        if isinstance(self.mlp, Mapping):
-            # A config states SiTU's betas as a record in the activation's place.
-            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
-        if isinstance(self.mtp_hyper_connections, Mapping):
-            object.__setattr__(self, "mtp_hyper_connections", HyperConnections(**self.mtp_hyper_connections))
-        if isinstance(self.engram, Mapping):
-            object.__setattr__(self, "engram", Engram(**self.engram))
-        if isinstance(self.dspark, Mapping):
-            object.__setattr__(self, "dspark", DSpark(**self.dspark))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, as a test or a notebook
         # writes them.
-        if isinstance(self.yarn, Mapping):
-            object.__setattr__(self, 'yarn', YarnScaling(**self.yarn))
-        if isinstance(self.mixture, Mapping):
-            object.__setattr__(self, "mixture", Mixture(**self.mixture))
-        if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
+        for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
+                             ("mtp_hyper_connections", HyperConnections),
+                             ("attention_residuals", AttentionResiduals), ("engram", Engram),
+                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture),
+                             ("rope_scaling", RopeScaling)):
+            value = getattr(self, name)
+            if isinstance(value, Mapping):
+                object.__setattr__(self, name, record(**value))
+        if isinstance(self.mlp, Mapping):
+            # A config states SiTU's betas as a record in the activation's place.
+            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -1814,7 +811,6 @@ class CausalTransformer(nn.Module):
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         object.__setattr__(self, "remat", remat_policy(self.remat))
         super().__post_init__()
-
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -2194,58 +1190,26 @@ class CausalTransformer(nn.Module):
         parallel branch, each a partial the block calls with a name. A
         model with no mixture has only the first.
         """
-        mixture = self.mixture
-        # The shared branch is the dense feed-forward at the mixture's shared
-        # width, handed to the sparse layer as a factory the way the block
-        # takes its own slots.
+        init_std, output_init_std = self.init_stds
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
-        init_std, output_init_std = self.init_stds
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
-        shared = None if mixture is None or not mixture.shared_features else functools.partial(
-            gated_mlp, hidden_features=mixture.shared_features)
-        routed = None if mixture is None else functools.partial(
-            SparseMLP,
-            num_experts=mixture.experts,
-            top_k=mixture.top_k,
-            hidden_features=(self.hidden_features
-                             if mixture.expert_features is None
-                             else mixture.expert_features),
-            out_features=self.emb_features,
-            activation=self.mlp,
-            implementation=mixture.implementation,
-            dispatch=mixture.dispatch,
-            capacity_factor=mixture.capacity_factor,
-            score_function=mixture.score_function,
-            normalize_weights=mixture.norm_topk_prob,
-            routed_scaling_factor=mixture.scaling,
-            expert_groups=mixture.groups,
-            groups_per_token=mixture.groups_per_token,
-            group_score=mixture.group_score,
-            expert_bias=mixture.bias,
-            media_bias=mixture.media_bias,
-            scale_inputs=mixture.scale_inputs,
-            swiglu_limit=self.swiglu_limit,
-            shared=shared,
-            shared_gate=mixture.shared_gate,
-            init_std=init_std,
-            output_init_std=output_init_std,
-            latent_features=mixture.latent_features,
-            latent_norm=None if not mixture.latent_norm else functools.partial(
-                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype),
-            dtype=self.dtype,
-            precision=self.precision)
-        parallel = None if mixture is None or not mixture.parallel else functools.partial(
+        mixture = self.mixture
+        if self.mlp == 'swigluoai' and (mixture is None or mixture.shared_features
+                                        or len(self.sparse_layers) != self.num_layers):
+            raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+        if mixture is None:
+            return gated_mlp, None, None
+        expert_features = (self.hidden_features if mixture.expert_features is None
+                           else mixture.expert_features)
+        parallel = None if not mixture.parallel else functools.partial(
             Gemma4Experts,
             num_experts=mixture.experts,
             top_k=mixture.top_k,
-            hidden_features=(self.hidden_features
-                             if mixture.expert_features is None
-                             else mixture.expert_features),
+            hidden_features=expert_features,
             out_features=self.emb_features,
             activation=self.mlp,
             implementation=mixture.implementation,
@@ -2256,12 +1220,7 @@ class CausalTransformer(nn.Module):
             scale_after_cast=self.scale_after_cast,
             dtype=self.dtype,
             precision=self.precision)
-        if parallel is not None:
-            # The branch rides beside every sparse layer's dense feed-forward.
-            routed = None
         if self.mlp == 'swigluoai':
-            if mixture is None or mixture.shared_features or len(self.sparse_layers) != self.num_layers:
-                raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,
@@ -2270,6 +1229,43 @@ class CausalTransformer(nn.Module):
                 dispatch=mixture.dispatch,
                 capacity_factor=mixture.capacity_factor,
                 dtype=self.dtype, precision=self.precision)
+        elif mixture.parallel:
+            # The branch rides beside every sparse layer's dense feed-forward.
+            routed = None
+        else:
+            routed = functools.partial(
+                SparseMLP,
+                num_experts=mixture.experts,
+                top_k=mixture.top_k,
+                hidden_features=expert_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                implementation=mixture.implementation,
+                dispatch=mixture.dispatch,
+                capacity_factor=mixture.capacity_factor,
+                score_function=mixture.score_function,
+                normalize_weights=mixture.norm_topk_prob,
+                routed_scaling_factor=mixture.scaling,
+                expert_groups=mixture.groups,
+                groups_per_token=mixture.groups_per_token,
+                group_score=mixture.group_score,
+                expert_bias=mixture.bias,
+                media_bias=mixture.media_bias,
+                scale_inputs=mixture.scale_inputs,
+                swiglu_limit=self.swiglu_limit,
+                # The shared branch is the dense feed-forward at the mixture's
+                # shared width, a factory the sparse layer builds like a slot.
+                shared=None if not mixture.shared_features else functools.partial(
+                    gated_mlp, hidden_features=mixture.shared_features),
+                shared_gate=mixture.shared_gate,
+                init_std=init_std,
+                output_init_std=output_init_std,
+                latent_features=mixture.latent_features,
+                latent_norm=None if not mixture.latent_norm else functools.partial(
+                    RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                    scale_after_cast=self.scale_after_cast, dtype=self.dtype),
+                dtype=self.dtype,
+                precision=self.precision)
         return gated_mlp, routed, parallel
 
     def setup(self):
@@ -2284,12 +1280,7 @@ class CausalTransformer(nn.Module):
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         self.refuse_unbuildable_fields(kinds)
-        sparse = self.sparse_layers
-        hashed = self.hash_layers
-        sharing = self.kv_sharing
         ple = self.per_layer_input_dim
-        widths = self.mlp_widths
-        sparsity = self.activation_sparsity_pattern
 
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -2316,139 +1307,21 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
-        providers = set(sharing.values())
-
-        def provides(index: int, layer_type: str) -> bool:
-            mixer = kinds[layer_type].mixer or mixer_spec
-            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
-                                          and mixer.publishes(index in sharing))
-
-        specs = tuple(
-            LayerSpec(
-                layer_type=layer_type,
-                kind=kinds[layer_type],
-                routed=index in sparse,
-                hash_routed=index in hashed,
-                width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
-                       else widths[index]),
-                sparsity=0.0 if sparsity is None else sparsity[index],
-                kv_shared=index in sharing,
-                provider=index if provides(index, layer_type) else None,
-                residual_site=(None if self.attention_residuals is None
-                               else self.attention_residuals.site(index)),
-                engram=(None if self.engram is None or index not in self.engram.layer_ids
-                        else self.engram.layer_ids.index(index)),
-                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
-                                 else self.dspark.target_layers.index(index)))
-            for index, layer_type in enumerate(types))
+        specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar)
 
-        def block(index: int, name: str) -> DecoderBlock:
-            spec = specs[index]
-            return DecoderBlock(
-                mixer=(spec.kind.mixer or mixer_spec).build(
-                    self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
-                feedforward=(
-                    functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
-                    if spec.hash_routed and routed is not None else
-                    routed
-                    if spec.routed and routed is not None else
-                    None
-                    if spec.width == 0 else
-                    functools.partial(gated_mlp, hidden_features=spec.width,
-                                      activation_sparsity=spec.sparsity)),
-                hash_routed=spec.hash_routed,
-                residual_multiplier=self.residual_multiplier,
-                routed=spec.routed,
-                media_routed=(spec.routed and not spec.hash_routed
-                              and self.mixture is not None and self.mixture.media_bias),
-                engram=None if spec.engram is None or self.engram is None else functools.partial(
-                    EngramLayer, rows=self.engram.num_embeddings[spec.engram],
-                    columns=self.engram.columns, head_dim=self.engram.head_dim,
-                    hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
-                    emb_features=self.emb_features, norm_eps=self.norm_eps,
-                    dtype=self.dtype, precision=self.precision),
-                engram_index=spec.engram,
-                prediction_slot=spec.prediction_slot,
-                emb_features=self.emb_features,
-                norm_eps=self.norm_eps,
-                scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast,
-                wiring=wiring,
-                per_layer_input_dim=ple or 0,
-                gate_activation=self.mlp,
-                parallel=parallel if spec.routed else None,
-                altup=self.altup,
-                laurel_rank=self.laurel_rank,
-                hyper_connections=self.hyper_connections,
-                residual_site=spec.residual_site,
-                dropout_rate=self.dropout_rate,
-                remat=self.remat,
-                dtype=self.dtype,
-                precision=self.precision,
-                name=name)
+        block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
         self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
-        # Prediction depths mirror whole-sequence hidden states, so their
-        # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward routes
-        # like the last layer's (GLM 4.5 ships its depth with the trunk's
-        # experts) and is dense otherwise.
-        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
-        prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
-                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
-            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
-        mtp_mixer = prediction_mixer.build(self.mixer_context(
-            kinds[mtp_type], mtp_type, kv_shared=False))
-        mtp_feedforward = (
-            routed if routed is not None and self.num_layers - 1 in sparse else
-            None if widths[-1] == 0 else
-            # The last layer's width: the one width of every model with
-            # depths, since the widths that vary are Gemma 3n's alone.
-            functools.partial(gated_mlp, hidden_features=widths[-1]))
-        self.mtp = [
-            MTPBlock(
-                mixer=mtp_mixer, feedforward=mtp_feedforward,
-                emb_features=self.emb_features,
-                hyper_connections=self.mtp_hyper_connections,
-                norm_eps=self.norm_eps,
-                scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast,
-                wiring=wiring,
-                dropout_rate=self.dropout_rate,
-                remat=self.remat,
-                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
-            for depth in range(self.num_nextn_predict_layers)]
+        self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
             assert routed is not None
-            layer_type = self.dspark.layer_type
-            drafting = kinds[layer_type].mixer or mixer_spec
-            if not isinstance(drafting, DeepseekV4Mixer):
-                raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
-                                 f"builds {type(drafting).__name__}")
-            drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
-            stages = self.dspark.stages
-            self.dspark_stages = [
-                DSparkStage(
-                    block=functools.partial(
-                        DecoderBlock, mixer=drafter,
-                        feedforward=functools.partial(routed, num_experts=self.dspark.experts,
-                                                      top_k=self.dspark.top_k),
-                        emb_features=self.emb_features, norm_eps=self.norm_eps,
-                        scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                        wiring=wiring, hyper_connections=self.hyper_connections,
-                        dtype=self.dtype, precision=self.precision),
-                    emb_features=self.emb_features, targets=len(self.dspark.target_layers),
-                    vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
-                    first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
-                    dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
-                for stage in range(stages)]
+            self.dspark_stages = self._dspark_stages(kinds, mixer_spec, routed, wiring)
         if self.altup is not None:
             # The copies past the first enter through their own projections
             # and leave through their own (modeling_gemma3n.py,
@@ -2476,10 +1349,164 @@ class CausalTransformer(nn.Module):
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
-                features=self.vocab_size, use_bias=False, dtype=jnp.float32,
+                features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
+
+    @nn.nowrap
+    def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
+                     ) -> tuple[LayerSpec, ...]:
+        """One `LayerSpec` per layer: its kind, whether it routes and how,
+        its feed-forward width and sparsity, the KV it shares or provides,
+        and its attention-residual, engram and DSpark slots."""
+        sparse, hashed, sharing = self.sparse_layers, self.hash_layers, self.kv_sharing
+        widths, sparsity = self.mlp_widths, self.activation_sparsity_pattern
+        providers = set(sharing.values())
+
+        def provides(index: int, layer_type: str) -> bool:
+            mixer = kinds[layer_type].mixer or mixer_spec
+            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
+                                          and mixer.publishes(index in sharing))
+
+        return tuple(
+            LayerSpec(
+                layer_type=layer_type,
+                kind=kinds[layer_type],
+                routed=index in sparse,
+                hash_routed=index in hashed,
+                width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
+                       else widths[index]),
+                sparsity=0.0 if sparsity is None else sparsity[index],
+                kv_shared=index in sharing,
+                provider=index if provides(index, layer_type) else None,
+                residual_site=(None if self.attention_residuals is None
+                               else self.attention_residuals.site(index)),
+                engram=(None if self.engram is None or index not in self.engram.layer_ids
+                        else self.engram.layer_ids.index(index)),
+                prediction_slot=(None if self.dspark is None or index not in self.dspark.target_layers
+                                 else self.dspark.target_layers.index(index)))
+            for index, layer_type in enumerate(types))
+
+    @nn.nowrap
+    def _block(self, specs: tuple[LayerSpec, ...], mixer_spec, factories, wiring: BlockWiring,
+               index: int, name: str) -> DecoderBlock:
+        """The decoder layer at `index`, named `name`: its mixer and its
+        feed-forward (hash-routed, routed, none, or the gated MLP at its
+        width) from its spec, the rest from the model's fields."""
+        gated_mlp, routed, parallel = factories
+        ple = self.per_layer_input_dim
+        spec = specs[index]
+        return DecoderBlock(
+            mixer=(spec.kind.mixer or mixer_spec).build(
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
+            feedforward=(
+                functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
+                if spec.hash_routed and routed is not None else
+                routed
+                if spec.routed and routed is not None else
+                None
+                if spec.width == 0 else
+                functools.partial(gated_mlp, hidden_features=spec.width,
+                                  activation_sparsity=spec.sparsity)),
+            hash_routed=spec.hash_routed,
+            residual_multiplier=self.residual_multiplier,
+            routed=spec.routed,
+            media_routed=(spec.routed and not spec.hash_routed
+                          and self.mixture is not None and self.mixture.media_bias),
+            engram=None if spec.engram is None or self.engram is None else functools.partial(
+                EngramLayer, rows=self.engram.num_embeddings[spec.engram],
+                columns=self.engram.columns, head_dim=self.engram.head_dim,
+                hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
+                emb_features=self.emb_features, norm_eps=self.norm_eps,
+                dtype=self.dtype, precision=self.precision),
+            engram_index=spec.engram,
+            prediction_slot=spec.prediction_slot,
+            emb_features=self.emb_features,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            wiring=wiring,
+            per_layer_input_dim=ple or 0,
+            gate_activation=self.mlp,
+            parallel=parallel if spec.routed else None,
+            altup=self.altup,
+            laurel_rank=self.laurel_rank,
+            hyper_connections=self.hyper_connections,
+            residual_site=spec.residual_site,
+            dropout_rate=self.dropout_rate,
+            remat=self.remat,
+            dtype=self.dtype,
+            precision=self.precision,
+            name=name)
+
+    @nn.nowrap
+    def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
+                           gated_mlp, routed, wiring: BlockWiring) -> list[MTPBlock]:
+        """The multi-token prediction depths."""
+        if not self.num_nextn_predict_layers:
+            return []
+        # Prediction depths mirror whole-sequence hidden states, so their
+        # mixer builds from the full-attention kind where the pattern has
+        # one, else from the first layer's kind; the feed-forward routes
+        # like the last layer's (GLM 4.5 ships its depth with the trunk's
+        # experts) and is dense otherwise.
+        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
+        prediction_mixer = kinds[mtp_type].mixer or mixer_spec
+        if (self.index_share_for_mtp_iteration
+                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
+            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
+        mtp_mixer = prediction_mixer.build(self.mixer_context(
+            kinds[mtp_type], mtp_type, kv_shared=False))
+        widths = self.mlp_widths
+        mtp_feedforward = (
+            routed if routed is not None and self.num_layers - 1 in self.sparse_layers else
+            None if widths[-1] == 0 else
+            # The last layer's width: the one width of every model with
+            # depths, since the widths that vary are Gemma 3n's alone.
+            functools.partial(gated_mlp, hidden_features=widths[-1]))
+        return [
+            MTPBlock(
+                mixer=mtp_mixer, feedforward=mtp_feedforward,
+                emb_features=self.emb_features,
+                hyper_connections=self.mtp_hyper_connections,
+                norm_eps=self.norm_eps,
+                scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast,
+                wiring=wiring,
+                dropout_rate=self.dropout_rate,
+                remat=self.remat,
+                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
+            for depth in range(self.num_nextn_predict_layers)]
+
+    @nn.nowrap
+    def _dspark_stages(self, kinds: dict[str, ResolvedKind], mixer_spec, routed, wiring: BlockWiring
+                       ) -> list[DSparkStage]:
+        """DSpark's drafting stages, attending with the V4 attention of their
+        layer kind and routing through the trunk's experts."""
+        assert self.dspark is not None
+        layer_type = self.dspark.layer_type
+        drafting = kinds[layer_type].mixer or mixer_spec
+        if not isinstance(drafting, DeepseekV4Mixer):
+            raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
+                             f"builds {type(drafting).__name__}")
+        drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
+        stages = self.dspark.stages
+        return [
+            DSparkStage(
+                block=functools.partial(
+                    DecoderBlock, mixer=drafter,
+                    feedforward=functools.partial(routed, num_experts=self.dspark.experts,
+                                                  top_k=self.dspark.top_k),
+                    emb_features=self.emb_features, norm_eps=self.norm_eps,
+                    scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                    wiring=wiring, hyper_connections=self.hyper_connections,
+                    dtype=self.dtype, precision=self.precision),
+                emb_features=self.emb_features, targets=len(self.dspark.target_layers),
+                vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
+                first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
+                dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
+            for stage in range(stages)]
 
     def _expand(self, x):
         """The embeddings `[B, S, D]` as the residual form the blocks take and
@@ -2532,13 +1559,12 @@ class CausalTransformer(nn.Module):
                  input_embeddings=None, embedding_positions=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
-        x, prediction = self.hidden_and_mtp_inputs(tokens, train=train, decode=decode,
-                               positions=positions, segment_ids=segment_ids,
-                               input_embeddings=input_embeddings,
-                               embedding_positions=embedding_positions, attention_mask=attention_mask,
-                               image_groups=image_groups, rotary_positions=rotary_positions,
-                               attention_pairwise_mask=attention_pairwise_mask,
-                               attention_key_positions=attention_key_positions)
+        x, prediction = self.hidden_and_mtp_inputs(
+            tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
+            attention_mask=attention_mask, image_groups=image_groups,
+            rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
+            attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -2586,9 +1612,9 @@ class CausalTransformer(nn.Module):
                                   self.precision)
         else:
             logits = self.lm_head(x)
-        logits = logits.astype(jnp.float32)
+        logits = logits.astype(at_least_fp32(logits.dtype))
         if self.final_logit_softcap is not None:
-            cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
+            cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
             logits = cap * jnp.tanh(logits / cap)
         return logits
 
@@ -2611,14 +1637,15 @@ class CausalTransformer(nn.Module):
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
         # build a mask and drop off the fused kernel.
-        restricted = attention_mask is not None or segment_ids is not None
-        valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
-                 ) if restricted else None
+        valid = None
+        if segment_ids is not None or attention_mask is not None:
+            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                valid = valid[:, :-1] & (jnp.ones(tokens[:, depth:].shape, bool)
-                                         if attention_mask is None else attention_mask[:, depth:])
+                valid = valid[:, :-1]
+                if attention_mask is not None:
+                    valid = valid & attention_mask[:, depth:]
                 if segment_ids is not None:
                     valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             metadata = AttentionMetadata(
@@ -2751,18 +1778,16 @@ class CausalTransformer(nn.Module):
                   jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
                   prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
-
-
     def hidden_states(self, tokens, **kwargs):
         """The final normalized states, excluding the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None,
-                      input_embeddings=None, embedding_positions=None,
-                      attention_mask=None, image_groups=None, rotary_positions=None,
-                      attention_pairwise_mask=None, attention_key_positions=None,
-                      routed_experts=None, routed=None, media_mask=None):
+                              positions=None, segment_ids=None,
+                              input_embeddings=None, embedding_positions=None,
+                              attention_mask=None, image_groups=None, rotary_positions=None,
+                              attention_pairwise_mask=None, attention_key_positions=None,
+                              routed_experts=None, routed=None, media_mask=None):
         """The final normalized states and the prediction depth's input.
 
         V4's depth reads the raw residual streams before the collapse head
@@ -2926,11 +1951,13 @@ class CausalTransformer(nn.Module):
             # the devices that hold none of its rows compute another's again:
             # 1.43 times one device's FLOPs for a stage x fsdp step of 8 rows in
             # 4 microbatches over 4 row shards, where the bubble accounts for 1.25.
-            row_axes = mesh_axes(logical_spec(RESIDUAL[:1], (rows,))[0])
-            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in row_axes)
+            # No axis splits the rows where the mesh leaves none for them
+            # (four stages on four devices): every device holds every row.
+            splitting = row_axes(rows)
+            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
             if (rows // shards) % count_microbatches:
                 raise LayoutRefused(
-                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(row_axes)}, "
+                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
                     f"{rows // shards} rows a device, which {count_microbatches} microbatches "
                     f"do not divide, so the devices that hold none of a microbatch's rows would "
                     f"compute another's again; use a microbatch count that divides "
@@ -2972,33 +1999,31 @@ class CausalTransformer(nn.Module):
                 for first, count in self.groups if count > 1}
         banked = []
         for collection, tree in self.variables.items():
-            names = set(tree)
-            if not names & set(runs):
+            banks = set(tree) & set(runs)
+            if not banks:
                 continue
             mixed = False
             for bank, layers in runs.items():
-                rows = [tree[layer] for layer in layers if layer in tree]
-                if bank not in tree:
-                    if rows:
-                        mixed = True
-                    continue
+                rows = [layer for layer in layers if layer in tree]
                 if not rows:
                     continue
                 mixed = True
+                if bank not in tree:
+                    continue
                 shared = {tuple(entry.key for entry in path)
                           for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
-                for layer, row in zip(layers, rows, strict=False):
+                for layer in rows:
                     overlap = shared & {tuple(entry.key for entry in path)
-                                        for path, _ in jax.tree_util.tree_leaves_with_path(row)}
+                                        for path, _ in jax.tree_util.tree_leaves_with_path(tree[layer])}
                     if overlap:
                         raise ValueError(
                             f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
                             f"the bank {bank} and in its layer {layer}; a leaf is read from one")
             if mixed:
                 continue
-            if not set(runs) <= names:
+            if banks != set(runs):
                 raise ValueError(
-                    f"collection {collection!r} holds the banks {sorted(names & set(runs))} "
+                    f"collection {collection!r} holds the banks {sorted(banks)} "
                     f"of the runs {sorted(runs)} and not the others; a store holds every "
                     f"run's bank or every layer's own subtree")
             banked.append(collection)
@@ -3278,7 +2303,6 @@ class CausalTransformer(nn.Module):
                 f"dtype, got {where.dtype}")
         rows = jnp.arange(batch)[:, None]
         return x.at[rows, where].set(replacements.astype(x.dtype))
-
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in its stored dtype, as the forward

@@ -114,20 +114,17 @@ def main(config: Config) -> dict:
                           agent=config.agent, environment={"OPENAI_API_KEY": "none", "MSWEA_API_KEY": "none"},
                           arguments=config.harbor_arguments, workers=config.workers,
                           ready_timeout=config.ready_timeout)
+    # The trainer shows each call's rollout metrics as rollout/<name>; the
+    # records are kept for the summary written below.
     history: list[SchedulerRecord] = []
-
-    def log(record: SchedulerRecord) -> None:
-        history.append(record)
-        print(f"update {record.updates:3d}  reward {record.metrics.get('reward/mean', 0.0):.3f}  "
-              f"version {record.version}  lag {record.lag}  resubmitted {sum(record.resubmitted.values())}",
-              flush=True)
 
     def harbor_tasks(batch) -> list[Task]:
         return [Task(task.id, {HARBOR_KEY: str(tasks[int(task.id)])}) for task in task_ids(batch)]
 
     rollout = RolloutScheduler(objective, trials, Publication(push, stamp=gateway.stamp), width=config.width,
                                rows=config.prompts * config.groups, tasks=harbor_tasks, groups=config.groups,
-                               max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation, log=log)
+                               max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation,
+                               log=history.append)
     draw = np.random.default_rng(config.seed)
     data = Dataset(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),

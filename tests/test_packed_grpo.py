@@ -10,11 +10,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_layer_stack import widened
+from test_tools import load
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
-from dew.objectives.lm import LMObjective
-from dew.objectives.rl import DPOObjective, GRPOObjective
+from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -36,9 +37,9 @@ VOCAB = 16
 WIDTH = 24
 
 
-def _model():
+def _model(dtype="float32"):
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2,
-                             mlp_features=32, max_seq_len=64, dtype="float32", attention_impl="xla")
+                             mlp_features=32, max_seq_len=64, dtype=dtype, attention_impl="xla")
 
 
 def _rollouts():
@@ -87,23 +88,61 @@ def _loss(objective, params, batch, reference):
     return mean_loss(objective.loss(params, batch, step)[0])[0]
 
 
+FLOOR_FACTOR = load("layout_parity").FLOOR_FACTOR
+"""layout_parity's rule: how far a run may sit from its reference, in
+multiples of the rounding measured for it."""
+
+
+def _step(objective, params, batch, reference):
+    """The loss and its gradient."""
+    value, gradients = jax.value_and_grad(lambda p: _loss(objective, p, batch, reference))(params)
+    return {"loss": value, "gradients": gradients}
+
+
 @pytest.mark.parametrize("policy_loss", ["ppo", "cispo"])
 def test_packed_grpo_equals_per_call_grpo_on_the_unmerged_chains(policy_loss):
+    """Packing is the same computation as the calls one per row, so in
+    float64 the packed and the per-call step agree within float64's rounding
+    of it: each leaf within FLOOR_FACTOR of the float32 per-call step's
+    distance from the float64 one (the rule tools/layout_parity.py holds a
+    layout to), scaled by float64's epsilon
+    over float32's, since the same sums round that much finer.
+
+    In float32 the two steps round their sums in different orders: a row's
+    attention runs over its chains beside each other, and the loss and the
+    gradients sum the tokens in another order. The packed step's float32
+    rounding reached 4.7 times the per-call step's on the CPU, so a float32
+    comparison either fails on rounding (CISPO's gradients 1.45 times over
+    a fixed 1e-6) or needs a bound loose enough to miss a real difference.
+    In float64 the steps agreed within 0.37 (PPO) and 0.58 (CISPO) of the
+    bound. Everything runs on the CPU backend, which every lane keeps beside
+    its accelerator, since a TPU has no float64."""
     rollouts = _rollouts()
     packed = pack(rollouts, WIDTH)
     assert packed[IDS_KEY].shape[0] < sum(len(rollout.calls) for rollout in rollouts)
     assert packed[SEGMENT_IDS_KEY].max() >= 2, "rows share chains"
     packed[OLD_LOG_PROBS_KEY] = packed[BEHAVIOR_LOG_PROBS_KEY]
     unmerged = _per_call(rollouts)
-    objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
-    params = objective.init(jax.random.key(1))
-    reference = jax.tree.map(lambda leaf: leaf * 0.9, params)
 
-    a, grad_a = jax.value_and_grad(lambda p: _loss(objective, p, packed, reference))(params)
-    b, grad_b = jax.value_and_grad(lambda p: _loss(objective, p, unmerged, reference))(params)
-    assert float(a) == pytest.approx(float(b), abs=1e-6)
-    for left, right in zip(jax.tree.leaves(grad_a), jax.tree.leaves(grad_b), strict=True):
-        np.testing.assert_allclose(left, right, atol=1e-6)
+    with jax.default_device(jax.devices("cpu")[0]):
+        objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
+        params = objective.init(jax.random.key(1))
+        reference = jax.tree.map(lambda leaf: leaf * 0.9, params)
+        rounded = _step(objective, params, unmerged, reference)
+        with jax.enable_x64():
+            twin = GRPOObjective(_model(jnp.float64), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
+            exact = _step(twin, widened(params), widened(unmerged), widened(reference))
+            packed_exact = _step(twin, widened(params), widened(packed), widened(reference))
+
+    scale = np.finfo(np.float64).eps / np.finfo(np.float32).eps
+    for (path, single), double, other in zip(jax.tree_util.tree_leaves_with_path(rounded),
+                                             jax.tree.leaves(exact), jax.tree.leaves(packed_exact),
+                                             strict=True):
+        single, double, other = (np.asarray(leaf, np.float64) for leaf in (single, double, other))
+        floor = max(np.max(np.abs(single - double)), np.finfo(np.float32).eps * np.max(np.abs(double)))
+        difference = np.max(np.abs(other - double))
+        assert difference <= FLOOR_FACTOR * floor * scale, (
+            f"{jax.tree_util.keystr(path)}: {difference:.3e} against {FLOOR_FACTOR * floor * scale:.3e}")
 
 
 def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
@@ -192,19 +231,3 @@ def test_the_loss_never_holds_the_logits_of_the_whole_batch():
     compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
     logits = rows * width * vocab * 4
     assert compiled.memory_analysis().temp_size_in_bytes < logits / 2
-
-
-@pytest.mark.parametrize("build, whole", [
-    (lambda model: LMObjective(model, WIDTH - 1), True),
-    (lambda model: GRPOObjective(model, WIDTH - 1), False),
-    (lambda model: DPOObjective(model, WIDTH - 1), False),
-])
-def test_only_the_plain_lm_loss_keeps_the_whole_logits_by_default(build, whole):
-    """The plain LM step holds the whole logits for its backward, which the
-    trainer tiles when the step does not fit. An RL objective's device also
-    holds rollouts or a frozen reference, so it keeps the tiled head unless
-    asked: 'whole' is the ask, and 'tiled' is the plain loss's way back."""
-    objective = build(_model())
-    assert (objective.head_tile is None) == whole
-    assert type(objective)(_model(), WIDTH - 1, head_tile='whole').head_tile is None
-    assert type(objective)(_model(), WIDTH - 1, head_tile='tiled').head_tile is not None

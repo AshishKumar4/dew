@@ -26,6 +26,7 @@ from ..dit import (
     remat_block,
     rope_for_scan,
 )
+from ..precision import at_least_fp32
 from ..rope import apply_rotary, rotary_freqs
 from ..sharding import logical_axes
 
@@ -216,14 +217,12 @@ class SimpleMMDiT(nn.Module):
         )
 
     def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
-        assert textcontext is not None, "textcontext must be provided for SimpleMMDiT"
         _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = rope_for_scan(img.shape[1], self.emb_features // self.num_heads,
-                                  self.scan_order)
+        freqs_cis = rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order)
 
         for block in self.blocks:
             img, txt = block(img, txt, cond_emb, freqs_cis, train)
@@ -244,10 +243,7 @@ class PatchMerging(nn.Module):
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        B, L, C = x.shape
-        assert H_patches * \
-            W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
-        assert H_patches % self.merge_size == 0 and W_patches % self.merge_size == 0, f"Patch dimensions ({H_patches}, {W_patches}) not divisible by merge size {self.merge_size}"
+        B, _, C = x.shape
 
         x = x.reshape(B, H_patches, W_patches, C)
         merged = einops.rearrange(
@@ -282,8 +278,7 @@ class PatchExpanding(nn.Module):
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        B, L, _ = x.shape
-        assert H_patches * W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
+        B = x.shape[0]
 
         expanded_features = self.expand_size * self.expand_size * self.out_features
         x = nn.Dense(
@@ -443,7 +438,6 @@ class HierarchicalMMDiT(nn.Module):
         )
 
     def __call__(self, x, temb, textcontext, train: bool = False):
-        assert textcontext is not None, "textcontext must be provided"
         _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
         assert H % (self.base_patch_size * (2**(num_stages - 1))) == 0 and \
@@ -461,7 +455,7 @@ class HierarchicalMMDiT(nn.Module):
         for stage in range(num_stages):
             freqs_cis = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA)
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
             for block in self.encoder_blocks[stage]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)
@@ -475,7 +469,7 @@ class HierarchicalMMDiT(nn.Module):
             img = self.fusion_layers[i](jnp.concatenate([img, skips[stage]], axis=-1))
             freqs_cis = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA)
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
             for block in self.decoder_blocks[i]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)

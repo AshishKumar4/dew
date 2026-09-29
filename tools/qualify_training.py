@@ -31,6 +31,97 @@ SEQUENCE = 32
 BATCH = 8
 
 
+def _mid_accumulation(state) -> bool:
+    """Whether a restored state sits between the two micro-steps of an
+    update, holding the first one's gradient."""
+    return (
+        int(state.microstep) % 2 == 1
+        and state.accumulation is not None
+        and state.accumulation.mass is not None
+        and float(state.accumulation.mass) > 0
+    )
+
+
+def _write_reference(path: Path, source, params, probe, step) -> None:
+    """The baseline's fp32 reference: the probe batch's loss and each source
+    tensor's gradient, from the model at its reference attention."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from dew.objectives.lm import LMObjective
+
+    parity = LMObjective(
+        source.model.clone(dtype=jnp.float32, attention_impl='reference'),
+        SEQUENCE,
+        ema_decay=None,
+    )
+
+    def reference_loss(params):
+        stats, _ = parity.loss({"params": params}, probe, step)
+        return parity.reduce_loss(stats)[0]
+
+    loss, gradients = jax.value_and_grad(reference_loss)(params["params"])
+    reference_arrays = {"ids": np.asarray(probe["text"]), "loss": np.asarray(loss)}
+    for layout in source.weight_layouts:
+        reference_arrays["gradient/" + layout.name] = layout.export(
+            {"params": gradients}
+        )
+    np.savez(path, **reference_arrays)
+
+
+def _restored_state(state, restored) -> dict:
+    """The final state's leaves by path, each finite, after checking the
+    checkpoint restores every one bit for bit in its own dtype."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    arrays = {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+        value = (
+            jax.random.key_data(leaf)
+            if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+            else leaf
+        )
+        array = np.asarray(value)
+        if not np.isfinite(array).all():
+            raise AssertionError(f"Nonfinite state at {jax.tree_util.keystr(path)}")
+        arrays[jax.tree_util.keystr(path)] = array
+    for left, right in zip(
+        jax.tree.leaves(state), jax.tree.leaves(restored), strict=True
+    ):
+        if left.dtype != right.dtype:
+            raise AssertionError("Checkpoint restoration changed a state dtype")
+        if jnp.issubdtype(left.dtype, jax.dtypes.prng_key):
+            left, right = jax.random.key_data(left), jax.random.key_data(right)
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+    return arrays
+
+
+def _check_export(run: Path, source, params, probe) -> None:
+    """Export the trained parameters, reload them, and hold the reload's fp32
+    logits on the probe to the trained model's."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    from dew.interop import load_pretrained
+
+    source.save(run / "export", variables=params)
+    reloaded = load_pretrained(
+        run / "export", dtype="float32", attention_impl="reference"
+    )
+    ids = jnp.asarray(probe["text"][:, :-1])
+    expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(
+        params, ids
+    )
+    actual = reloaded.model.apply(reloaded.variables, ids)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0, equal_nan=False
+    )
+    np.savez(run / "export_logits.npz", ids=np.asarray(ids), logits=np.asarray(actual))
+
+
 def worker(directory: Path, mode: str, dtype: str) -> None:
     import jax
     import jax.numpy as jnp
@@ -92,12 +183,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
         tracker=Recorder(run / "metrics"),
     )
     before, _, before_position = trainer.place()
-    if mode == "resumed" and (
-        int(before.microstep) % 2 != 1
-        or before.accumulation is None
-        or before.accumulation.mass is None
-        or float(before.accumulation.mass) <= 0
-    ):
+    if mode == "resumed" and not _mid_accumulation(before):
         raise RuntimeError("Resume lost the partially accumulated gradient")
     stream = data.train(data_partition(trainer.device_mesh))
     if not isinstance(stream, GlobalStream):
@@ -112,23 +198,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     stats, _, _ = objective.predict(before.params, probe, step, train=False)
     initial_loss = float(objective.reduce_loss(stats)[0])
     if mode == "baseline":
-        parity = LMObjective(
-            source.model.clone(dtype=jnp.float32, attention_impl='reference'),
-            SEQUENCE,
-            ema_decay=None,
-        )
-
-        def reference_loss(params):
-            stats, _ = parity.loss({"params": params}, probe, step)
-            return parity.reduce_loss(stats)[0]
-
-        loss, gradients = jax.value_and_grad(reference_loss)(before.params["params"])
-        reference_arrays = {"ids": np.asarray(probe["text"]), "loss": np.asarray(loss)}
-        for layout in source.weight_layouts:
-            reference_arrays["gradient/" + layout.name] = layout.export(
-                {"params": gradients}
-            )
-        np.savez(run / "reference.npz", **reference_arrays)
+        _write_reference(run / "reference.npz", source, before.params, probe, step)
     started = time.perf_counter()
     state = trainer.fit(
         data, steps=STEPS, log_every=1, checkpoint_every=CHECKPOINT_STEP
@@ -140,39 +210,9 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     if not position:
         raise RuntimeError("Final checkpoint has no data position")
 
-    arrays = {}
-    for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
-        value = (
-            jax.random.key_data(leaf)
-            if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
-            else leaf
-        )
-        array = np.asarray(value)
-        if not np.isfinite(array).all():
-            raise AssertionError(f"Nonfinite state at {jax.tree_util.keystr(path)}")
-        arrays[jax.tree_util.keystr(path)] = array
-    for left, right in zip(
-        jax.tree.leaves(state), jax.tree.leaves(restored), strict=True
-    ):
-        if left.dtype != right.dtype:
-            raise AssertionError("Checkpoint restoration changed a state dtype")
-        if jnp.issubdtype(left.dtype, jax.dtypes.prng_key):
-            left, right = jax.random.key_data(left), jax.random.key_data(right)
-        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+    arrays = _restored_state(state, restored)
     np.savez(run / "state.npz", **arrays)
-    source.save(run / "export", variables=state.params)
-    reloaded = load_pretrained(
-        run / "export", dtype="float32", attention_impl="reference"
-    )
-    ids = jnp.asarray(probe["text"][:, :-1])
-    expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(
-        state.params, ids
-    )
-    actual = reloaded.model.apply(reloaded.variables, ids)
-    np.testing.assert_allclose(
-        np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0, equal_nan=False
-    )
-    np.savez(run / "export_logits.npz", ids=np.asarray(ids), logits=np.asarray(actual))
+    _check_export(run, source, state.params, probe)
     report = {
         "mode": mode,
         "backend": jax.default_backend(),
@@ -204,15 +244,8 @@ def prepare(
     directory: Path, corpus: Path, family: str, dtype: str, attention_impl: str
 ) -> None:
     import torch
-    from transformers import (
-        AutoTokenizer,
-        LlamaConfig,
-        LlamaForCausalLM,
-        MixtralConfig,
-        MixtralForCausalLM,
-    )
-
     from tokenize_text import TokenizeArgs, main as tokenize
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM, MixtralConfig, MixtralForCausalLM
 
     directory.mkdir(parents=True, exist_ok=False)
     text = corpus.read_bytes()

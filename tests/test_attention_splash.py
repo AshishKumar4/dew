@@ -374,3 +374,26 @@ def test_every_block_size_divides_its_sequence_and_tiles_the_lanes(q_len, kv_len
     assert blocks.block_kv_compute % SPLASH_LANES == 0
     assert blocks.block_q <= SPLASH_BLOCK and blocks.block_kv <= SPLASH_BLOCK
     assert blocks.has_backward_blocks, "a kernel without them raises inside its own vjp"
+
+
+@pytest.mark.parametrize("bias", [False, True], ids=["splash", "flash"])
+def test_a_bf16_call_runs_the_kernels_at_the_default_precision_under_highest(bias):
+    """Mosaic refuses a bf16 matmul at HIGHEST ("Bad lhs type"), and a
+    kernel's dots take the configured precision when they are traced, which
+    the suite sets to HIGHEST. Every dot the Mosaic kernels trace for a bf16
+    call, forward and backward, is at the default: exact bf16 products,
+    accumulated in fp32 by the kernels. Read off the traced program, since
+    only a TPU compiles Mosaic."""
+    from dew.nn.attention import tpu_attention
+
+    query = jnp.zeros((1, 256, 2, 128), jnp.bfloat16)
+    additive = jnp.zeros((1, 2, 256, 256), jnp.float32) if bias else None
+
+    def loss(query, key, value):
+        return jnp.sum(tpu_attention(query, key, value, additive, None, True, None, softcap=None,
+                                     sinks=None, segment_ids=None, interpret=False)
+                       .astype(jnp.float32))
+
+    with jax.default_matmul_precision("highest"):
+        program = str(jax.make_jaxpr(jax.grad(loss, argnums=(0, 1, 2)))(query, query, query))
+    assert "pallas_call" in program and "Precision.HIGHEST" not in program

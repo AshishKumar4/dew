@@ -84,7 +84,7 @@
    "scheduler": "LMSDiscreteScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 7.006505489349365
+   "latent_scale": 7.006505966186523
   },
   "euler.default": {
    "scheduler": "EulerDiscreteScheduler",
@@ -156,7 +156,7 @@
    "scheduler": "DPMSolverSDEScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 52.324703216552734
+   "latent_scale": 52.32470703125
   },
   "dpm_sde.karras_v": {
    "scheduler": "DPMSolverSDEScheduler",
@@ -198,7 +198,7 @@
    "scheduler": "DPMSolverMultistepScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 2.460270643234253
+   "latent_scale": 2.460270404815674
   },
   "dpm_multi.beta_leading": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -288,7 +288,7 @@
    "scheduler": "TCDScheduler",
    "steps": 4,
    "guidance": null,
-   "latent_scale": 48.04665756225586
+   "latent_scale": 48.046661376953125
   },
   "tcd.original_20_v": {
    "scheduler": "TCDScheduler",

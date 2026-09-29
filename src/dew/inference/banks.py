@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import DecoderBank
@@ -61,9 +62,10 @@ class LayerBanks(Protocol):
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
-        """Return one run's bank, on those shardings: those layers stacked on a new
-        leading axis in the order given, or, for a run of one layer, that
-        layer's own subtree. Returned collections are local to namespace."""
+        """Return one run's bank on the given shardings or Formats: layers stacked
+        on a new leading axis in order, or a single layer's own subtree.
+        Formats carry a physical layout which the source must preserve.
+        Returned collections are local to namespace."""
         ...
 
 
@@ -242,19 +244,28 @@ def _typed(shapes: Variables, placement: Placement) -> Variables:
 def _row_placement(placement: Placement) -> Placement:
     """Return one layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
-    return jax.tree.map(
-        lambda sharding: NamedSharding(sharding.mesh, P(*sharding.spec[1:]),
-                                       memory_kind="device"), placement)
+    def row(target):
+        sharding = target.sharding if isinstance(target, Format) else target
+        assert isinstance(sharding, NamedSharding)
+        return NamedSharding(sharding.mesh, P(*sharding.spec[1:]), memory_kind="device")
+
+    return jax.tree.map(row, placement)
 
 
-def _bank_placement(placement: Placement, stacked: bool) -> Placement:
-    """Return a run's shardings: the layer axis whole in front of each leaf's own
-    spec, in the memory space the layout chose for that leaf."""
+def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> Placement:
+    """A bank's logical placement and, on a TPU host, layer-major storage."""
     if not stacked:
         return placement
-    return jax.tree.map(
-        lambda sharding: NamedSharding(sharding.mesh, P(None, *sharding.spec),
-                                       memory_kind=sharding.memory_kind), placement)
+
+    def place(sharding, shape):
+        bank = NamedSharding(sharding.mesh, P(None, *sharding.spec), memory_kind=sharding.memory_kind)
+        if bank.memory_kind == "pinned_host" and next(iter(bank.device_set)).platform == "tpu":
+            # A minor layer axis can change TPU tile shape when sliced,
+            # making the host-to-device copy halt even before its squeeze.
+            return Format(DeviceLayout(major_to_minor=tuple(range(len(shape.shape) + 1))), bank)
+        return bank
+
+    return jax.tree.map(place, placement, shapes)
 
 
 
@@ -386,7 +397,8 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
         for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
             bank = jax.block_until_ready(source.bank(
                 range(first, first + count),
-                _bank_placement(one_layer(placement, first, namespace=site.namespace), stacked=count > 1),
+                _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                                one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
                 namespace=site.namespace))
             for collection, tree in bank.items():
                 branch = bank_store.setdefault(collection, {})

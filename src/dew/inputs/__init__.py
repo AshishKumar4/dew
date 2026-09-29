@@ -26,7 +26,7 @@ from dew import registry
 from dew.nn.vision import PIXEL_VALUES_KEY
 from dew.objectives.base import Variables
 
-from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
+from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -82,9 +82,11 @@ class InputSpec:
     each is passed under: `{"textcontext": Condition(...)}`.
 
     `tokenize` is what a captioning dataset hands its text to. Every
-    condition tokenizes the batch's captions under its own field, so the
+    condition that reads captions tokenizes them under its own field, so the
     encoder a run names decides the ids and the context length while the
-    dataset carries the words alone.
+    dataset carries the words alone. A condition on another modality reads
+    the field its dataset writes, as audio conditioning reads a clip's
+    `audio`.
     """
 
     sample: Field
@@ -102,13 +104,13 @@ class InputSpec:
                 "Name a field per condition")
 
     def tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]:
-        """The batch fields this run's conditions read out of `captions`.
+        """The batch fields this run's caption conditions read out of `captions`.
 
-        Empty for a run that conditions on nothing, so the captions stop at
-        the loader and no string array reaches a device.
+        Empty for a run with none, so the captions stop at the loader and no
+        string array reaches a device.
         """
         return {condition.field: condition.encoder.tokenize(captions)
-                for condition in self.conditions.values()}
+                for condition in self.conditions.values() if condition.encoder.reads_captions}
 
     def to_json(self) -> dict:
         return {"sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
@@ -133,4 +135,4 @@ class InputSpec:
 from .diffusion import DiffusionConditioner
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
-           "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]
+           "HFAudio", "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]

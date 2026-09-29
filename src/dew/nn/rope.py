@@ -9,8 +9,11 @@ is the reference's `_compute_yarn_parameters` and the scale multiplier its
 `dim` at the rope width, where DeepSeek points `config.head_dim`.
 
 The inverse-frequency tables are static configuration, so they are built on
-the host in NumPy float32, as transformers builds them in torch on the CPU,
-and are the same on every backend. The one transcendental, `theta ** x`, is
+the host in NumPy, as transformers builds them in torch on the CPU, and are
+the same on every backend. Each function takes the dtype its tables and
+angles are computed in, `dew.nn.precision.at_least_fp32` of the activations'
+it rotates: float32 below float64, as transformers computes them, and
+float64 for a float64 model. The one transcendental, `theta ** x`, is
 rounded once from float64 (`_base_powers`); transformers' float32 `pow`
 agrees with that to within one ulp.
 """
@@ -20,23 +23,24 @@ import math
 
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
+
+from .precision import at_least_fp32
 
 
-def inverse_frequencies(theta: float, dim: int, pairs: int | None = None) -> np.ndarray:
+def inverse_frequencies(theta: float, dim: int, pairs: int | None = None, *,
+                        dtype: DTypeLike) -> np.ndarray:
     """`1 / theta ** (2i / dim)` for i below `pairs` (all of `dim // 2` by
     default), transformers' `compute_default_rope_parameters` table, built on
-    the host (`_base_powers`)."""
+    the host in `dtype` (`_base_powers`)."""
     count = dim // 2 if pairs is None else pairs
-    return 1.0 / _base_powers(theta, np.arange(0, 2 * count, 2, dtype=jnp.float32) / dim)
+    return 1.0 / _base_powers(theta, np.arange(0, 2 * count, 2, dtype=dtype) / dim)
 
 
 def _base_powers(theta: float, exponents: np.ndarray) -> np.ndarray:
-    """`theta ** exponents` correctly rounded to float32, whatever the backend.
-
-    The tables name their precision as `jnp.float32`, as Dew's other fp32
-    pins do, so a float64 twin that reads that name as float64
-    (tools/deepseek_v41_numerics.py `decided`) builds them in float64."""
-    return np.power(np.float64(theta), exponents.astype(np.float64)).astype(jnp.float32)
+    """`theta ** exponents` correctly rounded to the exponents' dtype,
+    whatever the backend: computed in float64 and rounded once."""
+    return np.power(np.float64(theta), exponents.astype(np.float64)).astype(exponents.dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,7 +81,8 @@ class RopeScaling:
                 f"context, got {self.original_max_position_embeddings}")
 
     def apply(self, inv_freq: np.ndarray) -> np.ndarray:
-        """Return the scaled inverse frequencies, the reference's arithmetic in float32 on the host."""
+        """Return the scaled inverse frequencies, the reference's arithmetic
+        on the host in the table's own dtype."""
         old_context_len = float(self.original_max_position_embeddings)
         wavelen = 2 * math.pi / inv_freq
         divided = np.where(wavelen > old_context_len / self.low_freq_factor,
@@ -87,18 +92,19 @@ class RopeScaling:
         smoothed = (1 - smooth) * divided / self.factor + smooth * divided
         medium = np.logical_and(wavelen >= old_context_len / self.high_freq_factor,
                                 wavelen <= old_context_len / self.low_freq_factor)
-        return np.where(medium, smoothed, divided).astype(jnp.float32)
+        return np.where(medium, smoothed, divided).astype(inv_freq.dtype)
 
 
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | None = None):
+                 rope_scaling: RopeScaling | None = None, *, dtype: DTypeLike):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` may be [P] for one sequence, or [B, P] for a packed batch
     whose documents each restart at 0; the angle axes line up with the
-    trailing [B, S] either way. The angles are computed in fp32, so a token
-    rotates the same in a prefill and in a single decode step.
+    trailing [B, S] either way. The angles are computed in `dtype`, at least
+    fp32 (`at_least_fp32` of the rotated activations'), so a token rotates
+    the same in a prefill and in a single decode step.
 
     `rot_dim` narrows the rotation to the first rot_dim dimensions.
     `partial_rotary_type` names which published convention that is, because
@@ -126,13 +132,13 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
             f"'proportional' or 'default', got {partial_rotary_type!r}")
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
-    inv_freq = inverse_frequencies(theta, divisor, pairs)
+    inv_freq = inverse_frequencies(theta, divisor, pairs, dtype=dtype)
     if rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
-        inv_freq = np.concatenate([inv_freq, np.zeros((padding,), jnp.float32)])
-    positions = jnp.asarray(positions, jnp.float32)
+        inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
+    positions = jnp.asarray(positions, inv_freq.dtype)
     if positions.ndim == 1:
         angles = positions[:, None] * inv_freq[None, :]
     else:
@@ -147,8 +153,8 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
     batch restarts positions per document. Freqs narrower than D // 2 rotate
     the first 2 * pairs dimensions and pass the rest through, which is the
     sliced partial rotary of `rotary_freqs(partial_rotary_type='default')`.
-    `scale` multiplies the whole head inside the fp32 arithmetic, so a
-    query's attention scale narrows once, with the product.
+    `scale` multiplies the whole head inside the arithmetic, at least fp32,
+    so a query's attention scale narrows once, with the product.
     """
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
@@ -158,12 +164,12 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
     else:
         cos = cos[None, :, None, :]
         sin = sin[None, :, None, :]
-    fp32 = x.astype(jnp.float32)
+    wide = x.astype(at_least_fp32(x.dtype))
     rotated_dims = cos.shape[-1]
-    fp32, passed = fp32[..., :rotated_dims], fp32[..., rotated_dims:]
-    x1, x2 = jnp.split(fp32, 2, axis=-1)
+    wide, passed = wide[..., :rotated_dims], wide[..., rotated_dims:]
+    x1, x2 = jnp.split(wide, 2, axis=-1)
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    out = fp32 * cos + rotated * sin
+    out = wide * cos + rotated * sin
     if passed.shape[-1]:
         out = jnp.concatenate([out, passed], axis=-1)
     return (out if scale is None else out * scale).astype(x.dtype)
@@ -194,8 +200,9 @@ class YarnScaling:
     attention_factor: float | None = None
 
 
-def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> np.ndarray:
-    """YaRN inverse frequencies over the rope width: `[head_dim // 2]`.
+def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling, *,
+                  dtype: DTypeLike) -> np.ndarray:
+    """YaRN inverse frequencies over the rope width, `[head_dim // 2]`, in `dtype`.
 
     Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
     head dim, as DeepSeek's configs do by pointing `head_dim` at the rope
@@ -205,7 +212,7 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> np.ndarray:
     """
     dim = head_dim
     pairs = dim // 2
-    pos_freqs = _base_powers(theta, np.arange(0, dim, 2, dtype=jnp.float32) / dim)
+    pos_freqs = _base_powers(theta, np.arange(0, dim, 2, dtype=dtype) / dim)
     inv_extrapolation = 1.0 / pos_freqs
     inv_interpolation = 1.0 / (yarn.factor * pos_freqs)
 
@@ -224,8 +231,8 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> np.ndarray:
     if span == 0:
         # The reference nudges a degenerate bound to keep the division finite.
         span = 0.001
-    ramp = np.clip((np.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
-    return (inv_interpolation * ramp + inv_extrapolation * (1 - ramp)).astype(jnp.float32)
+    ramp = np.clip((np.arange(pairs, dtype=dtype) - low) / span, 0, 1)
+    return (inv_interpolation * ramp + inv_extrapolation * (1 - ramp)).astype(dtype)
 
 def yarn_attention_factor(yarn: YarnScaling) -> float:
     """The cos/sin multiplier of `_compute_yarn_parameters`.
@@ -260,8 +267,9 @@ def yarn_query_scale(yarn: YarnScaling) -> float:
 
 
 def yarn_rope_freqs(positions, head_dim: int, theta: float,
-                    yarn: YarnScaling | None):
-    """cos/sin over the rope width, plain or YaRN-scaled: `[P, head_dim // 2]`.
+                    yarn: YarnScaling | None, *, dtype: DTypeLike):
+    """cos/sin over the rope width, plain or YaRN-scaled: `[P, head_dim // 2]`,
+    computed in `dtype` as `rotary_freqs`'s are.
 
     Plain rope is `rotary_freqs`, the one layout every mixer shares. YaRN
     replaces the inverse frequencies with the ramp and scales the resulting
@@ -269,9 +277,9 @@ def yarn_rope_freqs(positions, head_dim: int, theta: float,
     does.
     """
     if yarn is None:
-        return rotary_freqs(positions, head_dim, theta)
-    inv_freq = yarn_inv_freq(head_dim, theta, yarn)
-    positions = jnp.asarray(positions, jnp.float32)
+        return rotary_freqs(positions, head_dim, theta, dtype=dtype)
+    inv_freq = yarn_inv_freq(head_dim, theta, yarn, dtype=dtype)
+    positions = jnp.asarray(positions, inv_freq.dtype)
     if positions.ndim == 1:
         angles = positions[:, None] * inv_freq[None, :]
     else:
@@ -295,8 +303,8 @@ def apply_rotary_interleave(x, freqs_cos, freqs_sin):
     else:
         cos = freqs_cos[None, :, None, :]
         sin = freqs_sin[None, :, None, :]
-    fp32 = x.astype(jnp.float32)
-    even, odd = fp32[..., 0::2], fp32[..., 1::2]
+    wide = x.astype(at_least_fp32(x.dtype))
+    even, odd = wide[..., 0::2], wide[..., 1::2]
     out = jnp.concatenate([even * cos - odd * sin, odd * cos + even * sin],
                           axis=-1)
     return out.astype(x.dtype)

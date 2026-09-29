@@ -1,0 +1,24 @@
+{
+ "flaxdiff_commit": "94d2d21caeb79aba48a505fa79d9a1a974751234",
+ "architecture": "hybrid_dit",
+ "model": {
+  "output_channels": 4,
+  "patch_size": 2,
+  "emb_features": 32,
+  "num_layers": 4,
+  "num_heads": 4,
+  "mlp_ratio": 4,
+  "dropout_rate": 0.1,
+  "norm_groups": 0,
+  "use_hilbert": false,
+  "use_flash_attention": false,
+  "activation": "jax._src.nn.functions.silu",
+  "dtype": "jax.numpy.float32",
+  "precision": "DEFAULT",
+  "ssm_state_dim": 8,
+  "ssm_attention_ratio": "3:1",
+  "use_2d_fusion": true,
+  "use_zigzag": true
+ },
+ "jax_version": "0.5.3"
+}

@@ -57,6 +57,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
+from .precision import at_least_fp32
 from .sharding import logical_axes
 
 HEADS = ('mean', 'weighted', 'carried')
@@ -152,14 +153,14 @@ class HyperConnection(nn.Module):
 
     @nn.compact
     def mapping(self, streams):
-        """The site's `(pre, post, comb)` over the streams, all fp32."""
+        """The site's `(pre, post, comb)` over the streams, all fp32 (`at_least_fp32`)."""
         hc = self.spec.hc_mult
         mix = (2 + hc) * hc
         fn = self.param('fn', nn.initializers.normal(0.02), (mix, hc * self.emb_features), jnp.float32)
         base = self.param('base', nn.initializers.zeros, (mix,), jnp.float32)
         scale = self.param('scale', nn.initializers.ones, (3,), jnp.float32)
         flat = unweighted_rmsnorm(
-            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
+            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
             self.norm_eps)
         mixes = flat @ fn.T
         pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
@@ -171,14 +172,15 @@ class HyperConnection(nn.Module):
 
 
 def collapse_by(pre, streams):
-    """`sum_h pre[h] streams[h]` in fp32, back in the streams' dtype."""
-    return jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
+    """`sum_h pre[h] streams[h]` in fp32 (`at_least_fp32`), back in the streams' dtype."""
+    return jnp.sum(pre[..., None] * streams.astype(at_least_fp32(streams.dtype)), axis=2).astype(streams.dtype)
 
 
 def first_stream(streams):
     """The `pre` Single-Pass mHC's first sublayer collapses by: the first
-    stream alone (V4.1 inference/model.py:1159-1163), fp32 `[B, S, H]`."""
-    return jnp.zeros(streams.shape[:3], jnp.float32).at[..., 0].set(1.0)
+    stream alone (V4.1 inference/model.py:1159-1163), fp32 `[B, S, H]`
+    (`at_least_fp32`)."""
+    return jnp.zeros(streams.shape[:3], at_least_fp32(streams.dtype)).at[..., 0].set(1.0)
 
 
 class HyperHead(nn.Module):
@@ -199,7 +201,7 @@ class HyperHead(nn.Module):
         base = self.param('hc_base', nn.initializers.zeros, (hc,), jnp.float32)
         scale = self.param('hc_scale', nn.initializers.ones, (1,), jnp.float32)
         flat = unweighted_rmsnorm(
-            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
+            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
             self.norm_eps)
         pre = nn.sigmoid(flat @ fn.T * scale + base) + self.spec.hc_eps
         return collapse_by(pre, streams)

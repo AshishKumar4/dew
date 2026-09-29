@@ -11,6 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm
 from .conv import Conv
+from .precision import at_least_fp32
 from .sharding import constrain, logical_axes
 
 
@@ -89,6 +90,9 @@ class FourierEmbedding(nn.Module):
     """
     features: int
     scale: int = 16
+    dtype: Dtype | None = None
+    """The model's compute dtype; the features are computed in
+    `at_least_fp32` of it."""
 
     def setup(self):
         self.frequencies = self.variable(
@@ -97,7 +101,7 @@ class FourierEmbedding(nn.Module):
                                 dtype=jnp.float32) * self.scale)
 
     def __call__(self, x):
-        x = jax.lax.convert_element_type(x, jnp.float32)
+        x = jax.lax.convert_element_type(x, at_least_fp32(self.dtype))
         # 2 pi times the table is one rounded vector, as it was when the table
         # was a trace-time constant. Without the barrier XLA folds the 2 pi
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the

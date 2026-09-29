@@ -11,7 +11,9 @@ from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture, group_layers
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective, merge
 from dew.objectives.lm import LMObjective

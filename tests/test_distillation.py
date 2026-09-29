@@ -226,14 +226,19 @@ def test_beta_without_pairs_and_weights_outside_their_range_are_refused():
         DistillationObjective(student, teacher, temperature=0.0)
 
 
-def test_a_vocabulary_mismatch_is_refused_with_the_reason():
-    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
-    teacher = LMObjective(CausalTransformer(**{**META["teacher"], "vocab_size": VOCAB + 5}), SEQ,
-                          ema_decay=None)
+@pytest.mark.parametrize("student_vocab, teacher_vocab", [(VOCAB, VOCAB + 5), (1, 3)])
+def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher_vocab):
+    """A one-id student would broadcast against the teacher's columns into a
+    wrong KL instead of failing, so the mismatch is refused by name."""
+    student = LMObjective(CausalTransformer(**{**META["student"], "vocab_size": student_vocab}), SEQ,
+                          ema_decay=None, head_chunks=1)
+    teacher = LMObjective(CausalTransformer(**{**META["teacher"], "vocab_size": teacher_vocab}), SEQ,
+                          ema_decay=None, head_chunks=1)
     objective = DistillationObjective(student, teacher)
     params = objective.init(jax.random.key(0))
+    tokens = jnp.zeros_like(fixture_batch(fixture())[TEXT_KEY])
     with pytest.raises(ValueError, match="share a tokenizer and a vocabulary"):
-        scalar_loss(objective, params, fixture_batch(fixture()), step_at())
+        scalar_loss(objective, params, {TEXT_KEY: tokens}, step_at())
 
 
 def test_a_student_with_the_router_balance_loss_is_refused():

@@ -419,8 +419,6 @@ class HarborSource:
         atexit.register(self._exit_hook)
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
-        if type(samples) is not int or samples < 1:
-            raise ValueError("a submission runs at least one sample")
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")

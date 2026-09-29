@@ -24,7 +24,7 @@ from .attention_sinks import attention_with_sinks
 from .conv import Conv
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import precision_names, rounded_to
+from .precision import at_default_precision, at_least_fp32, precision_names, rounded_to
 from .rope import apply_rotary
 from .sharding import (
     HEADS,
@@ -38,6 +38,7 @@ from .sharding import (
     mesh_axes,
     row_axes,
     sequence_shards,
+    split_positions,
 )
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
@@ -185,7 +186,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     The policy saves nothing, so the backward pass holds the arguments: the
     input, the weight and the bias. Recomputing the reductions rather than
     naming them leaves the residuals to the policy that recomputes this
-    block (`causal_transformer.RESIDUALS`).
+    block (`decoder_block.RESIDUALS`).
 
     The wrapped function takes arrays first and static arguments last. A
     caller passes its parameters as plain arrays, so no flax lifting sits
@@ -207,7 +208,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     normalization in the input's dtype.
     """
     if fp32_statistics:
-        y = x.astype(jnp.float32)
+        y = x.astype(at_least_fp32(x.dtype))
         y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
@@ -239,7 +240,7 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
     before it meets the centered activations. `scale` and `bias` of None
     are the affine-free norm.
     """
-    y = x.astype(jnp.float32)
+    y = x.astype(at_least_fp32(x.dtype))
     row_mean = jnp.mean(y, axis=-1)
     variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=-1) - jax.lax.square(row_mean))
     scaling = jax.lax.rsqrt(jnp.expand_dims(variance, -1) + epsilon)
@@ -259,7 +260,7 @@ def unweighted_rmsnorm(x, eps: float):
     before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
     (modeling_deepseek_v4.py:66-72) and its GLM twin do.
     """
-    fp32 = x.astype(jnp.float32)
+    fp32 = x.astype(at_least_fp32(x.dtype))
     inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
     return x * inverse.astype(x.dtype)
 
@@ -507,9 +508,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     for such a call (`all_to_all_moves_less`). A call with no mask does the
     same work either way, and takes the exchange that sends fewer bytes.
     """
-    mesh = jax.sharding.get_abstract_mesh()
-    tensor = math.prod(mesh.shape[axis]
-                       for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
+    tensor = _tensor_shards(query)
     heads, kv_heads = query.shape[-2], key.shape[-2]
     masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
@@ -555,6 +554,13 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int) -
 def _entry(spec: P, dimension: int):
     """What `spec` names for `dimension`: a spec leaves off trailing whole ones."""
     return spec[dimension] if dimension < len(spec) else None
+
+
+def _tensor_shards(query) -> int:
+    """How many ways the mesh's tensor axes split the query heads."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return math.prod(mesh.shape[axis]
+                     for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
 
 
 def _four_dimensional(x):
@@ -624,15 +630,12 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
             ("activation_batch",), key_value_seq_lengths.shape))
-    names = tuple(extras)
 
     def local(query, key, value, *arrays):
         query, key, value = (jax.lax.all_to_all(x, SEQUENCE_AXIS, 2, 1, tiled=True)
                              for x in (query, key, value))
-        given = dict(zip(names, arrays, strict=True))
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
-                     key_value_seq_lengths=given.get('key_value_seq_lengths'))
+                     **dict(zip(extras, arrays, strict=True)))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
     exchanged = manual_map(
@@ -665,12 +668,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     whole keys, which neither order moves.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
-    tensor = mesh_axes(_entry(logical_spec(HEADS, query.shape), 2))
-    if tensor:
-        # Each tensor shard's query heads beside the key heads they read.
-        kv_heads = math.lcm(key.shape[-2], math.prod(
-            jax.sharding.get_abstract_mesh().shape[axis] for axis in tensor))
-        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    # Each tensor shard's query heads beside the key heads they read.
+    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 
     reordered = causal or sliding_window is not None or mask is not None
     if reordered:
@@ -707,16 +707,13 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
             ("activation_batch",), key_value_seq_lengths.shape))
-    names = tuple(extras)
 
     def local(query, key, value, *arrays):
         if gathered:
             key, value = (jax.lax.all_gather(x, SEQUENCE_AXIS, axis=1, tiled=True)
                           for x in (key, value))
-        given = dict(zip(names, arrays, strict=True))
         return kernel(query, key, value, causal=False, sliding_window=None,
-                      mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
-                      key_value_seq_lengths=given.get('key_value_seq_lengths'))
+                      **dict(zip(extras, arrays, strict=True)))
 
     attended = manual_map(
         local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
@@ -788,7 +785,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
     if mask is not None:
         logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
     if force_fp32_for_softmax and dtype != jnp.float32:
-        weights = jax.nn.softmax(logits.astype(jnp.float32))
+        weights = jax.nn.softmax(logits.astype(at_least_fp32(dtype)))
     else:
         weights = jax.nn.softmax(logits).astype(dtype)
     return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
@@ -911,15 +908,32 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     Every fused kernel runs one head width for the keys and the values, so a
     narrower value rides in padded and its own columns come back out. The
     widths a caller passes are static, so this costs no runtime branch.
-    A softcap, sinks and segment ids reach only 'tpu'; `attention_kernel`
-    runs them elsewhere on its own paths. `key_value_seq_lengths` goes to
-    the cudnn and xla kernels as lengths and to 'tpu' as the mask it means.
+    'cudnn' refuses here whatever its kernel cannot take: sinks, a softcap,
+    deterministic ops, and dtypes and head widths outside its tiles.
+    `key_value_seq_lengths` goes to the cudnn and xla kernels as lengths and
+    to 'tpu' as the mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
+        if sinks is not None:
+            raise ValueError("attention implementation 'cudnn' cannot honor sinks")
+        if softcap is not None:
+            raise ValueError(
+                f"attention implementation 'cudnn' cannot apply an attention logit "
+                f"softcap of {softcap}: the fused kernel has no tanh between its "
+                "scaling and its softmax. Use attention_impl 'xla' or the reference "
+                "implementation (attention_impl 'reference').")
+        if deterministic_ops_requested():
+            raise ValueError(
+                "attention implementation 'cudnn' cannot run under "
+                "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
+                "is unusable, because an executable holding two identical fused "
+                "attention backward calls, which every multi-layer model has, fails "
+                "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
+                "which is deterministic, or drop the flag.")
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
@@ -941,14 +955,12 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             key_value_seq_lengths=key_value_seq_lengths,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation='xla')
-    elif implementation == 'tpu':
+    else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
                             interpret=jax.default_backend() != 'tpu')
-    else:
-        raise ValueError(f"Unknown attention implementation: {implementation}")
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
@@ -961,11 +973,12 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     'auto' resolves here, against this call's shapes and this machine's
     backend. Splash takes sinks, a softcap and packed segment ids itself.
     Anywhere else the segment ids become the document mask, and sinks and a
-    softcap run their own XLA paths, because `jax.nn.dot_product_attention`
-    has neither argument. What is left goes to `fused_attention`, after the
-    arguments it cannot honour raise. Key lengths reach the cudnn and xla
-    kernels as they are; every other path reads them as the mask they mean,
-    which splash cannot describe, so 'auto' never picks 'tpu' for them.
+    softcap run their own XLA paths on 'reference' and 'xla', because
+    `jax.nn.dot_product_attention` has neither argument. What is left goes
+    to `fused_attention`, after the arguments it cannot honour raise. Key
+    lengths reach the cudnn and xla kernels as they are; every other path
+    reads them as the mask they mean, which splash cannot describe, so
+    'auto' never picks 'tpu' for them.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -987,30 +1000,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # (`kernel_for_materialized_mask`), so a packed call runs on xla.
         if implementation == 'cudnn':
             implementation = 'xla'
-    if sinks is not None and implementation != 'tpu':
-        if implementation not in ('reference', 'xla'):
-            raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
+    if sinks is not None and implementation in ('reference', 'xla'):
         mask = combined_attention_mask(
             query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         return attention_with_sinks(
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
-    if softcap is not None and implementation == 'cudnn':
-        raise ValueError(
-            f"attention implementation 'cudnn' cannot apply an attention logit "
-            f"softcap of {softcap}: the fused kernel has no tanh between its "
-            "scaling and its softmax. Use attention_impl 'xla' or the reference "
-            "implementation (attention_impl 'reference').")
-    if implementation == 'cudnn' and deterministic_ops_requested():
-        raise ValueError(
-            "attention implementation 'cudnn' cannot run under "
-            "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
-            "is unusable, because an executable holding two identical fused "
-            "attention backward calls, which every multi-layer model has, fails "
-            "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
-            "which is deterministic, or drop the flag.")
-
-    if implementation == 'reference' or (softcap is not None and implementation != 'tpu'):
+    if implementation == 'reference' or (softcap is not None and implementation == 'xla'):
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -1020,10 +1016,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             return softcapped_attention(
                 query, key, value, softcap, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
+        # flax pins a forced softmax to float32 itself; a wider compute
+        # dtype already runs it at least that wide.
         return nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=None,
-            force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True,
+            force_fp32_for_softmax=(force_fp32_for_softmax
+                                    and at_least_fp32(dtype or query.dtype) == jnp.float32),
+            deterministic=True,
             # flax takes the precision through these two or through
             # `precision`, never both, and its own value product would
             # multiply the fp32 probabilities by the bf16 value.
@@ -1049,11 +1049,17 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
             or (dtype is not None and jnp.dtype(dtype) != query.dtype))
 
 
-def _bf16_dot_missing(query) -> bool:
-    """A bf16 query on a GPU backend older than sm80, where jax.nn's xla
-    attention cannot run."""
-    return (query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu'
-            and not bf16_dot_runs())
+def _xla_kernel_narrows(query) -> bool:
+    """Whether jax.nn's xla attention would compute this call below its
+    query's precision, so 'auto' and 'xla' take the reference path, which
+    computes in the query's dtype (`dew.nn.precision.at_least_fp32`).
+
+    It rounds a float64 query's softmax to float32
+    (`_dot_product_attention_core`: "Softmax and it is always carried out in
+    fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
+    older than sm80 rejects at run time, past jax's own fallback."""
+    return query.dtype == jnp.float64 or (
+        query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu' and not bf16_dot_runs())
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
@@ -1062,20 +1068,17 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
-    backend (both 'auto' and 'xla' take the reference path for bf16 on a
-    GPU older than sm80, where jax.nn's xla kernel cannot run): the
-    reference path when the call asks for arithmetic no fused kernel
-    performs (`reference_only`), else cudnn where `cudnn_runs` and the call
-    has no sinks, the tpu kernel where `tpu_runs`, and xla anywhere else.
-    Any other name is returned as it is, so an explicit kernel still refuses
-    what it cannot honour by name.
+    backend (both 'auto' and 'xla' take the reference path where jax.nn's
+    xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
+    path when the call asks for arithmetic no fused kernel performs
+    (`reference_only`), else cudnn where `cudnn_runs` and the call has no
+    sinks, the tpu kernel where `tpu_runs`, and xla anywhere else. Any other
+    name is returned as it is, so an explicit kernel still refuses what it
+    cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and _bf16_dot_missing(query):
-        # jax.nn's xla attention names the BF16_BF16_F32 algorithm, which a
-        # GPU older than sm80 rejects at run time, past jax's own fallback;
-        # the reference path multiplies at the caller's precision.
+    if implementation in ('auto', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
     if implementation != 'auto':
         return implementation
@@ -1107,7 +1110,7 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     if implementation == 'auto' and reference_only(query, dtype, precision,
                                                    force_fp32_for_softmax):
         return 'reference'
-    if implementation in ('auto', 'cudnn', 'xla') and _bf16_dot_missing(query):
+    if implementation in ('auto', 'cudnn', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
@@ -1175,9 +1178,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
-    kernel = functools.partial(
-        attention_kernel, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
+    whole = functools.partial(
+        scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
@@ -1197,11 +1200,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
         if on_splash or (segment_ids is None and (
                 (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span)):
-            return scaled_dot_product_attention(
-                query, key, value, dtype=dtype, precision=precision,
-                force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-                causal=True, sliding_window=window, sinks=sinks, softcap=softcap,
-                segment_ids=segment_ids)
+            return whole(implementation=implementation, causal=True, sliding_window=window,
+                         segment_ids=segment_ids)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's
@@ -1217,15 +1217,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         if valid is not None:
             live = jnp.asarray(valid, bool)[:, None, None, :]
             mask = live if mask is None else mask & live
-        if mask is not None:
-            mask = combined_attention_mask(length, length, causal=True,
-                                           sliding_window=window, mask=mask)
-            implementation = masked
-        return scaled_dot_product_attention(
-            query, key, value, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-            causal=mask is None, sliding_window=window if mask is None else None, mask=mask,
-            sinks=sinks, softcap=softcap)
+        if mask is None:
+            return whole(implementation=implementation, causal=True, sliding_window=window)
+        return whole(implementation=masked, mask=combined_attention_mask(
+            length, length, causal=True, sliding_window=window, mask=mask))
+    kernel = functools.partial(
+        attention_kernel, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
     if shards > 1:
         out = _local_over_sequence(
             kernel, query, key, value, shards, window=window, chunk=chunk, positions=positions,
@@ -1252,15 +1250,12 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     The heads split over the tensor axis where they divide, the key heads
     repeated to the least common multiple of their count and the tensor
     axis, as the exchanges repeat them."""
-    mesh = jax.sharding.get_abstract_mesh()
     batch, length = query.shape[:2]
     span = window if window is not None else chunk
     assert span is not None
     queries = logical_spec(HEADS, query.shape)
-    tensor = mesh_axes(_entry(queries, 2))
-    if tensor:
-        kv_heads = math.lcm(key.shape[2], math.prod(mesh.shape[axis] for axis in tensor))
-        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    kv_heads = math.lcm(key.shape[2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
     keys = logical_spec(KV_HEADS, key.shape)
     fields = {}
     if positions is not None:
@@ -1483,17 +1478,27 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
             q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
-    if descriptor is not None:
-        return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
-                                segment_ids=segment_ids, interpret=interpret)
-    if softcap is not None or sinks is not None:
+    if descriptor is None and (softcap is not None or sinks is not None):
         raise ValueError(
             "attention implementation 'tpu' takes a softcap and sinks only on "
             "the splash kernel, and this call has a bias, a mask splash cannot "
             "describe or a length that is not a multiple of "
             f"{SPLASH_LANES}. Use attention_impl 'xla'.")
-    return pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window,
-                                  segment_ids)
+
+    def attend(query, key, value, bias, sinks):
+        if descriptor is None:
+            return pallas_flash_attention(query, key, value, bias, mask, causal,
+                                          sliding_window, segment_ids)
+        return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, interpret=interpret)
+
+    if jnp.finfo(query.dtype).bits == 16 and not interpret:
+        # Mosaic multiplies 16-bit operands at the default precision only.
+        # Their products are exact and accumulate in fp32; splash's fp32 P·V
+        # takes one bf16 pass, as at any default-precision run
+        # (`at_default_precision`).
+        return at_default_precision(attend)(query, key, value, bias, sinks)
+    return attend(query, key, value, bias, sinks)
 
 
 def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_ids,
@@ -1735,10 +1740,13 @@ class NormalAttention(nn.Module):
         if len(context.shape) == 4:
             context = context.reshape(
                 (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
-        # [B, S, heads, head_dim], column-parallel under a tensor axis.
+        # [B, S, heads, head_dim], column-parallel under a tensor axis; a
+        # context's positions split over a sequence axis where its link pays
+        # for it (`split_positions`).
         query = constrain(self.query(x), HEADS)
-        key = constrain(self.key(context), HEADS)
-        value = constrain(self.value(context), HEADS)
+        key, value = split_positions(
+            context, (self.heads, self.dim_head),
+            lambda tokens: (constrain(self.key(tokens), HEADS), constrain(self.value(tokens), HEADS)))
         if self.qk_norm:
             query = self.q_norm(query)
             key = self.k_norm(key)
@@ -1853,7 +1861,6 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
 
-    @nn.compact
     def __call__(self, hidden_states, context=None):
         if self.only_pure_attention:
             return self.attention2(hidden_states, context)
@@ -1936,28 +1943,24 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, context=None):
-        inner_dim = self.heads * self.dim_head
-        C = x.shape[-1]
+        channels = x.shape[-1]
         if self.norm_inputs:
             x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
-        if self.use_projection:
+
+        def project(features: int, name: str):
             if self.use_linear_attention:
-                projected_x = nn.Dense(features=inner_dim,
-                                       use_bias=False, precision=self.precision,
-                                       dtype=self.dtype, name='project_in')(x)
-            else:
-                projected_x = Conv(
-                    features=inner_dim, kernel_size=(1, 1),
-                    strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='project_in_conv',
-                )(x)
+                return nn.Dense(features=features, use_bias=False, precision=self.precision,
+                                dtype=self.dtype, name=name)
+            return Conv(features=features, kernel_size=(1, 1), strides=(1, 1), padding='VALID',
+                        use_bias=False, dtype=self.dtype, precision=self.precision,
+                        name=f'{name}_conv')
+
+        if self.use_projection:
+            inner_dim = self.heads * self.dim_head
+            hidden = project(inner_dim, 'project_in')(x)
         else:
-            projected_x = x
-            inner_dim = C
-
-        context = projected_x if context is None else context
-
-        projected_x = BasicTransformerBlock(
+            inner_dim, hidden = channels, x
+        hidden = BasicTransformerBlock(
             query_dim=inner_dim,
             heads=self.heads,
             dim_head=self.dim_head,
@@ -1970,20 +1973,10 @@ class TransformerBlock(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon
-        )(projected_x, context)
-
+        )(hidden, hidden if context is None else context)
         if self.use_projection:
-            if self.use_linear_attention:
-                projected_x = nn.Dense(features=C, precision=self.precision,
-                                       dtype=self.dtype, use_bias=False,
-                                       name='project_out')(projected_x)
-            else:
-                projected_x = Conv(
-                    features=C, kernel_size=(1, 1),
-                    strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='project_out_conv',
-                )(projected_x)
+            hidden = project(channels, 'project_out')(hidden)
 
         if self.only_pure_attention or self.explicitly_add_residual:
-            projected_x = x + projected_x
-        return projected_x
+            hidden = x + hidden
+        return hidden
