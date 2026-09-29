@@ -419,10 +419,10 @@ def power_profiles(solver: optax.GradientTransformation,
 
     Update t keeps (1 - 1/t)^(γ + 1) of each average and blends in the rest
     of the parameters it just made (Karras et al. 2024, Eq. 127). The
-    averages ride in the optimizer state, so they are sharded, placed,
-    checkpointed and skipped on a rejected step exactly as its moments are,
-    and every checkpoint save keeps a snapshot of them
-    (`Checkpoints.profile_steps`). Each std is rounded to fp32 first, the
+    averages ride in the optimizer state, so they are sharded, placed and
+    skipped on a rejected step exactly as its moments are; a checkpoint save
+    writes them once, as the snapshot of its step
+    (`Checkpoints.profile_steps`), which a restore reads them back from. Each std is rounded to fp32 first, the
     precision the state records it in.
     """
     from dew.training.posthoc import power_decay

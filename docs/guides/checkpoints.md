@@ -126,7 +126,7 @@ Planes are computed on the devices that hold the EMA. So a save holds one more E
 
 ## Post-hoc EMA
 
-An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded, checkpointed and restored with the rest of that state. Each `Checkpoints.save` also writes a snapshot of them under `profiles/` in the run directory, one per saved step, which `keep` does not prune.
+An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded and placed with the rest of that state. `Checkpoints.save` writes them once, as a snapshot under `profiles/` in the run directory, not again inside the step's optimizer state; `keep` does not prune the snapshots, and `restore` reads a persistent step's averages from its snapshot.
 
 ```python
 from dew.training.posthoc import reconstruct
@@ -137,7 +137,7 @@ averaged = reconstruct(run_directory, 0.07, step=40000)
 
 `reconstruct` returns the `params` collection as host arrays, in the weights' structure and dtypes. It weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`), which gives the same weights as NVlabs' `phema.py` to the last bit on the paper's setting, and reads one snapshot at a time. Its accuracy depends on how many snapshots there are: in a 96-step CPU run tracking 0.05 and 0.10, an average of 0.07 rebuilt from snapshots every 4 steps differed from one tracked directly by at most 1.2e-7 (weights of scale 2), every 8 steps by 4.8e-7, every 16 steps by 5.7e-6; the tracked 0.05 average was 1.3e-4 from it.
 
-Each profile holds one more copy of the weights in memory, and each snapshot writes them to disk again, beside the copy inside the checkpoint's optimizer state.
+Each profile holds one more copy of the weights in memory and on disk at every checkpoint step. A local checkpoint (`local_directory`) keeps them in its optimizer state, since it is pruned and read on its own.
 
 ## Preemption
 

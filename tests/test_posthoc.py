@@ -81,6 +81,29 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     assert jax.tree.map(lambda leaf: leaf.dtype, rebuilt) == jax.tree.map(lambda leaf: leaf.dtype, direct)
 
 
+def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
+    """The averages go to disk as the snapshot of the step alone, not again
+    inside the checkpoint's optimizer state, and every restore reads them
+    back from it bit for bit."""
+    def trainer():
+        return Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(tmp_path / "run")))
+    state = trainer().fit(Data(), steps=8, log_every=8, checkpoint_every=4)
+    Checkpoints(str(tmp_path / "run")).wait()
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    written = checkpoints._open().item_metadata(8)
+    assert dict(written)["opt_state"]["averages"] is None
+    stored = checkpoints.stored(8)["opt_state"]["averages"]
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), stored) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), state.opt_state.averages)
+    restored, _, _ = trainer().place()
+    untyped, _ = checkpoints.restore(None, 8)
+    for averages in (restored.opt_state.averages, tuple(untyped["opt_state"]["averages"])):
+        for held, expected in zip(jax.tree.leaves(averages), jax.tree.leaves(state.opt_state.averages),
+                                  strict=True):
+            np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
+
 def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
     config = RunConfig(optim=OptimConfig(ema_profiles=(0.05, 0.10)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))

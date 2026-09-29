@@ -74,19 +74,40 @@ step directories, and `dew.io.publish` ships with a step."""
 
 PROFILES = "profiles"
 """The subdirectory of the run directory holding a snapshot of the run's
-power-function EMAs at every checkpoint step (`dew.training.posthoc`)."""
+power-function EMAs at every checkpoint step (`dew.training.posthoc`).
+A persistent checkpoint's optimizer state holds no averages: the snapshot
+of its step is their only copy on disk, and restore reads them from it."""
+
+
+def _is_profiles(node) -> bool:
+    """Whether `node` is a `PowerProfilesState`, or the mapping of its fields
+    a restore without a template reads it as."""
+    from dew.training.optim import PowerProfilesState
+    return isinstance(node, PowerProfilesState) or (
+        isinstance(node, Mapping) and set(node) == set(PowerProfilesState._fields))
 
 
 def _power_profiles(opt_state):
-    """The `PowerProfilesState` inside `opt_state`, or None where the solver keeps none."""
-    from dew.training.optim import PowerProfilesState
-
-    def found(node):
-        return isinstance(node, PowerProfilesState)
-    held = [node for node in jax.tree.leaves(opt_state, is_leaf=found) if found(node)]
+    """The `PowerProfilesState` inside `opt_state`, or its mapping, or None
+    where the solver keeps none."""
+    held = [node for node in jax.tree.leaves(opt_state, is_leaf=_is_profiles) if _is_profiles(node)]
     if len(held) > 1:
         raise ValueError(f"the optimizer state holds {len(held)} power_profiles; wrap the solver once")
     return held[0] if held else None
+
+
+def _averages_of(profiles):
+    """The averages a `PowerProfilesState`, or its mapping, holds."""
+    return profiles['averages'] if isinstance(profiles, Mapping) else profiles.averages
+
+
+def _with_averages(opt_state, averages):
+    """`opt_state` with the averages of its power profiles replaced by `averages`."""
+    def put(node):
+        if not _is_profiles(node):
+            return node
+        return {**node, 'averages': averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+    return jax.tree.map(put, opt_state, is_leaf=_is_profiles)
 
 
 def is_uri(path: str) -> bool:
@@ -604,7 +625,13 @@ class Checkpoints:
         lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
         7B parameters, on hosts that keep the state there for want of room.
         """
-        state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
+        state_tree = self._item(state, saved, share)
+        profiles = _power_profiles(state.opt_state)
+        if profiles is not None:
+            # Written once, as the snapshot below: the checkpoint's copy
+            # would double what a save copies off the devices.
+            state_tree['opt_state'] = _with_averages(state_tree['opt_state'], None)
+        state_tree, deltas = _with_ema_deltas(state_tree)
         persistent = self._open()
         with region("checkpoint.submit"):
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
@@ -612,14 +639,14 @@ class Checkpoints:
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
-        profiles = _power_profiles(state.opt_state)
         if profiles is not None:
             self._save_profiles(step, profiles)
 
     def _save_profiles(self, step: int, profiles) -> None:
         """Keep a snapshot of the power-function EMAs of `profiles`, a
         `PowerProfilesState`, beside the checkpoint of `step`, where no
-        pruning of checkpoints reaches it."""
+        pruning of checkpoints reaches it, and from which the checkpoint's
+        own averages are restored."""
         snapshots = self._open_profiles()
         averages = {'averages': tuple(profiles.averages)}
         with region("checkpoint.submit_profiles"):
@@ -640,15 +667,19 @@ class Checkpoints:
         custom = self._open_profiles().metadata(step).custom_metadata
         return int(custom['updates']), tuple(custom['stds'])
 
-    def restore_profiles(self, step: int) -> tuple[Variables, ...]:
-        """The averages of the EMA snapshot at `step`, as host arrays, in the
-        order of `profile_metadata`'s relative standard deviations."""
+    def restore_profiles(self, step: int, template=None) -> tuple[Variables, ...]:
+        """The averages of the EMA snapshot at `step`, in the order of
+        `profile_metadata`'s relative standard deviations: as host arrays, or
+        typed and placed as the leaves of `template`, a tuple of trees."""
         snapshots = self._open_profiles()
-        metadata = snapshots.item_metadata(step)
-        host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
-        restored = snapshots.restore(step, args=ocp.args.PyTreeRestore(
-            restore_args=jax.tree.map(lambda _: host, dict(metadata))))
-        return tuple(restored['averages'])
+        if template is None:
+            host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+            args = ocp.args.PyTreeRestore(restore_args=jax.tree.map(lambda _: host, dict(snapshots.item_metadata(step))))
+        else:
+            wanted = {'averages': tuple(template)}
+            args = ocp.args.PyTreeRestore(item=wanted, restore_args=jax.tree.map(
+                lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)), wanted))
+        return tuple(snapshots.restore(step, args=args)['averages'])
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
                    share: DataPartition | None = None) -> None:
@@ -694,7 +725,8 @@ class Checkpoints:
             step = self.latest
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        from_local = step == self._local_latest()
+        checkpointer = self._open_local() if from_local else self._open()
         metadata = checkpointer.item_metadata(step)
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
@@ -703,6 +735,11 @@ class Checkpoints:
         if deltas:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
+        if not from_local and _power_profiles(stored['opt_state']) is not None:
+            averages = dict(self._open_profiles().item_metadata(step))['averages']
+            stored['opt_state'] = _with_averages(stored['opt_state'], tuple(
+                jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), average)
+                for average in averages))
         return stored
 
     def accumulation_template(self, step: int):
@@ -783,11 +820,17 @@ class Checkpoints:
                 restored['ema'] = jax.tree_util.tree_map_with_path(
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
+            if not from_local and _power_profiles(restored['opt_state']) is not None:
+                restored = {**restored, 'opt_state': _with_averages(restored['opt_state'],
+                                                                    self.restore_profiles(step))}
         else:
             state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
             if from_local:
                 self._check_placement(step, state_tree)
+            profiles = None if from_local else _power_profiles(state_tree.get('opt_state'))
+            if profiles is not None:
+                state_tree['opt_state'] = _with_averages(state_tree['opt_state'], None)
             targets, deltas = {}, {}
             if state_tree.get('ema') is not None:
                 deltas = _ema_deltas(checkpointer, step, metadata)
@@ -825,6 +868,9 @@ class Checkpoints:
             if targets:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
+            if profiles is not None:
+                restored = {**restored, 'opt_state': _with_averages(
+                    restored['opt_state'], self.restore_profiles(step, _averages_of(profiles)))}
         restored = dict(restored)
         table = restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
