@@ -76,6 +76,8 @@ EDM2 (Karras et al., 2024) trains under the `EDM` preset with its latent regime.
 
 `DiffusionObjective(alignment=Alignment(...))` adds representation alignment to the denoising loss. REPA (Yu et al., 2025) projects the model's hidden tokens at one layer with an MLP and scores them against a frozen encoder's patch features of the clean image by negative cosine similarity, weighted by `weight`. iREPA (Singh et al., 2026) uses `projector="conv"`, one 3x3 convolution over the token grid, and `spatial_norm=gamma`, which z-scores the encoder's features over space after subtracting gamma times their mean. Both losses match the official code (`tools/repa_reference.py`). The projector trains beside the model, the encoder's weights stay frozen, and a published task drops both. The aligned tokens must lie on the encoder's patch grid in raster order.
 
+`simple_dit`'s `routes` is TREAD's token routing (Krause et al., 2025), which applies during training only. Each `(ratio, start, end)` sends a random `ratio` of the tokens around blocks `start` to `end`. They rejoin afterwards holding the values they had before `start`, so those blocks compute on fewer tokens. The gather and scatter match CompVis/tread's `Router` (`tools/tread_reference.py`), and sampling runs every token through every block.
+
 ## Solvers
 
 `sample(denoise, x_T, steps, solver=..., key=...)` runs a solver from the highest time to zero. `denoise` is `process.denoiser(model, params, conditions)`, which calls the model and converts its output into estimates of $x_0$ and $\epsilon$. This samples from an untrained DiT with two solvers; only the shapes are meaningful:
