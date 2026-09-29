@@ -17,7 +17,7 @@ from flax.core import freeze
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.artifacts import agreed
+from dew.artifacts import agreed, uint8_pixels
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
@@ -30,6 +30,8 @@ from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import active_profile
 
 if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
+
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training.distributed import Layout, MeshSpec
 
@@ -89,7 +91,8 @@ class DenoisingInputs:
 class Images(Generic[ArrayT]):
     """Decoded samples in [-1, 1], NHWC, keeping the placement the task ran with.
 
-    ``host()`` reads this process's ``rows`` real rows back as a host array.
+    ``host()`` reads this process's ``rows`` real rows back as a host array;
+    ``pil()`` reads them back as 8-bit images.
     """
 
     images: ArrayT | None
@@ -100,6 +103,15 @@ class Images(Generic[ArrayT]):
         """This process's real rows as host arrays, without the padding a
         row plan added to fill the devices."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+
+    def pil(self) -> list[PILImage]:
+        """This process's real rows as RGB images, their pixels quantized by
+        `dew.artifacts.uint8_pixels`."""
+        from PIL import Image
+
+        if self.images is None:
+            raise ValueError("these samples kept only their latents; call the task with decode=True")
+        return [Image.fromarray(row) for row in uint8_pixels(self.host().images)]
 
 
 @dataclass(frozen=True, eq=False)

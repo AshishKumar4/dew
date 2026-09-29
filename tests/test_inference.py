@@ -31,6 +31,7 @@ from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
+from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -109,6 +110,19 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
     np.testing.assert_array_equal(
         front(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images,
         pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images)
+
+
+def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
+    """`pil()` drops the rows a row plan padded, maps [-1, 1] to [0, 255],
+    and refuses a result that kept only latents."""
+    pixels = jnp.stack([jnp.full((2, 3, 3), -1.0), jnp.full((2, 3, 3), 1.0), jnp.zeros((2, 3, 3))])
+    pictures = Images(pixels, rows=2).pil()
+    assert [picture.size for picture in pictures] == [(3, 2), (3, 2)]
+    assert [picture.mode for picture in pictures] == ["RGB", "RGB"]
+    np.testing.assert_array_equal(np.asarray(pictures[0]), np.zeros((2, 3, 3), np.uint8))
+    np.testing.assert_array_equal(np.asarray(pictures[1]), np.full((2, 3, 3), 255, np.uint8))
+    with pytest.raises(ValueError, match="decode"):
+        Images(None, rows=1, latents=jnp.zeros((1, 2, 2, 4))).pil()
 
 
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):

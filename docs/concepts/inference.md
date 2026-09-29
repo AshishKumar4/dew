@@ -7,7 +7,8 @@ import dew
 
 images = dew.pipeline("runs/flowers-dit")
 result = images(["a water lily", "a sunflower"], seed=0)
-pixels = result.host().images
+pixels = result.host().images  # NumPy, [-1, 1]
+result.pil()[0].save("water-lily.png")
 
 text = dew.pipeline("runs/shakespeare")
 print(text("ROMEO:", seed=0).text[0])
@@ -33,6 +34,8 @@ Without `mesh`, the default `MeshSpec()` puts the current process pool's devices
 Every process supplies its own rows. All cooperating processes must supply the same number of rows and the same tokenized shapes, and use the same execution controls, including the same number of continuations. The processes agree on invalid inputs, conflicting controls and errors in prepared inputs before any device collective runs.
 
 Results hold global arrays sharded by row, including any filler rows added so the batch divides across devices. `result.host()` returns the same record with NumPy arrays for this process's real rows. It does not gather rows from other processes. Filler rows are added as prompts, before any continuation exists. So all continuations of a prompt stay on the process that asked for them, and the rows `host()` drops belong only to filler prompts. Token generation and image prior noise use keys per global row. Canvas refinement and an explicitly sampled VAE posterior use keys for the whole batch, so changing the placed batch shape can change their draws.
+
+`TextToImage` results also have `pil()`, which returns the same real rows as a list of 8-bit RGB PIL images, quantized as `dew.artifacts.uint8_pixels` quantizes them. A result from `decode=False` has no images and raises.
 
 ```python
 from dew.training import Layout, MeshSpec
