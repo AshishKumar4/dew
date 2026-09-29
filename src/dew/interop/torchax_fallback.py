@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 
     from dew.nn.backbones.causal_transformer import DecoderBank
 
-INSTALL = "pip install 'dew-ml[torchax]'"
+INSTALL = "pip install 'dewml[torchax]'"
 
 TORCH_AXES: tuple[tuple[str, LogicalAxes], ...] = (
     # nn.Linear stores [out, in]; its bias is the output side alone.

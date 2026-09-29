@@ -644,7 +644,7 @@ def test_setup_installs_a_release_when_asked(fake):
     fake.offer("slice", "us-central2-b")
     assert run("setup", "slice", "--version", "0.2.1", "--gcs-bucket", "") == 0
     text = (config_dir() / "setup-slice.sh").read_text()
-    assert "PACKAGE_SPEC=dew-ml==0.2.1" in text
+    assert "PACKAGE_SPEC=dewml==0.2.1" in text
     assert "EDITABLE=0" in text
     assert "GCS_BUCKET=''" in text
 
@@ -680,7 +680,7 @@ def test_setup_script_renders_for_the_python_version_and_the_source(fake):
 
 
 def test_setup_script_is_bash_and_every_step_guards_itself(fake):
-    script = tpu_setup.render(python_version="3.12", package_spec="dew-ml")
+    script = tpu_setup.render(python_version="3.12", package_spec="dewml")
     checked = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
     assert checked.returncode == 0, checked.stderr
     for guard in ("command -v gcsfuse", 'grep -q "dew nofile"', 'command -v uv',
@@ -694,8 +694,8 @@ def test_package_spec_reads_source_extras_and_version():
     assert tpu_setup.package_spec("dew", "", "") == ("dew[tpu]", True)
     assert tpu_setup.package_spec("dew", "tpu,tfds", "") == ("dew[tpu,tfds]", True)
     assert tpu_setup.package_spec("dew", "tfds, tpu", "") == ("dew[tpu,tfds]", True)
-    assert tpu_setup.package_spec("", "tfds", "0.2.1") == ("dew-ml[tfds]==0.2.1", False)
-    assert tpu_setup.package_spec("", "", "") == ("dew-ml", False)
+    assert tpu_setup.package_spec("", "tfds", "0.2.1") == ("dewml[tfds]==0.2.1", False)
+    assert tpu_setup.package_spec("", "", "") == ("dewml", False)
 
 
 def test_train_syncs_detaches_on_all_workers_then_follows_worker_zero(fake, capsys):
