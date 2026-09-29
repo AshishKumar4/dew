@@ -284,19 +284,10 @@ def _stored_as_delta(average, live) -> bool:
             and "pinned_host" not in (average.sharding.memory_kind, live.sharding.memory_kind))
 
 
-def _at(tree, path: jax.tree_util.KeyPath):
-    for key in path:
-        tree = tree[key.key]
-    return tree
-
-
-def _find(tree, path: jax.tree_util.KeyPath):
-    """The leaf of `tree` at `path`, or None where `tree` has none."""
-    for key in path:
-        if not isinstance(tree, Mapping) or key.key not in tree:
-            return None
-        tree = tree[key.key]
-    return tree
+def _by_path(tree) -> dict[jax.tree_util.KeyPath, StateLeaf]:
+    """`tree`'s leaves by their key paths: an EMA leaf's path in the EMA
+    tree is its weight's in the params tree, whatever containers hold them."""
+    return dict(jax.tree_util.tree_flatten_with_path(tree)[0])
 
 
 def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateLeaf], list[str]]:
@@ -315,7 +306,8 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
         return state_tree, []
     paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
     leaves = [leaf for _, leaf in paths_leaves]
-    lives = [_at(state_tree['params'], path) for path, _ in paths_leaves]
+    held = _by_path(state_tree['params'])
+    lives = [held[path] for path, _ in paths_leaves]
     chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
               if _stored_as_delta(average, live)]
     if not chosen:
@@ -340,10 +332,10 @@ def _ema_deltas(checkpointer: ocp.CheckpointManager, step: int,
     recorded = set(custom.get('ema_deltas', ()))
     if not recorded:
         return {}
-    deltas = {}
+    deltas, lives = {}, _by_path(stored['params'])
     for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
         if jax.tree_util.keystr(path) in recorded:
-            live = _at(stored['params'], path)
+            live = lives[path]
             deltas[path] = jax.ShapeDtypeStruct(tuple(live.shape), live.dtype)
     return deltas
 
@@ -360,17 +352,6 @@ def _plane_template(ema, deltas):
         return jax.ShapeDtypeStruct((np.dtype(deltas[path].dtype).itemsize, *leaf.shape), np.uint8,
                                     sharding=_planes_sharding(getattr(leaf, "sharding", None)))
     return jax.tree_util.tree_map_with_path(planes, ema), targets
-
-
-def _nested(leaves: Mapping[jax.tree_util.KeyPath, StateLeaf]) -> dict:
-    """The tree holding each of `leaves` at its path."""
-    tree = {}
-    for path, leaf in leaves.items():
-        node = tree
-        for key in path[:-1]:
-            node = node.setdefault(key.key, {})
-        node[path[-1].key] = leaf
-    return tree
 
 
 def _check_template(template, metadata, stored) -> None:
@@ -730,8 +711,9 @@ class Checkpoints:
             deltas = _ema_deltas(checkpointer, step, metadata)
             if deltas:
                 restored = dict(restored)
+                weights = _by_path(restored['params'])
                 restored['ema'] = jax.tree_util.tree_map_with_path(
-                    lambda path, leaf: _from_delta_planes(leaf, _at(restored['params'], path))
+                    lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
             state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
@@ -773,7 +755,7 @@ class Checkpoints:
                     f"or objective without them. Restore it with the model it was "
                     f"written with.")
             if targets:
-                restored = {**restored, 'ema': self._averages(checkpointer, step, restored,
+                restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
         restored = dict(restored)
         table = restored.pop('position', None)
@@ -782,7 +764,7 @@ class Checkpoints:
         return restored, saved
 
     @staticmethod
-    def _averages(checkpointer: ocp.CheckpointManager, step: int, restored,
+    def _averages(checkpointer: ocp.CheckpointManager, step: int, metadata, restored,
                   targets: dict, deltas: dict) -> Variables:
         """Return the restored EMA tree with each plane stack of `targets` turned
         back into the leaf it holds, typed and placed as the template has it.
@@ -793,22 +775,27 @@ class Checkpoints:
         rest are read here, placed as the leaves they undo.
         """
         lives, unread = {}, {}
+        held = _by_path(restored.get('params'))
         for path, target in targets.items():
-            held = _find(restored.get('params'), path)
-            if (isinstance(held, jax.Array) and held.dtype == deltas[path].dtype
-                    and held.sharding.memory_kind != "pinned_host"):
-                lives[path] = held
+            weight = held.get(path)
+            if (isinstance(weight, jax.Array) and weight.dtype == deltas[path].dtype
+                    and weight.sharding.memory_kind != "pinned_host"):
+                lives[path] = weight
             else:
                 sharding = getattr(target, "sharding", None)
                 unread[path] = jax.ShapeDtypeStruct(
                     deltas[path].shape, deltas[path].dtype,
                     sharding=None if sharding is None else sharding.with_memory_kind("device"))
         if unread:
-            weights = {'params': _nested(unread)}
+            # The stored params tree, its containers kept, with every leaf
+            # but the ones to read held back by orbax's placeholder.
+            weights = {'params': jax.tree_util.tree_map_with_path(
+                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['params'])}
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 item=weights, partial_restore=True, restore_args=jax.tree.map(
-                    lambda leaf: ocp.ArrayRestoreArgs(sharding=leaf.sharding), weights)))
-            lives.update({path: _at(read['params'], path) for path in unread})
+                    lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)),
+                    weights)))
+            lives.update({path: leaf for path, leaf in _by_path(read['params']).items() if path in unread})
 
         def average(path, planes):
             if path not in targets:
