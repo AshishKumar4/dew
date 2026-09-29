@@ -16,7 +16,7 @@ FlaxDiff was this project's earlier library, built around diffusion. Dew separat
 
 [Custom objectives](concepts/objectives.md) describes the contract every objective follows, [Diffusion training](guides/diffusion.md) the diffusion pieces, and [Recipes](recipes.md) the command-line configuration.
 
-## Loading a FlaxDiff text-to-image checkpoint
+## Loading an older text-to-image checkpoint
 
 `dew.interop.flaxdiff.load_flaxdiff` loads `simple_udit` and `hybrid_dit` latent text-to-image models from the older checkpoint format, trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task `dew.pipeline` returns for a Dew run.
 
@@ -24,25 +24,25 @@ It takes three things from the old run:
 
 | Argument | Where it comes from |
 |---|---|
-| Checkpoint directory | One step directory written by FlaxDiff's trainer, with a `default/` folder inside |
-| `config` | The run config the trainer logged to wandb; it names the architecture and sizes, which the checkpoint does not |
-| `jax_version` | The JAX version in the run's `requirements.txt`. FlaxDiff drew the random frequencies of its time embedding from `jax.random`, whose stream changed in JAX 0.5.0, and did not save them, so the loader draws them the way that version did. |
+| Checkpoint directory | One step directory written by the older trainer, with a `default/` folder inside |
+| `config` | The run's saved training config, as JSON; it names the architecture and sizes, which the checkpoint does not |
+| `jax_version` | The JAX version in the run's `requirements.txt`. The older code drew the random frequencies of its time embedding from `jax.random`, whose stream changed in JAX 0.5.0, and did not save them, so the loader draws them the way that version did. |
 
-<!-- not run: needs a FlaxDiff checkpoint and its wandb config -->
+<!-- not run: needs an older checkpoint and its training config -->
 ```python
 import json
 
 from dew.interop.flaxdiff import load_flaxdiff
 from dew.sampling import Heun
 
-config = json.load(open("run_config.json"))  # wandb.Api().run(path).config
+config = json.load(open("run_config.json"))  # the run's saved training config
 pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
 images = pipe(["a lighthouse on a rocky coast"], seed=0, steps=25, sampler=Heun()).host().images
 ```
 
-`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where FlaxDiff 0.2's blocks differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against FlaxDiff's own code.
+`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.
 
-Anything else, including FlaxDiff's UNets and its 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
+Anything else, including the older UNets and the 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 
 ## New runs
 
