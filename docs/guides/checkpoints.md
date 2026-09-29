@@ -119,7 +119,7 @@ Orbax compresses every array of a checkpoint with zstd, which saves 6 to 9% on w
 | 176M-parameter DiT, fp32, step 1.35M | 652.7 MB | 560.3 MB | 488.6 MB (−25%) |
 | 8.7M-parameter DiT, fp32, step 750, decay 0.999 | 32.2 MB | 30.8 MB | 28.2 MB (−12%) |
 
-The longer a run trains, the closer its EMA sits to the weights, and the more the XOR saves. Written through `Checkpoints` on an RTX 4080, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. Once compiled, saves and restores took as long as before, within the noise of a shared machine. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model), which took 1 s and 4 s here.
+How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` on an RTX 4080, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. Once compiled, saves and restores took as long as before, within the noise of a shared machine. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model), which took 1 s and 4 s here.
 
 Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
 
