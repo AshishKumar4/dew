@@ -10,7 +10,7 @@ commit the JSON it writes:
 The script runs on JAX's default backend; `--where` names the machine for the
 caption, and the device comes from JAX. The page reads the commit of the
 installed Dew from pip's record of a git install, so install Dew from GitHub
-or a local clone with `pip install "dew-ml @ git+..."`, not an editable
+or a local clone with `pip install "dewml @ git+..."`, not an editable
 install.
 """
 
@@ -31,9 +31,9 @@ SNIPPETS = ("hero",)
 
 
 def installed_commit() -> str:
-    record = distribution("dew-ml").read_text("direct_url.json")
+    record = distribution("dewml").read_text("direct_url.json")
     if record is None:
-        raise SystemExit("dew-ml was not installed from git, so the page cannot name the commit it ran")
+        raise SystemExit("dewml was not installed from git, so the page cannot name the commit it ran")
     return json.loads(record)["vcs_info"]["commit_id"]
 
 
