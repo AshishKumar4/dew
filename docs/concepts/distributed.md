@@ -41,10 +41,10 @@ print(kernel.addressable_shards[0].data.shape)
 
 ```text
 Training CausalTransformer from step 0 to 4: 2.2M parameters, on 8 × cpu, mesh data 2 × fsdp 2 × tensor 2, batch 16, float32
-step 2/4  loss 4.741  perplexity 114.5  token_accuracy 18.8%  step_time_ms 281.7  samples_per_sec 56.80  accepted 100.0%  0:00:01 left
-step 4/4  loss 2.140  perplexity 8.499  token_accuracy 92.5%  step_time_ms 169.5  samples_per_sec 94.40  accepted 100.0%
-Trained 4 steps in 0:00:03: first step after 2.69 s, then 5.8 step/s
-16.1% of the wall time in steps, final loss 2.140
+step 2/4  loss 4.741  ce 4.741  perplexity 114.5  token_accuracy 18.8%  step_time_ms 302.9  samples_per_sec 52.82  accepted 100.0%  0:00:01 left
+step 4/4  loss 2.140  ce 2.140  perplexity 8.499  token_accuracy 92.5%  step_time_ms 154.2  samples_per_sec 103.8  accepted 100.0%
+Trained 4 steps in 0:00:02: first step after 1.32 s, then 5.9 step/s
+27.7% of the wall time in steps, final loss 2.140
 (256, 1024) P('fsdp', 'tensor')
 (128, 512)
 ```

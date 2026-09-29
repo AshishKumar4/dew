@@ -64,12 +64,12 @@ print(tokenizer.decode(continuation.tokens[0]))
 
 ```text
 Training CausalTransformer from step 0 to 300: 147,904 parameters, on 1 × cpu, batch 16, float32
-step 100/300  loss 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 23.08  samples_per_sec 693.3  accepted 100.0%  0:00:04 left
-step 200/300  loss 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 21.93  samples_per_sec 729.8  accepted 100.0%  0:00:02 left
-step 300/300  loss 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 20.22  samples_per_sec 791.2  accepted 100.0%
-eval val at step 300: perplexity 16.68 (32 records in 0.51 s)
-Trained 300 steps in 0:00:08: first step after 1.38 s, then 46.5 step/s
-77.3% of the wall time in steps, final loss 0.06941
+step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 62.10  samples_per_sec 257.6  accepted 100.0%  0:00:11 left
+step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 52.80  samples_per_sec 303.0  accepted 100.0%  0:00:06 left
+step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 49.44  samples_per_sec 323.6  accepted 100.0%
+eval val at step 300: perplexity 16.68 (32 records in 0.68 s)
+Trained 300 steps in 0:00:19: first step after 2.14 s, then 18.4 step/s
+85.2% of the wall time in steps, final loss 0.06941
 One day, Lily saw a big dog in the park. The dog want
 ```
 
@@ -151,7 +151,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 | `trainable` | `None` | `PathFilter` selecting the leaves the optimizer moves; the rest go under `frozen`. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
-The step reports `ce`, `perplexity` and `token_accuracy`; the training display leaves `ce` out when it equals the loss. `LMObjective` refuses a model built with `causal=False`.
+The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
 
 ### Loss and precision
 
@@ -335,10 +335,10 @@ print(tokenizer.decode(drawn.tokens[0]))
 
 ```text
 Training CausalTransformer from step 0 to 1000: 147,968 parameters, on 1 × cpu, batch 16, float32
-step  500/1000  loss 0.6956  masked_accuracy 64.9%  masked_fraction 45.6%  step_time_ms 43.26  samples_per_sec 369.9  accepted 100.0%  0:00:20 left
-step 1000/1000  loss 0.7562  masked_accuracy 64.4%  masked_fraction 51.6%  step_time_ms 27.59  samples_per_sec 580.0  accepted 100.0%
-Trained 1000 steps in 0:00:38: first step after 2.35 s, then 28.3 step/s
-93.7% of the wall time in steps, final loss 0.7562
+step  500/1000  loss 0.6956  masked_accuracy 64.9%  masked_fraction 45.6%  step_time_ms 20.22  samples_per_sec 791.4  accepted 100.0%  0:00:11 left
+step 1000/1000  loss 0.7562  masked_accuracy 64.4%  masked_fraction 51.6%  step_time_ms 18.57  samples_per_sec 861.4  accepted 100.0%
+Trained 1000 steps in 0:00:20: first step after 1.16 s, then 51.7 step/s
+94.3% of the wall time in steps, final loss 0.7562
 One day, Lily. She da b tfte,dAt nigl
 ```
 
@@ -426,8 +426,8 @@ print("Optimizer updates:", int(block_state.updates))
 
 ```text
 Training DiffusionGemma from step 0 to 1: 1,858 parameters, on 1 × cpu, batch 2, float32
-step 1/1  loss 6.802  canvas_ce 3.259  encoder_ce 3.542  step_time_ms 73.56  samples_per_sec 27.19  accepted 100.0%
-Trained 1 steps in 0:00:03: first step after 3.13 s
+step 1/1  loss 6.802  canvas_ce 3.259  encoder_ce 3.542  step_time_ms 77.14  samples_per_sec 25.93  accepted 100.0%
+Trained 1 steps in 0:00:03: first step after 3.18 s
 0.1% of the wall time in steps, final loss 6.802
 Optimizer updates: 1
 ```

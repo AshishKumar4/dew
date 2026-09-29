@@ -64,10 +64,10 @@ sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit
 
 ```text
 Training CausalTransformer from step 0 to 20: 147,904 parameters, on 1 × cpu, batch 8, float32
-step 10/20  loss 1.136  perplexity 3.115  token_accuracy 92.9%  step_time_ms 17.30  samples_per_sec 462.5  accepted 100.0%
-step 20/20  loss 0.2127  perplexity 1.237  token_accuracy 100.0%  step_time_ms 9.385  samples_per_sec 852.4  accepted 100.0%
-Trained 20 steps in 0:00:01: first step after 0.79 s, then 101.9 step/s
-19.1% of the wall time in steps, final loss 0.2127
+step 10/20  loss 1.136  ce 1.136  perplexity 3.115  token_accuracy 92.9%  step_time_ms 19.51  samples_per_sec 410.1  accepted 100.0%
+step 20/20  loss 0.2127  ce 0.2127  perplexity 1.237  token_accuracy 100.0%  step_time_ms 13.53  samples_per_sec 591.3  accepted 100.0%
+Trained 20 steps in 0:00:01: first step after 1.08 s, then 84.1 step/s
+17.3% of the wall time in steps, final loss 0.2127
 ```
 
 ### Preference optimization
@@ -89,10 +89,10 @@ dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
 
 ```text
 Training CausalTransformer from step 0 to 10: 147,904 parameters, on 1 × cpu, batch 8, float32
-step  5/10  loss 0.03523  accuracy 1.000  rewards/chosen -1.711  rewards/rejected -5.039  step_time_ms 38.78  samples_per_sec 206.3  accepted 100.0%
-step 10/10  loss 0.008948  accuracy 1.000  rewards/chosen -3.645  rewards/rejected -8.357  step_time_ms 13.56  samples_per_sec 590.2  accepted 100.0%
-Trained 10 steps in 0:00:02: first step after 1.60 s, then 79.2 step/s
-6.6% of the wall time in steps, final loss 0.008948
+step  5/10  loss 0.03523  accuracy 1.000  rewards/chosen -1.711  rewards/rejected -5.039  step_time_ms 68.22  samples_per_sec 117.3  accepted 100.0%
+step 10/10  loss 0.008948  accuracy 1.000  rewards/chosen -3.645  rewards/rejected -8.357  step_time_ms 36.17  samples_per_sec 221.2  accepted 100.0%
+Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
+10.5% of the wall time in steps, final loss 0.008948
 ```
 
 `PreferencePairs.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
@@ -130,10 +130,10 @@ print(int(rl_state.updates), "GRPO updates")
 
 ```text
 Training CausalTransformer from step 0 to 4: 147,904 parameters, on 1 × cpu, batch 8, float32
-step 2/4  loss 2.506e-05  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 1.770e-08  kl 0.002508  mismatch/ess 0.9903  mismatch/k3_kl 0.1754  mismatch/kl 0.6520  pg -2.049e-08  step_time_ms 75.75  samples_per_sec 422.4  rollout_seconds 1.466  accepted 100.0%  reward/mean 0.3438  length/mean 8.000  status/truncated 100.0%
-step 4/4  loss 2.535e-04  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 2.980e-08  kl 0.02535  mismatch/ess 0.9888  mismatch/k3_kl 0.1683  mismatch/kl 0.6362  pg -3.306e-08  step_time_ms 32.93  samples_per_sec 971.7  rollout_seconds 0.05340  accepted 100.0%  reward/mean 0.3789  length/mean 8.000  status/truncated 100.0%
-Trained 4 steps in 0:00:03: first step after 2.41 s, then 25.0 step/s
-4.7% of the wall time in steps, final loss 2.535e-04
+step 2/4  loss 2.506e-05  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 1.770e-08  kl 0.002508  mismatch/ess 0.9903  mismatch/k3_kl 0.1754  mismatch/kl 0.6520  pg -2.049e-08  step_time_ms 107.2  samples_per_sec 298.5  rollout_seconds 2.009  accepted 100.0%  reward/mean 0.3438  length/mean 8.000  status/truncated 100.0%
+step 4/4  loss 2.535e-04  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 2.980e-08  kl 0.02535  mismatch/ess 0.9888  mismatch/k3_kl 0.1683  mismatch/kl 0.6362  pg -3.306e-08  step_time_ms 73.57  samples_per_sec 435.0  rollout_seconds 0.1273  accepted 100.0%  reward/mean 0.3789  length/mean 8.000  status/truncated 100.0%
+Trained 4 steps in 0:00:04: first step after 3.76 s, then 13.0 step/s
+5.8% of the wall time in steps, final loss 2.535e-04
 4 GRPO updates
 ```
 
@@ -229,10 +229,10 @@ print("Completed", int(state.updates), "DPO updates; reference stayed fixed.")
 
 ```text
 Training CausalTransformer from step 0 to 2: 2,752 parameters, on 1 × cpu, batch 8, float32
-step 1/2  loss 0.6931  accuracy 0  rewards/chosen -2.384e-08  rewards/rejected 0  step_time_ms 24.22  samples_per_sec 330.3  accepted 100.0%
-step 2/2  loss 0.6703  accuracy 1.000  rewards/chosen 0.03338  rewards/rejected -0.01294  step_time_ms 0.8063  samples_per_sec 9,921  accepted 100.0%
-Trained 2 steps in 0:00:01: first step after 1.13 s, then 768.0 step/s
-0.1% of the wall time in steps, final loss 0.6703
+step 1/2  loss 0.6931  accuracy 0  rewards/chosen -2.384e-08  rewards/rejected 0  step_time_ms 35.71  samples_per_sec 224.0  accepted 100.0%
+step 2/2  loss 0.6703  accuracy 1.000  rewards/chosen 0.03338  rewards/rejected -0.01294  step_time_ms 1.349  samples_per_sec 5,928  accepted 100.0%
+Trained 2 steps in 0:00:01: first step after 1.44 s, then 442.7 step/s
+0.2% of the wall time in steps, final loss 0.6703
 Completed 2 DPO updates; reference stayed fixed.
 ```
 
@@ -478,10 +478,10 @@ print("PPO updates:", int(state.updates))
 
 ```text
 Training PPOObjective from step 0 to 2: 169 parameters, on 1 × cpu, batch 1, float32
-step 1/2  loss 0.1247  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.2493  kl 0  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.008742  pg -4.470e-08  step_time_ms 8.421  samples_per_sec 1,425  rollout_seconds 1.744  accepted 100.0%
-step 2/2  loss 0.1797  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.01021  pg 8.941e-08  step_time_ms 47.20  samples_per_sec 254.2  rollout_seconds 0.04404  accepted 100.0%
-Trained 2 steps in 0:00:02: first step after 2.29 s, then 20.5 step/s
-2.1% of the wall time in steps, final loss 0.1797
+step 1/2  loss 0.1247  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.2493  kl 0  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.008742  pg -4.470e-08  step_time_ms 2.660  samples_per_sec 4,511  rollout_seconds 0.9878  accepted 100.0%
+step 2/2  loss 0.1797  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.01021  pg 8.941e-08  step_time_ms 44.26  samples_per_sec 271.1  rollout_seconds 0.04330  accepted 100.0%
+Trained 2 steps in 0:00:02: first step after 1.52 s, then 22.4 step/s
+2.9% of the wall time in steps, final loss 0.1797
 PPO updates: 2
 ```
 
