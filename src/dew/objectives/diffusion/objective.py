@@ -32,7 +32,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.mp import Uncertainty
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
-from dew.sampling.guidance import CFG
+from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
@@ -85,7 +85,7 @@ class DiffusionObjective(Objective[Mean]):
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
         sampler: Solver = DDIM(),
-        guidance: CFG | None = CFG(3.0),
+        guidance: Guidance | None = CFG(3.0),
         steps: int = 200,
         pretrained: Variables | None = None,
         uncertainty: int | None = None,
