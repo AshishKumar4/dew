@@ -72,3 +72,36 @@ def test_another_run_keeps_its_missing_fields_refused():
     del written["version"], written["audio"]
     with pytest.raises(ValueError, match=r"missing fields \['audio'\]"):
         ListeningRun.from_dict(written)
+
+
+def version_1_quantized(spec):
+    """A diffusion run record as version 1 wrote it, quantized as `spec`
+    says: its spec has no `weight_only`."""
+    import dataclasses
+
+    run = DiffusionRunConfig.from_dict(record("hybrid-dit-176m-dfa94d6"))
+    written = json.loads(json.dumps(
+        dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, quantization=spec)).to_dict()))
+    del written["trainer"]["quantization"]["weight_only"]
+    return {**written, "version": 1}
+
+
+def test_a_quantized_run_from_before_weight_only_quantized_its_activations():
+    from dew.training.quantization import Quantization
+
+    spec = Quantization(dtype="fp8", patterns=(".*mlp.*",))
+    run = DiffusionRunConfig.from_dict(version_1_quantized(spec))
+    assert run.trainer.quantization == spec and not run.trainer.quantization.weight_only
+
+
+def test_a_task_reads_an_older_record_brought_forward(tmp_path):
+    """Tasks read `run.json` directly, including the spec at the top level
+    where records from before the trainer held it carry it."""
+    from dew.inference.tasks import _saved_quantization, run_record
+    from dew.training.quantization import Quantization
+
+    written = version_1_quantized(Quantization())
+    older = {**written, "quantization": written["trainer"]["quantization"],
+             "trainer": {**written["trainer"], "quantization": None}}
+    (tmp_path / "run.json").write_text(json.dumps(older))
+    assert _saved_quantization(run_record(str(tmp_path))) == Quantization()
