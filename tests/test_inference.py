@@ -132,6 +132,24 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
+def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path):
+    """A published run may hold its weights once, with no average beside
+    them; the default reads that copy, and asking for an average it does not
+    keep is refused."""
+    _, state = make_run(tmp_path / "kept")
+    single = tmp_path / "single"
+    checkpoints = Checkpoints(str(single), keep=1)
+    checkpoints.save(int(state.step), state.replace(ema=None), None)
+    checkpoints.wait()
+    dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
+
+    expected = TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, seed=0).host().images
+    np.testing.assert_array_equal(TextToImage.from_run(str(single))(["a lily"], steps=3, seed=0).host().images,
+                                  expected)
+    with pytest.raises(ValueError, match="keeps no EMA"):
+        TextToImage.from_run(str(single), ema=True)
+
+
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     """run.json holds the preset's fields, so inference samples with the
     shift the run trained with and not the preset default."""
@@ -575,8 +593,8 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     with pytest.raises(ValueError, match="no EMA"):
         objective.pipeline(state)
     with pytest.raises(ValueError, match="no EMA"):
-        dew.pipeline(str(tmp_path))
-    restored = dew.pipeline(str(tmp_path), ema=False)
+        dew.pipeline(str(tmp_path), ema=True)
+    restored = dew.pipeline(str(tmp_path))
     live = objective.pipeline(state, ema=False, processor=restored.processor)
     np.testing.assert_array_equal(restored("the ", seed=7).host().tokens,
                                   live("the ", seed=7).host().tokens)
