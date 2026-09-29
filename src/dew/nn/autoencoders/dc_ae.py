@@ -131,7 +131,7 @@ class _MultiscaleProjection(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = _conv(self.features, self.kernel, self.dtype, "proj_in", groups=self.features, bias=False)(x)
-        return _conv(self.features, 1, self.dtype, "proj_out", groups=3 * self.heads, bias=False)(x)
+        return _conv(self.features, 1, self.dtype, "per_head", groups=3 * self.heads, bias=False)(x)
 
 
 class _LinearAttention(nn.Module):
@@ -425,7 +425,9 @@ _NORMS = ("norm", "norm_out")
 def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
     """The parameter path of one `AutoencoderDC` tensor, or None for a batch
     norm's step count. Digits join the name before them; a norm's weight is
-    its 1-D scale, and every other weight a 2-D or 4-D kernel."""
+    its 1-D scale, and every other weight a 2-D or 4-D kernel. The multiscale
+    branch's `proj_out` is `per_head`: a bare `proj_out` names a sharded
+    projection elsewhere in Dew."""
     if name.endswith(".num_batches_tracked"):
         return None
     if _NAME.fullmatch(name) is None:
@@ -441,7 +443,7 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
         if part.isdigit():
             path[-1] = f"{path[-1]}_{part}"
         else:
-            path.append(part)
+            path.append("per_head" if part == "proj_out" else part)
     if leaf == "weight":
         leaf = "scale" if norm else "kernel"
     return (*path, leaf)
