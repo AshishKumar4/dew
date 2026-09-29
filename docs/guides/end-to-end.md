@@ -1,8 +1,6 @@
-# End-to-end examples
+# End-to-end runs
 
-Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a whole job, from data to trained or scored weights. By default each script uses settings for real hardware. The `--smoke` flag swaps in the repository's tiny fixtures, a few steps and one CPU device. Smoke runs need no network and no accelerator. `tests/test_examples.py` runs all five smoke runs as subprocesses and checks the files each one leaves behind.
-
-Each smoke command below is the one that test runs. Set `JAX_PLATFORMS=cpu` and point `--out` at a scratch directory.
+Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/examples) each run a whole job: they read data, train or load weights, and score or export the result. By default a script uses settings for real hardware. `--smoke` replaces them with the repository's tiny fixtures, a few steps and one CPU device, and needs no network and no accelerator. `tests/test_examples.py` runs every smoke command below as a subprocess and checks the files it leaves.
 
 ## Text-to-image diffusion on a TPU slice
 
@@ -104,4 +102,4 @@ python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
 JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 ```
 
-The smoke run first trains a byte-level model for two steps and then scores it, so the script has a run to read without you preparing one. If you point it at a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run; that checks the metric code, not the model.
+The smoke run first trains a byte-level model for two steps and then scores it. Given a diffusion run with `--image-run`, the smoke run also scores CLIPScore and FID offline. A smoke run has no held-out set, so the reference images are a second draw from the same run; that checks the metric code, not the model.

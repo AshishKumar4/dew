@@ -90,7 +90,7 @@ def test_without_torch_a_pickle_checkpoint_is_refused_naming_the_extra(tmp_path,
     source = pickled_fixture(tmp_path / "source")
     monkeypatch.setitem(sys.modules, "torch", None)
 
-    with pytest.raises(ImportError, match=r"dew-ml\[torch\].*huggingface\.co/spaces/safetensors/convert"):
+    with pytest.raises(ImportError, match=r"dewml\[torch\].*huggingface\.co/spaces/safetensors/convert"):
         load_pretrained(source)
 
 

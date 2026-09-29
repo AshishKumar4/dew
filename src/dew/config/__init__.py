@@ -55,7 +55,7 @@ from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
 from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
-from dew.training.trainer import ProfileWindow, Trainer
+from dew.training.trainer import ProfileWindow, Rollout, Trainer
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -530,7 +530,7 @@ class RunConfig:
         return dataclasses.replace(self, objective=kind)
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
-              metrics: Sequence[Metric] = (),
+              metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None) -> TrainState:
         """Train `objective` on `data` as this run says; every recipe calls
         this once it has built both.
@@ -553,6 +553,8 @@ class RunConfig:
         anything initialises it, so the quantized forward is what the run
         learns through, and a `lora` adapts the same module the same way,
         so the run traces the adapted forward and moves only its factors.
+        `rollout` is the trainer's, which turns each prefetched batch into the
+        one the step trains on, as an on-policy objective samples it.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -593,7 +595,7 @@ class RunConfig:
                 trainer, objective, build_optimizer(self.optim, steps),
                 key=jax.random.key(trainer.seed),
                 checkpoints=checkpoints,
-                tracker=tracker,
+                tracker=tracker, rollout=rollout,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,

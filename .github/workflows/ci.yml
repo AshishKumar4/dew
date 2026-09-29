@@ -1,4 +1,4 @@
-# Installs dew-ml, checks for syntax errors and undefined names, lints and type
+# Installs dewml, checks for syntax errors and undefined names, lints and type
 # checks src/dew, and runs the CPU test lane split into shards, each its own
 # check. For more information see:
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python

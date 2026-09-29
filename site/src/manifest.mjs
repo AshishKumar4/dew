@@ -6,6 +6,11 @@
 // Sources stay where they are in `docs/`: code, tests and the README link to
 // those paths. A group with `generated` is filled by a build script, which
 // writes its pages and `src/generated/<name>.json`.
+//
+// The sidebar shows only the groups of the header section the current page is
+// in (src/nav.mjs, src/route-data.mjs). A group without a label shows its
+// pages as plain links; a labeled group is a section that stays collapsed
+// until it holds the current page.
 
 export const repository = {
 	url: 'https://github.com/AshishKumar4/dew',
@@ -14,7 +19,6 @@ export const repository = {
 
 export const groups = [
 	{
-		label: 'Getting started',
 		items: [
 			{ source: 'docs/index.md', slug: 'docs', label: 'Overview' },
 			{ source: 'docs/installation.md', slug: 'getting-started/installation', label: 'Installation' },
@@ -24,60 +28,67 @@ export const groups = [
 		],
 	},
 	{
-		label: 'Tutorials',
-		items: [{ source: 'docs/tutorials.md', slug: 'tutorials', label: 'Overview' }],
-		generated: 'tutorials',
-	},
-	{
-		label: 'How-to guides',
+		label: 'Training',
 		items: [
-			{ source: 'docs/concepts/data.md', slug: 'guides/data', label: 'Supply training data' },
-			{ source: 'docs/concepts/objectives.md', slug: 'guides/custom-objective', label: 'Write a custom objective' },
-			{ source: 'docs/guides/evaluation.md', slug: 'guides/evaluation', label: 'Evaluate and track runs' },
-			{ source: 'docs/guides/checkpoints.md', slug: 'guides/checkpoints', label: 'Save and resume' },
-			{ source: 'docs/guides/diffusion.md', slug: 'guides/diffusion', label: 'Configure diffusion training' },
-			{ source: 'docs/guides/representation-learning.md', slug: 'guides/jepa', label: 'Train a JEPA encoder' },
-			{ source: 'docs/concepts/language_models.md', slug: 'guides/language-models', label: 'Train language models' },
-			{ source: 'docs/concepts/inference.md', slug: 'guides/inference', label: 'Generate and serve' },
-			{ source: 'docs/concepts/post_training.md', slug: 'guides/post-training', label: 'Post-train with SFT, DPO and RL' },
-			{ source: 'docs/recipes.md', slug: 'guides/recipes', label: 'Run a training recipe' },
-			{ source: 'docs/guides/multi-node.md', slug: 'guides/multi-node', label: 'Train on several nodes' },
-			{ source: 'docs/tpu.md', slug: 'guides/tpu', label: 'Run on Cloud TPUs' },
+			{ source: 'docs/concepts/data.md', slug: 'guides/data', label: 'Training data' },
+			{ source: 'docs/concepts/objectives.md', slug: 'guides/custom-objective', label: 'Custom objectives' },
+			{ source: 'docs/guides/evaluation.md', slug: 'guides/evaluation', label: 'Evaluation and tracking' },
+			{ source: 'docs/guides/checkpoints.md', slug: 'guides/checkpoints', label: 'Checkpoints' },
+			{ source: 'docs/recipes.md', slug: 'guides/recipes', label: 'Recipes' },
 		],
 	},
 	{
-		label: 'Concepts',
+		label: 'Diffusion',
+		items: [
+			{ source: 'docs/concepts/diffusion.md', slug: 'concepts/diffusion', label: 'Processes and solvers' },
+			{ source: 'docs/guides/diffusion.md', slug: 'guides/diffusion', label: 'Training configuration' },
+		],
+	},
+	{
+		label: 'Language models',
+		items: [
+			{ source: 'docs/concepts/language_models.md', slug: 'guides/language-models', label: 'Training' },
+			{ source: 'docs/concepts/moe.md', slug: 'concepts/moe', label: 'Mixture of experts' },
+			{ source: 'docs/concepts/post_training.md', slug: 'guides/post-training', label: 'Post-training' },
+			{ source: 'docs/concepts/inference.md', slug: 'guides/inference', label: 'Generation and serving' },
+		],
+	},
+	{
+		label: 'Representation learning',
+		items: [{ source: 'docs/guides/representation-learning.md', slug: 'guides/jepa', label: 'JEPA' }],
+	},
+	{
+		label: 'Scaling',
 		items: [
 			{ source: 'docs/concepts/distributed.md', slug: 'concepts/distributed', label: 'Distributed training' },
-			{ source: 'docs/concepts/moe.md', slug: 'concepts/moe', label: 'Mixture of experts' },
-			{ source: 'docs/concepts/diffusion.md', slug: 'concepts/diffusion', label: 'Diffusion processes and solvers' },
-		],
-	},
-	{
-		label: 'Examples',
-		items: [
-			{ source: 'docs/examples.md', slug: 'examples', label: 'Example scripts' },
-			{ source: 'docs/guides/end-to-end.md', slug: 'examples/end-to-end', label: 'End-to-end runs' },
-			{ source: 'docs/gallery.md', slug: 'examples/flaxdiff-gallery', label: 'FlaxDiff gallery' },
+			{ source: 'docs/guides/multi-node.md', slug: 'guides/multi-node', label: 'Multiple hosts' },
+			{ source: 'docs/tpu.md', slug: 'guides/tpu', label: 'Cloud TPUs' },
 		],
 	},
 	{
 		label: 'Reference',
 		items: [
 			{ source: 'docs/models.md', slug: 'reference/models', label: 'Supported models' },
-			{ source: 'docs/performance.md', slug: 'reference/performance', label: 'Performance measurements' },
+			{ source: 'docs/performance.md', slug: 'reference/performance', label: 'Performance' },
 			{ source: 'docs/benchmarks.md', slug: 'reference/benchmarks', label: 'Step benchmarks' },
 			{ source: 'docs/references.md', slug: 'reference/papers', label: 'Papers and attribution' },
+			{ source: 'CONTRIBUTING.md', slug: 'contributing', label: 'Contributing' },
 		],
 	},
 	{
-		label: 'API reference',
-		items: [{ source: 'docs/reference/core-api.md', slug: 'api', label: 'Overview' }],
-		generated: 'api',
+		items: [{ source: 'docs/tutorials.md', slug: 'tutorials', label: 'Overview' }],
+		generated: 'tutorials',
 	},
 	{
-		label: 'Contributing',
-		items: [{ source: 'CONTRIBUTING.md', slug: 'contributing', label: 'Contributing' }],
+		items: [
+			{ source: 'docs/examples.md', slug: 'examples', label: 'Example scripts' },
+			{ source: 'docs/guides/end-to-end.md', slug: 'examples/end-to-end', label: 'End-to-end runs' },
+			{ source: 'docs/gallery.md', slug: 'examples/gallery', label: 'Gallery' },
+		],
+	},
+	{
+		items: [{ source: 'docs/reference/core-api.md', slug: 'api', label: 'Overview' }],
+		generated: 'api',
 	},
 ];
 

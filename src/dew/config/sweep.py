@@ -6,7 +6,7 @@ returns. Trials land in a JSON ledger before they are reported, so an
 interrupted sweep resumes at the trial it stopped on instead of retraining
 the finished ones. `random_search` and `grid_search` need nothing beyond
 numpy; `optuna_search` asks Optuna's sampler for the next point and tells it
-the ledger's trials, and needs `dew-ml[hpo]`.
+the ledger's trials, and needs `dewml[hpo]`.
 """
 
 from __future__ import annotations

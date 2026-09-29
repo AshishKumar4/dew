@@ -2,24 +2,35 @@
 // The landing page. The hero comes from components/landing/LandingHero.astro
 // (Starlight renders it in the splash template's hero slot). Below it, each
 // section shows real code and what it produced: the page's own training script
-// and its recorded output, text-to-image samples, two examples, a tutorial
-// cell, then the tutorials.
+// and the terminal it ran on, text-to-image samples, places to try the model,
+// two examples, a tutorial cell, then the tutorials.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import { Code } from '@astrojs/starlight/components';
 import HeroOutput from '../components/landing/HeroOutput.astro';
-import LiveSampler from '../components/landing/LiveSampler.astro';
 import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
-import samplerCell from '../data/sampler.py?raw';
-import samplerSetup from '../data/sampler_setup.py?raw';
 import outputs from '../generated/notebook-outputs.json';
 import tutorials from '../generated/tutorial-cards.json';
+import { live } from '../live.mjs';
 import '../styles/landing.css';
 
-const hero = capture.snippets.hero;
-if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero snippet did not exit cleanly');
+const hero = capture.hero;
+if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero script did not exit cleanly');
+
+// Places to run the text-to-image model; the live sampler only when this build has live kernels (src/live.mjs).
+const tries = [
+	...(live.endpoint && live.turnstileSitekey
+		? [{ name: 'Live sampler', what: 'Edit the sampling cell and run it on a live CPU kernel.', href: '/sample/' }]
+		: []),
+	{
+		name: 'Colab notebook',
+		what: 'Load the model from the Hub and sample it on a GPU.',
+		href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb',
+	},
+	{ name: 'dewml/hybrid-dit-176m', what: 'The weights and model card on the Hugging Face Hub.', href: 'https://huggingface.co/dewml/hybrid-dit-176m' },
+];
 
 // A cell from a tutorial, with what it printed on the tutorial's last complete run.
 const shown = [
@@ -129,12 +140,13 @@ const cards = tutorials.map((entry) => {
 		<section class="band run" data-reveal>
 			<h2 class="band-title">A training run</h2>
 			<p class="band-lede">
-				A 14M-parameter byte-level transformer, trained on Tiny Shakespeare for 1,500 steps and then sampled. The
-				output is what this script printed.
+				A byte-level decoder whose every layer routes each token to 2 of 8 experts, trained on Tiny Shakespeare for
+				300 steps on a mesh of eight CPU devices simulated in one process, then served on the same mesh. The terminal
+				is what this script left on the screen.
 			</p>
 			<div class="run-grid">
 				<Code code={heroCode.trimEnd()} lang="python" title="train.py" />
-				<HeroOutput stdout={hero.stdout} meta={capture.meta} seconds={hero.seconds} />
+				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} />
 			</div>
 		</section>
 
@@ -162,13 +174,20 @@ const cards = tutorials.map((entry) => {
 			</p>
 		</section>
 
-		<section class="band sample-live" aria-label="Sample the model" data-reveal>
-			<h3 class="shown-label">Sample it yourself</h3>
-			<LiveSampler
-				setup={samplerSetup}
-				cell={samplerCell}
-				colab="https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb"
-			/>
+		<section class="band try" aria-label="Try the model" data-reveal>
+			<h3 class="shown-label">Try it</h3>
+			<ul class="try-list">
+				{
+					tries.map((entry) => (
+						<li>
+							<a class="try-link" href={entry.href}>
+								<span class="try-name">{entry.name}</span>
+								<span class="try-what">{entry.what}</span>
+							</a>
+						</li>
+					))
+				}
+			</ul>
 		</section>
 
 		<section class="band shown" aria-label="Examples and tutorials">

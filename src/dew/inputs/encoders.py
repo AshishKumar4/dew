@@ -61,6 +61,11 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     """Whether a dataset's captions are this encoder's raw data. One that is
     not reads the batch field its dataset writes itself, audio for instance,
     and `InputSpec.tokenize` leaves that field alone."""
+    keyword: ClassVar[str] = "textcontext"
+    """The model keyword this encoder's value is passed under. A value is
+    read by the models written for its type: a `TextContext` by the native
+    architectures' `textcontext`, a `DenoisingCondition` by the published
+    families' `conditioning`."""
 
     @classmethod
     @abstractmethod
