@@ -46,16 +46,21 @@ def test_a_tuple_field_comes_back_a_tuple_from_a_record():
     assert loaded == config
 
 
-def test_a_record_with_an_unknown_or_a_missing_field_is_refused():
+def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
     record = RunConfig().to_dict()
     with pytest.raises(ValueError, match="unknown fields \\['epochs_per_eval'\\]"):
         RunConfig.from_dict({**record, "trainer": {**record["trainer"], "epochs_per_eval": 1}})
-    trainer = dict(record["trainer"])
-    del trainer["steps"]
-    with pytest.raises(ValueError, match="missing fields \\['steps'\\]"):
-        RunConfig.from_dict({**record, "trainer": trainer})
+    with pytest.raises(ValueError, match="missing fields \\['project'\\]"):
+        RunConfig.from_dict({**record, "trainer": {**record["trainer"], "wandb": {"entity": "dew"}}})
     with pytest.raises(KeyError, match="no dataset named 'flowers'"):
         RunConfig.from_dict({**record, "data": {"name": "flowers", "fields": {}}})
+
+
+def test_a_field_a_record_lacks_takes_its_default():
+    record = RunConfig(trainer=TrainerConfig(steps=7)).to_dict()
+    trainer = dict(record["trainer"])
+    del trainer["steps"]
+    assert RunConfig.from_dict({**record, "trainer": trainer}).trainer.steps == TrainerConfig().steps
 
 
 def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
