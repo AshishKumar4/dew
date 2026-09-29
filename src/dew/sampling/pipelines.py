@@ -181,10 +181,10 @@ class TextToImage:
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
         """The objective's model over `variables`, sampling the way its
         evaluation does; a loss-only head the objective trains is dropped."""
-        from dew.objectives.diffusion.objective import _without_uncertainty
+        from dew.objectives.diffusion.objective import _without_loss_heads
 
         return cls(objective.model, objective.process, objective.inputs,
-                   _without_uncertainty(variables), objective.autoencoder,
+                   _without_loss_heads(variables), objective.autoencoder,
                    steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler,
                    blank=objective.blank_conditions)
 

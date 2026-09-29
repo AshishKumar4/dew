@@ -72,6 +72,10 @@ The presets are in `dew.diffusion.presets` and in the `dew.presets` registry. Tr
 
 EDM2 (Karras et al., 2024) trains under the `EDM` preset with its latent regime. Its network is the `edm2_unet` backbone, built from the magnitude-preserving layers in `dew.nn.mp`; it matches NVlabs' `UNet` (`tools/edm2_reference.py`), with a text condition in place of the class label. `--optim.forced-weight-normalization` renormalizes those layers' weights after every update, as the paper's forced weight normalization does, and `uncertainty=128` on the run config learns the paper's loss weighting, a head u(sigma) trained beside the model with the loss w / e^u ||D - y||^2 + u, which a published task drops.
 
+## Training aids
+
+`DiffusionObjective(alignment=Alignment(...))` adds representation alignment to the denoising loss. REPA (Yu et al., 2025) projects the model's hidden tokens at one layer with an MLP and scores them against a frozen encoder's patch features of the clean image by negative cosine similarity, weighted by `weight`. iREPA (Singh et al., 2026) uses `projector="conv"`, one 3x3 convolution over the token grid, and `spatial_norm=gamma`, which z-scores the encoder's features over space after subtracting gamma times their mean. Both losses match the official code (`tools/repa_reference.py`). The projector trains beside the model, the encoder's weights stay frozen, and a published task drops both. The aligned tokens must lie on the encoder's patch grid in raster order.
+
 ## Solvers
 
 `sample(denoise, x_T, steps, solver=..., key=...)` runs a solver from the highest time to zero. `denoise` is `process.denoiser(model, params, conditions)`, which calls the model and converts its output into estimates of $x_0$ and $\epsilon$. This samples from an untrained DiT with two solvers; only the shapes are meaningful:

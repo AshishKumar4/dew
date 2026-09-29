@@ -31,6 +31,7 @@ from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.mp import Uncertainty
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.registry import objectives
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
@@ -48,11 +49,16 @@ UNCERTAINTY = "loss_uncertainty"
 `constants` collections, beside the model's own modules."""
 
 
-def _without_uncertainty(variables: Variables) -> Variables:
-    """`variables` without the loss's uncertainty head, which the model never reads."""
-    return {name: ({key: value for key, value in tree.items() if key != UNCERTAINTY}
+LOSS_HEADS = (UNCERTAINTY, ALIGNMENT)
+"""The modules only the loss reads, trained beside the model under `params`."""
+
+
+def _without_loss_heads(variables: Variables) -> Variables:
+    """`variables` without what only the loss reads: the uncertainty head, the
+    alignment projector and the frozen representation encoder."""
+    return {name: ({key: value for key, value in tree.items() if key not in LOSS_HEADS}
                    if name in ("params", "constants") else tree)
-            for name, tree in variables.items()}
+            for name, tree in variables.items() if name != REPRESENTATION}
 
 
 def check_solver(process, sampler, steps: int) -> None:
@@ -89,6 +95,7 @@ class DiffusionObjective(Objective[Mean]):
         steps: int = 200,
         pretrained: Variables | None = None,
         uncertainty: int | None = None,
+        alignment: Alignment | None = None,
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
@@ -103,6 +110,12 @@ class DiffusionObjective(Objective[Mean]):
         every level contributes about equally. The head trains beside the
         model under `params`, as `UNCERTAINTY`, and a published task drops it.
         None keeps the preset's fixed weighting.
+
+        `alignment` adds REPA's or iREPA's representation alignment
+        (`Alignment`) of the model's hidden tokens at one layer with a
+        frozen encoder's features of the clean sample: its projector trains
+        under `params` as `ALIGNMENT`, the encoder's weights ride frozen
+        under `REPRESENTATION`, and a published task drops both.
         """
         self.model = model
         self.process = process
@@ -110,6 +123,7 @@ class DiffusionObjective(Objective[Mean]):
         self.autoencoder = autoencoder
         self.pretrained = pretrained
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
+        self.alignment = alignment
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
         # The unconditional branch is a pure function of the frozen towers
@@ -181,6 +195,8 @@ class DiffusionObjective(Objective[Mean]):
         held: dict[str, Any] = {"encoders": self.encoder_params()}
         if self.autoencoder is not None:
             held["autoencoder"] = self.autoencoder.params
+        if self.alignment is not None:
+            held[REPRESENTATION] = self.alignment.variables
         return held
 
     def init(self, key, variables: Variables | None = None) -> Variables:
@@ -196,21 +212,50 @@ class DiffusionObjective(Objective[Mean]):
             drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                     **conditions)
             state = {**drawn, "encoders": held["encoders"]}
-            if "autoencoder" in held:
+            for frozen in ("autoencoder", REPRESENTATION):
                 # The frozen weights are state, like the encoders'. They ride in
                 # as an argument to the compiled step for the layout to place.
-                state["autoencoder"] = held["autoencoder"]
+                if frozen in held:
+                    state[frozen] = held[frozen]
         if self.uncertainty is not None and UNCERTAINTY not in state["params"]:
             head = self.uncertainty.init(head_key, jnp.ones((1,)))
             for collection, value in head.items():
                 state[collection] = {**state.get(collection, {}), UNCERTAINTY: value}
+        if self.alignment is not None and ALIGNMENT not in state["params"]:
+            state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
+                jax.random.fold_in(key, 2), state)}
         return state
+
+    def _projector_init(self, key, state) -> Variables:
+        """The projector's parameters, shaped by the model's hidden tokens at
+        the aligned layer and the encoder's feature width."""
+        alignment = self.alignment
+        assert alignment is not None
+        conditions = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
+
+        def hidden(variables):
+            _, captured = self.model.apply(
+                variables, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions,
+                capture_intermediates=alignment.captures, mutable=["intermediates"])
+            return self._captured(captured)
+
+        tokens = jax.eval_shape(hidden, self.trainable(state))
+        features = jax.eval_shape(alignment.targets, state[REPRESENTATION],
+                                  jnp.zeros((1, *self.inputs.sample.shape)))
+        return alignment.init(key, tokens.shape[-1], tokens.shape[1], features.shape[-1])["params"]
+
+    def _captured(self, captured) -> jax.Array:
+        assert self.alignment is not None
+        kept = captured.get("intermediates", {}).get(self.alignment.layer)
+        if kept is None:
+            raise ValueError(f"the model has no submodule {self.alignment.layer!r} to align")
+        return kept["__call__"][0]
 
     def trainable(self, params) -> dict:
         """Return the model's own collections, without the frozen towers or
-        the loss's uncertainty head."""
-        return _without_uncertainty({name: value for name, value in params.items()
-                                     if name not in ("encoders", "autoencoder")})
+        the loss's own heads."""
+        return _without_loss_heads({name: value for name, value in params.items()
+                                    if name not in ("encoders", "autoencoder")})
 
     def encoded_conditions(self, params, batch) -> dict:
         """Encode each condition's own batch field under the tree's frozen towers."""
@@ -253,7 +298,7 @@ class DiffusionObjective(Objective[Mean]):
         return {name: batch[name] for name in fields}
 
     def loss(self, params, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
+        samples = images = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
             samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
@@ -268,9 +313,17 @@ class DiffusionObjective(Objective[Mean]):
         noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
 
         variables = self.trainable(params)
-        preds = self.model.apply(
-            variables, noisy * c_in, schedule.model_time(t), **conditions,
-            train=True, rngs={"dropout": dropout_key})
+        inputs = (variables, noisy * c_in, schedule.model_time(t))
+        call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
+        metrics = {}
+        if self.alignment is None:
+            preds = self.model.apply(*inputs, **call)
+        else:
+            preds, captured = self.model.apply(*inputs, **call, mutable=["intermediates"],
+                                               capture_intermediates=self.alignment.captures)
+            metrics["alignment"] = self.alignment.loss(
+                {"params": params["params"][ALIGNMENT]}, self._captured(captured),
+                self.alignment.targets(params[REPRESENTATION], images))
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         losses = optax.l2_loss(preds, target)
         weighted = losses * expand(self.process.weight(t), losses)
@@ -278,8 +331,12 @@ class DiffusionObjective(Objective[Mean]):
             head = {collection: params[collection][UNCERTAINTY] for collection in ("params", "constants")}
             logvar = expand(self.uncertainty.apply(head, schedule.model_time(t)), losses)
             weighted = weighted * jnp.exp(-logvar) + logvar / 2
-        return Mean(jnp.sum(weighted),
-                    jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
+        mass = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
+        total = jnp.sum(weighted)
+        if self.alignment is not None:
+            # REPA adds proj_coeff times its mean to the denoising mean.
+            total = total + self.alignment.weight * metrics["alignment"] * mass
+        return Mean(total, mass), Aux(metrics=metrics)
 
     def _sample_impl(self, params, batch, key, *, count: int):
         given, unconditional = self._conditions(params, batch, key, dropout=False)
