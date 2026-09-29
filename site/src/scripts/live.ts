@@ -5,8 +5,7 @@
 
 import { live } from '../live.mjs';
 
-const ENDPOINT = live.endpoint;
-const SITEKEY = live.turnstileSitekey;
+const { endpoint: ENDPOINT, turnstileSitekey: SITEKEY } = location.hostname === live.preview.hostname ? live.preview : live;
 
 export const liveEnabled = Boolean(ENDPOINT && SITEKEY);
 

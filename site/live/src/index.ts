@@ -35,8 +35,16 @@ async function passesTurnstile(env: Env, token: string, ip: string): Promise<boo
 	form.append('remoteip', ip);
 	const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
 	if (!response.ok) return false;
-	const outcome = await response.json<{ success: boolean; hostname?: string; action?: string }>();
-	return outcome.success && listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
+	const outcome = await response.json<{
+		success: boolean;
+		hostname?: string;
+		action?: string;
+		metadata?: { result_with_testing_key?: boolean };
+	}>();
+	if (!outcome.success) return false;
+	// Cloudflare's test secret passes every token and names no real hostname or action.
+	if (outcome.metadata?.result_with_testing_key) return env.TURNSTILE_TEST_KEYS === 'accept';
+	return listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
 }
 
 async function createSession(request: Request, env: Env, ip: string, cors: HeadersInit): Promise<Response> {
