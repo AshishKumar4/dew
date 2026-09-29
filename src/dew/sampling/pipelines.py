@@ -24,7 +24,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG
+from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import active_profile
@@ -147,7 +147,7 @@ class TextToImage:
     params: Variables
     autoencoder: AutoEncoder | None = None
     steps: int = 50
-    guidance: CFG | None = None
+    guidance: Guidance | None = None
     sampler: Solver[object] = DDIM()
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
@@ -338,8 +338,8 @@ class TextToImage:
         chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
         if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
             chosen = CFG(float(chosen))
-        if chosen is not None and not isinstance(chosen, CFG):
-            raise ValueError("guidance must be a scale, a CFG value or None")
+        if chosen is not None and not isinstance(chosen, Guidance):
+            raise ValueError("guidance must be a scale, a guidance value or None")
         request = request_key(key, seed)
         prepared = prompts if isinstance(prompts, DenoisingInputs) else None
         default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
@@ -505,18 +505,18 @@ class TextToImage:
 
     @overload
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
                  sampler: Solver | None = None, key: jax.Array,
                  seed: None = None, decode: bool = True) -> Images: ...
 
     @overload
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
                  sampler: Solver | None = None, key: None = None,
                  seed: int, decode: bool = True) -> Images: ...
 
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
                  sampler: Solver | None = None, key: jax.Array | None = None,
                  seed: int | None = None, decode: bool = True) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free

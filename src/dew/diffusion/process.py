@@ -162,7 +162,11 @@ class Denoiser:
         return process.prediction.backward_diffusion(x_t, preds, rates)
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:
-        return self.convert(x_t, t, self._raw(x_t, t, self.conditions))
+        return self.convert(x_t, t, self.raw(x_t, t))
+
+    def raw(self, x_t, t) -> jax.Array:
+        """The model's raw output at `(x_t, t)` under the conditions."""
+        return self._raw(x_t, t, self.conditions)
 
     def raw_both(self, x_t, t) -> tuple[jax.Array, jax.Array]:
         """The conditional and the unconditional raw outputs, in one model

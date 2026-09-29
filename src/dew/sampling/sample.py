@@ -10,24 +10,24 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
-from dew.sampling.guidance import CFG
+from dew.sampling.guidance import Guidance, Walk
 from dew.sampling.solvers import Solver
 
 
 @overload
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int, *, solver: Solver[StateT],
-                   guidance: CFG | None = None, key: jax.Array, times: None = None,
+                   guidance: Guidance | None = None, key: jax.Array, times: None = None,
                    final_denoise: bool = True) -> jax.Array: ...
 
 
 @overload
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: None = None, *, solver: Solver[StateT],
-                   guidance: CFG | None = None, key: jax.Array, times: ArrayLike | Sequence[float],
+                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float],
                    final_denoise: bool = True) -> jax.Array: ...
 
 
 def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: Solver[StateT],
-                   guidance: CFG | None = None, key: jax.Array, times: ArrayLike | Sequence[float] | None = None,
+                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float] | None = None,
                    final_denoise: bool = True) -> jax.Array:
     """`steps` points from T to 0: a solver step across each interval, then the
     model's clean prediction at the last point.
@@ -49,9 +49,9 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
         raise ValueError("steps must be a positive integer")
     process = denoise.process
     if guidance is None:
-        predict = denoise
+        walk = Walk.stateless(denoise)
     elif isinstance(denoise, Denoiser):
-        predict = guidance(denoise)
+        walk = guidance.walk(denoise)
     else:
         raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")
     with jax.ensure_compile_time_eval():
@@ -65,24 +65,26 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
         if bool(jnp.any(~jnp.isfinite(times))) or bool(jnp.any(jnp.diff(times) > 0)):
             raise ValueError("times must be a finite descending grid")
     batch = x_T.shape[0]
+    guided = walk.init(x_T)
     if times.shape[0] == 1:
-        return predict(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
+        return walk.at(guided)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
 
     with jax.ensure_compile_time_eval():
         initial = solver.init(x_T, times, process, key=key)
 
     def body(carry, inputs):
-        x, state = carry
+        x, state, guided = carry
         t, t_next, index = inputs
         t = jnp.full((batch,), t)
         t_next = jnp.full((batch,), t_next)
-        denoised, eps = predict(x, t)
-        x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index), process, predict)
-        return (x, state), None
+        (denoised, eps), guided = walk.step(x, t, guided)
+        x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
+                               process, walk.at(guided))
+        return (x, state, guided), None
 
-    (x, _), _ = lax.scan(
-        body, (x_T, initial),
+    (x, _, guided), _ = lax.scan(
+        body, (x_T, initial, guided),
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     if not final_denoise:
         return x
-    return predict(x, jnp.full((batch,), times[-1]))[0]
+    return walk.at(guided)(x, jnp.full((batch,), times[-1]))[0]
