@@ -68,4 +68,15 @@ For text conditioning, `InputSpec.conditions` maps a model keyword argument to a
 
 With an autoencoder configured, training runs on latent tensors instead of pixels. Set the denoising model's channel count and spatial shape to match the encoder output, and keep the encoder's scaling convention. Loading a VAE does not load the weights of an external diffusion transformer.
 
+`DiffusionRunConfig.autoencoder` is a `PretrainedAutoencoder`, which builds the autoencoder its checkpoint's config names: a Stable Diffusion `AutoencoderKL`, or SANA's deep compression autoencoder (`AutoencoderDC`; the f32c32 checkpoints downsample 32 times into 32 channels). A DC-AE repository takes `revision="main"` or a commit; `bf16` and `flax` name the SD1-era flax layouts:
+
+```python
+from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
+
+config = DiffusionRunConfig(autoencoder=PretrainedAutoencoder(
+    "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers", revision="main"))
+```
+
+On the published SANA 1.1 weights and a 256x384 batch, the DC-AE port matches diffusers 0.34.0's `AutoencoderDC` to 9e-6 of the largest latent value and 3e-6 of the largest decoded pixel.
+
 Use [training recipes](../recipes.md) for runs on real datasets. [Supported models](../models.md) lists the published checkpoints that load.
