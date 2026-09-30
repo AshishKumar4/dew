@@ -47,7 +47,7 @@ import dataclasses
 import functools
 import importlib
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -72,9 +72,12 @@ suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
 # The entry methods a run's matmuls travel through, wrapped where the model
 # defines them. `__call__` covers sampling and scoring; the language-model
 # objective trains through `hidden_states` and its prediction depths through
-# `mtp_hidden_states`. Qwix's interception is non-recursive over dynamic
-# extent, so `__call__` reaching `hidden_states` quantizes once.
-METHODS = ("__call__", "hidden_states", "mtp_hidden_states")
+# `mtp_hidden_states`; text generation (`dew.sampling.text`) enters through
+# the rest. Qwix's interception is non-recursive over dynamic extent, so
+# `__call__` reaching `hidden_states` quantizes once.
+METHODS = ("__call__", "hidden_states", "mtp_hidden_states", "states_and_logits", "states_and_logits_at",
+           "init_cache", "init_mtp_cache", "init_draft_cache", "mtp_step", "token_embeddings", "draft",
+           "draft_context")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,6 +174,67 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
     return not any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes)
 
 
+def _refuse_grouped_on_gpu() -> None:
+    """Refuse a grouped convolution with quantized activations on a GPU.
+
+    Measured with jax 0.11.2. In int8, with one or two input channels per
+    group and the int32 result scaled in float, plain JAX returns wrong
+    values without an error on the RTX 4080 (75% and 50% of the outputs),
+    and on the A100 quantizing the 176M text-to-image model's depthwise
+    convolutions dropped its CLIP score from 0.247 to 0.137. With four or
+    more per group, plain JAX computed it correctly on the RTX 4080, compiled
+    with its scaling; an int8 convolution run without its scaling fused in,
+    as it runs eagerly, fails to compile there at every group width. In fp8,
+    one or two input channels per group fail to compile on sm_89 (the RTX
+    4080), and four came out 3.5% from float; the A100, with no fp8 units,
+    computes it emulated, so nothing is gained there; sm_90 is untested. The
+    refusal covers every GPU, dtype and group width, and is revisited once an
+    H100 is measured."""
+    if jax.default_backend() == "gpu":
+        raise ValueError(
+            "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
+            "0.11.2: in int8, one input channel per group gives wrong values without an error on the "
+            "RTX 4080 and the A100, and two per group on the RTX 4080; in fp8, one or two per group "
+            "fail to compile on sm_89 (the RTX 4080), the A100 computes it emulated, with no fp8 "
+            "units to gain from, and sm_90 is untested. Leave the convolution out of "
+            "Quantization.patterns, as patterns=('^(?!.*spatial_fusion).*',) does for the hybrid "
+            "DiT's depthwise convolutions, or quantize weights only (weight_only=True)")
+
+
+def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
+    """Qwix's quantized `op` with the product of two quantized operands
+    scaled in float32, then rounded once to the dtype Qwix returns it in.
+
+    Qwix 0.1.8 scales it in the scales' dtype: a bf16 model's int32
+    accumulators became bf16 before either scale multiplied in, and XLA:TPU
+    then emitted its int8 and fp8 matmuls and convolutions with bf16
+    results. On a v6e an int8 depthwise convolution scaled that way came out
+    NaN in all but a few outputs in plain JAX, while the dense and attention
+    forms of the 176M text-to-image model stayed finite on their own. Served
+    in bf16 that model sampled NaN images, from its depthwise convolutions in
+    int8 and from an attention block in fp8, and scaled in float32 it samples
+    as well as unquantized (docs/performance.md). A weight-only product, one
+    quantized operand, dequantizes before a float matmul and passes through.
+
+    Quantized training runs Qwix's own operations, with no hook for this.
+    Its grouped convolutions quantize from float32 instead
+    (`GroupScaledConvolution`); its matmuls keep Qwix's scaling, and whether
+    a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
+    measured."""
+    qarray = importlib.import_module("qwix._src.core.qarray")
+
+    def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
+        operands = [arg for arg in args if isinstance(arg, qarray.QArray)]
+        if len(operands) < 2:
+            return op(*args, **kwargs)
+        _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
+        rescaled = jax.tree.map(lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+                                args, is_leaf=lambda arg: isinstance(arg, qarray.QArray))
+        return op(*rescaled, **kwargs).astype(dtype)
+
+    return scaled
+
+
 @functools.cache
 def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
@@ -179,12 +243,17 @@ def _providers() -> tuple[type, type]:
     The serving provider also passes complex matmuls through unquantized,
     as the training provider does (`numerics.should_quantize`); Qwix 0.1.8's
     PTQ raises on them instead, and the hybrid DiT's S5 scan multiplies
-    complex states. And it casts a quantized kernel's scales to the dtype a
+    complex states. It casts a quantized kernel's scales to the dtype a
     module promotes its kernel to, where Qwix 0.1.8 passes the kernel
     through: a bf16 module then multiplied bf16 activations by fp32
     dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080)."""
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
     qwix = importlib.import_module("qwix")
+    conv_general = importlib.import_module("qwix._src.core.conv_general")
+    dot_general = importlib.import_module("qwix._src.core.dot_general")
+    einsum = importlib.import_module("qwix._src.core.einsum")
     quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
@@ -203,6 +272,12 @@ def _providers() -> tuple[type, type]:
         multiplying each output group by it after, gives the per-group scales
         exactly: the convolution is linear and keeps groups apart, and every
         group then peaks at 1, so Qwix's single scale is each group's own.
+
+        The divided input is float32, so Qwix scales the convolution's 8-bit
+        product in float32 in training as well as in serving
+        (`_scaled_in_float32`), and the output returns to the input's dtype.
+        From a bf16 input Qwix scaled it in bf16, a form XLA:TPU computes as
+        NaN for an int8 depthwise convolution.
         """
 
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
@@ -223,17 +298,25 @@ def _providers() -> tuple[type, type]:
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             if feature_group_count == 1 or rule is None or rule.act_qtype is None:
                 return convolve(lhs=lhs)
+            _refuse_grouped_on_gpu()
             numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
-            scales = _group_scales(lhs, numbers, feature_group_count)
+            scales = _group_scales(lhs, numbers, feature_group_count).astype(jnp.float32)
             batch, feature = numbers.lhs_spec[:2]
-            out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
+            out = convolve(lhs=lhs.astype(jnp.float32)
+                           / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
             batch, feature = numbers.out_spec[:2]
-            return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
+            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
 
     class QtProvider(GroupScaledConvolution, qwix.QtProvider):
         pass
 
     class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
+        def __init__(self, rules: Sequence[object]) -> None:
+            super().__init__(
+                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
+                _einsum_fn=_scaled_in_float32(einsum.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
             if _real(lhs.dtype, rhs.dtype):
