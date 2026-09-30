@@ -43,8 +43,8 @@ import torch
 
 DIFFUSERS = "0.40.0"
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
-            "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32, "mlp_ratio": 3.0,
-            "axes_dims_rope": (4, 4, 4, 4), "rope_theta": 2000, "eps": 1e-6, "guidance_embeds": True}
+        "num_attention_heads": 2, "joint_attention_dim": 12, "timestep_guidance_channels": 32, "mlp_ratio": 3.0,
+        "axes_dims_rope": (4, 4, 4, 4), "rope_theta": 2000, "eps": 1e-6, "guidance_embeds": True}
 TOKENS = 5
 SEED = 29
 
