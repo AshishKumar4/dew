@@ -432,22 +432,24 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
 
 
-@encoders("flux2_text")
+@encoders("hidden_states_text")
 @dataclass(eq=False)
-class Flux2Conditioner(ConditionEncoder[str | Mapping[str, object]]):
-    """The text conditioning of a FLUX.2 checkpoint: hidden states of its
-    text encoder's language model at `layers`, stacked per token.
+class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
+    """Text conditioning read off a language model's hidden states: FLUX.2's
+    and Z-Image's.
 
-    `Flux2Pipeline._get_mistral_3_small_prompt_embeds` (FLUX.2 [dev], a
-    Mistral-3 encoder, `template="mistral3"`) formats each prompt as a system
-    turn and a user turn; `Flux2KleinPipeline._get_qwen3_prompt_embeds`
-    (FLUX.2 [klein], a Qwen3 encoder, `template="qwen3"`) as a user turn and
-    the assistant's opening with thinking off. Both pad every row on the
-    right to `tokens` and run the encoder with the padding mask, then
-    concatenate, for each token, `hidden_states[k]` for k in `layers`: the
-    output of decoder layer k, the embeddings being k = 0. The transformer
-    reads every row whole, padding included, so the pads carry the states
-    the encoder gives them. A prompt past the budget is refused rather than
+    Each pipeline formats a prompt with the encoder's chat template, pads
+    every row on the right to `tokens`, runs the encoder with the padding
+    mask, and concatenates, for each token, `hidden_states[k]` for k in
+    `layers`: the output of decoder layer k, the embeddings being k = 0.
+    `Flux2Pipeline` (a Mistral-3 encoder, `template="mistral3"`) writes a
+    system turn and a user turn and stacks layers 10, 20 and 30;
+    `Flux2KleinPipeline` (Qwen3, `template="qwen3"`) a user turn and the
+    assistant's opening with thinking off, layers 9, 18 and 27;
+    `ZImagePipeline` the same with `thinking` on, and reads the one layer
+    before the last. `mask` marks the real tokens: FLUX.2's transformer
+    reads every row whole, pads and their states included, and Z-Image's
+    only the real tokens. A prompt past the budget is refused rather than
     cut, since the template's closing turn would go with it.
     """
 
@@ -459,6 +461,7 @@ class Flux2Conditioner(ConditionEncoder[str | Mapping[str, object]]):
     width: int
     template: Literal["mistral3", "qwen3"]
     layers: tuple[int, ...]
+    thinking: bool = False
     tokens: int = 512
     guidance: float | None = None
     """The distilled guidance FLUX.2 [dev] embeds, its pipeline's default;
@@ -469,11 +472,12 @@ class Flux2Conditioner(ConditionEncoder[str | Mapping[str, object]]):
     SYSTEM: ClassVar[str] = (
         "You are an AI that reasons about image descriptions. You give structured responses focusing on object "
         "relationships, object\nattribution and actions without speculation.")
-    """`SYSTEM_MESSAGE`, from black-forest-labs/flux2 at 5a5d316b."""
+    """FLUX.2's `SYSTEM_MESSAGE`, from black-forest-labs/flux2 at 5a5d316b."""
 
     def _conversation(self, prompt: str) -> tuple[list[dict], dict]:
         if self.template == "qwen3":
-            return [{"role": "user", "content": prompt}], {"add_generation_prompt": True, "enable_thinking": False}
+            return ([{"role": "user", "content": prompt}],
+                    {"add_generation_prompt": True, "enable_thinking": self.thinking})
         return ([{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]},
                  {"role": "user", "content": [{"type": "text", "text": prompt.replace("[IMG]", "")}]}],
                 {"add_generation_prompt": False})
@@ -483,10 +487,10 @@ class Flux2Conditioner(ConditionEncoder[str | Mapping[str, object]]):
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
                         params: Variables | None = None):
-        from dew.interop.pretrained import load_flux2_conditioner
+        from dew.interop.pretrained import load_hidden_states_conditioner
 
-        return load_flux2_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
-                                      attention_impl=attention_impl, tokens=tokens, params=params)
+        return load_hidden_states_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
+                                              attention_impl=attention_impl, tokens=tokens, params=params)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows, guidance = [], []
@@ -513,7 +517,8 @@ class Flux2Conditioner(ConditionEncoder[str | Mapping[str, object]]):
             capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
         states = [layer_output(kept[INTERMEDIATES], layer - 1) for layer in self.layers]
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)
-        return DenoisingCondition(jnp.concatenate(states, axis=-1), guidance=guidance)
+        return DenoisingCondition(jnp.concatenate(states, axis=-1),
+                                  mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)
 
     def captions(self, tokens):
         return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
