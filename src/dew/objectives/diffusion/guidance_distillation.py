@@ -110,6 +110,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         output = self.model.apply(self.trainable(params), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=True,
                                   rngs={"dropout": jax.random.fold_in(step.key, 1)})
+        assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
         return Mean(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
