@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
@@ -242,7 +242,7 @@ class RepresentationAlignment:
     encoder: str = "facebook/dinov2-base"
     layer: str = "dit_block_7"
     weight: float = 0.5
-    projector: str = "mlp"
+    projector: Literal["mlp", "conv"] = "mlp"
     width: int = 2048
     kernel_size: int = 3
     spatial_norm: float | None = None
@@ -403,7 +403,8 @@ class DiffusionRunConfig(RunConfig):
         declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
         if "interval" in declared and self.preset is not None:
             # An interval process's model reads the interval's duration.
-            fields["interval"] = self.preset().interval
+            built = self.preset()
+            fields["interval"] = isinstance(built, Process) and built.interval
         if "output_channels" in declared:
             sample = self.sample_field()
             fields["output_channels"] = (sample.shape[-1] if autoencoder is None
