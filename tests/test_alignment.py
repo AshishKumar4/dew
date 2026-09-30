@@ -94,7 +94,9 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
                                sampler=Euler(), steps=2)
     denoising, _ = scalar_loss(plain, {**objective.trainable(params), "encoders": params["encoders"]},
                                batch, step)
-    assert float(loss) == pytest.approx(float(denoising) + 0.5 * float(aux.metrics["alignment"]), rel=1e-6)
+    # REPA's total is mse + proj_coeff * alignment; Dew's L2 halves the
+    # first, so the second is halved with it: 0.5 / 2.
+    assert float(loss) == pytest.approx(float(denoising) + 0.25 * float(aux.metrics["alignment"]), rel=1e-6)
     assert -1.0 <= float(aux.metrics["alignment"]) <= 1.0
 
     def alignment_only(tree):

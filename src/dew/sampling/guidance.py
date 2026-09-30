@@ -65,7 +65,8 @@ def _interval(interval) -> tuple[float, float]:
     # A record's interval arrives as a list, from a run's json or a command
     # line; a tuple keeps the value hashable, so it can ride into a jit as a
     # static argument.
-    return tuple(float(edge) for edge in interval)
+    start, stop = (float(edge) for edge in interval)
+    return start, stop
 
 
 @dataclass(frozen=True)

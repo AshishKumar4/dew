@@ -16,7 +16,7 @@ the averaged weights, through the same `sample` inference uses.
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -80,6 +80,18 @@ def check_solver(process, sampler, steps: int) -> None:
         lambda x, key: sampler.step(x, t, t_next, x, x, state, key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
+
+
+class TunedLatents(NamedTuple):
+    """An end-to-end step's latents: the autoencoder's raw draw, the batch
+    normalized samples the model trains on and the running statistics
+    after them, and the autoencoder's regularizer with its terms."""
+
+    raw: jax.Array
+    samples: jax.Array
+    statistics: Variables
+    regularizer: jax.Array
+    terms: dict[str, jax.Array]
 
 
 @objectives("diffusion")
@@ -275,7 +287,7 @@ class DiffusionObjective(Objective[Mean]):
             raise ValueError(f"the model has no submodule {self.alignment.layer!r} to align")
         return kept["__call__"][0]
 
-    def trainable(self, params) -> dict:
+    def trainable(self, params) -> Variables:
         """Return the model's own collections, without the frozen towers or
         the loss's own heads."""
         return _without_loss_heads({name: value for name, value in params.items()
@@ -328,12 +340,10 @@ class DiffusionObjective(Objective[Mean]):
         schedule = self.process.schedule
         count = images.shape[0]
         t = schedule.sample_t(time_key, count)
-        metrics: dict[str, jax.Array] = {}
-        statistics = None
+        end_to_end = None
         if self.end_to_end is not None:
-            tuned, raw, extra = self._end_to_end_latents(params, images, encode_key)
-            samples, statistics = self.end_to_end.batch_normalized(jax.lax.stop_gradient(raw),
-                                                                   params[LATENT_STATS])
+            end_to_end = self._end_to_end_latents(params, images, encode_key)
+            samples = end_to_end.samples
         elif self.autoencoder is not None:
             samples = self.autoencoder.encode(params["autoencoder"], images, encode_key)
         else:
@@ -349,25 +359,28 @@ class DiffusionObjective(Objective[Mean]):
             weighted = weighted * jnp.exp(-logvar) + logvar / 2
         mass = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
         total = jnp.sum(weighted)
-        if aligned is not None:
-            # REPA adds proj_coeff times its mean to the denoising mean.
+        metrics: dict[str, jax.Array] = {}
+        if self.alignment is not None and aligned is not None:
+            # REPA adds proj_coeff times its mean to the denoising mean; the
+            # denoising term here is halved, as Dew's L2 is, and so is this.
             metrics["alignment"] = aligned
-            total = total + self.alignment.weight * aligned * mass
-        if self.end_to_end is not None:
-            # The autoencoder's update: its regularizer and the alignment of
-            # its latent, read through the frozen model and projector in
-            # evaluation mode (the batch norm on its running statistics, no
-            # condition dropped), as REPA-E's `align_only` pass reads them,
-            # on the same times and noise.
-            latents = self.end_to_end.normalized(raw, params[LATENT_STATS])
-            frozen = jax.lax.stop_gradient(params)
-            given, _ = self._conditions(params, batch, drop_key, dropout=False)
-            _, through = self._denoised(frozen, self.trainable(frozen), latents, t, noise,
-                                        {**given, "train": False}, images)
-            metrics.update(extra, autoencoder_alignment=through)
-            total = total + (tuned + self.end_to_end.align_weight * through) * mass
-        variables = None if statistics is None else {LATENT_STATS: statistics}
-        return Mean(total, mass), Aux(metrics=metrics, variables=variables)
+            total = total + self.alignment.weight / 2 * aligned * mass
+        if self.end_to_end is None or end_to_end is None:
+            return Mean(total, mass), Aux(metrics=metrics)
+        # The autoencoder's update: its regularizer and the alignment of its
+        # latent, read through the frozen model and projector in evaluation
+        # mode (the batch norm on its running statistics, no condition
+        # dropped), as REPA-E's `align_only` pass reads them, on the same
+        # times and noise.
+        latents = self.end_to_end.normalized(end_to_end.raw, params[LATENT_STATS])
+        frozen = jax.lax.stop_gradient(params)
+        given, _ = self._conditions(params, batch, drop_key, dropout=False)
+        _, through = self._denoised(frozen, self.trainable(frozen), latents, t, noise,
+                                    {**given, "train": False}, images)
+        assert through is not None
+        metrics.update(end_to_end.terms, autoencoder_alignment=through)
+        total = total + (end_to_end.regularizer + self.end_to_end.align_weight * through) * mass
+        return Mean(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
 
     def _denoised(self, params, variables, samples, t, noise, call, images):
         """The per-element denoising loss at `(t, noise)` and, under
@@ -387,22 +400,24 @@ class DiffusionObjective(Objective[Mean]):
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         return optax.l2_loss(preds, target), aligned
 
-    def _end_to_end_latents(self, params, images, key):
-        """The trained autoencoder's regularizer, its raw posterior draw and
-        the regularizer's terms."""
+    def _end_to_end_latents(self, params, images, key) -> TunedLatents:
+        """The trained autoencoder's posterior draw of `images` and what the
+        step reads of it."""
         assert self.end_to_end is not None and isinstance(self.autoencoder, ModuleAutoEncoder)
         module, weights = self.autoencoder.model, {"params": params["params"][AUTOENCODER]}
         moments = module.apply(weights, images, method=module.moments)
         raw = posterior_latent(moments, key)
         reconstruction = module.apply(weights, raw, method=module.decode)
-        tuned, terms = self.end_to_end.regularizer(images, reconstruction, moments)
-        return tuned, raw, terms
+        regularizer, terms = self.end_to_end.regularizer(images, reconstruction, moments)
+        samples, statistics = self.end_to_end.batch_normalized(jax.lax.stop_gradient(raw),
+                                                               params[LATENT_STATS])
+        return TunedLatents(raw, samples, statistics, regularizer, terms)
 
     def published_autoencoder(self, variables: Variables) -> tuple[AutoEncoder | None, Variables]:
         """The autoencoder a task over `variables` decodes with, and its
         weights under `autoencoder`: the frozen one, or under `end_to_end`
         the tuned one, its latents normalized by the running statistics."""
-        if self.end_to_end is None:
+        if self.end_to_end is None or self.autoencoder is None:
             return self.autoencoder, variables
         tuned = copy.copy(self.autoencoder)
         statistics = variables[LATENT_STATS]
