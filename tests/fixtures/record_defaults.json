@@ -538,6 +538,7 @@
   "param_dtype": "float32"
  },
  "dew.objectives.diffusion.config.DiffusionRunConfig": {
+  "alignment": null,
   "audio": null,
   "autoencoder": null,
   "data": {
@@ -620,6 +621,17 @@
   "modelname": "pcuenq/sd-vae-ft-mse-flax",
   "revision": "bf16"
  },
+ "dew.objectives.diffusion.config.RepresentationAlignment": {
+  "encoder": "facebook/dinov2-base",
+  "end_to_end": null,
+  "kernel_size": 3,
+  "layer": "dit_block_7",
+  "projector": "mlp",
+  "resolution": 224,
+  "spatial_norm": null,
+  "weight": 0.5,
+  "width": 2048
+ },
  "dew.objectives.diffusion.config.TextCondition": {
   "checkpoint": "openai/clip-vit-large-patch14",
   "dtype": null,
@@ -629,6 +641,13 @@
   "param_dtype": "float32",
   "revision": null,
   "unconditional": ""
+ },
+ "dew.objectives.diffusion.end_to_end.EndToEnd": {
+  "align_weight": 1.5,
+  "epsilon": 0.0001,
+  "kl_weight": 1e-06,
+  "momentum": 0.1,
+  "reconstruction_weight": 1.0
  },
  "dew.objectives.lm.config.LMRunConfig": {
   "aux_loss_alpha": null,

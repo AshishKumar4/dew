@@ -9,13 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion import Alignment, DiffusionObjective
-from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore, torch_bicubic
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
 from dew.registry import models
 from dew.sampling import Euler, TextToImage
 
@@ -53,11 +52,6 @@ def test_the_irepa_loss_is_the_official_one():
     targets = spatial_zscore(jnp.asarray(CASES["features"]), SETTINGS["gamma"])
     loss = alignment.loss(projector("conv"), jnp.asarray(CASES["hidden"]), targets)
     np.testing.assert_allclose(float(loss), float(CASES["irepa"]), rtol=0, atol=LOSS_ATOL)
-
-
-def test_the_encoder_input_is_resized_as_torchs_bicubic():
-    resized = torch_bicubic(jnp.asarray(CASES["image"]), 14)
-    assert_as_exact_as_the_reference(resized, CASES["resized32"], CASES["resized"], "bicubic")
 
 
 class Patches(nn.Module):

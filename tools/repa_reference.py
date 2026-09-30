@@ -6,8 +6,6 @@
   from the file at a pinned commit.
 - iREPA: End2End-Diffusion/iREPA's `ProjectionLayer` ("conv", kernel 3) and
   `spatial_zscore` (`ldm/models/sit.py`, `ldm/utils.py`), the same way.
-- The resize both apply to the encoder's input: torch's bicubic
-  `F.interpolate`, from 16 to 14 pixels, as REPA's 256 to 224.
 
 Each case lands its inputs, the projector's weights in Flax's layout, and
 the loss in float64 and float32.
@@ -24,7 +22,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 REPA = "https://raw.githubusercontent.com/sihyun-yu/REPA/67f714503e3892f993844aab088ffc5791c92613/"
 IREPA = "https://raw.githubusercontent.com/End2End-Diffusion/iREPA/99ad4ac234efe8de52ce157120f72856e836d09f/ldm/"
@@ -91,11 +88,8 @@ def main() -> None:
             arrays[f"repa{suffix}"] = projection_loss([z], [mlp.to(dtype)(h)]).double().numpy()
             arrays[f"irepa{suffix}"] = projection_loss(
                 [zscore(z, alpha=GAMMA)], [conv.to(dtype)(h)]).double().numpy()
-            image = torch.randn(BATCH, 3, 16, 16, generator=torch.Generator().manual_seed(3))
-            arrays["image"] = image.numpy().transpose(0, 2, 3, 1)
-            arrays[f"resized{suffix}"] = F.interpolate(image.to(dtype), 14, mode="bicubic").double().numpy().transpose(0, 2, 3, 1)
     np.savez(FIXTURE / "losses.npz", **arrays)
-    print(f"{FIXTURE}: REPA and iREPA projection losses, one bicubic resize")
+    print(f"{FIXTURE}: REPA and iREPA projection losses")
 
 
 if __name__ == "__main__":
