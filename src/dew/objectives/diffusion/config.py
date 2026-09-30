@@ -236,6 +236,46 @@ class ShortcutTraining:
 
 
 @dataclasses.dataclass(frozen=True)
+class ConsistencyDistillation:
+    """Distill a saved flow run into a few-step student with rCM
+    (`ConsistencyDistillationObjective`, which documents the other fields):
+    sCM's consistency loss regularized by DMD2's, or either alone at the
+    other's weight 0. `teacher` is the teacher run's directory; its model
+    is this run's `model`, and the student and the fake score start from
+    its weights."""
+
+    teacher: str = ""
+    consistency_weight: float = 100.0
+    dmd_weight: float = 1.0
+    teacher_guidance: float = 1.0
+    tangent_warmup: int = 0
+    student_update_freq: int = 5
+    max_simulation_steps: int = 4
+    student_times: tuple[float, float] = (-0.8, 1.6)
+    critic_times: tuple[float, float] = (0.0, 1.6)
+
+    def __post_init__(self) -> None:
+        if not self.teacher:
+            raise ValueError("rCM distills a teacher; name its run directory")
+        for name in ("student_times", "critic_times"):
+            mean, std = (float(value) for value in getattr(self, name))
+            object.__setattr__(self, name, (mean, std))
+
+    def teacher_variables(self, variables: Variables | None) -> Variables:
+        """The teacher model's variables: a saved distilled tree's own, else
+        the teacher run's published ones."""
+        from dew.sampling.pipelines import restore_variables
+
+        from .objective import TEACHER, _without_loss_heads
+
+        if variables is not None:
+            return variables[TEACHER]
+        restored = restore_variables(self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+        return _without_loss_heads({name: tree for name, tree in restored.items()
+                                    if name not in ("encoders", "autoencoder")})
+
+
+@dataclasses.dataclass(frozen=True)
 class RepresentationAlignment:
     """Align the model's hidden tokens with a frozen DINOv2's patch features,
     REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
@@ -321,6 +361,9 @@ class DiffusionRunConfig(RunConfig):
     alignment: RepresentationAlignment | None = None
     mean_flow: MeanFlowTraining | None = None
     shortcut: ShortcutTraining | None = None
+    distill: ConsistencyDistillation | None = None
+    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
+    instead of the denoising loss; sampling is unguided."""
     """Train a shortcut model instead of the denoising loss; the preset is
     `shortcut`, and sampling is unguided."""
     """Train with MeanFlow's loss instead of the denoising loss; the preset
@@ -340,9 +383,17 @@ class DiffusionRunConfig(RunConfig):
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         object.__setattr__(self, "objective", "flow_grpo" if self.rl is not None else
                            "mean_flow" if self.mean_flow is not None else
-                           "shortcut" if self.shortcut is not None else "diffusion")
+                           "shortcut" if self.shortcut is not None else
+                           "rcm" if self.distill is not None else "diffusion")
         from dew.diffusion.presets import EDM, Flow
 
+        others = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "uncertainty")
+                  if getattr(self, name) is not None]
+        if self.distill is not None and (others or self.guidance is not None
+                                         or not isinstance(self.preset, presets.Flow)):
+            raise ValueError("rCM distills on its own losses under the flow preset and samples unguided: "
+                             f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
+                             " unset")
         if (self.mean_flow is not None or self.shortcut is not None) and self.uncertainty is not None:
             raise ValueError("MeanFlow and shortcut models train on their own losses, which read no "
                              "learned uncertainty weighting; leave uncertainty unset")
@@ -499,6 +550,15 @@ class DiffusionRunConfig(RunConfig):
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+        if self.distill is not None:
+            from .consistency import ConsistencyDistillationObjective
+
+            fields = {field.name: getattr(self.distill, field.name) for field in dataclasses.fields(self.distill)
+                      if field.name != "teacher"}
+            return ConsistencyDistillationObjective(
+                model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
+                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, sampler=self.sampler,
+                guidance=None, steps=self.sampling_steps)
         if self.shortcut is not None:
             from .few_step import ShortcutObjective
 

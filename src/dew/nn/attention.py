@@ -5,6 +5,8 @@ UNet transformer blocks sit beside it; the blocks come from diffusers'
 attention_flax.py.
 """
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import math
@@ -964,10 +966,68 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
+_FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
+
+
+@contextlib.contextmanager
+def forward_mode_attention():
+    """Trace the attention calls inside for `jax.jvp`.
+
+    cuDNN's and the TPU's fused kernels define their derivative in reverse
+    mode only (`jax.custom_vjp`), so forward-mode differentiation through
+    them fails. Inside this context each such call keeps the fused kernel
+    for its value and takes its tangent from the reference path's JVP,
+    which materializes the `[B, H, Q, K]` probabilities once. A
+    consistency model's tangent (sCM, rCM) runs its JVP inside it; the
+    reverse-mode pass that trains the model runs outside it, on the fused
+    kernel's own backward.
+    """
+    token = _FORWARD_MODE.set(True)
+    try:
+        yield
+    finally:
+        _FORWARD_MODE.reset(token)
+
+
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None, segment_ids=None, key_value_seq_lengths=None):
+    """Dispatch one whole-sequence attention call to the kernel it names,
+    differentiable in forward mode under `forward_mode_attention`."""
+    call = functools.partial(
+        _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
+        causal=causal, sliding_window=sliding_window, mask=mask, softcap=softcap, segment_ids=segment_ids,
+        key_value_seq_lengths=key_value_seq_lengths)
+    if not _FORWARD_MODE.get():
+        return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
+    lengths = (None if key_value_seq_lengths is None
+               else jnp.asarray(key_value_seq_lengths, jnp.int32))
+    resolved = resolve_implementation(
+        implementation, query, key, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks, causal=causal,
+        sliding_window=sliding_window, mask=mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3]),
+        bias=bias)
+    if resolved not in ('cudnn', 'tpu'):
+        return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
+
+    @jax.custom_jvp
+    def attend(query, key, value, bias, sinks):
+        return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
+
+    @attend.defjvp
+    def tangent(primals, tangents):
+        def reference(query, key, value, bias, sinks):
+            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
+        return attend(*primals), jax.jvp(reference, primals, tangents)[1]
+
+    return attend(query, key, value, bias, sinks)
+
+
+def _attention_kernel(query, key, value, dtype=None, precision=None,
+                      force_fp32_for_softmax=True, implementation='auto',
+                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
+                      softcap=None, segment_ids=None, key_value_seq_lengths=None):
     """Dispatch one whole-sequence attention call to the kernel it names.
 
     'auto' resolves here, against this call's shapes and this machine's
