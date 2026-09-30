@@ -183,8 +183,9 @@ class TextToImage:
         evaluation does; a loss-only head the objective trains is dropped."""
         from dew.objectives.diffusion.objective import _without_loss_heads
 
+        autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
-                   _without_loss_heads(variables), objective.autoencoder,
+                   _without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler,
                    blank=objective.blank_conditions)
 
