@@ -68,7 +68,7 @@ def rows(value: jax.Array) -> jax.Array:
     return jnp.sum(value, axis=tuple(range(1, value.ndim)))
 
 
-def consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array], x, t, teacher_F, warmup: float,
+def consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array], x, t, teacher_F, warmup: float | jax.Array,
                      scale: float) -> jax.Array:
     """sCM's per-row loss (`_student_scm_step`), scaled: the student's
     F-derivative along the teacher's ODE by one JVP, with tangents
