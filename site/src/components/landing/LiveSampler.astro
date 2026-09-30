@@ -140,6 +140,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				}
 				if (report?.step !== undefined && report.steps) {
 					untick();
+					compiled = true;
 					show('sampling', `Step ${report.step} of ${report.steps}`, report.step / report.steps);
 					if (message.png) {
 						preview.src = image(message.png);
@@ -187,16 +188,16 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 						throw new Error('Stopped.');
 					}
 					session = opened;
-					compiled = false;
+					compiled = opened.warm;
 					session.onClose = (message) => {
 						session = undefined;
 						if (!running) show('idle', `${message} Press Run to start a new one.`);
 					};
 				}
 				started = performance.now();
-				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs).
+				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs);
+				// a warm spare compiled it before it was handed out.
 				show('sampling', compiled ? 'Sampling' : 'Starting the sampler; a new kernel compiles it first');
-				compiled = true;
 				tick('Running');
 				const done = await session.run(editor.value, onOutput);
 				untick();
