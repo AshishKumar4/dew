@@ -175,25 +175,30 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
 
 
 def _refuse_grouped_on_gpu() -> None:
-    """Refuse a grouped convolution with quantized activations on a GPU,
-    where XLA:GPU (jax 0.11.2) computes one wrongly or not at all.
+    """Refuse a grouped convolution with quantized activations on a GPU.
 
-    In int8, with one or two input channels per group and the int32 result
-    scaled in float, plain JAX returns wrong values without an error on the
-    RTX 4080 (75% and 50% of the outputs), and on the A100 quantizing the
-    176M text-to-image model's depthwise convolutions dropped its CLIP score
-    from 0.247 to 0.137. With four per group Dew's int8 convolution failed
-    to compile on the RTX 4080, as a plain int8 convolution with int32
-    results does there at every group width. In fp8, one or two input
-    channels per group fail to compile on the RTX 4080, whose fp8 is
-    native."""
+    Measured with jax 0.11.2. In int8, with one or two input channels per
+    group and the int32 result scaled in float, plain JAX returns wrong
+    values without an error on the RTX 4080 (75% and 50% of the outputs),
+    and on the A100 quantizing the 176M text-to-image model's depthwise
+    convolutions dropped its CLIP score from 0.247 to 0.137. With four or
+    more per group, plain JAX computed it correctly on the RTX 4080, compiled
+    with its scaling; an int8 convolution run without its scaling fused in,
+    as it runs eagerly, fails to compile there at every group width. In fp8,
+    one or two input channels per group fail to compile on sm_89 (the RTX
+    4080), and four came out 3.5% from float; the A100, with no fp8 units,
+    computes it emulated, so nothing is gained there; sm_90 is untested. The
+    refusal covers every GPU, dtype and group width, and is revisited once an
+    H100 is measured."""
     if jax.default_backend() == "gpu":
         raise ValueError(
-            "XLA:GPU computes a grouped convolution with int8 or fp8 activations wrongly or not at "
-            "all, depending on the GPU, the dtype and the channels per group, so Dew refuses to "
-            "quantize one; leave it out of Quantization.patterns, as "
-            "patterns=('^(?!.*spatial_fusion).*',) does for the hybrid DiT's depthwise "
-            "convolutions, or quantize weights only (weight_only=True)")
+            "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
+            "0.11.2: in int8, one input channel per group gives wrong values without an error on the "
+            "RTX 4080 and the A100, and two per group on the RTX 4080; in fp8, one or two per group "
+            "fail to compile on sm_89 (the RTX 4080), the A100 computes it emulated, with no fp8 "
+            "units to gain from, and sm_90 is untested. Leave the convolution out of "
+            "Quantization.patterns, as patterns=('^(?!.*spatial_fusion).*',) does for the hybrid "
+            "DiT's depthwise convolutions, or quantize weights only (weight_only=True)")
 
 
 def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
