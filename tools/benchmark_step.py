@@ -69,6 +69,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.backbones.flux import FluxTransformer
+from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
@@ -461,6 +462,11 @@ def small_cases(dtype: str) -> list[Case]:
         Case("qwen_image_transformer", {"in_channels": 16, "out_channels": 16, "num_layers": 3,
                                          "heads": 6, "head_dim": 64, "axes_dims_rope": (16, 24, 24)},
              batch_size=4, image_size=32, channels=16),
+        # FLUX.2 reads three stacked encoder layers, so its context is three
+        # text widths wide.
+        Case("flux2_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6, "head_dim": 64,
+                                    "joint_attention_dim": 3 * TEXT_FEATURES},
+             batch_size=4, image_size=32, channels=128),
         Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
              batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
@@ -685,6 +691,11 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
+            process = presets.Flow()()
+        elif isinstance(model, Flux2Transformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(
+                features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None)
             process = presets.Flow()()
         elif isinstance(model, (SD3Transformer, FluxTransformer)):
             keyword = "conditioning"
