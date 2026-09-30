@@ -125,3 +125,51 @@ def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
     with pytest.raises(ValueError, match="needs `alignment`"):
         DiffusionObjective(task.model, task.process, task.inputs, autoencoder=task.autoencoder,
                            end_to_end=EndToEnd())
+
+
+def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path):
+    """REPA-E through `DiffusionRunConfig` on the committed tiny DINOv2 and
+    SD VAE: a saved run's task restores the tuned autoencoder and its
+    running statistics, and samples exactly as the trained objective's own
+    task does."""
+    import tarfile
+
+    from test_diffusion_run_sources import batch_for
+
+    from dew.checkpoints import Checkpoints
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import OxfordFlowers
+    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+    from dew.objectives.diffusion.config import RepresentationAlignment
+    from dew.registry import samplers
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    for name in ("tiny_diffusers", "rae"):
+        with tarfile.open(fixtures / f"{name}.tar.xz") as archive:
+            archive.extractall(tmp_path / name, filter="data")
+    config = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
+                                         "mlp_ratio": 1}, dtype="float32", attention_impl="xla"),
+        data=OxfordFlowers(image_size=32), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
+        sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
+        alignment=RepresentationAlignment(encoder=str(tmp_path / "rae/dinov2_plain"), layer="dit_block_0",
+                                          width=8, resolution=112, end_to_end=EndToEnd()))
+    task = config.build()
+    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
+    state = trainer.initial_state()
+    batch = batch_for(task, 32)
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run))
+    checkpoints.save(1, state, None)
+    checkpoints.wait()
+    config.save(str(run))
+
+    restored = TextToImage.from_run(str(run))
+    for got, want in zip(jax.tree.leaves(restored.params["autoencoder"]),
+                         jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    expected = task.pipeline(state, ema=False)(["a red bird"], seed=9).host().images
+    np.testing.assert_array_equal(restored(["a red bird"], seed=9).host().images, expected)

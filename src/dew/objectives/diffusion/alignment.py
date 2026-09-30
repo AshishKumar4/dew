@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.nn.blocks import torch_bicubic_resize
 from dew.objectives.base import Variables
 
 ALIGNMENT = "alignment_projector"
@@ -56,29 +57,6 @@ class Projector(nn.Module):
         grid = nn.Conv(self.features, (self.kernel_size, self.kernel_size), padding="SAME")(
             tokens.reshape(batch, side, side, width))
         return grid.reshape(batch, count, self.features)
-
-
-def torch_bicubic(images: jax.Array, size: int) -> jax.Array:
-    """`[B, H, W, C]` resized to `size` square as torch's `F.interpolate(mode=
-    "bicubic", align_corners=False)` does: Keys' cubic at a = -0.75, border
-    samples clamped, no antialiasing."""
-
-    def matrix(inputs: int) -> jax.Array:
-        position = (jnp.arange(size) + 0.5) * (inputs / size) - 0.5
-        start = jnp.floor(position)
-        weights = jnp.zeros((size, inputs))
-        for offset in range(-1, 3):
-            distance = jnp.abs(position - (start + offset))
-            near = ((1.25 * distance - 2.25) * distance) * distance + 1
-            far = ((-0.75 * distance + 3.75) * distance - 6) * distance + 3
-            weight = jnp.where(distance <= 1, near, jnp.where(distance < 2, far, 0.0))
-            index = jnp.clip(start + offset, 0, inputs - 1).astype(jnp.int32)
-            weights = weights.at[jnp.arange(size), index].add(weight)
-        return weights
-
-    rows, columns = matrix(images.shape[1]), matrix(images.shape[2])
-    return jnp.einsum("ph,qw,bhwc->bpqc", rows, columns, images.astype(jnp.float32),
-                      precision=jax.lax.Precision.HIGHEST)
 
 
 def spatial_zscore(features: jax.Array, gamma: float) -> jax.Array:
@@ -134,7 +112,7 @@ class Alignment:
         pixels = (images.astype(jnp.float32) + 1) / 2
         pixels = (pixels - jnp.asarray(self.mean)) / jnp.asarray(self.std)
         if self.resolution is not None and self.resolution != pixels.shape[1]:
-            pixels = torch_bicubic(pixels, self.resolution)
+            pixels = torch_bicubic_resize(pixels, self.resolution, self.resolution)
         features = self.encoder.apply(variables, pixels)
         if not isinstance(features, jax.Array):
             raise TypeError("a representation encoder must return one array of patch features")
@@ -170,4 +148,4 @@ class Alignment:
         return method == "__call__" and module.name == self.layer
 
 
-__all__ = ["ALIGNMENT", "REPRESENTATION", "Alignment", "Projector", "spatial_zscore", "torch_bicubic"]
+__all__ = ["ALIGNMENT", "REPRESENTATION", "Alignment", "Projector", "spatial_zscore"]

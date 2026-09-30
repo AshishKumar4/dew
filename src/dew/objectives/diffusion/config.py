@@ -27,6 +27,8 @@ from dew.objectives.base import FROZEN, Variables
 from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
 from dew.sampling.guidance import CFG
 
+from .alignment import REPRESENTATION, Alignment
+from .end_to_end import AUTOENCODER, EndToEnd
 from .objective import DiffusionObjective
 
 if TYPE_CHECKING:
@@ -206,6 +208,43 @@ class FlowGRPO:
 
 
 @dataclasses.dataclass(frozen=True)
+class RepresentationAlignment:
+    """Align the model's hidden tokens with a frozen DINOv2's patch features,
+    REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
+    the autoencoder end to end through it, REPA-E (Leng et al. 2025).
+
+    `encoder` is a transformers `Dinov2Model` checkpoint, REPA's DINOv2-B/14
+    by default, read at `resolution` pixels. `layer` names the model's
+    submodule whose output is aligned: REPA aligns after the eighth block,
+    `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
+    `end_to_end` is REPA-E's `EndToEnd`, which needs a KL `autoencoder`.
+    """
+
+    encoder: str = "facebook/dinov2-base"
+    layer: str = "dit_block_7"
+    weight: float = 0.5
+    projector: str = "mlp"
+    width: int = 2048
+    kernel_size: int = 3
+    spatial_norm: float | None = None
+    resolution: int = 224
+    end_to_end: EndToEnd | None = None
+
+    def build(self, variables: Variables | None = None) -> Alignment:
+        """The alignment over the encoder's weights: `variables`' own
+        `representation` when a saved tree supplies them, else the
+        checkpoint's."""
+        from dew.nn.autoencoders.rae import load_dinov2
+
+        module, params, _ = load_dinov2(self.encoder)
+        held = {"params": params} if variables is None else variables[REPRESENTATION]
+        return Alignment(module.clone(input_size=self.resolution), held, self.layer,
+                         weight=self.weight, projector=self.projector, width=self.width,
+                         kernel_size=self.kernel_size, spatial_norm=self.spatial_norm,
+                         resolution=self.resolution)
+
+
+@dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
     """Describe a run, plus the diffusion objective's own knobs."""
 
@@ -248,6 +287,9 @@ class DiffusionRunConfig(RunConfig):
     """Learn EDM2's loss weighting with a head of this many Fourier channels
     (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
     preset's fixed weighting."""
+    alignment: RepresentationAlignment | None = None
+    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
+    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered
@@ -260,6 +302,12 @@ class DiffusionRunConfig(RunConfig):
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         object.__setattr__(self, "objective", "diffusion" if self.rl is None else "flow_grpo")
         from dew.diffusion.presets import EDM, Flow
+
+        if self.alignment is not None and (self.rl is not None or self.pretrained is not None):
+            raise ValueError("representation alignment trains a scratch model on the denoising "
+                             "loss; it takes neither `rl` nor `pretrained`")
+        if self.alignment is not None and self.alignment.end_to_end is not None and self.autoencoder is None:
+            raise ValueError("end-to-end tuning trains the run's autoencoder; set `autoencoder`")
 
         if self.pretrained is not None:
             scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
@@ -396,6 +444,8 @@ class DiffusionRunConfig(RunConfig):
             guidance=self.guidance,
             steps=self.sampling_steps,
             uncertainty=self.uncertainty,
+            alignment=None if self.alignment is None else self.alignment.build(variables),
+            end_to_end=None if self.alignment is None else self.alignment.end_to_end,
         )
 
     def rollout(self, objective: DiffusionObjective):
@@ -424,7 +474,7 @@ class DiffusionRunConfig(RunConfig):
                 f"{self.model.architecture!r} runs the text as a second stream through "
                 "every block")
         autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
-            params=None if variables is None else variables["autoencoder"]))
+            params=None if variables is None else self._autoencoder_params(variables)))
         conditions = {}
         if self.context is not None:
             keyword = encoders[self.context.encoder].keyword
@@ -437,6 +487,13 @@ class DiffusionRunConfig(RunConfig):
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
         model = models.build(self.model.architecture, self.model_fields(autoencoder))
         return model, conditions, autoencoder
+
+    def _autoencoder_params(self, variables: Variables) -> Variables:
+        """The autoencoder's weights in a saved tree: frozen beside the
+        model, or trained under `params` when REPA-E tuned it."""
+        if self.alignment is not None and self.alignment.end_to_end is not None:
+            return variables["params"][AUTOENCODER]
+        return variables["autoencoder"]
 
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline at the data's resolution: its own

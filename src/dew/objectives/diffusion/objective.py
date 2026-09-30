@@ -243,18 +243,21 @@ class DiffusionObjective(Objective[Mean]):
             drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                     **conditions)
             state = {**drawn, "encoders": held["encoders"]}
+            own = self.held_variables()
             for frozen in ("autoencoder", REPRESENTATION):
                 # The frozen weights are state, like the encoders'. They ride in
                 # as an argument to the compiled step for the layout to place.
-                if frozen in held:
-                    state[frozen] = held[frozen]
+                # A caller holding only some towers takes the rest as built.
+                value = held.get(frozen, own.get(frozen))
+                if value is not None:
+                    state[frozen] = value
         if self.uncertainty is not None and UNCERTAINTY not in state["params"]:
             head = self.uncertainty.init(head_key, jnp.ones((1,)))
             for collection, value in head.items():
                 state[collection] = {**state.get(collection, {}), UNCERTAINTY: value}
         if self.end_to_end is not None and AUTOENCODER not in state["params"]:
             assert self.autoencoder is not None
-            state["params"] = {**state["params"], AUTOENCODER: state.pop("autoencoder")}
+            state["params"] = {**state["params"], AUTOENCODER: state.pop("autoencoder", self.autoencoder.params)}
             state[LATENT_STATS] = self.end_to_end.initial_statistics(
                 self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels)
         if self.alignment is not None and ALIGNMENT not in state["params"]:
