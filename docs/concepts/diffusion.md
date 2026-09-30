@@ -66,6 +66,7 @@ A preset is a frozen dataclass of the numbers that define a published convention
 | `Cosine` | The cosine beta table with v-prediction; its default P2 weight makes the loss an unweighted $x_0$ loss |
 | `Flow` | Rectified flow on the linear path with velocity prediction. Training times follow one of SD3's densities (Esser et al., 2024): logit-normal (the default), the heavy-tailed `mode` density, `cosmap` or uniform. `shift` is SD3's static resolution shift; `resolution_shift` sets it from the image size instead, as Flux's exp(mu) of a token count. A run config fills that count from its data on a 16-pixel grid, Flux's own; a model that tokenizes the image otherwise sets `tokens` to its count |
 | `JiT` | JiT (Li & He, 2025): rectified flow on the linear path where the model predicts the clean sample and the loss scores it in velocity space (`VelocityLoss`), with sigma floored at `t_eps`. Training times are the reference's logit-normal. `simple_dit`'s `patch_bottleneck` is JiT's bottleneck patch embedding for large pixel patches |
+| `MeanFlow` | MeanFlow (Geng et al., 2025): rectified flow whose model predicts the average velocity over an interval, reading the interval's `duration` beside the time (`Process.interval`, `simple_dit(interval=True)`). It trains under `MeanFlowObjective` (`mean_flow` on the run config), and one Euler step over the whole grid samples it |
 | `Sqrt` | Diffusion-LM (Li et al., 2022): the square-root schedule with the plain $x_0$ loss |
 | `MDLM` | Masked diffusion over tokens (Sahoo et al., 2024) on the log-linear schedule, from `dew.diffusion.discrete`; it takes the vocabulary's `mask_id` |
 
@@ -80,6 +81,10 @@ A run adds representation alignment with `alignment=RepresentationAlignment(...)
 `RepresentationAlignment(end_to_end=EndToEnd())` adds REPA-E (Leng et al., 2025), which tunes the run's KL autoencoder with the model. The autoencoder trains on its L1 reconstruction and KL, plus 1.5 times the alignment of its latent read through the frozen model. The model trains on the detached latent, normalized by an affine-free batch norm. That norm's running statistics replace the autoencoder's fixed latent scale, and a saved run's task decodes with the tuned autoencoder under them. REPA-E's LPIPS and PatchGAN terms are left out. The regularizer and batch norm match REPA-E's code (`tools/repae_reference.py`).
 
 `simple_dit`'s `routes` is TREAD's token routing (Krause et al., 2025), which applies during training only. Each `(ratio, start, end)` sends a random `ratio` of the tokens around blocks `start` to `end`. They rejoin afterwards holding the values they had before `start`, so those blocks compute on fewer tokens. The gather and scatter match CompVis/tread's `Router` (`tools/tread_reference.py`), and sampling runs every token through every block.
+
+## Few-step generators
+
+`MeanFlowObjective` trains the average velocity u(z_t, r, t) through the MeanFlow identity u = v - (t - r) du/dt. The derivative is taken along the flow with one `jax.jvp` through the model. Its training-time guidance mixes the sample's velocity with the model's own unconditional and conditional ones (`omega`, `kappa`), and each row's squared error is adaptively weighted (`norm_p`, `norm_eps`). The loss matches Gsunshine/meanflow's `forward` on the reference's own draws (`tools/meanflow_reference.py`). On an interval process, `sample` hands the model the interval to the next grid point at every step, so `steps=2` is one step from noise to data.
 
 ## Solvers
 

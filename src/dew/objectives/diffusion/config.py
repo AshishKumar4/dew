@@ -208,6 +208,25 @@ class FlowGRPO:
 
 
 @dataclasses.dataclass(frozen=True)
+class MeanFlowTraining:
+    """Train the model with MeanFlow's loss (`MeanFlowObjective`, which
+    documents the fields) under the `mean_flow` preset; one step samples
+    it."""
+
+    instantaneous: float = 0.75
+    omega: float = 1.0
+    kappa: float = 0.0
+    guidance_interval: tuple[float, float] = (0.0, 1.0)
+    norm_p: float = 1.0
+    norm_eps: float = 0.01
+
+    def __post_init__(self) -> None:
+        # A record carries the interval as a JSON list.
+        start, stop = (float(edge) for edge in self.guidance_interval)
+        object.__setattr__(self, "guidance_interval", (start, stop))
+
+
+@dataclasses.dataclass(frozen=True)
 class RepresentationAlignment:
     """Align the model's hidden tokens with a frozen DINOv2's patch features,
     REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
@@ -288,6 +307,10 @@ class DiffusionRunConfig(RunConfig):
     (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
     preset's fixed weighting."""
     alignment: RepresentationAlignment | None = None
+    mean_flow: MeanFlowTraining | None = None
+    """Train with MeanFlow's loss instead of the denoising loss; the preset
+    is `mean_flow` and sampling is unguided, since the guidance is trained
+    in."""
     """Align the model's hidden tokens with a frozen DINOv2's, REPA or
     iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     val_metrics: tuple[str, ...] = ("clip",)
@@ -300,9 +323,15 @@ class DiffusionRunConfig(RunConfig):
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
-        object.__setattr__(self, "objective", "diffusion" if self.rl is None else "flow_grpo")
+        object.__setattr__(self, "objective", "flow_grpo" if self.rl is not None else
+                           "mean_flow" if self.mean_flow is not None else "diffusion")
         from dew.diffusion.presets import EDM, Flow
 
+        if self.mean_flow is not None and (self.rl is not None or self.alignment is not None
+                                           or self.guidance is not None
+                                           or not isinstance(self.preset, presets.MeanFlow)):
+            raise ValueError("MeanFlow trains on its own loss under the mean_flow preset, guided in "
+                             "training (omega, kappa): set guidance None, and neither rl nor alignment")
         if self.alignment is not None and (self.rl is not None or self.pretrained is not None):
             raise ValueError("representation alignment trains a scratch model on the denoising "
                              "loss; it takes neither `rl` nor `pretrained`")
@@ -372,6 +401,9 @@ class DiffusionRunConfig(RunConfig):
         families name theirs as their sources do, in `model.config`."""
         fields = dict(self.model.fields())
         declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
+        if "interval" in declared and self.preset is not None:
+            # An interval process's model reads the interval's duration.
+            fields["interval"] = self.preset().interval
         if "output_channels" in declared:
             sample = self.sample_field()
             fields["output_channels"] = (sample.shape[-1] if autoencoder is None
@@ -435,6 +467,13 @@ class DiffusionRunConfig(RunConfig):
                 clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
                 autoencoder=autoencoder, guidance=self.guidance, sampler=self.sampler,
                 steps=self.sampling_steps, pretrained=variables)
+        if self.mean_flow is not None:
+            from .few_step import MeanFlowObjective
+
+            return MeanFlowObjective(
+                model, process, inputs, **dataclasses.asdict(self.mean_flow),
+                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
             model, process, inputs,
             autoencoder=autoencoder, pretrained=variables,

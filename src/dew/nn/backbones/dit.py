@@ -54,6 +54,10 @@ class SimpleDiT(nn.Module):
     `patch_bottleneck` is JiT's bottleneck patch embedding (Li & He 2025,
     "Back to Basics: Let Denoising Generative Models Denoise"), for large
     pixel patches: 128 in its models.
+
+    `interval` makes it an interval model (`Process.interval`), reading the
+    `duration` of the interval it predicts over beside the time: MeanFlow's
+    and shortcut models' network.
     """
     output_channels: int = 3
     patch_size: int = 16
@@ -74,6 +78,7 @@ class SimpleDiT(nn.Module):
     text_pooling: Literal["real", "all"] = "real"
     routes: Sequence[Sequence[float]] = ()
     patch_bottleneck: int | None = None
+    interval: bool = False
 
 
     def setup(self):
@@ -91,6 +96,7 @@ class SimpleDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
             text_pooling=self.text_pooling,
+            interval=self.interval,
         )
         self.blocks = self.stack()
         self.output = PatchSequenceOutput(
@@ -121,10 +127,10 @@ class SimpleDiT(nn.Module):
             ) for i in range(self.num_layers)
         ]
 
-    def __call__(self, x, temb, textcontext=None, train: bool = False):
+    def __call__(self, x, temb, textcontext=None, train: bool = False, duration=None):
         _, H, W, _ = x.shape
         x_seq, inv_idx = self.embed(x)
-        cond_emb = self.conditioning(temb, textcontext)
+        cond_emb = self.conditioning(temb, textcontext, duration)
         freqs_cis = rope_for_scan(x_seq, self.emb_features // self.num_heads, self.scan_order)
 
         starts = {int(start): (ratio, int(end)) for ratio, start, end in self.checked_routes()} if train else {}

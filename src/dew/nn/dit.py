@@ -226,15 +226,24 @@ class ConditioningEmbed(nn.Module):
 
     `text_pooling` "all" averages every position the text tower returns, the
     padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
-    their checkpoints load.
+    their checkpoints load. `interval` adds a second time embedding, of an
+    interval's `duration`.
     """
     emb_features: int
     mlp_ratio: int = 4
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     text_pooling: Literal["real", "all"] = "real"
+    interval: bool = False
 
     def setup(self):
+        if self.interval:
+            self.duration_embed = nn.Sequential([
+                FourierEmbedding(features=self.emb_features, dtype=self.dtype),
+                TimeProjection(features=self.emb_features * self.mlp_ratio,
+                               dtype=self.dtype, precision=self.precision),
+                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+            ], name="duration_embed")
         self.time_embed = nn.Sequential([
             FourierEmbedding(features=self.emb_features, dtype=self.dtype),
             TimeProjection(features=self.emb_features * self.mlp_ratio,
@@ -245,8 +254,15 @@ class ConditioningEmbed(nn.Module):
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")
 
-    def __call__(self, temb, textcontext: TextContext | None = None):
+    def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)
+        if self.interval:
+            # An interval model embeds the interval's length as a second
+            # time, as MeanFlow's and shortcut models' networks do; none
+            # given is the instantaneous prediction.
+            cond_emb = cond_emb + self.duration_embed(jnp.zeros_like(temb) if duration is None else duration)
+        elif duration is not None:
+            raise ValueError("a duration reaches a model built without `interval`")
         if textcontext is not None:
             mask = textcontext.mask if self.text_pooling == "real" else jnp.ones_like(textcontext.mask)
             text_emb = self.text_proj(masked_mean(textcontext.hidden, mask))

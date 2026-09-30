@@ -78,12 +78,21 @@ class Process:
     `sampling` is the schedule inference integrates when it is not the
     training one, as EDM trains on log-normal sigmas and samples on the
     Karras grid. None means the same schedule.
+
+    `interval` says the model predicts over an interval rather than at an
+    instant, as MeanFlow's average velocity and a shortcut model's step do:
+    it reads the interval's length in model time as `duration`, and a
+    sampler's step hands it the interval to the next grid point
+    (`Denoiser.spanning`), so a single-evaluation solver such as `Euler`
+    takes the whole interval in one step. A zero duration is the
+    instantaneous prediction.
     """
 
     schedule: NoiseScheduler
     prediction: PredictionTransform
     weighting: Weighting = ScheduleWeighting()
     sampling: NoiseScheduler | None = None
+    interval: bool = False
 
     @property
     def sampler_schedule(self) -> NoiseScheduler:
@@ -163,6 +172,14 @@ class Denoiser:
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:
         return self.convert(x_t, t, self.raw(x_t, t))
+
+    def spanning(self, t, t_next) -> Denoiser:
+        """This denoiser over the interval from `t` to `t_next`: every call
+        reads its length in model time as the `duration` condition."""
+        schedule = self.process.sampler_schedule
+        duration = {"duration": schedule.model_time(t) - schedule.model_time(t_next)}
+        return replace(self, conditions={**self.conditions, **duration},
+                       unconditional=None if self.unconditional is None else {**self.unconditional, **duration})
 
     def raw(self, x_t, t) -> jax.Array:
         """The model's raw output at `(x_t, t)` under the conditions."""

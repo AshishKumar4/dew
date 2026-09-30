@@ -223,6 +223,26 @@ class Flow:
             weighting=_weighting(self.min_snr_gamma))
 
 
+@presets("mean_flow")
+@dataclass(frozen=True)
+class MeanFlow:
+    """Rectified flow on the linear path whose model predicts the average
+    velocity over an interval (`Process.interval`), MeanFlow's convention
+    (Geng et al. 2025, "Mean Flows for One-step Generative Modeling"). Its
+    training times are Gsunshine/meanflow's logit-normal at P_mean -0.4 and
+    P_std 1.0, in the same noise-at-one time as Dew's. It trains under
+    `MeanFlowObjective`, and one Euler step over the whole grid samples it.
+    """
+
+    logit_mean: float = -0.4
+    logit_std: float = 1.0
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=FlowMatchingScheduler(logit_mean=self.logit_mean, logit_std=self.logit_std),
+            prediction=FlowMatchPredictionTransform(), interval=True)
+
+
 @presets("jit")
 @dataclass(frozen=True)
 class JiT:
