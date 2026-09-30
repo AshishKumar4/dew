@@ -38,6 +38,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
+from dew import records
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.blocks import torch_bicubic_resize
@@ -267,22 +268,33 @@ class RAE(nn.Module):
 def rae_fields(config: Mapping[str, object]) -> RAEFields:
     """Read an `AutoencoderRAE` config into the fields `RAE` takes, refusing
     what the port does not compute."""
-    kind = config.get("encoder_type", "dinov2")
+    kind = records.text(config.get("encoder_type", "dinov2"), "encoder_type")
     if kind not in RAE_ENCODERS:
         raise ValueError(f"encoder_type {kind!r} is not one of {RAE_ENCODERS}")
-    if not config.get("reshape_to_2d", True):
+    if not records.boolean(config.get("reshape_to_2d", True), "reshape_to_2d"):
         raise ValueError("a latent diffusion run reads an RAE's latent as a grid; reshape_to_2d must be true")
-    if config.get("num_channels", 3) != 3:
+    if records.integer(config.get("num_channels", 3), "num_channels") != 3:
         raise ValueError("the RAE encoders read three-channel images")
+
+    def integer(name: str, default: int) -> int:
+        return records.integer(config.get(name, default), name)
+
+    def per_channel(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+        value = config.get(name)
+        if value is None:
+            return default
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError(f"{name}={value!r}: this field is one number per image channel")
+        return tuple(records.number(entry, name) for entry in value)
+
     fields = RAEFields(
-        kind=kind, encoder_width=config.get("encoder_hidden_size", 768),
-        encoder_layers=config.get("encoder_num_hidden_layers", 12), encoder_patch=config.get("encoder_patch_size", 14),
-        input_size=config.get("encoder_input_size", 224), decoder_width=config.get("decoder_hidden_size", 512),
-        decoder_layers=config.get("decoder_num_hidden_layers", 8),
-        decoder_heads=config.get("decoder_num_attention_heads", 16),
-        decoder_intermediate=config.get("decoder_intermediate_size", 2048), patch=config.get("patch_size", 16),
-        pixel_mean=tuple(config.get("encoder_norm_mean") or (0.485, 0.456, 0.406)),
-        pixel_std=tuple(config.get("encoder_norm_std") or (0.229, 0.224, 0.225)))
+        kind=kind, encoder_width=integer("encoder_hidden_size", 768),
+        encoder_layers=integer("encoder_num_hidden_layers", 12), encoder_patch=integer("encoder_patch_size", 14),
+        input_size=integer("encoder_input_size", 224), decoder_width=integer("decoder_hidden_size", 512),
+        decoder_layers=integer("decoder_num_hidden_layers", 8), decoder_heads=integer("decoder_num_attention_heads", 16),
+        decoder_intermediate=integer("decoder_intermediate_size", 2048), patch=integer("patch_size", 16),
+        pixel_mean=per_channel("encoder_norm_mean", (0.485, 0.456, 0.406)),
+        pixel_std=per_channel("encoder_norm_std", (0.229, 0.224, 0.225)))
     if fields["input_size"] % fields["encoder_patch"]:
         raise ValueError(f"encoder_input_size {fields['input_size']} is not a multiple of "
                          f"encoder_patch_size {fields['encoder_patch']}")
@@ -290,7 +302,6 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
     if size is not None and size != fields["patch"] * fields["input_size"] // fields["encoder_patch"]:
         raise ValueError(f"image_size {size} is not patch_size times the encoder's grid")
     return fields
-
 
 _LAYER = {
     "norm1": "norm1", "layernorm_before": "norm1", "layer_norm1": "norm1",
