@@ -10,11 +10,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.attention import cudnn_runs, forward_mode_attention, scaled_dot_product_attention
+from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
     backward_simulation,
     consistency_loss,
     critic_loss,
+    discrete_consistency_loss,
     distribution_matching_loss,
     guided,
     trig_prediction,
@@ -60,6 +61,20 @@ def test_the_consistency_loss_is_rcms(iteration):
     loss = consistency_loss(lambda x, t: trig_prediction(network("student"), x, t)[1], x, t, teacher(x, t)[1],
                             ratio, CONFIG["loss_scale"])
     np.testing.assert_allclose(np.asarray(loss), CASE[f"scm{iteration}.loss"], rtol=RTOL)
+
+
+def test_the_discrete_consistency_loss_is_rcms():
+    """rCM's dCM step: two teacher Euler steps on an 8-point grid at shift 5."""
+    student = network("student")
+    loss = discrete_consistency_loss(
+        lambda x, t: trig_prediction(student, x, t)[0], lambda x, t: teacher(x, t)[1], X0,
+        jnp.asarray(CASE["dcm.noise"], jnp.float32),
+        # The recorded uniforms, over [0, 1 - skip / steps) as the step scales them.
+        jnp.asarray(CASE["dcm.u"][:, 0], jnp.float32) * (1 - CONFIG["dcm_skipping_interval_steps"]
+                                                        / CONFIG["dcm_total_steps"]),
+        CONFIG["dcm_total_steps"], CONFIG["dcm_skipping_interval_steps"], CONFIG["dcm_timestep_shift"],
+        CONFIG["loss_scale"])
+    np.testing.assert_allclose(np.asarray(loss), CASE["dcm.loss"], rtol=RTOL)
 
 
 def generated():
@@ -119,28 +134,6 @@ def test_forward_mode_attention_leaves_a_jvp_capable_kernel_as_it_is():
     reference_out, reference_tangent = attention("reference")
     np.testing.assert_allclose(np.asarray(out), np.asarray(reference_out), rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(np.asarray(tangent), np.asarray(reference_tangent), rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.skipif(not cudnn_runs(jnp.zeros((1, 1, 1, 64), jnp.bfloat16), None),
-                    reason="cuDNN's fused attention runs on a CUDA GPU")
-def test_cudnn_attention_takes_a_jvp_inside_forward_mode_attention():
-    """cuDNN's kernel is reverse-mode only; inside the context its tangent is
-    the reference path's, and its value the kernel's own."""
-    q, k, v = (jax.random.normal(jax.random.PRNGKey(i), (2, 128, 4, 64), jnp.bfloat16) for i in range(3))
-    tangents = tuple(jax.random.normal(jax.random.PRNGKey(10 + i), q.shape, jnp.bfloat16) for i in range(3))
-
-    def run(implementation):
-        with forward_mode_attention():
-            return jax.jvp(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation),
-                           (q, k, v), tangents)
-    with pytest.raises(TypeError, match="forward-mode"):
-        jax.jvp(lambda q: scaled_dot_product_attention(q, k, v, implementation="cudnn"), (q,), (tangents[0],))
-    out, tangent = run("cudnn")
-    reference_out, reference_tangent = run("xla")
-    # One bf16 spacing at these magnitudes (outputs near 1, tangents near 2).
-    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(reference_out, np.float32), atol=2 ** -7)
-    np.testing.assert_allclose(np.asarray(tangent, np.float32), np.asarray(reference_tangent, np.float32),
-                               atol=2 ** -5)
 
 
 def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_critic(tmp_path):

@@ -543,11 +543,15 @@
   "param_dtype": "float32"
  },
  "dew.objectives.diffusion.config.ConsistencyDistillation": {
+  "consistency": "continuous",
   "consistency_weight": 100.0,
   "critic_times": [
    0.0,
    1.6
   ],
+  "discrete_shift": 5.0,
+  "discrete_skip": 1,
+  "discrete_steps": 48,
   "dmd_weight": 1.0,
   "max_simulation_steps": 4,
   "student_times": [

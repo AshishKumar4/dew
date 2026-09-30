@@ -20,8 +20,10 @@ process; `trig_prediction` reads one on TrigFlow as rCM's
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -88,6 +90,29 @@ def consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array], x, t,
     return scale * rows(jnp.square(F - held - g))
 
 
+def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Array],
+                              teacher: Callable[[jax.Array, jax.Array], jax.Array], x0, noise, u,
+                              steps: int, skip: int, shift: float, scale: float) -> jax.Array:
+    """rCM's discrete consistency (dCM) per-row loss (`_student_dcm_step`):
+    on a grid of `steps` in shifted rf time, the student's x_0 at a point u
+    against its stopped x_0 `skip` teacher Euler steps of F later.
+    `student(x, t)` is the student's x_0 and `teacher(x, t)` the guided
+    teacher's F, both at TrigFlow time."""
+    def trig(k):
+        s = 1.0 - (u + k / steps)
+        rf = shift * s / (1 + (shift - 1) * s)
+        rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
+        return jnp.arctan(rf / (1 - rf))
+    times = [trig(k) for k in range(skip + 1)]
+    x = expand(jnp.cos(times[0]), x0) * x0 + expand(jnp.sin(times[0]), x0) * noise
+    predicted = student(x, times[0])
+    walked = x
+    for current, following in itertools.pairwise(times):
+        walked = walked - expand(current - following, walked) * teacher(walked, current)
+    target = jax.lax.stop_gradient(student(jax.lax.stop_gradient(walked), times[-1]))
+    return scale * rows(jnp.square(predicted - target))
+
+
 def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_T, times, noises,
                         live: jax.Array | None = None) -> jax.Array:
     """The student's few-step sample from `x_T` at t = pi/2
@@ -141,6 +166,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     times are rCM's log-normals in rf time, `student_times` for sCM and
     `critic_times` for DMD2 and the critic.
 
+    `consistency` "discrete" trains rCM's discrete consistency (dCM, Song
+    et al. 2023's consistency distillation) in place of sCM: the student's
+    x_0 at a point of a `discrete_steps` grid in rf time shifted by
+    `discrete_shift`, against its own stopped x_0 `discrete_skip` teacher
+    Euler steps later.
+
     Where rCM steps one optimizer and leaves the other network's state as
     it was, here the idle network's gradient is zero for that step: an
     optimizer whose update moves on a zero gradient, such as Adam's momentum,
@@ -152,7 +183,8 @@ class ConsistencyDistillationObjective(DiffusionObjective):
                  consistency_weight: float = 100.0, dmd_weight: float = 1.0, teacher_guidance: float = 1.0,
                  tangent_warmup: int = 0, student_update_freq: int = 5, max_simulation_steps: int = 4,
                  student_times: tuple[float, float] = (-0.8, 1.6), critic_times: tuple[float, float] = (0.0, 1.6),
-                 **kwargs):
+                 consistency: Literal["continuous", "discrete"] = "continuous", discrete_steps: int = 48,
+                 discrete_skip: int = 1, discrete_shift: float = 5.0, **kwargs):
         schedule = process.schedule
         if not (isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0 and not process.interval
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
@@ -176,6 +208,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         self.max_simulation_steps = max_simulation_steps
         self.student_times = student_times
         self.critic_times = critic_times
+        if consistency not in ("continuous", "discrete"):
+            raise ValueError(f"consistency is continuous (sCM) or discrete (dCM), not {consistency!r}")
+        self.consistency = consistency
+        self.discrete_steps = discrete_steps
+        self.discrete_skip = discrete_skip
+        self.discrete_shift = discrete_shift
 
     def held_variables(self) -> Variables:
         return {**super().held_variables(), TEACHER: self.teacher}
@@ -251,7 +289,15 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         def student_losses(params):
             student_params = self.trainable(params)
             total = jnp.zeros((count,), jnp.float32)
-            if self.consistency_weight > 0:
+            if self.consistency_weight > 0 and self.consistency == "discrete":
+                network = self._network(student_params, given)
+                u = jax.random.uniform(time_key, (count,)) * (1 - self.discrete_skip / self.discrete_steps)
+                total = total + discrete_consistency_loss(
+                    lambda x, t: trig_prediction(network, x, t)[0],
+                    lambda x, t: self._teacher(params, given, blank, x, t)[1],
+                    samples, jax.random.normal(noise_key, samples.shape), u, self.discrete_steps,
+                    self.discrete_skip, self.discrete_shift, self.consistency_weight)
+            elif self.consistency_weight > 0:
                 t = self._times(time_key, count, self.student_times)
                 noise = jax.random.normal(noise_key, samples.shape)
                 x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise
@@ -293,4 +339,4 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
 
 __all__ = ["FAKE_SCORE", "TEACHER", "ConsistencyDistillationObjective", "backward_simulation", "consistency_loss",
-           "critic_loss", "distribution_matching_loss", "guided", "trig_prediction", "trig_time"]
+           "critic_loss", "discrete_consistency_loss", "distribution_matching_loss", "guided", "trig_prediction", "trig_time"]
