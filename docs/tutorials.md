@@ -1,5 +1,5 @@
 # Tutorials
 
-Each tutorial is a Jupyter notebook in the repository's `tutorials/` folder, and each page here shows the notebook with the outputs from its last complete run. Open one in Colab to run it yourself: the first cell installs Dew from GitHub, and the notebook says at the top what hardware it needs.
+Each tutorial is a Jupyter notebook in the repository's `tutorials/` folder. The pages here show each notebook with the outputs of its last complete run. The first code cell of every notebook installs Dew from GitHub, and the top of the notebook names the hardware it needs; the Colab link opens it ready to run.
 
-Notebooks 01 to 04 are about image diffusion and build on each other: 04 samples from the checkpoint that 02 trains. The others stand alone. If you have not used Dew before, read the [quickstart](getting-started.md) first; it trains a model in a few seconds on a CPU and introduces the pieces every notebook uses.
+Notebooks 01 to 04 cover image diffusion and build on each other: 04 samples from the checkpoint 02 trains. The others stand alone. The [Quickstart](getting-started.md) introduces the objects every notebook uses and runs on a CPU in seconds.
