@@ -116,10 +116,12 @@ class MeanFlowObjective(DiffusionObjective):
         variables = self.trainable(params)
 
         def velocity(conditions, *, train: bool) -> Velocity:
-            def average(z, t, r):
-                return self.model.apply(variables, z, schedule.model_time(t), **conditions,
-                                        duration=schedule.model_time(t) - schedule.model_time(r),
-                                        train=train, rngs={"dropout": dropout_key})
+            def average(z, t, r) -> jax.Array:
+                output = self.model.apply(variables, z, schedule.model_time(t), **conditions,
+                                          duration=schedule.model_time(t) - schedule.model_time(r),
+                                          train=train, rngs={"dropout": dropout_key})
+                assert isinstance(output, jax.Array)
+                return output
             return average
 
         if self.omega != 1.0 or self.kappa != 0.0:
