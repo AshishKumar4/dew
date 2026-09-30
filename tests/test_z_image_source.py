@@ -170,5 +170,5 @@ def test_pipeline_walk_matches_the_source(pipeline, arrays, record):
     latents = np.asarray(walked.latents)
     for row in range(len(recorded["prompts"])):
         expected = arrays[f"pipeline.latents.{row}"].transpose(0, 2, 3, 1)[0]
-        assert relative_gap(latents[row], expected) < 2e-5, row
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5, row
+        assert relative_gap(latents[row], expected) < FORWARD, row
+        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row
