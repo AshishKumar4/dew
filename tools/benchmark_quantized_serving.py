@@ -19,8 +19,8 @@ says, and prints one JSON line:
 
 A precision is `none`, `int8` or `fp8` (weights and activations), or `int8w`
 or `fp8w` (weights only). `--float` keeps the modules whose paths contain one
-of its names unquantized. A case that fails to compile prints its error in
-place of the measurements.
+of its names unquantized. A case Dew refuses to quantize, or one that fails
+to compile, prints its error in place of the measurements.
 
 Usage:
     python tools/benchmark_quantized_serving.py float32 none
@@ -140,15 +140,15 @@ def quality(pipe: TextToImage, decode_batch: int) -> dict:
 def main(config: Config) -> None:
     load = TextToImage.from_run if Path(config.model).is_dir() else TextToImage.from_pretrained
     pipe = load(config.model, dtype=config.dtype)
-    if config.precision != "none":
-        pipe = pipe.quantized(spec(config))
     row = {"device": jax.devices()[0].device_kind, "dtype": config.dtype, "precision": config.precision,
            "float": list(config.float)}
     try:
+        if config.precision != "none":
+            pipe = pipe.quantized(spec(config))
         row |= forward(pipe)
         if config.clip:
             row |= quality(pipe, config.decode_batch)
-    except jax.errors.JaxRuntimeError as error:
+    except (ValueError, jax.errors.JaxRuntimeError) as error:
         row["error"] = str(error).splitlines()[0][:300]
     print(json.dumps(row), flush=True)
 

@@ -18,7 +18,7 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
 from dew.artifacts import agreed, uint8_pixels
-from dew.diffusion.process import Process
+from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
@@ -80,8 +80,8 @@ class DenoisingInputs:
     """
 
     noise: jax.Array
-    conditions: Mapping[str, object] = struct.field(default_factory=dict)
-    unconditional: Mapping[str, object] = struct.field(default_factory=dict)
+    conditions: Mapping[str, Conditioning] = struct.field(default_factory=dict)
+    unconditional: Mapping[str, Conditioning] = struct.field(default_factory=dict)
     rows: int | None = struct.field(pytree_node=False, default=None)
     grid_steps: int | None = struct.field(pytree_node=False, default=None)
     process: Process | None = struct.field(pytree_node=False, default=None)
