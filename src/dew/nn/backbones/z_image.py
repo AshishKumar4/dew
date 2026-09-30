@@ -15,8 +15,9 @@ which differs row to row; the source looks each position up in a table it
 computed in float64 and rounded to float32, so this does too.
 
 Beyond the padding the source pads each batch to its longest row and masks
-those keys. Here the prompt region is the conditioner's budget wide, the
-prompt and its padding lead it, and the rest is masked the same way.
+those keys. Here the prompt region is the conditioner's budget wide, rounded
+up to 32, the prompt and its padding lead it, and the rest is masked the
+same way.
 
 The source is called with the time 1 - sigma and its output is the negated
 flow; this module takes Dew's model time, sigma times the training count,
@@ -203,11 +204,13 @@ class ZImageTransformer(nn.Module):
         rows, columns = height // 2, width // 2
         count = rows * columns
         image_span = -(-count // MULTIPLE) * MULTIPLE
-        budget = conditioning.context.shape[1]
-        if budget % MULTIPLE:
-            raise ValueError(f"the prompt budget {budget} is not a multiple of {MULTIPLE}")
-        # The prompt and its padding: its real tokens rounded up to 32.
-        spans = -(-jnp.sum(conditioning.mask, axis=1, dtype=jnp.int32) // MULTIPLE) * MULTIPLE
+        context, mask = conditioning.context, conditioning.mask
+        # The prompt region holds every row's real tokens rounded up to 32.
+        extra = -context.shape[1] % MULTIPLE
+        context = jnp.pad(context, ((0, 0), (0, extra), (0, 0)))
+        mask = jnp.pad(mask, ((0, 0), (0, extra)))
+        budget = context.shape[1]
+        spans = -(-jnp.sum(mask, axis=1, dtype=jnp.int32) // MULTIPLE) * MULTIPLE
         slots = jnp.arange(budget)
 
         embedded = self._embedded_time(time, x.dtype)
@@ -219,8 +222,8 @@ class ZImageTransformer(nn.Module):
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))], axis=1)
         caption = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="cap_embedder")(
-            RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(conditioning.context))
-        caption = jnp.where(conditioning.mask[..., None], caption, pad_caption.astype(caption.dtype))
+            RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
+        caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
 
         grid = np.indices((rows, columns)).reshape(2, -1).T
         image_positions = jnp.concatenate([
