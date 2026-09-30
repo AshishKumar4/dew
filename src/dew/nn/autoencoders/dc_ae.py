@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
+from dew import records
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
@@ -380,7 +381,12 @@ class DCAE(nn.Module):
 def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
     """A config entry the source takes as one value or one per level."""
     value = config[name]
-    values = (value,) * levels if isinstance(value, str) else tuple(value)
+    if isinstance(value, str):
+        values = (value,) * levels
+    elif isinstance(value, (list, tuple)):
+        values = tuple(value)
+    else:
+        raise ValueError(f"{name}={value!r}: this field is one name or one entry per level")
     if len(values) != levels:
         raise ValueError(f"{name} has {len(values)} entries for {levels} levels")
     return values
@@ -389,16 +395,18 @@ def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
 def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
     """Read an `AutoencoderDC` config into the fields `DCAE` takes, refusing
     what the port does not compute."""
-    levels = len(config["encoder_block_out_channels"])
-    if len(config["decoder_block_out_channels"]) != levels:
+    encoder_channels = records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
+    decoder_channels = records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
+    levels = len(encoder_channels)
+    if len(decoder_channels) != levels:
         raise ValueError("the encoder and decoder have different numbers of levels")
     fields = DCAEFields(
-        image_channels=config["in_channels"], latent_channels=config["latent_channels"],
-        head_dim=config["attention_head_dim"],
+        image_channels=records.integer(config["in_channels"], "in_channels"),
+        latent_channels=records.integer(config["latent_channels"], "latent_channels"),
+        head_dim=records.integer(config["attention_head_dim"], "attention_head_dim"),
         encoder_blocks=_per_level(config, "encoder_block_types", levels),
         decoder_blocks=_per_level(config, "decoder_block_types", levels),
-        encoder_channels=tuple(config["encoder_block_out_channels"]),
-        decoder_channels=tuple(config["decoder_block_out_channels"]),
+        encoder_channels=encoder_channels, decoder_channels=decoder_channels,
         encoder_layers=_per_level(config, "encoder_layers_per_block", levels),
         decoder_layers=_per_level(config, "decoder_layers_per_block", levels),
         encoder_scales=tuple(map(tuple, _per_level(config, "encoder_qkv_multiscales", levels))),
