@@ -203,11 +203,19 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     Qwix 0.1.8 scales it in the scales' dtype: a bf16 model's int32
     accumulators became bf16 before either scale multiplied in, and XLA:TPU
     then emitted its int8 and fp8 matmuls and convolutions with bf16
-    results. The bf16 176M text-to-image model served that way sampled NaN
-    images on a v6e, while the float32 one, whose 8-bit products come out
-    in int32 or float32, sampled as well as unquantized. A weight-only
-    product, one quantized operand, dequantizes before a float matmul and
-    passes through."""
+    results. On a v6e an int8 depthwise convolution scaled that way came out
+    NaN in all but a few outputs in plain JAX, while the dense and attention
+    forms of the 176M text-to-image model stayed finite on their own. Served
+    in bf16 that model sampled NaN images, from its depthwise convolutions in
+    int8 and from an attention block in fp8, and scaled in float32 it samples
+    as well as unquantized (docs/performance.md). A weight-only product, one
+    quantized operand, dequantizes before a float matmul and passes through.
+
+    Quantized training runs Qwix's own operations, with no hook for this.
+    Its grouped convolutions quantize from float32 instead
+    (`GroupScaledConvolution`); its matmuls keep Qwix's scaling, and whether
+    a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
+    measured."""
     qarray = importlib.import_module("qwix._src.core.qarray")
 
     def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
@@ -259,6 +267,12 @@ def _providers() -> tuple[type, type]:
         multiplying each output group by it after, gives the per-group scales
         exactly: the convolution is linear and keeps groups apart, and every
         group then peaks at 1, so Qwix's single scale is each group's own.
+
+        The divided input is float32, so Qwix scales the convolution's 8-bit
+        product in float32 in training as well as in serving
+        (`_scaled_in_float32`), and the output returns to the input's dtype.
+        From a bf16 input Qwix scaled it in bf16, a form XLA:TPU computes as
+        NaN for an int8 depthwise convolution.
         """
 
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
@@ -281,11 +295,12 @@ def _providers() -> tuple[type, type]:
                 return convolve(lhs=lhs)
             _refuse_grouped_on_gpu()
             numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
-            scales = _group_scales(lhs, numbers, feature_group_count)
+            scales = _group_scales(lhs, numbers, feature_group_count).astype(jnp.float32)
             batch, feature = numbers.lhs_spec[:2]
-            out = convolve(lhs=lhs / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
+            out = convolve(lhs=lhs.astype(jnp.float32)
+                           / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
             batch, feature = numbers.out_spec[:2]
-            return out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature]).astype(out.dtype)
+            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
 
     class QtProvider(GroupScaledConvolution, qwix.QtProvider):
         pass

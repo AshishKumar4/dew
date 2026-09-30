@@ -282,6 +282,50 @@ def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
     np.testing.assert_array_equal(served.apply(served_variables, x), scaled.astype(jnp.bfloat16))
 
 
+def converted_int32_products(jaxpr) -> set:
+    """The dtypes the int32 results of the convolutions and matmuls in
+    `jaxpr`, and in the jaxprs it calls, are converted to."""
+    products, dtypes = set(), set()
+    for equation in jaxpr.eqns:
+        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
+                and equation.outvars[0].aval.dtype == jnp.int32):
+            products.add(id(equation.outvars[0]))
+        if equation.primitive.name == "convert_element_type" and id(equation.invars[0]) in products:
+            dtypes.add(jnp.dtype(equation.params["new_dtype"]))
+        for value in equation.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns"):
+                dtypes |= converted_int32_products(inner)
+    return dtypes
+
+
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("training", [True, False])
+def test_a_bf16_int8_depthwise_convolution_scales_its_int32_products_in_float32(training):
+    """A bf16 depthwise convolution quantized to int8 converts its int32
+    product to float32 for the scales, in training as in serving, and
+    returns bf16. Qwix 0.1.8 converted it to bf16 in training, and on a v6e
+    XLA:TPU computed an int8 depthwise convolution scaled that way as NaN in
+    all but a few outputs."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    features = 16
+    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME", feature_group_count=features,
+                use_bias=False, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features), jnp.bfloat16)
+    variables = conv.init(jax.random.key(1), x)
+    if training:
+        module, module_variables = apply_quantization(conv, Quantization()), variables
+    else:
+        module, module_variables = quantize_for_serving(conv, variables, Quantization(), x)
+    assert converted_int32_products(jax.make_jaxpr(module.apply)(module_variables, x).jaxpr) == {
+        jnp.dtype(jnp.float32)}
+    assert module.apply(module_variables, x).dtype == jnp.bfloat16
+
+
 def test_serving_leaves_complex_matmuls_in_float():
     """Qwix quantizes real values only; a complex matmul, like the S5 scan's
     in the hybrid DiT, runs unquantized beside the quantized Dense, within
