@@ -109,8 +109,11 @@ export class Coordinator extends DurableObject<Env> {
 			return { ok: false, reason: 'too-many-starts', retryAfter: Math.ceil((oldest - windowStart) / 1000) };
 		}
 		const day = utcDay(now);
-		// A spare is already counted against the cap and the budget.
-		const spare = sql.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL LIMIT 1").toArray()[0];
+		// A spare is already counted against the cap and the budget. One whose container has
+		// not reported its start may never get a host, so a session does not wait on it.
+		const spare = sql
+			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND started IS NOT NULL LIMIT 1")
+			.toArray()[0];
 		let id: string;
 		if (spare) {
 			id = spare.id;
@@ -128,6 +131,7 @@ export class Coordinator extends DurableObject<Env> {
 		}
 		let next: string | null = null;
 		if (
+			this.count("SELECT COUNT(*) AS n FROM sessions WHERE ip = '' AND ended IS NULL") === 0 &&
 			this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL') < maxSessions &&
 			this.committed(day) + wallSeconds + warmSeconds <= budgetSeconds
 		) {

@@ -5,8 +5,8 @@
 //   GET /on-time   the page connects at 1 s and the container is up at 4 s
 //   GET /late      the page connects at 119 s; a request at 121 s sweeps sessions that
 //                  have not started, while the container boots; it is up at 122 s
-//   GET /spare     one visitor's session asks for a spare, which is up at 3 s; another
-//                  visitor opens a session at 10 s and takes it
+//   GET /spare     one visitor's session asks for a spare, which is up at 3 s; a visitor
+//                  who comes at 2 s does not get it, one who comes at 10 s does
 
 import { Coordinator } from '../src/coordinator';
 
@@ -48,11 +48,13 @@ async function spare(coordinator: DurableObjectStub<Coordinator>) {
 	const first = await coordinator.open('first-visitor', at(0));
 	if (!first.ok || first.spare === null) return { error: 'the first session asked for no spare', first };
 	await coordinator.started(first.id, at(1));
+	// A visitor who comes while the spare boots gets a container of its own.
+	const early = await coordinator.open('early-visitor', at(2));
 	await coordinator.started(first.spare, at(3));
 	const second = await coordinator.open('second-visitor', at(10));
 	const both = await coordinator.status(at(20));
 	const twice = await coordinator.open('second-visitor', at(30));
 	// The second session's own spare never starts, and is swept as unused.
 	const later = await coordinator.status(at(200));
-	return { first, second, both, twice, later };
+	return { first, early, second, both, twice, later };
 }
