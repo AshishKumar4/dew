@@ -105,9 +105,11 @@ class Alignment:
     `weight` is REPA's `proj_coeff`. `projector` "mlp" of `width` is REPA's;
     "conv" of `kernel_size` with `spatial_norm` gamma (0.6 in iREPA's
     training script) is iREPA's, which z-scores each feature over the
-    tokens after subtracting gamma times its spatial mean. REPA's DINOv2
-    preprocessing, ImageNet statistics and 224 pixels per 256, is the
-    default.
+    tokens after subtracting gamma times its spatial mean. The pixel
+    statistics default to ImageNet's, DINOv2's; `resolution` None feeds the
+    encoder the data's size, and REPA's DINOv2 reads 224 pixels of a 256
+    image (`resolution=224`). The loss adds `weight / 2` times the
+    alignment, since Dew's L2 halves the denoising error REPA adds it to.
     """
 
     encoder: nn.Module
@@ -134,6 +136,8 @@ class Alignment:
         if self.resolution is not None and self.resolution != pixels.shape[1]:
             pixels = torch_bicubic(pixels, self.resolution)
         features = self.encoder.apply(variables, pixels)
+        if not isinstance(features, jax.Array):
+            raise TypeError("a representation encoder must return one array of patch features")
         features = features.reshape(features.shape[0], -1, features.shape[-1]).astype(jnp.float32)
         if self.spatial_norm is not None:
             features = spatial_zscore(features, self.spatial_norm)
@@ -152,7 +156,9 @@ class Alignment:
         if hidden.shape[:2] != targets.shape[:2]:
             raise ValueError(f"the model's {hidden.shape[1]} tokens at {self.layer!r} do not "
                              f"match the encoder's {targets.shape[1]} patches")
-        projected = self.module(targets.shape[-1]).apply(projector, hidden).astype(jnp.float32)
+        projected = self.module(targets.shape[-1]).apply(projector, hidden)
+        assert isinstance(projected, jax.Array)
+        projected = projected.astype(jnp.float32)
 
         def unit(value):
             return value / jnp.maximum(jnp.linalg.norm(value, axis=-1, keepdims=True), 1e-12)

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 from dew.objectives.base import Variables
 
@@ -48,12 +49,13 @@ class EndToEnd:
     momentum: float = 0.1
     epsilon: float = 1e-4
 
-    def initial_statistics(self, shift: float, scale: float, channels: int) -> Variables:
+    def initial_statistics(self, shift: ArrayLike, scale: ArrayLike, channels: int) -> Variables:
         """The running statistics REPA-E's `init_bn` starts from: the
         autoencoder's latent shift as the mean and 1 / scale^2 as the
-        variance."""
-        return {"mean": jnp.full((channels,), shift, jnp.float32),
-                "var": jnp.full((channels,), 1.0 / scale ** 2, jnp.float32)}
+        variance, per channel."""
+        scale = jnp.asarray(scale, jnp.float32)
+        return {"mean": jnp.broadcast_to(jnp.asarray(shift, jnp.float32), (channels,)),
+                "var": jnp.broadcast_to(1.0 / scale ** 2, (channels,))}
 
     def normalized(self, latents: jax.Array, statistics: Variables) -> jax.Array:
         """`latents` under the running statistics: the batch norm in eval mode."""
