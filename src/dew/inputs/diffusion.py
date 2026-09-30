@@ -499,7 +499,11 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
             conversation, options = self._conversation(_prompt(record, "text", ""))
             rows.append(self.tokenizer.apply_chat_template(conversation, tokenize=False, **options))
             guidance.append(_row_guidance(record, self.guidance))
-        encoded = self.tokenizer(rows, padding="max_length", padding_side="right", max_length=self.tokens)
+        # The template writes the special tokens itself: [dev]'s tokenizing
+        # `apply_chat_template` has the tokenizer add none, and the Qwen
+        # tokenizers [klein] and Z-Image call add none of their own.
+        encoded = self.tokenizer(rows, padding="max_length", padding_side="right", max_length=self.tokens,
+                                 add_special_tokens=False)
         if any(len(ids) > self.tokens for ids in encoded.input_ids):
             raise ValueError(f"A prompt runs past the {self.tokens}-token budget; raise `tokens`")
         tokens: dict[str, np.ndarray] = {"input_ids": np.asarray(encoded.input_ids, np.int32),

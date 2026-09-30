@@ -242,3 +242,27 @@ def test_the_empirical_shift_is_the_pipelines():
     assert empirical_mu(1024, 200) == pytest.approx(0.00016927 * 1024 + 0.45666666)
     assert empirical_mu(1024, 10) == pytest.approx(8.73809524e-05 * 1024 + 1.89833333)
     assert empirical_mu(5000, 4) == pytest.approx(0.00016927 * 5000 + 0.45666666)
+
+
+def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
+    """FLUX.2 [dev]'s conditioning over a tiny Mistral-3 encoder with Mistral
+    Small 3.1's chat template: the system and user turns, 512 tokens padded
+    on the right, the hidden states after layers 10, 20 and 30 stacked, and
+    the guidance [dev] embeds. The vision tower is carried, not run, and
+    exports as it came."""
+    from dew.interop.pretrained import _hidden_states_conditioning
+
+    directory = source / "mistral3"
+    encoder, layouts, _ = _hidden_states_conditioning(
+        directory, {}, jnp.float32, 16, pipeline="flux2", tokens=512, guidance=4.0, param_dtype="float32",
+        attention_impl="xla")
+    assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
+    condition = encoder.encode(encoder.params, encoder.tokenize(record["pipeline"]["prompts"]))
+    assert relative_gap(condition.context, arrays["mistral3.context"]) < FORWARD
+    np.testing.assert_array_equal(np.asarray(condition.guidance), [4.0, 4.0])
+    tensors = component_tensors(directory, "text_encoder")
+    assert {layout.name for layout in layouts} == {f"text_encoder/{name}" for name in tensors}
+    assert any("vision_tower." in name for name in tensors)
+    for layout in layouts:
+        written = layout.export({"encoders": {"conditioning": encoder.params}})
+        assert written.tobytes() == tensors[layout.name.removeprefix("text_encoder/")].tobytes(), layout.name
