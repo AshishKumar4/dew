@@ -198,7 +198,8 @@ def learning_rate(opt_state: optax.OptState) -> float | None:
     rates = [node.hyperparams["learning_rate"]
              for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
              if isinstance(node, injected) and "learning_rate" in node.hyperparams]
-    return float(rates[0]) if len(rates) == 1 else None
+    # optax types a hyperparameter as any ArrayLike; a learning rate is a real scalar.
+    return float(jnp.asarray(rates[0])) if len(rates) == 1 else None
 
 
 # How the display shows the metrics the trainer itself logs; an objective,
@@ -285,7 +286,7 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
     report. Both may declare `shown`, which their protocols leave optional,
     so the trainer reads it at this boundary."""
     return {**getattr(rollout, 'shown', {}),
-            **{metric.name: metric.shown for metric in metrics if hasattr(metric, 'shown')}}
+            **{metric.name: shown for metric in metrics if (shown := getattr(metric, 'shown', None)) is not None}}
 
 
 def _keeps_triton_gemm(model: nn.Module) -> bool:

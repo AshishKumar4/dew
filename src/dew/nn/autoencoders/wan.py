@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
+from dew import records
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
@@ -291,8 +292,11 @@ class WanVAE(nn.Module):
 def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     """Read an `AutoencoderKLWan` config into the fields `WanVAE` takes,
     refusing what the port does not compute."""
-    multipliers = tuple(config["dim_mult"])
-    temporal = tuple(config["temperal_downsample"])
+    multipliers = records.integers(config["dim_mult"], "dim_mult")
+    halvings = config["temperal_downsample"]
+    if not isinstance(halvings, (list, tuple)):
+        raise ValueError(f"temperal_downsample={halvings!r}: this field is one flag per downsampling")
+    temporal = tuple(records.boolean(halves, "temperal_downsample") for halves in halvings)
     if len(temporal) != len(multipliers) - 1:
         raise ValueError(f"temperal_downsample has {len(temporal)} entries for {len(multipliers)} levels")
     if config.get("attn_scales"):
@@ -302,8 +306,9 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     for name in ("is_residual", "patch_size"):
         if config.get(name):
             raise ValueError(f"{name} belongs to Wan 2.2's VAE, which this port does not compute")
-    return WanVAEFields(base=config["base_dim"], latent=config["z_dim"], multipliers=multipliers,
-                        blocks=config["num_res_blocks"], temporal=temporal)
+    return WanVAEFields(base=records.integer(config["base_dim"], "base_dim"),
+                        latent=records.integer(config["z_dim"], "z_dim"), multipliers=multipliers,
+                        blocks=records.integer(config["num_res_blocks"], "num_res_blocks"), temporal=temporal)
 
 
 _LEAF_RANK = {"weight": (4, 5), "bias": (1,), "gamma": (3, 4)}
