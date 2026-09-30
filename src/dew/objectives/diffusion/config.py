@@ -253,6 +253,10 @@ class ConsistencyDistillation:
     max_simulation_steps: int = 4
     student_times: tuple[float, float] = (-0.8, 1.6)
     critic_times: tuple[float, float] = (0.0, 1.6)
+    consistency: Literal["continuous", "discrete"] = "continuous"
+    discrete_steps: int = 48
+    discrete_skip: int = 1
+    discrete_shift: float = 5.0
 
     def __post_init__(self) -> None:
         if not self.teacher:

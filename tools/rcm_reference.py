@@ -10,7 +10,7 @@ the fixture records. Each loss is one call of the reference's method: the
 sCM step (the TrigFlow tangent by torch.func.jvp, the warmed-up and
 normalized g, the per-row loss), the DMD step (a two-step backward
 simulation of the student, the teacher's guided x0, the fake score's) and
-the critic step.
+the critic step, and rCM's discrete consistency (dCM) step.
 
     PYTHONPATH=src python tools/rcm_reference.py
 """
@@ -33,7 +33,8 @@ FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rcm"
 SHAPE = (3, 2, 1, 4, 4)
 CONFIG = {"teacher_guidance": 2.5, "fd_type": 0, "tangent_warmup": 10, "loss_scale": 100.0,
           "loss_scale_dmd": 1.0, "dmd_fix_timesteps": False, "max_simulation_steps_fake": 4,
-          "rectified_flow_t_scaling_factor": 1000.0, "student_update_freq": 5}
+          "rectified_flow_t_scaling_factor": 1000.0, "student_update_freq": 5,
+          "dcm_total_steps": 8, "dcm_skipping_interval_steps": 2, "dcm_timestep_shift": 5.0}
 STRENGTH = {"student": 0.5, "teacher": 0.6, "fake_score": 0.4}
 
 
@@ -88,6 +89,11 @@ class Recorded:
         self.draws.append(draw)
         return draw
 
+    def rand(self, *size, device=None, **kwargs):
+        draw = torch.rand(size, generator=self.generator, dtype=torch.float64)
+        self.draws.append(draw)
+        return draw
+
     def randn_like(self, like):
         return self.randn(like.shape)
 
@@ -109,10 +115,14 @@ def main() -> None:
     recorded = Recorded(generator)
     scope = {"torch": recorded, "np": np, "math": math, "rearrange": rearrange, "repeat": repeat,
              "log": types.SimpleNamespace(debug=lambda *args: None), "Literal": object, "TextCondition": object,
-             "TensorWithT": tuple, "DenoisePrediction": lambda x0, F: types.SimpleNamespace(x0=x0, F=F)}
+             "TensorWithT": tuple, "DenoisePrediction": lambda x0, F=None: types.SimpleNamespace(x0=x0, F=F)}
     scaling_scope = definitions(RCM + "rcm/utils/denoiser_scaling.py", ("RectifiedFlow_TrigFlowWrapper",),
                                 {"torch": torch})
+    definitions(RCM + "rcm/utils/timestep_utils.py", ("shift_rf_time", "rf_to_trig_time", "rf_to_sigma",
+                                                        "sigma_to_trig_time"), scope)
+    scope["torch"] = recorded
     methods = ("denoise", "student_F_withT", "backward_simulation", "_student_scm_step", "_student_dmd_step",
+               "_student_dcm_step",
                "training_step_critic", "get_effective_iteration", "get_effective_iteration_fake")
     definitions(RCM + "rcm/models/t2v_model_distill_rcm.py", methods, scope, within="T2VDistillModel_rCM")
 
@@ -148,6 +158,10 @@ def main() -> None:
         arrays[f"scm{iteration}.loss"] = loss.detach().numpy()
         arrays[f"scm{iteration}.time"] = times["G"][0].numpy()
         arrays[f"scm{iteration}.noise"] = recorded.draws[0].numpy()
+    recorded.draws.clear()
+    _, loss = model._student_dcm_step(ctx, 0)
+    arrays["dcm.loss"] = loss.detach().numpy()
+    arrays["dcm.noise"], arrays["dcm.u"] = (draw.numpy() for draw in recorded.draws)
     for name, step in (("dmd", model._student_dmd_step), ("critic", model.training_step_critic)):
         recorded.draws.clear()
         times["D"].clear()
@@ -157,7 +171,7 @@ def main() -> None:
         arrays[f"{name}.draws"] = torch.stack(recorded.draws).numpy()
     FIXTURE.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURE / "losses.npz", **arrays)
-    print(f"{FIXTURE}: sCM at two iterations, DMD and critic losses over {SHAPE[0]} rows")
+    print(f"{FIXTURE}: sCM at two iterations, dCM, DMD and critic losses over {SHAPE[0]} rows")
 
 
 if __name__ == "__main__":
