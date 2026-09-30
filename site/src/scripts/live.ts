@@ -115,7 +115,7 @@ export class LiveSession {
 		});
 		const body = await response.json().catch(() => ({}));
 		if (!response.ok) throw new Error(body.message ?? `The live service answered ${response.status}.`);
-		status('Starting a container with Dew and JAX. The first start can take half a minute…');
+		status('Starting a container and loading the model. This takes about a minute…');
 		const socket = new WebSocket(body.socket);
 		const { promise: ready, resolve, reject } = Promise.withResolvers<void>();
 		const onMessage = (event: MessageEvent) => {
