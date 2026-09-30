@@ -19,8 +19,9 @@
 			"instance_type": "standard-4",
 			"max_instances": 8,
 			// A deploy replaces a running container only after its session could have
-			// reached the wall clock (WALL_SECONDS 1200, plus the Kernel's 15 s alarm).
-			"rollout_active_grace_period": 1215
+			// reached the wall clock (a spare's WARM_SECONDS 600 and WALL_SECONDS 1200,
+			// plus the Kernel's 15 s alarm).
+			"rollout_active_grace_period": 1815
 		}
 	],
 	"durable_objects": {
@@ -42,6 +43,10 @@
 		"BUDGET_SECONDS": "144000",
 		"MAX_SESSIONS": "8",
 		"WALL_SECONDS": "1200",
+		// How long a spare container waits for the next session: it costs about $0.02 a
+		// window idle (12 GiB and 20 GB provisioned), plus about 4 vCPU-minutes to load
+		// and compile, and counts against the budget.
+		"WARM_SECONDS": "600",
 		"IDLE_SECONDS": "300",
 		"CPU_SECONDS": "900",
 		"IP_WINDOW_SECONDS": "600",
@@ -62,7 +67,7 @@
 					"image": "./container/Dockerfile",
 					"instance_type": "standard-4",
 					"max_instances": 2,
-					"rollout_active_grace_period": 1215
+					"rollout_active_grace_period": 1815
 				}
 			],
 			"durable_objects": {
@@ -80,6 +85,7 @@
 				"BUDGET_SECONDS": "7200",
 				"MAX_SESSIONS": "2",
 				"WALL_SECONDS": "1200",
+				"WARM_SECONDS": "600",
 				"IDLE_SECONDS": "300",
 				"CPU_SECONDS": "900",
 				"IP_WINDOW_SECONDS": "600",
