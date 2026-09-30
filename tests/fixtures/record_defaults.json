@@ -542,6 +542,23 @@
   "dtype": null,
   "param_dtype": "float32"
  },
+ "dew.objectives.diffusion.config.ConsistencyDistillation": {
+  "consistency_weight": 100.0,
+  "critic_times": [
+   0.0,
+   1.6
+  ],
+  "dmd_weight": 1.0,
+  "max_simulation_steps": 4,
+  "student_times": [
+   -0.8,
+   1.6
+  ],
+  "student_update_freq": 5,
+  "tangent_warmup": 0,
+  "teacher": "",
+  "teacher_guidance": 1.0
+ },
  "dew.objectives.diffusion.config.DiffusionRunConfig": {
   "alignment": null,
   "audio": null,
@@ -550,6 +567,7 @@
    "class": "dew.data.images.OxfordFlowers",
    "sets": {}
   },
+  "distill": null,
   "ema_decay": 0.999,
   "guidance": {
    "class": "dew.sampling.guidance.CFG",

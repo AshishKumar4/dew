@@ -53,17 +53,24 @@ UNCERTAINTY = "loss_uncertainty"
 `constants` collections, beside the model's own modules."""
 
 
-LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER)
+FAKE_SCORE = "fake_score"
+"""Where rCM's fake score network lives in `params` and `constants`."""
+
+TEACHER = "teacher"
+"""The collection of a distilling objective's frozen teacher variables."""
+
+LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE)
 """What trains beside the model under `params` and the model never reads."""
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
     """`variables` without what the model never reads: the uncertainty head,
     the alignment projector, the frozen representation encoder, and an
-    autoencoder trained end to end with its latent statistics."""
+    autoencoder trained end to end with its latent statistics, a fake score
+    and a teacher."""
     return {name: ({key: value for key, value in tree.items() if key not in LOSS_HEADS}
                    if name in ("params", "constants") else tree)
-            for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS)}
+            for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER)}
 
 
 def check_solver(process, sampler, steps: int) -> None:
