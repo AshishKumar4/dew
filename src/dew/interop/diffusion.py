@@ -493,8 +493,9 @@ def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "flo
         joint_attention_dim=records.integer(config.get("joint_attention_dim", 15360), "joint_attention_dim"),
         timestep_guidance_channels=records.integer(config.get("timestep_guidance_channels", 256),
                                                    "timestep_guidance_channels"),
-        mlp_ratio=float(config.get("mlp_ratio", 3.0)), axes_dims_rope=tuple(axes),
-        rope_theta=float(config.get("rope_theta", 2000)), eps=float(config.get("eps", 1e-6)),
+        mlp_ratio=records.number(config.get("mlp_ratio", 3.0), "mlp_ratio"), axes_dims_rope=tuple(axes),
+        rope_theta=records.number(config.get("rope_theta", 2000), "rope_theta"),
+        eps=records.number(config.get("eps", 1e-6), "eps"),
         guidance_embeds=records.boolean(config.get("guidance_embeds", True), "guidance_embeds"),
         dtype=resolve_dtype(dtype), attention_impl=attention_impl)
 
