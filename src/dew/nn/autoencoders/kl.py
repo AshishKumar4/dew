@@ -34,6 +34,9 @@ class AutoencoderKL(nn.Module):
     norm_groups: int = 32
     quantize: bool = True
     post_quantize: bool = True
+    decoder_channels: tuple[int, ...] | None = None
+    """The decoder's widths where they differ from the encoder's, as a
+    distilled decoder's do; None reads `channels`."""
     dtype: Dtype = jnp.float32
 
     @property
@@ -44,7 +47,7 @@ class AutoencoderKL(nn.Module):
     def setup(self):
         self.encoder = FlaxEncoder(out_channels=self.latent_channels, block_out_channels=self.channels,
             layers_per_block=self.blocks_per_level, norm_num_groups=self.norm_groups, double_z=True, dtype=jnp.dtype(self.dtype))
-        self.decoder = FlaxDecoder(out_channels=self.image_channels, block_out_channels=self.channels,
+        self.decoder = FlaxDecoder(out_channels=self.image_channels, block_out_channels=self.decoder_channels or self.channels,
             layers_per_block=self.blocks_per_level, norm_num_groups=self.norm_groups, dtype=jnp.dtype(self.dtype))
         if self.quantize:
             self.quant_conv = Conv(2 * self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)

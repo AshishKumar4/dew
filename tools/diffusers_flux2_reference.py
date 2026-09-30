@@ -15,11 +15,16 @@ is one ulp of the 3500-radian angle a distilled guidance embeds).
 Every parameter is moved off its initialization, so the RMS norms' scales
 are not all ones.
 
+Two tiny `AutoencoderKLFlux2`s, one with the small decoder's narrower
+levels, are walked as the pipeline encodes a reference image and decodes its
+result, the latent folded 2x2 and normalized by the batch norm's statistics.
+
 Run in the isolated reference environment (diffusers 0.40.0, transformers
 5.17.0, torch 2.8.0, CPU):
 
     python tools/diffusers_flux2_reference.py OUTPUT_DIR
     python tools/diffusers_flux2_reference.py bundle OUTPUT_DIR tests/fixtures/flux2_source.tar.xz
+    python tools/diffusers_flux2_reference.py published tests/fixtures/flux2_published.npz
 """
 
 from __future__ import annotations
@@ -130,6 +135,85 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
+VAE = {"block_out_channels": [8, 16], "down_block_types": ["DownEncoderBlock2D"] * 2,
+       "up_block_types": ["UpDecoderBlock2D"] * 2, "layers_per_block": 1, "latent_channels": 4,
+       "norm_num_groups": 4}
+VAES = {"vae": {}, "small_decoder": {"decoder_block_out_channels": [4, 12]}}
+
+
+def build_vae(name: str, root: Path) -> dict[str, np.ndarray]:
+    """A tiny `AutoencoderKLFlux2`, every parameter and the batch norm's
+    running statistics moved off their init, walked as `Flux2Pipeline` walks
+    it: `_encode_vae_image` (posterior mode, 2x2 fold, batch-norm
+    normalization) and the call's decode (the inverse, then `vae.decode`),
+    with the gradients of fixed probes against the pixels and the latent."""
+    from diffusers import AutoencoderKLFlux2, Flux2Pipeline
+
+    torch.manual_seed(SEED)
+    model = AutoencoderKLFlux2(**VAE, **VAES[name]).eval()
+    generator = torch.Generator().manual_seed(SEED + 2)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.05 * torch.randn(parameter.shape, generator=generator))
+        model.bn.running_mean.copy_(0.3 * torch.randn(model.bn.running_mean.shape, generator=generator))
+        model.bn.running_var.copy_(torch.rand(model.bn.running_var.shape, generator=generator) + 0.2)
+    model.save_pretrained(root / name / "vae", safe_serialization=True)
+    statistics = (model.bn.running_mean.view(1, -1, 1, 1),
+                  torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps))
+    image = (torch.rand((2, 3, 16, 24), generator=generator) * 2 - 1).requires_grad_()
+    latent = (Flux2Pipeline._patchify_latents(model.encode(image).latent_dist.mode()) - statistics[0]) / statistics[1]
+    probe_latent = torch.randn(latent.shape, generator=generator)
+    (grad_image,) = torch.autograd.grad((latent * probe_latent).sum(), [image])
+    code = torch.randn(latent.shape, generator=generator).requires_grad_()
+    pixels = model.decode(Flux2Pipeline._unpatchify_latents(code * statistics[1] + statistics[0])).sample
+    probe = torch.randn(pixels.shape, generator=generator)
+    (grad_code,) = torch.autograd.grad((pixels * probe).sum(), [code])
+    print(f"{name}: latent {tuple(latent.shape)} pixels {tuple(pixels.shape)}")
+    return {"image": image.detach().numpy(), "latent": latent.detach().numpy(), "probe_latent": probe_latent.numpy(),
+            "grad_image": grad_image.numpy(), "code": code.detach().numpy(), "pixels": pixels.detach().numpy(),
+            "probe": probe.numpy(), "grad_code": grad_code.numpy()}
+
+
+PUBLISHED_VAE = ("black-forest-labs/FLUX.2-klein-4B", "e7b7dc27f91deacad38e78976d1f2b499d76a294")
+CROP = 64
+
+
+def smooth_image() -> np.ndarray:
+    """A smooth `[1, 3, 128, 192]` image in [-1, 1] with a little noise."""
+    y, x = np.mgrid[0:128, 0:192] / 32.0
+    image = np.stack([np.sin(x + y), np.cos(2 * x - y), np.sin(3 * y) * np.cos(x)])[None]
+    return (0.8 * image + 0.05 * np.random.default_rng(0).standard_normal(image.shape)).astype(np.float32)
+
+
+def published(destination: str) -> None:
+    """The published VAE's pipeline latent of `smooth_image()` and its
+    decode's top-left `CROP` pixels, in float64, and how far the source's
+    own float32 run lands from each, for `tests/fixtures/flux2_published.npz`."""
+    from diffusers import AutoencoderKLFlux2, Flux2Pipeline
+
+    model = AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
+
+    def walk(dtype):
+        with torch.no_grad():
+            mean = model.bn.running_mean.view(1, -1, 1, 1).to(dtype)
+            std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1).to(dtype) + model.config.batch_norm_eps)
+            folded = Flux2Pipeline._patchify_latents(
+                model.encode(torch.from_numpy(smooth_image()).to(dtype)).latent_dist.mode())
+            pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
+            return ((folded - mean) / std).numpy(), pixels.numpy()[:, :, :CROP, :CROP]
+
+    single = walk(torch.float32)
+    model.double()
+    exact = walk(torch.float64)
+    arrays = {}
+    for key, value, rounded in zip(("latent", "pixels"), exact, single, strict=True):
+        arrays[f"vae.{key}"] = value
+        arrays[f"vae.{key}.float32_gap"] = np.float64(np.abs(rounded - value).max() / max(1.0, np.abs(value).max()))
+    print({key: float(value) for key, value in arrays.items() if key.endswith("gap")})
+    np.savez_compressed(destination, **arrays)
+    print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
@@ -152,7 +236,9 @@ def main(destination: str) -> None:
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
-    record = {"diffusers": DIFFUSERS, "base": BASE, "tokens": TOKENS, "seed": SEED,
+    for name in VAES:
+        arrays.update({f"{name}.{key}": value for key, value in build_vae(name, root).items()})
+    record = {"diffusers": DIFFUSERS, "vae": VAE, "vaes": VAES, "base": BASE, "tokens": TOKENS, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
                                "guidance": list(case.guidance)} for name, case in CASES.items()}}
     np.savez_compressed(root / "flux2_transformer.npz", **arrays)
@@ -164,5 +250,7 @@ def main(destination: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 2 and sys.argv[1] == "published":
+        published(sys.argv[2])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-flux2-reference")
