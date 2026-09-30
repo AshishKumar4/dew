@@ -235,8 +235,9 @@ def _providers() -> tuple[type, type]:
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
     qwix = importlib.import_module("qwix")
-    core = {name: importlib.import_module(f"qwix._src.core.{name}")
-            for name in ("conv_general", "dot_general", "einsum")}
+    conv_general = importlib.import_module("qwix._src.core.conv_general")
+    dot_general = importlib.import_module("qwix._src.core.dot_general")
+    einsum = importlib.import_module("qwix._src.core.einsum")
     quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
@@ -289,9 +290,9 @@ def _providers() -> tuple[type, type]:
     class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(core["dot_general"].dot_general),
-                _einsum_fn=_scaled_in_float32(core["einsum"].einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(core["conv_general"].conv_general_dilated))
+                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
+                _einsum_fn=_scaled_in_float32(einsum.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
