@@ -514,6 +514,10 @@
   "sigma_max": 80.0,
   "sigma_min": 0.002
  },
+ "dew.diffusion.presets.MeanFlow": {
+  "logit_mean": -0.4,
+  "logit_std": 1.0
+ },
  "dew.diffusion.presets.ResolutionShift": {
   "base_shift": 0.5,
   "base_tokens": 256,
@@ -553,6 +557,7 @@
    }
   },
   "lora": null,
+  "mean_flow": null,
   "model": {
    "class": "dew.config.ModelConfig",
    "sets": {
@@ -613,6 +618,17 @@
   "reward": "clip_score",
   "rollout_steps": 11,
   "train_steps": null
+ },
+ "dew.objectives.diffusion.config.MeanFlowTraining": {
+  "guidance_interval": [
+   0.0,
+   1.0
+  ],
+  "instantaneous": 0.75,
+  "kappa": 0.0,
+  "norm_eps": 0.01,
+  "norm_p": 1.0,
+  "omega": 1.0
  },
  "dew.objectives.diffusion.config.PretrainedAutoencoder": {
   "dtype": "bfloat16",

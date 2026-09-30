@@ -48,12 +48,16 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError("steps must be a positive integer")
     process = denoise.process
-    if guidance is None:
-        walk = Walk.stateless(denoise)
-    elif isinstance(denoise, Denoiser):
-        walk = guidance.walk(denoise)
-    else:
+    if guidance is not None and not isinstance(denoise, Denoiser):
         raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")
+
+    def walked(denoiser):
+        return Walk.stateless(denoiser) if guidance is None else guidance.walk(denoiser)
+
+    walk = walked(denoise)
+    # A process whose model predicts over an interval reads, at each step,
+    # the interval to the next grid point.
+    spanned = denoise if isinstance(denoise, Denoiser) and denoise.process.interval else None
     with jax.ensure_compile_time_eval():
         if times is None:
             assert steps is not None
@@ -77,9 +81,10 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
         t, t_next, index = inputs
         t = jnp.full((batch,), t)
         t_next = jnp.full((batch,), t_next)
-        (denoised, eps), guided = walk.step(x, t, guided)
+        stepping = walk if spanned is None else walked(spanned.spanning(t, t_next))
+        (denoised, eps), guided = stepping.step(x, t, guided)
         x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
-                               process, walk.at(guided))
+                               process, stepping.at(guided))
         return (x, state, guided), None
 
     (x, _, guided), _ = lax.scan(
