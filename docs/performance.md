@@ -577,14 +577,105 @@ bf16 forward's time (28.3 ms against 36.0) and 35% to 39% off the fp32
 one's (34.7 and 32.5 ms against 53.3). Every
 quantized row keeps CLIP within 0.002 of fp32.
 
-The spatial fusion's depthwise convolutions stay unquantized on this card
-(`--float spatial_fusion`), because XLA:GPU gets them wrong in both
-dtypes. In int8, a convolution with one or two input channels per group
-returns wrong values without an error: the whole-model int8 row runs in
-42.3 ms and scores CLIP 0.1391. In fp8 the same convolutions fail to
-compile (`Failed to get configs for: 36 out of 126 instructions`, one per
-depthwise convolution). Both are XLA:GPU defects with plain-JAX
-reproductions; Dew does not work around them.
+The RTX 4080's bf16 rows with quantized activations were measured before
+serving scaled the product of two quantized operands in float32 (below). On
+that card the change moved the bf16 forward's distance from unquantized, at
+noise level 0.5 over the same batch, from 1.90% to 1.88% in int8 and from
+4.23% to 4.26% in fp8.
+
+A100-SXM4-40GB on Colab, jax 0.11.2, Qwix 0.1.8. The bf16 rows with int8 or
+fp8 activations are from 2026-09-30, the rest from 2026-09-28:
+
+| compute | precision | forward ms | sample s | CLIP | weights MiB | temporaries MiB |
+|---|---|---:|---:|---:|---:|---:|
+| fp32 | none | 27.5 | 1.31 | 0.2471 | 670 | 182 |
+| fp32 | int8w | 33.2 | 1.70 | 0.2485 | 183 | 164 |
+| fp32 | fp8w | 33.2 | 1.70 | 0.2468 | 183 | 164 |
+| fp32 | int8, fusion in fp32 | 30.3 | 1.75 | 0.2496 | 183 | 168 |
+| fp32 | fp8, fusion in fp32 | 34.8 | 1.42 | 0.2461 | 183 | 186 |
+| bf16 | none | 25.0 | 1.82 | 0.2485 | 670 | 128 |
+| bf16 | int8w | 24.9 | 1.82 | 0.2481 | 183 | 110 |
+| bf16 | fp8w | 25.3 | 1.84 | 0.2470 | 183 | 110 |
+| bf16 | int8, fusion in bf16 | 28.4 | 1.90 | 0.2484 | 183 | 118 |
+| bf16 | fp8, fusion in bf16 | 31.7 | 2.05 | 0.2467 | 183 | 171 |
+
+On the A100 quantizing saves memory and no time. With weights and
+activations quantized the forward is slower than unquantized in the same
+compute dtype: 28.4 ms in bf16 int8 against 25.0, 30.3 ms in fp32 int8
+against 27.5, and slower again in fp8, which the A100 has no units for.
+Every quantized row keeps CLIP within 0.0025 of fp32.
+
+TPU v6e, one chip on Colab, jax 0.11.2, libtpu 0.0.48, Qwix 0.1.8. The bf16
+rows without a weight-only precision are from 2026-09-30, the rest from
+2026-09-28:
+
+| compute | precision | forward ms | sample s | CLIP | weights MiB | temporaries MiB |
+|---|---|---:|---:|---:|---:|---:|
+| fp32 | none | 13.7 | 28.36 | 0.2492 | 670 | 72 |
+| fp32 | int8w | 13.5 | 27.73 | 0.2488 | 183 | 74 |
+| fp32 | fp8w | 13.6 | 27.75 | 0.2466 | 183 | 74 |
+| fp32 | int8 | 7.1 | 28.50 | 0.2476 | 182 | 79 |
+| fp32 | fp8 | 13.3 | 28.08 | 0.2472 | 182 | 79 |
+| fp32 | int8, fusion in fp32 | 14.9 | 28.02 | 0.2469 | 183 | 61 |
+| fp32 | fp8, fusion in fp32 | 20.4 | 28.82 | 0.2452 | 183 | 61 |
+| bf16 | none | 5.7 | 29.56 | 0.2493 | 670 | 126 |
+| bf16 | int8w | 5.2 | 29.63 | 0.2497 | 183 | 46 |
+| bf16 | fp8w | 5.6 | 30.58 | 0.2478 | 183 | 46 |
+| bf16 | int8 | 6.5 | 28.45 | 0.2499 | 182 | 52 |
+| bf16 | fp8 | 9.8 | 28.19 | 0.2462 | 182 | 52 |
+| bf16 | int8, fusion in bf16 | 6.3 | 28.40 | 0.2521 | 183 | 50 |
+| bf16 | fp8, fusion in bf16 | 9.3 | 28.56 | 0.2443 | 183 | 50 |
+
+On the v6e int8 weights and activations halve the fp32 forward (7.1 ms
+against 13.7) with the depthwise convolutions quantized too; with them in
+fp32 the forward takes 14.9 ms. In bf16 the weight-only rows run in the
+unquantized forward's time (5.2 and 5.6 ms against 5.7), and with activations
+quantized the forward is slower (6.3 to 9.8 ms). Sampling takes 28
+to 31 s in every row, whatever the forward's time, so on this machine
+something other than the denoiser's 20 steps sets it; this section does not
+break it down. Every quantized row keeps CLIP within 0.005 of fp32.
+
+Before serving scaled the product of two quantized operands in float32,
+every bf16 row with int8 or fp8 activations sampled NaN images on the v6e
+(CLIP 0.1481, with the depthwise convolutions quantized or not). Qwix 0.1.8
+scales that product in the scales' dtype, bf16 in a bf16 model. In plain
+JAX on the v6e, an int8 depthwise convolution whose int32 product is scaled
+in bf16 came out NaN in all but a few outputs, while the model's dense and
+attention forms scaled the same way stayed finite. In the served model the
+NaN began in the depthwise convolutions in int8 and in an attention block in
+fp8. Scaled in float32, the bf16 model's 8-bit operations have the result
+types of the fp32 model's, and it samples as above.
+
+XLA:CPU, 12 threads of a Colab L4 host, jax 0.11.2, Qwix 0.1.8, latents
+decoded two at a time (`--decode-batch 2`). The bf16 int8 row is from
+2026-09-30, the rest from 2026-09-28:
+
+| compute | precision | forward ms | sample s | CLIP | weights MiB | temporaries MiB |
+|---|---|---:|---:|---:|---:|---:|
+| fp32 | none | 4912 | 111.72 | 0.2472 | 670 | 563 |
+| fp32 | int8w | 4953 | 112.50 | 0.2486 | 183 | 844 |
+| fp32 | int8 | 9804 | 208.77 | 0.2465 | 182 | 192 |
+| bf16 | none | 5472 | 122.54 | 0.2495 | 670 | 657 |
+| bf16 | int8w | 5550 | 123.50 | 0.2494 | 183 | 584 |
+| bf16 | int8 | 10550 | 224.61 | 0.2497 | 182 | 152 |
+
+On XLA:CPU int8 weights and activations double the forward's time (9.8 s
+against 4.9 in fp32) and weight-only int8 leaves it as it was. Every
+quantized row keeps CLIP within 0.0025 of fp32.
+
+On a GPU, Dew refuses to quantize the activations of a grouped
+convolution, so the GPU rows with quantized activations keep the spatial
+fusion's depthwise convolutions in float (`--float spatial_fusion`), and
+`TextToImage.quantized` raises without it. XLA:GPU (jax 0.11.2) computes
+those convolutions wrongly or not at all. On the RTX 4080, an int8
+convolution with one or two input channels per group returns wrong values
+without an error: before the refusal, the whole-model int8 row ran in 42.3
+ms and scored CLIP 0.1391. In fp8 the same convolutions fail to compile
+there (`Failed to get configs for: 36 out of 126 instructions`, one per
+depthwise convolution). On the A100 the whole-model int8 row scored CLIP
+0.1373 in fp32 and failed to compile in bf16 (`UNIMPLEMENTED`). fp8
+computed on the A100 (CLIP 0.2443 in fp32), but Dew refuses it there too,
+with the rest of the GPUs.
 
 ## Kernel choices per generation, 2026-09-22
 
