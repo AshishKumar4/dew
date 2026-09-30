@@ -212,3 +212,30 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     expected = task.pipeline(distilled, ema=False)(["a red bird"], seed=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], seed=9)
                                   .host().images, expected)
+
+
+def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():
+    """The mechanism `forward_mode_attention` wraps cuDNN and TPU calls in,
+    on a double of such a kernel: the reference path under a custom_vjp,
+    which refuses forward mode as the fused kernels do. Wrapped, its value
+    is the kernel's own and its tangent the reference's, bit for bit."""
+    from dew.nn.attention import forward_differentiable
+
+    def reference(q, k, v):
+        return scaled_dot_product_attention(q, k, v, implementation="reference")
+
+    @jax.custom_vjp
+    def reverse_only(q, k, v):
+        return reference(q, k, v)
+
+    reverse_only.defvjp(lambda q, k, v: (reference(q, k, v), (q, k, v)),
+                        lambda residuals, cotangent: jax.vjp(reference, *residuals)[1](cotangent))
+    q, k, v = (jax.random.normal(jax.random.PRNGKey(i), (2, 16, 2, 8)) for i in range(3))
+    tangents = tuple(jax.random.normal(jax.random.PRNGKey(10 + i), q.shape) for i in range(3))
+    with pytest.raises(TypeError, match="forward-mode"):
+        jax.jvp(reverse_only, (q, k, v), tangents)
+    out, tangent = jax.jvp(lambda q, k, v: forward_differentiable(reverse_only, reference, q, k, v),
+                           (q, k, v), tangents)
+    _, reference_tangent = jax.jvp(reference, (q, k, v), tangents)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(reverse_only(q, k, v)))
+    np.testing.assert_array_equal(np.asarray(tangent), np.asarray(reference_tangent))

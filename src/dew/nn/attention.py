@@ -1011,17 +1011,28 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if resolved not in ('cudnn', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
-    @jax.custom_jvp
-    def attend(query, key, value, bias, sinks):
+    def fused(query, key, value, bias, sinks):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
-    @attend.defjvp
-    def tangent(primals, tangents):
-        def reference(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
-        return attend(*primals), jax.jvp(reference, primals, tangents)[1]
+    def reference(query, key, value, bias, sinks):
+        return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
 
-    return attend(query, key, value, bias, sinks)
+    return forward_differentiable(fused, reference, query, key, value, bias, sinks)
+
+
+def forward_differentiable(value, tangent, *arrays):
+    """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
+    its reverse-mode derivative takes forward mode through a reference
+    computing the same function."""
+    @jax.custom_jvp
+    def attend(*arrays):
+        return value(*arrays)
+
+    @attend.defjvp
+    def rule(primals, tangents):
+        return attend(*primals), jax.jvp(tangent, primals, tangents)[1]
+
+    return attend(*arrays)
 
 
 def _attention_kernel(query, key, value, dtype=None, precision=None,
