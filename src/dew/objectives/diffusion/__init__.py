@@ -5,6 +5,7 @@ from .config import (
     ConsistencyDistillation,
     DiffusionRunConfig,
     FlowGRPO,
+    GuidanceDistillation,
     MeanFlowTraining,
     PretrainedAutoencoder,
     RepresentationAlignment,
@@ -14,6 +15,7 @@ from .config import (
 from .consistency import ConsistencyDistillationObjective
 from .end_to_end import EndToEnd
 from .few_step import MeanFlowObjective, ShortcutObjective
+from .guidance_distillation import GuidanceDistillationObjective
 from .masked import MaskedDiffusionObjective
 from .objective import VALIDATION_SAMPLES, DiffusionObjective
 
@@ -27,7 +29,7 @@ __all__ = [
     "DiffusionObjective",
     "DiffusionRunConfig",
     "EndToEnd",
-    "FlowGRPO",
+    "FlowGRPO", "GuidanceDistillation", "GuidanceDistillationObjective",
     "MaskedDiffusionObjective",
     "MeanFlowObjective",
     "MeanFlowTraining",

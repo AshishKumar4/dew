@@ -280,6 +280,34 @@ class ConsistencyDistillation:
 
 
 @dataclasses.dataclass(frozen=True)
+class GuidanceDistillation:
+    """Distill a saved run's classifier-free guidance into this run's model,
+    which reads the scale as its conditioning's guidance input
+    (`GuidanceDistillationObjective`). `teacher` is the teacher run's
+    directory and `scales` the range each row's scale is drawn from."""
+
+    teacher: str = ""
+    scales: tuple[float, float] = (1.0, 8.0)
+
+    def __post_init__(self) -> None:
+        if not self.teacher:
+            raise ValueError("guidance distillation distills a teacher; name its run directory")
+        low, high = (float(value) for value in self.scales)
+        object.__setattr__(self, "scales", (low, high))
+
+    def teacher_objective(self, variables: Variables | None) -> tuple[DiffusionObjective, Variables]:
+        """The teacher run's objective over its variables: a saved student
+        tree's copy of them, else the run's published ones."""
+        from dew.sampling.pipelines import restore_variables
+
+        from .objective import TEACHER
+
+        held = (variables[TEACHER] if variables is not None else
+                restore_variables(self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None))
+        return DiffusionRunConfig.load(self.teacher).build(variables=held), held
+
+
+@dataclasses.dataclass(frozen=True)
 class RepresentationAlignment:
     """Align the model's hidden tokens with a frozen DINOv2's patch features,
     REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
@@ -366,6 +394,10 @@ class DiffusionRunConfig(RunConfig):
     mean_flow: MeanFlowTraining | None = None
     shortcut: ShortcutTraining | None = None
     distill: ConsistencyDistillation | None = None
+    guidance_distill: GuidanceDistillation | None = None
+    """Distill a saved run's classifier-free guidance into this model's
+    guidance input; sampling reads the conditioner's guidance value and no
+    second branch."""
     """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
     instead of the denoising loss; sampling is unguided."""
     """Train a shortcut model instead of the denoising loss; the preset is
@@ -388,9 +420,15 @@ class DiffusionRunConfig(RunConfig):
         object.__setattr__(self, "objective", "flow_grpo" if self.rl is not None else
                            "mean_flow" if self.mean_flow is not None else
                            "shortcut" if self.shortcut is not None else
-                           "rcm" if self.distill is not None else "diffusion")
+                           "rcm" if self.distill is not None else
+                           "guidance_distillation" if self.guidance_distill is not None else "diffusion")
         from dew.diffusion.presets import EDM, Flow
 
+        extras = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "distill", "uncertainty")
+                  if getattr(self, name) is not None]
+        if self.guidance_distill is not None and (extras or self.guidance is not None):
+            raise ValueError("guidance distillation trains on its own loss and samples one branch: set "
+                             f"guidance None, and leave {extras or 'the other training modes'} unset")
         others = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "uncertainty")
                   if getattr(self, name) is not None]
         if self.distill is not None and (others or self.guidance is not None
@@ -553,6 +591,14 @@ class DiffusionRunConfig(RunConfig):
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+        if self.guidance_distill is not None:
+            from .guidance_distillation import GuidanceDistillationObjective
+
+            teacher, held = self.guidance_distill.teacher_objective(variables)
+            return GuidanceDistillationObjective(
+                model, process, inputs, teacher=teacher, teacher_variables=held,
+                scales=self.guidance_distill.scales, autoencoder=autoencoder, pretrained=variables,
                 ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
