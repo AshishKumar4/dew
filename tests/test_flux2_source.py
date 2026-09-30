@@ -6,13 +6,17 @@ its real config and safetensors, and runs each as `Flux2Pipeline` runs it -
 one token per latent position, the four-axis ids the pipeline lays out, the
 timestep it has divided by the training count and the distilled guidance -
 recording the forward and the gradients of the latent, the text states and
-every parameter against a fixed cotangent.
+every parameter against a fixed cotangent. It walks two tiny
+`AutoencoderKLFlux2`s the same way: the pipeline's encode of a reference
+image and its decode of a result, through the 2x2 fold and the batch norm's
+statistics.
 
 The pipeline flattens its latent row-major, one token per position, so these
 tests reshape between that and NHWC with numpy's own reshape.
 """
 
 import json
+import sys
 import tarfile
 from pathlib import Path
 
@@ -23,6 +27,7 @@ import pytest
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
+from dew.nn.autoencoders.flux2 import load_flux2_vae
 from dew.nn.backbones.flux2 import Flux2Transformer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +78,7 @@ def walk(name, arrays, record):
 
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
-    model, params, layouts = load(source, name)
+    _, params, layouts = load(source, name)
     tensors = component_tensors(source / name, "transformer")
     assert {layout.name for layout in layouts} == {f"transformer/{key}" for key in tensors}
     for layout in layouts:
@@ -120,3 +125,57 @@ def test_an_unsupported_config_is_refused(source, change):
     flux2_fields(config)
     with pytest.raises(ValueError):
         flux2_fields({**config, **change})
+
+
+def nhwc(array):
+    return np.asarray(array).transpose(0, 2, 3, 1)
+
+
+@pytest.mark.parametrize("name", ("vae", "small_decoder"))
+def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, arrays, name):
+    autoencoder, params, layouts, _ = load_flux2_vae(source / name)
+    tensors = component_tensors(source / name, "vae")
+    assert {layout.name for layout in layouts} == {f"vae/{key}" for key in tensors if not key.startswith("bn.")}
+    image = nhwc(arrays[f"{name}.image"])
+    latent = autoencoder.encode(params, image)
+    assert latent.shape == (2, *autoencoder.latent_shape(image.shape[1:])) == (2, 4, 6, 16)
+    probe_latent = nhwc(arrays[f"{name}.probe_latent"])
+    grad_image = jax.grad(lambda image: jnp.sum(autoencoder.encode(params, image) * probe_latent))(image)
+    code = nhwc(arrays[f"{name}.code"])
+    pixels = autoencoder.decode(params, code)
+    probe = nhwc(arrays[f"{name}.probe"])
+    grad_code = jax.grad(lambda code: jnp.sum(autoencoder.decode(params, code) * probe))(code)
+    gaps = {"latent": relative_gap(latent, nhwc(arrays[f"{name}.latent"])),
+            "pixels": relative_gap(pixels, nhwc(arrays[f"{name}.pixels"])),
+            "grad_image": relative_gap(grad_image, nhwc(arrays[f"{name}.grad_image"])),
+            "grad_code": relative_gap(grad_code, nhwc(arrays[f"{name}.grad_code"]))}
+    print(f"{name} gaps {gaps}")
+    assert max(gaps["latent"], gaps["pixels"]) < FORWARD, gaps
+    assert max(gaps["grad_image"], gaps["grad_code"]) < GRADIENT, gaps
+
+
+@pytest.mark.network
+def test_the_published_autoencoder_matches_the_source():
+    """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
+    ships), downloaded, on a smooth 128x192 image, against the source run in
+    float64 (`flux2_published.npz`): the pipeline's folded, normalized latent
+    and a corner of its decode, each to within twice the source's own
+    float32 distance from that result, or 1e-5."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py")
+    tool = importlib.util.module_from_spec(spec)
+    # Its dataclasses resolve their module through sys.modules.
+    sys.modules[spec.name] = tool
+    spec.loader.exec_module(tool)
+    reference = np.load(ROOT / "tests/fixtures/flux2_published.npz")
+    repo, revision = tool.PUBLISHED_VAE
+    autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
+    latent = autoencoder.encode(params, nhwc(tool.smooth_image()))
+    pixels = autoencoder.decode(params, nhwc(reference["vae.latent"]))[:, :tool.CROP, :tool.CROP]
+    assert latent.shape == (1, 8, 12, 128)
+    gaps = {"latent": relative_gap(latent, nhwc(reference["vae.latent"])),
+            "pixels": relative_gap(pixels, nhwc(reference["vae.pixels"]))}
+    bounds = {key: max(FORWARD, 2 * float(reference[f"vae.{key}.float32_gap"])) for key in gaps}
+    print(f"published VAE gaps {gaps}, bounds {bounds}")
+    assert all(gaps[key] < bounds[key] for key in gaps), (gaps, bounds)

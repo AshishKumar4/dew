@@ -1,0 +1,112 @@
+"""FLUX.2's autoencoder, diffusers' `AutoencoderKLFlux2`, as its pipeline uses it.
+
+The network is a Stable Diffusion `AutoencoderKL` with 32 latent channels
+(and, in the small decoder, narrower decoder levels). What differs is the
+latent the transformer reads: `Flux2Pipeline` folds each 2x2 block of the
+VAE's latent into the channels, 32 to 128 at a sixteenth of the image's side,
+and normalizes each of the 128 channels by the running statistics of the
+VAE's affine-free batch norm, `(z - mean) / sqrt(var + eps)`. Both belong to
+the latent here, so a diffusion run sees what the pipeline's transformer
+sees.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from dew.nn.text_encoders import check_tree
+from dew.objectives.base import Variables
+
+from .api import ModuleAutoEncoder
+from .kl import AutoencoderKL
+
+if TYPE_CHECKING:
+    from dew.interop.pretrained import WeightLayout
+
+STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
+"""The batch norm's buffers: its statistics become the latent normalization,
+and it computes nothing else."""
+
+
+def fold(latents):
+    """`Flux2Pipeline._patchify_latents` channels last: `[B, H, W, C]` to
+    `[B, H/2, W/2, 4C]`, a channel's four pixels adjacent, row-major."""
+    batch, height, width, channels = latents.shape
+    grouped = latents.reshape(batch, height // 2, 2, width // 2, 2, channels)
+    return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height // 2, width // 2, 4 * channels)
+
+
+def unfold(latents):
+    """`Flux2Pipeline._unpatchify_latents` channels last."""
+    batch, height, width, channels = latents.shape
+    grouped = latents.reshape(batch, height, width, channels // 4, 2, 2)
+    return grouped.transpose(0, 1, 4, 2, 5, 3).reshape(batch, 2 * height, 2 * width, channels // 4)
+
+
+class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
+    """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
+    as the latent normalization, per folded channel."""
+
+    def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
+        super().__init__(model, params)
+        self.encode_single_frame = jax.jit(lambda params, image, key=None: fold(model.apply(
+            {"params": params}, image, key, method=model.encode)))
+        self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
+            {"params": params}, unfold(latent), method=model.decode))
+        self.latent_shift = np.asarray(mean, np.float32)
+        self.latent_scale = 1.0 / np.sqrt(np.asarray(variance, np.float32) + np.float32(epsilon))
+        if self.latent_shift.shape != (4 * model.latent_channels,) or self.latent_scale.shape != self.latent_shift.shape:
+            raise ValueError(f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
+                             f"channel ({4 * model.latent_channels},)")
+
+    @property
+    def downscale_factor(self) -> int:
+        return 2 * self.model.downscale_factor
+
+    @property
+    def latent_channels(self) -> int:
+        return 4 * self.model.latent_channels
+
+
+def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
+                   subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None
+                   ) -> tuple[Flux2Autoencoder, Variables, tuple[WeightLayout, ...], dict]:
+    """Build a published FLUX.2 VAE, its parameters and their source layouts
+    from `subfolder` of a pipeline directory or Hub repo. The batch norm's
+    running statistics are read from the weights even where `params` are
+    supplied, since they are the latent normalization, not parameters."""
+    from dew.interop import diffusion, sources
+    from dew.nn.autoencoders.vae import _vae_path
+
+    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,))
+    config = json.loads((directory / subfolder / "config.json").read_text())
+    if config.get("_class_name") != "AutoencoderKLFlux2":
+        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2")
+    if tuple(config.get("patch_size", (2, 2))) != (2, 2):
+        raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
+    if not config.get("mid_block_add_attention", True) or config.get("act_fn", "silu") != "silu":
+        raise ValueError("the port computes the published VAE: SiLU and mid-block attention")
+    model = AutoencoderKL(
+        channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
+        image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
+        norm_groups=config["norm_num_groups"], quantize=diffusion.flag(config, "use_quant_conv", default=True),
+        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
+        decoder_channels=tuple(config["decoder_block_out_channels"])
+        if config.get("decoder_block_out_channels") else None, dtype=compute)
+    tensors = diffusion.component_tensors(directory, subfolder)
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        params, layouts = diffusion.record_layouts(
+            "vae", tensors, lambda name: None if name in STATISTICS else _vae_path(name, np.ndim(tensors[name])),
+            ("autoencoder",), param_dtype=param_dtype)
+    frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
+                                 jnp.float32)
+    check_tree({"params": params}, model, frame)
+    autoencoder = Flux2Autoencoder(model=model, params=params, mean=tensors["bn.running_mean"],
+                                   variance=tensors["bn.running_var"], epsilon=config.get("batch_norm_eps", 1e-4))
+    return autoencoder, params, layouts, config
