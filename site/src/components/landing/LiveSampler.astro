@@ -102,6 +102,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		const original = editor.value;
 
 		let session: LiveSession | undefined;
+		let compiled = false;
 		let running = false;
 		let stopping = false;
 		let started = 0;
@@ -173,6 +174,8 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			output.replaceChildren();
 			log.hidden = true;
 			log.open = false;
+			// On a phone the figure sits below the editor; bring it into view for the run.
+			if (stage.getBoundingClientRect().bottom > window.innerHeight) stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
 			try {
 				const { LiveSession } = await import('../../scripts/live');
 				if (!session) {
@@ -184,13 +187,16 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 						throw new Error('Stopped.');
 					}
 					session = opened;
+					compiled = false;
 					session.onClose = (message) => {
 						session = undefined;
 						if (!running) show('idle', `${message} Press Run to start a new one.`);
 					};
 				}
 				started = performance.now();
-				show('sampling', 'Sampling');
+				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs).
+				show('sampling', compiled ? 'Sampling' : 'Starting the sampler; a new kernel compiles it first');
+				compiled = true;
 				tick('Running');
 				const done = await session.run(editor.value, onOutput);
 				untick();
