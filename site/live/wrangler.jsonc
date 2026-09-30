@@ -17,7 +17,10 @@
 			"image": "./container/Dockerfile",
 			// 4 vCPUs and 12 GiB: the landing page's 176M text-to-image model samples on the CPU.
 			"instance_type": "standard-4",
-			"max_instances": 8,
+			// MAX_SESSIONS caps what runs; the headroom is for instances the platform still
+			// holds, such as one of the previous version during a rollout, which otherwise
+			// leave a session or its spare with no container.
+			"max_instances": 10,
 			// A deploy replaces a running container only after its session could have
 			// reached the wall clock (a spare's WARM_SECONDS 600 and WALL_SECONDS 1200,
 			// plus the Kernel's 15 s alarm).
@@ -66,7 +69,7 @@
 					"class_name": "Kernel",
 					"image": "./container/Dockerfile",
 					"instance_type": "standard-4",
-					"max_instances": 2,
+					"max_instances": 4,
 					"rollout_active_grace_period": 1815
 				}
 			],

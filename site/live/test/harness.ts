@@ -52,9 +52,11 @@ async function spare(coordinator: DurableObjectStub<Coordinator>) {
 	const early = await coordinator.open('early-visitor', at(2));
 	await coordinator.started(first.spare, at(3));
 	const second = await coordinator.open('second-visitor', at(10));
+	// The page's connection makes the spare's Kernel report its running container again.
+	const again = second.ok && (await coordinator.started(second.id, at(11)));
 	const both = await coordinator.status(at(20));
 	const twice = await coordinator.open('second-visitor', at(30));
 	// The second session's own spare never starts, and is swept as unused.
 	const later = await coordinator.status(at(200));
-	return { first, early, second, both, twice, later };
+	return { first, early, second, again, both, twice, later };
 }

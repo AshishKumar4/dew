@@ -144,10 +144,16 @@ export class Coordinator extends DurableObject<Env> {
 	/**
 	 * Record that a session's container is running. False when the session is already
 	 * over, for example swept as unused while its container was still booting: nothing
-	 * counts that container any more, so the Kernel must destroy it.
+	 * counts that container any more, so the Kernel must destroy it. A Kernel reports
+	 * again each time it waits for its running container, as when a page takes a spare;
+	 * the first report is the start.
 	 */
 	async started(id: string, now: number): Promise<boolean> {
-		const cursor = this.ctx.storage.sql.exec('UPDATE sessions SET started = ? WHERE id = ? AND started IS NULL AND ended IS NULL', now, id);
+		const cursor = this.ctx.storage.sql.exec(
+			'UPDATE sessions SET started = COALESCE(started, ?) WHERE id = ? AND ended IS NULL',
+			now,
+			id,
+		);
 		return cursor.rowsWritten === 1;
 	}
 
