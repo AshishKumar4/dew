@@ -1,0 +1,50 @@
+---
+// Starlight's sidebar. On narrow screens the header hides its section links,
+// so the menu lists them above the current section's pages.
+import Default from '@astrojs/starlight/components/Sidebar.astro';
+import { sections, sectionOf } from '../../nav.mjs';
+
+const current = sectionOf(Astro.url.pathname);
+---
+
+<nav class="sections" aria-label="Sections">
+	{
+		sections.map((section) => (
+			<a href={section.href} aria-current={section.key === current ? 'true' : undefined}>
+				{section.label}
+			</a>
+		))
+	}
+</nav>
+<Default />
+
+<style>
+	.sections {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+		padding-bottom: 0.75rem;
+		margin-bottom: 0.75rem;
+		border-bottom: 1px solid var(--dew-rule);
+	}
+
+	@media (min-width: 50rem) {
+		.sections {
+			display: none;
+		}
+	}
+
+	.sections a {
+		color: var(--sl-color-gray-2);
+		text-decoration: none;
+		font-size: var(--sl-text-sm);
+		font-weight: 500;
+		padding: 0.35rem 0.6rem;
+		border-radius: 0.4rem;
+	}
+
+	.sections a[aria-current='true'] {
+		color: var(--sl-color-white);
+		background: var(--sl-color-gray-6);
+	}
+</style>
