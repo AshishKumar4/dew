@@ -25,13 +25,15 @@ RUN grep -Eq '^[0-9a-f]{40}$' /opt/live/dew-commit \
 # Cells run as this user, which cannot signal or trace the server.
 RUN useradd --create-home --uid 1001 --shell /usr/sbin/nologin kernel
 
-# The page's sampling cells, run once here so the tokenizer and VAE configs are
-# in HF_HOME and the default cell's compiled programs in the XLA cache. The
-# cache's programs target AVX2, which every host this runs on has.
-ENV JAX_PLATFORMS=cpu JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
-	JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2
-COPY warm.py sampler_setup.py sampler.py progress.py preload.py /opt/live/
-RUN python /opt/live/warm.py && chown -R kernel:kernel /opt/xla /opt/hf
+# The page's setup cell, run once here so the tokenizer and VAE configs are in
+# HF_HOME. The kernel then keeps compiled programs in /opt/xla, which a kernel
+# restarted in the same container reads; programs compiled here would never be
+# read (see warm.py).
+ENV JAX_PLATFORMS=cpu
+COPY warm.py sampler_setup.py /opt/live/
+RUN python /opt/live/warm.py && mkdir /opt/xla && chown -R kernel:kernel /opt/xla /opt/hf
+ENV JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1
+COPY sampler.py progress.py preload.py /opt/live/
 
 COPY server.py /opt/live/server.py
 ENV PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1

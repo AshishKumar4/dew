@@ -7,7 +7,8 @@ they print and plot. The container holds no secrets and has no network access.
 
 The server exits, which stops the container, when the page disconnects, after
 DEW_LIVE_IDLE_SECONDS without a request while no cell runs, or after
-DEW_LIVE_WALL_SECONDS in all. The kernel runs under RLIMIT_CPU of
+DEW_LIVE_WALL_SECONDS from the page's connection; a container no page connects
+to within DEW_LIVE_CONNECT_SECONDS exits too. The kernel runs under RLIMIT_CPU of
 DEW_LIVE_CPU_SECONDS, so a runaway cell kills the kernel and not the server.
 
 Messages from the page, as JSON:
@@ -26,6 +27,10 @@ and, without an id: {"type": "ready", "uptime": <s>, "setup": <s>}, {"type": "re
 A new kernel runs the landing page's setup cell before the page hears "ready",
 so the model loads once per kernel, while the container waits for its page;
 "setup" says how long that took, and "uptime" how long the server had run. A
+spare, which no page has connected to by then, also runs the page's sampling
+cell once, so the page's first run finds its programs compiled. (A compilation
+cache baked into the image cannot do this: JAX keys a CPU program by the host's
+CPU model and features, and the build machine is never a Cloudflare host.) A
 sampling cell then reports its steps as display outputs (see progress.py).
 """
 
@@ -47,17 +52,20 @@ from websockets.http11 import Request, Response
 IDLE_SECONDS = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
 WALL_SECONDS = int(os.environ.get("DEW_LIVE_WALL_SECONDS", "1200"))
 CPU_SECONDS = int(os.environ.get("DEW_LIVE_CPU_SECONDS", "900"))
-CONNECT_SECONDS = 60  # a container nobody connects to within a minute exits
+# A container nobody connects to within this long exits: a minute for a session's own
+# container, WARM_SECONDS for a spare (the Worker's kernel.ts).
+CONNECT_SECONDS = int(os.environ.get("DEW_LIVE_CONNECT_SECONDS", "60"))
 MAX_CODE = 100_000  # characters in one cell
 MAX_OUTPUT = 2_000_000  # characters of output from one cell; the rest is dropped
 MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well under the relay's 32 MiB
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
-# The landing page's setup cell (deploy.mjs copies it here), then preload.py.
+# The landing page's setup cell (deploy.mjs copies it here), then preload.py; and its
+# sampling cell, which a spare runs once.
 PRELOAD = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler_setup.py", "preload.py"))
+WARMUP = Path("/opt/live/sampler.py").read_text()
 PRELOAD_SECONDS = 300
-SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
-               "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "XLA_FLAGS")
+SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS")
 
 
 class SandboxedKernelManager(AsyncKernelManager):
@@ -78,8 +86,8 @@ class SandboxedKernelManager(AsyncKernelManager):
             # PyTorch, and no ipywidgets for tqdm's notebook progress bars.
             "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
             "PYTHONWARNINGS": "ignore:IProgress not found",
-            # The text-to-image model and the compiled programs the image was built
-            # with (see the Dockerfile), read without a network.
+            # The text-to-image model's configs, read without a network, and the
+            # kernel's compilation cache (see the Dockerfile).
             **{name: os.environ[name] for name in SAMPLER_ENV},
         }
         await super()._async_launch_kernel(
@@ -138,6 +146,7 @@ class Session:
         self.closed = asyncio.Event()
         self.close_reason = ""
         self.preload_seconds = 0.0
+        self.connected: float | None = None
 
 
     async def start_kernel(self) -> None:
@@ -156,20 +165,27 @@ class Session:
     async def preload(self) -> None:
         """Run the landing page's setup cell in the new kernel, before the page may send cells.
 
-        The model loads once per kernel, while the container still waits for its page.
+        The model loads once per kernel, while the container still waits for its page;
+        a spare, with no page yet, also runs the sampling cell to compile it.
         """
         started = time.monotonic()
-        msg_id = self.client.execute(PRELOAD, silent=True, store_history=False, allow_stdin=False)
+        await self.run_quietly(PRELOAD)
+        if self.socket is None:
+            await self.run_quietly(WARMUP)
+        self.preload_seconds = time.monotonic() - started
+        print(f"the kernel was prepared in {self.preload_seconds:.1f} s", flush=True)
+
+    async def run_quietly(self, code: str) -> None:
+        """Run `code` in the kernel without sending its outputs anywhere; raise if it fails."""
+        msg_id = self.client.execute(code, silent=True, store_history=False, allow_stdin=False)
         while True:
             message = await self.client.get_iopub_msg(timeout=PRELOAD_SECONDS)
             if message["parent_header"].get("msg_id") != msg_id:
                 continue
             if message["msg_type"] == "error":
-                raise RuntimeError("the setup cell failed: " + "\n".join(message["content"]["traceback"]))
+                raise RuntimeError("a preparation cell failed: " + "\n".join(message["content"]["traceback"]))
             if message["msg_type"] == "status" and message["content"]["execution_state"] == "idle":
-                break
-        self.preload_seconds = time.monotonic() - started
-        print(f"the setup cell ran in {self.preload_seconds:.1f} s", flush=True)
+                return
 
     async def ready_or_closed(self) -> bool:
         """Wait for the kernel; False when the session closed first, as when the kernel failed to start."""
@@ -267,7 +283,7 @@ class Session:
         while not self.closed.is_set():
             await asyncio.sleep(5)
             now = time.monotonic()
-            if now - self.started > WALL_SECONDS:
+            if self.connected is not None and now - self.connected > WALL_SECONDS:
                 await self.close("time")
             elif self.socket is None and now - self.started > CONNECT_SECONDS:
                 await self.close("unused")
@@ -291,7 +307,7 @@ class Session:
             await socket.close(4009, "this container already has a session")
             return
         self.socket = socket
-        self.last_request = time.monotonic()
+        self.connected = self.last_request = time.monotonic()
         runner = asyncio.create_task(self.run_queue())
         try:
             if not await self.ready_or_closed():

@@ -1,6 +1,7 @@
 // One Kernel object per session: it owns that session's container, relays its
 // WebSocket, destroys the container at the wall-clock limit, and reports the
-// container's start and stop to the Coordinator.
+// container's start and stop to the Coordinator. A spare's Kernel starts its
+// container before any page connects (see coordinator.ts).
 
 import { Container } from '@cloudflare/containers';
 import { coordinatorOf } from './coordinator';
@@ -29,6 +30,13 @@ export class Kernel extends Container<Env> {
 		};
 	}
 
+	/** Start the container of spare session `session`, which waits WARM_SECONDS for its page. */
+	async warm(session: string): Promise<void> {
+		await this.ctx.storage.put('session', session);
+		const envVars = { ...this.envVars, DEW_LIVE_CONNECT_SECONDS: String(limitsOf(this.env).warmSeconds) };
+		await this.startAndWaitForPorts(this.defaultPort, START_WAIT, { envVars });
+	}
+
 	/** Relay the page's WebSocket to the container, starting the container on the first connection. */
 	override async fetch(request: Request): Promise<Response> {
 		const session = request.headers.get(SESSION_HEADER);
@@ -50,7 +58,9 @@ export class Kernel extends Container<Env> {
 
 	override async onStart(): Promise<void> {
 		const session = await this.ctx.storage.get<string>('session');
-		await this.schedule(limitsOf(this.env).wallSeconds + 15, 'expire');
+		const { wallSeconds, warmSeconds } = limitsOf(this.env);
+		// A spare's wall clock starts when its page connects, up to WARM_SECONDS in.
+		await this.schedule(wallSeconds + warmSeconds + 15, 'expire');
 		// A container the Coordinator does not count must not run: it would escape the
 		// session cap, the one-at-a-time rule and the budget.
 		const counted = session !== undefined && (await coordinatorOf(this.env).started(session, Date.now()));
