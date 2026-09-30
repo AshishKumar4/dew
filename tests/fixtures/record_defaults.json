@@ -388,6 +388,22 @@
   ],
   "timeout": 15
  },
+ "dew.data.streaming.OnlineImages": {
+  "image_size": 256,
+  "loading": {
+   "class": "dew.data.dataset.Loading",
+   "sets": {
+    "threads": 512,
+    "worker_buffer": 20,
+    "workers": 16
+   }
+  },
+  "min_image_size": 128,
+  "retries": 3,
+  "seed": 0,
+  "sources": [],
+  "timeout": 15
+ },
  "dew.data.streaming.OnlineVideos": {
   "frames": 16,
   "image_size": 256,
