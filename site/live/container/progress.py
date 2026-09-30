@@ -23,7 +23,6 @@ from typing import Any
 
 import jax
 import numpy as np
-from IPython.display import display
 from PIL import Image
 
 # Stable Diffusion's VAE latents (sd-vae-ft-mse, as the model is trained on)
@@ -67,6 +66,8 @@ def preview_png(latent: np.ndarray) -> str | None:
 
 
 def _show(report: dict[str, Any], png: str | None = None) -> None:
+    from IPython.display import display  # the kernel's; nothing else needs IPython
+
     data = {"text/plain": json.dumps({"dew-progress": report})}
     if png is not None:
         data["image/png"] = png
