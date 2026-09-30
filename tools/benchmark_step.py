@@ -73,6 +73,7 @@ from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
+from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
@@ -108,34 +109,39 @@ class _DenoisingTextTable(ConditionEncoder[str]):
     """Synthetic token and pooled features for native diffusion models."""
 
     def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None):
+                 guidance: float | None, masked: bool = False):
         self.table = table
         self.params = table.params
         self.features = features
         self.pooled_features = pooled_features
         self.guidance = guidance
+        self.masked = masked
+        """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
                         features: int = TEXT_FEATURES, pooled_features: int | None = None,
-                        guidance: float | None = None, vocab: int = 130, seed: int = 0, dtype=None):
+                        guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
+                        dtype=None):
         return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
                                             features=max(features, pooled_features or 0),
                                             vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance)
+                   features, pooled_features, guidance, masked)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
 
     def encode(self, params: Variables, tokens) -> DenoisingCondition:
-        hidden = self.table.encode(params, tokens).hidden
+        text = self.table.encode(params, tokens)
+        hidden = text.hidden
         pooled = None if self.pooled_features is None else hidden[:, 0, :self.pooled_features]
         guidance = None if self.guidance is None else jnp.full((hidden.shape[0],), self.guidance)
-        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance)
+        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
+                                  mask=jnp.asarray(text.mask, bool) if self.masked else None)
 
     def to_json(self) -> dict:
         return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance}
+                "guidance": self.guidance, "masked": self.masked}
 
 
 @dataclass(frozen=True)
@@ -467,6 +473,9 @@ def small_cases(dtype: str) -> list[Case]:
         Case("flux2_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6, "head_dim": 64,
                                     "joint_attention_dim": 3 * TEXT_FEATURES},
              batch_size=4, image_size=32, channels=128),
+        Case("z_image_transformer", {"dim": 384, "n_layers": 3, "n_refiner_layers": 1, "n_heads": 6,
+                                      "cap_feat_dim": TEXT_FEATURES},
+             batch_size=4, image_size=32, channels=16),
         Case("uvit", {key: value for key, value in dit.items() if key != "mlp_ratio"},
              batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
@@ -691,6 +700,10 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
+            process = presets.Flow()()
+        elif isinstance(model, ZImageTransformer):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True)
             process = presets.Flow()()
         elif isinstance(model, Flux2Transformer):
             keyword = "conditioning"

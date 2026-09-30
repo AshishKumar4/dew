@@ -62,14 +62,15 @@ def rotary_table(dim: int, length: int, theta: float) -> tuple[np.ndarray, np.nd
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
 
-def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: float):
-    """The rotary cosines and sines for integer `positions` `[B, S, 3]`,
-    each channel pair's value repeated for both channels, `[B, S, sum(axes)]`."""
+def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: float, dtype):
+    """The rotary cosines and sines for integer `positions` `[B, S, 3]` in
+    `dtype`, each channel pair's value repeated for both channels,
+    `[B, S, sum(axes)]`."""
     cosines, sines = [], []
     for index, (dim, length) in enumerate(zip(axes, lengths, strict=True)):
         cos_table, sin_table = rotary_table(dim, length, theta)
-        cosines.append(jnp.asarray(cos_table)[positions[..., index]])
-        sines.append(jnp.asarray(sin_table)[positions[..., index]])
+        cosines.append(jnp.asarray(cos_table, dtype)[positions[..., index]])
+        sines.append(jnp.asarray(sin_table, dtype)[positions[..., index]])
     return (jnp.repeat(jnp.concatenate(cosines, axis=-1), 2, axis=-1),
             jnp.repeat(jnp.concatenate(sines, axis=-1), 2, axis=-1))
 
@@ -234,8 +235,8 @@ class ZImageTransformer(nn.Module):
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
         rotation = (self.axes_dims, self.axes_lens, self.rope_theta)
-        image_cos, image_sin = _rotation(image_positions, *rotation)
-        caption_cos, caption_sin = _rotation(caption_positions, *rotation)
+        image_cos, image_sin = _rotation(image_positions, *rotation, image.dtype)
+        caption_cos, caption_sin = _rotation(caption_positions, *rotation, image.dtype)
         whole_image = jnp.full((batch,), image_span, jnp.int32)
         block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
                  "attention_impl": self.attention_impl}
