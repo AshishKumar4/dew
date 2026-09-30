@@ -19,7 +19,9 @@ from .unet3d import UNet3D
 from .unet_condition import UNet2DCondition, UNetStage
 from .uvit import SimpleUDiT, UViT
 from .video_dit import VideoDiT
+from .z_image import ZImageTransformer
 
 __all__ = ["CausalTransformer", "Flux2Transformer", "FluxTransformer", "HierarchicalMMDiT",
            "HybridSSMAttentionDiT", "QwenImageTransformer", "SD3Transformer", "SimpleDiT", "SimpleMMDiT",
-           "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT"]
+           "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT",
+           "ZImageTransformer"]

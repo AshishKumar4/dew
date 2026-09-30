@@ -1096,7 +1096,7 @@ class _Call(NamedTuple):
     it pads its T5 tower to. Qwen-Image's pipeline pads to the longest prompt
     of a call, so its budget is the prompt window Dew pads each row to."""
 
-    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image"]
+    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image", "z_image"]
     steps: int
     guidance: float
     guided: bool
@@ -1123,6 +1123,9 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
     # its index marks it step-distilled, which `_call_policy` reads.
     "Flux2Pipeline": _Call("flux2", 50, 4.0, guided=False, sequence=512),
     "Flux2KleinPipeline": _Call("flux2", 50, 4.0, guided=True, sequence=512),
+    # Z-Image guides as `pos + 5.0 (pos - neg)`, which is Dew's
+    # `neg + 6.0 (pos - neg)`.
+    "ZImagePipeline": _Call("z_image", 50, 6.0, guided=True, sequence=512),
     "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
@@ -1458,6 +1461,8 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "Flux2Transformer2DModel":
         return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "ZImageTransformer2DModel":
+        return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
@@ -1578,6 +1583,35 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
         text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=fields["in_channels"], sample_size=64,
         context_width=fields["joint_attention_dim"],
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
+
+
+def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build Z-Image's single-stream transformer over the Flux VAE's latent,
+    cut into 2x2 patches, conditioned by its Qwen3 encoder's second-to-last
+    layer.
+
+    Its pipeline renders at 1024 pixels by default, 128 latent positions
+    through the VAE's 8x, and hands its statically shifting scheduler
+    `linspace(1, 1/N, N)`.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.z_image import ZImageTransformer
+
+    fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = ZImageTransformer(**fields)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_z_image_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params}, layouts
+
+    built = {"name": "z_image_transformer",
+             "fields": {**fields, "dtype": dtype, "axes_dims": list(fields["axes_dims"]),
+                        "axes_lens": list(fields["axes_lens"])}}
+    return _Denoiser(
+        component="transformer", model=model, weights=weights, built=built, config=config,
+        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=128,
+        context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
 
 
 def _component_config(directory: Path, name: str) -> dict:
