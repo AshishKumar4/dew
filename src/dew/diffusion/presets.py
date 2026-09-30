@@ -243,6 +243,20 @@ class MeanFlow:
             prediction=FlowMatchPredictionTransform(), interval=True)
 
 
+@presets("shortcut")
+@dataclass(frozen=True)
+class Shortcut:
+    """Rectified flow on the linear path whose model predicts the velocity
+    of one step of a given size (`Process.interval`), a shortcut model's
+    convention (Frans et al. 2025, "One Step Diffusion via Shortcut
+    Models"). It trains under `ShortcutObjective`, which draws its own
+    times on dyadic grids."""
+
+    def __call__(self) -> Process:
+        return Process(schedule=FlowMatchingScheduler(density="uniform"),
+                       prediction=FlowMatchPredictionTransform(), interval=True)
+
+
 @presets("jit")
 @dataclass(frozen=True)
 class JiT:

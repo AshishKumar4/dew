@@ -1,4 +1,4 @@
-"""Few-step generators trained from scratch: MeanFlow.
+"""Few-step generators trained from scratch: MeanFlow and shortcut models.
 
 MeanFlow (Geng et al. 2025, "Mean Flows for One-step Generative Modeling")
 trains a model of the average velocity u(z_t, r, t) over [r, t] through the
@@ -6,6 +6,12 @@ MeanFlow identity u = v - (t - r) du/dt, the total derivative taken along
 the flow with one JVP. One step of the average velocity then crosses the
 whole interval. The official code is Gsunshine/meanflow's `MeanFlow`, in
 JAX, which `tools/meanflow_reference.py` runs.
+
+Shortcut models (Frans et al. 2025, "One Step Diffusion via Shortcut
+Models") train a velocity conditioned on its step size d: flow matching at
+the smallest step, and self-consistency, one step of 2d is two of d, on a
+fraction of the batch. The official code is kvfrans/shortcut-models'
+`get_targets`, in JAX, which `tools/shortcut_reference.py` runs.
 """
 
 from __future__ import annotations
@@ -14,6 +20,8 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
 from flax import linen as nn
 
 from dew.diffusion.process import Process, aligned_conditions
@@ -62,6 +70,27 @@ def adaptive_loss(u, target, power: float, epsilon: float) -> jax.Array:
     power 0 is the plain error and power 1 a near-unit loss per row."""
     error = jnp.sum(jnp.square(u - target), axis=tuple(range(1, u.ndim)))
     return error / jax.lax.stop_gradient((error + epsilon) ** power)
+
+
+def shortcut_levels(rows: int, sections: int) -> jax.Array:
+    """The step levels of the self-consistency rows, a step of 2^-level:
+    `rows // log2(sections)` rows per level from the coarsest, the rest at
+    level 0, one step across the whole path (`get_targets`)."""
+    count = int(np.log2(sections))
+    levels = jnp.repeat(count - 1 - jnp.arange(count), rows // count)
+    return jnp.concatenate([levels, jnp.zeros(rows - levels.shape[0], levels.dtype)])
+
+
+def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
+    """Self-consistency: the velocity of one step of `step` from `x` at
+    `sigma` is the mean of two of half that size, each state clipped to
+    [-4, 4] as the reference clips it. `velocity(x, sigma, sigma - step)`
+    is the model's over the interval to `sigma - step`."""
+    half = step / 2
+    first = velocity(x, sigma, sigma - half)
+    midway = jnp.clip(x - expand(half, x) * first, -4, 4)
+    second = velocity(midway, sigma - half, sigma - step)
+    return jax.lax.stop_gradient(jnp.clip((first + second) / 2, -4, 4))
 
 
 @objectives("mean_flow")
@@ -142,4 +171,79 @@ class MeanFlowObjective(DiffusionObjective):
         return Mean(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
 
-__all__ = ["MeanFlowObjective", "adaptive_loss", "guided_velocity", "intervals", "mean_flow_target"]
+@objectives("shortcut")
+class ShortcutObjective(DiffusionObjective):
+    """A shortcut model on an interval process (`presets.Shortcut`).
+
+    `sections` is the finest grid, the reference's `denoise_timesteps`
+    (128): flow-matching rows train at one step of 1 / sections, on times
+    of that grid. One row in `bootstrap_every` (8) trains self-consistency
+    at a level of `shortcut_levels`, on times of that level's grid, against
+    two half steps of the EMA weights when the run keeps them. The
+    condition is dropped on `unconditional_prob` of the flow-matching rows.
+    Sampling walks `steps - 1` equal Euler steps with no guidance; a count
+    of steps that is a power of two up to `sections` is one the model
+    trained at.
+    """
+
+    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
+                 sections: int = 128, bootstrap_every: int = 8, **kwargs):
+        schedule = process.schedule
+        if not (process.interval and isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0
+                and isinstance(process.prediction, FlowMatchPredictionTransform)):
+            raise ValueError("a shortcut model is an interval model of velocity on the unshifted "
+                             "linear path; build the process with presets.Shortcut")
+        if sections < 2 or sections & (sections - 1):
+            raise ValueError(f"sections is a power of two, not {sections}")
+        kwargs.setdefault("guidance", None)
+        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("steps", 2)
+        super().__init__(model, process, inputs, **kwargs)
+        self.sections = sections
+        self.bootstrap_every = bootstrap_every
+
+    def loss(self, params, batch, step: Step):
+        samples = unit_range(batch[self.inputs.sample.key])
+        encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
+        if self.autoencoder is not None:
+            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+        count = samples.shape[0]
+        rows = count // self.bootstrap_every
+        schedule = self.process.schedule
+        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
+        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
+                             given, aligned_conditions(given, unconditional))
+
+        levels = shortcut_levels(rows, self.sections)
+        grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
+        # Data at t = k / grid, k below grid, in the reference's time; noise is Dew's sigma = 1 - t.
+        sigma = 1 - jax.random.randint(time_key, (count,), 0, grid.astype(jnp.int32)) / grid
+        step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
+        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        x, _, v = self.process.prediction.forward_diffusion(samples, noise, broadcast_rates(schedule, sigma, samples))
+        dropped = jnp.arange(count) >= rows
+        dropped &= jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
+        conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
+                                  given, blank)
+
+        def velocity(variables, conditions, *, train: bool) -> Velocity:
+            def over(x, sigma, following) -> jax.Array:
+                output = self.model.apply(variables, x, schedule.model_time(sigma), **conditions,
+                                          duration=schedule.model_time(sigma) - schedule.model_time(following),
+                                          train=train, rngs={"dropout": dropout_key})
+                assert isinstance(output, jax.Array)
+                return output
+            return over
+
+        teacher = self.trainable(jax.lax.stop_gradient(params if step.ema is None else step.ema))
+        leading = jax.tree.map(lambda value: value[:rows], given)
+        bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
+                                       step_size[:rows])
+        target = jnp.concatenate([bootstrapped, v[rows:]])
+        u = velocity(self.trainable(params), conditions, train=True)(x, sigma, sigma - step_size)
+        losses = optax.l2_loss(u, target)
+        return Mean(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+
+
+__all__ = ["MeanFlowObjective", "ShortcutObjective", "adaptive_loss", "guided_velocity", "intervals",
+           "mean_flow_target", "shortcut_levels", "shortcut_target"]

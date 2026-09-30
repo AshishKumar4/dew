@@ -227,6 +227,15 @@ class MeanFlowTraining:
 
 
 @dataclasses.dataclass(frozen=True)
+class ShortcutTraining:
+    """Train a shortcut model (`ShortcutObjective`, which documents the
+    fields) under the `shortcut` preset."""
+
+    sections: int = 128
+    bootstrap_every: int = 8
+
+
+@dataclasses.dataclass(frozen=True)
 class RepresentationAlignment:
     """Align the model's hidden tokens with a frozen DINOv2's patch features,
     REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
@@ -308,6 +317,9 @@ class DiffusionRunConfig(RunConfig):
     preset's fixed weighting."""
     alignment: RepresentationAlignment | None = None
     mean_flow: MeanFlowTraining | None = None
+    shortcut: ShortcutTraining | None = None
+    """Train a shortcut model instead of the denoising loss; the preset is
+    `shortcut`, and sampling is unguided."""
     """Train with MeanFlow's loss instead of the denoising loss; the preset
     is `mean_flow` and sampling is unguided, since the guidance is trained
     in."""
@@ -324,7 +336,8 @@ class DiffusionRunConfig(RunConfig):
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         object.__setattr__(self, "objective", "flow_grpo" if self.rl is not None else
-                           "mean_flow" if self.mean_flow is not None else "diffusion")
+                           "mean_flow" if self.mean_flow is not None else
+                           "shortcut" if self.shortcut is not None else "diffusion")
         from dew.diffusion.presets import EDM, Flow
 
         if self.mean_flow is not None and (self.rl is not None or self.alignment is not None
@@ -332,6 +345,11 @@ class DiffusionRunConfig(RunConfig):
                                            or not isinstance(self.preset, presets.MeanFlow)):
             raise ValueError("MeanFlow trains on its own loss under the mean_flow preset, guided in "
                              "training (omega, kappa): set guidance None, and neither rl nor alignment")
+        if self.shortcut is not None and (self.rl is not None or self.alignment is not None
+                                          or self.mean_flow is not None or self.guidance is not None
+                                          or not isinstance(self.preset, presets.Shortcut)):
+            raise ValueError("a shortcut model trains on its own loss under the shortcut preset and "
+                             "samples unguided: set guidance None, and none of rl, alignment, mean_flow")
         if self.alignment is not None and (self.rl is not None or self.pretrained is not None):
             raise ValueError("representation alignment trains a scratch model on the denoising "
                              "loss; it takes neither `rl` nor `pretrained`")
@@ -473,6 +491,13 @@ class DiffusionRunConfig(RunConfig):
 
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
+                autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
+                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+        if self.shortcut is not None:
+            from .few_step import ShortcutObjective
+
+            return ShortcutObjective(
+                model, process, inputs, **dataclasses.asdict(self.shortcut),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
                 ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
