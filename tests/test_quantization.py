@@ -131,25 +131,39 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in zip(losses, losses[1:])), losses
 
 
-def test_a_scanned_quantized_stack_scores_as_the_plain_one():
-    """Quantization composes with the scan. Both stacks compiled as a
-    training step compiles them, the wrapped scan agrees with the wrapped
-    plain loop while staying away from its fp32 twin; the distance is the
-    assertion that the rules reached under the scan. Observed on logits of
-    order 3: scan against plain 0.0 on CPU and 1.5e-02 on the RTX 4080,
-    where the scan body and the unrolled layers lower to different fusions
-    and int8 rounding flips under the reordered reductions; scan against
-    fp32 1.2e-01 on both. (Eager the two differ by 3.6e-02, fusion order in
-    the uncompiled matmuls, so both sides compile here.)"""
+def int8_products(jaxpr) -> int:
+    """How many convolutions and matmuls of two int8 operands `jaxpr` runs,
+    a scan's body counted once per iteration."""
+    count = 0
+    for equation in jaxpr.eqns:
+        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
+                and all(operand.aval.dtype == jnp.int8 for operand in equation.invars)):
+            count += 1
+        repeats = equation.params["length"] if equation.primitive.name == "scan" else 1
+        for value in equation.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns"):
+                count += repeats * int8_products(inner)
+    return count
+
+
+def test_a_scanned_quantized_stack_quantizes_what_the_plain_one_does():
+    """Quantization composes with the scan: the wrapped scan runs as many
+    int8 products as the wrapped plain loop (19 for this model), and its
+    compiled logits stay away from its fp32 twin, so the rules reached the
+    matmuls under the scan. The two stacks' logits are not compared: the
+    scan body and the unrolled layers compile to different fusions, which on
+    the RTX 4080 differ by 2.3e-04 unquantized, and int8 rounding turns that
+    into 7.0e-02 on logits of order 4, at the default and the highest matmul
+    precision alike (0.0 on CPU)."""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(), scan_layers=True)
     plain_wrapped = apply_quantization(tiny(), Quantization())
-    scanned = jax.jit(qmodel.apply)(variables, ids)
-    plain = jax.jit(plain_wrapped.apply)(variables, ids)
+    scanned = int8_products(jax.make_jaxpr(qmodel.apply)(variables, ids).jaxpr)
+    assert scanned == int8_products(jax.make_jaxpr(plain_wrapped.apply)(variables, ids).jaxpr) > 0
     reference = jax.jit(model.apply)(variables, ids)
-    assert float(jnp.max(jnp.abs(scanned - reference))) > 1e-2
-    assert float(jnp.max(jnp.abs(scanned - plain))) < 5e-2
+    assert float(jnp.max(jnp.abs(jax.jit(qmodel.apply)(variables, ids) - reference))) > 1e-2
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",
@@ -471,8 +485,10 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     assert int(state.step) == 1
     image = jnp.ones((1, RES, RES, 3), jnp.float32)
     noise_level = jnp.ones((1,), jnp.float32)
-    quantized_out = objective.model.apply(state.params, image, noise_level)
-    plain_out = plain.model.apply(state.params, image, noise_level)
+    # Compiled, as a run computes: XLA:GPU compiles an int8 convolution only
+    # with its dequantization fused in, and eagerly the convolution runs alone.
+    quantized_out = jax.jit(objective.model.apply)(state.params, image, noise_level)
+    plain_out = jax.jit(plain.model.apply)(state.params, image, noise_level)
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 
