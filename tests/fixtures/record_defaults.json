@@ -525,6 +525,7 @@
   "max_tokens": 4096,
   "tokens": null
  },
+ "dew.diffusion.presets.Shortcut": {},
  "dew.diffusion.presets.Sqrt": {
   "min_snr_gamma": null
  },
@@ -595,6 +596,7 @@
    "sets": {}
   },
   "sampling_steps": 200,
+  "shortcut": null,
   "text": {
    "class": "dew.objectives.diffusion.config.TextCondition",
    "sets": {}
@@ -647,6 +649,10 @@
   "spatial_norm": null,
   "weight": 0.5,
   "width": 2048
+ },
+ "dew.objectives.diffusion.config.ShortcutTraining": {
+  "bootstrap_every": 8,
+  "sections": 128
  },
  "dew.objectives.diffusion.config.TextCondition": {
   "checkpoint": "openai/clip-vit-large-patch14",
