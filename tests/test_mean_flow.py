@@ -61,8 +61,8 @@ def test_the_loss_is_the_references(power):
 
 def test_the_first_fraction_of_rows_is_instantaneous():
     t, r = intervals(jnp.asarray([0.2, 0.9, 0.5, 0.1]), jnp.asarray([0.6, 0.3, 0.4, 0.7]), 0.5)
-    np.testing.assert_array_equal(np.asarray(t), [0.6, 0.9, 0.5, 0.7])
-    np.testing.assert_array_equal(np.asarray(r), [0.6, 0.9, 0.4, 0.1])
+    np.testing.assert_array_equal(np.asarray(t), np.float32([0.6, 0.9, 0.5, 0.7]))
+    np.testing.assert_array_equal(np.asarray(r), np.float32([0.6, 0.9, 0.4, 0.1]))
 
 
 def objective(**fields):

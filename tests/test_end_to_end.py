@@ -69,7 +69,8 @@ def objective(end_to_end: EndToEnd) -> DiffusionObjective:
                               end_to_end=end_to_end, ema_decay=None)
 
 
-BATCH = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
+# Eight rows, which the test mesh's eight devices divide.
+BATCH = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 8, 8, 3), 0, 256), np.uint8)}
 STEP = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
 
 
