@@ -29,6 +29,8 @@ import numpy as np
 import optax
 from flax import linen as nn
 
+from dew.nn.precision import at_least_fp32
+
 MP_KERNEL = "mp_kernel"
 """The parameter name of a magnitude-preserving weight, which forced weight
 normalization keeps at unit magnitude."""
@@ -39,8 +41,8 @@ def normalize(x: jax.Array, axes: Sequence[int] | None = None, eps: float = 1e-4
     by default: each output channel of a kernel, or each feature vector."""
     axes = tuple(range(x.ndim - 1)) if axes is None else tuple(axes)
     count = math.prod(x.shape[axis] for axis in axes)
-    norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=axes, keepdims=True))
-    return x / (eps + norm / np.sqrt(count)).astype(x.dtype)
+    norm = jnp.sqrt(jnp.sum(jnp.square(x.astype(at_least_fp32(x.dtype))), axis=axes, keepdims=True))
+    return x / (eps + norm / math.sqrt(count)).astype(x.dtype)
 
 
 def mp_silu(x: jax.Array) -> jax.Array:
@@ -50,16 +52,17 @@ def mp_silu(x: jax.Array) -> jax.Array:
 
 def mp_sum(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
     """The interpolation (1 - t) a + t b at unit magnitude (Eq. 88)."""
-    return (a + t * (b - a)) / np.sqrt((1 - t) ** 2 + t ** 2)
+    return (a + t * (b - a)) / math.sqrt((1 - t) ** 2 + t ** 2)
 
 
 def mp_cat(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
     """The channel concatenation of `a` and `b`, weighted by `t` and at unit
     magnitude (Eq. 103)."""
     na, nb = a.shape[-1], b.shape[-1]
-    scale = np.sqrt((na + nb) / ((1 - t) ** 2 + t ** 2))
-    return jnp.concatenate([a * (scale / np.sqrt(na) * (1 - t)),
-                            b * (scale / np.sqrt(nb) * t)], axis=-1)
+    # Python floats, which take the operands' dtype rather than promoting it.
+    scale = math.sqrt((na + nb) / ((1 - t) ** 2 + t ** 2))
+    return jnp.concatenate([a * (scale / math.sqrt(na) * (1 - t)),
+                            b * (scale / math.sqrt(nb) * t)], axis=-1)
 
 
 class MPFourier(nn.Module):
@@ -79,8 +82,10 @@ class MPFourier(nn.Module):
             "constants", "phases",
             lambda: 2 * np.pi * jax.random.uniform(self.make_rng("params"), (self.channels,),
                                                    jnp.float32))
-        y = jnp.asarray(x, jnp.float32)[..., None] * frequencies.value + phases.value
-        return (jnp.cos(y) * np.sqrt(2)).astype(jnp.asarray(x).dtype)
+        x = jnp.asarray(x)
+        wide = at_least_fp32(x.dtype)
+        y = x.astype(wide)[..., None] * frequencies.value.astype(wide) + phases.value.astype(wide)
+        return (jnp.cos(y) * math.sqrt(2)).astype(x.dtype)
 
 
 class MPConv(nn.Module):
@@ -99,8 +104,8 @@ class MPConv(nn.Module):
     def __call__(self, x: jax.Array, gain: jax.Array | float = 1.0) -> jax.Array:
         shape = (*self.kernel_size, x.shape[-1], self.features)
         weight = self.param(MP_KERNEL, lambda key: normalize(jax.random.normal(key, shape)))
-        weight = normalize(weight.astype(jnp.float32))
-        weight = weight * (gain / np.sqrt(math.prod(shape[:-1])))
+        weight = normalize(weight.astype(at_least_fp32(x.dtype)))
+        weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:
             return x @ weight
