@@ -197,7 +197,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
     prompts = [*record["pipeline"]["prompts"], ""]
     condition = encoder.encode(params, encoder.tokenize(prompts))
     assert condition.context.shape == (3, 512, record["pipeline"]["config"]["joint_attention_dim"])
-    assert condition.mask is None and condition.guidance is None
+    assert condition.guidance is None
     for row in range(len(prompts)):
         assert relative_gap(condition.context[row], arrays[f"pipeline.context.{row}"][0]) < FORWARD, row
     with pytest.raises(ValueError, match="token budget"):

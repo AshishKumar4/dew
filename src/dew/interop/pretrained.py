@@ -36,7 +36,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import (
     Composition,
     DiffusionConditioner,
-    Flux2Conditioner,
+    HiddenStatesConditioner,
     QwenImageConditioner,
     T5Segment,
 )
@@ -1247,25 +1247,28 @@ class _QwenImageText:
 
 
 @dataclass(frozen=True)
-class _Flux2Text:
-    """FLUX.2's text encoder - Mistral-3 for [dev], Qwen3 for [klein] - which
-    `Flux2Conditioner` runs, padded to the call's token budget.
-    `embeds_guidance` marks [dev]'s transformer, which reads the guidance
-    scale as an input."""
+class _HiddenStatesText:
+    """The text encoder FLUX.2 (`pipeline="flux2"`: Mistral-3 for [dev],
+    Qwen3 for [klein]) or Z-Image (`"z_image"`: Qwen3) reads hidden states
+    from, which `HiddenStatesConditioner` runs, padded to the call's token
+    budget. `embeds_guidance` marks FLUX.2 [dev]'s transformer, which reads
+    the guidance scale as an input."""
 
-    embeds_guidance: bool
+    pipeline: Literal["flux2", "z_image"]
+    embeds_guidance: bool = False
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: int, *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
-              ) -> tuple[Flux2Conditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
-        """Construct `Flux2Conditioner` at the pipeline's prompt budget."""
-        return _flux2_conditioning(directory, index, compute, size, tokens=policy.sequence,
-                                   guidance=policy.guidance if self.embeds_guidance else None,
-                                   param_dtype=param_dtype, attention_impl=attention_impl, params=params)
+              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+        """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
+        return _hidden_states_conditioning(
+            directory, index, compute, size, pipeline=self.pipeline, tokens=policy.sequence,
+            guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
+            attention_impl=attention_impl, params=params)
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
-        """The empty prompt [klein]'s guided call encodes as its negative."""
+        """The empty prompt a guided call encodes as its negative."""
         return {"text": ""}
 
 
@@ -1286,7 +1289,7 @@ class _Denoiser:
     weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    text: _TextTowers | _QwenImageText | _Flux2Text
+    text: _TextTowers | _QwenImageText | _HiddenStatesText
     patch: int
     latent_input: int
     sample_size: int
@@ -1572,7 +1575,7 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     guided = fields["guidance_embeds"]
     return _Denoiser(
         component="transformer", model=model, weights=weights, built=built, config=config,
-        text=_Flux2Text(embeds_guidance=guided), patch=1, latent_input=fields["in_channels"], sample_size=64,
+        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=fields["in_channels"], sample_size=64,
         context_width=fields["joint_attention_dim"],
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
@@ -1784,10 +1787,10 @@ _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] 
 formats a prompt with, and the `hidden_states` it stacks."""
 
 
-def _flux2_text_path(record: decoders.DecoderFields, family: str, multimodal: bool):
-    """Map a FLUX.2 text encoder's tensors: a Qwen3 language model's own
-    names, or a Mistral-3's language model as the Mistral decoder's with its
-    vision tower and projector held as stored, which a text prompt never
+def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal: bool):
+    """Map a hidden-states text encoder's tensors: a Qwen3 language model's
+    own names, or a Mistral-3's language model as the Mistral decoder's with
+    its vision tower and projector held as stored, which a text prompt never
     reads and an export writes back."""
     decoder = decoders._FAMILIES[family]
 
@@ -1802,20 +1805,24 @@ def _flux2_text_path(record: decoders.DecoderFields, family: str, multimodal: bo
     return path
 
 
-def _flux2_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
-                        tokens: int, guidance: float | None, param_dtype: str, attention_impl: str,
-                        params: Variables | None = None
-                        ) -> tuple[Flux2Conditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
-    """Build FLUX.2's conditioner: the text encoder's language model, the
-    tokenizer and chat template, the parameters and their layouts."""
+def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+                                pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
+                                param_dtype: str, attention_impl: str, params: Variables | None = None
+                                ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],
+                                           dict[str, Mapping[str, object]]]:
+    """Build FLUX.2's or Z-Image's conditioner: the text encoder's language
+    model, the tokenizer and chat template, the parameters and their layouts.
+    Z-Image reads the output of the encoder's second-to-last layer with the
+    template's thinking on."""
     from dew.data.text import load_tokenizer
     from dew.interop import diffusion
 
     config = _component_config(directory, "text_encoder")
     kind = records.text(config.get("model_type"), "model_type")
-    if kind not in _FLUX2_TEXT:
-        raise ValueError(f"FLUX.2's text encoder is one of {sorted(_FLUX2_TEXT)}, not {kind!r}")
-    template, layers = _FLUX2_TEXT[kind]
+    known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
+    if kind not in known:
+        raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
+    template, layers = known[kind]
     multimodal = kind == "mistral3"
     text = dict(records.record(config["text_config"], "text_config")) if multimodal else config
     if multimodal:
@@ -1824,47 +1831,53 @@ def _flux2_conditioning(directory: Path, index: Mapping[str, object], compute, s
     record = decoders.translate_config(text)
     named = dtype_name(compute)
     if named is None:
-        raise ValueError("FLUX.2's text encoder computes in a named dtype; pass dtype")
+        raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
     decoder = models.build("causal_transformer",
                            with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl))
     if not isinstance(decoder, CausalTransformer):
         raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    if pipeline == "z_image":
+        layers = (decoder.num_layers - 1,)
     if max(layers) > decoder.num_layers:
-        raise ValueError(f"FLUX.2 reads hidden state {max(layers)} of a {decoder.num_layers}-layer encoder")
+        raise ValueError(f"{pipeline} reads hidden state {max(layers)} of a {decoder.num_layers}-layer encoder")
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = diffusion.record_layouts(
             "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
-            _flux2_text_path(record, records.text(text["model_type"], "model_type"), multimodal), ("encoders", "conditioning", "text_encoder"),
-            param_dtype=param_dtype)
+            _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
+            ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype)
         params = {"text_encoder": tower}
     height, width = index.get("dew_height", size), index.get("dew_width", size)
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
-    encoder = Flux2Conditioner(
+    encoder = HiddenStatesConditioner(
         decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory), height, width,
-        template=template, layers=layers, tokens=tokens, guidance=guidance, param_dtype=param_dtype)
+        template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
+        param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
 
 
-def load_flux2_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
-                           revision: str | None = None, attention_impl: str = "auto", tokens: int = 512,
-                           params: Variables | None = None) -> Flux2Conditioner:
-    """Load FLUX.2's text conditioning, or bind supplied parameters using metadata only."""
+def load_hidden_states_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
+                                   param_dtype: str = "float32", revision: str | None = None,
+                                   attention_impl: str = "auto", tokens: int = 512,
+                                   params: Variables | None = None) -> HiddenStatesConditioner:
+    """Load FLUX.2's or Z-Image's text conditioning, or bind supplied
+    parameters using metadata only."""
     compute = resolve_dtype(dtype)
     resolve_dtype(param_dtype)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
     denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    if not isinstance(denoiser.text, _Flux2Text):
-        raise ValueError(f"{checkpoint} is not a FLUX.2 checkpoint")
+    text = denoiser.text
+    if not isinstance(text, _HiddenStatesText):
+        raise ValueError(f"{checkpoint} is neither a FLUX.2 nor a Z-Image checkpoint")
     if params is None:
         directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
     policy = _call_policy(index, denoiser)
-    encoder, _, _ = _flux2_conditioning(
-        directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
-        guidance=policy.guidance if denoiser.text.embeds_guidance else None, param_dtype=param_dtype,
+    encoder, _, _ = _hidden_states_conditioning(
+        directory, index, compute, denoiser.sample_size * 16, pipeline=text.pipeline, tokens=tokens,
+        guidance=policy.guidance if text.embeds_guidance else None, param_dtype=param_dtype,
         attention_impl=attention_impl, params=params)
     return encoder
 
