@@ -214,6 +214,8 @@ PER_ARCH = {
     "flux2_transformer": {"in_channels": 16, "out_channels": 16, "num_layers": 1, "num_single_layers": 1,
                           "heads": 2, "head_dim": 16, "joint_attention_dim": 16,
                           "timestep_guidance_channels": 32, "axes_dims_rope": (4, 4, 4, 4)},
+    "z_image_transformer": {"in_channels": 4, "dim": 32, "n_layers": 1, "n_refiner_layers": 1, "n_heads": 2,
+                            "cap_feat_dim": 16, "axes_dims": (4, 6, 6), "axes_lens": (64, 16, 16)},
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
@@ -257,7 +259,7 @@ def build_model(architecture, dtype="bfloat16"):
         return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
     if architecture not in COMPOSITES:
         own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer",
-               "flux2_transformer")
+               "flux2_transformer", "z_image_transformer")
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **resolved(architecture, fields))
     text = models.build("causal_transformer", **resolved(
@@ -295,6 +297,10 @@ def tiny_inputs(architecture, rng):
         latents = jax.random.normal(rng, (1, 4, 4, 16))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], guidance=jnp.full((1,), 3.5))}
+    if architecture == "z_image_transformer":
+        latents = jax.random.normal(rng, (1, 4, 4, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :16], mask=text.mask)}
     if architecture == "qwen_image_transformer":
         latents = jax.random.normal(rng, (1, 4, 4, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
