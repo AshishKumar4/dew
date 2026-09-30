@@ -80,7 +80,11 @@ export class LiveSession {
 	private next = 0;
 	onClose: (message: string) => void = () => {};
 
-	private constructor(private readonly socket: WebSocket) {
+	private constructor(
+		private readonly socket: WebSocket,
+		/** The kernel was a warm spare, which has already compiled the sampling cell. */
+		readonly warm: boolean,
+	) {
 		socket.addEventListener('message', (event) => {
 			const message = JSON.parse(String(event.data));
 			if (message.type === 'closing') {
@@ -131,7 +135,7 @@ export class LiveSession {
 			socket.removeEventListener('message', onMessage);
 			socket.removeEventListener('close', onClose);
 		}
-		return new LiveSession(socket);
+		return new LiveSession(socket, body.warm === true);
 	}
 
 	/** Run one cell; `onOutput` hears each output as it arrives. */
