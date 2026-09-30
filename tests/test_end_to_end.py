@@ -107,7 +107,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     task = objective(EndToEnd())
     trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
-    before = state.params[LATENT_STATS]
+    before = jax.tree.map(np.asarray, state.params[LATENT_STATS])
     state, *_ = trainer.compile(state, BATCH)(state, BATCH)
     after = state.params[LATENT_STATS]
     assert not np.allclose(np.asarray(after["mean"]), np.asarray(before["mean"]))
