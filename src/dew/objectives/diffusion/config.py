@@ -145,10 +145,11 @@ class PretrainedAutoencoder:
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
         """Bind supplied params while reconstructing the model from its config."""
-        from dew.nn.autoencoders.pretrained import load_autoencoder
-        from dew.registry import resolve_dtype
+        import jax.numpy as jnp
 
-        return load_autoencoder(self.modelname, revision=self.revision, dtype=resolve_dtype(self.dtype),
+        from dew.nn.autoencoders.pretrained import load_autoencoder
+
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=jnp.dtype(self.dtype),
                                 latent_shift=self.latent_shift, latent_scale=self.latent_scale,
                                 params=params)
 
