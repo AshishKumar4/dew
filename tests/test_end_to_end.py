@@ -127,7 +127,7 @@ def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
                            end_to_end=EndToEnd())
 
 
-def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path, monkeypatch):
+def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path):
     """REPA-E through `DiffusionRunConfig` on the committed tiny DINOv2 and
     SD VAE: a saved run's task restores the tuned autoencoder and its
     running statistics, and samples exactly as the trained objective's own
@@ -167,12 +167,10 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     checkpoints.wait()
     config.save(str(run))
 
-    import dew.interop.diffusion
-
-    def forbid(*args, **kwargs):
-        raise AssertionError("restoring the run read the representation encoder's weights")
-
-    monkeypatch.setattr(dew.interop.diffusion, "component_tensors", forbid)
+    # The saved tree carries the encoder's weights, so restoring reads its
+    # checkpoint's config and nothing else.
+    for weights in (tmp_path / "rae/dinov2_plain").glob("*.safetensors"):
+        weights.unlink()
     restored = TextToImage.from_run(str(run))
     for got, want in zip(jax.tree.leaves(restored.params["autoencoder"]),
                          jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
