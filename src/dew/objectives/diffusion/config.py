@@ -241,8 +241,9 @@ class RepresentationAlignment:
     REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), and optionally tune
     the autoencoder end to end through it, REPA-E (Leng et al. 2025).
 
-    `encoder` is a transformers `Dinov2Model` checkpoint, REPA's DINOv2-B/14
-    by default, read at `resolution` pixels. `layer` names the model's
+    `encoder` is a transformers `Dinov2Model` checkpoint, `repo`,
+    `repo@revision` or a directory, REPA's DINOv2-B/14 by default, read at
+    `resolution` pixels; a run's record pins it to a commit. `layer` names the model's
     submodule whose output is aligned: REPA aligns after the eighth block,
     `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
     `end_to_end` is REPA-E's `EndToEnd`, which needs a KL `autoencoder`.
@@ -262,11 +263,13 @@ class RepresentationAlignment:
         """The alignment over the encoder's weights: `variables`' own
         `representation` when a saved tree supplies them, else the
         checkpoint's."""
+        from dew.interop.pretrained import split_revision
         from dew.nn.autoencoders.rae import load_dinov2
 
-        module, params, _ = load_dinov2(self.encoder)
-        held = {"params": params} if variables is None else variables[REPRESENTATION]
-        return Alignment(module.clone(input_size=self.resolution), held, self.layer,
+        name, revision = split_revision(self.encoder)
+        supplied = None if variables is None else variables[REPRESENTATION]["params"]
+        module, params, _ = load_dinov2(name, revision=revision, params=supplied)
+        return Alignment(module.clone(input_size=self.resolution), {"params": params}, self.layer,
                          weight=self.weight, projector=self.projector, width=self.width,
                          kernel_size=self.kernel_size, spatial_norm=self.spatial_norm,
                          resolution=self.resolution)
@@ -340,6 +343,9 @@ class DiffusionRunConfig(RunConfig):
                            "shortcut" if self.shortcut is not None else "diffusion")
         from dew.diffusion.presets import EDM, Flow
 
+        if (self.mean_flow is not None or self.shortcut is not None) and self.uncertainty is not None:
+            raise ValueError("MeanFlow and shortcut models train on their own losses, which read no "
+                             "learned uncertainty weighting; leave uncertainty unset")
         if self.mean_flow is not None and (self.rl is not None or self.alignment is not None
                                            or self.guidance is not None
                                            or not isinstance(self.preset, presets.MeanFlow)):
@@ -519,16 +525,22 @@ class DiffusionRunConfig(RunConfig):
         return None if self.rl is None else self.rl.rollout(objective)
 
     def pinned(self) -> DiffusionRunConfig:
-        """This run with a Hub `pretrained` pinned to the commit it resolves to
-        now, so the record names the weights the run started from."""
-        if self.pretrained is None or os.path.isdir(self.pretrained):
-            return self
+        """This run with its Hub sources, `pretrained` and the alignment's
+        encoder, pinned to the commits they resolve to now, so the record
+        names the weights the run started from."""
         from dew.interop import sources
         from dew.interop.pretrained import split_revision
 
-        name, revision = split_revision(self.pretrained)
-        commit = sources.snapshot(name, revision, weights=False).name
-        return dataclasses.replace(self, pretrained=f"{name}@{commit}")
+        def pin(source: str) -> str:
+            if os.path.isdir(source):
+                return source
+            name, revision = split_revision(source)
+            return f"{name}@{sources.snapshot(name, revision, weights=False).name}"
+
+        alignment = (None if self.alignment is None else
+                     dataclasses.replace(self.alignment, encoder=pin(self.alignment.encoder)))
+        return dataclasses.replace(self, pretrained=None if self.pretrained is None else pin(self.pretrained),
+                                   alignment=alignment)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
