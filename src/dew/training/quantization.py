@@ -72,9 +72,12 @@ suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
 # The entry methods a run's matmuls travel through, wrapped where the model
 # defines them. `__call__` covers sampling and scoring; the language-model
 # objective trains through `hidden_states` and its prediction depths through
-# `mtp_hidden_states`. Qwix's interception is non-recursive over dynamic
-# extent, so `__call__` reaching `hidden_states` quantizes once.
-METHODS = ("__call__", "hidden_states", "mtp_hidden_states")
+# `mtp_hidden_states`; text generation (`dew.sampling.text`) enters through
+# the rest. Qwix's interception is non-recursive over dynamic extent, so
+# `__call__` reaching `hidden_states` quantizes once.
+METHODS = ("__call__", "hidden_states", "mtp_hidden_states", "states_and_logits", "states_and_logits_at",
+           "init_cache", "init_mtp_cache", "init_draft_cache", "mtp_step", "token_embeddings", "draft",
+           "draft_context")
 
 
 @dataclasses.dataclass(frozen=True)

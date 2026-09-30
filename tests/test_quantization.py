@@ -224,6 +224,29 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
 
 
 @pytest.mark.parametrize("weight_only", [False, True])
+def test_a_served_language_model_generates_with_its_quantized_kernels(weight_only):
+    """Generation enters a language model through methods besides
+    `__call__` (`states_and_logits_at` for the prefill, `states_and_logits`
+    for each step), and they compute with the stored quantized kernels as
+    `__call__` does. Before, they ran outside Qwix's interception and a
+    stored kernel reached a Dense raw (`TypeError: expected number, got
+    WithAux`)."""
+    pytest.importorskip("qwix")
+    from dew.sampling import Sampling, generate
+
+    model = tiny()
+    prompt = token_batch()["text"][:, :4]
+    variables = model.init(jax.random.key(0), prompt)
+    served, served_variables = quantize_for_serving(model, variables, Quantization(weight_only=weight_only), prompt)
+    logits = served.apply(served_variables, prompt)
+    _, stepped = served.apply(served_variables, prompt, method="states_and_logits")
+    np.testing.assert_array_equal(stepped, logits)
+    assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
+    tokens = generate(served, served_variables, prompt, 3, seed=0, sampling=Sampling(temperature=0)).host().tokens
+    assert tokens.shape == (BATCH, 7)
+
+
+@pytest.mark.parametrize("weight_only", [False, True])
 def test_a_served_bf16_module_computes_in_bf16(weight_only):
     """A quantized kernel follows the module's compute dtype as its float
     kernel would: a bf16 Dense stays bf16 through its matmul. Before, the
