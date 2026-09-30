@@ -279,7 +279,7 @@ class Session:
         await self.send({"type": "restarted"})
 
     async def watch(self) -> None:
-        """Close the session at the wall-clock limit, or when it sits idle."""
+        """Close the session at the wall-clock limit, when it sits idle, or when no page comes."""
         while not self.closed.is_set():
             await asyncio.sleep(5)
             now = time.monotonic()
@@ -287,7 +287,8 @@ class Session:
                 await self.close("time")
             elif self.socket is None and now - self.started > CONNECT_SECONDS:
                 await self.close("unused")
-            elif not self.busy and self.queue.empty() and now - self.last_request > IDLE_SECONDS:
+            elif self.connected is not None and not self.busy and self.queue.empty() \
+                    and now - self.last_request > IDLE_SECONDS:
                 await self.close("idle")
 
     async def close(self, reason: str) -> None:

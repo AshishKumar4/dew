@@ -15,14 +15,15 @@ const START_WAIT = { instanceGetTimeoutMS: 90_000, portReadyTimeoutMS: 150_000 }
 
 export class Kernel extends Container<Env> {
 	defaultPort = 8888;
-	// With the page's WebSocket open the container stays up, and server.py applies the
-	// idle limit; this only stops a container whose page has gone.
-	sleepAfter = '2m';
 	enableInternet = false;
 
 	constructor(ctx: DurableObjectState<{}>, env: Env) {
 		super(ctx, env);
 		const limits = limitsOf(env);
+		// With the page's WebSocket open the container stays up, and server.py applies the
+		// idle limit. Without one this stops the container: a page that has gone, or a spare
+		// that no page took in its WARM_SECONDS (server.py exits then too).
+		this.sleepAfter = `${limits.warmSeconds + 120}s`;
 		this.envVars = {
 			DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
 			DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds),

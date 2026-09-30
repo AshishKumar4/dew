@@ -77,7 +77,7 @@ test('a container that starts after its session was swept as unused is not left 
 });
 
 test('a session takes the spare the last one asked for, and every spare counts while it runs', async () => {
-	const { first, early, second, both, twice, later } = await run('spare');
+	const { first, early, second, again, both, twice, later } = await run('spare');
 	const wall = Number(limits.WALL_SECONDS);
 	const warm = Number(limits.WARM_SECONDS);
 	assert.equal(first.warm, false);
@@ -88,6 +88,7 @@ test('a session takes the spare the last one asked for, and every spare counts w
 	assert.equal(second.id, first.spare, 'the second session must take the running spare');
 	assert.equal(second.warm, true);
 	assert.notEqual(second.spare, null, 'taking a spare must ask for the next one');
+	assert.equal(again, true, 'a spare taken by a page is still counted, so its Kernel keeps it');
 	assert.equal(both.active, 4, 'three sessions and the new spare');
 	assert.equal(both.budgetUsedSeconds, 2 * wall + 2 * (wall + warm), 'a spare holds its wait and a full session');
 	assert.equal(twice.reason, 'one-at-a-time', 'the spare now belongs to the second visitor');
