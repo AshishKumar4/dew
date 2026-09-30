@@ -235,7 +235,7 @@ class Flux2Transformer(nn.Module):
         cos, sin = jnp.asarray(cosines, image.dtype), jnp.asarray(sines, image.dtype)
         hidden = int(self.features * self.mlp_ratio)
         block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
-                     "attention_impl": self.attention_impl}
+                 "attention_impl": self.attention_impl}
         for index in range(self.num_layers):
             image, context = Flux2Block(self.features, self.heads, self.head_dim, hidden,
                                         name=f"transformer_blocks_{index}", **block)(

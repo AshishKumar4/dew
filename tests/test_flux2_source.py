@@ -219,8 +219,8 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
     autoencoder = klein.autoencoder
     raw = unfold(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
     for row in range(len(pipeline["prompts"])):
-        assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < 2e-5, row
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5, row
+        assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < FORWARD, row
+        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row
 
 
 def test_a_step_distilled_klein_samples_unguided(source):
