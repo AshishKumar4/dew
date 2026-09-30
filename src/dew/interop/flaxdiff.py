@@ -95,8 +95,9 @@ def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: boo
     The older 2024 aggregate format (`default/checkpoint`) is not supported.
     """
     import orbax.checkpoint as ocp
+    from etils import epath
 
-    path = (Path(directory) / "default").resolve()
+    path = epath.Path((Path(directory) / "default").resolve())
     state = "best_state" if best else "state"
     weights = "ema_params" if ema else "params"
     pytree = ocp.PyTreeCheckpointHandler()
