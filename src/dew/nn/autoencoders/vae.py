@@ -543,15 +543,14 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
             # config exists in a revision that carries no matching weights.
             if params is not None:
                 _check_weights(modelname, candidates, index)
-            else:
-                weights_path = hf_hub_download(modelname, weights,
-                                               revision=candidate_revision, subfolder=subfolder)
+            weights_path = None if params is not None else hf_hub_download(
+                modelname, weights, revision=candidate_revision, subfolder=subfolder)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             errors.append(e)
             continue
         with open(config_path) as handle:
             config = json.load(handle)
-        if params is not None:
+        if weights_path is None:
             return {"config": config, "params": params}
         if weights == FLAX_WEIGHTS:
             with open(weights_path, "rb") as handle:
