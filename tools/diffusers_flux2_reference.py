@@ -15,7 +15,9 @@ is one ulp of the 3500-radian angle a distilled guidance embeds).
 Every parameter is moved off its initialization, so the RMS norms' scales
 are not all ones.
 
-Two tiny `AutoencoderKLFlux2`s, one with the small decoder's narrower
+A tiny Mistral-3 encoder over Mistral Small 3.1's config and chat template
+(FLUX.2 [dev]'s own files are gated) records the prompt states [dev]'s
+pipeline reads. Two tiny `AutoencoderKLFlux2`s, one with the small decoder's narrower
 levels, are walked as the pipeline encodes a reference image and decodes its
 result, the latent folded 2x2 and normalized by the batch norm's statistics.
 
@@ -325,6 +327,63 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
+# FLUX.2 [dev]'s Mistral-3 encoder: a tiny `Mistral3ForConditionalGeneration`
+# over Mistral Small 3.1's config and chat template (the release's own files
+# are gated), one layer deeper than the last the pipeline stacks (10, 20, 30;
+# transformers' last hidden state is after the final norm), and its
+# prompt states as `Flux2Pipeline._get_mistral_3_small_prompt_embeds` reads them.
+MISTRAL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/mistral-small-3.1-source"
+
+
+def mistral_tokenizer():
+    """A byte-level tokenizer carrying Mistral Small 3.1's named special
+    tokens and chat template: every character is one piece."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    metadata = json.loads((MISTRAL / "tokenizer_config.json").read_text())
+    special = [item["content"] for item in metadata["added_tokens_decoder"].values()
+               if not item["content"].startswith("<SPECIAL_")]
+    vocab = {word: index for index, word in enumerate(special)}
+    for word in sorted(pre_tokenizers.ByteLevel.alphabet()):
+        vocab.setdefault(word, len(vocab))
+    model = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    model.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    model.decoder = decoders.ByteLevel()
+    made = PreTrainedTokenizerFast(tokenizer_object=model, bos_token="<s>", eos_token="</s>", pad_token="<pad>",
+                                   unk_token="<unk>", additional_special_tokens=special)
+    made.chat_template = json.loads((MISTRAL / "chat_template.json").read_text())["chat_template"]
+    return made
+
+
+def build_mistral3(root: Path) -> dict[str, np.ndarray]:
+    from diffusers import Flux2Pipeline
+    from transformers import AutoModelForImageTextToText, Mistral3Config
+
+    tok = mistral_tokenizer()
+    config = json.loads((MISTRAL / "config.json").read_text())
+    config.pop("torch_dtype", None)
+    config["text_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=31, num_attention_heads=2,
+                                 num_key_value_heads=1, head_dim=8, vocab_size=len(tok),
+                                 max_position_embeddings=1024)
+    config["vision_config"].update(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
+                                   head_dim=8, image_size=56)
+    config["image_token_index"] = tok.convert_tokens_to_ids("[IMG]")
+    torch.manual_seed(SEED + 10)
+    model = AutoModelForImageTextToText.from_config(Mistral3Config(**config)).eval()
+    generator = torch.Generator().manual_seed(SEED + 11)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    model.save_pretrained(root / "mistral3" / "text_encoder", safe_serialization=True)
+    tok.save_pretrained(root / "mistral3" / "tokenizer")
+    with torch.no_grad():
+        embeds = Flux2Pipeline._get_mistral_3_small_prompt_embeds(model, tok, list(PROMPTS), dtype=torch.float32,
+                                                                  device=torch.device("cpu"))
+    print(f"mistral3: context {tuple(embeds.shape)}")
+    return {"mistral3.context": embeds.numpy()}
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
@@ -350,6 +409,7 @@ def main(destination: str) -> None:
     for name in VAES:
         arrays.update({f"{name}.{key}": value for key, value in build_vae(name, root).items()})
     arrays.update(pipeline_record(root))
+    arrays.update(build_mistral3(root))
     record = {"diffusers": DIFFUSERS, "vae": VAE, "vaes": VAES, "base": BASE,
               "pipeline": {"config": PIPELINE, "vae": PIPELINE_VAE, "prompts": PROMPTS, "height": HEIGHT,
                            "width": WIDTH, "steps": STEPS}, "tokens": TOKENS, "seed": SEED,

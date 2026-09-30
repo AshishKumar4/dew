@@ -1791,16 +1791,22 @@ def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal:
     """Map a hidden-states text encoder's tensors: a Qwen3 language model's
     own names, or a Mistral-3's language model as the Mistral decoder's with
     its vision tower and projector held as stored, which a text prompt never
-    reads and an export writes back."""
+    reads and an export writes back. A Mistral-3 checkpoint names its
+    language model `language_model.model.` and its head
+    `language_model.lm_head` (transformers 4.50 and 5 write these), or
+    `model.language_model.` and `lm_head` (4.52 to 4.57)."""
     decoder = decoders._FAMILIES[family]
 
     def path(name: str) -> tuple[str, ...] | None:
         if not multimodal or name == "lm_head.weight":
             return decoder.weight_path(name, record)
-        if name.startswith("model.language_model."):
-            return decoder.weight_path("model." + name.removeprefix("model.language_model."), record)
-        if name.startswith(("model.vision_tower.", "model.multi_modal_projector.")):
-            return ("visual", name.removeprefix("model."))
+        if name == "language_model.lm_head.weight":
+            return decoder.weight_path("lm_head.weight", record)
+        for prefix in ("model.language_model.", "language_model.model."):
+            if name.startswith(prefix):
+                return decoder.weight_path("model." + name.removeprefix(prefix), record)
+        if name.removeprefix("model.").startswith(("vision_tower.", "multi_modal_projector.")):
+            return ("visual", name)
         raise ValueError(f"unknown tensor name {name!r}")
     return path
 
@@ -1838,8 +1844,11 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         raise TypeError("causal_transformer registry entry must build CausalTransformer")
     if pipeline == "z_image":
         layers = (decoder.num_layers - 1,)
-    if max(layers) > decoder.num_layers:
-        raise ValueError(f"{pipeline} reads hidden state {max(layers)} of a {decoder.num_layers}-layer encoder")
+    if max(layers) >= decoder.num_layers:
+        # transformers' last hidden state is the final norm's output, which
+        # none of these pipelines reads of its released encoder.
+        raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
+                         "encoder does not have before its final norm")
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = diffusion.record_layouts(
