@@ -214,6 +214,117 @@ def published(destination: str) -> None:
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
+# The pipeline half: one tiny FLUX.2 [klein] pipeline over the published
+# configs, shrunk, saved the way the release is saved and walked through its
+# own call. The release is step-distilled; this one is not, so its call
+# guides two branches, the empty prompt the negative.
+SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/flux2-klein-4b-source"
+PIPELINE = {**BASE, "in_channels": 16, "joint_attention_dim": 48, "guidance_embeds": False, "num_layers": 1,
+            "num_single_layers": 1}
+PIPELINE_VAE = {"block_out_channels": [8, 16], "down_block_types": ["DownEncoderBlock2D"] * 2,
+                "up_block_types": ["UpDecoderBlock2D"] * 2, "layers_per_block": 1, "latent_channels": 4,
+                "norm_num_groups": 4}
+PROMPTS = ["a red cat on a mat", "tiny photo"]
+HEIGHT, WIDTH, STEPS = 16, 24, 4
+
+
+def tokenizer():
+    """A byte-level Qwen2 tokenizer carrying the published special tokens and
+    chat template: every character is one piece."""
+    from tokenizers.pre_tokenizers import ByteLevel
+    from transformers import Qwen2Tokenizer
+
+    metadata = json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text())
+    special = [item["content"] for item in metadata["added_tokens_decoder"].values()]
+    vocab = {word: index for index, word in enumerate(sorted(ByteLevel.alphabet()))}
+    for word in special:
+        vocab.setdefault(word, len(vocab))
+    made = Qwen2Tokenizer(vocab=vocab, merges=[], eos_token=metadata["eos_token"], pad_token=metadata["pad_token"],
+                          additional_special_tokens=special)
+    made.chat_template = (SOURCE / "tokenizer" / "chat_template.jinja").read_text()
+    return made
+
+
+def text_encoder(tok):
+    """The published Qwen3 config, narrowed but as deep as the layers the
+    pipeline reads (9, 18, 27); every field it does not name is the
+    release's own."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    config = json.loads((SOURCE / "text_encoder" / "config.json").read_text())
+    config.pop("dtype")
+    config.update(hidden_size=PIPELINE["joint_attention_dim"] // 3, intermediate_size=32, num_hidden_layers=28,
+                  layer_types=["full_attention"] * 28, max_window_layers=28, num_attention_heads=2,
+                  num_key_value_heads=1, head_dim=8, vocab_size=len(tok), max_position_embeddings=1024,
+                  bos_token_id=None, eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+    torch.manual_seed(SEED + 5)
+    model = Qwen3ForCausalLM(Qwen3Config(**config)).eval()
+    generator = torch.Generator().manual_seed(SEED + 6)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    return model
+
+
+def build_pipeline(root: Path):
+    from diffusers import (
+        AutoencoderKLFlux2,
+        FlowMatchEulerDiscreteScheduler,
+        Flux2KleinPipeline,
+        Flux2Transformer2DModel,
+    )
+
+    tok = tokenizer()
+    encoder = text_encoder(tok)
+    torch.manual_seed(SEED + 7)
+    vae = AutoencoderKLFlux2(**PIPELINE_VAE).eval()
+    transformer = Flux2Transformer2DModel(**PIPELINE).eval()
+    generator = torch.Generator().manual_seed(SEED + 8)
+    with torch.no_grad():
+        for module in (vae, transformer):
+            for parameter in module.parameters():
+                parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+        vae.bn.running_mean.copy_(0.3 * torch.randn(vae.bn.running_mean.shape, generator=generator))
+        vae.bn.running_var.copy_(torch.rand(vae.bn.running_var.shape, generator=generator) + 0.2)
+    scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
+    pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
+                              text_encoder=encoder, tokenizer=tok, transformer=transformer, is_distilled=False)
+    directory = root / "pipeline"
+    pipe.save_pretrained(directory, safe_serialization=True)
+    pipe.set_progress_bar_config(disable=True)
+    # The class declares no sample size, so the directory declares the
+    # geometry it is read at.
+    index = json.loads((directory / "model_index.json").read_text())
+    index.update(dew_height=HEIGHT, dew_width=WIDTH)
+    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
+    return pipe
+
+
+def pipeline_record(root: Path) -> dict[str, np.ndarray]:
+    """The prompt states each prompt encodes to, and the unmodified call's
+    walk from fixed latents at `STEPS` steps: the raw VAE latent it ends on
+    and the image it decodes."""
+    pipe = build_pipeline(root)
+    rows, columns = HEIGHT // 4, WIDTH // 4
+    generator = torch.Generator().manual_seed(SEED + 9)
+    latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"], rows, columns), generator=generator)
+    arrays: dict[str, np.ndarray] = {"pipeline.x_T": latents.numpy()}
+    for row, prompt in enumerate([*PROMPTS, ""]):
+        with torch.no_grad():
+            embeds, _ = pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))
+        arrays[f"pipeline.context.{row}"] = embeds.numpy()
+    for row, prompt in enumerate(PROMPTS):
+        with torch.no_grad():
+            walked = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
+                          latents=latents[row:row + 1].clone(), output_type="latent").images
+            images = pipe(prompt=prompt, height=HEIGHT, width=WIDTH, num_inference_steps=STEPS,
+                          latents=latents[row:row + 1].clone(), output_type="np").images
+        arrays[f"pipeline.latents.{row}"] = walked.numpy()
+        arrays[f"pipeline.images.{row}"] = images
+        print(f"pipeline {prompt!r}: latents {tuple(walked.shape)} images {images.shape}")
+    return arrays
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
@@ -238,7 +349,10 @@ def main(destination: str) -> None:
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
     for name in VAES:
         arrays.update({f"{name}.{key}": value for key, value in build_vae(name, root).items()})
-    record = {"diffusers": DIFFUSERS, "vae": VAE, "vaes": VAES, "base": BASE, "tokens": TOKENS, "seed": SEED,
+    arrays.update(pipeline_record(root))
+    record = {"diffusers": DIFFUSERS, "vae": VAE, "vaes": VAES, "base": BASE,
+              "pipeline": {"config": PIPELINE, "vae": PIPELINE_VAE, "prompts": PROMPTS, "height": HEIGHT,
+                           "width": WIDTH, "steps": STEPS}, "tokens": TOKENS, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
                                "guidance": list(case.guidance)} for name, case in CASES.items()}}
     np.savez_compressed(root / "flux2_transformer.npz", **arrays)

@@ -27,7 +27,7 @@ import pytest
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
-from dew.nn.autoencoders.flux2 import load_flux2_vae
+from dew.nn.autoencoders.flux2 import load_flux2_vae, unfold
 from dew.nn.backbones.flux2 import Flux2Transformer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,3 +179,66 @@ def test_the_published_autoencoder_matches_the_source():
     bounds = {key: max(FORWARD, 2 * float(reference[f"vae.{key}.float32_gap"])) for key in gaps}
     print(f"published VAE gaps {gaps}, bounds {bounds}")
     assert all(gaps[key] < bounds[key] for key in gaps), (gaps, bounds)
+
+
+@pytest.fixture(scope="module")
+def klein(source):
+    from dew.interop.pretrained import load_pretrained
+
+    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+
+
+def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record):
+    """The conditioner stacks what `encode_prompt` stacks: the chat template
+    with thinking off, every row padded on the right to 512 tokens, and the
+    outputs of layers 9, 18 and 27 side by side, pads included."""
+    encoder = klein.inputs.conditions["conditioning"].encoder
+    params = klein.variables["encoders"]["conditioning"]
+    prompts = [*record["pipeline"]["prompts"], ""]
+    condition = encoder.encode(params, encoder.tokenize(prompts))
+    assert condition.context.shape == (3, 512, record["pipeline"]["config"]["joint_attention_dim"])
+    assert condition.mask is None and condition.guidance is None
+    for row in range(len(prompts)):
+        assert relative_gap(condition.context[row], arrays[f"pipeline.context.{row}"][0]) < FORWARD, row
+    with pytest.raises(ValueError, match="token budget"):
+        encoder.tokenize(["x" * 513])
+
+
+def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
+    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    its defaults (50 steps, two branches guided at 4.0 against the empty
+    prompt), and at the recorded step count the sigmas it lays out shifted
+    by its empirical mu, the latent it ends on and the image it decodes."""
+    pipeline = record["pipeline"]
+    task = klein.text_to_image()
+    assert task.steps == 50 and task.guidance is not None and task.guidance.scale == 4.0
+    initial = arrays["pipeline.x_T"].transpose(0, 2, 3, 1)
+    walked = task(task.prepare(pipeline["prompts"], initial=initial, seed=0, steps=pipeline["steps"]),
+                  key=jax.random.PRNGKey(0)).host()
+    images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    autoencoder = klein.autoencoder
+    raw = unfold(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
+    for row in range(len(pipeline["prompts"])):
+        assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < 2e-5, row
+        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5, row
+
+
+def test_a_step_distilled_klein_samples_unguided(source):
+    """The published [klein] marks itself step-distilled, and its call then
+    ignores its guidance scale."""
+    from dew.interop.pretrained import _call_policy, _denoiser
+
+    denoiser = _denoiser(source / "pipeline", dtype="float32", attention_impl="xla")
+    index = json.loads((source / "pipeline" / "model_index.json").read_text())
+    assert _call_policy(index, denoiser).guided
+    assert not _call_policy({**index, "is_distilled": True}, denoiser).guided
+
+
+def test_the_empirical_shift_is_the_pipelines():
+    from dew.diffusion.schedules.source import empirical_mu
+
+    # compute_empirical_mu at diffusers 0.40.0, evaluated by hand: the 10- and
+    # 200-step lines at 1024 tokens, and the 200-step line past 4300.
+    assert empirical_mu(1024, 200) == pytest.approx(0.00016927 * 1024 + 0.45666666)
+    assert empirical_mu(1024, 10) == pytest.approx(8.73809524e-05 * 1024 + 1.89833333)
+    assert empirical_mu(5000, 4) == pytest.approx(0.00016927 * 5000 + 0.45666666)
