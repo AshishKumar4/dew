@@ -34,6 +34,14 @@ from dew.sampling.solvers import Euler
 
 from .objective import DiffusionObjective
 
+
+def _own_loss(name: str, kwargs: dict) -> None:
+    """Refuse the denoising loss's extras, which an objective with its own
+    loss would leave unused."""
+    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+    if unused:
+        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+
 Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
 
@@ -116,6 +124,7 @@ class MeanFlowObjective(DiffusionObjective):
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("MeanFlow trains an interval model of velocity on the unshifted linear "
                              "path; build the process with presets.MeanFlow")
+        _own_loss("MeanFlow", kwargs)
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("sampler", Euler())
         kwargs.setdefault("steps", 2)
@@ -193,6 +202,7 @@ class ShortcutObjective(DiffusionObjective):
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("a shortcut model is an interval model of velocity on the unshifted "
                              "linear path; build the process with presets.Shortcut")
+        _own_loss("a shortcut model", kwargs)
         if sections < 2 or sections & (sections - 1):
             raise ValueError(f"sections is a power of two, not {sections}")
         kwargs.setdefault("guidance", None)

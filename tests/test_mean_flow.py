@@ -143,3 +143,10 @@ def test_a_meanflow_run_samples_unguided():
 
     with pytest.raises(ValueError, match="set guidance None"):
         DiffusionRunConfig(preset=presets.MeanFlow(), mean_flow=MeanFlowTraining())
+
+
+@pytest.mark.parametrize("extra", [{"uncertainty": 8}])
+def test_meanflow_refuses_the_denoising_losss_extras(extra):
+    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
+    with pytest.raises(ValueError, match="own loss"):
+        MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))), **extra)
