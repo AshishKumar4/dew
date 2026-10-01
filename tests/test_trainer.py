@@ -1401,7 +1401,7 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
                      if not flag.startswith("--xla_gpu_deterministic_ops"))
     # BFC fragmentation failed the 4096-token reference child's 6.5 GiB temporary in 5 of 16 lone
-    # runs (its compiled peak is 9.3 GiB of the 13.6 GiB pool); cuda_async: 0 of 16, p50 unchanged.
+    # runs (its compiled peak is 9.3 GiB of the 13.6 GiB pool); cuda_async: 0 of 24, p50 94.3 -> 94.0 ms.
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
                    "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
