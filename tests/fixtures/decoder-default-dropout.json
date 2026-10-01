@@ -5,6 +5,7 @@
   "platforms": [
     "cpu"
   ],
+  "flatbuffers_version": "25.12.19",
   "calling_convention_version": 10,
   "computation": "forward logits and parameter gradient of their sum, with weights and token IDs as arguments",
   "export_sha256": "112203dd8c1960bad8a9b147968059681cba5301bddaa141c7a94bc17d7107a1",
