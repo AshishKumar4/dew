@@ -354,7 +354,8 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)

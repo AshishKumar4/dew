@@ -485,7 +485,7 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         trained("the ", key=2, sampling=Sampling(temperature=0, eos_id=255)).host().tokens,
         result.host().tokens)
     with pytest.raises(TypeError, match="seed"):
-        task("the ", key=2)
+        task("the ", seed=2)
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
