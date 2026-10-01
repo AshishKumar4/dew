@@ -146,6 +146,12 @@ Source clipping and dynamic thresholding live in `SourceLimitedPrediction`. They
 
 Guidance is applied to the model's raw outputs, and the process converts the guided output once, as published pipelines order it, so a nonlinear conversion never sees the two branches separately. For one model to answer both questions, train it with some conditions blanked: `DiffusionObjective(unconditional_prob=...)` replaces the condition with its empty value on that fraction of rows, 12% by default.
 
+Three other rules take the same place as `CFG` in `sample` and `TextToImage`:
+
+- `APG(scale, eta=1.0, norm_threshold=15.0, momentum=0.0)` is adaptive projected guidance (Sadat et al., 2025). The direction `cond - uncond` is averaged over the walk with `momentum`, its norm is clipped at `norm_threshold`, and its component parallel to the conditional output is scaled by `eta`. With `eta=1`, no clipping and no momentum it is `CFG`. Without an interval it matches Diffusers' `AdaptiveProjectedGuidance` over a whole walk. With one, the two differ where the interval ends: Diffusers counts steps `[int(start * N), int(stop * N))`, while `interval` is closed in progress. Where guidance is off, the momentum average stays as it was, as in Diffusers.
+- `CFGPlusPlus(scale)` is CFG++ (Chung et al., 2025), with `scale` in [0, 1]. The clean prediction is guided and the noise a step renoises with is the unconditional one. Only solvers that step from the `(x_0, epsilon)` pair, such as `DDIM`, take its trajectory.
+- `Autoguidance(scale, model)` guides with a weaker model of the same task, read under the same condition (Karras et al., 2024): `guide + scale * (model - guide)`. The guide's variables sit under `guide` in the denoiser's variables. It matches NVlabs/edm2's `edm_sampler(gnet=...)`.
+
 ## Text to image
 
 `TextToImage` in `dew.inference` combines the text encoder, the denoising loop and, for latent models, the decoder. `objective.pipeline(state)` builds one from a trained objective, and `TextToImage.from_run(directory)` rebuilds one from a saved run.
