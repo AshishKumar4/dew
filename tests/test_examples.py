@@ -80,7 +80,7 @@ def test_landing_snippet_runs(section, tmp_path):
 
 
 def test_recorded_hero_runs_offline(tmp_path):
-    """The exact recorded script, with its step override, over local byte fixtures."""
+    """Smoke the exact script with a step override and offline data, not its recorded output."""
     script = tmp_path / "hero.py"
     shutil.copyfile(REPO_ROOT / "site/src/data/hero.py", script)
     corpus = tmp_path / "tokens"
