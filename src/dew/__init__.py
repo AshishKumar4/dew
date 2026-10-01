@@ -22,6 +22,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
+    from dew.eval import Mean
     from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
     from dew.objectives import Objective
@@ -69,6 +70,7 @@ _EXPORTS = {
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
+    "Mean": "dew.eval",
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
     "pipeline": "dew.inference",
@@ -110,6 +112,7 @@ __all__ = [
     "Layout",
     "LocalTracker",
     "MLflowTracker",
+    "Mean",
     "MeshSpec",
     "Objective",
     "Process",

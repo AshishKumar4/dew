@@ -44,6 +44,33 @@ INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "
                   / "inception_v3_fid.safetensors")
 
 
+def test_mean_metric_counts_uneven_batches_and_weighted_totals():
+    from dew.eval import Mean
+
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher")
+    first = metric(None, {"values": np.asarray([1., 3.])})
+    last = metric(None, {"values": np.asarray([8.])})
+    assert metric.finalize(metric.merge(first, last)) == 4.
+    assert metric.shown.better == "higher" and metric.reads is ImageGrid
+    weighted = Mean(lambda artifact, batch: batch["totals"], name="weighted", better="lower")
+    assert weighted.finalize(weighted.merge(weighted(None, {"totals": (12., 3.)}),
+                                             weighted(None, {"totals": (8., 1.)}))) == 5.
+    with pytest.raises(ValueError, match="count"):
+        weighted.finalize((0., 0.))
+    with pytest.raises(ValueError, match="per-example"):
+        metric(None, {"values": np.asarray(4.)})
+
+
+def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
+    from dew import Mean
+
+    with pytest.raises(TypeError, match="better"):
+        Mean(lambda artifact, batch: batch["values"], name="accuracy")
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher")
+    assert metric.finalize(metric(None, {"values": [1., 3.]})) == 2.
+    assert metric.finalize(metric(None, {"values": [10.]})) == 10.
+
+
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
     features = np.asarray(jax.random.normal(rng, (256, 16)))
     mu, sigma = features.mean(axis=0), np.cov(features, rowvar=False)
