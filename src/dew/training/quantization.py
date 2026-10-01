@@ -253,10 +253,13 @@ def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
     convolution; importing Qwix here keeps it optional.
 
-    The serving provider also passes complex matmuls through unquantized,
-    as the training provider does (`numerics.should_quantize`); Qwix 0.1.8's
-    PTQ raises on them instead, and the hybrid DiT's S5 scan multiplies
-    complex states. It casts a quantized kernel's scales to the dtype a
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it.
+
+    The serving provider casts a quantized kernel's scales to the dtype a
     module promotes its kernel to, where Qwix 0.1.8 passes the kernel
     through: a bf16 module then multiplied bf16 activations by fp32
     dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
@@ -325,15 +328,8 @@ def _providers() -> tuple[type, type]:
             batch, feature = numbers.out_spec[:2]
             return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
 
-    class QtProvider(GroupScaledConvolution, qwix.QtProvider):
-        pass
-
-    class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
-        def __init__(self, rules: Sequence[object]) -> None:
-            super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
-                _einsum_fn=_scaled_in_float32(einsum.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+    class ComplexInFloat(qwix.QuantizationProvider):
+        """Passes a matmul with a complex operand through unquantized."""
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
@@ -348,6 +344,16 @@ def _providers() -> tuple[type, type]:
             if _real(*(operand.dtype for operand in operands)):
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
+
+    class QtProvider(GroupScaledConvolution, ComplexInFloat, qwix.QtProvider):
+        pass
+
+    class PtqProvider(GroupScaledConvolution, ComplexInFloat, qwix.PtqProvider):
+        def __init__(self, rules: Sequence[object]) -> None:
+            super().__init__(
+                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
+                _einsum_fn=_scaled_in_float32(einsum.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
             # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8

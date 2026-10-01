@@ -372,6 +372,44 @@ def test_a_bf16_int8_depthwise_convolution_scales_its_int32_products_in_float32(
     assert module.apply(module_variables, x).dtype == jnp.bfloat16
 
 
+def test_quantized_training_differentiates_through_complex_matmuls_in_float():
+    """Quantized training leaves a matmul with a complex operand, like the
+    S5 scan's in the hybrid DiT, in float, and differentiates through it:
+    values and gradients are those of Qwix's own quantized training applied
+    to the real Dense alone. Observed on CPU: bitwise equal, 2.1e-02 from fp32
+    in the kernel's gradient. Before, Qwix quantized the real operand of a
+    real-by-complex matmul, its backward returned a complex gradient for
+    that real operand, and `jax.grad` failed on it."""
+    qwix = pytest.importorskip("qwix")
+    from flax import linen as nn
+
+    class Rotated(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            # A real activation times a complex matrix, as the S5 scan's
+            # input projection is, then two complex operands.
+            rotation = jnp.exp(1j * jnp.arange(64.0).reshape(8, 8))
+            mixed = jnp.einsum("bf,fg->bg", nn.Dense(8, name="proj")(x), rotation)
+            return jnp.real(jax.lax.dot_general(mixed, rotation, (((1,), (0,)), ((), ()))))
+
+    model = Rotated()
+    x = jax.random.normal(jax.random.key(0), (4, 16))
+    variables = model.init(jax.random.key(1), x)
+    reference = qwix.quantize_model(model, qwix.QtProvider(
+        [qwix.QtRule(module_path="proj", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+
+    def value_and_gradients(module):
+        return jax.jit(jax.value_and_grad(lambda v, x: jnp.sum(module.apply(v, x) ** 2), argnums=(0, 1)))(
+            variables, x)
+
+    got = value_and_gradients(apply_quantization(model, Quantization()))
+    want = value_and_gradients(reference)
+    jax.tree.map(np.testing.assert_array_equal, got, want)
+    _, (kernel_gradient, _) = value_and_gradients(model)
+    error = jnp.linalg.norm(got[1][0]["params"]["proj"]["kernel"] - kernel_gradient["params"]["proj"]["kernel"])
+    assert 0.0 < float(error / jnp.linalg.norm(kernel_gradient["params"]["proj"]["kernel"])) < 0.05
+
+
 def test_serving_leaves_complex_matmuls_in_float():
     """Qwix quantizes real values only; a complex matmul, like the S5 scan's
     in the hybrid DiT, runs unquantized beside the quantized Dense, within
