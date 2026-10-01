@@ -4,7 +4,10 @@
 // container before any page connects (see coordinator.ts).
 //
 // The container application uses the durable_object scheduling policy, so this
-// object starts its container itself, through ctx.container.
+// object starts its container itself, through ctx.container. Such containers sit
+// out image rollouts: a deploy leaves a running one on its old image. So each
+// records the image it started from, and only a container on the current
+// deploy's image serves a page (see also Coordinator.open).
 
 import { DurableObject } from 'cloudflare:workers';
 import { coordinatorOf } from './coordinator';
@@ -39,6 +42,11 @@ export class LiveKernel extends DurableObject<Env> {
 		return this.ctx.container;
 	}
 
+	/** The kernel image this deploy starts, which the Worker hands to Coordinator.open. */
+	image(): string {
+		return this.container.images.kernel;
+	}
+
 	/** Start the container of spare session `session`, which waits WARM_SECONDS for its page. */
 	async warm(session: string): Promise<void> {
 		await this.ctx.storage.put('session', session);
@@ -68,10 +76,12 @@ export class LiveKernel extends DurableObject<Env> {
 	 */
 	private async ensureRunning(session: string, env: Record<string, string>): Promise<void> {
 		const container = this.container;
+		const image = container.images.kernel;
+		if (container.running && (await this.ctx.storage.get<string>('image')) !== image) await container.destroy();
 		if (!container.running) {
 			const limits = limitsOf(this.env);
 			container.start({
-				image: container.images.kernel,
+				image,
 				// 4 vCPUs and 12 GiB: the landing page's 176M text-to-image model samples on the CPU.
 				instance: 'standard-4',
 				enableInternet: false,
@@ -79,13 +89,14 @@ export class LiveKernel extends DurableObject<Env> {
 					DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
 					DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds),
 					DEW_LIVE_CPU_SECONDS: String(limits.cpuSeconds),
+					DEW_LIVE_IMAGE: image,
 					...env,
 				},
 			});
 			await container.setInactivityTimeout(this.lifetimeMs());
-			await this.ctx.storage.put('started', Date.now());
+			await this.ctx.storage.put({ started: Date.now(), image });
 			await this.ctx.storage.setAlarm(Date.now() + WATCH_MS);
-			if (!(await coordinatorOf(this.env).started(session, Date.now()))) {
+			if (!(await coordinatorOf(this.env).started(session, Date.now(), image))) {
 				await this.expire();
 				throw new Error('this session is over');
 			}
