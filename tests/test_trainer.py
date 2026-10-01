@@ -30,6 +30,7 @@ from rich.console import Console
 
 from dew import position
 from dew.artifacts import Representations
+from dew.checkpoints import STATE_LEAVES
 from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
@@ -39,6 +40,7 @@ from dew.training import (
     MeshSpec,
     ProfileWindow,
     Trainer,
+    TrainState,
     display,
     ema_update,
     trainer as trainer_module,
@@ -386,6 +388,107 @@ def raw_leaf(leaf):
         leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
+def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
+    from dew.data import Loading, TokenWindows
+    from dew.data.dataset import Forwarding
+
+    tokens = np.arange(29, dtype=np.uint16)
+    tokens.tofile(tmp_path / "train.bin")
+    tokens.tofile(tmp_path / "val.bin")
+
+    class WindowsRegression(Regression):
+        def loss(self, params, batch, step):
+            x = batch["text"][:, :FEATURES].astype(jnp.float32) / 32
+            return super().loss(params, {"x": x, "y": 2 * x[:, :2]}, step)
+
+    class Observed(Forwarding):
+        def __init__(self, source, seen):
+            self._source, self.seen = source, seen
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            batch = next(self._source)
+            self.seen.append(batch["text"].copy())
+            return batch
+
+        def get_state(self):
+            return self._source.get_state()
+
+        def set_state(self, state):
+            self._source.set_state(state)
+
+    def dataset(seen):
+        data = TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
+                            loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
+        return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
+
+    def trainer(directory):
+        return make_trainer(directory, objective=WindowsRegression(), optimizer=optax.adam(1e-3))
+
+    whole_seen, prefix_seen, resumed_seen = [], [], []
+    whole = trainer(tmp_path / "whole").fit(dataset(whole_seen), steps=4, checkpoint_every=1)
+    prefix = trainer(tmp_path / "split").fit(dataset(prefix_seen), steps=2, checkpoint_every=1)
+    fresh = trainer(tmp_path / "split")
+    restored, _, place = fresh.place()
+    assert position.read(place).records == 2 * BATCH
+    assert jax.tree.structure(restored) == jax.tree.structure(prefix)
+    for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
+        actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+    resumed = fresh.fit(dataset(resumed_seen), steps=4, checkpoint_every=1)
+    assert resumed_seen[0].tobytes() == whole_seen[2].tobytes(), "the first batch after resume"
+    assert jax.tree.structure(resumed) == jax.tree.structure(whole)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(whole), strict=True):
+        actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+    _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
+    _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
+    assert resumed_place == whole_place
+    assert position.read(resumed_place).records == 4 * BATCH
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
+def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
+    """Repeated token IDs share embedding-gradient updates. CUDA's default
+    scatter-add order is not repeatable; conftest enables deterministic ops
+    before the backend opens. Check every state leaf, not just parameters."""
+    from dew.data import Loading, TokenWindows
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    tokens = np.tile(np.arange(8, dtype=np.uint8), 256)
+    tokens.tofile(tmp_path / "train.bin")
+    tokens[:128].tofile(tmp_path / "val.bin")
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
+        "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
+    }))
+    data = TokenWindows(path=str(tmp_path), seq_len=16,
+                        loading=Loading(workers=0)).load(batch=8)
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                              num_heads=2, mlp_features=32, max_seq_len=32)
+    objective = LMObjective(model, seq_len=16, ema_decay=None)
+
+    def trainer(checkpoints=None):
+        return Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
+                       checkpoints=checkpoints)
+
+    baseline = trainer().fit(data, steps=3)
+    repeated = trainer().fit(data, steps=3)
+    split = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    prefix = split.fit(data, steps=2, checkpoint_every=1)
+    restarted = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    restored, _, position = restarted.place()
+    assert position is not None
+    resumed = restarted.fit(data, steps=3, checkpoint_every=1)
+    for actual, expected in ((restored, prefix), (repeated, baseline), (resumed, baseline)):
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
 def test_the_state_is_built_from_the_initializer_and_the_key_alone():
     """What `place` compiles takes the objective's held variables and the run
     key as arguments, so a loaded checkpoint reaches the device as data.
@@ -509,6 +612,129 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
     assert jnp.array_equal(jax.random.key_data(trained.key), jax.random.key_data(state.key))
     assert json.loads(position)["index"] == 3
+
+
+def held_state(params, ema):
+    """A train state that holds `params` and `ema` and scalars beside them."""
+    count = jnp.zeros((), jnp.int32)
+    return TrainState(step=count, microstep=count, updates=count, params=params,
+                      opt_state={"count": count}, ema=ema,
+                      key=jax.random.key_data(jax.random.key(0)), scale=None,
+                      window_size=jnp.ones((), jnp.int32), accumulation=None)
+
+
+def bit_patterns(shape, dtype, seed):
+    """Values drawn bit by bit, so NaN payloads and subnormals turn up, with
+    both zeros, a NaN of every payload bit set and the smallest subnormal first."""
+    kind = np.dtype(f"u{np.dtype(dtype).itemsize}")
+    bits = np.random.default_rng(seed).integers(0, np.iinfo(kind).max, size=shape,
+                                                dtype=kind, endpoint=True)
+    bits.flat[:4] = [1 << (8 * kind.itemsize - 1), 0, np.iinfo(kind).max, 1]
+    return bits.view(dtype)
+
+
+def same_bits(expected, actual):
+    expected, actual = np.asarray(expected), np.asarray(actual)
+    return (expected.dtype == actual.dtype and expected.shape == actual.shape
+            and np.array_equal(expected.view(np.uint8), actual.view(np.uint8)))
+
+
+def awkward_state():
+    """Weights in fp32 and bf16, and an EMA of each dtype, one of them
+    narrower than the weight it follows."""
+    params = {"params": {"kernel": bit_patterns((16, 8), np.float32, 0),
+                         "scale": bit_patterns((8,), jnp.bfloat16, 1),
+                         "bias": bit_patterns((8,), np.float32, 2)}}
+    ema = {"params": {"kernel": bit_patterns((16, 8), np.float32, 3),
+                      "scale": bit_patterns((8,), jnp.bfloat16, 4),
+                      "bias": bit_patterns((8,), jnp.bfloat16, 5)}}
+    return held_state(jax.tree.map(jnp.asarray, params), jax.tree.map(jnp.asarray, ema))
+
+
+def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
+    """Every NaN payload, signed zero and subnormal of the EMA survives a save,
+    read whole, typed, without the weights beside it, into pinned host memory
+    and as the shapes the checkpoint reports."""
+    state = awkward_state()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+
+    def typed(tree, memory_kind="device"):
+        where = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind=memory_kind)
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where),
+                            tree)
+
+    whole, _ = checkpoints.restore()
+    ema_alone, _ = checkpoints.restore({"ema": typed(state.ema)})
+    pinned, _ = checkpoints.restore({"params": typed(state.params),
+                                     "ema": typed(state.ema, "pinned_host")})
+    resumed, _ = checkpoints.restore(held_state(typed(state.params), typed(state.ema)))
+    for restored in (whole["ema"], ema_alone["ema"], pinned["ema"], resumed.ema):
+        assert jax.tree.all(jax.tree.map(same_bits, state.ema, restored))
+    assert jax.tree.all(jax.tree.map(same_bits, state.params, resumed.params))
+    assert all(leaf.sharding.memory_kind == "pinned_host" for leaf in jax.tree.leaves(pinned["ema"]))
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), checkpoints.stored()["ema"]) == \
+        jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), state.ema)
+
+
+def test_an_ema_held_in_lists_comes_back_bit_for_bit(tmp_path):
+    """Variables may nest sequences; the EMA's leaves inside them are found by
+    their key paths, read whole, alone, and beside weights asked for in
+    another dtype, which sends the weights they undo to a read of their own."""
+    kernels = [bit_patterns((4, 3), np.float32, seed) for seed in (0, 1)]
+    params = {"params": {"layers": [{"w": jnp.asarray(kernel)} for kernel in kernels]}}
+    ema = {"params": {"layers": [{"w": jnp.asarray(bit_patterns((4, 3), np.float32, seed))}
+                                 for seed in (2, 3)]}}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, held_state(params, ema), None)
+    checkpoints.wait()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def typed(tree, dtype=None):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, dtype or leaf.dtype,
+                                                              sharding=where), tree)
+
+    whole, _ = checkpoints.restore()
+    alone, _ = checkpoints.restore({"ema": typed(ema)})
+    beside, _ = checkpoints.restore({"params": typed(params, jnp.bfloat16), "ema": typed(ema)})
+    for restored in (whole["ema"], alone["ema"], beside["ema"]):
+        assert jax.tree.all(jax.tree.map(same_bits, ema, restored))
+
+
+def test_an_ema_that_follows_its_weights_is_stored_in_fewer_bytes(tmp_path):
+    """An average agrees with the weights it follows in its leading bits, and
+    the checkpoint stores it in fewer bytes than an EMA that does not."""
+    rng = np.random.default_rng(0)
+    kernel = rng.normal(size=(512, 512)).astype(np.float32)
+    near = kernel * (1 + 1e-4 * rng.normal(size=kernel.shape)).astype(np.float32)
+    far = rng.normal(size=kernel.shape).astype(np.float32)
+
+    def stored_bytes(ema, name):
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(0, held_state({"params": {"kernel": jnp.asarray(kernel)}},
+                                       {"params": {"kernel": jnp.asarray(ema)}}), None)
+        checkpoints.wait()
+        return sum(path.stat().st_size for path in (tmp_path / name).rglob("*") if path.is_file())
+
+    assert stored_bytes(near, "near") < stored_bytes(far, "far") - 0.3 * kernel.nbytes
+
+
+def test_a_checkpoint_that_stores_the_ema_as_itself_still_restores(tmp_path):
+    """Checkpoints written before the EMA was stored as its difference from
+    the weights hold it as plain arrays, and read back as they were written."""
+    state = awkward_state()
+    written = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
+    written.save(0, args=ocp.args.PyTreeSave({name: getattr(state, name) for name in STATE_LEAVES}))
+    written.wait_until_finished()
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                              sharding=leaf.sharding), state.ema)
+    for restored in (checkpoints.restore()[0]["ema"], checkpoints.restore({"ema": template})[0]["ema"]):
+        assert jax.tree.all(jax.tree.map(same_bits, state.ema, restored))
 
 
 class AffineWithOffset(nn.Module):
@@ -834,15 +1060,41 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     narrow for the sparklines still shows each metric's name and value,
     through the evaluations, to the last frame."""
     screen = io.StringIO()
+    evaluation_budgets = []
+    render_metrics = display.TrainingDisplay.metrics
+
+    def metrics(panel, rows, inner, lines, *, evaluation=False):
+        if evaluation:
+            evaluation_budgets.append(lines)
+        return render_metrics(panel, rows, inner, lines, evaluation=evaluation)
+
+    monkeypatch.setattr(display.TrainingDisplay, "metrics", metrics)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
     make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
                                            metrics=(Spread([]),))
 
-    last = screen.getvalue().rpartition("dew · ")[2]
+    output = screen.getvalue()
+    assert "eval val at step" not in output
+    assert evaluation_budgets and max(evaluation_budgets) < 40
+    last = output.rpartition("dew · ")[2]
     for name in ("loss", "step_time_ms", "spread"):
         assert re.search(rf" {name} +\S", last), last
+    assert "val" in last and "step 6" in last, last
+    summary = output.rpartition("✓ ")[2]
+    assert "val at 6" in summary and "spread" in summary, summary
+    if width == 120:
+        assert re.search(r"spread +\S+ +[▁▂▃▄▅▆▇█]{2}", last), last
+        assert re.search(r"[▁▂▃▄▅▆▇█]{2}", summary), summary
+
+
+def test_off_a_terminal_evaluation_keeps_its_plain_line(capsys):
+    trainer = make_trainer(objective=Features())
+    trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
+    output = capsys.readouterr().out
+    assert re.search(r"eval val at step 3: spread \S+ \(24 records in \S+ s\)", output), output
+    assert re.search(r"eval val at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
 
 
 def test_a_failing_metric_fails_the_validation_pass():
@@ -1296,6 +1548,27 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
+def test_a_step_planned_within_the_fit_reserve_does_not_fit():
+    """A step XLA plans inside the allocator's limit, with less than
+    FIT_RESERVE of it to spare, does not count as fitting: on an RTX 4080 such
+    a step failed to place its largest temporary in 1 to 2 of 16 runs, so the
+    ladder takes the next rung instead. One with the reserve to spare fits."""
+    from types import SimpleNamespace
+
+    from dew.training.trainer import FIT_RESERVE, step_headroom
+
+    limit, resident = 16 * 2**30, 2**30
+
+    def planned(temporaries):
+        return SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
+            output_size_in_bytes=0, alias_size_in_bytes=0, temp_size_in_bytes=temporaries))
+
+    device = SimpleNamespace(memory_stats=lambda: {"bytes_limit": limit, "bytes_in_use": resident})
+    spare = int(limit * FIT_RESERVE)
+    assert step_headroom(planned(limit - resident - spare // 2), [device]) < 0
+    assert step_headroom(planned(limit - resident - 2 * spare), [device]) > 0
+
+
 def test_accumulation_must_be_positive():
     with pytest.raises(ValueError, match="accumulation"):
         make_trainer(accumulation=0)
@@ -1304,11 +1577,13 @@ def test_accumulation_must_be_positive():
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384])
 def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
     """Compare real Trainer steps with the measured recipe: unfused whole
-    logits at 4096 tokens, fused whole logits at 8192, and a 4096-row tile
-    at 16384. Fresh processes keep conftest's deterministic XLA flags out
-    of the measurement; those flags change which whole-logits step fits.
-    The ABBA order and warmed step medians allow 4% noise, below the old
-    8%, 18%, and 3x regressions. Children need room for a preallocated pool.
+    logits at 4096 tokens, and a 4096-row tile at 8192 and 16384. At 8192
+    the fused whole logits plan 13.1 GiB of the 13.6 GiB pool, within the
+    fit check's reserve (`FIT_RESERVE`), so the step has to say it tiles.
+    Fresh processes keep conftest's deterministic XLA flags out of the
+    measurement; those flags change which whole-logits step fits. The ABBA
+    order and warmed step medians allow 4% noise, below the old 8%, 18%,
+    and 3x regressions. Children need room for a preallocated pool.
     """
     devices = jax.devices()
     if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
@@ -1334,14 +1609,16 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
         "seq_len": 1024}
     flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
                      if not flag.startswith("--xla_gpu_deterministic_ops"))
+    # BFC fragmentation failed the 4096-token reference child's 6.5 GiB temporary in 5 of 16 lone
+    # runs (its compiled peak is 9.3 GiB of the 13.6 GiB pool); cuda_async: 0 of 24, p50 94.3 -> 94.0 ms.
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
                    "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
-                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true", "XLA_PYTHON_CLIENT_ALLOCATOR": "cuda_async"}
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
-        objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
-        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        objective = {"head_tile": [4096, 8192] if tokens >= 8192 else "whole"} if reference else {}
+        options = " --xla_gpu_enable_triton_gemm=false" if reference and tokens == 4096 else ""
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",
@@ -1349,6 +1626,8 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
              "--json-out", str(record)], cwd=root,
             env={**environment, "XLA_FLAGS": flags + options}, capture_output=True, text=True, timeout=180)
         assert done.returncode == 0, done.stdout + done.stderr
+        if not reference:
+            assert ("with the whole logits kept" in done.stderr) == (tokens >= 8192), done.stderr
         row, = json.loads(record.read_text())
         assert row["finite"], row
         samples[int(reference)].append(row["p50_ms"])

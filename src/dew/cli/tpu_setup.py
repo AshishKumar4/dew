@@ -4,9 +4,8 @@ The setup script is rendered from the Python version, the extras and the
 source mode. Every step is guarded, so a second run re-creates nothing, but
 the `uv pip install` lines resolve against PyPI each time. A checkout is
 installed alone with its `tpu` extra, the libtpu for the jax the checkout
-pins, since a jax[tpu] from PyPI beside the pin can't be resolved with it. A
-release installs after jax[tpu], so a jax[tpu] or dewml release since the
-last run is installed; `setup --version` pins the dewml side.
+requires. A release installs after jax[tpu], so a jax[tpu] or dewml release
+since the last run is installed; `setup --version` pins the dewml side.
 """
 
 from __future__ import annotations

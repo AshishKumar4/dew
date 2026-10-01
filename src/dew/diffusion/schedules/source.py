@@ -20,7 +20,9 @@ The five families are the shapes those `set_timesteps` take:
   point.
 - `lambda`: DPM-Solver multistep and singlestep, DEIS and UniPC integrate in
   log-SNR over paired sigma and model-time tables, normalized so that
-  alpha^2 + sigma^2 is 1, and truncate their model times to integers.
+  alpha^2 + sigma^2 is 1, and truncate their model times to integers. Under
+  `use_flow_sigmas` DPM-Solver multistep and UniPC walk the shifted
+  rectified-flow path instead, alpha + sigma = 1, reading velocity.
 - `sigma`: LMS, Euler, Euler ancestral and Heun integrate the
   variance-exploding sigma directly and scale the model input by
   1 / sqrt(sigma^2 + 1).
@@ -301,10 +303,14 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
 # reconstruct. Each maps to the only value that leaves the source's own
 # behaviour unchanged, so an active one is refused instead of dropped.
 _UNIMPLEMENTED: Mapping[str, object] = MappingProxyType({
-    "use_lu_lambdas": False, "use_flow_sigmas": False, "solver_p": None,
+    "use_lu_lambdas": False, "solver_p": None,
     "invert_sigmas": False, "stochastic_sampling": False,
     "interpolation_type": "linear", "timestep_type": "discrete",
 })
+
+# The log-SNR classes whose `use_flow_sigmas` walk is reconstructed: the ones
+# the published flow pipelines ship (SANA's DPM-Solver++, Wan's UniPC).
+_FLOW_SIGMA_CLASSES = ("DPMSolverMultistep", "UniPCMultistep")
 
 # The classes that round a Karras grid's recovered model times before
 # truncating them. The rest keep the log-linear inverse as it comes, and no
@@ -414,6 +420,9 @@ class _Policy:
     original_steps: int
     timestep_scaling: float
     flow: _Flow | None
+    flow_shift: float | None
+    """A log-SNR class's `flow_shift` under `use_flow_sigmas`: its grid is then
+    the shifted rectified-flow path rather than the beta table's."""
 
 
 def _spaced_times(spacing: str, *, train_steps: int, steps: int, offset: int, last: int,
@@ -511,10 +520,15 @@ class SourceSchedule:
             if key in declared and value(key) != inactive:
                 raise ValueError(f"Native source scheduling does not implement active {key}")
         # A flow file declares no prediction type: its class fixes the
-        # convention, so the family names the transform.
+        # convention, so the family names the transform. A log-SNR class on
+        # flow sigmas reads the velocity its flow checkpoint predicts.
+        flow_sigmas = records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas")
+        if flow_sigmas and kind not in _FLOW_SIGMA_CLASSES:
+            raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for "
+                             f"{' and '.join(_FLOW_SIGMA_CLASSES)}, not {kind}")
         prediction = ("flow_prediction" if source.family == "flow"
                       else _choice(value("prediction_type"), "prediction_type",
-                                   source.predictions))
+                                   ("flow_prediction",) if flow_sigmas else source.predictions))
         if kind == "PNDM" and prediction == "v_prediction":
             raise ValueError("Published PNDM v-prediction requires velocity-domain history; "
                              "native PNDM uses epsilon history")
@@ -541,21 +555,25 @@ class SourceSchedule:
         return self.policy.train_steps
 
     def training_process(self, tokens: int | None = None) -> Process:
-        """The process the checkpoint was trained under, at `tokens` latent
+        """The process Dew fine-tunes the checkpoint on, at `tokens` latent
         tokens.
 
-        Every class but the EDM one tabulates a VP beta table and trains on
-        it. EDM's convention has no beta table and no VP law. Its training
-        process is EDM's own log-normal sigma draw, over the preconditioning
-        the sampler reads. A flow file trains at the shift its sampler walks
-        at the same geometry, as SD3 shifts both by resolution (Esser et al.
-        2024, section 5.3.2), so a dynamic file needs `tokens`. The terminal
-        stretch is a sampling grid's alone.
+        A scheduler file states how its checkpoint samples, not the noise
+        distribution it was trained on, so this is the convention its sampler
+        reads. Every class but the EDM one tabulates a VP beta table, which
+        the process draws from. EDM's convention has no beta table and no VP
+        law; its process is EDM's own log-normal sigma draw, over the
+        preconditioning the sampler reads. A flow file's process takes the
+        shift its sampler walks at the same geometry, so a dynamic file needs
+        `tokens`; the terminal stretch is a sampling grid's alone. A log-SNR
+        class on flow sigmas takes the flow path at its `flow_shift`.
         """
         if self.policy.family == "flow":
             flow = self.policy.flow
             shift = 1.0 if flow is None else flow.base(tokens)
             return Process(FlowMatchingScheduler(shift=shift), self.prediction)
+        if self.policy.flow_shift is not None:
+            return Process(FlowMatchingScheduler(shift=self.policy.flow_shift), self.prediction)
         if self.policy.family == "edm":
             schedule = EDMNoiseScheduler(sigma_min=self.policy.sigma_min or 0.002,
                                          sigma_max=self.policy.sigma_max or 80.0,
@@ -606,6 +624,8 @@ class SourceSchedule:
         integers: the source stores them as int64."""
         policy = self.policy
         base, log_base = self._training_sigmas()
+        if policy.flow_shift is not None:
+            return self._flow_sigmas(steps, float(base[0]))
         last = policy.train_steps - policy.lambda_clipped
         times = _spaced_times(policy.spacing, train_steps=policy.train_steps, steps=steps,
                               offset=policy.offset, last=last, extra=1, rounded=True)
@@ -623,6 +643,24 @@ class SourceSchedule:
         else:
             terminal = float(base[0])
         return np.append(sigmas, terminal), np.trunc(times), 1.0
+
+    def _flow_sigmas(self, steps: int, sigma_min: float) -> tuple[np.ndarray, np.ndarray, float]:
+        """`use_flow_sigmas`: the shifted flow path from 1 - 1/T down, one point
+        dropped at the clean end, whatever the spacing and lambda clipping.
+
+        DPM-Solver's `sigma_min` terminal is still its beta table's first
+        sigma, and UniPC's the grid's own last one, as each source appends.
+        """
+        policy = self.policy
+        assert policy.flow_shift is not None
+        shift = policy.flow_shift
+        rising = 1.0 - np.linspace(1, 1 / policy.train_steps, steps + 1)
+        sigmas = np.flip(shift * rising / (1 + (shift - 1) * rising))[:-1].copy()
+        if policy.terminal == "zero":
+            terminal = 0.0
+        else:
+            terminal = float(sigmas[-1]) if policy.grid_terminal else sigma_min
+        return np.append(sigmas, terminal), np.trunc(sigmas * policy.train_steps), 1.0
 
     def _sigma_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
         """The paired tables of a variance-exploding class: its spacing
@@ -795,7 +833,8 @@ class SourceSchedule:
         else:
             sigmas, times, prior = self._lambda_grid(steps)
             self._check_unique_start(times)
-            schedule = VPGrid(sigmas, np.append(times, times[-1]), prior)
+            paired = FlowGrid if policy.flow_shift is not None else VPGrid
+            schedule = paired(sigmas, np.append(times, times[-1]), prior)
         return (Process(schedule, self.prediction),
                 jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
 
@@ -965,6 +1004,31 @@ def _lambda_clipping(kind: str, value: Control, betas: np.ndarray) -> tuple[bool
                                               records.number(limit, "lambda_min_clipped")))
 
 
+def _flow_shift(kind: str, value: Control, transform: Transform,
+                algorithm: Algorithm) -> float | None:
+    """`flow_shift` under an active `use_flow_sigmas`, and None without it.
+
+    The source reaches its flow branch only when no sigma transformation is
+    on, and converts velocity only to a clean prediction, so a flow file
+    with either is refused rather than walked on sigmas it was not trained on.
+    """
+    if not records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas"):
+        return None
+    if transform != "none":
+        raise ValueError("use_flow_sigmas under a Karras, exponential or beta grid walks the "
+                         "beta table's sigmas on the flow path; the source refuses neither")
+    clean = (algorithm in ("dpmsolver++", "sde-dpmsolver++") if kind == "DPMSolverMultistep"
+             else records.boolean(value("predict_x0"), "predict_x0"))
+    if not clean:
+        raise ValueError("The source converts flow velocity to a clean prediction only; "
+                         "use_flow_sigmas needs a dpmsolver++ algorithm or predict_x0")
+    shift = records.number(value("flow_shift"), "flow_shift")
+    if not shift > 0:
+        raise ValueError("flow_shift must be positive")
+    return shift
+
+
+
 def _resolve(kind: str, source: _Class, value: Control,
              betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
@@ -989,6 +1053,7 @@ def _resolve(kind: str, source: _Class, value: Control,
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
     order = records.integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
+    flow_shift = _flow_shift(kind, value, transform, algorithm)
     policy = _Policy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
@@ -1013,7 +1078,7 @@ def _resolve(kind: str, source: _Class, value: Control,
         distilled=kind in ("LCM", "TCD"),
         original_steps=original_steps,
         timestep_scaling=records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
-        flow=flow)
+        flow=flow, flow_shift=flow_shift)
     return policy, _build_solver(kind, value, order, algorithm, terminal,
                                  variance, disabled)
 
@@ -1085,6 +1150,8 @@ def _prediction_transform(policy: _Policy, prediction: str) -> PredictionTransfo
     if policy.family == "edm":
         inner: PredictionTransform = KarrasPredictionTransform(
             policy.sigma_data, velocity=prediction == "v_prediction")
+    elif policy.flow_shift is not None:
+        inner = FlowMatchPredictionTransform()
     else:
         normalize = policy.family in ("sigma", "stage")
         parameterization = {"epsilon": EpsilonPredictionTransform,

@@ -30,18 +30,30 @@ regardless of the global batch: partitioning may make a shard's batch small.
 CPU and GPU lower the input unchanged. The barrier's derivative and batching
 rules are identities; JAX's primitive defines neither.
 
-`Conv` exists only to work around these bugs. The partitioner bugs are
-reported at https://github.com/openxla/xla/issues/49382 and drafted in
+The partitioner bugs are reported at
+https://github.com/openxla/xla/issues/49382 and drafted in
 Dew issue #4 (https://github.com/AshishKumar4/dew/issues/4).
-When XLA fixes these lowerings, every model can use `flax.linen.Conv` again.
+
+For 3x3 depthwise convolutions, shifted products also avoid cuDNN's slow
+dilated grouped forward and weight-gradient convolutions. The accumulation
+stays fp32, including for bf16 inputs; ordinary JAX differentiation keeps
+forward-mode and higher-order derivatives. CUDA retains cuDNN at dilation
+one, which is faster on the RTX 4080. Other backends retain lax.
+`tools/benchmark_depthwise.py` measures each path's
+forward and backward separately, as well as the hybrid DiT training step.
+Qwix-wrapped models (QT and PTQ, weight-only included) keep its provider's
+lax convolutions and therefore do not get this depthwise speedup.
 """
 
 import math
+from collections.abc import Sequence
 
 import jax
+import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import PromoteDtypeFn
+from flax.typing import ConvGeneralDilatedT
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
@@ -121,15 +133,74 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
         x, P(*(tuple(entry) if entry else None for entry in entries)))
 
 
+def _depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """Nine shifted products, with the convolution's fp32 accumulation."""
+    height, width = lhs.shape[1:3]
+    padded = jnp.pad(lhs.astype(jnp.float32),
+                     ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0)))
+    kernel = rhs.astype(jnp.float32)
+    output = jnp.zeros(lhs.shape, jnp.float32)
+    for row in range(3):
+        for column in range(3):
+            shifted = padded[:, row * dilation:row * dilation + height,
+                             column * dilation:column * dilation + width, :]
+            output = output + shifted * kernel[row, column, 0, :]
+    return output.astype(lhs.dtype)
+
+
+def _cuda_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    # Otherwise XLA fuses bf16 casts and all nine weight reductions into a
+    # 0.77 ms kernel on sm89. Materializing fp32 gives a 0.31 ms forward/VJP
+    # at B16, against 0.85 ms without boundaries (tools/benchmark_depthwise.py).
+    inputs = _barrier(lhs.astype(jnp.float32))
+    kernel = _barrier(rhs.astype(jnp.float32))
+    return _barrier(_depthwise_3x3(inputs, kernel, dilation)).astype(lhs.dtype)
+
+
+def _conv_general_dilated(
+        lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
+        padding: str | Sequence[tuple[int, int]], lhs_dilation: Sequence[int] | None = None,
+        rhs_dilation: Sequence[int] | None = None,
+        dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+        feature_group_count: int = 1, batch_group_count: int = 1,
+        precision: jax.lax.PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
+        out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+    def convolve(x: jax.Array, w: jax.Array) -> jax.Array:
+        return jax.lax.conv_general_dilated(
+            x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
+            dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
+            batch_group_count=batch_group_count, precision=precision,
+            preferred_element_type=preferred_element_type, out_sharding=out_sharding)
+
+    dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)
+    if (lhs.ndim == rhs.ndim == 4 and rhs.shape[:3] == (3, 3, 1)
+            and lhs.shape[-1] == rhs.shape[-1] == feature_group_count
+            and tuple(window_strides) == (1, 1)
+            and (lhs_dilation is None or tuple(lhs_dilation) == (1, 1))
+            and dilation in ((1, 1), (2, 2), (3, 3))
+            and (padding == 'SAME' or padding == ((dilation[0], dilation[0]),) * 2)
+            and batch_group_count == 1 and preferred_element_type is None and out_sharding is None
+            and lhs.dtype == rhs.dtype and lhs.dtype in (jnp.float32, jnp.bfloat16)
+            and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+            == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
+        return jax.lax.platform_dependent(
+            lhs, rhs,
+            cuda=convolve if dilation[0] == 1 else lambda x, w: _cuda_depthwise_3x3(x, w, dilation[0]),
+            default=convolve)
+    return convolve(lhs, rhs)
+
+
 class Conv(nn.Conv):
-    """Flax's convolution with the placement and TPU input barriers above.
+    """Flax's convolution with safe placement and backend-specific depthwise work.
 
     The kernel is placed where Flax reads its promoted operands, through
     `promote_dtype`. Parameters and names remain Flax's, so checkpoints do
-    not change. Remove the workarounds when XLA fixes the lowerings.
+    not change. Other grouped and ordinary convolutions remain lax calls.
     """
 
     promote_dtype: PromoteDtypeFn = _promoted_whole
+    conv_general_dilated: ConvGeneralDilatedT | None = _conv_general_dilated
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         spatial = 1 if isinstance(self.kernel_size, int) else len(self.kernel_size)

@@ -1,35 +1,47 @@
-"""Run the landing page's code on a CPU and record what it prints.
+"""Run the landing page's script on a terminal and record what it showed.
 
-The landing page shows src/data/hero.py next to the output in
-src/data/capture.json, so the output must come from running exactly that
-file. Run this after changing it, in an environment with Dew installed, and
-commit the JSON it writes:
+The landing page shows src/data/hero.py next to the terminal it ran on, kept
+in src/data/capture.json, so the output must come from running exactly that
+file. Run this after changing it, in an environment with Dew and pyte
+installed, and commit the JSON it writes:
 
-    python site/scripts/capture_snippets.py
+    python site/scripts/capture_snippets.py --where "a workstation"
 
-`--where` names the machine for the caption, for example "the CPU of a Colab
-runtime". The page reads the commit of the installed Dew from pip's record of
-a git install, so install Dew from GitHub or a local clone with `pip install
-"dewml @ git+..."`, not an editable install. Record at the commit the live
-kernel runs (site/live/container/dew-commit, which deploy.mjs writes), so
-that Run it live prints what the page shows; docs/key-concepts.md quotes the
-same output, and the build fails until it matches.
+The script's stdout is a pseudo-terminal of `--columns` columns, so
+`Trainer.fit` draws its live display there as it would for a person; its
+stderr (JAX's and Python's warnings) is kept apart. Every byte written to the
+terminal goes to `--cast`, an asciinema v2 recording, and capture.json keeps
+the screen as it was when the script exited, cell by cell with its colours.
+
+`--where` names the machine for the caption. The page reads the commit of the
+installed Dew from pip's record of a git install, so install Dew from GitHub
+or a local clone with `pip install "dewml @ git+..."`, not an editable
+install.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
+import fcntl
 import json
 import os
 import platform
+import pty
+import select
+import struct
 import subprocess
 import sys
+import termios
 import time
 from importlib.metadata import distribution, version
 from pathlib import Path
 
+import pyte
+
 DATA = Path(__file__).resolve().parents[1] / "src/data"
-SNIPPETS = ("hero",)
+# Enough rows that nothing the script prints scrolls off the screen.
+ROWS = 200
 
 
 def installed_commit() -> str:
@@ -39,29 +51,123 @@ def installed_commit() -> str:
     return json.loads(record)["vcs_info"]["commit_id"]
 
 
+def run_on_terminal(script: Path, columns: int) -> tuple[int, float, list[tuple[float, str]], str]:
+    """Run `script` with stdout on a pseudo-terminal: its exit code, its
+    seconds, what it wrote to the terminal with the time of each write, and
+    its stderr."""
+    primary, secondary = pty.openpty()
+    fcntl.ioctl(secondary, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, columns, 0, 0))
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "TERM": "xterm-256color", "COLUMNS": str(columns),
+           "LINES": str(ROWS)}
+    env.pop("NO_COLOR", None)
+    started = time.monotonic()
+    child = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL, stdout=secondary,
+                             stderr=subprocess.PIPE, env=env, cwd=script.parent)
+    os.close(secondary)
+    writes: list[tuple[float, str]] = []
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    stderr = b""
+    open_fds = {primary, child.stderr.fileno()}
+    while open_fds:
+        ready, _, _ = select.select(list(open_fds), [], [])
+        for fd in ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:  # The terminal's other end closed.
+                chunk = b""
+            if not chunk:
+                open_fds.discard(fd)
+            elif fd == primary:
+                writes.append((time.monotonic() - started, decoder.decode(chunk)))
+            else:
+                stderr += chunk
+    code = child.wait()
+    os.close(primary)
+    return code, time.monotonic() - started, writes, stderr.decode(errors="replace")
+
+
+class DimScreen(pyte.Screen):
+    """A pyte screen that also keeps faint text (SGR 2), which pyte drops.
+
+    pyte's cells have no field for it, so a faint cell's colour is kept as
+    "dim:<colour>" and `screen_cells` splits it out again."""
+
+    dim = False
+
+    def select_graphic_rendition(self, *attrs: int) -> None:
+        codes = list(attrs) or [0]
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code in (38, 48):  # A colour's own parameters: 5;n or 2;r;g;b.
+                index += 3 if codes[index + 1:index + 2] == [5] else 5
+                continue
+            if code in (0, 22):
+                self.dim = False
+            elif code == 2:
+                self.dim = True
+            index += 1
+        super().select_graphic_rendition(*attrs)
+        fg = self.cursor.attrs.fg.removeprefix("dim:")
+        self.cursor.attrs = self.cursor.attrs._replace(fg=f"dim:{fg}" if self.dim else fg)
+
+
+def screen_cells(text: str, columns: int) -> list[list[dict]]:
+    """The screen `text` leaves on a terminal of `columns` columns, as rows of
+    runs of text sharing one style, without the empty rows at the end."""
+    screen = DimScreen(columns, ROWS)
+    stream = pyte.Stream(screen)
+    # A terminal moves to the next line's start on \n only through the pty's
+    # output translation, which already turned the child's \n into \r\n.
+    stream.feed(text)
+    rows = []
+    for y in range(ROWS):
+        line = screen.buffer[y]
+        runs: list[dict] = []
+        for x in range(columns):
+            char = line[x]
+            fg = char.fg.removeprefix("dim:")
+            style = {key: value for key, value in (("fg", fg), ("bold", char.bold), ("dim", fg != char.fg))
+                     if value not in ("default", False)}
+            if runs and runs[-1]["style"] == style:
+                runs[-1]["text"] += char.data
+            else:
+                runs.append({"text": char.data, "style": style})
+        while runs and not runs[-1]["text"].rstrip():
+            runs.pop()
+        if runs:
+            runs[-1]["text"] = runs[-1]["text"].rstrip()
+        rows.append([{"text": run["text"], **run["style"]} for run in runs])
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--where", required=True, help='the machine, for the caption: "the CPU of a Colab runtime"')
+    parser.add_argument("--where", required=True, help='the machine, for the caption: "a workstation"')
+    # Wide enough for the display's header line to name the whole mesh.
+    parser.add_argument("--columns", type=int, default=96)
+    parser.add_argument("--cast", type=Path, default=Path("hero.cast"), help="where to write the recording")
     options = parser.parse_args()
 
-    snippets = {}
-    for name in SNIPPETS:
-        started = time.monotonic()
-        done = subprocess.run([sys.executable, str(DATA / f"{name}.py")], capture_output=True, text=True,
-                              env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONUNBUFFERED": "1"})
-        if done.returncode != 0:
-            raise SystemExit(f"{name}.py exited {done.returncode}:\n{done.stderr}")
-        snippets[name] = {"returncode": 0, "seconds": round(time.monotonic() - started, 1), "stdout": done.stdout}
+    script = DATA / "hero.py"
+    code, seconds, writes, stderr = run_on_terminal(script, options.columns)
+    if code != 0:
+        raise SystemExit(f"hero.py exited {code}:\n{stderr}")
+    header = {"version": 2, "width": options.columns, "height": ROWS, "timestamp": int(time.time()),
+              "env": {"TERM": "xterm-256color"}}
+    options.cast.write_text("\n".join([json.dumps(header)] + [json.dumps([round(t, 6), "o", text]) for t, text in writes]) + "\n")
     capture = {
-        "about": "What site/src/data/hero.py printed, written by site/scripts/capture_snippets.py.",
-        # The CPUs this process may run on, which taskset narrows; os.cpu_count() is the machine's.
-        "meta": {"where": options.where, "vcpus": len(os.sched_getaffinity(0)), "python": platform.python_version(),
+        "about": "The screen site/src/data/hero.py left on a terminal, written by site/scripts/capture_snippets.py.",
+        "meta": {"where": options.where, "python": platform.python_version(),
                  "jax": version("jax"), "flax": version("flax"), "optax": version("optax"),
                  "dew": installed_commit(), "date": time.strftime("%Y-%m-%d")},
-        "snippets": snippets,
+        "hero": {"returncode": code, "seconds": round(seconds, 1), "columns": options.columns,
+                 "screen": screen_cells("".join(text for _, text in writes), options.columns)},
     }
     (DATA / "capture.json").write_text(json.dumps(capture, indent="\t") + "\n")
-    print(f"wrote {DATA / 'capture.json'}")
+    print(f"wrote {DATA / 'capture.json'} and {options.cast}")
 
 
 if __name__ == "__main__":

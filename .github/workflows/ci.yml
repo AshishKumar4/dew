@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile
 
 jobs:
   lint:
@@ -41,17 +41,77 @@ jobs:
         pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         # pyright resolves every import in src/dew, the optional readers' included.
-        pip install -e ".[$EXTRAS,gguf,torchax]"
+        pip install -e ".[$EXTRAS,gguf,torchax]" -c constraints.txt
     - name: Lint with flake8
       run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # stop the build if there are Python syntax errors or undefined names; the
+        # landing page's sampling and text cells run after their setup cell, which defines their names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=site/src/data/sampler.py,site/src/data/text.py
     - name: Lint
       run: |
         uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples recipes
         JAX_PLATFORMS=cpu python tools/lint_slop.py
     - name: Type check
       run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
+
+  # What PyPI receives, installed the way a user installs it: the sdist and
+  # wheel build, pass twine, and name no requirement by URL, which PyPI
+  # refuses and twine passes; the wheel installs from PyPI alone into an
+  # empty environment and runs; and the accelerator extras resolve.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Build and check the sdist and wheel
+      run: |
+        python -m pip install --upgrade pip build twine uv
+        python -m build
+        python -m twine check --strict dist/*
+        python tools/check_distribution.py dist/*
+    - name: Install the wheel from PyPI into an empty environment
+      run: |
+        python -m venv "$RUNNER_TEMP/clean"
+        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple dist/*.whl
+    - name: Run it
+      working-directory: ${{ runner.temp }}
+      run: |
+        "$RUNNER_TEMP/clean/bin/python" - <<'EOF'
+        import importlib.metadata
+
+        import jax
+        import jax.numpy as jnp
+
+        import dew
+        from dew import models
+        from dew.training.runtime import _pool_keys_alike
+
+        assert "site-packages" in dew.__file__, dew.__file__
+        print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
+              "flax", importlib.metadata.version("flax"))
+        # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
+        assert not _pool_keys_alike()
+        import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
+        model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2,
+                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
+        tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
+        logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
+        assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
+        EOF
+    - name: Resolve the accelerator extras
+      run: |
+        for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
+          echo "dewml[$extras] @ file://$(realpath dist/*.whl)" \
+            | uv pip compile - --python-version 3.12 --python-platform x86_64-manylinux_2_31 --quiet > /dev/null
+        done
+    - name: Install the jax for GPU pools as docs/installation.md says
+      run: |
+        uv pip install --python "$RUNNER_TEMP/clean/bin/python" --quiet jax \
+          -c "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/constraints.txt"
+        cd "$RUNNER_TEMP"
+        "$RUNNER_TEMP/clean/bin/python" -c "from dew.training.runtime import _pool_keys_alike; assert _pool_keys_alike()"
 
   test:
     runs-on: ubuntu-latest
@@ -83,7 +143,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[$EXTRAS]"
+        # The jax constraints.txt names: the patched 0.11.2 the multi-process
+        # cache tests need. The package job runs the release users install.
+        pip install -e ".[$EXTRAS]" -c constraints.txt
     # conftest.py persists XLA's compilations under ~/.cache/dew/xla; every
     # run restores the latest one main saved for this shard.
     - name: Restore the compilation cache

@@ -735,6 +735,16 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
 
 @pytest.mark.parametrize("name,category", [
     ("loop_convert_fusion", "convert"),  # whole tokens: convert is not conv
+    ("void cudnn::cnn::conv2d_grouped_direct_kernel<false, true, false, true, false, false, 0, 0, "
+     "int, float, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, __nv_bfloat16>"
+     "(cudnn::cnn::GroupedDirectFpropParams, __nv_bfloat16 const*, __nv_bfloat16 const*, "
+     "__nv_bfloat16*, float, float, float const*, float const*, __nv_bfloat16 const*, "
+     "__nv_bfloat16 const*, cudnnActivationStruct)", "conv"),
+    ("conv2d_c1_k1_nhwc_specialized", "conv"),
+    ("wgrad2d_c1_k1_nhwc", "conv"),
+    ("wgrad2d_c1_k1_nhwc_reduce", "conv"),
+    ("cudnn_generated_fort_native_sdpa_sm80_flash_bprop_wmma_f16_knob_2_64x128x64_1x4x1_cga1x1x1_kernel0_0",
+     "attention"),
     ("ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x4_tn", "gemm"),  # cuBLAS's family token
     ("ncclDevKernel_AllGather_RING_LL", "collective"),
     ("cudnn::fusion::compute_dot_do_o", "attention"),  # not the gemm its dot names
@@ -763,6 +773,75 @@ def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
     stronger = {"label": "torch, bf16 experts", "rate": 125.0}
     assert scoreboard.verdict({"dew": [dew], "reference": [weaker, stronger]}) == (
         "Dew (dew) LOSES to torch, bf16 experts: 0.880x")
+
+
+# ---------------------------------------------------------------------------
+# tools/benchmark_quantized_serving.py
+# ---------------------------------------------------------------------------
+
+def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips():
+    """One NaN latent and one infinite decoded pixel are counted where they
+    occur, before the pixels are clipped and cast to the uint8 that CLIP
+    scores, where the NaN and the infinity become ordinary pixels."""
+    from types import SimpleNamespace
+
+    bench = load("benchmark_quantized_serving")
+    latents = np.zeros((4, 2, 2, 1), np.float32)
+    latents[1, 0, 0, 0] = np.nan
+
+    class Pipe:
+        """The part of TextToImage that sampling reads: latents, and an
+        autoencoder that passes them through with one pixel infinite."""
+        params = {"autoencoder": {}}
+        autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
+
+        def __call__(self, prompts, **controls):
+            return SimpleNamespace(latents=jnp.asarray(latents))
+
+    # NumPy warns as it casts the NaN to a pixel; nothing else would.
+    with pytest.warns(RuntimeWarning, match="invalid value encountered in cast"):
+        pixels, counts = bench.sample(Pipe(), seed=0, decode_batch=4)
+    assert counts == {"latents": 1, "pixels": 2}
+    assert pixels.dtype == np.uint8 and pixels.shape == latents.shape
+
+
+# ---------------------------------------------------------------------------
+# tools/check_distribution.py
+# ---------------------------------------------------------------------------
+
+def test_a_distribution_whose_requirement_names_a_url_is_refused(tmp_path, monkeypatch, capsys):
+    """A wheel and an sdist are read the way PyPI reads them, and a
+    requirement that names a URL, which PyPI refuses and `twine check`
+    passes, fails the check naming it."""
+    import tarfile
+    import zipfile
+
+    check = load("check_distribution")
+    lines = ["flax>=0.12.10", "jax @ https://github.com/AshishKumar4/jax/archive/19a48d1d.tar.gz"]
+    core = "Metadata-Version: 2.4\nName: dewml\nVersion: 0.1.0\n" + "".join(
+        f"Requires-Dist: {line}\n" for line in lines)
+    wheel = tmp_path / "dewml-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("dewml-0.1.0.dist-info/METADATA", core)
+    (tmp_path / "PKG-INFO").write_text(core)
+    sdist = tmp_path / "dewml-0.1.0.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        archive.add(tmp_path / "PKG-INFO", arcname="dewml-0.1.0/PKG-INFO")
+    assert check.requirements(wheel) == check.requirements(sdist) == lines
+
+    monkeypatch.setattr(sys, "argv", ["check_distribution.py", str(wheel), str(sdist)])
+    with pytest.raises(SystemExit, match=r"jax @ https://github\.com/AshishKumar4/jax") as refused:
+        check.main()
+    assert str(refused.value).count("jax @") == 2
+
+    clean = tmp_path / "clean" / wheel.name
+    clean.parent.mkdir()
+    with zipfile.ZipFile(clean, "w") as archive:
+        archive.writestr("dewml-0.1.0.dist-info/METADATA", core.replace(
+            f"Requires-Dist: {lines[1]}", "Requires-Dist: jax<0.11.3,>=0.11.2"))
+    monkeypatch.setattr(sys, "argv", ["check_distribution.py", str(clean)])
+    check.main()
+    assert "dewml-0.1.0-py3-none-any.whl: 2 requirements" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
