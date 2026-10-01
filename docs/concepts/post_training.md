@@ -246,7 +246,15 @@ SFT uses the language-model objective's moving EMA by default; `ema_decay=None` 
 
 ## GRPO
 
-GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages; strings and messages go through the tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly through `tokenizer_for`, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+
+```python
+import json
+from dew.data import Loading, Prompts
+
+data = Prompts(tokenizer="byte", records=(json.dumps({"prompt": "dew"}),) * 8,
+               max_prompt_len=8, loading=Loading(workers=0)).load(batch=8)
+```
 
 The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long keeps its end. The metadata columns travel as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into strings for the reward:
 
@@ -505,7 +513,7 @@ from dew.objectives.rl import FlowGRPOObjective, FlowRollout
 inputs = InputSpec(Field("image", (4, 4, 1)))
 model = models.SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
                          num_layers=1, num_heads=2, mlp_ratio=2)
-objective = FlowGRPOObjective(model, presets.Flow()(), inputs,
+objective = FlowGRPOObjective(model, presets.Flow(), inputs,
                               guidance=None, beta=0.01, steps=5)
 
 def brightness(images, batch):

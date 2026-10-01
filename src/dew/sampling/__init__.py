@@ -2,7 +2,7 @@
 
 from .decoding import LogitsTransform, StepState, Stopping
 from .flow import FlowSDE, FlowTrajectory, GaussianTransition, flow_transition, sample_trajectory
-from .guidance import CFG
+from .guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
 from .guided import Grammar
 from .pipelines import TextToImage
 from .sample import sample
@@ -30,6 +30,7 @@ from .strategies import Beam, Sample, Speculative, Strategy
 from .text import Generation, Sampling, generate
 
 __all__ = [
+    "APG",
     "CFG",
     "DDIM",
     "DDPM",
@@ -39,7 +40,9 @@ __all__ = [
     "PNDM",
     "RK4",
     "TCD",
+    "Autoguidance",
     "Beam",
+    "CFGPlusPlus",
     "Consistency",
     "DPMSolverMultistep",
     "DPMSolverSDE",
@@ -51,6 +54,7 @@ __all__ = [
     "GaussianTransition",
     "Generation",
     "Grammar",
+    "Guidance",
     "Heun",
     "LogitsTransform",
     "MultiStepDPM",

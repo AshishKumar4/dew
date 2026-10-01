@@ -105,7 +105,7 @@ def train():
     )
     objective = DiffusionObjective(
         model,
-        EDM(regime="pixel")(),
+        EDM(regime="pixel"),
         InputSpec(Field("image", (64, 64, 3))),
     )
     trainer = Trainer(
@@ -152,10 +152,9 @@ trainer = Trainer(
 Set `ema_decay` when you construct the objective. A value closer to 1 averages weights over more updates:
 
 ```python
-process = EDM(regime="pixel")()
 objective = DiffusionObjective(
     model,
-    process,
+    EDM(regime="pixel"),
     InputSpec(Field("image", (64, 64, 3))),
     ema_decay=0.999,
 )
@@ -167,6 +166,7 @@ After training, sample from the averaged weights with `state.averaged`. Use `sta
 from dew import sample
 from dew.sampling import Heun
 
+process = objective.process
 denoise = process.denoiser(model, state.averaged, conditions={})
 images = sample(
     denoise,
@@ -183,8 +183,8 @@ Set `ema_decay=None` to train without an averaged copy, then sample with `state.
 optimizer state stay fp32, so the optimizer still accumulates in full
 precision.
 
-For int8 quantization-aware training, install Qwix with `uv pip install qwix`
-and wrap the model before you construct the objective:
+For int8 quantization-aware training, install the `quantization` extra
+(`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
 
 ```python
 from dew.training.quantization import Quantization, apply_quantization
