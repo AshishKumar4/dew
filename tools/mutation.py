@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import shlex
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -25,7 +27,12 @@ TARGETS = {
         "tests/test_optional_ema.py", "tests/test_training_dtypes.py")),
     "checkpoints": Target("src/dew/checkpoints", (
         "tests/test_training_transactions.py", "tests/test_optional_ema.py",
-        "tests/test_posthoc.py", "tests/test_frozen_reference.py")),
+        "tests/test_posthoc.py", "tests/test_frozen_reference.py",
+        "tests/test_trainer.py::test_restore_preserves_the_optimizer_state_the_ema_and_the_key",
+        "tests/test_trainer.py::test_the_ema_comes_back_bit_for_bit_however_it_is_read",
+        "tests/test_trainer.py::test_an_ema_held_in_lists_comes_back_bit_for_bit",
+        "tests/test_trainer.py::test_a_checkpoint_that_stores_the_ema_as_itself_still_restores",
+        "tests/test_trainer.py::test_a_global_position_is_read_by_any_process_count")),
     "process": Target("src/dew/diffusion/process.py", (
         "tests/test_guidance.py", "tests/test_shortcut.py", "tests/test_mean_flow.py")),
     "schedules": Target("src/dew/diffusion/schedules", (
@@ -82,40 +89,76 @@ def report(database) -> dict:
                 mutation["path"], mutation["line"], mutation["operator"], mutation["occurrence"]))}
 
 
-def run(target: Target, directory: Path, shard: int, shards: int, timeout: float) -> dict:
-    """Partition deterministically; no operator or source line is excluded."""
-    from cosmic_ray.commands import execute, init
-    from cosmic_ray.config import ConfigDict
+def source_digest(paths: list[Path]) -> str:
+    """Bind a resumed session to exactly the source population it mutated."""
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def selected_target(target: Target, filename: Path | None) -> Target:
+    """Choose one source file within a target, without excluding any of its lines."""
+    if filename is None:
+        return target
+    path, boundary = filename.resolve(), Path(target.path).resolve()
+    within = path == boundary if boundary.is_file() else path.is_relative_to(boundary)
+    if not within or path.suffix != ".py" or not path.is_file():
+        raise ValueError(f"{filename} is not a Python source file within {target.path}")
+    return dataclasses.replace(target, path=str(path.relative_to(Path.cwd())))
+
+
+def run(target: Target, directory: Path, shard: int, shards: int, timeout: float, *,
+        resume: bool = False, seconds: float | None = None) -> dict:
+    """Partition deterministically; retain a bounded run's pending work for resume."""
+    from cosmic_ray.commands import init
     from cosmic_ray.modules import find_modules
+    from cosmic_ray.mutating import mutate_and_test
     from cosmic_ray.work_db import use_db
     from cosmic_ray.work_item import WorkItem
 
     command = shlex.join([sys.executable, "-m", "pytest", "-x", "-q", "--tb=short",
                           "-m", "not network", *target.tests])
-    config = ConfigDict({"module-path": target.path, "timeout": timeout,
-                         "test-command": command, "excluded-modules": [],
-                         "distributor": {"name": "local"}})
-    directory.mkdir(parents=True)
+    modules = list(find_modules([Path(target.path)]))
+    identity = {"source_digest": source_digest(modules), "path": target.path,
+                "tests_digest": source_digest([Path(test.split("::", 1)[0]) for test in target.tests]
+                                               + [Path("tests/conftest.py")]),
+                "tests": target.tests, "shard": shard, "shards": shards}
+    manifest = directory / "manifest.json"
+    if resume:
+        if json.loads(manifest.read_text()) != json.loads(json.dumps(identity)):
+            raise ValueError("the session's source, tests or shard selection changed; start a new session")
+    else:
+        directory.mkdir(parents=True)
+        manifest.write_text(json.dumps(identity, indent=2) + "\n")
+    started = time.monotonic()
     with use_db(directory / "baseline.sqlite") as baseline:
+        baseline.clear()
         baseline.add_work_item(WorkItem(job_id="baseline", mutations=()))
-        execute(baseline, config)
-        _, result = next(baseline.results)
+        result = mutate_and_test((), command, timeout)
+        baseline.set_result("baseline", result)
         if classify(result) != "survived":
             raise RuntimeError(f"unmutated tests failed: {classify(result)}\n{result.output}")
+    baseline_seconds = time.monotonic() - started
     with use_db(directory / "population.sqlite") as population:
-        init(find_modules([Path(target.path)]), population, config.operators_config)
+        if not resume:
+            init(modules, population, {})
         work = sorted(population.work_items, key=lambda work: (
             str(work.mutations[0].module_path), work.mutations[0].start_pos,
             work.mutations[0].operator_name, work.mutations[0].occurrence))
     with use_db(directory / "session.sqlite") as session:
-        session.add_work_items(work[shard::shards])
+        if not resume:
+            session.add_work_items(work[shard::shards])
         try:
-            execute(session, config)
+            for pending in session.pending_work_items:
+                if seconds is not None and time.monotonic() - started + timeout >= seconds:
+                    break
+                result = mutate_and_test(pending.mutations, command, timeout)
+                session.set_result(pending.job_id, result)
         finally:
             results = report(session)
-            results["population"] = len(work)
-            results["shard"] = shard
-            results["shards"] = shards
+            results.update(identity)
+            results.update(population=len(work), baseline_seconds=baseline_seconds)
             (directory / "report.json").write_text(json.dumps(results, indent=2) + "\n")
     return results
 
@@ -145,6 +188,9 @@ def main() -> None:
     parser.add_argument("target", choices=TARGETS, nargs="?")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path)
+    parser.add_argument("--file", type=Path, help="one file within the chosen module's source directory")
+    parser.add_argument("--resume", action="store_true", help="continue the existing SQLite session")
+    parser.add_argument("--seconds", type=float, help="stop admitting work before this budget expires")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180)
@@ -158,8 +204,11 @@ def main() -> None:
         parser.error("shard must be in [0, shards), and shards must be positive")
     if arguments.timeout <= 0:
         parser.error("timeout must be positive")
-    results = run(TARGETS[arguments.target], arguments.output,
-                  arguments.shard, arguments.shards, arguments.timeout)
+    if arguments.seconds is not None and arguments.seconds <= arguments.timeout:
+        parser.error("seconds must exceed the per-mutation timeout")
+    target = selected_target(TARGETS[arguments.target], arguments.file)
+    results = run(target, arguments.output, arguments.shard, arguments.shards, arguments.timeout,
+                  resume=arguments.resume, seconds=arguments.seconds)
     print(json.dumps({key: value for key, value in results.items() if key != "mutations"}, indent=2))
     if results["population"] == 0:
         raise SystemExit("no mutations were generated")

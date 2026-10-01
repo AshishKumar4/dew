@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from importlib import import_module
 from typing import TYPE_CHECKING, Generic, overload
 
 import jax
@@ -211,10 +212,10 @@ class TextToImage:
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
-        import dew.objectives.rl.flow  # noqa: F401 registers the flow_grpo a record names
         from dew.objectives.diffusion import DiffusionRunConfig
         from dew.registry import objectives
 
+        import_module("dew.objectives.rl.flow")  # registers the flow_grpo a record names
         config = DiffusionRunConfig.load(directory)
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:

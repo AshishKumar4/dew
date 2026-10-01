@@ -1497,13 +1497,18 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
     if module == 'self_attn':
         return _attention_param_path(parts)
     if len(parts) == 5 and module in ('attn_hc', 'ffn_hc') and leaf in _V4_HC:
-        # mHC's residual mapping, in modeling_deepseek_v4.py:902-913's layout.
+        # mHC's residual mapping around each sublayer, its tensors in
+        # the reference's own layout (modeling_deepseek_v4.py:902-913).
         return (module, leaf)
     if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
             and parts[5].isdigit() and parts[6] in _MOE_SHARED and leaf == 'weight'):
+        # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
+        # tensor per expert, stacked by _stack_experts below.
         return ('mlp', 'experts', parts[5], parts[6], 'kernel')
     if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
             and parts[5] in _MOE_SHARED and leaf == 'weight'):
+        # The dense shared experts beside them, one MLP however many the
+        # config counts.
         return ('mlp', 'shared_experts', parts[5], 'kernel')
     if (module == 'linear_attn'
             and records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
@@ -1512,7 +1517,9 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
             return ('self_attn', tail[0], 'kernel')
         if tail in _LINEAR_LEAVES:
             return ('self_attn', *tail)
-    # Gemma 4's per-layer residual: kernels and a scale, no weighted values norm.
+    # Gemma 4's per-layer residual. Gate and projection are kernels, the
+    # post norm is a scale. The values norm carries no weight, so it maps
+    # nothing.
     if len(parts) == 5 and leaf == 'weight':
         if module in ('per_layer_input_gate', 'per_layer_projection'):
             return (module, 'kernel')
@@ -1549,6 +1556,8 @@ def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
 def _attention_param_path(parts: list[str]) -> tuple[str, ...] | None:
     """The sparse selector's leaves, followed by DeepSeek V4's nested leaves."""
     if len(parts) == 7 and parts[4] == 'indexer':
+        # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
+        # and k_norm.{weight,bias}: the sparse selector's own tensors.
         sublayer, leaf = parts[5], parts[6]
         if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
             return ('self_attn', 'indexer', sublayer, 'kernel')
@@ -2174,6 +2183,9 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
     check_tree(variables, model, np.zeros((1, 2), np.int32))
 
 
+# Each family imports these shared readers, so its table is loaded only
+# after their module is complete, including when a cold import starts in a
+# family module. decoder_families.ENTRIES is the single ordered registration.
 @functools.cache
 def family_entries() -> tuple[DecoderFamily, ...]:
     """The registered layouts, loaded after their shared readers are defined."""

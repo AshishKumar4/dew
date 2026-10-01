@@ -9,6 +9,10 @@ on:
         default: process
         type: choice
         options: [transaction, checkpoints, process, schedules, attention, sources]
+      file:
+        description: One Python source file inside the selected module (blank selects all)
+        required: false
+        type: string
   # One module a night; ordinary pushes leave the runners to the regular gates.
   schedule:
     - cron: "0 2 * * *"
@@ -35,8 +39,8 @@ jobs:
           import datetime
           import os
 
-          modules = ("transaction", "checkpoints", "process", "schedules", "attention", "sources")
-          module = os.environ["REQUESTED_MODULE"] or modules[datetime.datetime.now(datetime.UTC).weekday() % 6]
+          modules = ("process", "transaction", "checkpoints")
+          module = os.environ["REQUESTED_MODULE"] or modules[datetime.datetime.now(datetime.UTC).weekday() % 3]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"module={module}\n")
           PY
@@ -56,6 +60,7 @@ jobs:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "2"
       MODULE: ${{ needs.plan.outputs.module }}
+      SOURCE_FILE: ${{ inputs.file }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,8 +75,10 @@ jobs:
           pip install -e ".[test,mutation,av,tfds]" -c constraints.txt
       - name: Run mutation tests
         run: |
-          python tools/mutation.py "$MODULE" --shard ${{ matrix.shard }} --shards 8 \
-            --output "mutation-${{ matrix.shard }}"
+          file=()
+          if [[ -n "$SOURCE_FILE" ]]; then file=(--file "$SOURCE_FILE"); fi
+          python tools/mutation.py "$MODULE" "${file[@]}" --shard ${{ matrix.shard }} --shards 8 \
+            --output "mutation-${{ matrix.shard }}" --seconds 9600
       - name: Upload mutations and results
         if: always()
         uses: actions/upload-artifact@v4

@@ -16,6 +16,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, overload
 
 import jax
@@ -447,12 +448,12 @@ class TextGeneration:
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
         """
-        import dew.objectives.lm  # registers the saved objective kinds
-        import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
         from dew.objectives.base import thaw
         from dew.registry import objectives
         from dew.sampling.pipelines import restore_variables
 
+        import_module("dew.objectives.lm")  # registers the saved objective kinds
+        import_module("dew.objectives.rl")
         record, model_config, processor = _saved_run(directory, dtype)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)

@@ -36,6 +36,21 @@ def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
 
 
+@pytest.mark.parametrize("fields,causal,message", [
+    ({"head_dim": 3}, True, "head dim"),
+    ({"window": 0}, True, "window"),
+    ({"chunk": 0}, True, "chunk"),
+    ({"window": 2, "chunk": 2}, True, "one or the other"),
+    ({"chunk": 2}, False, "not causal"),
+    ({"num_kv_heads": 3}, True, "multiple"),
+    ({"num_kv_heads": 0}, True, "multiple"),
+])
+def test_layer_kinds_refuse_invalid_rotary_mask_and_grouped_head_geometry(fields, causal, message):
+    with pytest.raises(ValueError, match=message):
+        model = tiny(num_layers=1, layer_types=("special",), kinds={"special": fields}, causal=causal)
+        model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+
+
 def decode_logits(model, params, prompt, rest):
     """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V]."""
     cache = model.apply(params, prompt.shape[0], method=CausalTransformer.init_cache,

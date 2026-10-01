@@ -418,6 +418,9 @@ class UrlStream:
         if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True
+                # A stalled loader owes one warning to the person watching it;
+                # test_slow_fetching_waits_instead_of_fabricating_samples checks
+                # the notice alongside the real records, never a fabricated batch.
                 _log.warning("No sample in %ss, still fetching (%s dropped so far)",
                              self.queue_timeout, self.dropped)
             return
