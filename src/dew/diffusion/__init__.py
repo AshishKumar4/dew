@@ -36,6 +36,7 @@ from .transforms import (
     PredictionTransform,
     ScheduleWeighting,
     SourceLimitedPrediction,
+    VelocityLoss,
     VPredictionTransform,
     Weighting,
     broadcast_rates,
@@ -47,6 +48,6 @@ __all__ = ["ConsistencyBoundary", "ContinuousNoiseScheduler", "CosineContinuousN
            "FlowMatchPredictionTransform", "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
            "KarrasPredictionTransform", "KarrasVENoiseScheduler", "LinearNoiseScheduler", "MinSNR",
            "NoiseScheduler", "PredictionTransform", "Process", "ScheduleWeighting", "SourceLimitedPrediction",
-           "SqrtContinuousNoiseScheduler", "VPredictionTransform", "Weighting", "broadcast_rates",
+           "SqrtContinuousNoiseScheduler", "VPredictionTransform", "VelocityLoss", "Weighting", "broadcast_rates",
            "cosine_beta_schedule", "discrete", "exp_beta_schedule", "expand", "linear_beta_schedule",
            "presets"]

@@ -260,6 +260,30 @@
    "guidance": null,
    "latent_scale": 2.370527505874634
   },
+  "dpm_multi.flow": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.551439046859741
+  },
+  "dpm_multi.flow_sde_order3_sigma_min": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.192948579788208
+  },
+  "unipc.flow": {
+   "scheduler": "UniPCMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.603177309036255
+  },
+  "unipc.flow_order3_sigma_min": {
+   "scheduler": "UniPCMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.376939058303833
+  },
   "edm.default": {
    "scheduler": "EDMDPMSolverMultistepScheduler",
    "steps": 5,
