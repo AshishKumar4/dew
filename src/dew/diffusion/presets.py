@@ -1,7 +1,7 @@
 """Named conventions, as the dataclasses a run's `run.json` stores.
 
-A preset is a frozen dataclass of the numbers that define a convention, and
-objectives and image tasks build its `Process` on construction. Calling it
+A preset is a frozen dataclass of the numbers that define a convention.
+Objectives build its `Process` on construction. Calling it
 also builds a process for direct schedule inspection or low-level sampling.
 A record that holds the preset's fields rebuilds it exactly.
 """
@@ -43,11 +43,13 @@ class Preset(Protocol):
 
 
 def build_process(convention: Process | Preset) -> Process:
-    """Resolve a Gaussian convention for a diffusion objective or image task."""
+    """Resolve a Gaussian convention for a diffusion objective."""
     process = convention if isinstance(convention, Process) else convention()
     if not isinstance(process, Process):
+        kind = type(convention)
+        name = presets.name_of(kind) if kind in presets.values() else kind.__name__
         raise ValueError(
-            f"{type(convention).__name__} builds a {type(process).__name__}; "
+            f"preset {name!r} builds a {type(process).__name__}; "
             "image diffusion needs a Gaussian Process. Masked diffusion trains "
             "through LMRunConfig's --objective masked_diffusion")
     return process
