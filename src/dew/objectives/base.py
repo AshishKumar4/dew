@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -138,6 +138,14 @@ class Shown:
     percent: bool = False
     group: str | None = None
 
+
+
+@dataclass(frozen=True)
+class TrainingScalar:
+    """An objective-owned training report selected for ranking or stopping."""
+    owner: Objective
+    name: str
+    shown: Shown
 
 
 @struct.dataclass
@@ -303,6 +311,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
+    def scalar(self, name: str) -> TrainingScalar:
+        """Select a declared training scalar; `objective.loss` selects the loss itself."""
+        if name != 'loss' and name not in self.shown:
+            raise ValueError(f"the objective does not declare training scalar {name!r}")
+        return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
+
     @abstractmethod
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """Additive loss statistics and the reports from one realized batch.
@@ -398,6 +412,7 @@ def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
 S = TypeVar("S")
 
 
+@runtime_checkable
 class Metric(Protocol[S]):
     """Reduce a validation pass to one scalar, on the host.
 

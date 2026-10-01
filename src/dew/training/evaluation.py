@@ -78,7 +78,7 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
              key: jax.Array, metrics: Sequence[Metric] = (),
              step: int | jax.Array = 0, averaged: Variables | None = None,
              preview: bool = False, mesh: Mesh | None = None, split: str = "val",
-             schedule_step: int | jax.Array | None = None) -> Evaluation:
+             schedule_step: int | jax.Array | None = None, loss: bool = False) -> Evaluation:
     """Evaluate a finite coordinated prefix without an optimizer or tracker.
 
     batches opens a fresh iterator over this process's share of the split
@@ -111,11 +111,11 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     previews: tuple[Artifact, ...] = ()
     scored = records = 0
     uneven = False
-    if batches is not None and (metrics or preview_enabled):
+    if batches is not None and (metrics or preview_enabled or loss):
         scores, previews, scored, records, uneven = _score_split(
             objective, variables, batches, context, mesh, metrics=metrics, split=split,
             root=root, preview_enabled=preview_enabled, score_key=score_key,
-            preview_key=preview_key)
+            preview_key=preview_key, loss=loss)
     elapsed = time.perf_counter() - started
     scores, elapsed = broadcast_from_process_zero((scores, elapsed))
     return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
@@ -203,7 +203,7 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
-                 score_key: jax.Array, preview_key: jax.Array,
+                 score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
                  ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int, bool]:
     """Score the coordinated prefix of a validation split.
 
@@ -216,6 +216,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     its peers have already left.
     """
     summaries = _Accumulators()
+    loss_stats = None
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
@@ -242,23 +243,41 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             batch, rows = _placed_batch(mesh, batch, scored)
             records += rows
             produced = None
-            if metrics:
+            if metrics or loss:
                 # The objective scores under the mesh, as the step trains
                 # under it: the model's placements and its sequence and stage
                 # splits read it. A preview decodes, which neither split does.
                 with jax.set_mesh(mesh):
-                    produced = _scored_batch(objective, variables, batch, context, scored,
-                                             metrics=metrics, summaries=summaries,
-                                             score_key=score_key, root=root)
+                    if loss:
+                        assert batch is not None
+                        loss_batch = batch
+                        loss_variables = context.ema if context.ema is not None and not objective._ema_is_reference else variables
+                        statistics, _ = agreed(f"validation loss batch {scored}", lambda: objective.loss(
+                            loss_variables, loss_batch, replace(context, key=jax.random.fold_in(score_key, scored))))
+                        statistics = collective_host(statistics, phase=f"validation loss batch {scored}")
+                        loss_stats = statistics if loss_stats is None else jax.tree.map(
+                            lambda total, value: total + value, loss_stats, statistics)
+                    if metrics:
+                        produced = _scored_batch(objective, variables, batch, context, scored,
+                                                 metrics=metrics, summaries=summaries,
+                                                 score_key=score_key, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
-            if not metrics:
+            if not metrics and not loss:
                 break
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
+            if loss_stats is not None and f'{split}/loss' not in scores:
+                reduced = loss_stats
+                if isinstance(loss_stats, (np.ndarray, np.number)) and np.ndim(loss_stats) == 0:
+                    reduced = loss_stats / scored
+                value, valid = objective.reduce_loss(jax.tree.map(jnp.asarray, reduced))
+                if not bool(valid) or not np.isfinite(float(value)):
+                    raise ValueError("validation loss has no finite statistical support")
+                scores[f'{split}/loss'] = float(value)
     finally:
         _close_source(iterator if iterator is not None else source)
     return scores, previews, scored, records, uneven

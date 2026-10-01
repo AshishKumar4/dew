@@ -113,7 +113,7 @@ class DewLM(TemplateLM):
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool = True,
-                 step: int | None = None, dtype: str | None = None) -> DewLM:
+                 step: int | str | None = None, dtype: str | None = None) -> DewLM:
         """Load the run in `run` as a harness model, the way `dew.pipeline` builds it."""
         return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype),
                    batch_size=batch_size)
