@@ -144,7 +144,6 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
     from dew import Trainer
     from dew.data import Dataset
     from dew.objectives.lm import LMObjective
-    from dew.training.distributed import MeshSpec
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
                               max_seq_len=8, position_embedding='learned', mlp='gelu_exact',
@@ -152,11 +151,12 @@ def test_exact_nanogpt_architecture_trains_through_dew(bias):
                               attention_bias=bias, qk_norm=False, attention_impl='reference',
                               dropout_rate=.2, embedding_dropout_rate=.2, attention_dropout_rate=.2)
     rows = np.asarray([[2, 4, 8, 3, 2, 4, 8, 3, 2], [7, 3, 9, 5, 7, 3, 9, 5, 7]], np.int32)
+    rows = np.tile(rows, (jax.device_count(), 1))
     variables = model.init(jax.random.key(0), jnp.asarray(rows[:, :-1]))
     objective = LMObjective(model, seq_len=8, ema_decay=None, pretrained=variables)
     data = Dataset(train=lambda partition: iter({'text': rows} for _ in range(3)),
-                   val=None, records=6, batch=2)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(data=1))
+                   val=None, records=3 * len(rows), batch=len(rows))
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
     before = np.asarray(model.apply(variables, jnp.asarray(rows[:, :-1])))
     state = trainer.fit(data, steps=3)
     after = np.asarray(model.apply(state.params, jnp.asarray(rows[:, :-1])))
