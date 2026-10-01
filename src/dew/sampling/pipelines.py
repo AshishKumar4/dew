@@ -654,8 +654,9 @@ def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> V
 
     A run written before the table became a variable trained against the
     table its variable initializer draws. Apply the saved parameters with only
-    constants mutable: no parameter initializer runs or is traced. The shape
-    pass finds absent tables, and the compiled pass computes only those leaves.
+    constants mutable: parameters are read, not drawn. Flax still checks their
+    shapes abstractly. The shape pass finds absent tables, and the compiled
+    pass computes only those leaves.
     """
     from flax.traverse_util import flatten_dict, unflatten_dict
 
