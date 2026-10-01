@@ -33,6 +33,23 @@ def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
     return text
 
 
+def _row_guidance(record: Mapping[str, object], default: float | None) -> float:
+    """The guidance a row is walked at.
+
+    A record's own where it names one, and the checkpoint's pipeline default
+    otherwise. A model that reads no guidance (`default` None) refuses a
+    record that names one.
+    """
+    value = record.get("guidance")
+    if value is None:
+        return 0.0 if default is None else default
+    if default is None:
+        raise ValueError("This checkpoint's model reads no guidance value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+        raise ValueError("A record's guidance must be a finite number")
+    return float(value)
+
+
 def latent_image_conditions(autoencoder, params, pixels, mask, key):
     """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
@@ -215,20 +232,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return tokens
 
     def _guidance(self, record: Mapping[str, object]) -> float:
-        """The guidance a row is walked at.
-
-        A record's own where it names one, and this checkpoint's pipeline
-        default otherwise. A composition whose model reads no guidance
-        refuses a record that names one.
-        """
-        value = record.get("guidance")
-        if value is None:
-            return 0.0 if self.guidance is None else self.guidance
-        if self.guidance is None:
-            raise ValueError("This checkpoint's model reads no guidance value")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
-            raise ValueError("A record's guidance must be a finite number")
-        return float(value)
+        return _row_guidance(record, self.guidance)
 
     def time_ids(self, count, dtype):
         """SDXL's micro-conditioning: the original size, no crop, then the
@@ -426,6 +430,110 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
         shutil.copytree(Path(self.checkpoint) / "processor", destination / "processor",
                         dirs_exist_ok=True)
 
+
+
+@encoders("hidden_states_text")
+@dataclass(eq=False)
+class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
+    """Text conditioning read off a language model's hidden states: FLUX.2's
+    and Z-Image's.
+
+    Each pipeline formats a prompt with the encoder's chat template, pads
+    every row on the right to `tokens`, runs the encoder with the padding
+    mask, and concatenates, for each token, `hidden_states[k]` for k in
+    `layers`: the output of decoder layer k, the embeddings being k = 0.
+    `Flux2Pipeline` (a Mistral-3 encoder, `template="mistral3"`) writes a
+    system turn and a user turn and stacks layers 10, 20 and 30;
+    `Flux2KleinPipeline` (Qwen3, `template="qwen3"`) a user turn and the
+    assistant's opening with thinking off, layers 9, 18 and 27;
+    `ZImagePipeline` the same with `thinking` on, and reads the one layer
+    before the last. `mask` marks the real tokens: FLUX.2's transformer
+    reads every row whole, pads and their states included, and Z-Image's
+    only the real tokens. A prompt past the budget is refused rather than
+    cut, since the template's closing turn would go with it.
+    """
+
+    decoder: CausalTransformer
+    tokenizer: PreTrainedTokenizerBase
+    params: Variables
+    checkpoint: str
+    height: int
+    width: int
+    template: Literal["mistral3", "qwen3"]
+    layers: tuple[int, ...]
+    thinking: bool = False
+    tokens: int = 512
+    guidance: float | None = None
+    """The distilled guidance FLUX.2 [dev] embeds, its pipeline's default;
+    None for a transformer that embeds none."""
+    param_dtype: str = "float32"
+    keyword: ClassVar[str] = "conditioning"
+
+    SYSTEM: ClassVar[str] = (
+        "You are an AI that reasons about image descriptions. You give structured responses focusing on object "
+        "relationships, object\nattribution and actions without speculation.")
+    """FLUX.2's `SYSTEM_MESSAGE`, from black-forest-labs/flux2 at 5a5d316b."""
+
+    def _conversation(self, prompt: str) -> tuple[list[dict], dict]:
+        if self.template == "qwen3":
+            return ([{"role": "user", "content": prompt}],
+                    {"add_generation_prompt": True, "enable_thinking": self.thinking})
+        return ([{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]},
+                 {"role": "user", "content": [{"type": "text", "text": prompt.replace("[IMG]", "")}]}],
+                {"add_generation_prompt": False})
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
+                        param_dtype: str = "float32", revision: str | None = None,
+                        attention_impl: str = "auto", tokens: int = 512,
+                        params: Variables | None = None):
+        from dew.interop.pretrained import load_hidden_states_conditioner
+
+        return load_hidden_states_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
+                                              attention_impl=attention_impl, tokens=tokens, params=params)
+
+    def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
+        rows, guidance = [], []
+        for prompt in texts:
+            record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
+            conversation, options = self._conversation(_prompt(record, "text", ""))
+            rows.append(self.tokenizer.apply_chat_template(conversation, tokenize=False, **options))
+            guidance.append(_row_guidance(record, self.guidance))
+        # The template writes the special tokens itself: [dev]'s tokenizing
+        # `apply_chat_template` has the tokenizer add none, and the Qwen
+        # tokenizers [klein] and Z-Image call add none of their own.
+        encoded = self.tokenizer(rows, padding="max_length", padding_side="right", max_length=self.tokens,
+                                 add_special_tokens=False)
+        if any(len(ids) > self.tokens for ids in encoded.input_ids):
+            raise ValueError(f"A prompt runs past the {self.tokens}-token budget; raise `tokens`")
+        tokens: dict[str, np.ndarray] = {"input_ids": np.asarray(encoded.input_ids, np.int32),
+                                         "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
+        if self.guidance is not None:
+            tokens["guidance"] = np.asarray(guidance, np.float32)
+        return tokens
+
+    def encode(self, params, tokens) -> DenoisingCondition:
+        from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+
+        _, kept = self.decoder.apply(
+            {"params": params["text_encoder"]["params"]}, jnp.asarray(tokens["input_ids"]),
+            attention_mask=jnp.asarray(tokens["attention_mask"], bool), method="hidden_states",
+            capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
+        states = [layer_output(kept[INTERMEDIATES], layer - 1) for layer in self.layers]
+        guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)
+        return DenoisingCondition(jnp.concatenate(states, axis=-1),
+                                  mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)
+
+    def captions(self, tokens):
+        return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
+
+    def to_json(self):
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.decoder.dtype),
+                "param_dtype": self.param_dtype, "tokens": self.tokens}
+
+    def save_assets(self, destination: Path) -> None:
+        """Copy the tokenizer's files as they came: they are read, never trained."""
+        shutil.copytree(Path(self.checkpoint) / "tokenizer", destination / "tokenizer", dirs_exist_ok=True)
 
 @lru_cache(maxsize=32)
 def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
