@@ -46,6 +46,7 @@ class DiskConfig:
     bank_layers: int | None = None
     probe_layers: int = 2
     read_ahead: bool = True
+    warmup: bool = True
     trace: str | None = None
 
 
@@ -125,7 +126,14 @@ def measure(config: DiskConfig):
                   file=sys.stderr, flush=True)
             return prefill_seconds, time.perf_counter() - started, np.asarray(jnp.concatenate(emitted, axis=1))
 
-        run()  # Compile outside the measured interval; also warms filesystem and retained rows.
+        if config.warmup:
+            run()  # Also warms filesystem and retained rows.
+        else:
+            # Compile without an extra SSD sweep. Cache initialization has
+            # already admitted retained rows; an unretained model larger
+            # than RAM cannot stay warm in the filesystem cache anyway.
+            prefill = prefill.lower(variables, cache, prompt).compile()
+            decode = decode.lower(variables, cache, jnp.zeros((1, 1), jnp.int32)).compile()
         before = source.stats()
         before_io = storage_reads()
         if config.trace:
