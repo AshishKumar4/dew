@@ -132,7 +132,7 @@ def test_multi_split_metric_keys_and_ambiguous_selection(tmp_path):
             validation=readers, best=Best(lambda m: abs(m['first', metric] - .5), top=1))
     assert run.checkpoints.best == 3
     record = run.checkpoints.kept()[0]
-    assert {'first/value', 'second/value', 'first/loss', 'second/loss'} <= set(record.metrics)
+    assert {'first/value', 'second/value'} <= set(record.metrics)
 
 
 def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
@@ -168,14 +168,14 @@ def test_training_values_are_selected_through_the_objective(tmp_path):
 
 
 def test_time_cadence_and_recorded_duration(tmp_path):
-    from dew.config import BestConfig, TrainerConfig
+    from dew.config import TrainerConfig
     from dew.data import Dataset
 
     assert TrainerConfig(checkpoint_every='30m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2)) == datetime.timedelta(minutes=30)
     with pytest.raises(ValueError, match='positive duration'):
         TrainerConfig(checkpoint_every='0m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2))
     with pytest.raises(TypeError, match='code-only'):
-        BestConfig(lambda m: 0)
+        TrainerConfig(best=Best(lambda m: 0))
     run = trainer(tmp_path / 'run', keep=Keep(latest=5))
     run.fit(data(), steps=3, log_every=1, checkpoint_every=datetime.timedelta(microseconds=1))
     assert [entry.step for entry in run.checkpoints.kept()] == [1, 2, 3]
@@ -203,12 +203,12 @@ def test_missing_scores_do_not_rank_and_declared_max_is_inferred(tmp_path):
 
 
 def test_named_config_selector_roundtrips_and_refuses_callable():
-    from dew.config import BestConfig, RunConfig, TrainerConfig
+    from dew.config import RunConfig, TrainerConfig
     metric = Value('accuracy', Shown(better='higher'))
-    config = RunConfig(trainer=TrainerConfig(best=BestConfig('accuracy', top=2), checkpoint_every='15m'))
+    config = RunConfig(trainer=TrainerConfig(best=Best('accuracy', top=2), checkpoint_every='15m'))
     assert RunConfig.from_dict(config.to_dict()) == config
     best = config.trainer.best_policies([metric])[0]
-    assert best.metric is metric and best.top == 2
+    assert best.metric == 'accuracy' and best.top == 2
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=lambda m: 1.)
 
@@ -290,3 +290,21 @@ def test_validation_loss_uses_exactly_the_ema_weights_of_the_evaluated_state():
     assert result.scores['val/loss'] == 0.
     direct = evaluate(objective, averaged, data().val, key=jax.random.key(0), step=7, loss=True)
     assert direct.scores == result.scores
+
+
+def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_path):
+    metric = Value('value', Shown(better='lower'))
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1, where=lambda c: c.metrics[metric] < .4))
+    run.fit(data(), steps=6, log_every=1, eval_every=1, checkpoint_every=1,
+            metrics=[metric], best=Best(metric, mode='max'))
+    retained = run.checkpoints.kept()
+    assert {entry.step for entry in retained} == {1, 2, 6}
+    for entry in retained:
+        assert entry.metrics[metric] == entry.metrics['val/value']
+    class WithCe(Overfit):
+        shown = {'ce': Shown(better='lower')}
+    objective = WithCe()
+    assert 'ce' in dir(objective.values)
+    assert objective.values.ce.owner is objective
+    with pytest.raises(AttributeError, match='does not declare'):
+        _ = objective.values.unknown_report

@@ -148,6 +148,32 @@ class TrainingScalar[Statistics, Additions]:
     shown: Shown
 
 
+class TrainingValues[Statistics, Additions]:
+    """Typed, completable attributes for the objective's declared training reports.
+
+    Dynamic objectives may use item lookup. Undeclared attributes fail at
+    access, before a fit starts; completion lists the objective's own names.
+    """
+    loss: TrainingScalar[Statistics, Additions]
+    ce: TrainingScalar[Statistics, Additions]
+    aux_loss: TrainingScalar[Statistics, Additions]
+
+    def __init__(self, owner: Objective[Statistics, Additions]):
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        try:
+            return self._owner.scalar(name)
+        except ValueError as missing:
+            raise AttributeError(str(missing)) from missing
+
+    def __getitem__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        return self._owner.scalar(name)
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(object.__dir__(self)) | {'loss'} | set(self._owner.shown))
+
+
 @struct.dataclass
 class Prediction:
     """Hold what a token objective scored a batch with, for a teacher to compare.
@@ -310,6 +336,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         trainer passes it as data; None means take it from this objective's
         own `held_variables`. An objective that holds nothing ignores it.
         """
+
+    @property
+    def values(self) -> TrainingValues[Loss, Effects]:
+        return TrainingValues(self)
 
     def scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
         """Select a declared training scalar; `objective.loss` selects the loss itself."""

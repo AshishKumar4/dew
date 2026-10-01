@@ -1,12 +1,4 @@
 {
- "dew.config.BestConfig": {
-  "metric": "required",
-  "top": 1,
-  "mode": null,
-  "threshold": null,
-  "weights_only": false,
-  "split": "val"
- },
  "dew.config.ModelConfig": {
   "architecture": "simple_dit",
   "attention_impl": "auto",
@@ -1736,6 +1728,14 @@
   ],
   "tile_size": null,
   "weight_only": false
+ },
+ "dew.training.selection.Best": {
+  "metric": "required",
+  "top": 1,
+  "mode": null,
+  "threshold": null,
+  "weights_only": false,
+  "split": null
  },
  "dew.training.trainer.ProfileWindow": {
   "directory": "required",

@@ -164,10 +164,38 @@ def _recorded_rank(metrics):
                                     if key.startswith('checkpoint/rank/')), None))
 
 
+class Metrics(Mapping):
+    """Recorded scalars indexed by their names or by the objects that produced them."""
+    def __init__(self, values: Mapping[str, float]):
+        self._values = values
+
+    def __getitem__(self, key):
+        from dew.objectives.base import Metric, TrainingScalar
+        if isinstance(key, str):
+            return self._values[key]
+        if isinstance(key, TrainingScalar):
+            return self._values[f'train/{key.name}']
+        if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], Metric):
+            return self._values[f'{key[0]}/{key[1].name}']
+        if isinstance(key, Metric):
+            names = [name for name in self._values if not name.startswith('checkpoint/')
+                     and (name == key.name or name.endswith('/' + key.name))]
+            if len(names) != 1:
+                raise KeyError(f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)")
+            return self._values[names[0]]
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+
 @dataclasses.dataclass(frozen=True)
 class Kept:
     step: int
-    metrics: Mapping[str, float]
+    metrics: Metrics
     ranked_by: str | None
     mode: str | None
     kind: str = 'state'
@@ -533,8 +561,13 @@ class _RankedSteps(preservation.PreservationPolicy):
             if keep.interval and (previous is None or checkpoint.time - previous >= keep.interval):
                 held.add(checkpoint.step)
                 previous = checkpoint.time
-            if keep.where and keep.where(Kept(checkpoint.step, checkpoint.metrics or {}, None, None)):
-                held.add(checkpoint.step)
+            if keep.where:
+                try:
+                    selected = keep.where(Kept(checkpoint.step, Metrics(checkpoint.metrics or {}), None, None))
+                except KeyError:
+                    selected = False
+                if selected:
+                    held.add(checkpoint.step)
         return [checkpoint.step in held for checkpoint in checkpoints]
 
 
@@ -594,7 +627,7 @@ class Checkpoints:
         retained = {checkpoint.step: checkpoint.metrics for checkpoint in self.kept()}
         if self._pending is not None and self._open().is_saving_in_progress():
             step, scores = self._pending
-            retained[step] = scores
+            retained[step] = Metrics(scores)
         else:
             self._pending = None
         candidates = []
@@ -620,7 +653,7 @@ class Checkpoints:
             metadata = persistent.metadata(step)
             custom = metadata.custom_metadata or {}
             selection = next(iter((custom.get('rankings') or {}).values()), {})
-            kept.append(Kept(step, metadata.metrics or {}, custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), 'weights' if custom.get('weights_only') else 'state', custom.get('rankings') or {}))
+            kept.append(Kept(step, Metrics(metadata.metrics or {}), custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), 'weights' if custom.get('weights_only') else 'state', custom.get('rankings') or {}))
         return kept
 
     def control(self, step: int) -> dict:
