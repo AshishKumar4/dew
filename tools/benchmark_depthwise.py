@@ -2,9 +2,12 @@
 """Measure 3x3 depthwise forward/VJP and the published 176M DiT's step.
 
 RTX 4080: ~/.cache/dew/dew-gpu-run env PYTHONPATH=src python tools/benchmark_depthwise.py kernels
-Run `step --implementation lax` and `step --implementation shifted` in separate
-processes. The diagnostic lax choice substitutes the original primitive only
-inside this benchmark; production dispatch has no performance flag.
+Run `step --implementation lax`, `step --implementation shifted` and
+`step --implementation plain` in separate processes. The diagnostic choices
+substitute another primitive for the dilated kernels only inside this
+benchmark: lax the original convolution, plain the nine shifted products at
+dilation 2 without the fp32 materialization CUDA takes; production dispatch
+has no performance flag.
 """
 
 import argparse
@@ -54,12 +57,12 @@ def timed(operation, args, repeats):
 def kernels(args):
     rng = np.random.default_rng(17)
     rows = []
-    for batch in (16, 32):
+    for batch in ((16, 32) if args.batch_size is None else (args.batch_size,)):
         for dtype in (jnp.float32, jnp.bfloat16):
             x = jnp.asarray(rng.normal(size=(batch, 16, 16, 768)), dtype)
             kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 768)), dtype)
             cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
-            for dilation in (1, 2, 3):
+            for dilation in args.dilations:
                 expected = jax.jit(partial(vjp, partial(reference, dilation=dilation)))(
                     x, kernel, cotangent)
                 magnitudes = jax.jit(partial(vjp, partial(reference, dilation=dilation)))(
@@ -103,6 +106,10 @@ def step(args):
     if args.implementation == 'lax':
         conv._depthwise_3x3 = partial(reference, precision=None)
         conv._cuda_depthwise_3x3 = partial(reference, precision=None)
+    elif args.implementation == 'plain':
+        materialized = conv._cuda_depthwise_3x3
+        conv._cuda_depthwise_3x3 = lambda x, w, dilation: (
+            conv._depthwise_3x3 if dilation == 2 else materialized)(x, w, dilation)
     config = {'emb_features': 768, 'mlp_ratio': 4, 'norm_epsilon': 1e-5,
               'num_heads': 12, 'num_layers': 16, 'patch_size': 2, 'scan_order': 'zigzag',
               'ssm_attention_ratio': '3:1', 'ssm_state_dim': 64, 'text_pooling': 'all',
@@ -199,10 +206,12 @@ def errors(lhs, rhs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('kernels', 'step', 'checkpoint'))
-    parser.add_argument('--implementation', choices=('lax', 'shifted'), default='shifted')
+    parser.add_argument('--implementation', choices=('lax', 'shifted', 'plain'), default='shifted')
     parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='bfloat16',
                         help='Training step compute dtype; checkpoint keeps the published dtypes.')
     parser.add_argument('--batch-size', type=int, choices=(16, 32), help='One step case in a fresh process.')
+    parser.add_argument('--dilations', type=int, nargs='+', choices=(1, 2, 3), default=(1, 2, 3),
+                        help='Depthwise kernel dilations to measure.')
     parser.add_argument('--remat', action='store_true', help='The same rematerialization policy for both paths.')
     parser.add_argument('--repeats', type=int, default=50)
     parser.add_argument('--output', type=Path, default=Path('depthwise.json'))
