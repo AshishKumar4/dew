@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile
 
 jobs:
   lint:

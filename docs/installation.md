@@ -80,6 +80,8 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
+The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
+
 tokamax kernels have no extra (`dew.nn.moe` says why).
 
 ## Development install
