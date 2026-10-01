@@ -59,10 +59,7 @@ FAKE_SCORE = "fake_score"
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
 
-DISCRIMINATOR = "discriminator"
-"""Where an adversarial objective's discriminator heads live in `params`."""
-
-LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
+LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE)
 """What trains beside the model under `params` and the model never reads."""
 
 
