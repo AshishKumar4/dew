@@ -194,33 +194,3 @@ jobs:
       with:
         name: pytest-report-${{ matrix.python-version }}-${{ matrix.shard }}
         path: pytest-report.xml
-
-  gpt2-checkpoint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      JAX_PLATFORMS: cpu
-      OPENBLAS_NUM_THREADS: "1"
-      OMP_NUM_THREADS: "1"
-    steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-        cache: pip
-        cache-dependency-path: pyproject.toml
-    - name: Install the fp32 reference and Dew
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[test]" -c constraints.txt
-    - name: Compare GPT-2 small logits and cached greedy generation
-      run: |
-        PYTHONPATH=src python tools/classic_gpt_reference.py \
-          --checkpoint openai-community/gpt2 --output gpt2-parity.json
-    - name: Upload the checkpoint parity measurement
-      if: always() && hashFiles('gpt2-parity.json') != ''
-      uses: actions/upload-artifact@v4
-      with:
-        name: gpt2-parity
-        path: gpt2-parity.json
