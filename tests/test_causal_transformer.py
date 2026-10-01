@@ -69,23 +69,35 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
 
 def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
     from dew.config import ModelConfig
+    from flax.traverse_util import unflatten_dict
+    from jax import export
 
     config = dict(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
                   mlp_features=16, max_seq_len=8)
     model = ModelConfig("causal_transformer", config=config, dtype="float32",
                         matmul_precision="highest", attention_impl="reference").build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
-    held = np.load(Path(__file__).with_name("fixtures") / "decoder-default-dropout.npz")
+    directory = Path(__file__).with_name("fixtures")
+    held = np.load(directory / "decoder-default-dropout.npz")
+    try:
+        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
+    except Exception as error:
+        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
     with jax.default_device(jax.devices("cpu")[0]):
         ids = jnp.asarray(held["ids"])
-        params = model.init(jax.random.key(2026), ids)
-        forward = np.asarray(model.apply(params, ids, train=True))
-        assert forward.tobytes() == held["forward"].tobytes()
-        gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
-        for kind, values in (("params", params), ("grad", gradient)):
-            for path, leaf in jax.tree_util.tree_flatten_with_path(values)[0]:
-                expected = held[kind + "/" + "/".join(item.key for item in path)]
-                assert np.asarray(leaf).tobytes() == expected.tobytes()
+        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
+                                 for name, leaf in held.items() if name.startswith("params/")})
+
+        def forward_and_gradient(params, ids):
+            forward = model.apply(params, ids, train=True)
+            gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
+            return forward, gradient
+
+        expected = before.call(params, ids)
+        actual = jax.jit(forward_and_gradient)(params, ids)
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
 
 
 def test_embedding_dropout_matches_flax_on_the_same_draw(rng):
