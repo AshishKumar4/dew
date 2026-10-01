@@ -408,7 +408,11 @@ run that wants the unet flag can pass `--trainer.xla-flags`.
 Two flags stand out for other reasons:
 
 - `--xla_gpu_autotune_level=4` changes nothing on any architecture, because
-  it is already the default in this build.
+  it is already the default in this build. Level 0 turns autotuning off,
+  which removes XLA's compile-time kernel choice as a source of run-to-run
+  differences (see [checkpoints](guides/checkpoints.md)). On the 4080 it
+  slowed the 176M hybrid DiT's step from 139 to 151 ms and a 67M decoder's
+  from 79.8 to 81.5 ms, two fresh processes each.
 - `--xla_gpu_enable_command_buffer=` (command buffers off) is the only
   configuration that is reliably slower: 17.90 against 17.38 on the unet over
   four runs, and slower on the other two as well. Command buffers are on by
