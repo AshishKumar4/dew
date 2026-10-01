@@ -403,7 +403,7 @@ def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
 
 class PowerProfilesState(NamedTuple):
     """The state `power_profiles` keeps beside its solver's."""
-    count: jax.Array
+    updates: jax.Array
     """Updates made, the t of the averages' profiles."""
     stds: jax.Array
     """The relative standard deviation of each average."""
@@ -420,9 +420,9 @@ def power_profiles(solver: optax.GradientTransformation,
     Update t keeps (1 - 1/t)^(γ + 1) of each average and blends in the rest
     of the parameters it just made (Karras et al. 2024, Eq. 127). The
     averages ride in the optimizer state, so they are sharded, placed and
-    skipped on a rejected step exactly as its moments are; a checkpoint save
-    transfers them off the devices once, as the snapshot of its step
-    (`Checkpoints.profile_steps`), which a restore reads them back from. Each std is rounded to fp32 first, the
+    skipped on a rejected step exactly as its moments are. Each checkpoint
+    is also the snapshot of its step (`Checkpoints.profile_steps`), retained
+    whole so the state and averages share one atomic save. Each std is rounded to fp32 first, the
     precision the state records it in.
     """
     from dew.training.posthoc import power_decay
@@ -435,7 +435,7 @@ def power_profiles(solver: optax.GradientTransformation,
     solver = optax.with_extra_args_support(solver)
 
     def init_fn(params):
-        return PowerProfilesState(count=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
+        return PowerProfilesState(updates=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
                                   averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds),
                                   inner=solver.init(params))
 
@@ -444,9 +444,9 @@ def power_profiles(solver: optax.GradientTransformation,
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
         produced = optax.apply_updates(params, updates)
-        averages = tuple(ema_update(average, produced, decay(state.count))
+        averages = tuple(ema_update(average, produced, decay(state.updates))
                          for average, decay in zip(state.averages, decays, strict=True))
-        return updates, PowerProfilesState(state.count + 1, state.stds, averages, inner)
+        return updates, PowerProfilesState(state.updates + 1, state.stds, averages, inner)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 

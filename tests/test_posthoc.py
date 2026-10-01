@@ -82,9 +82,8 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
 
 
 def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
-    """The averages go to disk as the snapshot of the step alone, not again
-    inside the checkpoint's optimizer state, and every restore reads them
-    back from it bit for bit."""
+    """A snapshot is the ordinary checkpoint itself: averages are stored
+    once in opt_state, retained, and every restore reads them bit for bit."""
     def trainer():
         return Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
                        checkpoints=Checkpoints(str(tmp_path / "run")))
@@ -93,8 +92,8 @@ def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     written = checkpoints._open().item_metadata(8)
-    assert dict(written)["opt_state"]["averages"] is None
-    stored = checkpoints.stored(8)["opt_state"]["averages"]
+    assert dict(written)["opt_state"]["averages"] is not None
+    stored = tuple(checkpoints.stored(8)["opt_state"]["averages"])
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), stored) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), state.opt_state.averages)
     restored, _, _ = trainer().place()
@@ -115,7 +114,7 @@ def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
     assert isinstance(state, PowerProfilesState)
     np.testing.assert_array_equal(state.stds, np.float32([0.05, 0.10]))
     _, state = solver.update({"w": jnp.ones(3)}, state, params)
-    assert int(state.count) == 1
+    assert int(state.updates) == 1
     # The first update takes the weights it made whole.
     for average in state.averages:
         np.testing.assert_array_equal(average["w"], params["w"] - 2.7e-4 * np.ones(3, np.float32))
@@ -135,15 +134,83 @@ def test_a_local_checkpoint_keeps_the_profiles_in_its_state(tmp_path):
     assert checkpoints.profile_steps() == []
 
 
-def test_an_archive_failure_surfaces_from_wait(tmp_path, monkeypatch):
-    checkpoints = Checkpoints(str(tmp_path / 'run'))
-
-    def fail():
-        raise OSError('archive failed')
-
-    monkeypatch.setattr(checkpoints, '_archive_profiles', fail)
+def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconstructed(tmp_path, monkeypatch):
+    directory = str(tmp_path / 'run')
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
     state = trainer.fit(Data(), steps=2, log_every=2)
+    checkpoints = Checkpoints(directory, keep=1)
+    checkpoints.save(2, state, None, metrics={'loss': 0.2})
+    checkpoints.wait()
+
+    interrupted = Checkpoints(directory, keep=1)
+
+    import orbax.checkpoint as ocp
+
+    handler = ocp.PyTreeCheckpointHandler()
+
+    def fail_before_commit(directory):
+        raise OSError('interrupted before commit')
+
+    monkeypatch.setattr(handler, 'finalize', fail_before_commit)
+    interrupted._manager = ocp.CheckpointManager(
+        directory, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True),
+        item_handlers=handler)
+    interrupted.save(4, state.replace(step=jnp.int32(4)), None, metrics={'loss': 0.1})
+    with pytest.raises(OSError, match='interrupted before commit'):
+        interrupted.wait()
+    # The one write failed before its atomic commit. A fresh process must
+    # not select that step for resume, best weights, or reconstruction.
+    assert interrupted.latest == interrupted.best == 2
+    fresh = Checkpoints(directory, keep=1)
+    assert fresh.latest == fresh.best == 2
+    assert fresh.profile_steps() == [2]
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state)
+    restored, _ = fresh.restore(template)
+    def bits(leaf):
+        if isinstance(leaf, jax.Array) and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key):
+            leaf = jax.random.key_data(leaf)
+        return np.asarray(leaf)
+
+    for held, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(bits(held), bits(expected))
+
+    fresh.save(6, state.replace(step=jnp.int32(6)), None, metrics={'loss': 0.05})
+    fresh.wait()
+    assert fresh.latest == fresh.best == 6
+    assert fresh.profile_steps() == [2, 6]
+    assert fresh._open().all_steps() == [2, 6]
+
+
+@pytest.mark.parametrize('kind', ['array', 'list', 'frozen'])
+def test_power_profiles_keeps_the_parameters_pytree(kind):
+    from flax.core import freeze
+
+    params = jnp.ones(3)
+    if kind == 'list':
+        params = [params, {'nested': jnp.ones(2)}]
+    elif kind == 'frozen':
+        params = freeze({'w': params, 'nested': {'b': jnp.ones(2)}})
+    solver = power_profiles(optax.sgd(0.1), (0.05, 0.10))
+    state = solver.init(params)
+    updates, state = solver.update(jax.tree.map(jnp.ones_like, params), state, params)
+    expected = optax.apply_updates(params, updates)
+    for average in state.averages:
+        assert jax.tree.structure(average) == jax.tree.structure(expected)
+        for held, weight in zip(jax.tree.leaves(average), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(held), np.asarray(weight))
+
+
+def test_reconstruction_accumulates_bfloat16_weights_in_float32(tmp_path):
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
+    state = trainer.fit(Data(), steps=2, log_every=2)
+    averages = tuple(jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), average)
+                     for average in state.opt_state.averages)
+    state = state.replace(params=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), state.params),
+                          opt_state=state.opt_state._replace(averages=averages))
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
     checkpoints.save(2, state, None)
-    with pytest.raises(OSError, match='archive failed'):
-        checkpoints.wait()
+    checkpoints.wait()
+    rebuilt = reconstruct(str(tmp_path / 'run'), float(np.float32(0.05)))
+    for held, expected in zip(jax.tree.leaves(rebuilt), jax.tree.leaves(averages[0]), strict=True):
+        assert held.dtype == np.asarray(expected).dtype
+        np.testing.assert_array_equal(held.view(np.uint16), np.asarray(expected).view(np.uint16))
