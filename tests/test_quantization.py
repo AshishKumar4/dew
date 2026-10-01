@@ -71,20 +71,22 @@ def quantized_forward(spec, **overrides):
     return model, qmodel, variables, ids
 
 
-def test_the_wrapped_forward_matches_qwixs_own_call():
-    """Dew's wrapping against the provider built by hand: identical logits,
-    and both away from the fp32 forward. The gap is the assertion: rules
-    that never reached a matmul would leave the fp32 numerics bitwise.
-    Observed on CPU: wrapped and hand-built bitwise equal, 1.2e-01 from
-    fp32 on logits of order 3."""
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
+    """Dew's wrapping against the provider built by hand, over the layer
+    loop and over the scanned stack: identical compiled logits, and both
+    away from the fp32 forward. The gap is the assertion: rules that never
+    reached a matmul would leave the fp32 numerics bitwise. Observed with
+    both layouts: wrapped and hand-built bitwise equal on CPU and on the RTX
+    4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080) from fp32 on logits up to 3.9."""
     qwix = pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(Quantization())
+    model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
     reference = qwix.quantize_model(model, qwix.QtProvider(rules))
-    plain = model.apply(variables, ids)
-    wrapped = qmodel.apply(variables, ids)
-    manual = reference.apply(variables, ids)
+    plain = jax.jit(model.apply)(variables, ids)
+    wrapped = jax.jit(qmodel.apply)(variables, ids)
+    manual = jax.jit(reference.apply)(variables, ids)
     assert float(jnp.max(jnp.abs(wrapped - manual))) == 0.0
     assert float(jnp.max(jnp.abs(wrapped - plain))) > 1e-2
 
@@ -151,11 +153,12 @@ def test_a_scanned_quantized_stack_quantizes_what_the_plain_one_does():
     """Quantization composes with the scan: the wrapped scan runs as many
     int8 products as the wrapped plain loop (19 for this model), and its
     compiled logits stay away from its fp32 twin, so the rules reached the
-    matmuls under the scan. The two stacks' logits are not compared: the
-    scan body and the unrolled layers compile to different fusions, which on
-    the RTX 4080 differ by 2.3e-04 unquantized, and int8 rounding turns that
-    into 7.0e-02 on logits of order 4, at the default and the highest matmul
-    precision alike (0.0 on CPU)."""
+    matmuls under the scan. Its logits are checked against Qwix's own call
+    over the same scanned stack (`test_the_wrapped_forward_matches_qwixs_own_call`),
+    not against the plain loop's: the scan body and the unrolled layers
+    compile to different fusions, which on the RTX 4080 differ by 2.3e-04
+    unquantized, and int8 rounding turns that into 7.0e-02 on logits of order
+    4, at the default and the highest matmul precision alike (0.0 on CPU)."""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(), scan_layers=True)
