@@ -41,6 +41,7 @@ checkout = Path(importlib.util.find_spec("dew").origin).parents[2]
 (directory / f"{stem}.json").write_text(json.dumps({
     "dew_commit": subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
     "jax_version": jax.__version__, "jaxlib_version": version("jaxlib"), "platforms": ["cpu"],
+    "flatbuffers_version": version("flatbuffers"),
     "calling_convention_version": exported.calling_convention_version,
     "computation": "forward logits and parameter gradient of their sum, with weights and token IDs as arguments",
     "export_sha256": hashlib.sha256(serialized).hexdigest(),

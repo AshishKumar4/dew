@@ -76,6 +76,9 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    # The legacy decoder graph test deserializes jax.export; JAX does not
+    # declare flatbuffers. This version wrote the committed export fixture.
+    "flatbuffers==25.12.19",
     "pytest-xdist",
     # CI's shards: splits the suite by tests/test_durations.json.
     "pytest-split>=0.11",
