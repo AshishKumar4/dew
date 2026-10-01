@@ -493,9 +493,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     scoring pass runs.
 
     `pretrained` is a variables dict to start from instead of a fresh
-    init, as `dew.interop.load_pretrained(...).variables` returns for a
-    Hugging Face checkpoint. The trainer takes its whole initial state
-    from `init`, so continued pretraining starts here.
+    init. A `dew.interop.load_pretrained(...)` bundle's `lm_objective`
+    builds the objective with its model and variables together. The
+    trainer takes its whole initial state from `init`.
 
     `balance_rate` moves each sparse layer's routing bias against its
     load by this much every step, which is DeepSeek's aux-loss-free

@@ -85,7 +85,8 @@ class ByteTokenizer:
         self.eos_id = 255
         self.bos_id = None
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        """UTF-8 byte ids; this vocabulary has no special tokens to insert."""
         return list(text.encode("utf-8"))
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
@@ -132,8 +133,8 @@ class HFTokenizer:
             return bos
         raise TypeError(f"{self.name} names a bos_token_id that is not one id: {bos!r}")
 
-    def encode(self, text: str) -> list[int]:
-        return self.tokenizer.encode(text)
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         # batch_decode of one row is decode's text, typed as one str.

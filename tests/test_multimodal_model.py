@@ -26,7 +26,7 @@ from dew.interop.pretrained import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
+
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -64,8 +64,8 @@ def test_objective_pixel_gradient_matches_reference(source):
     The gradient crosses image encoder, projection, decoder and shifted loss.
     """
     loaded, inputs = source
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None, pad_id=0)
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
 
     def loss(pixels):
@@ -85,8 +85,8 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     """One real Trainer update agrees with the reference's all-parameter SGD."""
     loaded, inputs = source
     reference = json.loads((FIXTURE / "training.json").read_text())
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None, pad_id=0)
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None, pad_id=0)
     rows = 2 * jax.device_count()
     training_inputs = inputs.take_rows(jnp.arange(rows) % 2)
     data = Dataset(train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows)
@@ -307,7 +307,7 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
                          {"pixel_values": jnp.asarray(images)})
     rows = 2 * jax.device_count()
     repeated = inputs.take_rows(jnp.arange(rows) % 2)
-    objective = LMObjective(loaded.model, tokens.shape[1] - 1, pretrained=loaded.variables,
+    objective = loaded.lm_objective(tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
     data = Dataset(train=lambda partition: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
@@ -520,8 +520,8 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
     but misses this update by 0.00167.
     """
     family, loaded, inputs, directory = family_source
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None, pad_id=0)
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
 
     def loss(params, pixels):

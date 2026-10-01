@@ -218,3 +218,4 @@ def test_a_task_reads_an_older_record_with_the_spec_at_the_top_level(tmp_path):
              "trainer": {**written["trainer"], "quantization": None}}
     (tmp_path / "run.json").write_text(json.dumps(older))
     assert _saved_quantization(run_record(str(tmp_path))) == Quantization()
+
