@@ -6,8 +6,11 @@ Run once with LADD_STEPS 0 to train and save the teacher, then with
 TEACHER_STEPS 0 to distill it. Outputs go to $LADD_OUTPUT (the teacher's
 weights and the synthetic set are cached there). An override set holds the
 objective's fields and the run's: lr, head_lr, batch, accumulation, seed,
-synthetic (train on the teacher's own samples, as LADD does) and
-eval_every (FID-5k at 1 and 4 steps every that many optimizer steps).
+synthetic (train on the teacher's own samples, as LADD does),
+eval_every (FID-5k at 1 and 4 steps every that many optimizer steps, and a
+checkpoint of the whole training state in $LADD_OUTPUT/seed_<seed>, which a
+rerun resumes from), evaluate (false skips the FID) and stop (end after that
+many steps, as a dropped run would).
 
 A flow teacher (simple_dit, patch 2, width 256, 6 blocks, class-name
 prompts) trains
@@ -28,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from dew.checkpoints import Checkpoints
 from dew.diffusion import presets
 from dew.eval.fid import fid
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -54,7 +58,12 @@ def network():
 
 
 def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128, accumulation=1, data=None,
-          evaluate=None, eval_every=0):
+          evaluate=None, eval_every=0, checkpoints=None, stop=None):
+    """`steps` optimizer steps of `task`. With `checkpoints` (a directory) the
+    whole training state and the data sampler's state are saved at every
+    evaluation and at the end, and a run that finds a checkpoint there
+    resumes from the latest one. `stop` ends the run after that many steps,
+    as a dropped run would."""
     pixels, classes = (images, labels) if data is None else data
     optimizer = optax.adamw(lr)
     if head_lr is not None:
@@ -66,8 +75,27 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
     state = trainer.initial_state()
     rng = np.random.default_rng(seed)
     text = CharTable.from_pretrained("char_table")
+    store = None if checkpoints is None else Checkpoints(checkpoints)
+    first = 0
+    if store is not None and store.latest is not None:
+        template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
+                                state)
+        first = store.latest
+        state, _ = store.restore(template, first)
+        with open(f"{checkpoints}/sampler_{first}.json") as handle:
+            rng.bit_generator.state = json.load(handle)
+        print(json.dumps({"resumed": first}), flush=True)
+
+    def save(done):
+        if store is None:
+            return
+        store.save(done, state, None)
+        store.wait()
+        with open(f"{checkpoints}/sampler_{done}.json", "w") as handle:
+            json.dump(rng.bit_generator.state, handle)
+
     step = None
-    for index in range(steps * accumulation):
+    for index in range(first * accumulation, steps * accumulation):
         rows = rng.integers(0, len(pixels), rows_per_step // accumulation)
         batch = {"image": pixels[rows], "text": text.tokenize([names[c] for c in classes[rows]])}
         step = step or trainer.compile(state, batch)
@@ -76,8 +104,14 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
             print(index // accumulation, {k: round(float(v), 3) for k, v in jax.device_get(metrics).items()},
                   flush=True)
         done = (index + 1) // accumulation
-        if evaluate is not None and eval_every and (index + 1) % accumulation == 0 and done % eval_every == 0:
-            print(json.dumps({"step": done, **evaluate(state.params)}), flush=True)
+        if eval_every and (index + 1) % accumulation == 0 and done % eval_every == 0:
+            if evaluate is not None:
+                print(json.dumps({"step": done, **evaluate(state.params)}), flush=True)
+            save(done)
+        if stop is not None and (index + 1) % accumulation == 0 and done == stop:
+            return state
+    if steps and (store is None or store.latest != steps):
+        save(steps)
     return state
 
 
@@ -99,6 +133,7 @@ def score(task, params, steps, solver, guidance=None):
 
 flow = presets.Flow()()
 OUTPUT = os.environ.get("LADD_OUTPUT", "/mnt/scratch/dew/runs/diffusion-gaps")
+os.makedirs(OUTPUT, exist_ok=True)
 saved = f"{OUTPUT}/ladd_cifar_teacher.npz"
 if teacher_steps:
     started = time.time()
@@ -152,14 +187,19 @@ for overrides in variants:
     data = synthetic_data() if fields.pop("synthetic", False) else None
     lr = fields.pop("lr", 1e-5)
     head_lr = fields.pop("head_lr", None)
+    eval_every = fields.pop("eval_every", 0)
+    stop = fields.pop("stop", None)
+    evaluated = fields.pop("evaluate", True)
     task = AdversarialDistillationObjective(network(), flow, spec(), teacher=jax.tree.map(jnp.copy, teacher_model),
                                             ema_decay=None, **fields)
-    eval_every = fields.pop("eval_every", 0)
 
     def evaluate(params, task=task):
         return {f"consistency_{n}": score(task, params, n, Consistency()) for n in (1, 4)}
 
     distilled = train(task, ladd_steps, lr, log_every=500, head_lr=head_lr, seed=seed, rows_per_step=rows_per_step,
-                      accumulation=accumulation, data=data, evaluate=evaluate, eval_every=eval_every)
+                      accumulation=accumulation, data=data, evaluate=evaluate if evaluated else None,
+                      eval_every=eval_every, checkpoints=f"{OUTPUT}/seed_{seed}", stop=stop)
+    if stop is not None:
+        continue
     print(json.dumps({"ladd": overrides, **{f"consistency_{n}": score(task, distilled.params, n, Consistency())
                                             for n in (1, 4)}, "seconds": round(time.time() - started)}), flush=True)
