@@ -405,6 +405,36 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     assert compiled._cache_size() - traced == 1
 
 
+def processor_rows(width):
+    """`ramp(width)` as a source processor hands it over: whole rows carry the
+    token positions and no validity field (`Processor.from_hf`)."""
+    tokens = jnp.asarray(ramp(width))
+    return ModelInputs(tokens, {"positions": jnp.arange(width, dtype=jnp.int32)[None, :]})
+
+
+def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
+    """Every text prompt a loaded source's processor builds carries its token
+    positions. One-axis positions say nothing a left-padded row loses: the
+    filler is invalid, and the real tokens keep their positions. So two such
+    prompts inside one bucket share one executable, and each draws what bare
+    ids of its width draw at the exact width: the same tokens, and the same
+    likelihoods to the bound the bare-id test above justifies.
+    """
+    compiled = text._compiled(None)
+    traced = compiled._cache_size()
+    for width in (100, 120):
+        reference = generate(roomy.model, roomy.variables, ramp(width), 8, seed=0, sampling=roomy.sampling)
+        drawn = roomy(processor_rows(width), 8, seed=0)
+        assert drawn.tokens.shape == (1, width + 8)
+        np.testing.assert_array_equal(drawn.tokens, reference.tokens)
+        logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
+        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
+        for field in ("raw_log_probs", "behavior_log_probs"):
+            np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
+                                       rtol=0, atol=bound, err_msg=field)
+    assert compiled._cache_size() - traced == 1
+
+
 def test_the_cache_a_call_builds_holds_the_request_not_the_model_context(roomy, monkeypatch):
     """A 200-token prompt with a 100-token budget runs over 512 cache slots:
     the buckets are 256 and 128, and the model's own 1024 is the ceiling that
