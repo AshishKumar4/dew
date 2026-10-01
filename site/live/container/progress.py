@@ -9,6 +9,12 @@ cell's step count and whose PNG is that prediction mapped linearly from
 latents to a small RGB image, then {"dew-progress": {"stage": "decode"}} while
 the model's final clean prediction and the VAE decode run. The
 page shows these as the run's progress; any other display is the cell's own.
+
+`ReportingModels` wraps the setup cell's `text_model` the same way: it
+reports {"dew-progress": {"stage": "load", "model": name}} before a model this
+kernel has not loaded yet loads, and {"dew-progress": {"stage": "generate",
+"first": bool}} before each generation, `first` for that model's first one in
+this kernel, which compiles its program.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import base64
 import io
 import json
 import queue
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -113,3 +120,33 @@ class Reporting:
 
 def _ready(result: Any) -> bool:
     return all(leaf.is_ready() for leaf in jax.tree.leaves(result))
+
+
+class ReportingModels:
+    """`load`, the setup cell's `text_model`, reporting each model's load and generations."""
+
+    def __init__(self, load: Callable[[str], Any]) -> None:
+        self.load = load
+        self.tasks: dict[str, ReportingText] = {}
+
+    def __call__(self, name: str) -> ReportingText:
+        if name not in self.tasks:
+            _show({"stage": "load", "model": name})
+            self.tasks[name] = ReportingText(self.load(name))
+        return self.tasks[name]
+
+
+class ReportingText:
+    """A text generation task, reporting each call before it runs."""
+
+    def __init__(self, task: Any) -> None:
+        self.task = task
+        self.called = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.task, name)
+
+    def __call__(self, *args, **kw):
+        _show({"stage": "generate", "first": not self.called})
+        self.called = True
+        return self.task(*args, **kw)

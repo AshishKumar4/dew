@@ -12,7 +12,7 @@ import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
 
 export { Coordinator } from './coordinator';
-export { Kernel } from './kernel';
+export { LiveKernel } from './kernel';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -56,7 +56,9 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 		return reply({ error: 'turnstile', message: 'The bot check did not pass. Reload the page and try again.' }, 403, cors);
 	}
 	const now = Date.now();
-	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now);
+	// Any Kernel object answers with the image of the deploy it runs in.
+	const image = await env.KERNEL.get(env.KERNEL.idFromName('image')).image();
+	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now, image);
 	if (!opened.ok) {
 		return reply({ error: opened.reason, message: REFUSALS[opened.reason], retryAfter: opened.retryAfter }, 429, cors, {
 			'Retry-After': String(opened.retryAfter),
