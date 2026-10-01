@@ -834,6 +834,15 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     narrow for the sparklines still shows each metric's name and value,
     through the evaluations, to the last frame."""
     screen = io.StringIO()
+    evaluation_budgets = []
+    render_metrics = display.TrainingDisplay.metrics
+
+    def metrics(panel, rows, inner, lines, *, evaluation=False):
+        if evaluation:
+            evaluation_budgets.append(lines)
+        return render_metrics(panel, rows, inner, lines, evaluation=evaluation)
+
+    monkeypatch.setattr(display.TrainingDisplay, "metrics", metrics)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
@@ -842,6 +851,7 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
 
     output = screen.getvalue()
     assert "eval val at step" not in output
+    assert evaluation_budgets and max(evaluation_budgets) < 40
     last = output.rpartition("dew · ")[2]
     for name in ("loss", "step_time_ms", "spread"):
         assert re.search(rf" {name} +\S", last), last
