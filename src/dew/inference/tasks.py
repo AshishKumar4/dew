@@ -401,6 +401,9 @@ class TextGeneration:
         Requires `dewml[quantization]`. `example` is one prepared model
         input for the abstract trace; a multimodal model needs its media
         fields too. The processor and decoding controls stay unchanged.
+        Host NumPy weights quantize on CPU and stay on host; enable the CPU
+        backend beside an explicitly selected accelerator, or load weights
+        onto the task's mesh before quantizing them.
         """
         from dew.training.quantization import quantize_for_serving
 
