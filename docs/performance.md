@@ -1,6 +1,6 @@
 # Performance measurements
 
-This page records experiments on one RTX 4080, at the revisions and settings stated in each section. For architecture comparisons, see [step benchmarks](benchmarks.md). For how distributed training is configured today, see [distributed training](concepts/distributed.md). A result at one shape and one revision does not settle a default for every case, and it says nothing about TPUs.
+This page records performance experiments: where a training step's time goes, which kernel each hardware generation runs and why, which XLA flags and optimizer settings were tried, and how expert parallelism and rematerialization behave. Each section states its hardware (an RTX 4080 unless it says otherwise; some sections use an L4, an A100, 4x RTX 3090 or a TPU v6e), revision and settings. A result at one shape and one revision does not settle a default for every case. [Step benchmarks](benchmarks.md) compares architectures, and [Distributed training](concepts/distributed.md) describes how distributed training is configured.
 
 The timeline busy percentages below were taken before `e5ee70d`, which fixed the measurement window for nested kernel intervals. Before you reuse those percentages, replay the original traces. The synchronized wall-clock step times are separate measurements, and that arithmetic bug does not affect them.
 
@@ -25,7 +25,7 @@ MHz and 30 W at rest and at 2760 MHz and 120-220 W under load. XLA reads a
 flag once, when a backend opens, so every flag configuration ran in a fresh
 process.
 
-## Where a step's time goes, 2026-09-05
+## Step time breakdown, 2026-09-05
 
 ```
 JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.8 \
@@ -59,7 +59,7 @@ parameters to bf16 (0.15 ms of the 0.79). The decoder's gemm time is the fp32
 product is 12.8 ms at the 49.5 TFLOP/s TF32 ceiling measured in
 `docs/research/benchmark-parity.md`.
 
-### The host's budget per step
+### Host time per step
 
 This table shows what the host spends per step on simple_dit. The numbers
 come from the trace's host plane and from timing the dispatch loop while the
@@ -90,7 +90,7 @@ far the loop runs ahead (7 steps against 27). On a faster card or a smaller
 model it would set the wall clock. The placement itself (0.25 ms) is not the
 cause. Freeing the consumed batch is not the cause either: keeping every
 batch alive changes nothing under the default preallocation. Prefetch depths
-2, 8 and 32 measure the same. I adopted no fix, because the runtime owns the
+2, 8 and 32 measure the same. No fix was adopted, because the runtime owns the
 addresses.
 
 The other way to lose this time is to wait on the device every step, and that
@@ -100,11 +100,10 @@ ticks. The peak allocation does not grow with how far the loop runs ahead
 (0.823 GiB at 27 steps ahead, 0.819 in lockstep; 3.499 against 3.495 GiB for
 hierarchical_mmdit).
 
-### Antipatterns audited
+### Antipattern audit
 
-I read through `src/dew` and measured on the small preset. The nine classes
-are the ones the owner listed. Each row names the cost it found and what was
-done about it.
+An audit of `src/dew` for nine classes of performance antipattern, measured on
+the small preset. Each row names the cost found and what was done about it.
 
 | class | site | what was measured | verdict |
 |---|---|---|---|
@@ -114,30 +113,30 @@ done about it.
 | 3 baked constants | the compiled step's optimized HLO | simple_dit: 20 constants, 0.19 MiB, the largest the 2D sincos table bf16[256, 384]; causal_transformer: none | none found; the encoder's table moved into the state before this pass |
 | 4 dtype churn | HLO dots by output dtype and the trace's convert kernels | simple_dit: 65 bf16 dots, 40 fp32 outputs that are XLA split-K partials and the fp32 `final_proj`; parameter casts 0.15 ms/step; decoder: the fp32 head by design | none found in dew's code; XLA's split-K choice is the card's |
 | 5 redundant work | `nn/attention.py` odd-length routing to the xla kernel | hierarchical_mmdit 33.9 to 20.9 ms, simple_mmdit 12.9 to 11.0, peaks 3.50 to 1.85 and 1.43 to 1.08 GiB | fixed, `3b67135` |
-| 5 redundant work | `objectives/lm` head chunking at its default of 4 | 1.9 ms/step (2.2%) against one chunk, for 1.2 GiB | reported to the LM lane with the sweep in `docs/benchmarks.md` |
-| 5 redundant work | `objectives/diffusion/objective.py:141`, `null = self.encode(...)` every step | a frozen encoder's forward on the unconditional tokens, once per step, inside the step; free with the table encoder used here, a text tower's forward at batch 1 with CLIP; not measured with CLIP | reported to the diffusion lane |
+| 5 redundant work | `objectives/lm` head chunking at its default of 4 | 1.9 ms/step (2.2%) against one chunk, for 1.2 GiB | kept as the default; the sweep is in [Step benchmarks](benchmarks.md) |
+| 5 redundant work | `objectives/diffusion/objective.py:141`, `null = self.encode(...)` every step | a frozen encoder's forward on the unconditional tokens, once per step, inside the step; free with the table encoder used here, a text tower's forward at batch 1 with CLIP; not measured with CLIP | since fixed (see the correction below) |
 | 6 data path | `DevicePrefetchIterator` depth, `shard_batch` cost, main-thread placement | 0.15 to 0.25 ms/step waiting for a batch at depth 2, 8 and 32; placement 0.25 ms; the loop is bounded by dispatch, not the transfer | none found |
 | 7 sharding | the compiled step's `input_output_alias` | every state leaf aliased (396 of 396 on simple_dit, 143 of 143 on the decoder): donation happens | none found; collectives on a mesh not measured this pass |
 | 8 compile time | `Trainer.compile` | one compile per fit (class 2 row); the FLOP count reads the same executable | none found; the persistent cache was not timed this pass |
 | 9 memory | peak against the state, run-ahead against lockstep | simple_dit 0.82 GiB peak on a 303 MiB state, unchanged by run-ahead; hierarchical_mmdit 3.50 GiB on 847 MiB, 1.65 GiB of it the xla attention's fp32 logits | fixed by the class-5 row |
 
-This pass did not run the following, so I claim nothing about them: the
-`jax_default_matmul_precision` settings, remat on a step that fits in memory,
-XLA flags other than command buffers, and the cost of the class-1 eager
-scalars. (`bfloat16` matmul precision would change the numerics of the fp32
-head, and the precision rule refuses it in any case.)
+The audit did not measure the `jax_default_matmul_precision` settings, remat on
+a step that fits in memory, XLA flags other than command buffers, or the cost
+of the class-1 eager scalars, and claims nothing about them. (`bfloat16` matmul
+precision would change the numerics of the fp32 head, and the precision rule
+refuses it in any case.)
 
 Correction, 2026-09-22, checked against current main. The jitted `bookkeep`
 from the first class-1 row is on main (`src/dew/training/trainer.py`, called
 from `Trainer.fit`). The class-5 row about `objective.py:141` no longer matches
-the code. The diffusion objective encodes the unconditional prompt once, when
+the code: the diffusion objective encodes the unconditional prompt once, when
 it is built, and each step only casts that stored encoding to the batch's
-dtypes (`blank_conditions`, `src/dew/objectives/diffusion/objective.py:142-149`,
-used at `:204-207`).
+dtypes (`DiffusionObjective.blank_conditions` in
+`src/dew/objectives/diffusion/objective.py`).
 
-### Against PyTorch
+### Comparison with PyTorch
 
-I reran `tools/benchmark_torch.py` in a fresh venv with torch 2.14.0+cu130 and
+`tools/benchmark_torch.py` ran in a fresh venv with torch 2.14.0+cu130 and
 cuDNN 9.24. The run the week before used 2.11.0+cu128 with cuDNN 9.19. The
 flags were `--mode compile --warmup 20 --steps 100`, with the small presets
 and one process per row. The dew columns are the rows of
@@ -158,7 +157,7 @@ between the fixed-batch row and this tool's loop at the same commit
 the week before to 1.19x. On the newer torch, torch's SDPA row is 0.4 ms
 slower than the week before.
 
-## The attention kernels
+## Attention kernels
 
 `tools/benchmark_attention.py`, bf16. The batch is chosen so that query tokens
 times heads is 524288 in every row. The table shows the forward pass alone,
@@ -220,13 +219,13 @@ heuristics`). At head dimension 256 that tiling asks for 102784 bytes of
 shared memory, and the card has 101376, so it fails with `RESOURCE_EXHAUSTED:
 Shared memory size limit exceeded`.
 
-I probed other tilings through tokamax's private classes. A 32x32 tiling with
+Other tilings, probed through tokamax's private classes: a 32x32 tiling with
 one stage fits and is correct (gradient error 0.031, the same as xla). It
 runs forward and backward in 1.80 ms against xla's 2.66 at S=2048. Two
 16-row tilings compile and run at the same speed, but they return wrong
 gradients (error 6.6 on gradients of size 6.3). tokamax's autotuner picks a
-tiling by its time on random inputs and never compares numerics, so I cannot
-trust autotuning to find the correct one. At head dimension 128 the Triton
+tiling by its time on random inputs and never compares numerics, so
+autotuning cannot be trusted to find the correct one. At head dimension 128 the Triton
 kernel ties cudnn (0.235 against 0.236 ms forward, 0.75 against 0.78 forward
 and backward at S=2048), so it gains nothing where cudnn already runs.
 
@@ -237,14 +236,14 @@ unsupported`. tokamax also applies the cap after adding the bias, while Gemma
 applies it before (1.4e-2 apart on CPU with a bias, identical without one).
 The second is attention sinks, which no tokamax implementation takes.
 
-I added no Dew route for this kernel. A forward-only kernel cannot serve
+Dew has no route for this kernel. A forward-only kernel cannot serve
 training, and the only backward tiling that works is reachable through
 private tokamax classes. The route needs an upstream tokamax release whose
 VJP picks a tiling that fits the card, or a public tiling setting, with a
 correctness check next to it. Installing tokamax 0.0.13 next to Dew also
 pins `typeguard==2.13.3`, while tyro 1.0.16 requires `typeguard>=4.0.0`. That
-breaks the command line of every recipe, so I ran the tool through its `main`
-function in a separate environment.
+breaks the command line of every recipe, so these measurements ran the tool
+through its `main` function in a separate environment.
 
 ## Odd sequence lengths on cudnn
 
@@ -272,9 +271,8 @@ gradients, both one ulp). If the pad key is left unmasked, the q9/kv7 output
 moves by 0.26 at scale 2.4 and the test fails. If the pad query row is left
 in, the shape changes and the test fails.
 
-To see what the padding is worth, I ran `--warmup 3 --steps 50` on the small
-preset with `'xla'` (the kernel these shapes ran on before the padding)
-against `'auto'`:
+The padding's value, from `--warmup 3 --steps 50` on the small preset with
+`'xla'` (the kernel these shapes ran on before the padding) against `'auto'`:
 
 | architecture | shapes | xla ms/step | cudnn ms/step | xla peak GiB | cudnn peak GiB | loss at the end, xla / cudnn |
 |---|---|---:|---:|---:|---:|---|
@@ -288,8 +286,8 @@ went. Attention is a small part of the unet's step, so the unet gains little.
 The losses are after 103 steps on one fixed batch and differ in the sixth
 digit. That difference is the two kernels' bf16 rounding, compounded by Adam.
 Decoding asks for one query position at a time, which is an odd length. It
-runs on cudnn with the cache mask as an additive bias. I did not measure its
-speed.
+runs on cudnn with the cache mask as an additive bias; its speed was not
+measured.
 
 ## Attention metadata and the masked conv, 2026-09-07
 
@@ -371,10 +369,8 @@ that lacks the field gets it materialized. Single-process runs, which is what
 the table measures, are untouched. So are batches of plain token arrays,
 which carry no validity anywhere.
 
-I did not rerun the head-chunk and head-dimension-256 cases, because nothing
-in this change reaches them. To reproduce, run `run_batch.sh` in
-`.cache/dew/mask-routing-83f08e5`. Its `kernel_cases.py` holds the case
-definitions, the allocator and HLO capture, and the correctness groups.
+The head-chunk and head-dimension-256 cases were not rerun, because nothing
+in this change reaches them.
 
 ## XLA flags
 
@@ -382,7 +378,7 @@ definitions, the allocator and HLO capture, and the correctness groups.
 it before JAX opens a backend. The default is None, and this sweep is the
 reason. It covers three architectures, with one fresh process per
 configuration. Each cell is the median of the runs, with the range and count
-where I repeated a configuration.
+where a configuration was repeated.
 
 | configuration | simple_dit | causal_transformer | unet |
 |---|---|---|---|
@@ -395,7 +391,7 @@ where I repeated a configuration.
 | `--xla_gpu_enable_while_loop_double_buffering=true` | 6.95 [6.93-7.09] n=5 | 75.73 | 17.30 |
 | the two above with any signal, together | 7.00 [6.99-7.02] n=2 | 75.75 [75.67-75.84] n=2 | 17.09 [16.93-17.26] n=2 |
 
-I adopted no flag, and the noise band is the reason. Four repeats of the same
+No flag was adopted, and the noise band is the reason. Four repeats of the same
 configuration on simple_dit spread from 6.97 to 7.53 ms, or 8%, because each
 fresh process autotunes again. Against that spread, every simple_dit number
 in the table comes from one distribution. The causal_transformer is the quiet
@@ -420,22 +416,21 @@ Two flags stand out for other reasons:
   list than the default adds nothing to that.
 
 None of the candidate flags changes numerics. The sweep covered only kernel
-selection and scheduling. I tested no flag that relaxes precision, and none
+selection and scheduling. No flag that relaxes precision was tested, and none
 would be adopted, because an adopted change has to keep a fixed-seed 20-step
 loss trajectory within 1e-5.
 
-## What batch size buys the unet
+## UNet batch scaling
 
-I measured these numbers and adopted nothing from them. They show where the
-remaining room is on the architecture whose step is least sensitive to
-batch.
+These numbers show where the remaining room is on the architecture whose step
+is least sensitive to batch; nothing was adopted from them.
 
 ```
 python tools/benchmark_step.py --preset small --architectures unet \
     --batch-size 16 --warmup 3 --steps 10
 ```
 
-I ran this once per batch size, and again with
+It ran once per batch size, and again with
 `--xla-flags=--xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUBLASLT,CUDNN,CUSTOM_CALL,WHILE`
 for the extended rows.
 
@@ -450,7 +445,7 @@ Four times the batch costs 3.3 times the step. So about 4 ms of the 17.4 ms
 step (23%) does not scale with the batch, and 0.84 ms per sample does.
 Command buffers save 1.4% at batch 16 and nothing at batch 64.
 
-When I measured these rows they had a utilisation column that read 1.7%. That
+When first recorded, these rows had a utilisation column that read 1.7%. That
 number was wrong because of the counter. XLA's `cost_analysis()` cannot see
 inside the cuDNN convolution calls the backend emits, and it undercounted
 this model 22.5 times. Counted off the optimized HLO, the unet runs at 40.5%
@@ -458,8 +453,8 @@ of peak, as `docs/benchmarks.md` reports.
 
 ## Muon against AdamW at equal tokens
 
-These are the only CPU rows in this file. A loss curve at equal tokens does
-not depend on the card's kernels, and the run is small enough that one
+These are the only CPU rows in this file. They compare optimizers at equal
+token budgets, not accelerator speed; the run is small enough that one
 workstation CPU does nine of them in under an hour.
 
 ```
@@ -473,8 +468,8 @@ JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --out /tmp/muon-3e-3.json
 ```
 
-The first command downloads the corpus, which is not in the repository. I ran
-the last command once per arm, learning rate and seed.
+The first command downloads the corpus, which is not in the repository. The
+last command ran once per arm, learning rate and seed.
 
 Conditions: `causal_transformer`, 128 wide, 2 layers, 2 heads, tied head, byte
 vocabulary of 256, sequence length 128, batch 16, 557,952 parameters, bf16
@@ -485,8 +480,8 @@ tokens of the Shakespeare corpus. 12th Gen i9-12900K, jax 0.11.1,
 disjoint cores. Every arm sees the same batches in the same order at the same
 seed, so a difference between two arms comes from the solver.
 
-There are three arms. `adamw` is AdamW. `muon` is Muon as this branch builds
-it. `muon-unsplit` is `optax.contrib.muon` with its own ndim == 2 rule, which
+There are three arms. `adamw` is AdamW. `muon` is Dew's Muon, with its
+parameter groups. `muon-unsplit` is `optax.contrib.muon` with its own ndim == 2 rule, which
 is how the 'muon' entry worked before the parameter groups. Final loss is the
 mean over the last 50 steps.
 
@@ -509,10 +504,9 @@ Muon with the parameter groups reaches 1.4386 where AdamW reaches 1.4764,
 0.038 nats lower at the same tokens. The three seeds of an arm spread 0.007
 to 0.013, so the gap to AdamW is three times that noise. The gap to unsplit
 Muon is 0.018, one and a half times the noise, and the split version is ahead
-on each of the three seeds, by 0.016, 0.020 and 0.017. Muon also holds its
-loss at ten times its best learning rate: it loses 0.028, where AdamW loses
-0.116. That matches the tolerance the labs report
-(`docs/research/frontier-training.md:183`).
+on each of the three seeds, by 0.016, 0.020 and 0.017. Raising the learning
+rate from each arm's best to 1e-2 costs Muon 0.028 (3.3 times its best rate)
+and AdamW 0.116 (10 times its best rate).
 
 These numbers say nothing about 0.4B parameters. That is the run section 4.9
 of `docs/design/plan.md` asks for, and it needs a v5e-16. The wall-clock
@@ -524,7 +518,7 @@ The fp8 trunk compiles and runs on the card, but the step does not get
 faster. Conditions: RTX 4080 16 GiB, driver 595.84, jax/jaxlib 0.11.1, Qwix
 0.1.8, `JAX_PLATFORMS=cuda`, one process, one device, bf16 compute with the
 `xla` attention kernel, `Quantization(dtype="fp8")` over the whole trunk,
-adamw, 3 warmup and 10 measured steps. I ran two sizes, each in its own
+adamw, 3 warmup and 10 measured steps. Two sizes ran, each in its own
 process: 8 layers of width 256 (mlp 512) and 8 layers of width 1024 (mlp
 2048), both with 8 heads, vocabulary 512, sequence 64 and batch 8.
 
@@ -692,11 +686,11 @@ Each choice below is made in one place per kernel and keyed by hardware generati
 | v6e | lm-moe after, `auto` = xla | 74.68 | 75.25 | 5.05 |
 | v6e | lm-moe after, tokamax (`mosaic_tpu_v2`) | 75.40 | 76.04 | 5.05 |
 
-Rerun on the final branch, jax 0.11.2, one Colab L4 session (2026-09-22 19:55 to 20:13 CDT), `tools/benchmark_kernels.py step --path lm-moe --batch 4`: `auto` (pallas) 224.90 ms, 8.15 GiB peak; `--implementation xla` 602.36 ms, 12.46 GiB. `projection`: Pallas 3.37 ms, XLA 25.19 ms forward plus backward.
+Rerun at jax 0.11.2, one Colab L4 session (2026-09-22 19:55 to 20:13 CDT), `tools/benchmark_kernels.py step --path lm-moe --batch 4`: `auto` (pallas) 224.90 ms, 8.15 GiB peak; `--implementation xla` 602.36 ms, 12.46 GiB. `projection`: Pallas 3.37 ms, XLA 25.19 ms forward plus backward.
 
-On a mesh, KernelReview's 2x RTX 3090 (jax 0.11.2, one bf16 ExpertMLP layer forward plus backward, XLA against Pallas): fsdp 1 expert 1 141.9 against 64.4 ms; fsdp 2 83.3 against 98.1 ms, where the Pallas path all-gathers the fsdp-sharded expert kernel (128 MiB of temporaries against XLA's 3120); expert 2 global 174.0 against 102.7; expert 2 exchange 93.0 against 14.9. Whole lm-moe steps: data 2 1024.0 against 578.3 ms, expert 2 exchange 780.9 against 537.1, same losses. That made `auto` take XLA where fsdp alone sharded the experts, until the dispatch moved every routed layer inside its row map, where both kernels see gathered experts, and there the Pallas kernels win on the RTX 3090 (expert parallelism, below).
+On a mesh, 2x RTX 3090 (jax 0.11.2, one bf16 ExpertMLP layer forward plus backward, XLA against Pallas): fsdp 1 expert 1 141.9 against 64.4 ms; fsdp 2 83.3 against 98.1 ms, where the Pallas path all-gathers the fsdp-sharded expert kernel (128 MiB of temporaries against XLA's 3120); expert 2 global 174.0 against 102.7; expert 2 exchange 93.0 against 14.9. Whole lm-moe steps: data 2 1024.0 against 578.3 ms, expert 2 exchange 780.9 against 537.1, same losses. That made `auto` take XLA where fsdp alone sharded the experts, until the dispatch moved every routed layer inside its row map, where both kernels see gathered experts, and there the Pallas kernels win on the RTX 3090 ([Expert parallelism on 4x RTX 3090](#expert-parallelism-on-4x-rtx-3090-2026-09-23)).
 
-KernelMatrix's rows, forward plus backward, jax 0.11.2, checked against float64: at lm-moe's up projection the Pallas kernels take 1.21 ms against XLA's 6.25 on an A100, 3.15 against 25.9 on an L4 and 1.59 against 15.7 on the RTX 4080; at 128 experts 0.43 against 15.7 (A100), 1.38 against 77.9 (L4) and 0.55 against 33.5 (RTX 4080). On a TPU v5e and v6e XLA wins at 128 experts (v6e 0.346 ms against `mosaic_tpu_v2`'s 0.408). DistExpert's RTX 3090 (sm86, jax 0.11.2): 2.54 ms against 17.40 up and 2.37 against 16.97 down, same forward error. An sm75 card (T4) cannot compile the Triton kernels, and no sm90 or sm120 card was available, so those run XLA.
+Kernel-matrix rows, forward plus backward, jax 0.11.2, checked against float64: at lm-moe's up projection the Pallas kernels take 1.21 ms against XLA's 6.25 on an A100, 3.15 against 25.9 on an L4 and 1.59 against 15.7 on the RTX 4080; at 128 experts 0.43 against 15.7 (A100), 1.38 against 77.9 (L4) and 0.55 against 33.5 (RTX 4080). On a TPU v5e and v6e XLA wins at 128 experts (v6e 0.346 ms against `mosaic_tpu_v2`'s 0.408). On an RTX 3090 (sm86, jax 0.11.2): 2.54 ms against 17.40 up and 2.37 against 16.97 down, same forward error. An sm75 card (T4) cannot compile the Triton kernels, and no sm90 or sm120 card was available, so those run XLA.
 
 `expert_projection` alone, 8192 rows, 768 to 2048, 8 experts, forward plus backward: XLA 26.21 ms and Pallas 3.38 ms on the L4; XLA 14.84 ms and Pallas 1.86 ms on the RTX 4080. Errors against a float64 oracle of the rounded operands are the same or lower for Pallas (kernel gradient 4.2e-6 against 6.8e-6 relative). The L4 step is 2.82x faster; JAX's stock Pallas lowering with an out-sharding fix measured 1.97x on the same step, because its tangents run in fp32 and Dew's backward multiplies the bf16 cotangent.
 
@@ -715,7 +709,7 @@ On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step; tokamax's def
 | v6e | lm-dense step | 123.85 ms, 5.77 GiB | 124.94 ms, 4.50 GiB | |
 | v6e | lm-moe step | 74.68 ms, 5.05 GiB | 71.96 ms, 3.87 GiB | |
 
-The two L4 step rows are jax 0.11.2, from the final branch's Colab session (2026-09-22, 19:55 to 20:13 CDT); the update rows and the v6e rows are jax 0.11.1. The rounding noise is a counter hash of the step, the leaf and the element index. threefry noise (`jax.random.bits`) makes the update slower than fp32 state on both devices. The saving is memory everywhere; on the v6e lm-dense step it costs 0.9% instead of saving time, so the option stays off by default.
+The two L4 step rows are jax 0.11.2, from one Colab session (2026-09-22, 19:55 to 20:13 CDT); the update rows and the v6e rows are jax 0.11.1. The rounding noise is a counter hash of the step, the leaf and the element index. threefry noise (`jax.random.bits`) makes the update slower than fp32 state on both devices. The saving is memory everywhere; on the v6e lm-dense step it costs 0.9% instead of saving time, so the option stays off by default.
 
 ### The vocabulary head: the compute dtype's product
 
@@ -730,24 +724,17 @@ On the v6e the fp32 operands already multiplied in one bf16 pass, so only skippi
 
 The bf16 product changes the loss by less than its own rerun spread. `tools/lm_step_parity.py`, 100 steps of the 39M-parameter decoder on the RTX 4080, twice each way: two fp32-head runs differ by at most 2.3e-4 relative at any step, two bf16-head runs by 7.7e-4, and a bf16-head run differs from an fp32-head run by 3.4e-4 and 7.2e-4, within the bf16 head's own rerun spread. Final losses 0.0078378 and 0.0078376 (fp32 head), 0.0078368 and 0.0078387 (bf16 head). Rejected: the fused Pallas kernel, 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, 2.24x slower on the v6e (kernel catalog, 2026-09-22).
 
-On sm89, the trainer compiles without XLA's Triton GEMM fusions unless the
-run explicitly sets that flag or the model has an SSD mixer. At Qwen3-0.6B's
-widths with two layers, bf16, vocabulary 151936, and a 0.9 allocator
-fraction on an RTX 4080 (JAX 0.11.2), this removes a 4096-token cliff:
-286.0 ms per training step with the fusions, 93.4 ms without. At other
-shapes, the unfused step can use more temporary memory. Before tiling the
-head or recomputing blocks, a step that does not fit is tried with XLA's default
-options; at 8192 tokens only that whole-logits step fits (178.7 ms, versus
-211.2 ms after tiling). When tiling is needed, sm89 uses the measured
-4096-by-8192 tile. These are two-layer measurements, not full-model times.
+On an A100, the reference runs measured the fp32 head at 38 ms a step, 21% of a Qwen3-0.6B bf16 fine-tune's busy time, as TF32 GEMMs that torch autocast runs in bf16; that and the rows above made the bf16 product the default.
+
+On sm89, the trainer compiles without XLA's Triton GEMM fusions unless the run explicitly sets that flag or the model has an SSD mixer. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936, and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a 4096-token cliff: 286.0 ms per training step with the fusions, 93.4 ms without. At other shapes, the unfused step can use more temporary memory. Before tiling the head or recomputing blocks, a step that does not fit is tried with XLA's default options; at 8192 tokens only that whole-logits step fits (178.7 ms, versus 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
 
 ### Generations below sm80
 
 A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the one test: below sm80 bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
 
-### Measured winners Dew does not adopt yet
+### Faster kernels not adopted
 
-KernelMatrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64 (`~/.cache/dew/verification-evidence/kernel-matrix/MATRIX.md`). Each needs a kernel or a dependency Dew does not carry yet:
+Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64. Each needs a kernel or a dependency Dew does not carry yet:
 
 | op | where it wins | numbers | why not yet |
 |---|---|---|---|
@@ -772,11 +759,9 @@ KernelMatrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell 
 
 On the RTX 4080 the Triton kernel ran 6x to 12x slower than XLA wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. The scan takes the kernel on TPU only.
 
-On an A100, ReferenceRuns measured the fp32 head at 38 ms a step, 21% of a Qwen3-0.6B bf16 fine-tune's busy time, as TF32 GEMMs that torch autocast runs in bf16; that and the rows above made the bf16 product the default.
-
 ### Packed sliding-window attention on GPU: `local_attention`
 
-A packed batch with a sliding window has no fused-kernel flag on a GPU before Hopper: `jax.nn.dot_product_attention` takes no segment ids beside `local_window_size`, cuDNN's packed layout (`q_offsets`) raises "Packed layout requires a GPU with at least Hopper architecture" on sm89, and JAX's Pallas GPU `mha` takes segment ids but no window (and was 4-9% off in the gradient at this shape). `local_attention` therefore builds its `[W, 2W]` band mask and, where cuDNN runs, hands it to cuDNN as the additive bias; elsewhere xla takes it. Colab L4, jax 0.11.2, bf16, 16 query heads of 64 over 4 key heads, window 4096, 5 packed documents, forward plus backward (`~/.cache/dew/verification-evidence/packed-window/bench.py`):
+A packed batch with a sliding window has no fused-kernel flag on a GPU before Hopper: `jax.nn.dot_product_attention` takes no segment ids beside `local_window_size`, cuDNN's packed layout (`q_offsets`) raises "Packed layout requires a GPU with at least Hopper architecture" on sm89, and JAX's Pallas GPU `mha` takes segment ids but no window (and was 4-9% off in the gradient at this shape). `local_attention` therefore builds its `[W, 2W]` band mask and, where cuDNN runs, hands it to cuDNN as the additive bias; elsewhere xla takes it. Colab L4, jax 0.11.2, bf16, 16 query heads of 64 over 4 key heads, window 4096, 5 packed documents, forward plus backward:
 
 | tokens | before (band on xla) | after (band on cuDNN) |
 |---|---|---|
@@ -830,11 +815,11 @@ Changes, each measured before and after in one hold:
 - The exchange's first round runs outside the checkpointed scan that holds the later rounds, so the backward keeps its intermediates instead of recomputing them: expert 4 goes from 705.9 to 634.0 ms, and compute from 307.0 to 272.4.
 - The exchange gathers each bucket's rows through the sort's index and scatters what returns straight to its slots, two row copies fewer a round. On the NVLink pair, dropless goes from 300.5 to 295.8 ms and capacity 1.25 from 218.5 to 212.3, with peak memory from 14.1 to 13.7 GiB and 12.6 to 12.0.
 
-One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tokens, 32 experts, top 4), forward plus backward: the Pallas kernels inside the dispatch's map take 26.2 ms (Pallas under main's older row map took 25.1), and `jax.lax.ragged_dot` inside the map takes 271.9 ms with 6.5 GiB of temporaries, since XLA runs it as a product over every expert. The same layer through the global path outside any map, where main's selector had sent fsdp-only meshes to XLA, ran out of memory on the 24 GiB cards.
+One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tokens, 32 experts, top 4), forward plus backward: the Pallas kernels inside the dispatch's map take 26.2 ms (25.1 under the earlier row map), and `jax.lax.ragged_dot` inside the map takes 271.9 ms with 6.5 GiB of temporaries, since XLA runs it as a product over every expert. The same layer through the global path outside any map, where the earlier kernel selector sent fsdp-only meshes to XLA, ran out of memory on the 24 GiB cards.
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory (`dew.training.trainer.step_fits`: the step's temporaries and the outputs that do not reuse the donated state, against each device's `bytes_limit` less what the resident state and batch already use; each process reads its own devices and the pool takes the tightest): a decoder from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. Forward plus backward plus AdamW, bf16 compute, 10 timed steps, `tools/benchmark_kernels.py step --remat`:
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory (`dew.training.trainer.step_fits`: the step's temporaries and the outputs that do not reuse the donated state, against each device's `bytes_limit` less 8% of it (`FIT_RESERVE`: with less to spare, a step XLA planned inside the limit failed to place its largest temporary in 1 to 2 of 16 runs on an RTX 4080) and what the resident state and batch already use; each process reads its own devices and the pool takes the tightest): a decoder from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs. The rung a step compiled under is the `remat` of the run's `StepCompiled` record and of `tools/benchmark_step.py`'s rows. Forward plus backward plus AdamW, bf16 compute, 10 timed steps, `tools/benchmark_kernels.py step --remat`:
 
 | device | model, batch x tokens | none | minimal / dots | full |
 |---|---|---|---|---|
@@ -849,4 +834,4 @@ A model's `remat` is where its step starts, and the trainer moves it up one rung
 | RTX 3090 | 359.8M decoder, 8 x 1024 | 420.9 ms, 13.16 GiB | 438.3 ms, 9.77 GiB | 505.1 ms, 6.33 GiB |
 | RTX 3090 | 321.8M MoE decoder, 4 x 1024 | 126.5 ms, 7.82 GiB | 133.6 ms, 6.26 GiB | 150.2 ms, 6.02 GiB |
 
-`'minimal'` costs 3-11% over no recomputation and `'full'` 17-24%, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), the RTX 3090 rows one GPU of the box.
+In the rows where all three ran (the decoders), `'minimal'` costs 4-10% over no recomputation and `'full'` 15-21%, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), the RTX 3090 rows one GPU of the box.

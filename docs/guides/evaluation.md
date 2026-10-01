@@ -1,12 +1,10 @@
 # Evaluation and tracking
 
-This guide assumes you have done the [first training run](../getting-started.md). The training loss measures the batches the optimizer trains on. Validation uses a separate dataset, and it runs only when you set how often it should run.
+Evaluation scores a separate validation split while `Trainer.fit` runs, through metrics that read the artifacts the objective's `evaluate` returns. A tracker receives the training scalars, the validation metrics, previews and run records. Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set, and `fit` refuses an `eval_every` whose pass nothing reads: it needs `metrics` that read the objective's artifact, or `preview=True` with a tracker. Passing `metrics` alone does not turn evaluation on.
 
-## Enable evaluation explicitly
+## Example
 
-To evaluate, provide `Dataset.val`, set `eval_every` in `Trainer.fit`, and pick metrics that can read the artifact your objective returns. Passing `metrics` on its own does not turn evaluation on.
-
-The example below trains a tiny next-token decoder on synthetic token sequences and measures perplexity on a different sequence. It needs no tokenizer, downloaded weights or accelerator.
+The example trains a tiny next-token decoder on synthetic token rows and measures perplexity on a different row. It needs no tokenizer, downloaded weights or accelerator.
 
 ```python
 import itertools
@@ -34,74 +32,96 @@ state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
 assert int(state.step) == 10
 ```
 
-Each token row has nine IDs: the model reads the first eight and predicts the last eight. `seq_len=8` counts prediction positions, and `vocab_size=4` means the valid IDs are zero to three. The arrays are int32. The model computes in float32 with the XLA attention implementation, which suits a small example.
+```text
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+step  5/10  loss 0.6666  ce 0.6666  perplexity 1.948  token_accuracy 75.0%  step_time_ms 5.879  samples_per_sec 1,361  accepted 100.0%
+eval val at step 5: perplexity 5.283 (8 records in 0.18 s)
+step 10/10  loss 0.2373  ce 0.2373  perplexity 1.268  token_accuracy 87.5%  step_time_ms 37.04  samples_per_sec 216.0  accepted 100.0%
+eval val at step 10: perplexity 5.221 ↓ 1.2% (8 records in 0.00 s)
+Trained 10 steps in 0:00:01: first step after 0.82 s, then 736.2 step/s
+1.2% of the wall time in steps, final loss 0.2373
+```
 
-The run prints the training loss at steps five and ten, and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets. Lower is better, as long as you compare on the same validation data and tokenizer. This synthetic cyclic task does not measure general language ability.
+Each row has nine IDs: the model reads the first eight and predicts the last eight, so `seq_len=8`, and `vocab_size=4` makes the valid IDs zero to three. The run logs the training loss at steps five and ten and the validation perplexity at the same steps. Perplexity is the exponential of the cross entropy, weighted by the number of valid targets; lower is better when compared on the same validation data and tokenizer. Validation reads the EMA weights, which this short run has barely moved. This cyclic task does not measure general language ability.
 
 ## Artifacts and metrics
 
-`Objective.evaluate` returns scoring artifacts for the whole coordinated batch. `LMObjective` produces teacher-forced `TokenScores`. Diffusion produces one generated image or video per real row. JEPA produces representations. Masked diffusion produces generated token rows, one batch's worth, for custom text metrics; it does not decode them. Those samples are not teacher-forced perplexity and not held-out NELBO.
+`Objective.evaluate` returns scoring artifacts for the whole coordinated batch:
+
+| Objective | Artifact |
+|---|---|
+| `LMObjective` | Teacher-forced `TokenScores`. |
+| Diffusion | One generated image or video per real row. |
+| JEPA | Representations. |
+| Masked diffusion | Generated token rows, one batch's worth, undecoded, for custom text metrics. These are not teacher-forced perplexity and not held-out NELBO. |
 
 A `Metric[S]` declares which artifact type it `reads`. It computes one batch's sufficient statistics with `__call__`, combines them with `merge(accumulated, contribution)`, and reports its scalar with `finalize(accumulated)`. The first contribution starts the pass. The trainer keeps only the accumulator and the current contribution; metric instances keep no state between calls. An accumulator belongs to one pass, and a metric may merge its own NumPy buffers in place.
 
-Each built-in metric reduces its batches as follows:
+The built-in metrics reduce their batches as follows:
 
 - Perplexity sums weighted losses and target weights, then exponentiates.
 - Image means weight each image once. Video PSNR and SSIM weight each frame once.
 - Paired image metrics and CLIP need as many generated rows as reference or prompt rows.
-- FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches you feed it, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k. With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes: bilinear resize to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` holds them to 1e-4 absolute on features and 1e-5 relative on the distance. The values compare with pytorch-fid's, not with clean-fid's (antialiased bicubic resize) or the TF1 TTUR code's.
+- FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches it is fed, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k. With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes: bilinear resize to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` holds them to 1e-4 absolute on features and 1e-5 relative on the distance. The values compare with pytorch-fid's, not with clean-fid's (antialiased bicubic resize) or the TF1 TTUR code's. On TPU the feature extractor puts an optimization barrier before each strided 2D convolution, which keeps XLA's space-to-batch rewrite from miscompiling it at small per-device batches; no images are added to the batch, and CPU and GPU compile the barrier away.
+- JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split and are not a probe over the full dataset.
 
-On TPU, the extractor uses Dew's shared convolution workaround: an optimization barrier before strided 2D convolutions prevents XLA's space-to-batch miscompile at small per-device batches. No images are added to the batch. CPU and GPU lower that boundary to the unchanged input.
+Training metrics are named under `train/`, and reduced validation metrics under `val/`. Metric names must be unique within a pass.
 
-JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split, and they are not a probe over the full dataset.
+## Previews
 
-The trainer calls `Objective.preview` once per evaluation event, and only when you pass `fit(preview=True)`, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference and not averaged policy weights. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.
+The trainer calls `Objective.preview` once per evaluation event, only when `fit(preview=True)` is passed, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.
 
-## Use a tracker
+## Trackers
 
-Import `LocalTracker`, `WandbTracker`, `MLflowTracker`, `TensorBoardTracker` and `Trackers` from `dew.training`.
+`Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` borrows the tracker; whoever constructed it closes it. When a tracker used as a context manager fails to close while another exception is active, the original exception still surfaces. The trackers are importable from `dew.training`:
 
-`Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)` and `close()`. `Trainer.fit` borrows the tracker; whoever constructed it closes it. When a tracker is used as a context manager and closing fails while another exception is active, you still see the original exception.
+| Tracker | Writes | Install |
+|---|---|---|
+| `LocalTracker(path)` | JSONL journals of scalars and typed records, written synchronously, plus preview files. | |
+| `WandbTracker` | Weights & Biases; `offline=True` opens no online session. | `dewml[wandb]` |
+| `MLflowTracker(experiment, name, uri=store)` | One MLflow run through `MlflowClient`. | `dewml[mlflow]` |
+| `TensorBoardTracker(path)` | One event file through TensorBoard's own `EventFileWriter`, without TensorFlow. | `dewml[tensorboard]` |
+| `Trackers(*trackers)` | Every tracker receives each report even if another fails; the first failure is raised. | |
 
-`LocalTracker("runs/example/tracking")` writes JSONL journals of scalars and typed records, synchronously, plus preview files. It never overwrites a recipe's `run.json`. Recipes create this local tracker under their checkpoint directory; a run whose checkpoints live at a URI prints its local tracking path. Recipes keep the W&B preview request you configured, but they do not turn previews on when the only reporting is local. W&B reporting is optional and uses the same interface. Pass `offline=True` to keep W&B from opening an online session.
+`LocalTracker` never overwrites a recipe's `run.json`. Recipes create a local tracker under their checkpoint directory; a run whose checkpoints live at a URI prints its local tracking path. Recipes keep a configured W&B preview request, but do not turn previews on when the only reporting is local. The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`; a perfect PSNR stays positive infinity. Read these fields with `float(value)`. Plots are opt-in: install `dewml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display, and nothing is plotted during training. Non-finite points are marked and left out of the curve segments; their exact values stay in the journal.
 
-`MLflowTracker("experiment", name, uri=store)` opens one MLflow run through `MlflowClient`, so it never touches MLflow's global active run. Scalars become the run's metrics. Each record becomes a JSON artifact at `records/<type>-<step>.json`. A preview is uploaded as the same files the local renderers write. A `FitEnded` record whose status is not "completed" ends the run as `FAILED`. Records are artifacts and not params because MLflow refuses a second value for a param, and a run reports several records of the same type. `uri` can be any store MLflow reads; from MLflow 3.16 on, a local file store also needs MLflow's own `MLFLOW_ALLOW_FILE_STORE=true`. Install `dewml[mlflow]`.
+`MLflowTracker` never touches MLflow's global active run. Scalars become the run's metrics. Each record becomes a JSON artifact at `records/<type>-<step>.json`, rather than a param, because MLflow refuses a second value for a param and a run reports several records of the same type. A preview is uploaded as the files the local renderers write. A `FitEnded` record whose status is not "completed" ends the run as `FAILED`. `uri` can be any store MLflow reads; from MLflow 3.16 on, a local file store also needs `MLFLOW_ALLOW_FILE_STORE=true`.
 
-`TensorBoardTracker("runs/example/events")` writes one event file with TensorBoard's own `EventFileWriter` and does not need TensorFlow. Scalars become scalar summaries and records become text summaries under `reporting/<type>`. Images become image summaries under `val/samples/<index>`, a clip becomes an animated GIF that the image plugin shows, and representations become a histogram of their per-dimension spread. `TokenScores` has no summary form, so it raises, as it does for W&B. Install `dewml[tensorboard]`.
+`TensorBoardTracker` writes scalars as scalar summaries and records as text summaries under `reporting/<type>`. Images become image summaries under `val/samples/<index>`, a clip becomes an animated GIF that the image plugin shows, and representations become a histogram of their per-dimension spread. `TokenScores` has no summary form, so it raises, as it does for W&B.
 
-To report to several trackers, use `with Trackers(LocalTracker(path), TensorBoardTracker(events)) as tracker:`. Every tracker receives each report even if another one fails, and the first failure is raised. Reporting has no background queue and never drops a report, so the I/O costs time at every log step. On an i9-12900K, one report of six scalars took 0.005 ms into a local journal, 0.033 ms into an event file and 0.26 ms into an MLflow file store, so a thousand reports cost 5 ms, 33 ms and 0.26 s. Over 10,000 steps of the small regression at `log_every=10`, the local and TensorBoard trackers stayed within the run-to-run spread of an untracked run. MLflow's run creation, batch logging and termination added 0.5 s to 6.2 s.
+Reporting has no background queue and never drops a report, so the I/O costs time at every log step. On an i9-12900K, one report of six scalars took 0.005 ms into a local journal, 0.033 ms into an event file and 0.26 ms into an MLflow file store, so a thousand reports cost 5 ms, 33 ms and 0.26 s. Over 10,000 steps of a small regression at `log_every=10`, the local and TensorBoard trackers stayed within the run-to-run spread of an untracked run. MLflow's run creation, batch logging and termination added 0.5 s to 6.2 s.
 
-The local JSON writes non-finite metric values as the strings `"NaN"`, `"+Inf"` and `"-Inf"`. A perfect PSNR stays positive infinity; it is not written as null or as a made-up finite score. Use `float(value)` when you read these fields.
+## Run records
 
-Plots are opt-in. Install `dewml[plots]`, then call `tracker.plot()`, or construct `LocalTracker(path, plots=True)` to render the plots when the tracker closes. Matplotlib uses the Agg backend and never opens a display. Nothing is plotted during training log steps. Non-finite points are marked and left out of the curve segments; their exact values stay in the journal.
+`dew.telemetry.records` defines the typed records a tracker receives:
 
-The run records in `dew.telemetry.records` are:
+| Record | Meaning |
+|---|---|
+| `RunRecord` | The resolved model, data and optimizer configuration, and package versions. |
+| `FitStarted` | The fit began. |
+| `StepCompiled` | A training step compiled for a new batch shape, with the seconds it took, the remat it compiled under, and the per-axis link bandwidths and projection-spreading choices. |
+| `CheckpointRequested` | A checkpoint save was submitted asynchronously; it does not mean the checkpoint is durable. |
+| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.profile` capture reports no record. |
+| `FitEnded` | The fit ended, with its status. |
+| `TrialFinished` | One sweep trial. |
 
-- `RunRecord`: the resolved model, data and optimizer configuration, and package versions.
-- `FitStarted`.
-- `StepCompiled`: a training step compiled for a new batch shape, with the seconds it took, the remat it compiled under, and the per-axis link bandwidths and projection-spreading choices.
-- `CheckpointRequested`: records that a checkpoint save was submitted asynchronously, not that it is durable. Checkpoint waits work as before this record was added.
-- `ProfileWindow`: the directory a `Trainer` profile window wrote and the number of steps it traced. It is reported once the trace has stopped, and it copies no per-step layer tensors. A standalone `dew.profile` capture writes its own directory and reports no record.
-- `FitEnded`.
-- `TrialFinished`: one sweep trial.
+Dew does not hash data contents or source revisions. Put their identities in the run summary when you need them, and save the optimizer, data source and evaluation settings separately from the checkpoints.
 
-Dew does not hash data contents or source revisions for you. Put their identities in the run summary when you need them.
+## Hyperparameter sweeps
 
-Training metrics are named under `train/`, and reduced validation metrics under `val/`. The logging cadence decides when the tracker receives values. If you need a record of the optimizer, data source and evaluation settings, save the configuration separately from the checkpoints.
+`dew.config.sweep.sweep(config, space, *, train, trials, ledger, tracker, search=random_search, seed=0)` trains one trial per point of a search space through the entry point `train`, which trains a config and returns its score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It uses the normal training loop and has no scheduler.
 
-## Search a hyperparameter space
+A space maps dotted paths into the run record to the values a trial can take. `override` applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises instead of silently training the unchanged config.
 
-`dew.config.sweep.sweep` trains one trial per point of a search space, through `RunConfig.train`. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. `sweep` takes the config, the space, the entry point that trains a config and returns the trial's score, a trial budget, a ledger path and a tracker. It uses the normal training loop and has no scheduler.
+| Search | Behavior |
+|---|---|
+| `random_search` | Draws each field independently, reproducibly from the trial number. |
+| `grid_search` | Walks the cartesian product in order. |
+| `optuna_search` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]`. |
 
-A space maps dotted paths into the run record to the values a trial can take. `override` applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises an error instead of silently training the unchanged config. There are three search backends:
+A finished trial is written to the ledger before it is reported, so rerunning an interrupted sweep continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
-- `random_search` draws each field independently, reproducibly from the trial number.
-- `grid_search` walks the cartesian product in order.
-- `optuna_search` asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]` for it.
-
-A finished trial is written to the ledger before it is reported. If a sweep is interrupted, rerunning the same call continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker you pass receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
-
-The example below continues the previous one and reuses `objective`, `data`, `metrics` and `jax` from it.
+The example continues the previous one and reuses `objective`, `data`, `metrics` and `jax`:
 
 ```python
 from dew import LocalTracker, evaluate
@@ -134,14 +154,28 @@ with LocalTracker("runs/sweep/tracking") as tracker:
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
 
-The two trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`, each with its own `run.json` recording the learning rate it used, and the script prints the better rate. `sweep` returns the ledger's trials, so `trial.value` is the score the entry point returned and `trial.overrides` is the point it trained.
+```text
+Experiment_Name: lm-rate/trial-0
+Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-0/tracking
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+Trained 10 steps in 0:00:01: first step after 0.66 s, then 2072.9 step/s
+0.6% of the wall time in steps, final loss 0.2373
+Experiment_Name: lm-rate/trial-1
+Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial-1/tracking
+Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
+Trained 10 steps in 0:00:01: first step after 0.68 s, then 2683.2 step/s
+0.4% of the wall time in steps, final loss 0.6440
+{'optim.learning_rate': 0.01}
+```
+
+The two trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`, each with its own `run.json` recording the learning rate it used. `sweep` returns the ledger's trials: `trial.value` is the score the entry point returned and `trial.overrides` the point it trained. A second run of the script reads the ledger and trains nothing.
 
 ## Reproducibility and limits
 
-Each evaluation event derives its random key from the run key and the training step. Scoring batch indices and preview sampling use separate fixed RNG domains. Repeating an event with the same state and batches reproduces its samples, and adding a tracker does not change the scoring draws.
+Each evaluation event derives its random key from the run key and the training step. Scoring batch indices and preview sampling use separate fixed RNG domains, so repeating an event with the same state and batches reproduces its samples, and adding a tracker does not change the scoring draws.
 
-All processes take part in the objective's numerical work and in global-array gathers. Only process zero computes host metrics, decodes previews and writes tracking output. Host metric kernels use one process-local device. Evaluation uses `dew.artifacts.collective_host` to check local conversions and addressable shards up front, agree on the global gather plan, and share each transfer's outcome before the next gather. Built-in previews agree on local setup and generation outcomes before they start that transfer. A custom hook with its own collectives must also call `agree_process_phase` at those points; the trainer's final agreement on the hook cannot do it for you. Finish all gathers before decoding on process zero alone. Plain `host` still works on process zero alone for local arrays. A dead process, a blocked loader, or a failure inside a device collective that is already running still needs the distributed runtime's timeout and the launcher's failure handling.
+All processes take part in the objective's numerical work and in global-array gathers. Only process zero computes host metrics, decodes previews and writes tracking output. Host metric kernels use one process-local device. Evaluation uses `dew.artifacts.collective_host` to check local conversions and addressable shards up front, agree on the global gather plan, and share each transfer's outcome before the next gather. Built-in previews agree on local setup and generation outcomes before they start that transfer. A custom hook with its own collectives must also call `agree_process_phase` at those points; the trainer's final agreement on the hook cannot do it. Finish all gathers before decoding on process zero alone. Plain `host` still works on process zero alone for local arrays. A dead process, a blocked loader, or a failure inside a device collective that is already running still needs the distributed runtime's timeout and the launcher's failure handling.
 
-Validation reads the shortest coordinated prefix of the shards. If one shard ends before another, the remaining local rows do not enter the metrics. The `evaluation/coordinated_batches`, `evaluation/records` and `evaluation/uneven_shards` fields describe that consumed prefix, which may not be the whole split. The record count comes from the placed global batch, so sequence and pipeline-stage replicas count once and scalar metadata adds no rows. The trainer prints the event key next to those counts. Metric names stay under `val/` and must be unique within a pass. An empty coordinated validation pass generates no preview and returns no metric values. A non-empty pass with no counted language target raises an error.
+Validation reads the shortest coordinated prefix of the shards. If one shard ends before another, the remaining local rows do not enter the metrics. The `evaluation/coordinated_batches`, `evaluation/records` and `evaluation/uneven_shards` fields describe that consumed prefix, which may not be the whole split. The record count comes from the placed global batch, so sequence and pipeline-stage replicas count once and scalar metadata adds no rows. The trainer's printed evaluation line shows the scores, the record count, the elapsed time and, when shards were uneven, that fact. An empty coordinated validation pass generates no preview and returns no metric values. A non-empty pass with no counted language target raises.
 
-When you compare generative scores, record the seed, the numbers of generated and real samples consumed, the conditioning data, the solver, the number of sampling steps, the guidance, and the feature and preprocessing definition. Keep the run configuration with the results.
+When comparing generative scores, record the seed, the numbers of generated and real samples consumed, the conditioning data, the solver, the number of sampling steps, the guidance, and the feature and preprocessing definition, and keep the run configuration with the results.

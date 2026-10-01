@@ -1,20 +1,1858 @@
 {
-	"about": "What site/src/data/hero.py printed, written by site/scripts/capture_snippets.py.",
+	"about": "The screen site/src/data/hero.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"meta": {
-		"where": "a workstation CPU",
-		"vcpus": 4,
-		"python": "3.13.13",
+		"where": "a workstation",
+		"python": "3.12.13",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.9",
 		"optax": "0.2.8",
-		"dew": "a437d4729e04eecdbf3a0dd00c56498cfa4a6824",
-		"date": "2026-09-24"
+		"dew": "7be897a414e2b65161f239a8aeec8fbc66556cd8",
+		"date": "2026-09-28"
 	},
-	"snippets": {
-		"hero": {
-			"returncode": 0,
-			"seconds": 8.6,
-			"stdout": "Training from step 0 to 100 on {'data': 1, 'expert': 1, 'fsdp': 1, 'tensor': 1, 'sequence': 1, 'stage': 1} (1 process(es))\nstep 25: loss 0.0306\nstep 50: loss 0.0102\nstep 75: loss 0.0067\nstep 100: loss 0.0051\nGoodput: first step after 1.99 s, 31.6% of the wall time in steps\ndew trains jax models. dew trains jax model\n"
-		}
+	"hero": {
+		"returncode": 0,
+		"seconds": 972.3,
+		"columns": 96,
+		"screen": [
+			[
+				{
+					"text": "eval val at step 100: perplexity 8.187 (256 records in 6.34 s)",
+					"dim": true
+				}
+			],
+			[
+				{
+					"text": "eval val at step 200: perplexity 6.033 \u2193 26% (256 records in 5.10 s)",
+					"dim": true
+				}
+			],
+			[
+				{
+					"text": "eval val at step 300: perplexity 5.453 \u2193 9.6% (256 records in 5.69 s)",
+					"dim": true
+				}
+			],
+			[
+				{
+					"text": "\u256d\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "dew",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " \u00b7 ",
+					"fg": "2aa7c9",
+					"dim": true
+				},
+				{
+					"text": "CausalTransformer",
+					"fg": "2aa7c9",
+					"bold": true
+				},
+				{
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " 6.6M parameters"
+				},
+				{
+					"text": "  \u00b7  on ",
+					"dim": true
+				},
+				{
+					"text": "8 \u00d7 cpu"
+				},
+				{
+					"text": "  \u00b7  mesh ",
+					"dim": true
+				},
+				{
+					"text": "data 2 \u00d7 expert 2 \u00d7 fsdp 2"
+				},
+				{
+					"text": "  \u00b7  batch ",
+					"dim": true
+				},
+				{
+					"text": "32"
+				},
+				{
+					"text": "  \u00b7  ",
+					"dim": true
+				},
+				{
+					"text": "float32  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2501",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2ba5c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2fa3c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "31a2ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "32a1ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "369fcb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "389ecb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "399dcb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3b9ccb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3d9bcc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3f9acc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4099cc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4297cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4695cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4794cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4993ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4d91ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4f90cf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "508fcf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "548dcf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "568cd0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "578bd0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "598ad0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5b88d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5d87d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5e86d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6085d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6483d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6582d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6781d3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6b7fd3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6d7ed4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6e7dd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "727bd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7479d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7578d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7777d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7976d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7b75d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7c74d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7e73d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8271d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8370d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "856fd8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "896dd8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "300",
+					"bold": true
+				},
+				{
+					"text": "/300",
+					"dim": true
+				},
+				{
+					"text": "  100%  2.9"
+				},
+				{
+					"text": " s/step",
+					"dim": true
+				},
+				{
+					"text": "  0:15:37 "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "train                                                                                       ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  loss           ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.581",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2587",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2586",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2586",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2586",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2585",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2584",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2583",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2582",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2581",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2582",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2582",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 50%",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  aux_loss       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   0.04198",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2587",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2584",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2584",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2582",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2582",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2582",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2582",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2582",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2581",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2581",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2581",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2581",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2581",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2582",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2582",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2581",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2581",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2581",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2581",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2581",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2581",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2581",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2582",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2582",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2582",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 18%",
+					"dim": true
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  ce             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.539",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2587",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2586",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2586",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2586",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2585",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2584",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2583",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2582",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2581",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2582",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2582",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 50%",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  perplexity     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     4.659",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2588",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2586",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2585",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2583",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2582",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2582",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2582",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2582",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2582",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2581",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2581",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2581",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2581",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    \u2193 79%",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  token_accuracy ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     53.0%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2582",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2583",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2583",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2584",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2584",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2585",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2586",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2586",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2586",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2586",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2586",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2587",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2587",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2587",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2587",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2587",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2588",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2588",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2588",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2588",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2588",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2588",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2191 33.9 pt",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "throughput                                                                                  ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  step_time_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     3,160",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2583",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2583",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2583",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2581",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2582",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2584",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2584",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2584",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2582",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2588",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2583",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2582",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2582",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2583",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2582",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2581",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2582",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2585",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2582",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2583",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2584",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2584",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2583",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2584",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2584",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2585",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2584",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   \u2191 2.2%",
+					"fg": "d9534f"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  samples_per_sec",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     10.13",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2586",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2586",
+					"fg": "30a2ca"
+				},
+				{
+					"text": "\u2588",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2587",
+					"fg": "379ecb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2585",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2585",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2585",
+					"fg": "4496cd"
+				},
+				{
+					"text": "\u2587",
+					"fg": "4894cd"
+				},
+				{
+					"text": "\u2581",
+					"fg": "4b92ce"
+				},
+				{
+					"text": "\u2586",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2587",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2587",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2586",
+					"fg": "588ad0"
+				},
+				{
+					"text": "\u2586",
+					"fg": "5c88d1"
+				},
+				{
+					"text": "\u2587",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2588",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2587",
+					"fg": "6980d3"
+				},
+				{
+					"text": "\u2584",
+					"fg": "6c7ed4"
+				},
+				{
+					"text": "\u2587",
+					"fg": "707cd4"
+				},
+				{
+					"text": "\u2586",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2585",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2585",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2586",
+					"fg": "7d74d6"
+				},
+				{
+					"text": "\u2585",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2585",
+					"fg": "8470d7"
+				},
+				{
+					"text": "\u2584",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2585",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   \u2193 2.2%",
+					"fg": "d9534f"
+				},
+				{
+					"text": "                     "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "optimizer                                                                                   ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "   "
+				},
+				{
+					"text": "accepted ",
+					"dim": true
+				},
+				{
+					"text": "100.0%",
+					"bold": true
+				},
+				{
+					"text": "                                                                            "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "val  ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": "step 300  perplexity ",
+					"dim": true
+				},
+				{
+					"text": "5.453",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2193 9.6%",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "                                                       "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2713 ",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "finished",
+					"fg": "2aa7c9",
+					"dim": true
+				},
+				{
+					"text": "  \u2500\u256f",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u256d\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2713 ",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "CausalTransformer",
+					"fg": "2aa7c9",
+					"bold": true
+				},
+				{
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "   trained  ",
+					"dim": true
+				},
+				{
+					"text": "300 steps in 0:15:38            "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "first step  ",
+					"dim": true
+				},
+				{
+					"text": "after 6.85 s                    "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "      then  ",
+					"dim": true
+				},
+				{
+					"text": "0.3 step/s                      "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "   goodput  ",
+					"dim": true
+				},
+				{
+					"text": "97.4% of the wall time in steps "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "final loss  ",
+					"dim": true
+				},
+				{
+					"text": "1.581                          ",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "val at 300  perplexity ",
+					"dim": true
+				},
+				{
+					"text": "5.453",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2193 9.6%",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "         "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "ROMEO:"
+				}
+			],
+			[
+				{
+					"text": "He was thou was my the cattlet me to our gift,"
+				}
+			],
+			[
+				{
+					"text": "Of were he what twork and the gentleman and me stress,"
+				}
+			],
+			[
+				{
+					"text": "And, not determentant?"
+				}
+			],
+			[],
+			[
+				{
+					"text": "MONTAGUE:"
+				}
+			],
+			[
+				{
+					"text": "Master, sent's every, a"
+				}
+			],
+			[],
+			[
+				{
+					"text": "JULIET:"
+				}
+			],
+			[
+				{
+					"text": "What mother's parth, and we liver'd gone in"
+				}
+			],
+			[
+				{
+					"text": "The present his first, I'll tempter some,"
+				}
+			],
+			[
+				{
+					"text": "And, sRich ask, and at the criated come and,"
+				}
+			],
+			[
+				{
+					"text": "What shall he scourse mews s"
+				}
+			]
+		]
 	}
 }

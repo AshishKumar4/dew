@@ -28,7 +28,7 @@ from dew.registry import datasets
 from .chat import Conversation, render_prompt
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
 from .rows import json_records, parquet_names, parquet_rows, row_dataset
-from .text import load_tokenizer
+from .text import load_tokenizer, tokenizer_for
 
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
@@ -113,7 +113,7 @@ def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str,
             raise ValueError(f"{origin}: tools require chat messages, not a plain string")
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
-        ids = load_tokenizer(tokenizer).encode(prompt, add_special_tokens=False)
+        ids = tokenizer_for(tokenizer).encode(prompt, add_special_tokens=False)
     elif isinstance(prompt, list):
         ids = [token for token in prompt if isinstance(token, int)]
         if len(ids) != len(prompt):
@@ -245,6 +245,8 @@ class Prompts(DatasetSpec):
     holds `prompt` left-padded to `max_prompt_len` with `pad_id`,
     `prompt_length`, and the reward columns as UTF-8 bytes.
 
+    String prompts use `tokenizer_for`, so `tokenizer="byte"` encodes UTF-8
+    locally and a Hub name loads its own vocabulary without special tokens.
     An optional `tools` column holds schemas as a list or JSON string for
     chat prompts. Schemas are rendered into prompt tokens and never copied
     into the device batch. `val_path` is a second parquet file scored as one

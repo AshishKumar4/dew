@@ -1,2 +1,5 @@
 # Written by deploy.mjs for each deploy.
 container/dew-commit
+container/sampler_setup.py
+container/sampler.py
+container/text.py

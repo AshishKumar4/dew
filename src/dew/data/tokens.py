@@ -95,10 +95,11 @@ def bounded(stream: Reader, batches: int | None) -> Reader:
 class TokenWindows(DatasetSpec):
     """Reads fixed windows of `seq_len + 1` ids off the token stream.
 
-    Each window starts `seq_len` ids after the last, so record i's last token
-    is record i + 1's first and the model sees every transition once. A batch
-    is `{"text": int32 [batch, seq_len + 1]}`. `val_batches` bounds a
-    validation pass; None scores the whole split.
+    Training windows start `stride` ids apart, `seq_len` by default. A
+    stride of one lets the shuffled training stream read every contiguous
+    window. Validation always starts windows `seq_len` ids apart, so it
+    counts each target once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
+    `val_batches` bounds a validation pass; None scores the whole split.
 
     The training stream's saved position is a global window count, so a run
     resumes on any process count the global batch divides over.
@@ -106,6 +107,7 @@ class TokenWindows(DatasetSpec):
 
     path: str | None = None
     seq_len: int = 256
+    stride: int | None = dataclasses.field(default=None, kw_only=True)
     val_batches: int | None = 4
     field: str | None = None
     """Which arrayrecord field or parquet column the ids are in, for a corpus
@@ -116,7 +118,7 @@ class TokenWindows(DatasetSpec):
 
         self.uncaptioned(tokenize)
         corpus, held_out = token_corpus(self.path, "TokenWindows", field=self.field)
-        train = TokenWindowSource(corpus, self.seq_len)
+        train = TokenWindowSource(corpus, self.seq_len, stride=self.stride)
         validation = TokenWindowSource(held_out, self.seq_len)
         return Dataset(
             train=train_stream(train, [], batch=batch, seed=self.seed, loading=self.loading),

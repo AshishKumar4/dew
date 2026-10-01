@@ -1,137 +1,149 @@
 # Post-training
 
-Post-training changes how a model behaves after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Proximal policy optimization (PPO) also learns a critic that estimates future rewards. Flow-GRPO scores samples from a rectified-flow model.
+Post-training changes how a trained model behaves. Dew runs each method as an objective on the ordinary `Trainer`; the methods differ in the supervision their batches carry.
 
-Dew runs all of these objectives on the same `Trainer`. Their batches carry different kinds of supervision. Read [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for how models, objectives and the trainer fit together.
+| Method | Supervision | Data | Objective |
+|---|---|---|---|
+| Supervised fine-tuning (SFT) | Example answers | `ChatMessages`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
+| Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `PreferencePairs` | `DPOObjective` |
+| Group-relative policy optimization (GRPO) | A reward on answers the model samples | `Prompts` and `SampledRollout`, or a rollout scheduler | `GRPOObjective` |
+| Proximal policy optimization (PPO) | A reward, plus a learned critic | `EpisodeRollout` and `PPORollout` | `PPOObjective` |
+| Flow-GRPO | A reward on samples from a rectified-flow model | `FlowRollout` | `FlowGRPOObjective` |
 
-## Continue a decoder with SFT, DPO and GRPO
+DPO and GRPO (with `beta > 0`) keep the starting weights as a frozen reference. [Language models](language_models.md) covers next-token training, and [Objectives](objectives.md) how models, objectives and the trainer fit together.
 
-The three examples below continue the TinyStories decoder from [Train a decoder on TinyStories](language_models.md#train-a-decoder-on-tinystories), in the same Python session, and reuse its `model`, `lm_state`, `tokenizer` and imports. Each stage starts from `lm_state.params`, so you can run them in any order.
+![SFT reads token rows with roles; DPO reads chosen and rejected rows against a frozen reference; GRPO samples groups of completions from the policy, scores them with a reward and trains on the packed rows.](../assets/post-training-light.svg)
+![SFT reads token rows with roles; DPO reads chosen and rejected rows against a frozen reference; GRPO samples groups of completions from the policy, scores them with a reward and trains on the packed rows.](../assets/post-training-dark.svg)
 
-### Supervised fine-tuning
+## Example
 
-Fine-tune the decoder on a response to a prompt. Each token carries a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. `ChatMessages` produces this role column from chat templates when reading conversation data.
+The example builds a small byte-level decoder and runs one short stage of each of SFT, DPO and GRPO, each starting from the previous stage's weights. A fresh initialization stands in for a pretrained model, so it downloads nothing.
 
 ```python
 import itertools
+import json
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import optax
 
-from dew import Dataset
+from dew import Dataset, Trainer, models
+from dew.data import ByteTokenizer, Loading, PreferencePairs
 from dew.data.chat import Role
+from dew.objectives.lm import LMObjective
+from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
+from dew.sampling import Sampling
 
+tokenizer = ByteTokenizer()
+model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
+                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                     max_seq_len=64)
+base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+```
+
+`base` is a full Flax variables mapping, including its outer `params` collection, which is what every objective's `pretrained` argument takes.
+
+### Supervised fine-tuning
+
+Each token carries a role: the prompt's tokens are `Role.USER` and the response's `Role.ASSISTANT`. With `loss_role=Role.ASSISTANT` the loss counts only assistant targets; prompt tokens still provide context.
+
+```python
 prompt = tokenizer.encode("Tom had a red ball.")
-response = tokenizer.encode(" He kicked it to his dog.")
+response = tokenizer.encode(" He kicked it.")
 row = np.array(prompt + response, dtype=np.int32)
 roles = np.array([Role.USER] * len(prompt) + [Role.ASSISTANT] * len(response), dtype=np.int8)
 sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
-sft_data = Dataset(
-    train=lambda partition: itertools.repeat(sft_batch),
-    val=None,
-    records=8,
-    batch=8,
-)
-sft_objective = LMObjective(
-    model,
-    seq_len=len(row) - 1,
-    pretrained=lm_state.params,
-    loss_role=Role.ASSISTANT,
-    ema_decay=None,
-)
-sft_state = Trainer(
-    sft_objective,
-    optax.adamw(1e-3),
-    key=jax.random.key(2),
-).fit(sft_data, steps=20, log_every=10)
+sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
+                   records=8, batch=8)
+sft_objective = LMObjective(model, seq_len=len(row) - 1, pretrained=base,
+                            loss_role=Role.ASSISTANT, ema_decay=None)
+sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit(
+    sft_data, steps=20, log_every=10)
 ```
 
-The loss counts assistant targets after the next-token shift. Prompt tokens still provide context. For conversation files, `ChatMessages` also preserves tool calls, tool responses and tool schemas; [SFT](#sft-learn-from-assistant-answers) below describes the format.
+```text
+Training CausalTransformer from step 0 to 20: 147,904 parameters, on 1 × cpu, batch 8, float32
+step 10/20  loss 1.136  ce 1.136  perplexity 3.115  token_accuracy 92.9%  step_time_ms 19.51  samples_per_sec 410.1  accepted 100.0%
+step 20/20  loss 0.2127  ce 0.2127  perplexity 1.237  token_accuracy 100.0%  step_time_ms 13.53  samples_per_sec 591.3  accepted 100.0%
+Trained 20 steps in 0:00:01: first step after 1.08 s, then 84.1 step/s
+17.3% of the wall time in steps, final loss 0.2127
+```
 
 ### Preference optimization
 
-Continue with a chosen and a rejected response to the same prompt. The masks restrict the loss to the response tokens.
+A pair holds the same prompt followed by a chosen and a rejected response; the masks mark response tokens with 1.
 
 ```python
-import json
-
-from dew.data import PreferencePairs
-from dew.objectives.rl import DPOObjective
-
-rejected = tokenizer.encode(" He kicked kicked kicked it.")
+rejected = tokenizer.encode(" He kicked kicked.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
-pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=16,
+width = max(len(pair["chosen"]), len(pair["rejected"]))
+pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
-dpo = DPOObjective(model, seq_len=15, beta=0.1, pretrained=lm_state.params)
-dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
+dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, pretrained=sft_state.params)
+dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
-`DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width, and shorter pairs are padded to it; the objective scores one fewer position because of the next-token shift.
+```text
+Training CausalTransformer from step 0 to 10: 147,904 parameters, on 1 × cpu, batch 8, float32
+step  5/10  loss 0.03523  accuracy 1.000  rewards/chosen -1.711  rewards/rejected -5.039  step_time_ms 68.22  samples_per_sec 117.3  accepted 100.0%
+step 10/10  loss 0.008948  accuracy 1.000  rewards/chosen -3.645  rewards/rejected -8.357  step_time_ms 36.17  samples_per_sec 221.2  accepted 100.0%
+Trained 10 steps in 0:00:03: first step after 2.58 s, then 29.9 step/s
+10.5% of the wall time in steps, final loss 0.008948
+```
+
+`PreferencePairs.seq_len` is the full row width; shorter rows are padded to it, and the objective scores one position fewer because of the next-token shift.
 
 ### Reinforcement learning with a reward function
 
-This continues the same decoder with a reward for stories about a dog. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
+GRPO samples a group of completions per prompt, scores each with a reward function and trains on their rewards relative to the rest of the group. The prompt batch uses the numeric layout `Prompts` produces, with the reward metadata as UTF-8 bytes. The reward here counts the alphabetic characters in the decoded completion and divides the count by 8, the response budget in bytes, so an 8-byte completion of letters scores 1.
 
 ```python
-from dew.objectives.rl import GRPOObjective, SampledRollout
-
-prompt = tokenizer.encode("Once upon a time, there was a little")
+story = tokenizer.encode("Once upon a time")
 prompt_batch = {
-    "prompt": np.tile(np.array(prompt, dtype=np.int32), (8, 1)),
-    "prompt_length": np.full(8, len(prompt), dtype=np.int32),
-    "data_source": np.tile(
-        np.frombuffer(b"tinystories", dtype=np.uint8).astype(np.int32),
-        (8, 1),
-    ),
-    "ground_truth": np.tile(
-        np.frombuffer(b"dog", dtype=np.uint8).astype(np.int32),
-        (8, 1),
-    ),
+    "prompt": np.tile(np.array(story, dtype=np.int32), (8, 1)),
+    "prompt_length": np.full(8, len(story), dtype=np.int32),
+    "data_source": np.tile(np.frombuffer(b"stories", np.uint8).astype(np.int32), (8, 1)),
+    "ground_truth": np.zeros((8, 0), dtype=np.int32),
     "extra_info": np.zeros((8, 0), dtype=np.int32),
 }
 
 
 def reward(data_source, completion, ground_truth, extra_info):
-    return float(ground_truth in completion)
+    return sum(character.isalpha() for character in completion) / 8
 
 
-rl_data = Dataset(
-    train=lambda partition: itertools.repeat(prompt_batch),
-    val=None,
-    records=8,
-    batch=8,
-)
-rl_objective = GRPOObjective(
-    model,
-    seq_len=len(prompt) + 7,
-    beta=0.01,
-    pretrained=lm_state.params,
-)
-rollout = SampledRollout(
-    rl_objective,
-    reward=reward,
-    groups=4,
-    max_new_tokens=8,
-    sampling=Sampling(temperature=1.0, top_k=40),
-    decode=tokenizer.decode,
-)
-rl_state = Trainer(
-    rl_objective,
-    optax.adamw(1e-4),
-    key=jax.random.key(3),
-    rollout=rollout,
-).fit(rl_data, steps=20, log_every=10)
+rl_data = Dataset(train=lambda partition: itertools.repeat(prompt_batch), val=None,
+                  records=8, batch=8)
+rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
+                             pretrained=dpo_state.params)
+rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
+                         sampling=Sampling(temperature=1.0, top_k=40),
+                         decode=tokenizer.decode)
+rl_state = Trainer(rl_objective, optax.adamw(1e-4), key=jax.random.key(3),
+                   rollout=rollout).fit(rl_data, steps=4, log_every=2)
+print(int(rl_state.updates), "GRPO updates")
 ```
 
-Each prompt produces four responses, and `SampledRollout.decode` turns each one into the text the reward reads. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
+```text
+Training CausalTransformer from step 0 to 4: 147,904 parameters, on 1 × cpu, batch 8, float32
+step 2/4  loss 2.506e-05  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 1.770e-08  kl 0.002508  mismatch/ess 0.9903  mismatch/k3_kl 0.1754  mismatch/kl 0.6520  pg -2.049e-08  step_time_ms 107.2  samples_per_sec 298.5  rollout_seconds 2.009  accepted 100.0%  reward/mean 0.3438  length/mean 8.000  status/truncated 100.0%
+step 4/4  loss 2.535e-04  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 2.980e-08  kl 0.02535  mismatch/ess 0.9888  mismatch/k3_kl 0.1683  mismatch/kl 0.6362  pg -3.306e-08  step_time_ms 73.57  samples_per_sec 435.0  rollout_seconds 0.1273  accepted 100.0%  reward/mean 0.3789  length/mean 8.000  status/truncated 100.0%
+Trained 4 steps in 0:00:04: first step after 3.76 s, then 13.0 step/s
+5.8% of the wall time in steps, final loss 2.535e-04
+4 GRPO updates
+```
 
-[`recipes/chain.py`](../../recipes/chain.py) connects SFT, DPO and GRPO stages from the command line. The sections below explain each objective's data and options in full, and the DPO section includes a complete example that downloads nothing.
+Each prompt produces four completions, and `SampledRollout.decode` turns each into the text the reward reads. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. `beta` sets the coefficient of the KL term against the frozen reference. With a TinyStories decoder ([Language models](language_models.md)) and a reward of 1 for completions that mention a dog, 3 of 128 completions sampled before 20 such steps mentioned a dog in one Colab run, and all 128 sampled after them did.
 
-## SFT: learn from assistant answers
+[`recipes/chain.py`](../../recipes/chain.py) connects SFT, DPO and GRPO stages ([Stage chains](#stage-chains)).
 
-An SFT conversation is a list of messages, each with a role. `ChatMessages` reads conversations from a Parquet file, a `.jsonl` file or a Hub dataset id. Each row holds one list of messages in the column named by `column`, which defaults to `messages`. A row that has a `prompt` column instead, as in verl's layout, is read from there, and tool schemas go in a `tools` column where a row has any. This shows one row in the verl layout; it is not a script:
+## Supervised fine-tuning
+
+An SFT conversation is a list of messages, each with a role. `ChatMessages` reads conversations from a Parquet file, a `.jsonl` file or a Hub dataset ID. Each row holds one list of messages in the column named by `column` (default `messages`). A row that has a `prompt` column instead, as in verl's layout, is read from there, and tool schemas go in a `tools` column where a row has any. One row in the verl layout:
 
 ```text
 prompt = [
@@ -140,9 +152,20 @@ prompt = [
 ]
 ```
 
-Give `ChatMessages` your tokenizer (a Hub name or local path) in `tokenizer`, your conversations in `path` and the prediction length in `seq_len`. For a Hub dataset, `split` picks the split and `options` takes the same `HFOptions` the `hf` provider passes to `datasets.load_dataset`. The tokenizer must have a chat template, which is the rule for turning message boundaries, role headers and content into tokens. Each model is trained on its own format. If you join the message strings yourself, you can change both the input and which tokens count toward the loss.
+| Field | Default | Meaning |
+|---|---|---|
+| `tokenizer` | required | Hub name or local path of a tokenizer with a chat template. |
+| `path` | `None` | Conversations: Parquet, `.jsonl` or a Hub dataset ID. |
+| `column` | `messages` | Column holding each row's messages. |
+| `split` | `train` | Split of a Hub dataset. |
+| `val_path` | `None` | A separate source of held-out conversations, scored as one pass. |
+| `val_split` | `None` | Split `val_path` is read at; `None` reads `split`. |
+| `seq_len` | `256` | Prediction length `L`. |
+| `options` | `HFOptions()` | What `datasets.load_dataset` takes beside the ID and the split. |
 
-Dew renders the conversation one prefix at a time to give each token a role. For an assistant turn, it leaves the generation header out of the assistant span. It checks that each tokenized prefix matches the start of the longer render, and raises if the template changes earlier tokens. This check does not guarantee correct assistant masks for every chat template or string delimiter. Look at the rendered tokens and roles for some typical conversations before a real run. Conversations must start with a system or user message. Dew rejects one that starts with an assistant message.
+The chat template is the rule for turning message boundaries, role headers and content into tokens, and each model is trained on its own format. Joining message strings by hand can change both the input and which tokens count toward the loss. `ChatMessages` also preserves tool calls, tool responses and tool schemas.
+
+Dew renders the conversation one prefix at a time to give each token a role. For an assistant turn, it leaves the generation header out of the assistant span. It checks that each tokenized prefix matches the start of the longer render, and raises if the template changes earlier tokens. This check does not guarantee correct assistant masks for every chat template or string delimiter, so look at the rendered tokens and roles for some typical conversations before a real run. Conversations must start with a system or user message; one that starts with an assistant message is rejected.
 
 `ChatMessages.load(batch=B)` packs conversations into these arrays:
 
@@ -153,23 +176,21 @@ Dew renders the conversation one prefix at a time to give each token a role. For
 | `text_segment_ids` | `[B, L + 1]` | Document identity; separates packed conversations. |
 | `text_positions` | `[B, L + 1]` | Position within each packed document. |
 
-Here `L` is `ChatMessages.seq_len`. Use `LMObjective(model, L, loss_role=Role.ASSISTANT)`, with `Role` imported from `dew.data.chat`. The objective shifts IDs and roles together: input position `i` predicts token `i + 1`, and the role of the target decides whether that prediction counts. It also skips padding and the transitions between packed documents. With `loss_role` set, a batch without `text_roles` raises. Without `loss_role`, the loss is not limited to assistant targets.
+Train with `LMObjective(model, L, loss_role=Role.ASSISTANT)`. The objective shifts IDs and roles together: input position `i` predicts token `i + 1`, and the role of the target decides whether that prediction counts. It also skips padding and the transitions between packed documents. With `loss_role` set, a batch without `text_roles` raises. Keep evaluation conversations out of the training file; [Evaluation and tracking](../guides/evaluation.md) covers what token metrics measure.
 
-`val_path` can name a separate file of conversations. Keep evaluation conversations out of the training file. See [evaluation](../guides/evaluation.md) for what token metrics measure.
+## Direct preference optimization
 
-## DPO: learn from preference pairs
+DPO compares how much the policy prefers one answer over the other with how much a fixed reference policy does. The policy is the model being updated; the reference is a snapshot of its starting parameters. For each prompt, the chosen and rejected sequences hold the prompt followed by their own completion, and completion masks mark answer tokens with 1 and prompt tokens with 0.
 
-DPO compares how much the policy prefers one answer over the other with how much a fixed reference policy does. The policy is the model you update. The reference is a snapshot of its starting parameters. For each prompt, the chosen and rejected sequences hold the prompt followed by their own completion. Completion masks mark answer tokens with 1 and prompt tokens with 0.
+`PreferencePairs` takes either a Parquet `path` or a tuple of JSON strings in `records`, not both. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`, each mask as long as its ID list. A missing mask makes every token a completion token; Dew does not guess a boundary from the text, so give masks for prompt-and-answer data.
 
-`PreferencePairs` takes either a Parquet `path` or a tuple of JSON strings in `records`, not both. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`. Each mask has the same length as its ID list. If you leave out a mask, Dew treats every token as completion. It does not guess a boundary from the text, so always give masks for prompt-and-answer data.
+A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. `PreferencePairs.seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
 
-A loaded batch holds `input_ids` and `completion_mask`, both shaped `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Dew right-pads shorter rows to `S` and gives padding a mask weight of zero. Rows that are too long raise an error. `PreferencePairs.seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
+The objective sums the next-token log-probabilities over each completion and applies the log-sigmoid preference loss. `beta` (default 0.1) must be positive; it scales the comparison between policy and reference. Validation measures the perplexity of the chosen answers under the policy, which alone does not measure how often the preferred answer wins or how good the responses are.
 
-The objective sums the next-token log-probabilities over each completion and applies the log-sigmoid preference loss. `beta` must be positive. It scales the comparison between policy and reference. Validation measures the perplexity of the chosen answers under the policy. That number alone does not measure how often the preferred answer wins or how good the responses are.
+### Offline DPO example
 
-### Run a complete offline DPO example
-
-Run this block in a fresh Python process after [installing Dew](../installation.md). All inputs are in memory. The made-up vocabulary has eight tokens, just enough to show how pairs are built and optimized. IDs 1 and 2 (or 1 and 6) form the prompt, 3 is the preferred answer, 4 is the rejected answer and 5 ends the answer. The end token counts toward the completion loss. Repeating the two pairs gives a batch of eight, which also divides across eight local devices.
+This block runs in a fresh process. The made-up vocabulary has eight tokens: IDs 1 and 2 (or 1 and 6) form the prompt, 3 is the preferred answer, 4 the rejected answer and 5 ends the answer, which counts toward the completion loss. Repeating the two pairs gives a batch of eight, which also divides across eight local devices.
 
 ```python
 import json
@@ -183,93 +204,109 @@ from dew.data import Loading, PreferencePairs
 from dew.objectives.rl import DPOObjective
 
 rows = [
-    {
-        "chosen": [1, 2, 3, 5],
-        "rejected": [1, 2, 4, 5],
-        "chosen_mask": [0, 0, 1, 1],
-        "rejected_mask": [0, 0, 1, 1],
-    },
-    {
-        "chosen": [1, 6, 3, 5],
-        "rejected": [1, 6, 4, 5],
-        "chosen_mask": [0, 0, 1, 1],
-        "rejected_mask": [0, 0, 1, 1],
-    },
+    {"chosen": [1, 2, 3, 5], "rejected": [1, 2, 4, 5],
+     "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
+    {"chosen": [1, 6, 3, 5], "rejected": [1, 6, 4, 5],
+     "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
 ]
 row_width = 4
-spec = PreferencePairs(
-    records=tuple(json.dumps(row) for row in rows * 4),
-    seq_len=row_width,
-    pad_id=0,
-    loading=Loading(workers=0, threads=1, read_buffer=2),
-)
+spec = PreferencePairs(records=tuple(json.dumps(row) for row in rows * 4),
+                       seq_len=row_width, pad_id=0,
+                       loading=Loading(workers=0, threads=1, read_buffer=2))
 data = spec.load(batch=8)
-model = models.build(
-    "causal_transformer",
-    vocab_size=8,
-    emb_features=16,
-    num_layers=1,
-    num_heads=2,
-    mlp_features=32,
-    max_seq_len=row_width,
-)
+model = models.build("causal_transformer", vocab_size=8, emb_features=16, num_layers=1,
+                     num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
 state = trainer.fit(data, steps=2, log_every=1)
-assert int(state.step) == 2
-for before, after in zip(
-    jax.tree.leaves(reference), jax.tree.leaves(state.ema), strict=True
-):
+for before, after in zip(jax.tree.leaves(reference), jax.tree.leaves(state.ema), strict=True):
     np.testing.assert_allclose(before, np.asarray(after), rtol=0, atol=1e-6)
 print("Completed", int(state.updates), "DPO updates; reference stayed fixed.")
 ```
 
-You should see two training updates and the final confirmation. `fit` builds its state inside a compiled function, so its copy of the reference can differ from the eager `initial_state()` by float rounding (1.8e-7 at most on an L4). The tolerance of 1e-6 allows that rounding and still fails if an optimizer step moves the reference, because one Adam step at this learning rate moves weights by about 1e-3. This run writes no checkpoints or tracker records. For a real dataset, build both sequences with the same tokenizer and chat format, check that they share the prompt, and take the masks from known token boundaries. Do not search the string for an assistant marker and assume the character offset you find is a token boundary.
+```text
+Training CausalTransformer from step 0 to 2: 2,752 parameters, on 1 × cpu, batch 8, float32
+step 1/2  loss 0.6931  accuracy 0  rewards/chosen -2.384e-08  rewards/rejected 0  step_time_ms 35.71  samples_per_sec 224.0  accepted 100.0%
+step 2/2  loss 0.6703  accuracy 1.000  rewards/chosen 0.03338  rewards/rejected -0.01294  step_time_ms 1.349  samples_per_sec 5,928  accepted 100.0%
+Trained 2 steps in 0:00:01: first step after 1.44 s, then 442.7 step/s
+0.2% of the wall time in steps, final loss 0.6703
+Completed 2 DPO updates; reference stayed fixed.
+```
 
-### Account for reference memory
+`fit` builds its state inside a compiled function, so its copy of the reference can differ from the eager `initial_state()` by float rounding (1.8e-7 at most on an L4). The tolerance of 1e-6 allows that rounding and still fails if an optimizer step moves the reference, because one Adam step at this learning rate moves weights by about 1e-3. For a real dataset, build both sequences with the same tokenizer and chat format, check that they share the prompt, and take the masks from known token boundaries rather than from a character offset found by searching the string.
 
-Dew stores the DPO reference in `TrainState.ema`. EMA stands for *exponential moving average*, but DPO fixes its decay at 1, so this tree never moves. The objective refuses an `ema_decay` override. `rewards/chosen` and `rewards/rejected` are beta times each side's sequence log-ratio of policy over reference. A policy that has not moved therefore reports zero rewards and no wins. You do not create a second model object or optimize the reference. You do still keep a separate parameter tree and run forward passes through the reference. Budget memory for the policy parameters, reference parameters, optimizer state, gradients, activations and batches. Storing the reference in the EMA field does not make it free.
+### Reference memory
 
-SFT uses the language-model objective's moving EMA by default. Pass `ema_decay=None` to train without an averaged copy. GRPO keeps a frozen reference only when `beta > 0`. The `pretrained` argument takes a full Flax variables mapping, including its outer `params` collection. When a DPO or GRPO stage starts, those starting weights become the frozen reference.
+The DPO reference lives in `TrainState.ema` with its decay fixed at 1, so the tree never moves; `DPOObjective` refuses an `ema_decay` argument. `rewards/chosen` and `rewards/rejected` are beta times each side's sequence log-ratio of policy over reference, so a policy that has not moved reports zero rewards and no wins. There is no second model object and the reference is not optimized, but it is a separate parameter tree with its own forward passes. Budget memory for the policy parameters, reference parameters, optimizer state, gradients, activations and batches.
 
-## GRPO: generate answers and score them
+SFT uses the language-model objective's moving EMA by default; `ema_decay=None` trains without an averaged copy. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its `pretrained` weights become the frozen reference.
 
-GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts` accepts Parquet or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings and messages need a tokenizer; token-ID lists do not load one. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+## GRPO
 
-The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len`. If a prompt is too long, it keeps the end. The metadata columns travel as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into strings for this callable interface:
+GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly through `tokenizer_for`, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+
+```python
+import json
+from dew.data import Loading, Prompts
+
+data = Prompts(tokenizer="byte", records=(json.dumps({"prompt": "dew"}),) * 8,
+               max_prompt_len=8, loading=Loading(workers=0)).load(batch=8)
+```
+
+The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len` (default 128). A prompt that is too long keeps its end. The metadata columns travel as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into strings for the reward:
 
 ```text
 reward(data_source: str, completion: str,
        ground_truth: str, extra_info: str) -> float
 ```
 
-Pick a reward whose score you can check independently of training. For example, for an exact-answer task, compare the decoded completion with the ground-truth answer under a normalization rule you write down. `SampledRollout.decode` defaults to token IDs separated by spaces, not natural-language text. If your reward reads text, pass the model tokenizer's decode function.
+Pick a reward whose score can be checked independently of training; for an exact-answer task, compare the decoded completion with the ground truth under a normalization rule you write down. `SampledRollout.decode` defaults to token IDs separated by spaces, not natural-language text, so a reward that reads text needs the tokenizer's decode function.
 
-Construct `SampledRollout` with the objective, the reward callable, `groups=G` and `max_new_tokens=R`, and pass it to the trainer as `rollout`. `G` must be at least 2. The trainer calls the rollout on the host before the compiled update. Each prompt gets `G` sampled completions. Group-relative rewards give their advantages; `estimator="mean"` only centres them (Dr.GRPO) and `estimator="rloo"` compares each with the rest of its group, the same names `pack` takes. An advantage says how a completion's reward compares with the other rewards in its group.
+| `SampledRollout` field | Default | Meaning |
+|---|---|---|
+| `objective` | required | The `GRPOObjective` whose policy samples. |
+| `reward` | required | The reward callable above. |
+| `decode` | IDs joined by spaces | Turns sampled IDs into the reward's text. |
+| `groups` | `4` | Completions per prompt, `G`; at least 2. |
+| `max_new_tokens` | `32` | Response budget, `R`. |
+| `estimator` | `"group"` | Advantage estimator: `"group"`, `"mean"` (only centres, Dr.GRPO) or `"rloo"` (each against the rest of its group). |
+| `truncation` | `"score"` | What a completion that ran out of budget does: `"score"`, `"mask"` or `"zero"` ([Sessions and packed rows](#sessions-and-packed-rows)). |
+| `sampling` | `Sampling()` | Temperature, top-k, top-p, min-p and EOS IDs. |
 
-The rollout turns each completion into a one-call `Session` and builds the batch with `pack`, the same layout every GRPO batch in Dew has ([Engine-sourced rollouts and packed rows](#engine-sourced-rollouts-and-packed-rows)). With `N = B * G`, every column is `[N, P + R]` and aligned with `input_ids`: each chain is a prompt without its padding, then the sampled response, and chains may share a row.
+The trainer calls the rollout on the host before the compiled update. The rollout turns each completion into a one-call `Session` and builds the batch with `pack`, the layout every GRPO batch in Dew has. With `N = B * G`, every column is `[N, P + R]` and aligned with `input_ids`: each chain is a prompt without its padding, then the sampled response, and chains may share a row.
 
 | Field | Meaning |
 | --- | --- |
-| `input_ids`, `text_segment_ids`, `text_positions` | The chains, which chain each id belongs to, and its position in that chain. |
-| `response_mask` | 1 on sampled ids, EOS included. |
-| `old_log_probs` | Raw model-policy likelihoods recorded at each sampled id. |
+| `input_ids`, `text_segment_ids`, `text_positions` | The chains, which chain each ID belongs to, and its position in that chain. |
+| `response_mask` | 1 on sampled IDs, EOS included. |
+| `old_log_probs` | Raw model-policy likelihoods recorded at each sampled ID. |
 | `behavior_log_probs` | Actual temperature/top-k sampling likelihoods. |
 | `advantages` | The completion's advantage repeated across its chain. |
-| `versions`, `session_index`, `call_index` | The policy version, the completion (`row * G + group`) and its call, on sampled ids. |
+| `versions`, `session_index`, `call_index` | The policy version, the completion (`row * G + group`) and its call, on sampled IDs. |
 
-Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. Every completion is scored, whether it stopped on EOS or on the budget. GRPO combines a clipped policy-ratio loss with a k3 KL penalty against the frozen reference when `beta > 0`. The clipping parameters are `epsilon_low`, `epsilon_high` and `dual_clip`.
+Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. With the default `truncation="score"`, every completion is scored, whether it stopped on EOS or on the budget.
 
-Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)` from `dew.sampling`. You can give one EOS id or a tuple of ids. The response mask includes EOS. The text passed to the reward leaves out EOS and padding. The rollout turns `Prompts.prompt_length` into the standard `ModelInputs` attention mask.
+| `GRPOObjective` argument | Default | Meaning |
+|---|---|---|
+| `beta` | `0.0` | k3 KL penalty against the frozen reference; `> 0` keeps the reference. |
+| `epsilon_low`, `epsilon_high` | `0.2`, `0.2` | Clipping range of the policy ratio. |
+| `dual_clip` | `3.0` | Dual-clip bound for negative advantages. |
+| `policy_loss` | `"ppo"` | `"ppo"`, `"gspo"` or `"cispo"`. |
+| `aggregation` | `"token-mean"` | `"token-mean"` or `"session-mean"`. |
+| `behavior_importance` | `None` | Token TIS cap, or an IcePop `(lo, hi)` band. |
+| `sequence_mask`, `geometric_mask` | `None` | Chain rejection by summed or mean k1. |
+| `sampling_temperature` | `1.0` | Temperature the sampled IDs are scored at. |
 
-Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment ids and positions. GRPO validation scores prompt perplexity over real next-token transitions. It does not generate answers for a separate reward evaluation.
+Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)`; `eos_id` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
 
-`old_log_probs` holds the raw policy likelihoods from the cached forward pass at sampling time. `behavior_log_probs` holds the likelihoods after temperature and top-k. For greedy sampling, the chosen action has a behavior log-probability of zero. GRPO's PPO ratio compares the current raw policy with the old raw policy. A correction from behavior policy to proximal policy is a separate algorithm choice, and Dew does not apply one unless you ask.
+Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment IDs and positions. GRPO validation scores prompt perplexity over real next-token transitions; it does not generate answers for a separate reward evaluation.
 
-To ask for one, set `GRPOObjective(..., behavior_importance=2.0)`. This applies detached, token-level truncated importance weights from the recorded raw old policy to the recorded behavior policy. The default, `None`, keeps the uncorrected loss. On supported actions the weight is `min(exp(clip(old_raw - behavior, -20, 20)), cap)`. It multiplies the policy-surrogate terms before the usual reduction over token count. PPO clipping still compares the current policy with the raw old policy, and the KL term does not change. Missing or misaligned behavior likelihoods are refused. This follows verl's token TIS implementation at revision `d040717b21af2e23e8e789a3e354cff2394ae2de`, and `tools/parity_behavior.py` checks it against the installed reference. Truncation, token-level weighting and filtered action support mean this is not an unbiased estimator of the raw policy over full trajectories.
+`old_log_probs` holds the raw policy likelihoods from the cached forward pass at sampling time, and `behavior_log_probs` the likelihoods after temperature and top-k. For greedy sampling, the chosen action has a behavior log-probability of zero. GRPO's PPO ratio compares the current raw policy with the old raw policy. A correction from behavior policy to proximal policy is a separate algorithm choice, applied only on request.
+
+`GRPOObjective(..., behavior_importance=2.0)` applies detached, token-level truncated importance weights from the recorded raw old policy to the recorded behavior policy; the default `None` keeps the uncorrected loss. On supported actions the weight is `min(exp(clip(old_raw - behavior, -20, 20)), cap)`. It multiplies the policy-surrogate terms before the usual reduction over token count. PPO clipping still compares the current policy with the raw old policy, and the KL term does not change. Missing or misaligned behavior likelihoods are refused. This follows verl's token TIS implementation at revision `d040717b21af2e23e8e789a3e354cff2394ae2de`, and `tools/parity_behavior.py` checks it against the installed reference. Truncation, token-level weighting and filtered action support mean this is not an unbiased estimator of the raw policy over full trajectories.
 
 ## Tool episodes
 
@@ -285,7 +322,7 @@ The verifier takes an `Episode` and returns a finite scalar reward. It sees the 
 
 Verification runs while the environment context is still open, so a verifier you write can inspect temporary files or a live sandbox. Resources are released after verification, whether it succeeded or failed. If release fails, the episode is thrown out instead of being scored.
 
-Episodes train through the same packer as engine-sourced rollouts ([Engine-sourced rollouts and packed rows](#engine-sourced-rollouts-and-packed-rows)). `session_of(episode, group=...)` turns each episode into a `Session` whose calls are its actions. When the environment's next context starts with the previous context plus the sampled actions, the two calls merge into one chain; any other context starts a new chain. Chains share rows `max_prompt_tokens + max_new_tokens` IDs wide, so set `GRPOObjective.seq_len` to that width minus one. The batch keeps B*G*K rows for B tasks, G samples and K turns, which always fits and keeps shapes fixed. Only sampled actions, EOS included, carry loss mass. Observations are never targets. Raw likelihoods land in `old_log_probs` and behavior likelihoods in `behavior_log_probs`, copied from the actual inference result without retokenizing or rescoring a transcript. Truncated episodes are masked rather than trained on, and they are left out of the group baseline.
+Episodes train through the same packer as engine-sourced rollouts ([Sessions and packed rows](#sessions-and-packed-rows)). `session_of(episode, group=...)` turns each episode into a `Session` whose calls are its actions. When the environment's next context starts with the previous context plus the sampled actions, the two calls merge into one chain; any other context starts a new chain. Chains share rows `max_prompt_tokens + max_new_tokens` IDs wide, so set `GRPOObjective.seq_len` to that width minus one. The batch keeps B*G*K rows for B tasks, G samples and K turns, which always fits and keeps shapes fixed. Only sampled actions, EOS included, carry loss mass. Observations are never targets. Raw likelihoods land in `old_log_probs` and behavior likelihoods in `behavior_log_probs`, copied from the actual inference result without retokenizing or rescoring a transcript. Truncated episodes are masked rather than trained on, and they are left out of the group baseline.
 
 Collection binds one snapshot of the variables until it returns. Every rank supplies the same number of task rows and agrees on budgets, sampling and clocks before it opens any environment. All local episode slots are sampled together in each round. Finished slots keep their global row positions with inert prompts whose outputs are thrown away, so episodes with different turn counts do not change the order of collectives or the random draws. Ranks agree on a tool, reset or verifier failure before the next generation, and every rank releases the environments it opened. The committed update clock stays in `policy_step`, and the attempted-work clock in the episode identities. Continuing from a checkpoint restores the Trainer and the input iterator.
 
@@ -299,11 +336,15 @@ Both asyncio and concurrent-futures cancellations raise `EpisodeCancelled` with 
 
 The lifecycle matches the responsibilities in [verl BaseTool](https://github.com/volcengine/verl/blob/main/verl/tools/base_tool.py): create, execute, calculate reward and release. verl's [multi-turn guide](https://verl.readthedocs.io/en/latest/sglang_multiturn/multiturn.html) describes assistant-only masks and warns about differences caused by retokenization. Dew keeps each actual model call instead of rebuilding sampled tokens from message deltas. A remote sandbox adapter would also have to handle creation, timeout policy and termination, as the [E2B Python SDK](https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_sync/main.py) does. Dew bundles neither an E2B client nor a verl runtime adapter. `SubprocessEnvironment` covers only the local case with resource limits. For single-shot verification, `SandboxFleet` with `ContainerRunner` runs each program in a network-less container; see [asynchronous RLVR](#asynchronous-rlvr).
 
+### verl rows
+
 `dew.objectives.rl.verl.to_verl(sessions)` writes native verl `AgentLoopOutput` rows, one per strict chain of each session: the first call's prompt, then every sampled and in-between id with `response_mask` 1 on the sampled ones, the engine's behavior log probabilities (0.0 elsewhere), `routed_experts` when every call recorded routing, and `min_global_steps` and `max_global_steps` from the call versions. `from_verl(rows)` reads verl's own rows back: each run of mask-1 ids becomes one call, whose prompt is every id before it, and `min_global_steps` is its policy version. Pass `samples=` verl's `rollout.n` to group rows the way verl repeats prompts. `extra_fields.dew` is optional. When Dew wrote it, it restores the session's identity, status, finish reasons, versions and sampling supports exactly. A call that sampled nothing, such as one aborted before its first token, keeps its place. A native row's own `min_global_steps` and `max_global_steps` are kept; Dew writes its own only when a row had none. verl's own `extra_fields` come back in `VerlTrajectory.extras` and are written out unchanged. Rows carrying media (`multi_modal_data`, `mm_processor_kwargs`, `mm_processor_output`) are refused, because Dew's text trainer would score their placeholder ids without the images or video. `from_verl(rows, media=True)` imports them for a round trip only. Import also refuses rows without behavior log probabilities, a version or a reward.
 
 Live, imported and journal-restored actions all go through the same validation: a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
 
 `tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, and reads and drops `ability` and `agent_name`. Dew does not import torch or verl at runtime.
+
+### Episode journal
 
 Set `EpisodeRollout(..., journal=EpisodeJournal("run/episodes"))` to save sampled pending actions and completed turns in a SQLite WAL, one per rank. The environment must implement `get_state() -> bytes` and `set_state(state: bytes) -> None`. Those snapshots must hold the tool state and any workspace state that later calls or the verifier need. The subprocess adapter exposes these operations as JSON requests, with base64 state strings and a `{"restored": true}` acknowledgment. Environments without snapshots still work when you do not use a journal.
 
@@ -340,21 +381,21 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 
 `OpenAICompletion` accepts token-id rows as prompts, and its `Completion` records per-choice `tokens` and `log_probs` when the engine reports them.
 
-### Scheduling rollouts
+### Rollout scheduler
 
 `RolloutScheduler(objective, source, weights, width=W, rows=N, tasks=..., groups=G, max_lag=1, ahead=1, sync_every=1)` is the trainer's `Rollout` for any `SessionSource`. Train on `scheduler.tasks(dataset)` with `Trainer(..., rollout=scheduler)`. `tasks` turns a batch into `Task`s: `task_ids` reads integer `task_id` rows, `prompt_tasks` reads prompt rows. The wrapped stream registers each batch as the trainer's prefetch reads it. When the trainer hands the scheduler batch `i`, the scheduler submits batches `i + 1` through `i + ahead` under the version `weights` serves at that moment; batch `i` was submitted `ahead` calls earlier and has been running since. Nothing is read ahead of the trainer's prefetch, so the checkpointed data position stays the trainer's. A resumed run re-reads and resubmits whatever was in flight, and reopening the stream cancels the rollouts the old stream left running.
 
 Each task becomes one group of `G` rollouts. The scheduler relabels every admitted rollout with its own group id, sample index and attempt, so a resubmitted sample rejoins its group. Admission goes by status:
 
 - `COMPLETED` and `AGENT_ERROR` rollouts are admitted with their verifier reward.
-- `TRUNCATED` rollouts complete their group and train as `truncation` says (`"mask"` by default: no loss, no baseline; see [packed rows](#engine-sourced-rollouts-and-packed-rows)). Under `"score"`, a truncation that arrives without a reward is submitted again as a failed attempt: its verifier never ran, which is an infrastructure failure, not an outcome of the policy.
+- `TRUNCATED` rollouts complete their group and train as `truncation` says (`"mask"` by default: no loss, no baseline; see [Sessions and packed rows](#sessions-and-packed-rows)). Under `"score"`, a truncation that arrives without a reward is submitted again as a failed attempt: its verifier never ran, which is an infrastructure failure, not an outcome of the policy.
 - `INFRA_ERROR` and `CANCELLED` rollouts are never scored. The sample is submitted again under the served weights, up to `max_attempts` failures per sample, after which its group is abandoned.
 - A rollout whose oldest call is more than `max_lag` updates behind is discarded and submitted again. One still running whose submission is already past the bound is cancelled without being waited on.
 - With `timeout=S`, a rollout still running `S` seconds after its submission is cancelled and submitted again as a failed attempt. Cancelling asks the source to stop; a thread stuck inside an environment step cannot be reclaimed, so environments must bound their own step time.
 
 If a source raises instead of returning a status, Dew cancels the batch's work and the exception propagates. Two settings cut the long tail without changing the batch shape. `oversample=K` runs `G + K` samples per group and admits the first `G` to finish. `admit=M` admits the first `M` groups of a batch to complete and cancels the rest. Both select by completion time, which favors short rollouts. Rollouts running when a push lands keep running; their later calls carry the new version, and the rollout's staleness is its oldest call's.
 
-The scheduler pushes weights through `weights.load(params, updates)` whenever the served version falls `sync_every` updates behind, so a first submission is at most `ahead + sync_every - 1` updates stale. Construction refuses a `max_lag` below that. A push that does not move the served version is tried once more, then raises. Admitted groups are packed by `pack(sessions, W, rows=N)` into fixed `[N, W]` rows with per-rollout advantages. A session whose calls do not extend each other packs as one chain per call, so a complete group is admitted only if its chains fit `N` rows beside the groups admitted before it; otherwise it is cut, counted in the record, and the batch trains without it. Size `N` for the chains a group can split into: a group whose chains cannot fit `N` rows on its own raises, whatever order the groups finish in. `old_log_probs` is always rescored under the trainer's current weights, which serve as the proximal policy ([AReaL](https://arxiv.org/abs/2505.24298)); `behavior_log_probs` keeps what the engine reported, and `GRPOObjective(behavior_importance=...)`, a TIS cap or an IcePop band, weights each token by proximal over behavior. A schedule that allows any lag requires it. `log` receives a `SchedulerRecord` per call: the oldest admitted version and lag, admitted groups, resubmissions by cause, cancellations, abandoned and cut groups, seconds waited, and `session_metrics` over the admitted rollouts and their packed batch, with each rollout's latency from submission to finish. One trainer process owns the scheduler; multi-process trainers are refused.
+The scheduler pushes weights through `weights.load(params, updates)` whenever the served version falls `sync_every` updates behind, so a first submission is at most `ahead + sync_every - 1` updates stale. Construction refuses a `max_lag` below that. A push that does not move the served version is tried once more, then raises. Admitted groups are packed by `pack(sessions, W, rows=N)` into fixed `[N, W]` rows with per-rollout advantages. A session whose calls do not extend each other packs as one chain per call, so a complete group is admitted only if its chains fit `N` rows beside the groups admitted before it; otherwise it is cut, counted in the record, and the batch trains without it. Size `N` for the chains a group can split into: a group whose chains cannot fit `N` rows on its own raises, whatever order the groups finish in. `old_log_probs` is always rescored under the trainer's current weights, which serve as the proximal policy ([AReaL](https://arxiv.org/abs/2505.24298)); `behavior_log_probs` keeps what the engine reported, and `GRPOObjective(behavior_importance=...)`, a TIS cap or an IcePop band, weights each token by proximal over behavior. A schedule that allows any lag requires it. `log` receives a `SchedulerRecord` per call: the oldest admitted version and lag, admitted groups, resubmissions by cause, cancellations, abandoned and cut groups, seconds waited, and `session_metrics` over the admitted rollouts and their packed batch, with each rollout's latency from submission to finish.
 
 A multi-process trainer runs one scheduler per process, each on its own source over the task rows its data stream reads, and each packs its own `N` rows: the step's batch is every process's rows together, sharded as the trainer shards any batch, so no rollout crosses a process. The processes meet at the weight push, which every process calls and one process sends, and at the proximal rescoring, which runs once over the pool's batch. An admission that fails on one process raises on every process there, rather than leave the others waiting in the rescoring. On 4x RTX 3090 (PCIe 3.0, one host), three trainer processes on GPUs 0 to 2 trained Qwen3-0.6B with GRPO from rollouts vLLM drew on GPU 3, one task batch ahead (`max_lag=1`). After the first update no process waited more than 0.03 s for its rollouts, and eight updates took 161 s with `NCCLPush` and 229 s with `SafetensorsReload`.
 
@@ -371,7 +412,7 @@ A `Program` is files written into a fresh temporary directory, an argv run there
 
 `tests/test_fleet.py` runs real programs through each verdict, including a forked child that must die at the timeout and, when Docker and `python:3.12-slim` are present, a container that must have no network and a read-only mount. `tests/test_rollout_scheduler.py` checks admission, retries, truncation masks, stragglers, the staleness bound, resume and a `Trainer` run through multi-turn environments on the native server. `tests/test_rollout_sources.py` checks both sources' statuses and cancellation. `tests/test_rollout_servers.py` checks the vLLM and SGLang requests and responses against each engine's wire format, the version of a draw in flight across a push, a safetensors reload read back by `load_pretrained`, and reloads refused on both engines, by status or by a 200 that says `success: false`.
 
-## Engine-sourced rollouts and packed rows
+## Sessions and packed rows
 
 `dew.objectives.rl.sessions` holds the records any recording gateway can supply. A `Call` has the `prompt_ids` the engine read, the `sampled_ids` it drew (EOS included on a natural stop), one engine-reported `behavior_log_probs` entry per sampled id, a `finish_reason` and the policy `version` served when the request was submitted. A `Session` is one harness session: `task`, `group`, `sample`, `attempt`, its calls in submission order, a `Status` (`COMPLETED`, `TRUNCATED`, `AGENT_ERROR`, `INFRA_ERROR`, `CANCELLED`), the verifier's `reward`, its `components` and a `detail` string. A `SessionSource` turns a `Task(id, data)` into futures of sessions.
 
@@ -401,7 +442,7 @@ Whenever behavior likelihoods are present the loss reports `mismatch/kl`, `misma
 
 Before training a new model family or harness setting, run `tools/audit_template.py template --tokenizer <name>` to see whether its chat template keeps histories append-only, and `tools/audit_template.py sessions traces.jsonl` to measure calls per chain on recorded sessions. The audit takes the sampled turn to be what the template writes for a final assistant turn, so each family's own tool-call and reasoning syntax is checked. With Qwen3 (`Qwen/Qwen3-0.6B`), only a reasoning turn followed by a tool-role observation merges: user-role observations drop the reasoning from history, a turn without reasoning is written with an empty `<think></think>` block that history drops, and, in the reasoning setting that otherwise merges, arguments sent as a JSON string still merge while compact tool-call JSON is re-serialized with spaces and splits.
 
-## PPO with a critic
+## PPO
 
 `PPOObjective(model, seq_len, critic=..., value_coefficient=.5, value_clip=.2, beta=...)` trains the policy and critic as two subtrees of one variables tree, with the ordinary optimizer. `ValueHead(backbone)` adds a scalar Dense head on a decoder's hidden states. A custom critic can instead return one scalar per token position from packed token ids with their `segment_ids` and `positions`. The critic is initialized separately from the policy. The unit-decay reference covers only the policy subtree.
 
@@ -409,18 +450,24 @@ Before training a new model family or harness setting, run `tools/audit_template
 
 The prepared batch keeps `old_log_probs`, `behavior_log_probs` and `response_mask`, and adds `old_values`, `advantages` and `returns`, each shaped like the packed `input_ids`. Both losses reduce over the same action-token mass, so PPO keeps token-mean aggregation and refuses sequence masks. `value_coefficient` scales the half-squared critic loss, and `value_clip` clips predictions around the recorded values. Policy clipping, KL strength and the optional behavior-importance cap are the same controls as in GRPO. You can also keep these targets in a dataset and run several PPO updates on them without sampling again.
 
-This example imports repository test fixtures, so run it from a checkout with `PYTHONPATH=src:tests`. It runs on CPU with `JAX_PLATFORMS=cpu`. It samples square-tool calls, runs the in-memory square environment and learns from the final-answer reward. It needs no checkpoint or network service. The fixtures define a small bigram policy and trainable token features, not a useful pretrained language model.
+The next example samples square-tool calls, runs the in-memory square environment and learns from the final-answer reward. Its policy, environment and critic backbone come from the test suite of a Dew repository checkout: a small bigram policy and trainable token features, not a pretrained language model. It needs no checkpoint or network service.
 
 ```python
 import itertools
+import sys
+from pathlib import Path
+
+import dew
 import jax
 import numpy as np
 import optax
 from dew import Trainer
 from dew.data import Dataset
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
-from test_tool_episodes import ToolPolicy, Harness, verify, SAMPLING
+
+sys.path.insert(0, str(Path(dew.__file__).parents[2] / "tests"))
 from test_ppo import TokenFeatures
+from test_tool_episodes import SAMPLING, Harness, ToolPolicy, verify
 
 key = jax.random.key(19)
 objective = PPOObjective(ToolPolicy(), seq_len=10,
@@ -434,7 +481,16 @@ data = Dataset(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
 state = trainer.fit(data, steps=2, log_every=1)
-assert int(state.updates) == 2
+print("PPO updates:", int(state.updates))
+```
+
+```text
+Training PPOObjective from step 0 to 2: 169 parameters, on 1 × cpu, batch 1, float32
+step 1/2  loss 0.1247  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.2493  kl 0  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.008742  pg -4.470e-08  step_time_ms 2.660  samples_per_sec 4,511  rollout_seconds 0.9878  accepted 100.0%
+step 2/2  loss 0.1797  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.01021  pg 8.941e-08  step_time_ms 44.26  samples_per_sec 271.1  rollout_seconds 0.04330  accepted 100.0%
+Trained 2 steps in 0:00:02: first step after 1.52 s, then 22.4 step/s
+2.9% of the wall time in steps, final loss 0.1797
+PPO updates: 2
 ```
 
 `tools/parity_ppo.py` records installed verl's GAE, clipped policy and value losses and autograd gradients at revision `d040717b21af2e23e8e789a3e354cff2394ae2de`. `tests/test_ppo.py` checks those tensors, the complete Objective loss and parameter gradients, and a two-update run that changes the policy and critic weights, lowers the critic error and keeps the policy reference fixed. Removing the critic, KL or policy-clipping term makes the composite reference comparison fail.
@@ -457,7 +513,7 @@ from dew.objectives.rl import FlowGRPOObjective, FlowRollout
 inputs = InputSpec(Field("image", (4, 4, 1)))
 model = models.SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
                          num_layers=1, num_heads=2, mlp_ratio=2)
-objective = FlowGRPOObjective(model, presets.Flow()(), inputs,
+objective = FlowGRPOObjective(model, presets.Flow(), inputs,
                               guidance=None, beta=0.01, steps=5)
 
 def brightness(images, batch):
@@ -481,15 +537,15 @@ Callback scores stay float64 through collection, JSON and byte transfer between 
 
 On several hosts, every rank takes part in generation. Rewards run on rank zero. The rollout returns rows owned by each process, and the trainer reassembles them. Its host conversion gathers the full trajectory on every rank before picking the owned rows, so host memory grows with the global rollout size. The two-process CPU check shows correct row ownership and a matching single update. It does not measure throughput on a cluster.
 
-## Move between stages
+## Stage chains
 
-The Python-only `recipes.chain.Recipe` takes a shared decoder, optimizer, key, output directory, batch size and a tuple of `Stage` values. The type of a stage's dataset picks its objective: `ChatMessages` picks SFT, `PreferencePairs` picks DPO and `Prompts` picks GRPO. The stage name only labels its directory. A name such as `"sft"` does not infer masks or convert data.
+`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset picks its objective: `ChatMessages` trains SFT, `PreferencePairs` DPO and `Prompts` GRPO. The stage name only labels its directory; a name such as `"sft"` does not infer masks or convert data.
 
-In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead. For a fresh chain, use distinct stage names and a new run directory. The returned list keeps every stage's final state, so a long chain can hold a lot of memory.
+In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. If a stage directory already exists, the stage can restore its checkpoint instead, so a fresh chain needs distinct stage names and a new run directory. `Recipe.run` returns every stage's final state, oldest first, so a long chain can hold a lot of memory.
 
-The chain exposes `beta`, `reward`, `groups`, `max_new_tokens` and `estimator`. It does not expose the rollout's `decode`, `eos_id` or `temperature`, so its default reward input is token-ID text. For rewards on decoded text or for stop tokens, build `SampledRollout` and `Trainer` yourself. The [LM command-line recipe](../recipes.md) accepts the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files. It is not a command-line SFT, DPO and GRPO chain.
+A `Stage` sets `steps` (default 100), `beta` (None: 0.1 for DPO, 0.0 for GRPO; an SFT stage refuses one), `reward` (required for GRPO), `groups`, `max_new_tokens` and `estimator`. It does not expose the rollout's `decode` or `sampling`, so its reward reads token-ID text. For rewards on decoded text or for stop tokens, build `SampledRollout` and `Trainer` directly. The [LM recipe](../recipes.md) trains the `lm`, `masked_diffusion` and `block_diffusion` objectives over token files; it is not a command-line SFT, DPO and GRPO chain.
 
-## Limits and evidence
+## Scope and numerical checks
 
 Multi-turn text episodes run through `EpisodeRollout` and environments you supply, including on coordinated JAX process pools and with the local `SubprocessEnvironment`. `EpisodeJournal` restores completed turn boundaries for environments that can snapshot their state. Dew does not bundle remote sandbox adapters for episodes; `SandboxFleet` runs verification programs in local processes or containers.
 
