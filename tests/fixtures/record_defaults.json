@@ -632,6 +632,7 @@
   "num_nextn_predict_layers": 0,
   "o_proj_bias": null,
   "output_gate": false,
+  "parallel_residual": false,
   "partial_rotary_factor": null,
   "partial_rotary_type": "proportional",
   "per_layer_input_dim": null,

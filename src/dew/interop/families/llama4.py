@@ -111,7 +111,8 @@ def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     return {'attention_chunk_size': chunks.pop() if chunks else None}
 
 
-def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _llama4_prepare(tensors: Mapping[str, np.ndarray],
+                     _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """Split each fused `experts.gate_up_proj` into the two stacked kernels.
 
     `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the

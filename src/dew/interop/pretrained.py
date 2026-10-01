@@ -2303,7 +2303,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # (Gemma 4's prepare) has no raw-name bindings.
     entry = decoders._FAMILIES[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
