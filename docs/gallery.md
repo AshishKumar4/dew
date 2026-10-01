@@ -6,57 +6,57 @@ Samples from models trained with Dew. [Diffusion training](guides/diffusion.md) 
 
 A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: [`dewml/hybrid-dit-176m`](https://huggingface.co/dewml/hybrid-dit-176m).
 
-Each image is captioned with its prompt. The [manifest](/examples/curated/manifest.json) records the actual seed, solver, guidance and batch context for reproducing each draw; settings differ between images.
+Each image is captioned with its prompt. The [manifest](../site/public/examples/curated/manifest.json) records the actual seed, solver, guidance and batch context for reproducing each draw; settings differ between images.
 
 <div class="curated-gallery">
 
-<figure><img src="/examples/curated/p0_s5.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p0_s5.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-<figure><img src="/examples/curated/p0_s14.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p0_s14.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-<figure><img src="/examples/curated/p0_s10.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p0_s10.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-<figure><img src="/examples/curated/p0_s3.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p0_s3.webp" width="256" height="256" alt="green and purple northern lights reflected in a frozen lake, snowy mountains at night" loading="lazy" decoding="async" /><figcaption>green and purple northern lights reflected in a frozen lake, snowy mountains at night</figcaption></figure>
 
-<figure><img src="/examples/curated/p1_s3.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p1_s3.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p1_s10.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p1_s10.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p1_s5.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p1_s5.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p1_s1.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p1_s1.webp" width="256" height="256" alt="rolling sand dunes in the desert at sunset, deep orange sand and purple sky" loading="lazy" decoding="async" /><figcaption>rolling sand dunes in the desert at sunset, deep orange sand and purple sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p2_s2.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p2_s2.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p2_s12.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p2_s12.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p2_s13.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p2_s13.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p2_s1.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p2_s1.webp" width="256" height="256" alt="the milky way above snowy mountains, a clear starry night sky" loading="lazy" decoding="async" /><figcaption>the milky way above snowy mountains, a clear starry night sky</figcaption></figure>
 
-<figure><img src="/examples/curated/p3_s2.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p3_s2.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
 
-<figure><img src="/examples/curated/p3_s13.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p3_s13.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
 
-<figure><img src="/examples/curated/p3_s1.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p3_s1.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
 
-<figure><img src="/examples/curated/p3_s12.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p3_s12.webp" width="256" height="256" alt="a Gothic cathedral interior with glowing stained glass windows and stone arches" loading="lazy" decoding="async" /><figcaption>a Gothic cathedral interior with glowing stained glass windows and stone arches</figcaption></figure>
 
-<figure><img src="/examples/curated/p4_s1.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p4_s1.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
 
-<figure><img src="/examples/curated/p4_s13.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p4_s13.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
 
-<figure><img src="/examples/curated/p4_s2.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p4_s2.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
 
-<figure><img src="/examples/curated/p4_s12.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p4_s12.webp" width="256" height="256" alt="a canyon with towering red rock cliffs and a winding river at sunset" loading="lazy" decoding="async" /><figcaption>a canyon with towering red rock cliffs and a winding river at sunset</figcaption></figure>
 
-<figure><img src="/examples/curated/p5_s8.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p5_s8.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
 
-<figure><img src="/examples/curated/p5_s12.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p5_s12.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
 
-<figure><img src="/examples/curated/p5_s1.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p5_s1.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
 
-<figure><img src="/examples/curated/p5_s13.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
+<figure><img src="../site/public/examples/curated/p5_s13.webp" width="256" height="256" alt="a field of sunflowers in southern France, an oil painting by Vincent van Gogh" loading="lazy" decoding="async" /><figcaption>a field of sunflowers in southern France, an oil painting by Vincent van Gogh</figcaption></figure>
 
 </div>
 
