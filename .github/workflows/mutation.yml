@@ -1,0 +1,77 @@
+name: Mutation tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: Source module to mutate
+        required: true
+        default: process
+        type: choice
+        options: [transaction, checkpoints, process, schedules, attention, sources]
+  # Review runs of this workflow before it is available on the default branch.
+  push:
+    branches: ["ci/mutation/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.ref }}-${{ inputs.module }}
+  cancel-in-progress: true
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      JAX_PLATFORMS: cpu
+      PYTHONDONTWRITEBYTECODE: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "2"
+      MODULE: ${{ inputs.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[test,mutation,av,tfds]" -c constraints.txt
+      - name: Run mutation tests
+        run: |
+          module="${MODULE:-${GITHUB_REF_NAME#ci/mutation/}}"
+          python tools/mutation.py "$module" --shard ${{ matrix.shard }} --shards 8 \
+            --output "mutation-${{ matrix.shard }}"
+      - name: Upload mutations and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutations-${{ matrix.shard }}
+          path: mutation-${{ matrix.shard }}/
+          if-no-files-found: error
+
+  summary:
+    needs: mutation
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutations-*
+          path: mutation-reports
+      - name: Report the module score
+        run: python tools/mutation.py --summarize mutation-reports >> "$GITHUB_STEP_SUMMARY"
