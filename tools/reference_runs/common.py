@@ -32,8 +32,10 @@ from trace_window import kernel_category, window_split
 # Dense bf16 tensor throughput with fp32 accumulation, the figure MFU is
 # taken against. GA102 whitepaper, appendix table: RTX 3090 71 TFLOPS dense
 # (142 with sparsity). DistTrain's instrumentation table carries the same.
+# A TPU v6e chip ("TPU v6 lite") peaks at 918 TFLOPs bf16
+# (cloud.google.com/tpu/docs/v6e, the system architecture table).
 PEAK_BF16 = {"NVIDIA GeForce RTX 3090": 71e12, "NVIDIA GeForce RTX 4080": 97.5e12,
-             "NVIDIA A100": 312e12, "NVIDIA L4": 121e12}
+             "NVIDIA A100": 312e12, "NVIDIA L4": 121e12, "TPU v6 lite": 918e12}
 
 EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
@@ -173,7 +175,9 @@ def xplane_kernels(directory: str | Path) -> tuple[list[tuple[str, int, int, int
     with the names of the device lines they came from.
 
     A GPU plane holds one line per CUDA stream; the per-op and per-module
-    lines are derived from the same kernels, so only stream lines count."""
+    lines are derived from the same kernels, so only stream lines count. A
+    TPU plane runs its HLO ops on one "XLA Ops" line, named after the HLO
+    instruction (`fusion.12`, `convolution.3`)."""
     from jax.profiler import ProfileData
 
     traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
@@ -181,14 +185,15 @@ def xplane_kernels(directory: str | Path) -> tuple[list[tuple[str, int, int, int
         raise FileNotFoundError(f"no xplane.pb under {directory}")
     kernels, lines = [], set()
     for plane in ProfileData.from_file(str(traces[-1])).planes:
-        match = re.match(r"/device:GPU:(\d+)", plane.name)
+        match = re.match(r"/device:(GPU|TPU):(\d+)", plane.name)
         if match is None:
             continue
         for line in plane.lines:
             lines.add(f"{plane.name}:{line.name}")
-            if not line.name.lower().startswith("stream"):
+            if not (line.name.lower().startswith("stream") if match.group(1) == "GPU"
+                    else line.name == "XLA Ops"):
                 continue
-            device = int(match.group(1))
+            device = int(match.group(2))
             kernels.extend((event.name, event.start_ns, event.end_ns, device) for event in line.events)
     return kernels, sorted(lines)
 
