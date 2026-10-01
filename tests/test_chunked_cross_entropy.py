@@ -18,6 +18,7 @@ short. The two reductions run in different orders, so nothing there is exact;
 the one case whose head is bf16 rounds at the end and holds to 1e-4.
 """
 
+import contextlib
 import math
 
 import jax
@@ -795,7 +796,10 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
         return outputs, jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1))(
             hidden, head, softcap)
 
-    (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
+    # fp32 products at full precision, so the fp32 bound below holds on a
+    # backend whose default fp32 product is TF32 too.
+    with (jax.default_matmul_precision("highest") if dtype == jnp.float32 else contextlib.nullcontext()):
+        (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
     assert jnp.array_equal(tiled[1], whole[1])
     # The two take log Z in a different order, so a probability can move by
     # an fp32 ulp; where the head's gradient multiplies bf16 operands, that
@@ -812,8 +816,7 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     # exp(x - log Z) carries that error relative and three roundings of its
     # own, and a gradient entry sums V of them, V more roundings. Two paths,
     # so twice gamma(4V + 5) + gamma(2) max |log Z|, 9.8e-4 here. Measured:
-    # 4.9e-6 of the largest entry on CPU, 3.3e-5 on an RTX 4080, whose
-    # default fp32 products are TF32.
+    # 4.9e-6 of the largest entry on CPU and 1.5e-6 on an RTX 4080.
     if dtype == jnp.float32:
         def gamma(steps):
             return steps * 2.0**-24 / (1 - steps * 2.0**-24)
