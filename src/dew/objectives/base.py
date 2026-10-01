@@ -163,12 +163,12 @@ class TrainingValues[Statistics, Additions]:
 
     def __getattr__(self, name: str) -> TrainingScalar[Statistics, Additions]:
         try:
-            return self._owner.scalar(name)
+            return self._owner._scalar(name)
         except ValueError as missing:
             raise AttributeError(str(missing)) from missing
 
     def __getitem__(self, name: str) -> TrainingScalar[Statistics, Additions]:
-        return self._owner.scalar(name)
+        return self._owner._scalar(name)
 
     def __dir__(self) -> list[str]:
         return sorted(set(object.__dir__(self)) | {'loss'} | set(self._owner.shown))
@@ -341,7 +341,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     def values(self) -> TrainingValues[Loss, Effects]:
         return TrainingValues(self)
 
-    def scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
+    def _scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
         """Select a declared training scalar; `objective.loss` selects the loss itself."""
         if name != 'loss' and name not in self.shown:
             raise ValueError(f"the objective does not declare training scalar {name!r}")

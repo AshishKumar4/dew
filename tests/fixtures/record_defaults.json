@@ -40,36 +40,36 @@
   }
  },
  "dew.config.TrainerConfig": {
-  "name": null,
-  "checkpoint_dir": "./checkpoints",
-  "keep": 2,
-  "best": null,
-  "batch_size": 32,
-  "seed": 0,
-  "steps": null,
-  "epochs": null,
-  "log_every": 100,
-  "eval_every": "epoch",
-  "checkpoint_every": "epoch",
   "accumulation": 1,
   "batch_ramp": null,
-  "dynamic_scale": false,
-  "mesh": {
-   "class": "dew.training.distributed.MeshSpec",
-   "sets": {}
+  "batch_size": 32,
+  "best": null,
+  "checkpoint_dir": "./checkpoints",
+  "checkpoint_every": "epoch",
+  "compilation_cache_dir": {
+   "factory": "dew.telemetry.instrumentation.default_compilation_cache_dir"
   },
+  "dynamic_scale": false,
+  "epochs": null,
+  "eval_every": "epoch",
+  "keep": 2,
   "layout": {
    "class": "dew.training.distributed.Layout",
    "sets": {}
   },
-  "profile": null,
-  "compilation_cache_dir": {
-   "factory": "dew.telemetry.instrumentation.default_compilation_cache_dir"
+  "log_every": 100,
+  "mesh": {
+   "class": "dew.training.distributed.MeshSpec",
+   "sets": {}
   },
-  "wandb": null,
   "multi_host": null,
-  "xla_flags": null,
-  "quantization": null
+  "name": null,
+  "profile": null,
+  "quantization": null,
+  "seed": 0,
+  "steps": null,
+  "wandb": null,
+  "xla_flags": null
  },
  "dew.config.Wandb": {
   "entity": null,
@@ -1731,11 +1731,11 @@
  },
  "dew.training.selection.Best": {
   "metric": "required",
-  "top": 1,
   "mode": null,
+  "split": null,
   "threshold": null,
-  "weights_only": false,
-  "split": null
+  "top": 1,
+  "weights_only": false
  },
  "dew.training.trainer.ProfileWindow": {
   "directory": "required",
