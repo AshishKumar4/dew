@@ -1,8 +1,8 @@
 """Mix tokens with S5 state-space layers and a 2D state fusion convolution.
 
-The S5 layer is a diagonal SSM run by `associative_scan` from the S4D-Lin
-poles. The fusion convolution is Spatial-Mamba's, and the two together are
-the SSM mixer of `ModulatedBlock`.
+The S5 layer is a diagonal SSM from the S4D-Lin poles, run in chunks of
+pole-power products (`diagonal_recurrence`). The fusion convolution is
+Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 """
 
 
@@ -31,6 +31,69 @@ def hippo_a_imag_init(key, shape, dtype=jnp.float32):
     return (jnp.pi * n).astype(dtype)
 
 
+# Positions a chunk of `diagonal_recurrence` covers.
+SCAN_CHUNK = 16
+
+
+def _complex_blocks(re: jax.Array, im: jax.Array) -> jax.Array:
+    """The real form `[[re, -im], [im, re]]` of complex matrices `[M, K, ...]`:
+    their product with `[re; im]` stacked along K is the complex product,
+    stacked the same way along M."""
+    return jnp.concatenate([jnp.concatenate([re, -im], 1), jnp.concatenate([im, re], 1)], 0)
+
+
+def _toeplitz(powers: jax.Array, size: int, lag: int) -> jax.Array:
+    """`[size, size, N]` with entry `(k, j)` the power `powers[k - j - lag]`
+    of each of the N poles where that index is not negative, else zero. It
+    is built from shifted copies, so its transpose is slices, not a
+    scatter."""
+    return jnp.stack([jnp.pad(powers[:max(size - j - lag, 0)], ((min(j + lag, size), 0), (0, 0)))
+                      for j in range(size)], axis=1)
+
+
+def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CHUNK) -> jax.Array:
+    """The states `x_k = pole * x_(k-1) + v_k`, from `x = 0` before the
+    first position, of N diagonal complex recurrences over axis 1.
+
+    `pole` is `[N]` complex. `inputs` is `v` `[B, S, 2N]` in real form, its
+    real parts and then its imaginary parts on the last axis, and the states
+    come back the same way, computed in real arithmetic. Positions run in
+    chunks of `chunk`: inside a chunk the states are one product of the
+    powers `pole^(k - j)` with the chunk's inputs, and across chunks a second
+    product carries each chunk's last state forward by the powers
+    `pole^(chunk m)`. The powers are running products of the pole, as a scan
+    forms them, and both products run at fp32's full precision, so the
+    states round as an fp32 scan's do.
+    """
+    batch, steps, width = inputs.shape
+    states = width // 2
+    length = min(chunk, steps)
+    chunks = -(-steps // length)
+    highest = jax.lax.Precision.HIGHEST
+    one = jnp.ones((1, states), pole.dtype)
+    # pole^t for t = 0 .. length.
+    powers = jnp.cumprod(jnp.concatenate([one, jnp.broadcast_to(pole, (length, states))]), axis=0)
+    blocks = jnp.pad(inputs, ((0, 0), (0, chunks * length - steps), (0, 0)))
+    blocks = blocks.reshape(batch, chunks, length, 2, states).transpose(0, 1, 3, 2, 4)
+    within = _toeplitz(powers[:length], length, 0)
+    local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within.real, within.imag),
+                       blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
+    local = local.reshape(batch, chunks, 2, length, states)
+    if chunks > 1:
+        # (pole^length)^m for m = 0 .. chunks - 1.
+        strides = jnp.cumprod(jnp.concatenate([one, jnp.broadcast_to(powers[-1], (chunks - 1, states))]),
+                              axis=0)
+        across = _toeplitz(strides, chunks, 1)
+        last = local[:, :, :, -1].transpose(0, 2, 1, 3).reshape(batch, 2 * chunks, states)
+        carry = jnp.einsum("cdn,bdn->bcn", _complex_blocks(across.real, across.imag), last,
+                           precision=highest).reshape(batch, 2, chunks, 1, states)
+        # The state a chunk starts from, carried to each of its positions by pole^(k + 1).
+        lift = powers[1:]
+        local = local + jnp.stack([lift.real * carry[:, 0] - lift.imag * carry[:, 1],
+                                   lift.real * carry[:, 1] + lift.imag * carry[:, 0]], axis=2)
+    return local.transpose(0, 1, 3, 2, 4).reshape(batch, chunks * length, width)[:, :steps]
+
+
 class S5Layer(nn.Module):
     """Run a diagonal complex state-space recurrence over `[B, S, F]` inputs.
 
@@ -41,6 +104,10 @@ class S5Layer(nn.Module):
     real part so the recurrence cannot grow. `dt` discretizes them per
     pole, and the scan runs in at least fp32 whatever dtype the input
     carries (`at_least_fp32`).
+
+    The parameters are the poles `log_A_real`/`A_imag`, the input map
+    `B_re`/`B_im`, the output map `C_re`/`C_im`, the skip `D` and the
+    per-pole step `log_dt`.
     """
     features: int
     state_dim: int = 64
@@ -48,120 +115,65 @@ class S5Layer(nn.Module):
     dt_max: float = 0.1
     dtype: Dtype | None = None
 
-    @nn.compact
-    def __call__(self, u):
-        """Scan `u` `[B, S, F]` through the discretized poles into `[B, S, F]`.
-
-        The parameters are the poles `log_A_real`/`A_imag`, the input map
-        `B_re`/`B_im`, the output map `C_re`/`C_im`, the skip `D` and the
-        per-pole step `log_dt`. The scan's carry is `(A_bar, Bu)`, the
-        running pole product and the running state.
-        """
-        # The input u has shape [B, S, F].
-        B, S, F = u.shape
-        assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
-
+    def setup(self):
         # A: diagonal complex state matrix, S4D-Lin init, parameterized as
         # log of the negative real part for stability
-        log_A_real = self.param(
-            'log_A_real',
-            hippo_log_a_real_init,
-            (self.state_dim,)
-        )
-        A_imag = self.param(
-            'A_imag',
-            hippo_a_imag_init,
-            (self.state_dim,)
-        )
-
+        self.log_A_real = self.param('log_A_real', hippo_log_a_real_init, (self.state_dim,))
+        self.A_imag = self.param('A_imag', hippo_a_imag_init, (self.state_dim,))
         # B: input-to-state projection [state_dim, F]
-        B_re = self.param(
-            'B_re',
-            nn.initializers.lecun_normal(),
-            (self.state_dim, F)
-        )
-        B_im = self.param(
-            'B_im',
-            nn.initializers.lecun_normal(),
-            (self.state_dim, F)
-        )
-
+        self.B_re = self.param('B_re', nn.initializers.lecun_normal(), (self.state_dim, self.features))
+        self.B_im = self.param('B_im', nn.initializers.lecun_normal(), (self.state_dim, self.features))
         # C: state-to-output projection [F, state_dim], lecun_normal as in S5
-        C_re = self.param(
-            'C_re',
-            nn.initializers.lecun_normal(),
-            (F, self.state_dim)
-        )
-        C_im = self.param(
-            'C_im',
-            nn.initializers.lecun_normal(),
-            (F, self.state_dim)
-        )
-
+        self.C_re = self.param('C_re', nn.initializers.lecun_normal(), (self.features, self.state_dim))
+        self.C_im = self.param('C_im', nn.initializers.lecun_normal(), (self.features, self.state_dim))
         # D: skip connection, N(0,1) per channel as in S5
-        D = self.param('D', nn.initializers.normal(stddev=1.0), (F,))
-
+        self.D = self.param('D', nn.initializers.normal(stddev=1.0), (self.features,))
         # dt: discretization timestep, learned per state dim so each state
         # channel can model its own time scale
-        log_dt = self.param(
+        self.log_dt = self.param(
             'log_dt',
             lambda key, shape: jax.random.uniform(
-                key, shape,
-                minval=jnp.log(self.dt_min),
-                maxval=jnp.log(self.dt_max)
-            ),
-            (self.state_dim,)
-        )
-        dt = jnp.exp(log_dt)  # [state_dim]
+                key, shape, minval=jnp.log(self.dt_min), maxval=jnp.log(self.dt_max)),
+            (self.state_dim,))
 
-        A_real = -jnp.exp(log_A_real)  # negative real part for stability
-        A_diag = A_real + 1j * A_imag  # [state_dim]
+    def operators(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """The zero-order hold of the recurrence, `(A_bar, B, C, D)`.
 
-        # ZOH discretization: A_bar = exp(A * dt), B_bar = (A_bar - I) * A^{-1} * B
-        A_bar = jnp.exp(A_diag * dt)  # [state_dim], complex
+        `A_bar = exp(A dt)` is the `[N]` complex poles. The complex products
+        with u and with the states run as real ones over stacked real and
+        imaginary parts, so `B` is `[Re B_bar; Im B_bar]` `[2N, F]`, with
+        `B_bar = (A_bar - 1) / A * B`, and `C` is `[C_re, -C_im]` `[F, 2N]`,
+        whose product with real-form states is `Re(C x)`. `D` is the `[F]`
+        skip.
+        """
+        dt = jnp.exp(self.log_dt)
+        A_diag = -jnp.exp(self.log_A_real) + 1j * self.A_imag
+        A_bar = jnp.exp(A_diag * dt)
+        B_bar = ((A_bar[:, None] - 1.0) / (A_diag[:, None] + 1e-8)) * (self.B_re + 1j * self.B_im)
+        return (A_bar, jnp.concatenate([B_bar.real, B_bar.imag]),
+                jnp.concatenate([self.C_re, -self.C_im], -1), self.D)
 
-        B_complex = B_re + 1j * B_im
-        B_bar = ((A_bar[:, None] - 1.0) / (A_diag[:, None] + 1e-8)) * B_complex  # [state_dim, F]
-
-        C_complex = C_re + 1j * C_im
-
-        # x_k = A_bar * x_{k-1} + B_bar @ u_k via associative scan with
-        # (a1, b1) * (a2, b2) = (a1 * a2, a2 * b1 + b2)
+    def __call__(self, u):
+        """Scan `u` `[B, S, F]` through the discretized poles into `[B, S, F]`."""
+        F = u.shape[-1]
+        assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
+        A_bar, B_bar, C, D = self.operators()
         u_float = u.astype(at_least_fp32(u.dtype))
-        Bu = jnp.einsum('bsf,nf->bsn', u_float, B_bar)  # [B, S, state_dim]
-
-        A_bar_expanded = jnp.broadcast_to(A_bar[None, None, :], (B, S, self.state_dim))
-
-        def binary_operator(e1, e2):
-            a1, b1 = e1
-            a2, b2 = e2
-            return a1 * a2, a2 * b1 + b2
-
-        _, x_states = jax.lax.associative_scan(
-            binary_operator,
-            (A_bar_expanded, Bu),
-            axis=1
-        )
-        # The complex state sequence has shape [B, S, state_dim].
-
+        x = diagonal_recurrence(A_bar, jnp.einsum('bsf,nf->bsn', u_float, B_bar))
         # The k-th output is Re(C x_k) plus the skip D u_k.
-        y_complex = jnp.einsum('fn,bsn->bsf', C_complex, x_states)  # [B, S, F]
-        y = y_complex.real
-
-        y = y + D[None, None, :] * u_float  # [B, S, F]
-
-        if self.dtype is not None:
-            y = y.astype(self.dtype)
-        else:
-            y = y.astype(u.dtype)
-
-        return y
+        y = jnp.einsum('bsn,fn->bsf', x, C) + D * u_float
+        return y.astype(self.dtype) if self.dtype is not None else y.astype(u.dtype)
 
 
 @logical_axes({}, heuristic=(("s5_*",), ("out_proj",)))
 class BidirectionalS5Layer(nn.Module):
     """Runs forward and backward S5 scans, concats and projects back to features.
     Patches have no inherent direction, so scan both ways.
+
+    Both directions read `u` in its own order through one input product,
+    and the backward recurrence runs over the reversed positions of its
+    projected inputs, the narrow `[B, S, 2N]` stream, rather than over a
+    reversed copy of `u`.
     """
     features: int
     state_dim: int = 64
@@ -172,28 +184,19 @@ class BidirectionalS5Layer(nn.Module):
     @nn.compact
     def __call__(self, u):
         # The input u has shape [B, S, F].
-        y_fwd = S5Layer(
-            features=self.features,
-            state_dim=self.state_dim,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
-            dtype=self.dtype,
-            name="s5_forward"
-        )(u)
-
-        u_rev = jnp.flip(u, axis=1)
-        y_bwd_rev = S5Layer(
-            features=self.features,
-            state_dim=self.state_dim,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
-            dtype=self.dtype,
-            name="s5_backward"
-        )(u_rev)
-        y_bwd = jnp.flip(y_bwd_rev, axis=1)
-
+        (pole_fwd, b_fwd, c_fwd, d_fwd), (pole_bwd, b_bwd, c_bwd, d_bwd) = (
+            S5Layer(features=self.features, state_dim=self.state_dim, dt_min=self.dt_min,
+                    dt_max=self.dt_max, dtype=self.dtype, name=name).operators()
+            for name in ("s5_forward", "s5_backward"))
+        width = 2 * self.state_dim
+        u_float = u.astype(at_least_fp32(u.dtype))
+        projected = jnp.einsum('bsf,nf->bsn', u_float, jnp.concatenate([b_fwd, b_bwd]))
+        x_fwd = diagonal_recurrence(pole_fwd, projected[..., :width])
+        x_bwd = jnp.flip(diagonal_recurrence(pole_bwd, jnp.flip(projected[..., width:], axis=1)), axis=1)
+        dtype = self.dtype if self.dtype is not None else u.dtype
+        y_fwd = (jnp.einsum('bsn,fn->bsf', x_fwd, c_fwd) + d_fwd * u_float).astype(dtype)
+        y_bwd = (jnp.einsum('bsn,fn->bsf', x_bwd, c_bwd) + d_bwd * u_float).astype(dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
-
         return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
 
 
