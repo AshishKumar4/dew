@@ -8,7 +8,7 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 
-const dist = fileURLToPath(new URL('../dist/', import.meta.url));
+const dist = process.env.SITE_TEST_DIST ?? fileURLToPath(new URL('../dist/', import.meta.url));
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
 let server;
 let browser;
@@ -34,11 +34,11 @@ after(async () => {
 
 const url = () => `http://127.0.0.1:${server.address().port}/`;
 const fixture = {
-	seconds: 6, speed: 4,
+	seconds: 6, duration: 1.5,
 	frames: [
-		{ time: 0, screen: [[{ text: 'step 0' }]] },
-		{ time: 2, screen: [[{ text: 'step 1', fg: 'cyan', bold: true }]] },
-		{ time: 6, screen: [[{ text: '<finished> summary and samples', dim: true }]] },
+		{ time: 0, at: 0, screen: [[{ text: 'step 0' }]] },
+		{ time: 2, at: 0.5, screen: [[{ text: 'step 1', fg: 'cyan', bold: true }]] },
+		{ time: 6, at: 1.5, screen: [[{ text: '<finished> summary and samples', dim: true }]] },
 	],
 };
 

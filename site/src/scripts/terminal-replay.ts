@@ -7,8 +7,8 @@ export interface Run {
 
 interface Replay {
 	seconds: number;
-	speed: number;
-	frames: { time: number; screen: Run[][] }[];
+	duration: number;
+	frames: { time: number; at: number; screen: Run[][] }[];
 }
 
 const named: Record<string, string> = {
@@ -59,16 +59,16 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 	};
 	const tick = (now: number) => {
 		if (!replay) return;
-		if (previous) elapsed = Math.min(replay.seconds, elapsed + (now - previous) / 1000 * replay.speed);
+		if (previous) elapsed = Math.min(replay.duration, elapsed + (now - previous) / 1000);
 		previous = now;
 		let next = frame;
-		while (next + 1 < replay.frames.length && replay.frames[next + 1].time <= elapsed) next++;
+		while (next + 1 < replay.frames.length && replay.frames[next + 1].at <= elapsed) next++;
 		if (next !== frame) {
 			frame = next;
 			render(replay.frames[frame].screen);
 		}
-		clock.textContent = `${Math.round(elapsed)} / ${Math.round(replay.seconds)} s`;
-		if (elapsed === replay.seconds) {
+		clock.textContent = `${Math.round(replay.frames[frame].time)} / ${Math.round(replay.seconds)} s`;
+		if (elapsed === replay.duration) {
 			wantsPlay = false;
 			toggle.disabled = true;
 			toggle.textContent = 'Finished';
@@ -88,7 +88,7 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 			if (!response.ok) throw new Error(`Recording: HTTP ${response.status}`);
 			replay = await response.json();
 			if (!replay || !replay.frames.length) throw new Error('Recording has no frames');
-			note.textContent = `Text replay at ${replay.speed.toFixed(1)}× real time.`;
+			note.textContent = 'Waits shortened; updates held for readability. The clock shows recording time.';
 			controls.hidden = reduced.matches;
 			resume();
 		} catch {
@@ -99,7 +99,11 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 
 	toggle.addEventListener('click', () => {
 		wantsPlay = !wantsPlay;
-		if (wantsPlay) resume();
+		if (wantsPlay) {
+			toggle.textContent = 'Pause';
+			if (!visible) screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
+			resume();
+		}
 		else {
 			stop();
 			toggle.textContent = 'Play';
@@ -110,6 +114,7 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 		elapsed = 0;
 		frame = -1;
 		wantsPlay = true;
+		if (!visible) screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
 		resume();
 	});
 	reduced.addEventListener('change', () => {
@@ -122,7 +127,7 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 			frame = -1;
 			void load();
 			controls.hidden = !replay;
-			if (replay) note.textContent = `Text replay at ${replay.speed.toFixed(1)}× real time.`;
+			if (replay) note.textContent = 'Waits shortened; updates held for readability. The clock shows recording time.';
 			resume();
 		}
 	});

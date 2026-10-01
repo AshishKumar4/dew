@@ -1,0 +1,57 @@
+{
+ "prompt": "a red and gold mountain landscape, a painting in the style of Nicholas Roerich",
+ "seed": 7,
+ "sampler": "DPMSolverMultistep",
+ "steps": 20,
+ "cfg": 5.0,
+ "guidance_interval": [
+  0.0,
+  1.0
+ ],
+ "negative_prompt": "letterbox, white border, black border, border, frame, blurry, text, watermark, lowres, collage",
+ "batch_prompts": [
+  "a water lily pond with a Japanese bridge, an impressionist painting by Claude Monet",
+  "a swirling starry night over a quiet village, an oil painting by Vincent van Gogh",
+  "a red and gold mountain landscape, a painting in the style of Nicholas Roerich",
+  "a misty mountain valley at dawn, a watercolor painting by J. M. W. Turner"
+ ],
+ "batch_row": 2,
+ "model": {
+  "model": "dewml/hybrid-dit-176m, loaded with dew.sampling.TextToImage.from_run",
+  "parameters": 175640848,
+  "dew_commit": "1bdb25dc88ab64df00ad41550d5a22a8e70edf52",
+  "device": "NVIDIA GeForce RTX 4080"
+ },
+ "frames": 20,
+ "kept_steps": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19
+ ],
+ "columns": 8,
+ "crop": [
+  0,
+  42,
+  256,
+  213
+ ],
+ "width": 256,
+ "height": 171
+}

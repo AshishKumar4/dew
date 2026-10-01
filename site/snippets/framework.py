@@ -136,10 +136,12 @@ def grpo(out, smoke):
     # End snippet: grpo
     tracker.close()
     assert int(state.updates) == steps
-    curve = [{"step": row["step"], "reward": row["scalars"]["reward/mean"]}
+    curve = [{"step": row["step"], "reward": row["scalars"]["rollout/reward/mean"]}
              for line in (out / "tracking/scalars.jsonl").read_text().splitlines()
-             if "reward/mean" in (row := json.loads(line))["scalars"]]
-    return {"steps": steps, "reward": "Alphabetic characters / 8 response bytes", "curve": curve}
+             if "rollout/reward/mean" in (row := json.loads(line))["scalars"]]
+    assert len(curve) == steps and all(0 <= row["reward"] <= 1 for row in curve)
+    return {"steps": steps, "reward": "Alphabetic characters / 8 response bytes",
+            "reports": "tracking/scalars.jsonl"}
 
 
 def pretrained(out, smoke):
@@ -165,7 +167,7 @@ def pretrained(out, smoke):
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
-    bundle.save(out / "export", variables=state.params)
+    bundle.save(out / "export", variables=state.params, max_shard_size="128MB")
     # End snippet: finetune
     assert int(state.updates) == 1
     assert any(not np.array_equal(np.asarray(before), np.asarray(after))
@@ -220,13 +222,18 @@ def reliability(out, smoke):
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
                       checkpoints=checkpoints)
     state = trainer.fit(data, steps=2, checkpoint_every=1)
-    resumed = trainer.fit(data, steps=3, checkpoint_every=1)
+    resumed = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(out / "checkpoints"))).fit(
+        data, steps=3, checkpoint_every=1)
     # End snippet: reliability
     baseline = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(data, steps=3)
     differences = []
-    left, _ = jax.tree_util.tree_flatten_with_path(resumed.params)
-    right = jax.tree.leaves(baseline.params)
+    assert jax.tree.structure(resumed) == jax.tree.structure(baseline)
+    left, _ = jax.tree_util.tree_flatten_with_path(resumed)
+    right = jax.tree.leaves(baseline)
     for (path, actual), expected in zip(left, right, strict=True):
+        if jax.dtypes.issubdtype(actual.dtype, jax.dtypes.prng_key):
+            actual, expected = jax.random.key_data(actual), jax.random.key_data(expected)
         actual, expected = np.asarray(actual), np.asarray(expected)
         if not np.array_equal(actual, expected):
             differences.append({"path": jax.tree_util.keystr(path), "shape": list(actual.shape),
@@ -258,6 +265,11 @@ def main():
     options = parser.parse_args()
     global PROFILE
     PROFILE = not options.no_profile
+    if options.section == "reliability":
+        # Begin snippet: determinism
+        from dew.training import prepare_process
+        prepare_process(multi_host=False, xla_flags="--xla_gpu_deterministic_ops=true")
+        # End snippet: determinism
     options.out.mkdir(parents=True, exist_ok=True)
     if options.section == "mesh":
         jax.config.update("jax_num_cpu_devices", 4)

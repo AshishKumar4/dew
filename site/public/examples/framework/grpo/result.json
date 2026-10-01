@@ -1,0 +1,5 @@
+{
+  "steps": 16,
+  "reward": "Alphabetic characters / 8 response bytes",
+  "curve": []
+}

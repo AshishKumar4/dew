@@ -1,0 +1,10 @@
+{
+  "text": [
+    " trains jax models. dew ",
+    " models. dew trains jax "
+  ],
+  "weight_formats": [
+    "int8",
+    "fp8"
+  ]
+}

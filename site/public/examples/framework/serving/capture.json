@@ -1,0 +1,900 @@
+{
+	"about": "The screen framework.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [
+		"--section",
+		"serving",
+		"--out",
+		"/mnt/scratch/dew/tmp/landing-framework/final/serving",
+		"--no-profile"
+	],
+	"script_sha256": "ad48bc051a4c04bb32a07e48205acfbf8f32f0a2846951a9d04225e6826b1ab8",
+	"meta": {
+		"where": "one RTX 4080",
+		"python": "3.12.13",
+		"jax": "0.11.2.post3",
+		"flax": "0.12.9",
+		"optax": "0.2.8",
+		"dew": "c159e9b007f4a2ddf617240b409511e1508a1b29",
+		"date": "2026-09-30"
+	},
+	"hero": {
+		"returncode": 0,
+		"seconds": 12.9,
+		"columns": 96,
+		"screen": [
+			[
+				{
+					"text": "\u256d\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "dew",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " \u00b7 ",
+					"fg": "2aa7c9",
+					"dim": true
+				},
+				{
+					"text": "CausalTransformer",
+					"fg": "2aa7c9",
+					"bold": true
+				},
+				{
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " 18,560 parameters"
+				},
+				{
+					"text": "  \u00b7  on ",
+					"dim": true
+				},
+				{
+					"text": "1 \u00d7 NVIDIA GeForce RTX 4080"
+				},
+				{
+					"text": "  \u00b7  batch ",
+					"dim": true
+				},
+				{
+					"text": "8"
+				},
+				{
+					"text": "  \u00b7  ",
+					"dim": true
+				},
+				{
+					"text": "float32                 "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2501",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2ba5c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2da4c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "2fa3c9"
+				},
+				{
+					"text": "\u2501",
+					"fg": "31a2ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "33a1ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "34a0ca"
+				},
+				{
+					"text": "\u2501",
+					"fg": "369fcb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "389ecb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3a9ccb"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3c9bcc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3e9acc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "3f99cc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4198cc"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4397cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4596cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4795cd"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4994ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4a92ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4c91ce"
+				},
+				{
+					"text": "\u2501",
+					"fg": "4e90cf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "508fcf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "528ecf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "548dcf"
+				},
+				{
+					"text": "\u2501",
+					"fg": "558cd0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "578bd0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "598ad0"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5b88d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5d87d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "5f86d1"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6085d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6284d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6483d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6682d2"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6881d3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6a80d3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6b7ed3"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6d7dd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "6f7cd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "717bd4"
+				},
+				{
+					"text": "\u2501",
+					"fg": "737ad5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7579d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7678d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7877d5"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7a76d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7c74d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "7e73d6"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8072d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8171d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8370d7"
+				},
+				{
+					"text": "\u2501",
+					"fg": "856fd8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "876ed8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "896dd8"
+				},
+				{
+					"text": "\u2501",
+					"fg": "8b6cd9"
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "150",
+					"bold": true
+				},
+				{
+					"text": "/150",
+					"dim": true
+				},
+				{
+					"text": "  100%  510.7"
+				},
+				{
+					"text": " step/s",
+					"dim": true
+				},
+				{
+					"text": "  0:00:01 "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "train                                                                                       ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  loss           ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   0.05083",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  ce             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   0.05083",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  perplexity     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.052",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  token_accuracy ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     99.4%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "throughput                                                                                  ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  step_time_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     2.307",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  samples_per_sec",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     3,467",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  mfu            ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "      0.0%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "optimizer                                                                                   ",
+					"fg": "8b6cd9",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  accepted       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    100.0%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2713 ",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "finished",
+					"fg": "2aa7c9",
+					"dim": true
+				},
+				{
+					"text": "  \u2500\u256f",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u256d\u2500  ",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": "\u2713 ",
+					"fg": "3fae6a"
+				},
+				{
+					"text": "CausalTransformer",
+					"fg": "2aa7c9",
+					"bold": true
+				},
+				{
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "   trained  ",
+					"dim": true
+				},
+				{
+					"text": "150 steps in 0:00:01            "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "first step  ",
+					"dim": true
+				},
+				{
+					"text": "after 0.62 s                    "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "      then  ",
+					"dim": true
+				},
+				{
+					"text": "595.5 step/s                    "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "   goodput  ",
+					"dim": true
+				},
+				{
+					"text": "28.6% of the wall time in steps "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "final loss  ",
+					"dim": true
+				},
+				{
+					"text": "0.02598                        ",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
+					"fg": "2aa7c9"
+				}
+			],
+			[
+				{
+					"text": "[' trains jax models. dew ', ' models. dew trains jax ']"
+				}
+			],
+			[
+				{
+					"text": "{"
+				}
+			],
+			[
+				{
+					"text": "  \"text\": ["
+				}
+			],
+			[
+				{
+					"text": "    \" trains jax models. dew \","
+				}
+			],
+			[
+				{
+					"text": "    \" models. dew trains jax \""
+				}
+			],
+			[
+				{
+					"text": "  ],"
+				}
+			],
+			[
+				{
+					"text": "  \"weight_formats\": ["
+				}
+			],
+			[
+				{
+					"text": "    \"int8\","
+				}
+			],
+			[
+				{
+					"text": "    \"fp8\""
+				}
+			],
+			[
+				{
+					"text": "  ]"
+				}
+			],
+			[
+				{
+					"text": "}"
+				}
+			]
+		]
+	}
+}
