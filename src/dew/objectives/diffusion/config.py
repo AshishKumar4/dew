@@ -13,6 +13,8 @@ import dataclasses
 import os
 from typing import TYPE_CHECKING, ClassVar
 
+import numpy as np
+
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
@@ -183,12 +185,16 @@ class FlowGRPO:
     def rollout(self, objective):
         """The trainer's rollout over `objective`, scored by the named metric."""
         from dew.artifacts import ImageGrid
+        from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowRollout
 
         metric = metrics[self.reward]()
+        if not isinstance(metric, ImageMetric):
+            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
+                             "scores each sample with an image metric's per-sample measure")
 
         def reward(images, batch):
-            return metric.measure(ImageGrid(images), batch)
+            return np.asarray(metric.measure(ImageGrid(images), batch))
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
@@ -346,6 +352,8 @@ class DiffusionRunConfig(RunConfig):
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
+            if source.inputs is None:
+                raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
             if source.inputs.mask is not None:
                 raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
                                  "on masks an image dataset does not carry")
@@ -406,9 +414,12 @@ class DiffusionRunConfig(RunConfig):
         if self.context is not None:
             keyword = encoders[self.context.encoder].keyword
             params = None if variables is None else variables["encoders"][keyword]
-            conditions[keyword] = (
-                self.text.build(params=params, dtype=self.model.dtype) if self.text is not None
-                else self.audio.build(self.data, params=params, dtype=self.model.dtype))
+            if self.text is not None:
+                conditions[keyword] = self.text.build(params=params, dtype=self.model.dtype)
+            else:
+                # __post_init__ holds audio to a VideoDataset.
+                assert self.audio is not None and isinstance(self.data, VideoDataset)
+                conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
         model = models.build(self.model.architecture, self.model_fields(autoencoder))
         return model, conditions, autoencoder
 
