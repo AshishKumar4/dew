@@ -1803,6 +1803,40 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
 
 
 
+@pytest.mark.mesh
+def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(monkeypatch):
+    """A held checkpoint reaches the state's JIT as a copy placed where the
+    state keeps each variable, sharded as it is, and the JIT takes those
+    buffers over. Handed over as they are, the arrays were placed below the
+    state and freed after it was built, a hole as large as the checkpoint:
+    on an A100 Qwen3-1.7B's 'minimal' rung then found no block for its
+    temporaries. The objective's own arrays stay as they were."""
+    from jax.tree_util import Partial
+
+    held = {}
+    put = jax.device_put
+
+    def recorded(x, *args, **kwargs):
+        out = put(x, *args, **kwargs)
+        if isinstance(out, Partial):
+            held.update(jax.tree_util.tree_leaves_with_path(out.keywords["variables"]))
+        return out
+
+    monkeypatch.setattr(jax, "device_put", recorded)
+    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    state, shardings, _ = trainer.place()
+    params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
+    sharded = 0
+    for path, leaf in jax.tree_util.tree_leaves_with_path(weights):
+        copy = held[path]
+        assert copy.is_deleted(), jax.tree_util.keystr(path)
+        assert copy.sharding == params[path], jax.tree_util.keystr(path)
+        sharded += not copy.sharding.is_fully_replicated
+        assert not leaf.is_deleted()
+    assert sharded
+    jax.tree.map(np.testing.assert_array_equal, state.params, weights)
+
+
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     """Compiling reads the parameters', optimizer state's and key's shapes
     and shardings, not their values, so a run compiles its step ahead of
