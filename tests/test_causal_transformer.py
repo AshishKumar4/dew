@@ -802,7 +802,7 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
     ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
     ({'per_layer_input_dim': 0}, "None is a model without them"),
-    ({'mlp': 'relu'}, "swiglu"),
+    ({'mlp': 'unknown'}, "swiglu"),
 ])
 def test_rejected_configs(rng, config, message):
     with pytest.raises(ValueError, match=message):
