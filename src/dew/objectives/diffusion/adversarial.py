@@ -71,7 +71,9 @@ class AdversarialDistillationObjective(DiffusionObjective):
     student starts from them, and the discriminator's heads read the
     teacher's hidden tokens after each of `feature_layers`. The student's
     time is drawn from `student_times` and the renoising level from
-    LADD's logit-normal at `renoise_times` (mean 1, std 1: high noise). The
+    LADD's logit-normal at `renoise_times` (mean 1, std 1: high noise, the
+    paper's for images; on a 2-D toy that level hides every difference from
+    the discriminator, and mean -2 learns). The
     discriminator and the student train in the same step, each through a
     loss whose other side is stopped. ADD's distillation term is
     weight * alpha_t ||x_0 - sg(teacher's x_0 of the renoised x_0)||^2,
