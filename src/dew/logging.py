@@ -30,7 +30,7 @@ def configure() -> None:
         console = Console(stderr=True, force_terminal=None if sys.stderr.isatty() else False)
         diagnostics = RichHandler(console=console,
                                   show_time=True, show_level=True, show_path=False,
-                                  markup=False, highlighter=None)
+                                  log_time_format="%H:%M:%S", markup=False, highlighter=None)
         diagnostics.setFormatter(logging.Formatter("%(name)s: %(message)s"))
         logger.addHandler(diagnostics)
         if logger.level == logging.NOTSET:

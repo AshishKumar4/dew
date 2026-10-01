@@ -960,7 +960,9 @@ def test_a_gpu_pool_whose_jax_keys_its_processes_apart_compiles_without_the_cach
     assert done.returncode == 0, done.stdout + done.stderr
     kept = backend != "gpu"
     assert f"cache 0 {kept}" in done.stdout and f"cache 1 {kept}" in done.stdout, done.stdout
-    said = done.stdout.count("so the pool compiles without the persistent compilation cache")
+    # The launcher's rank prefix appears on each wrapped Rich log line.
+    notices = " ".join(re.sub(r"(?m)^\[\d+\] *", "", done.stdout).split())
+    said = notices.count("so the pool compiles without the persistent compilation cache")
     assert said == (0 if kept else 2), done.stdout
 
 
