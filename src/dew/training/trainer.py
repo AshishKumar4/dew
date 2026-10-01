@@ -324,7 +324,9 @@ DIFFUSION_REMAT = (False, 'dots', 'full')
 # 4080 (jax 0.11.2, a 2-layer Qwen3-0.6B-width decoder at 8 x 1024 tokens, whole logits, a
 # 13.1 GiB plan), a fresh process failed with RESOURCE_EXHAUSTED on its 10.3 GiB temporary in
 # 1 of 16 runs with 3.6% of the limit to spare and 2 of 16 with 5.8%, under the BFC and the
-# cuda_async allocators alike, and in none of 48 with 7.9%.
+# cuda_async allocators alike, and in none of 48 with 7.9% (pool-fraction sweep, 2026-10-01).
+# 8% is the smallest share at which that sweep did not fail, a measured edge on one card, not a
+# derived bound; a step planned within it takes the next, slower rung.
 FIT_RESERVE = 0.08
 
 
