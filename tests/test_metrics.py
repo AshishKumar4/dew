@@ -47,12 +47,12 @@ INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "
 def test_mean_metric_counts_uneven_batches_and_weighted_totals():
     from dew.eval import Mean
 
-    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher")
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher", reads=ImageGrid)
     first = metric(None, {"values": np.asarray([1., 3.])})
     last = metric(None, {"values": np.asarray([8.])})
     assert metric.finalize(metric.merge(first, last)) == 4.
     assert metric.shown.better == "higher" and metric.reads is ImageGrid
-    weighted = Mean(lambda artifact, batch: batch["totals"], name="weighted", better="lower")
+    weighted = Mean(lambda artifact, batch: batch["totals"], name="weighted", better="lower", reads=ImageGrid)
     assert weighted.finalize(weighted.merge(weighted(None, {"totals": (12., 3.)}),
                                              weighted(None, {"totals": (8., 1.)}))) == 5.
     with pytest.raises(ValueError, match="count"):
@@ -65,10 +65,36 @@ def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
     from dew import Mean
 
     with pytest.raises(TypeError, match="better"):
-        Mean(lambda artifact, batch: batch["values"], name="accuracy")
-    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher")
+        Mean(lambda artifact, batch: batch["values"], name="accuracy", reads=ImageGrid)
+    with pytest.raises(TypeError, match="reads"):
+        Mean(lambda artifact, batch: batch["values"], name="accuracy", better="higher")
+    with pytest.raises(ValueError, match="unprefixed"):
+        Mean(lambda artifact, batch: batch["values"], name="val/accuracy", better="higher", reads=ImageGrid)
+    metric = Mean(lambda artifact, batch: batch["values"], name="score", better="higher", reads=ImageGrid)
     assert metric.finalize(metric(None, {"values": [1., 3.]})) == 2.
     assert metric.finalize(metric(None, {"values": [10.]})) == 10.
+
+
+def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit():
+    from dew import Mean, Trainer, models
+    from dew.artifacts import TokenScores
+    from dew.data import Dataset
+    from dew.objectives.lm import LMObjective
+    import optax
+
+    tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
+    data = Dataset(train=lambda partition: iter([{"text": tokens}] * 4),
+                   val=lambda partition: iter([{"text": tokens}]), records=32, batch=8)
+    model = models.build("causal_transformer", vocab_size=4, emb_features=8, num_layers=1,
+                         num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
+    objective = LMObjective(model, seq_len=4, ema_decay=None)
+    metric = Mean(lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+                  reads=TokenScores, name="accuracy", better="higher")
+    trainer = Trainer(objective, optax.adam(.05), key=jax.random.key(0))
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric])
+    logits = model.apply(final.params, jnp.asarray(tokens[:, :-1]), train=False)
+    expected = float(jnp.mean(jnp.argmax(logits, axis=-1) == tokens[:, 1:]))
+    assert trainer._display.evaluations["val"][-1].scores["val/accuracy"] == expected
 
 
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):

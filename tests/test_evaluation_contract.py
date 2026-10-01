@@ -53,9 +53,9 @@ def test_image_mean_weights_each_image_once_across_unequal_batches():
 
 def test_perplexity_streams_weighted_targets_and_empty_contributions():
     metric = perplexity()
-    first = metric(TokenScores(np.array([[1., 4.]]), np.array([[1., .5]])), {})
-    empty = metric(TokenScores(np.array([[9.]]), np.array([[0.]])), {})
-    last = metric(TokenScores(np.array([[2.]]), np.array([[3.]])), {})
+    first = metric(TokenScores(np.array([[1., 4.]]), np.array([[1., .5]]), correct=jnp.zeros_like(np.array([[1., 4.]]), dtype=bool)), {})
+    empty = metric(TokenScores(np.array([[9.]]), np.array([[0.]]), correct=jnp.zeros_like(np.array([[9.]]), dtype=bool)), {})
+    last = metric(TokenScores(np.array([[2.]]), np.array([[3.]]), correct=jnp.zeros_like(np.array([[2.]]), dtype=bool)), {})
     pooled = metric.merge(metric.merge(first, empty), last)
     assert metric.finalize(pooled) == pytest.approx(np.exp(9 / 4.5))
     with pytest.raises(ValueError, match="no counted target"):

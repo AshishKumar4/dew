@@ -64,7 +64,7 @@ class ScheduledScores(Objective):
         return params["params"]["offset"], Aux({})
 
     def evaluate(self, params, batch, step):
-        return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]))
+        return TokenScores(jnp.ones_like(batch["x"]) * step.step, jnp.ones_like(batch["x"]), correct=jnp.zeros_like(jnp.ones_like(batch["x"]) * step.step, dtype=bool))
 
 
 def test_integer_evaluation_key_matches_a_jax_key():

@@ -72,25 +72,34 @@ also keeps the supplied integer seed.
 
 `Mean` turns per-example values or a `(total, count)` pair into a metric.
 It sums counts across uneven batches, so a small last batch has its own
-weight. Choose `better` explicitly for checkpoint ranking. `reads` defaults
-to `ImageGrid`; a text metric names `TokenScores`:
+weight. Choose `better` and `reads` explicitly: evaluation selects the exact
+artifact type. This LM metric ranks the logits' top-1 accuracy:
 
 ```python
-from dew import Mean
+from dew import Checkpoints, Mean
 from dew.artifacts import TokenScores
 
-cross_entropy = Mean(
-    lambda scores, batch: (np.sum(scores.losses * scores.weights), np.sum(scores.weights)),
-    name="cross_entropy", better="lower", reads=TokenScores,
+accuracy = Mean(
+    lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+    reads=TokenScores, name="accuracy", better="higher",
 )
-state = Trainer(objective, optax.adam(0.01), key=jax.random.key(0)).fit(
-    data, steps=10, eval_every=5, metrics=[cross_entropy],
+language_model = LMObjective(model, seq_len=8, ema_decay=None)
+run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+              checkpoints=Checkpoints("runs/lm-accuracy"))
+state = run.fit(
+    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
 )
+run.checkpoints.wait()
+assert run.checkpoints.best is not None
 ```
 
 The helper starts a pass from its first contribution and finalizes on the
 host without collectives. A vector counts each example once; a pair can
 carry token counts or fractional weights. A scalar batch mean is refused.
+`TokenScores.correct` comes from the same chunked head as its losses; it
+does not retain a full logits tensor. The unprefixed name `accuracy` is
+reported as `val/accuracy`. Passing `name="val/accuracy"` gives a clear error
+instead of adding the prefix twice.
 
 ## Previews
 
