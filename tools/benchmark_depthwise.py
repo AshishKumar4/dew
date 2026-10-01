@@ -2,12 +2,10 @@
 """Measure 3x3 depthwise forward/VJP and the published 176M DiT's step.
 
 RTX 4080: ~/.cache/dew/dew-gpu-run env PYTHONPATH=src python tools/benchmark_depthwise.py kernels
-Run `step --implementation lax`, `step --implementation shifted` and
-`step --implementation plain` in separate processes. The diagnostic choices
-substitute another primitive for the dilated kernels only inside this
-benchmark: lax the original convolution, plain the nine shifted products at
-dilation 2 without the fp32 materialization CUDA takes; production dispatch
-has no performance flag.
+Run `step --implementation lax` and `step --implementation polyphase` in
+separate processes. The diagnostic lax choice substitutes the dilated
+convolution for the polyphase one only inside this benchmark; production
+dispatch has no performance flag.
 """
 
 import argparse
@@ -71,8 +69,7 @@ def kernels(args):
                 for name, operation in (
                         ('lax-NHWC', partial(reference, dilation=dilation)),
                         ('lax-NCHW', partial(reference, dilation=dilation, layout='NCHW')),
-                        ('shifted', partial(conv._depthwise_3x3, dilation=dilation)),
-                        ('shifted-materialized', partial(conv._cuda_depthwise_3x3, dilation=dilation))):
+                        ('polyphase', partial(conv._polyphase_depthwise_3x3, dilation=dilation))):
                     actual = jax.jit(partial(vjp, operation))(x, kernel, cotangent)
                     errors = [float(np.max(np.abs(np.asarray(a, np.float64) - np.asarray(b, np.float64))))
                               for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True)]
@@ -104,12 +101,7 @@ def step(args):
     import benchmark_step
 
     if args.implementation == 'lax':
-        conv._depthwise_3x3 = partial(reference, precision=None)
-        conv._cuda_depthwise_3x3 = partial(reference, precision=None)
-    elif args.implementation == 'plain':
-        materialized = conv._cuda_depthwise_3x3
-        conv._cuda_depthwise_3x3 = lambda x, w, dilation: (
-            conv._depthwise_3x3 if dilation == 2 else materialized)(x, w, dilation)
+        conv._polyphase_depthwise_3x3 = partial(reference, precision=None)
     config = {'emb_features': 768, 'mlp_ratio': 4, 'norm_epsilon': 1e-5,
               'num_heads': 12, 'num_layers': 16, 'patch_size': 2, 'scan_order': 'zigzag',
               'ssm_attention_ratio': '3:1', 'ssm_state_dim': 64, 'text_pooling': 'all',
@@ -142,8 +134,8 @@ def convolution_profile(directory):
                 milliseconds = (event.end_ns - event.start_ns) / 1e6 / 5
                 if stats.get('hlo_op', '').startswith('cudnn-conv'):
                     native += milliseconds
-    # Shifted work can fuse with surrounding ops, so this counts only
-    # native convolutions and never calls their absence zero fusion work.
+    # The grids' interleaving can fuse with surrounding ops, so this counts
+    # only native convolutions and never calls their absence zero fusion work.
     return {'native_cudnn_conv_ms': native}
 
 
@@ -152,19 +144,16 @@ def checkpoint(args):
     from dew.sampling import TextToImage
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m')
-    original = conv._depthwise_3x3
-    original_cuda = conv._cuda_depthwise_3x3
+    original = conv._polyphase_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
     with jax.default_matmul_precision('highest'):
         try:
-            conv._depthwise_3x3 = partial(reference, precision=None)
-            conv._cuda_depthwise_3x3 = partial(reference, precision=None)
+            conv._polyphase_depthwise_3x3 = partial(reference, precision=None)
             jax.clear_caches()
             before = pipeline(prompt, seed=17, steps=20)
             jax.block_until_ready(before)
         finally:
-            conv._depthwise_3x3 = original
-            conv._cuda_depthwise_3x3 = original_cuda
+            conv._polyphase_depthwise_3x3 = original
         jax.clear_caches()
         after = pipeline(prompt, seed=17, steps=20)
         jax.block_until_ready(after)
@@ -206,7 +195,7 @@ def errors(lhs, rhs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('kernels', 'step', 'checkpoint'))
-    parser.add_argument('--implementation', choices=('lax', 'shifted', 'plain'), default='shifted')
+    parser.add_argument('--implementation', choices=('lax', 'polyphase'), default='polyphase')
     parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='bfloat16',
                         help='Training step compute dtype; checkpoint keeps the published dtypes.')
     parser.add_argument('--batch-size', type=int, choices=(16, 32), help='One step case in a fresh process.')
