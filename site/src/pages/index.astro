@@ -29,7 +29,7 @@ const recorded = (name: string) => {
 	const root = ['examples', 'framework', name];
 	return { result: JSON.parse(readPublic(...root, 'result.json')), capture: JSON.parse(readPublic(...root, 'capture.json')) };
 };
-const names = ['lm', 'diffusion', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
+const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
 const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
@@ -41,6 +41,9 @@ const replays = ['aurora', 'alpine', 'painted-mountains'].map((name) => {
 	}
 	return { name, ...meta };
 });
+const modelSize = Math.round(replays[0].model.parameters / 1e6);
+const resolution = records.sample_public.result.shape.slice(1, 3).join('×');
+const mesh = records.mesh.result;
 const tries = [
 	...(live.endpoint && live.turnstileSitekey ? [{ name: 'Live sampler', what: 'Edit the cell and run it on a CPU kernel.', href: '/sample/' }] : []),
 	{ name: 'Colab notebook', what: 'Load the model and sample it on a GPU.', href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb' },
@@ -96,7 +99,7 @@ const tutorialNames: Record<string, string> = {
 			<p class="band-lede">A process defines the noise, times and training target. A solver walks that process at generation time; it can change without retraining.</p>
 			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<Code code={snippet('diffusion')} lang="python" title="Define and train a DiT" />
-			<p class="framework-note">A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
+			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
 				<div class="replay-frame" style={`aspect-ratio: ${entry.width} / ${entry.height}`}>
 					<img src={`/hero/replay/${entry.name}/final.webp`} width={entry.width} height={entry.height} alt={entry.prompt} loading="lazy" decoding="async" />
@@ -120,8 +123,8 @@ const tutorialNames: Record<string, string> = {
 			<p class="band-lede">Change the mesh, not the training loop. FSDP shards parameter storage, tensor parallelism splits model widths, and an expert axis shards an MoE's experts; the data axis fills the remaining devices.</p>
 			<Code code={snippet('mesh')} lang="python" title="framework.py — the same objective and data" />
 			<figure class="mesh-overview">
-				<div class="mesh-devices">{records.mesh.result.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / 2)} · tensor {index % 2}</span></div>)}</div>
-				<figcaption>Four simulated CPU devices: two FSDP shards × two tensor slices.</figcaption>
+				<div class="mesh-devices">{mesh.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / mesh.axes.tensor)} · tensor {index % mesh.axes.tensor}</span></div>)}</div>
+				<figcaption>{mesh.devices.length} simulated CPU devices: {mesh.axes.fsdp} FSDP shards × {mesh.axes.tensor} tensor slices.</figcaption>
 			</figure>
 			<p class="framework-note"><a href="/concepts/distributed/">Placement and sharding</a> · <a href="/guides/multi-node/">Several hosts</a> · <a href="/guides/tpu/">Cloud TPU</a></p>
 		</section>
