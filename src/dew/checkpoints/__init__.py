@@ -284,7 +284,7 @@ def _stored_as_delta(average, live) -> bool:
             and "pinned_host" not in (average.sharding.memory_kind, live.sharding.memory_kind))
 
 
-def _by_path(tree) -> dict[jax.tree_util.KeyPath, StateLeaf]:
+def _by_path(tree):
     """`tree`'s leaves by their key paths: an EMA leaf's path in the EMA
     tree is its weight's in the params tree, whatever containers hold them."""
     return dict(jax.tree_util.tree_flatten_with_path(tree)[0])
