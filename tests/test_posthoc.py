@@ -119,3 +119,31 @@ def test_a_run_record_names_its_profiles_and_the_solver_keeps_them():
     # The first update takes the weights it made whole.
     for average in state.averages:
         np.testing.assert_array_equal(average["w"], params["w"] - 2.7e-4 * np.ones(3, np.float32))
+
+
+def test_a_local_checkpoint_keeps_the_profiles_in_its_state(tmp_path):
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
+    state = trainer.fit(Data(), steps=2, log_every=2)
+    checkpoints = Checkpoints(str(tmp_path / 'run'), local_directory=str(tmp_path / 'local'), local_every=1)
+    checkpoints.save_local(2, state, None)
+    checkpoints.wait()
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state)
+    restored, _ = checkpoints.restore(template, 2)
+    for held, expected in zip(jax.tree.leaves(restored.opt_state.averages),
+                              jax.tree.leaves(state.opt_state.averages), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
+    assert checkpoints.profile_steps() == []
+
+
+def test_an_archive_failure_surfaces_from_wait(tmp_path, monkeypatch):
+    checkpoints = Checkpoints(str(tmp_path / 'run'))
+
+    def fail():
+        raise OSError('archive failed')
+
+    monkeypatch.setattr(checkpoints, '_archive_profiles', fail)
+    trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
+    state = trainer.fit(Data(), steps=2, log_every=2)
+    checkpoints.save(2, state, None)
+    with pytest.raises(OSError, match='archive failed'):
+        checkpoints.wait()

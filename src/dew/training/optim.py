@@ -421,7 +421,7 @@ def power_profiles(solver: optax.GradientTransformation,
     of the parameters it just made (Karras et al. 2024, Eq. 127). The
     averages ride in the optimizer state, so they are sharded, placed and
     skipped on a rejected step exactly as its moments are; a checkpoint save
-    writes them once, as the snapshot of its step
+    transfers them off the devices once, as the snapshot of its step
     (`Checkpoints.profile_steps`), which a restore reads them back from. Each std is rounded to fp32 first, the
     precision the state records it in.
     """
