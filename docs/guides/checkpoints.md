@@ -126,7 +126,7 @@ Planes are computed on the devices that hold the EMA. So a save holds one more E
 
 ## Post-hoc EMA
 
-An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded and placed with the rest of that state. `Checkpoints.save` writes them once, as a snapshot under `profiles/` in the run directory, not again inside the step's optimizer state; `keep` does not prune the snapshots, and `restore` reads a persistent step's averages from its snapshot.
+An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded and placed with the rest of that state. `Checkpoints.save` transfers them off the devices once, in the same asynchronous save as the state. After that save finishes, it archives the profiles item under `profiles/` in the run directory, outside checkpoint pruning; `restore` reads a persistent step's averages from its snapshot, not from a second copy in its optimizer state.
 
 ```python
 from dew.training.posthoc import reconstruct

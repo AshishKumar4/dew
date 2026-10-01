@@ -464,6 +464,15 @@ def absent(expected, held) -> list[jax.tree_util.KeyPath]:
             if jax.tree_util.keystr(path) not in have]
 
 
+class _StateCheckpoints(ocp.CheckpointManager):
+    """The state item of a manager that also writes an optional profiles item."""
+    def item_metadata(self, step):
+        return super().item_metadata(step)['default']
+
+    def restore(self, step, *, args):
+        return super().restore(step, args=ocp.args.Composite(default=args))['default']
+
+
 class Checkpoints:
     """Holds the checkpoints of one run, in one directory.
 
@@ -498,6 +507,7 @@ class Checkpoints:
         self._manager = None
         self._local_manager = None
         self._profiles_manager = None
+        self._profiles_step = None
 
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
@@ -510,25 +520,53 @@ class Checkpoints:
                                        reverse=True),
                 ]),
                 best_fn=_loss, best_mode='min',
-                create=True, enable_async_checkpointing=True)
-            self._manager = ocp.CheckpointManager(
-                self.directory, options=options,
-                item_handlers=ocp.PyTreeCheckpointHandler())
+                create=True, enable_async_checkpointing=True,
+                async_options=ocp.AsyncOptions(post_finalization_callback=self._archive_profiles))
+            self._manager = _StateCheckpoints(
+                self.directory, options=options, item_handlers={
+                    'default': ocp.PyTreeCheckpointHandler(), 'profiles': ocp.PyTreeCheckpointHandler()})
         return self._manager
 
-    def _open_profiles(self) -> ocp.CheckpointManager:
-        """The manager of the EMA snapshots under `profiles/`, which keeps every step."""
+    def _open_profiles(self) -> ocp.Checkpointer:
+        """The reader of the archived EMA snapshots."""
         if self._profiles_manager is None:
-            _check_shared(self.directory)
-            # Its own barrier prefix: it writes at the steps the persistent
-            # manager writes.
-            multiprocessing = MultiprocessingOptions(barrier_sync_key_prefix='profiles')
-            options = ocp.CheckpointManagerOptions(
-                create=True, enable_async_checkpointing=True, multiprocessing_options=multiprocessing)
-            self._profiles_manager = ocp.CheckpointManager(
-                str(epath.Path(self.directory) / PROFILES), options=options,
-                item_handlers=ocp.PyTreeCheckpointHandler())
+            self._profiles_manager = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
         return self._profiles_manager
+
+    def _archive_profiles(self) -> None:
+        """Keep the just-written profiles item outside checkpoint pruning.
+
+        This runs after the item writes finish, before the manager commits
+        or prunes a step. No device arrays are read a second time.
+        """
+        if jax.process_index() != 0 or self._profiles_step is None:
+            return
+        # The callback runs before the outer step directory is committed;
+        # its item directories have already been finalized by Orbax.
+        step = str(self._profiles_step)
+        for path in epath.Path(self.directory).iterdir():
+            if path.name != step and not path.name.startswith(step + '.'):
+                continue
+            source = path / PROFILES
+            if not source.exists():
+                continue
+            target = self._profile_path(self._profiles_step)
+            target.mkdir(parents=True, exist_ok=True)
+            directories = [source]
+            while directories:
+                for leaf in directories.pop().iterdir():
+                    if leaf.is_dir():
+                        directories.append(leaf)
+                    else:
+                        destination = target / leaf.relative_to(source)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        leaf.copy(destination, overwrite=True)
+            (path / '_CHECKPOINT_METADATA').copy(target / '_CHECKPOINT_METADATA', overwrite=True)
+            (target / 'commit_success.txt').write_text('')
+            source.rmtree()
+
+    def _profile_path(self, step: int) -> epath.Path:
+        return epath.Path(self.directory) / PROFILES / str(step)
 
     @property
     def local_path(self) -> str:
@@ -633,38 +671,31 @@ class Checkpoints:
             state_tree['opt_state'] = _with_averages(state_tree['opt_state'], None)
         state_tree, deltas = _with_ema_deltas(state_tree)
         persistent = self._open()
+        # Do not change the callback's step while the previous save uses it.
+        persistent.wait_until_finished()
+        self._profiles_step = step if profiles is not None else None
+        custom = {'ema_deltas': deltas}
+        saves = {'default': ocp.args.PyTreeSave(state_tree)}
+        if profiles is not None:
+            saves['profiles'] = ocp.args.PyTreeSave({'averages': tuple(profiles.averages)})
+            custom.update(updates=int(profiles.count), stds=[float(std) for std in np.asarray(profiles.stds)])
         with region("checkpoint.submit"):
-            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
-                            custom_metadata={'ema_deltas': deltas})
-        if _written_in_place(state_tree):
+            persistent.save(step, args=ocp.args.Composite(**saves), metrics=metrics, force=True,
+                            custom_metadata=custom)
+        if _written_in_place(state_tree) or (profiles is not None and _written_in_place(profiles.averages)):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
-        if profiles is not None:
-            self._save_profiles(step, profiles)
-
-    def _save_profiles(self, step: int, profiles) -> None:
-        """Keep a snapshot of the power-function EMAs of `profiles`, a
-        `PowerProfilesState`, beside the checkpoint of `step`, where no
-        pruning of checkpoints reaches it, and from which the checkpoint's
-        own averages are restored."""
-        snapshots = self._open_profiles()
-        averages = {'averages': tuple(profiles.averages)}
-        with region("checkpoint.submit_profiles"):
-            snapshots.save(step, args=ocp.args.PyTreeSave(averages), force=True, custom_metadata={
-                'updates': int(profiles.count),
-                'stds': [float(std) for std in np.asarray(profiles.stds)]})
-        if _written_in_place(averages):
-            with region("checkpoint.write_in_place"):
-                snapshots.wait_until_finished()
 
     def profile_steps(self) -> list[int]:
         """The steps holding a snapshot of the run's power-function EMAs, oldest first."""
-        return sorted(self._open_profiles().all_steps())
+        directory = epath.Path(self.directory) / PROFILES
+        return sorted(int(path.name) for path in directory.iterdir()
+                      if path.name.isdecimal() and (path / 'commit_success.txt').exists()) if directory.exists() else []
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
         """The updates the EMA snapshot at `step` had seen, and the relative
         standard deviation of each of its averages, without reading them."""
-        custom = self._open_profiles().metadata(step).custom_metadata
+        custom = self._open_profiles().metadata(self._profile_path(step)).custom_metadata
         return int(custom['updates']), tuple(custom['stds'])
 
     def restore_profiles(self, step: int, template=None) -> tuple[Variables, ...]:
@@ -674,12 +705,12 @@ class Checkpoints:
         snapshots = self._open_profiles()
         if template is None:
             host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
-            args = ocp.args.PyTreeRestore(restore_args=jax.tree.map(lambda _: host, dict(snapshots.item_metadata(step))))
+            args = ocp.args.PyTreeRestore(restore_args=jax.tree.map(lambda _: host, dict(snapshots.metadata(self._profile_path(step)).item_metadata)))
         else:
             wanted = {'averages': tuple(template)}
             args = ocp.args.PyTreeRestore(item=wanted, restore_args=jax.tree.map(
                 lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)), wanted))
-        return tuple(snapshots.restore(step, args=args)['averages'])
+        return tuple(snapshots.restore(self._profile_path(step), args=args)['averages'])
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
                    share: DataPartition | None = None) -> None:
@@ -736,7 +767,7 @@ class Checkpoints:
             stored['ema'] = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: deltas.get(path, leaf), stored['ema'])
         if not from_local and _power_profiles(stored['opt_state']) is not None:
-            averages = dict(self._open_profiles().item_metadata(step))['averages']
+            averages = dict(self._open_profiles().metadata(self._profile_path(step)).item_metadata)['averages']
             stored['opt_state'] = _with_averages(stored['opt_state'], tuple(
                 jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), average)
                 for average in averages))
@@ -951,7 +982,7 @@ class Checkpoints:
         """
         with region("checkpoint.wait"):
             error = None
-            for checkpointer in (self._manager, self._local_manager, self._profiles_manager):
+            for checkpointer in (self._manager, self._local_manager):
                 if checkpointer is not None:
                     try:
                         checkpointer.wait_until_finished()
