@@ -1,0 +1,14 @@
+{
+  "dew_commit": "42ddfc1413b288a98da1dacdc97c7965339648dd",
+  "jax_version": "0.11.2.post3",
+  "jaxlib_version": "0.11.2",
+  "platforms": [
+    "cpu"
+  ],
+  "calling_convention_version": 10,
+  "computation": "forward logits and parameter gradient of their sum, with weights and token IDs as arguments",
+  "export_sha256": "112203dd8c1960bad8a9b147968059681cba5301bddaa141c7a94bc17d7107a1",
+  "dtype": "float32",
+  "precision": "highest",
+  "reason": "Execute old and current graphs on the same CPU; cross-CPU fp32 outputs can differ by ULPs."
+}
