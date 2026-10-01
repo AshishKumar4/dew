@@ -107,6 +107,7 @@ final step: 10 latest: 10
 | `restore(template, step=None)` | Read a step into the structure of `template`. |
 | `stored(step=None)` | The shapes and dtypes each saved state field holds, without reading values. |
 | `wait()` | Block until asynchronous saves have finished. |
+| `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
 Saves are asynchronous; `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing; the Orbax managers are created on first use.
 
@@ -122,6 +123,23 @@ Orbax compresses every array of a checkpoint with zstd, which in the two runs be
 How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` with JAX's CPU backend, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. In three processes of three saves and restores each, alternating with processes running the code before this change, a compiled save blocked the step for 0.19 to 0.46 s instead of 0.04 to 0.14 s, the time to compute the planes, and landed on disk in 1.9 to 3.7 s instead of 1.8 to 2.3 s, apart from saves that took 17 to 74 s either way while the shared disk was busy. Restores took 1.45 to 1.59 s instead of 1.31 to 1.71 s. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model): there, a save blocked for 1.0 to 2.7 s and a restore took 2.0 to 3.0 s.
 
 Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
+
+## Post-hoc EMA
+
+An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded, placed and saved with that state. A snapshot is the ordinary checkpoint itself, retained by Orbax's public preservation policy even after `keep` would prune it. There is one atomic save, not a separate write of the averages: an interrupted save cannot publish a state without its profiles.
+
+```python
+from dew.training.posthoc import reconstruct
+
+averaged = reconstruct(run_directory, 0.07)             # at the latest snapshot
+averaged = reconstruct(run_directory, 0.07, step=40000)
+```
+
+`reconstruct` returns the `params` collection as host arrays, in the weights' structure and dtypes. It weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`), which gives the same weights as NVlabs' `phema.py` to the last bit on the paper's setting, and reads one snapshot at a time. Its accuracy depends on how many snapshots there are: in a 96-step CPU run tracking 0.05 and 0.10, an average of 0.07 rebuilt from snapshots every 4 steps differed from one tracked directly by at most 1.2e-7 (weights of scale 2), every 8 steps by 4.8e-7, every 16 steps by 5.7e-6; the tracked 0.05 average was 1.3e-4 from it.
+
+Each profile holds one more copy of the weights in memory. Retaining the whole checkpoint costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot: about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB, but the separate-manager design added blocking setup and a gap between commits; the one-checkpoint design keeps the state and profiles atomic. Empty `ema_profiles` retains the ordinary `keep` policy.
+
+In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state saved with and without snapshot retention blocked for median 14.9 and 15.2 ms respectively (six warmed pairs). No extra parameter bytes are transferred or serialized for a snapshot. The 176M A100 save timing is part of the combined device validation; these CPU figures do not measure PCIe transfer.
 
 ## Preemption
 
