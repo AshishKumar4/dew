@@ -89,7 +89,7 @@ class FourierEmbedding(nn.Module):
     FlaxDiff's main branch draws numpy's, as Dew does (commit 63f2427).
     """
     features: int
-    scale: int = 16
+    scale: float = 16
     dtype: Dtype | None = None
     """The model's compute dtype; the features are computed in
     `at_least_fp32` of it."""
