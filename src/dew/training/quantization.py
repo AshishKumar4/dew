@@ -397,28 +397,17 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
 
 
 def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
-    """Quantize host kernels on CPU individually, retaining NumPy storage.
-
-    Resident trees go through Qwix unchanged, so its operations keep their
-    sharding. A host kernel's CPU work is fetched before the next kernel,
-    rather than putting an unplaced model on one accelerator.
-    """
+    """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
-    if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(parameters)):
-        return qwix.quantize_params(parameters, abstract)
     shapes = flatten_dict(abstract)
     quantized = {}
     for path, parameter in flatten_dict(parameters).items():
-        shape = shapes[path]
-        if isinstance(parameter, np.ndarray):
-            if isinstance(shape, jax.ShapeDtypeStruct):
-                quantized[path] = parameter
-                continue
-            with jax.default_device(jax.devices("cpu")[0]):
-                converted = qwix.quantize_params({"weight": jnp.asarray(parameter)}, {"weight": shape})
-            quantized[path] = jax.device_get(converted["weight"])
-        else:
-            quantized[path] = qwix.quantize_params({"weight": parameter}, {"weight": shape})["weight"]
+        host = isinstance(parameter, np.ndarray)
+        converted = qwix.quantize_params(
+            {"weight": jnp.asarray(parameter) if host else parameter}, {"weight": shapes[path]})["weight"]
+        quantized[path] = jax.device_get(converted) if host else converted
+        # Release a host kernel's device buffers before converting the next.
+        del converted
     return unflatten_dict(quantized)
 
 
@@ -441,10 +430,11 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     provider quantizes a convolution's weights only together with its
     activations.
 
-    Host NumPy kernels quantize one at a time on CPU and remain NumPy arrays,
-    ready for `dew.inference.pipeline.place`. This needs the CPU backend
-    enabled alongside any explicitly selected accelerators. Resident JAX
-    parameters keep their placement through Qwix's operations.
+    Host NumPy kernels quantize one at a time on the default device and
+    return to host storage, ready for placement. Temporary device storage is
+    bounded by one kernel, not the whole model. If one kernel will not fit,
+    place the weights with a mesh and layout before quantizing. Resident
+    JAX parameters keep their placement through Qwix's operations.
     """
     rules = _rules(spec, training=False)
     qwix = _qwix()
