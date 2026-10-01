@@ -368,6 +368,8 @@ def test_a_sampling_call_does_not_encode_the_tasks_own_unconditional_prompt(monk
     objective = make_objective()
     params = objective.init(jax.random.PRNGKey(0))
     pipe = TextToImage.from_objective(objective, params)
+    # The first use caches the fixed prompt; later requests only encode their text.
+    _ = objective.unconditional_conditions
     calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
 
     prepared = pipe.prepare(["a bird", "a cat"], steps=3, seed=0)

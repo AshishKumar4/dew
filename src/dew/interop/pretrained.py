@@ -765,7 +765,9 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     # A family whose checkpoint packs its experts as `[E, out, in]`
     # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
     # back swapped.
-    packed = family.prepare_weights is decoders._gemma4_prepare
+    from dew.interop.families.gemma import _gemma4_prepare
+
+    packed = family.prepare_weights is _gemma4_prepare
 
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
