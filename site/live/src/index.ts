@@ -12,7 +12,7 @@ import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
 
 export { Coordinator } from './coordinator';
-export { Kernel } from './kernel';
+export { LiveKernel } from './kernel';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
