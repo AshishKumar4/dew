@@ -38,9 +38,11 @@ For 3x3 depthwise convolutions, shifted products also avoid cuDNN's slow
 dilated grouped forward and weight-gradient convolutions. The accumulation
 stays fp32, including for bf16 inputs; ordinary JAX differentiation keeps
 forward-mode and higher-order derivatives. CUDA retains cuDNN at dilation
-one, which is faster on the RTX 4080. CPU uses shifted products, and other
-backends retain lax. `tools/benchmark_depthwise.py` measures each path's
+one, which is faster on the RTX 4080. Other backends retain lax.
+`tools/benchmark_depthwise.py` measures each path's
 forward and backward separately, as well as the hybrid DiT training step.
+Qwix-wrapped models (QT and PTQ, weight-only included) keep its provider's
+lax convolutions and therefore do not get this depthwise speedup.
 """
 
 import math
@@ -183,7 +185,7 @@ def _conv_general_dilated(
             and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
         return jax.lax.platform_dependent(
-            lhs, rhs, cpu=lambda x, w: _depthwise_3x3(x, w, dilation[0]),
+            lhs, rhs,
             cuda=convolve if dilation[0] == 1 else lambda x, w: _cuda_depthwise_3x3(x, w, dilation[0]),
             default=convolve)
     return convolve(lhs, rhs)

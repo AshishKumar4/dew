@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_fp32_reduction_bound
 
 from dew.nn.conv import Conv, _cuda_depthwise_3x3, _depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
@@ -47,20 +48,15 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     actual = jax.jit(partial(forward_and_vjp, shifted))(x, kernel, cotangent)
     magnitudes = jax.jit(partial(forward_and_vjp, reference))(
         jnp.abs(x), jnp.abs(kernel), jnp.abs(cotangent))
-    unit_roundoff = np.finfo(np.float32).eps / 2
     for got, want, magnitude, terms in zip(
             actual, expected, magnitudes, (9, 9, np.prod(x.shape[:-1])), strict=True):
-        gamma = terms * unit_roundoff / (1 - terms * unit_roundoff)
-        error = np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64))
-        bound = 2 * gamma * np.asarray(magnitude, np.float64)
-        assert np.all(error <= bound), (float(error.max()), float(bound.max()))
+        assert_fp32_reduction_bound(got, want, magnitude, terms)
     expected_loss = jnp.sum(expected[0] * cotangent)
     actual_loss = jnp.sum(actual[0] * cotangent)
     terms = x.size + 9
-    gamma = terms * unit_roundoff / (1 - terms * unit_roundoff)
-    loss_bound = 2 * gamma * np.sum(np.asarray(magnitudes[0], np.float64)
-                                  * np.abs(np.asarray(cotangent, np.float64)))
-    assert abs(float(actual_loss) - float(expected_loss)) <= loss_bound
+    loss_magnitude = np.sum(np.asarray(magnitudes[0], np.float64)
+                            * np.abs(np.asarray(cotangent, np.float64)))
+    assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
@@ -95,8 +91,12 @@ def test_shared_conv_preserves_flax_parameters_and_batch_dimensions(dilation, sh
     actual_variables = conv.init(jax.random.key(1), x)
     for actual, expected in zip(jax.tree.leaves(actual_variables), jax.tree.leaves(variables), strict=True):
         np.testing.assert_array_equal(actual, expected)
-    np.testing.assert_allclose(jax.jit(conv.apply)(variables, x),
-                               jax.jit(reference.apply)(variables, x), rtol=2e-6, atol=2e-6)
+    variables['params']['bias'] = jnp.asarray(rng.normal(size=(4,)).astype(np.float32))
+    magnitude = convolve(jnp.abs(x).reshape(-1, *shape[-3:]),
+                         jnp.abs(variables['params']['kernel']), dilation).reshape(shape)
+    magnitude = magnitude + jnp.abs(variables['params']['bias'])
+    assert_fp32_reduction_bound(jax.jit(conv.apply)(variables, x),
+                                jax.jit(reference.apply)(variables, x), magnitude, 10)
 
 
 @pytest.mark.parametrize('changes', [
@@ -120,10 +120,12 @@ def test_spatial_fusion_keeps_its_checkpoint_and_residual_add_order():
     kernels = {f'dwconv_dil{dilation}': {'kernel': jnp.asarray(
         rng.normal(size=(3, 3, 1, 4)).astype(np.float32))} for dilation in (1, 2, 3)}
     expected = x
+    magnitude = jnp.abs(x)
     for dilation in (1, 2, 3):
         expected = expected + convolve(x, kernels[f'dwconv_dil{dilation}']['kernel'], dilation)
+        magnitude = magnitude + convolve(jnp.abs(x), jnp.abs(kernels[f'dwconv_dil{dilation}']['kernel']), dilation)
     actual = jax.jit(SpatialFusionConv(4).apply)({'params': kernels}, x)
-    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=3e-6)
+    assert_fp32_reduction_bound(actual, expected, magnitude, 28)
 
 
 def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
