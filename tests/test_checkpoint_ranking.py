@@ -100,7 +100,7 @@ def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
 
 def test_legacy_loss_and_periodic_retention(tmp_path):
     run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
-    state = run.fit(data(), steps=1, log_every=1)
+    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
     checkpoints = run.checkpoints
     for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
         checkpoints.save(step, state.replace(step=jnp.int32(step)), None, metrics={'loss': loss})
@@ -200,3 +200,24 @@ def test_missing_scores_do_not_rank_and_declared_max_is_inferred(tmp_path):
     checkpoint.wait()
     assert checkpoint.best is None
     assert not checkpoint.would_keep(Ranking('score', np.nan))
+
+
+def test_named_config_selector_roundtrips_and_refuses_callable():
+    from dew.config import BestConfig, RunConfig, TrainerConfig
+    metric = Value('accuracy', Shown(better='higher'))
+    config = RunConfig(trainer=TrainerConfig(best=BestConfig('accuracy', top=2), checkpoint_every='15m'))
+    assert RunConfig.from_dict(config.to_dict()) == config
+    best = config.trainer.best_policies([metric])[0]
+    assert best.metric is metric and best.top == 2
+    with pytest.raises(TypeError, match='code-only'):
+        TrainerConfig(best=lambda m: 1.)
+
+
+def test_unranked_first_tracker_does_not_select_a_different_trackers_best(tmp_path):
+    run = trainer(tmp_path / 'run')
+    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    checkpoints = Checkpoints(str(tmp_path / 'isolated'))
+    checkpoints.save(1, state, None, ranking=[Ranking('fid', float('nan')), Ranking('clip', 1., mode='max')])
+    checkpoints.wait()
+    assert checkpoints.best is None
+    assert checkpoints.resolve('best:clip') == 1

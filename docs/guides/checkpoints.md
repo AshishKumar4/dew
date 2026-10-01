@@ -96,20 +96,99 @@ final step: 10 latest: 10
 | Argument | Meaning |
 |---|---|
 | `directory` | Where the persistent checkpoints go: a path on a filesystem every process shares, or a bucket (`gs://...`). One numbered subdirectory per step. |
-| `keep` | How many of the latest steps to keep. The step with the lowest `loss` metric a save reported is kept as well. |
+| `keep` | Latest full states to retain, unioned with best-K and post-hoc snapshots. An int is latest-N; `Keep` also adds periodic, wall-time-spaced and predicate-selected checkpoints. |
 | `local_directory`, `local_every` | A path on every host's own disk where `fit` writes one more checkpoint, the latest, every `local_every` steps. Both or neither. |
 
 | Member | Meaning |
 |---|---|
 | `latest` | The newest step every process can read, local or persistent. |
-| `best` | The kept step with the lowest reported loss. |
+| `best` | The best committed step for the first evaluation tracker, or None if none is ranked. |
 | `path(step)` | The directory of one step. |
-| `restore(template, step=None)` | Read a step into the structure of `template`. |
+| `restore(template, step=None)` | Read the latest full state, a numbered step, `"best"`, or `"best:<metric key>"` into the structure of `template`. |
 | `stored(step=None)` | The shapes and dtypes each saved state field holds, without reading values. |
 | `wait()` | Block until asynchronous saves have finished. |
+| `kept()` | Committed steps with their metrics, ranking rules and state/weights kind. |
 | `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
 Saves are asynchronous; `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing; the Orbax managers are created on first use.
+
+## Best weights and early stopping
+
+Evaluation decides what “best” means; the checkpointer decides where those weights stay. `fit` takes the metric objects it evaluates, so a selector names a producer, not an unrelated log string. The metric's `Shown(better="lower" | "higher")` supplies its direction. A missing direction is refused unless `Best(..., mode="min" | "max")` supplies one.
+
+```python
+from dew import Best, Checkpoints, Plateau, Trainer, metrics
+
+fid = metrics["fid"]()
+clip = metrics["clip_score"]()
+trainer = Trainer(objective, optimizer, key=key,
+                  checkpoints=Checkpoints(run_directory, keep=2))
+state = trainer.fit(data, steps=100_000, metrics=[fid, clip],
+                    eval_every=1_000, checkpoint_every=5_000,
+                    best=fid, stop=Plateau(fid, evals=5, min_delta=0.01))
+```
+
+With no selector, a run with validation ranks by the objective's validation loss; a run without validation ranks by its training loss. A validation pass always refers to the checkpoint's own state, including its EMA overlay when evaluation uses averaged weights. Evaluation runs at the checkpoint cadence too, so a save never inherits a score from earlier weights. An evaluation between checkpoint steps writes a state only if its score enters a best-K set. A regular checkpoint that also enters best is written once.
+
+Each save records all metrics from that evaluation and the training loss under their names, such as `val/fid` and `train/loss`. Ranking values, directions and top-K limits have separate metadata. A save without a selected score is unranked, not ranked by a different loss. In particular, an emergency preemption save does not invent a validation score. Old checkpoints' `loss` key keeps its historical training-loss meaning.
+
+Several trackers retain the union of their winners. A callable reads metrics by object, handles unhashable metric objects, and minimizes its result unless `mode="max"` is supplied. `threshold` admits only scores strictly better than that value in the selected direction.
+
+```python
+# Three best FID steps and two best CLIP-score steps, plus the latest two states.
+trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
+            checkpoint_every=5_000,
+            best=[Best(fid, top=3), Best(clip, top=2)])
+
+# An aggregate of metrics evaluated on the same weights.
+trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
+            best=Best(lambda m: m[fid] - 0.1 * m[clip], threshold=20.0))
+```
+
+The supplied metrics run together. If a callable needs a score absent from that evaluation, its tracker leaves the step unranked: it never fills a missing value from a previous evaluation. For training reports, `best=objective.loss` selects the objective's training loss; `objective.scalar("ce")` selects a value the objective declares in `shown`. Aggregates can index those objects too. Strings are for recorded configurations, reader selectors and log keys, not for selecting a declared evaluation metric in code.
+
+`Plateau` counts eligible evaluations, not training steps. An improvement must exceed `min_delta`, an absolute amount in the selected direction. Missing scores do not advance patience; nonfinite objective validation losses are errors. Patience and its policy are checkpoint metadata, so resuming with the same policy continues the same count. A changed policy is refused. Stopping writes a final full checkpoint and reports “Stopped: validation plateau”; its control metadata includes the reason. Nothing is added to `TrainState`.
+
+The existing readers accept best selectors; `"best"` chooses the first tracker and `"best:val/clip_score"` chooses the named tracker. An aggregate is named by its position, such as `"best:aggregate:0"`.
+
+```python
+restored, position = trainer.checkpoints.restore(template, step="best")
+image_model = TextToImage.from_run(run_directory, step="best:val/clip_score")
+for checkpoint in trainer.checkpoints.kept():
+    print(checkpoint.step, checkpoint.kind, checkpoint.metrics, checkpoint.rankings)
+```
+
+`restore_best=True` on `fit` returns the best *whole* training state, including its earlier optimizer, counters and RNG, not earlier weights paired with the final optimizer. It does not change the default return value, which is the final state. `Best(fid, weights_only=True)` writes only parameters and EMA for an off-cadence winner. Such a snapshot is inference-only: full-state restore and `restore_best=True` refuse it. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker; there is no duplicate write. Latest-N retention counts full states so a small inference snapshot cannot replace the state a run resumes from.
+
+Several validation splits use explicit reader names; a metric selector needs its split when more than one is present. A callable uses `(split, metric)` keys.
+
+```python
+trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
+            validation={"flowers": flowers.val, "faces": faces.val},
+            best=Best(fid, split="flowers"))
+# A cross-split aggregate: Best(lambda m: m["flowers", fid] + m["faces", fid])
+```
+
+Recorded runs use `TrainerConfig.best`, a metric name or `BestConfig(metric="fid", top=3, mode="min")`; several selectors can be a tuple of `BestConfig` records. A callable cannot be a recorded selector and raises a clear error. All new recorded fields have defaults meaning what older runs did.
+
+## Time cadence and retention
+
+A checkpoint cadence is steps or a `timedelta`, through the same parameter. A duration saves at the next safe training step after it elapses; processes agree on that step. Recorded configurations use a duration such as `checkpoint_every="30m"` (`s`, `m` and `h` are supported).
+
+```python
+from datetime import timedelta
+from dew import Keep
+
+checkpoints = Checkpoints(run_directory, keep=Keep(
+    latest=2, every=10_000, interval=timedelta(hours=1),
+    where=lambda c: c.metrics.get("val/loss", float("inf")) < 1.5))
+trainer = Trainer(objective, optimizer, key=key, checkpoints=checkpoints)
+trainer.fit(data, steps=100_000, checkpoint_every=timedelta(minutes=15))
+```
+
+`Keep.every` retains steps divisible by that period. `Keep.interval` retains checkpoints at least that much wall time apart, starting with the oldest saved step; it does **not** mean “keep every checkpoint older than this age.” `Keep.where` is a code-only predicate over a checkpoint's step and metrics. These policies, latest full states, all best-K sets and post-hoc snapshots are unioned. Filenames remain step numbers; scores live in metadata and `kept()`, not in names that readers must parse.
+
+Ranking reads completed evaluation scalars on the host and adds no parameter transfer. The same evaluation is shared by all trackers, and entering several best-K sets still requests one save. Weights-only winners omit the optimizer, clocks and data position rather than compressing a full training checkpoint and calling it small.
 
 ## The EMA copy on disk
 
