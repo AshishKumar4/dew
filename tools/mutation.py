@@ -34,7 +34,8 @@ TARGETS = {
         "tests/test_trainer.py::test_a_checkpoint_that_stores_the_ema_as_itself_still_restores",
         "tests/test_trainer.py::test_a_global_position_is_read_by_any_process_count")),
     "process": Target("src/dew/diffusion/process.py", (
-        "tests/test_guidance.py", "tests/test_shortcut.py", "tests/test_mean_flow.py")),
+        "tests/test_diffusion_process.py", "tests/test_guidance.py",
+        "tests/test_shortcut.py", "tests/test_mean_flow.py")),
     "schedules": Target("src/dew/diffusion/schedules", (
         "tests/test_schedulers.py", "tests/test_flow_matching.py",
         "tests/test_native_diffusion_edges.py")),
