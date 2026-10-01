@@ -152,6 +152,56 @@ def torch_nearest_resize(x, height: int, width: int):
     return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
 
 
+def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.ndarray:
+    """The `[size_out, size_in]` matrix of torch's bicubic interpolation along
+    one axis, `align_corners=False`.
+
+    Without antialiasing each output reads four taps at half-pixel source
+    coordinates, clamped at the border, with the cubic's a = -0.75; the
+    coordinate is computed in float32 as torch's CPU kernel computes it, since
+    at 256 pixels its rounding moves a weight by 1e-5. With antialiasing the
+    kernel is a = -0.5, widened by the scale when shrinking, and normalized."""
+    scale = np.float32(size_in) / np.float32(size_out)
+    matrix = np.zeros((size_out, size_in), np.float64)
+    if antialias:
+        stretch = max(float(scale), 1.0)
+        for i in range(size_out):
+            center = float(scale) * (i + 0.5)
+            low, high = max(int(center - 2 * stretch + 0.5), 0), min(int(center + 2 * stretch + 0.5), size_in)
+            x = np.abs((np.arange(low, high) - center + 0.5) / stretch)
+            weights = np.where(x < 1, (1.5 * x - 2.5) * x * x + 1, np.where(x < 2, ((-0.5 * x + 2.5) * x - 4) * x + 2, 0))
+            matrix[i, low:high] = weights / weights.sum()
+        return matrix.astype(np.float32)
+    a, one = np.float32(-0.75), np.float32(1)
+
+    def near(x):
+        return ((a + 2) * x - (a + 3)) * x * x + one
+
+    def far(x):
+        return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+
+    for i in range(size_out):
+        source = scale * (np.float32(i) + np.float32(0.5)) - np.float32(0.5)
+        index = int(np.floor(source))
+        t = np.float32(source - np.float32(index))
+        for tap, weight in zip(range(index - 1, index + 3), (far(t + one), near(t), near(one - t), far(2 * one - t)), strict=True):
+            matrix[i, min(max(tap, 0), size_in - 1)] += weight
+    return matrix.astype(np.float32)
+
+
+def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
+    """Resample `[B, H, W, C]` to `height` by `width` as torch's
+    `F.interpolate(mode="bicubic", align_corners=False)` does.
+
+    `jax.image.resize`'s cubic is Keys' a = -0.5 and always antialiases a
+    shrink; torch's is a = -0.75 and antialiases only when asked, so a vision
+    encoder that resizes its input or its position table reproduces its
+    reference only through this arithmetic."""
+    rows = _torch_bicubic_weights(x.shape[1], height, antialias)
+    columns = _torch_bicubic_weights(x.shape[2], width, antialias)
+    return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
+
+
 @logical_axes({}, heuristic=(("Conv_*",),))
 class Upsample(nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""

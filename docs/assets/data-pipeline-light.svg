@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 390" width="760" height="390" role="img">
+<rect x="24" y="24" width="280" height="104" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
+<text x="36" y="47" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">Dataset</text>
+<text x="36" y="69" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">train(partition) → iterator</text>
+<text x="36" y="88" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">val(partition) → one pass</text>
+<text x="36" y="107" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">records, batch</text>
+<rect x="456" y="24" width="280" height="104" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
+<text x="468" y="47" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">DataPartition</text>
+<text x="468" y="69" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">index, count: which share of</text>
+<text x="468" y="88" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">every global batch</text>
+<text x="468" y="107" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">this process reads</text>
+<rect x="24" y="196" width="280" height="104" rx="6" fill="#f2f6f5" stroke="#c9d9d5" stroke-width="1"/>
+<text x="36" y="219" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">host batch</text>
+<text x="36" y="241" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">{"text": (B / count, S)}</text>
+<text x="36" y="260" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">NumPy arrays,</text>
+<text x="36" y="279" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">one dict per step</text>
+<rect x="456" y="196" width="280" height="104" rx="6" fill="#d3f1ec" stroke="#0b7d71" stroke-width="1"/>
+<text x="468" y="219" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#16282b" text-anchor="start">global batch</text>
+<text x="468" y="241" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">jax.Array (B, S)</text>
+<text x="468" y="260" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">rows split over</text>
+<text x="468" y="279" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">data × expert × fsdp</text>
+<line x1="304" y1="76" x2="454" y2="76" stroke="#4d6763" stroke-width="1.25"/>
+<path d="M454.0,76.0 L447.0,79.5 L447.0,72.5 z" fill="#4d6763"/>
+<line x1="456" y1="128" x2="306" y2="196" stroke="#4d6763" stroke-width="1.25"/>
+<path d="M306.0,196.0 L310.9,189.9 L313.8,196.3 z" fill="#4d6763"/>
+<line x1="304" y1="248" x2="454" y2="248" stroke="#4d6763" stroke-width="1.25"/>
+<path d="M454.0,248.0 L447.0,251.5 L447.0,244.5 z" fill="#4d6763"/>
+<text x="380" y="66" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#4d6763" text-anchor="middle">data_partition(mesh)</text>
+<text x="400" y="170" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#4d6763" text-anchor="start">next(train(partition))</text>
+<text x="380" y="238" font-family="'Geist Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#4d6763" text-anchor="middle">shard_batch</text>
+<text x="24" y="336" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">One process: DataPartition() reads every row; the host batch is the global batch.</text>
+<text x="24" y="358" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">Several processes: each reads B / count rows of every step, and</text>
+<text x="24" y="378" font-family="Geist, Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4d6763" text-anchor="start">jax.make_array_from_process_local_data joins them.</text>
+</svg>

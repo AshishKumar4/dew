@@ -95,17 +95,18 @@ def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: boo
     The older 2024 aggregate format (`default/checkpoint`) is not supported.
     """
     import orbax.checkpoint as ocp
+    from etils import epath
 
-    path = (Path(directory) / "default").resolve()
+    path = epath.Path((Path(directory) / "default").resolve())
     state = "best_state" if best else "state"
     weights = "ema_params" if ema else "params"
-    handler = ocp.PyTreeCheckpointHandler()
-    with ocp.Checkpointer(handler) as checkpointer:
-        metadata = handler.metadata(path)
-        item = {state: {weights: metadata.tree[state][weights]}}
-        restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), item)
+    pytree = ocp.PyTreeCheckpointHandler()
+    with ocp.Checkpointer(pytree) as checkpointer:
+        metadata = pytree.metadata(path)
+        selected = {state: {weights: metadata.tree[state][weights]}}
+        restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), selected)
         tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
-            item=item, restore_args=restore_args, partial_restore=True))
+            item=selected, restore_args=restore_args, partial_restore=True))
     return dict(tree[state][weights]["params"])
 
 

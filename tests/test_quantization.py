@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_fp32_reduction_bound
 
 from dew import models  # noqa: F401  registers the models
 from dew.config import OptimConfig, _rebuild
@@ -63,6 +64,16 @@ def test_the_value_round_trips_through_json():
     assert _rebuild(Quantization, record) == spec
 
 
+def test_without_qwix_quantization_names_the_extra_that_installs_it(monkeypatch):
+    """Quantizing without Qwix installed raises naming `dewml[quantization]`,
+    where Python's own error named only the missing module."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "qwix", None)
+    with pytest.raises(ModuleNotFoundError, match=r"dewml\[quantization\]"):
+        apply_quantization(tiny(), Quantization())
+
+
 def quantized_forward(spec, **overrides):
     model = tiny(**overrides)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
@@ -71,20 +82,22 @@ def quantized_forward(spec, **overrides):
     return model, qmodel, variables, ids
 
 
-def test_the_wrapped_forward_matches_qwixs_own_call():
-    """Dew's wrapping against the provider built by hand: identical logits,
-    and both away from the fp32 forward. The gap is the assertion: rules
-    that never reached a matmul would leave the fp32 numerics bitwise.
-    Observed on CPU: wrapped and hand-built bitwise equal, 1.2e-01 from
-    fp32 on logits of order 3."""
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
+    """Dew's wrapping against the provider built by hand, over the layer
+    loop and over the scanned stack: identical compiled logits, and both
+    away from the fp32 forward. The gap is the assertion: rules that never
+    reached a matmul would leave the fp32 numerics bitwise. Observed with
+    both layouts: wrapped and hand-built bitwise equal on CPU and on the RTX
+    4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080) from fp32 on logits up to 3.9."""
     qwix = pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(Quantization())
+    model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
     reference = qwix.quantize_model(model, qwix.QtProvider(rules))
-    plain = model.apply(variables, ids)
-    wrapped = qmodel.apply(variables, ids)
-    manual = reference.apply(variables, ids)
+    plain = jax.jit(model.apply)(variables, ids)
+    wrapped = jax.jit(qmodel.apply)(variables, ids)
+    manual = jax.jit(reference.apply)(variables, ids)
     assert float(jnp.max(jnp.abs(wrapped - manual))) == 0.0
     assert float(jnp.max(jnp.abs(wrapped - plain))) > 1e-2
 
@@ -131,51 +144,111 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in zip(losses, losses[1:])), losses
 
 
-def test_a_scanned_quantized_stack_scores_as_the_plain_one():
-    """Quantization composes with the scan. Both stacks compiled as a
-    training step compiles them, the wrapped scan agrees with the wrapped
-    plain loop while staying away from its fp32 twin; the distance is the
-    assertion that the rules reached under the scan. Observed on logits of
-    order 3: scan against plain 0.0 on CPU and 1.5e-02 on the RTX 4080,
-    where the scan body and the unrolled layers lower to different fusions
-    and int8 rounding flips under the reordered reductions; scan against
-    fp32 1.2e-01 on both. (Eager the two differ by 3.6e-02, fusion order in
-    the uncompiled matmuls, so both sides compile here.)"""
+def int8_products(jaxpr) -> int:
+    """How many convolutions and matmuls of two int8 operands `jaxpr` runs,
+    a scan's body counted once per iteration."""
+    count = 0
+    for equation in jaxpr.eqns:
+        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
+                and all(operand.aval.dtype == jnp.int8 for operand in equation.invars)):
+            count += 1
+        repeats = equation.params["length"] if equation.primitive.name == "scan" else 1
+        for value in equation.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns"):
+                count += repeats * int8_products(inner)
+    return count
+
+
+def test_a_scanned_quantized_stack_quantizes_what_the_plain_one_does():
+    """Quantization composes with the scan: the wrapped scan runs as many
+    int8 products as the wrapped plain loop (19 for this model), and its
+    compiled logits stay away from its fp32 twin, so the rules reached the
+    matmuls under the scan. Its logits are checked against Qwix's own call
+    over the same scanned stack (`test_the_wrapped_forward_matches_qwixs_own_call`),
+    not against the plain loop's: the scan body and the unrolled layers
+    compile to different fusions, which on the RTX 4080 differ by 2.3e-04
+    unquantized, and int8 rounding turns that into 7.0e-02 on logits of order
+    4, at the default and the highest matmul precision alike (0.0 on CPU)."""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(), scan_layers=True)
     plain_wrapped = apply_quantization(tiny(), Quantization())
-    scanned = jax.jit(qmodel.apply)(variables, ids)
-    plain = jax.jit(plain_wrapped.apply)(variables, ids)
+    scanned = int8_products(jax.make_jaxpr(qmodel.apply)(variables, ids).jaxpr)
+    assert scanned == int8_products(jax.make_jaxpr(plain_wrapped.apply)(variables, ids).jaxpr) > 0
     reference = jax.jit(model.apply)(variables, ids)
-    assert float(jnp.max(jnp.abs(scanned - reference))) > 1e-2
-    assert float(jnp.max(jnp.abs(scanned - plain))) < 5e-2
+    assert float(jnp.max(jnp.abs(jax.jit(qmodel.apply)(variables, ids) - reference))) > 1e-2
 
 
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("group_width", [1, 4])
-def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width):
+def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width, dtype):
     """A grouped convolution never adds one group's inputs into another's
     outputs, so each group's activations take their own int8 scale. Over 64
     channels whose ranges span 1e-3 to 1, every output channel lands within
-    int8 rounding of float (depthwise and 4 channels per group). One scale
-    per example for all channels rounds the small groups to zero instead:
-    observed on CPU before the fix, the worst channel 100% (depthwise) and
-    107% (4 per group) off. Observed after: 1.0% and 1.2%."""
+    int8 rounding of float (depthwise and 4 channels per group), in float32
+    and in bf16 compute. The reference is the float32 convolution, at the
+    highest precision, of the inputs and kernel the module computes with.
+    One scale per example for all channels rounds the small groups to zero
+    instead: observed on CPU before the fix, the worst channel 100%
+    (depthwise) and 107% (4 per group) off. Observed after: 1.0% and 1.2%
+    in float32, 1.1% and 1.2% in bf16 (1.1% and 1.4% while Qwix scaled the
+    bf16 product in bf16)."""
     pytest.importorskip("qwix")
     from dew.nn.conv import Conv
 
     features = 64
     conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
-                feature_group_count=features // group_width, use_bias=False)
+                feature_group_count=features // group_width, use_bias=False, dtype=dtype)
     ranges = jnp.logspace(-3, 0, features)
-    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges
-    variables = conv.init(jax.random.key(1), x)
-    plain = conv.apply(variables, x)
+    x = (jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges).astype(dtype)
+    variables = jax.tree.map(lambda leaf: leaf.astype(dtype).astype(jnp.float32), conv.init(jax.random.key(1), x))
+    with jax.default_matmul_precision("highest"):
+        plain = conv.clone(dtype=jnp.float32).apply(variables, x.astype(jnp.float32))
     quantized = apply_quantization(conv, Quantization()).apply(variables, x)
-    error = (jnp.sqrt(jnp.sum((quantized - plain) ** 2, axis=(0, 1, 2)))
+    assert quantized.dtype == dtype
+    error = (jnp.sqrt(jnp.sum((quantized.astype(jnp.float32) - plain) ** 2, axis=(0, 1, 2)))
              / jnp.sqrt(jnp.sum(plain ** 2, axis=(0, 1, 2))))
     assert float(error.max()) < 0.02, np.asarray(error)
     assert float(error.min()) > 0.0
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+@pytest.mark.parametrize("dtype", ["int8", "fp8"])
+@pytest.mark.parametrize("group_width", [1, 4])
+@pytest.mark.parametrize("dilation", [1, 2, 3])
+def test_a_gpu_refuses_grouped_quantized_convolutions(group_width, dtype, dilation):
+    """XLA:GPU computes a grouped convolution with int8 or fp8 activations
+    wrongly or not at all, depending on the GPU, so quantizing one raises
+    naming the ways around it, for training and for serving alike; weight-only
+    quantization, one of them, leaves the convolution in float."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    features = 64
+    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
+                feature_group_count=features // group_width, use_bias=False,
+                kernel_dilation=(dilation, dilation))
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features))
+    variables = conv.init(jax.random.key(1), x)
+    with pytest.raises(ValueError, match="spatial_fusion"):
+        apply_quantization(conv, Quantization(dtype=dtype)).apply(variables, x)
+    with pytest.raises(ValueError, match="spatial_fusion"):
+        quantize_for_serving(conv, variables, Quantization(dtype=dtype), x)
+    served, served_variables = quantize_for_serving(conv, variables, Quantization(dtype=dtype, weight_only=True), x)
+    # Qwix's intercepted weight-only convolution keeps its provider's lax
+    # path; unwrapped Conv uses shifted products at d2/d3 on CUDA. The same
+    # products can sum in different fp32 orders, so bitwise equality no
+    # longer holds, while the reduction bound does.
+    magnitude = jax.lax.conv_general_dilated(
+        jnp.abs(x), jnp.abs(variables['params']['kernel']), (1, 1), 'SAME',
+        rhs_dilation=(dilation, dilation), dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
+        feature_group_count=features // group_width, precision=jax.lax.Precision.HIGHEST)
+    assert_fp32_reduction_bound(served.apply(served_variables, x), conv.apply(variables, x),
+                                magnitude, 9 * group_width)
 
 
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
@@ -197,6 +270,29 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
 
 
 @pytest.mark.parametrize("weight_only", [False, True])
+def test_a_served_language_model_generates_with_its_quantized_kernels(weight_only):
+    """Generation enters a language model through methods besides
+    `__call__` (`states_and_logits_at` for the prefill, `states_and_logits`
+    for each step), and they compute with the stored quantized kernels as
+    `__call__` does. Before, they ran outside Qwix's interception and a
+    stored kernel reached a Dense raw (`TypeError: expected number, got
+    WithAux`)."""
+    pytest.importorskip("qwix")
+    from dew.sampling import Sampling, generate
+
+    model = tiny()
+    prompt = token_batch()["text"][:, :4]
+    variables = model.init(jax.random.key(0), prompt)
+    served, served_variables = quantize_for_serving(model, variables, Quantization(weight_only=weight_only), prompt)
+    logits = served.apply(served_variables, prompt)
+    _, stepped = served.apply(served_variables, prompt, method="states_and_logits")
+    np.testing.assert_array_equal(stepped, logits)
+    assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
+    tokens = generate(served, served_variables, prompt, 3, seed=0, sampling=Sampling(temperature=0)).host().tokens
+    assert tokens.shape == (BATCH, 7)
+
+
+@pytest.mark.parametrize("weight_only", [False, True])
 def test_a_served_bf16_module_computes_in_bf16(weight_only):
     """A quantized kernel follows the module's compute dtype as its float
     kernel would: a bf16 Dense stays bf16 through its matmul. Before, the
@@ -209,6 +305,71 @@ def test_a_served_bf16_module_computes_in_bf16(weight_only):
     variables = dense.init(jax.random.key(1), x)
     served, served_variables = quantize_for_serving(dense, variables, Quantization(weight_only=weight_only), x)
     assert served.apply(served_variables, x).dtype == jnp.bfloat16
+
+
+def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
+    """A served bf16 Dense multiplies its int8 matmul's int32 accumulator by
+    both scales in float32 and rounds once to bf16. Qwix 0.1.8 rounded the
+    accumulator to bf16 before the scales multiplied in, and XLA:TPU then
+    compiled the int8 matmuls of the bf16 176M text-to-image model with bf16
+    results, which sampled NaN images on a v6e."""
+    pytest.importorskip("qwix")
+    from flax import linen as nn
+    from qwix._src.core import qarray
+
+    dense = nn.Dense(64, use_bias=False, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (8, 256), jnp.bfloat16)
+    variables = dense.init(jax.random.key(1), x)
+    served, served_variables = quantize_for_serving(dense, variables, Quantization(), x)
+    kernel = served_variables["params"]["kernel"].array.astype(jnp.bfloat16)
+    activations = qarray.quantize(x, qarray.HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,)))
+    products = jax.lax.dot(activations.qvalue, kernel.qvalue, preferred_element_type=jnp.int32)
+    scaled = products * activations.scale.astype(jnp.float32) * kernel.scale.astype(jnp.float32)
+    np.testing.assert_array_equal(served.apply(served_variables, x), scaled.astype(jnp.bfloat16))
+
+
+def converted_int32_products(jaxpr) -> set:
+    """The dtypes the int32 results of the convolutions and matmuls in
+    `jaxpr`, and in the jaxprs it calls, are converted to."""
+    products, dtypes = set(), set()
+    for equation in jaxpr.eqns:
+        if (equation.primitive.name in ("conv_general_dilated", "dot_general")
+                and equation.outvars[0].aval.dtype == jnp.int32):
+            products.add(id(equation.outvars[0]))
+        if equation.primitive.name == "convert_element_type" and id(equation.invars[0]) in products:
+            dtypes.add(jnp.dtype(equation.params["new_dtype"]))
+        for value in equation.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if hasattr(inner, "eqns"):
+                dtypes |= converted_int32_products(inner)
+    return dtypes
+
+
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("training", [True, False])
+def test_a_bf16_int8_depthwise_convolution_scales_its_int32_products_in_float32(training):
+    """A bf16 depthwise convolution quantized to int8 converts its int32
+    product to float32 for the scales, in training as in serving, and
+    returns bf16. Qwix 0.1.8 converted it to bf16 in training, and on a v6e
+    XLA:TPU computed an int8 depthwise convolution scaled that way as NaN in
+    all but a few outputs."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    features = 16
+    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME", feature_group_count=features,
+                use_bias=False, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features), jnp.bfloat16)
+    variables = conv.init(jax.random.key(1), x)
+    if training:
+        module, module_variables = apply_quantization(conv, Quantization()), variables
+    else:
+        module, module_variables = quantize_for_serving(conv, variables, Quantization(), x)
+    assert converted_int32_products(jax.make_jaxpr(module.apply)(module_variables, x).jaxpr) == {
+        jnp.dtype(jnp.float32)}
+    assert module.apply(module_variables, x).dtype == jnp.bfloat16
 
 
 def test_serving_leaves_complex_matmuls_in_float():
@@ -356,8 +517,10 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     assert int(state.step) == 1
     image = jnp.ones((1, RES, RES, 3), jnp.float32)
     noise_level = jnp.ones((1,), jnp.float32)
-    quantized_out = objective.model.apply(state.params, image, noise_level)
-    plain_out = plain.model.apply(state.params, image, noise_level)
+    # Compiled, as a run computes: XLA:GPU compiles an int8 convolution only
+    # with its dequantization fused in, and eagerly the convolution runs alone.
+    quantized_out = jax.jit(objective.model.apply)(state.params, image, noise_level)
+    plain_out = jax.jit(plain.model.apply)(state.params, image, noise_level)
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 

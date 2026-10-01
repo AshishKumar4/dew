@@ -25,7 +25,7 @@ not copied, into the directory. The safety checker is left out, as
 `from_single_file` leaves it (diffusers' SINGLE_FILE_OPTIONAL_COMPONENTS).
 The pipeline then loads from there, and the entry is kept only once it has.
 diffusers' conversions are written in torch, so this route needs
-`pip install 'dew-ml[diffusers]'`; the loaded pipeline itself runs in JAX.
+`pip install 'dewml[diffusers]'`; the loaded pipeline itself runs in JAX.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from dew.telemetry.instrumentation import dew_cache_dir
 if TYPE_CHECKING:
     import torch
 
-INSTALL = "pip install 'dew-ml[diffusers]'"
+INSTALL = "pip install 'dewml[diffusers]'"
 
 _CLIP_ENCODERS = ("CLIPTextModel", "CLIPTextModelWithProjection")
 

@@ -1,4 +1,4 @@
-# Installs dew-ml, checks for syntax errors and undefined names, lints and type
+# Installs dewml, checks for syntax errors and undefined names, lints and type
 # checks src/dew, and runs the CPU test lane split into shards, each its own
 # check. For more information see:
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization
 
 jobs:
   lint:
@@ -44,8 +44,9 @@ jobs:
         pip install -e ".[$EXTRAS,gguf,torchax]"
     - name: Lint with flake8
       run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # stop the build if there are Python syntax errors or undefined names; the
+        # landing page's sampling cell runs after its setup cell, which defines its names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=site/src/data/sampler.py
     - name: Lint
       run: |
         uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples recipes

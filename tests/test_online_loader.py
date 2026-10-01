@@ -390,7 +390,7 @@ def test_loading_rows_asks_for_the_streaming_extra(monkeypatch):
     the extra is installed in the environment that runs it.
     """
     monkeypatch.setitem(sys.modules, "datasets", None)
-    with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
+    with pytest.raises(ImportError, match=r"dewml\[streaming\]"):
         online_loader.load_rows(["some/hf/dataset"])
 
 
