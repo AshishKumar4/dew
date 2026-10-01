@@ -776,6 +776,36 @@ def test_a_scoreboard_row_waits_for_every_reference_record(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# tools/benchmark_quantized_serving.py
+# ---------------------------------------------------------------------------
+
+def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips():
+    """One NaN latent and one infinite decoded pixel are counted where they
+    occur, before the pixels are clipped and cast to the uint8 that CLIP
+    scores, where the NaN and the infinity become ordinary pixels."""
+    from types import SimpleNamespace
+
+    bench = load("benchmark_quantized_serving")
+    latents = np.zeros((4, 2, 2, 1), np.float32)
+    latents[1, 0, 0, 0] = np.nan
+
+    class Pipe:
+        """The part of TextToImage that sampling reads: latents, and an
+        autoencoder that passes them through with one pixel infinite."""
+        params = {"autoencoder": {}}
+        autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
+
+        def __call__(self, prompts, **controls):
+            return SimpleNamespace(latents=jnp.asarray(latents))
+
+    # NumPy warns as it casts the NaN to a pixel; nothing else would.
+    with pytest.warns(RuntimeWarning, match="invalid value encountered in cast"):
+        pixels, counts = bench.sample(Pipe(), seed=0, decode_batch=4)
+    assert counts == {"latents": 1, "pixels": 2}
+    assert pixels.dtype == np.uint8 and pixels.shape == latents.shape
+
+
+# ---------------------------------------------------------------------------
 # tools/lint_slop.py
 # ---------------------------------------------------------------------------
 
