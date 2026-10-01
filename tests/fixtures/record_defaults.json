@@ -556,6 +556,688 @@
   "alpha": "required",
   "rank": "required"
  },
+ "dew.nn.attention.Stage": {
+  "dtype": {
+   "value": "jax.numpy.float32"
+  },
+  "explicitly_add_residual": true,
+  "force_fp32_for_softmax": false,
+  "heads": "required",
+  "norm_epsilon": 0.0001,
+  "norm_inputs": true,
+  "only_pure_attention": true,
+  "precision": null,
+  "use_linear_attention": true,
+  "use_projection": false,
+  "use_self_and_cross": true
+ },
+ "dew.nn.attention_residuals.AttentionResiduals": {
+  "block_size": "required"
+ },
+ "dew.nn.backbones.causal_transformer.CausalTransformer": {
+  "activation_sparsity_pattern": null,
+  "altup": null,
+  "attention_bias": false,
+  "attention_dropout_rate": 0.0,
+  "attention_impl": "auto",
+  "attention_k_eq_v": false,
+  "attention_residuals": null,
+  "attention_scale": null,
+  "attention_sinks": false,
+  "attn_logit_softcap": null,
+  "bank_layers": null,
+  "causal": true,
+  "depth_scaled_init": false,
+  "dropout_rate": 0.0,
+  "dspark": null,
+  "dtype": null,
+  "emb_features": 512,
+  "embedding_dropout_rate": 0.0,
+  "embedding_multiplier": 1.0,
+  "embedding_scale": false,
+  "embedding_zero_ids": [],
+  "engram": null,
+  "final_logit_softcap": null,
+  "force_fp32_for_softmax": true,
+  "head_dim": null,
+  "hyper_connections": null,
+  "index_share_for_mtp_iteration": false,
+  "initializer_range": null,
+  "kinds": null,
+  "kv_cache": {
+   "class": "dew.nn.kv_cache.KVCache",
+   "sets": {}
+  },
+  "kv_shared_layers": null,
+  "laurel_rank": null,
+  "layer_scalar": null,
+  "layer_types": null,
+  "logits_scaling": 1.0,
+  "mask_token_id": null,
+  "max_seq_len": 2048,
+  "mixer": null,
+  "mixture": null,
+  "mlp": "swiglu",
+  "mlp_features": null,
+  "mtp_hyper_connections": null,
+  "mtp_layer_type": null,
+  "norm_eps": 1e-05,
+  "num_heads": 8,
+  "num_kv_heads": null,
+  "num_kv_shared_layers": 0,
+  "num_layers": 8,
+  "num_nextn_predict_layers": 0,
+  "o_proj_bias": null,
+  "output_gate": false,
+  "partial_rotary_factor": null,
+  "partial_rotary_type": "proportional",
+  "per_layer_input_dim": null,
+  "per_layer_input_vocab": null,
+  "pre_norms": true,
+  "precision": null,
+  "qk_norm": true,
+  "qk_norm_scope": "head",
+  "remat": null,
+  "residual_multiplier": 1.0,
+  "rope_scaling": null,
+  "rope_theta": 10000.0,
+  "sandwich_norms": false,
+  "scale_after_cast": false,
+  "scale_offset": false,
+  "scan_layers": false,
+  "swiglu_limit": null,
+  "tie_embeddings": true,
+  "use_double_wide_mlp": false,
+  "v_norm": false,
+  "vocab_size": "required",
+  "yarn": null
+ },
+ "dew.nn.backbones.decoder_block.Mixture": {
+  "bias": false,
+  "capacity_factor": null,
+  "dispatch": "global",
+  "every": null,
+  "expert_features": null,
+  "experts": "required",
+  "group_score": "top2",
+  "groups": 1,
+  "groups_per_token": 1,
+  "hash_layers": null,
+  "implementation": "auto",
+  "latent_features": null,
+  "latent_norm": false,
+  "layers": null,
+  "media_bias": false,
+  "norm_topk_prob": true,
+  "parallel": false,
+  "scale_inputs": false,
+  "scaling": 1.0,
+  "score_function": "softmax",
+  "shared_features": 0,
+  "shared_gate": false,
+  "top_k": 2
+ },
+ "dew.nn.backbones.decoder_block.RematPolicy": {
+  "offload": [],
+  "save": []
+ },
+ "dew.nn.backbones.dit.SimpleDiT": {
+  "adaln_silu": true,
+  "attention_impl": "auto",
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 768,
+  "force_fp32_for_softmax": true,
+  "interval": false,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_bottleneck": null,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "remat": false,
+  "routes": [],
+  "scan_order": "raster",
+  "text_pooling": "real",
+  "time_scale": 16
+ },
+ "dew.nn.backbones.edm2.EDM2UNet": {
+  "attention_impl": "auto",
+  "attn_balance": 0.3,
+  "attn_resolutions": [
+   16,
+   8
+  ],
+  "channel_mult": [
+   1,
+   2,
+   3,
+   4
+  ],
+  "channel_mult_emb": null,
+  "channel_mult_noise": null,
+  "channels_per_head": 64,
+  "clip_act": 256.0,
+  "concat_balance": 0.5,
+  "dropout": 0.0,
+  "dtype": null,
+  "label_balance": 0.5,
+  "model_channels": 192,
+  "num_blocks": 3,
+  "output_channels": 3,
+  "res_balance": 0.3
+ },
+ "dew.nn.backbones.flux.FluxTransformer": {
+  "attention_impl": "auto",
+  "axes_dims_rope": [
+   16,
+   56,
+   56
+  ],
+  "dtype": null,
+  "guidance_embeds": false,
+  "head_dim": 128,
+  "heads": 24,
+  "in_channels": 64,
+  "joint_attention_dim": 4096,
+  "num_layers": 19,
+  "num_single_layers": 38,
+  "out_channels": 64,
+  "patch_size": 1,
+  "pooled_projection_dim": 768,
+  "precision": null
+ },
+ "dew.nn.backbones.flux2.Flux2Transformer": {
+  "attention_impl": "auto",
+  "axes_dims_rope": [
+   32,
+   32,
+   32,
+   32
+  ],
+  "dtype": null,
+  "eps": 1e-06,
+  "guidance_embeds": true,
+  "head_dim": 128,
+  "heads": 48,
+  "in_channels": 128,
+  "joint_attention_dim": 15360,
+  "mlp_ratio": 3.0,
+  "num_layers": 8,
+  "num_single_layers": 48,
+  "out_channels": 128,
+  "precision": null,
+  "rope_theta": 2000.0,
+  "timestep_guidance_channels": 256
+ },
+ "dew.nn.backbones.jepa.JepaEncoder": {
+  "attention_impl": "auto",
+  "bidirectional_ssm": true,
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 384,
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 6,
+  "num_layers": 12,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "scan_order": "raster",
+  "ssm_attention_ratio": "all-attn",
+  "ssm_state_dim": 64
+ },
+ "dew.nn.backbones.jepa.JepaPredictor": {
+  "attention_impl": "auto",
+  "bidirectional_ssm": true,
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 384,
+  "factorized": false,
+  "force_fp32_for_softmax": true,
+  "grid": [
+   14,
+   14
+  ],
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 6,
+  "num_layers": 6,
+  "precision": null,
+  "predictor_features": 192,
+  "qk_norm": false,
+  "scan_order": "raster",
+  "ssm_attention_ratio": "all-attn",
+  "ssm_state_dim": 64
+ },
+ "dew.nn.backbones.jepa.JepaVideoEncoder": {
+  "attention_impl": "auto",
+  "bidirectional_ssm": true,
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 384,
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 6,
+  "num_layers": 12,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "scan_order": "raster",
+  "ssm_attention_ratio": "all-attn",
+  "ssm_state_dim": 64
+ },
+ "dew.nn.backbones.layer_plan.LayerKind": {
+  "chunk": null,
+  "head_dim": null,
+  "mixer": null,
+  "num_kv_heads": null,
+  "rope_scaling": null,
+  "rope_theta": null,
+  "window": null,
+  "yarn": null
+ },
+ "dew.nn.backbones.mmdit.HierarchicalMMDiT": {
+  "attention_impl": "auto",
+  "base_patch_size": 8,
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": [
+   512,
+   768,
+   1024
+  ],
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": [
+   8,
+   12,
+   16
+  ],
+  "num_layers": [
+   4,
+   4,
+   14
+  ],
+  "output_channels": 3,
+  "precision": null,
+  "qk_norm": false,
+  "remat": false
+ },
+ "dew.nn.backbones.mmdit.SimpleMMDiT": {
+  "attention_impl": "auto",
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 768,
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "remat": false,
+  "scan_order": "raster"
+ },
+ "dew.nn.backbones.qwen_image.QwenImageTransformer": {
+  "attention_impl": "auto",
+  "axes_dims_rope": [
+   16,
+   56,
+   56
+  ],
+  "causal_condition": true,
+  "context_in_dim": 4096,
+  "dtype": null,
+  "eps": 1e-06,
+  "head_dim": 128,
+  "heads": 32,
+  "in_channels": 64,
+  "mlp_ratio": 3,
+  "num_layers": 32,
+  "out_channels": 64,
+  "precision": null
+ },
+ "dew.nn.backbones.sd3.SD3Transformer": {
+  "attention_impl": "auto",
+  "caption_projection_dim": 1152,
+  "dtype": null,
+  "dual_attention_layers": [],
+  "head_dim": 64,
+  "heads": 18,
+  "in_channels": 16,
+  "joint_attention_dim": 4096,
+  "num_layers": 18,
+  "out_channels": 16,
+  "patch_size": 2,
+  "pooled_projection_dim": 2048,
+  "pos_embed_max_size": 96,
+  "precision": null,
+  "qk_norm": null,
+  "sample_size": 128
+ },
+ "dew.nn.backbones.ssm_dit.HybridSSMAttentionDiT": {
+  "adaln_silu": true,
+  "attention_impl": "auto",
+  "bidirectional_ssm": true,
+  "block_pattern": null,
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 768,
+  "force_fp32_for_softmax": true,
+  "interval": false,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_bottleneck": null,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "remat": false,
+  "routes": [],
+  "scan_order": "raster",
+  "ssm_attention_ratio": "3:1",
+  "ssm_state_dim": 64,
+  "text_pooling": "real",
+  "time_scale": 16,
+  "use_2d_fusion": false
+ },
+ "dew.nn.backbones.unet.Unet": {
+  "activation": {
+   "value": "jax._src.nn.functions.silu"
+  },
+  "attention_configs": [
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   }
+  ],
+  "attention_impl": "auto",
+  "dtype": null,
+  "emb_features": 256,
+  "feature_depths": [
+   64,
+   128,
+   256,
+   512
+  ],
+  "norm_groups": 8,
+  "num_middle_res_blocks": 1,
+  "num_res_blocks": 2,
+  "output_channels": 3,
+  "precision": null
+ },
+ "dew.nn.backbones.unet3d.UNet3D": {
+  "activation": {
+   "value": "jax._src.nn.functions.silu"
+  },
+  "attention_configs": [
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   },
+   {
+    "class": "dew.nn.attention.Stage",
+    "sets": {
+     "heads": 8
+    }
+   }
+  ],
+  "attention_impl": "auto",
+  "dtype": null,
+  "emb_features": 256,
+  "feature_depths": [
+   64,
+   128,
+   256,
+   512
+  ],
+  "norm_groups": 8,
+  "num_middle_res_blocks": 1,
+  "num_res_blocks": 2,
+  "output_channels": 3,
+  "precision": null,
+  "temporal_heads": 8
+ },
+ "dew.nn.backbones.unet_condition.UNet2DCondition": {
+  "additional_time_features": 0,
+  "approximate_gelu": true,
+  "attention_impl": "auto",
+  "attention_norm_epsilon": 1e-05,
+  "blocks_per_level": 2,
+  "cosine_first": true,
+  "dropout": 0.0,
+  "dtype": {
+   "value": "jax.numpy.float32"
+  },
+  "frequency_shift": 0,
+  "in_channels": 4,
+  "linear_projection": false,
+  "middle_attention": true,
+  "norm_epsilon": 1e-05,
+  "norm_groups": 32,
+  "out_channels": 4,
+  "precision": null,
+  "stages": "required"
+ },
+ "dew.nn.backbones.unet_condition.UNetStage": {
+  "cross_attention": true,
+  "cross_only": false,
+  "depth": 1,
+  "features": "required",
+  "heads": "required"
+ },
+ "dew.nn.backbones.uvit.SimpleUDiT": {
+  "adaln_silu": true,
+  "attention_impl": "auto",
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 768,
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_size": 16,
+  "precision": null,
+  "remat": false,
+  "scan_order": "raster",
+  "text_pooling": "real"
+ },
+ "dew.nn.backbones.uvit.UViT": {
+  "activation": {
+   "value": "jax._src.nn.functions.silu"
+  },
+  "add_residualblock_output": false,
+  "attention_impl": "auto",
+  "dtype": null,
+  "emb_features": 768,
+  "explicitly_add_residual": true,
+  "force_fp32_for_softmax": true,
+  "norm_epsilon": 1e-05,
+  "norm_inputs": false,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_size": 16,
+  "precision": null,
+  "scan_order": "raster",
+  "use_projection": false,
+  "use_self_and_cross": false
+ },
+ "dew.nn.backbones.video_dit.VideoDiT": {
+  "attention_impl": "auto",
+  "dropout_rate": 0.0,
+  "dtype": null,
+  "emb_features": 768,
+  "force_fp32_for_softmax": true,
+  "mlp_ratio": 4,
+  "norm_epsilon": 1e-05,
+  "num_heads": 12,
+  "num_layers": 12,
+  "output_channels": 3,
+  "patch_size": 16,
+  "precision": null,
+  "qk_norm": false,
+  "remat": false,
+  "scan_order": "raster"
+ },
+ "dew.nn.backbones.z_image.ZImageTransformer": {
+  "attention_impl": "auto",
+  "axes_dims": [
+   32,
+   48,
+   48
+  ],
+  "axes_lens": [
+   1536,
+   512,
+   512
+  ],
+  "cap_feat_dim": 2560,
+  "dim": 3840,
+  "dtype": null,
+  "in_channels": 16,
+  "n_heads": 30,
+  "n_layers": 30,
+  "n_refiner_layers": 2,
+  "norm_eps": 1e-05,
+  "precision": null,
+  "rope_theta": 256.0,
+  "t_scale": 1000.0
+ },
+ "dew.nn.diffusion_gemma.DiffusionGemma": {
+  "canvas_length": "required",
+  "conditioner": null,
+  "text": "required"
+ },
+ "dew.nn.dspark.DSpark": {
+  "block_size": "required",
+  "experts": "required",
+  "layer_type": "required",
+  "markov_rank": "required",
+  "noise_token_id": "required",
+  "stages": "required",
+  "target_layers": "required",
+  "top_k": "required"
+ },
+ "dew.nn.engram.Engram": {
+  "compressed_vocab_size": "required",
+  "head_dim": "required",
+  "layer_ids": "required",
+  "max_ngram_size": "required",
+  "n_heads": "required",
+  "num_embeddings": "required",
+  "pad_token_id": 2,
+  "vocab_size": "required"
+ },
+ "dew.nn.gemma3n.AltUp": {
+  "active_idx": 0,
+  "coef_clip": 120.0,
+  "correct_scale": true,
+  "num_inputs": 4
+ },
+ "dew.nn.hyper_connections.HyperConnections": {
+  "hc_eps": 1e-06,
+  "hc_mult": 4,
+  "hc_sinkhorn_iters": 20,
+  "head": "mean",
+  "single_pass": false
+ },
+ "dew.nn.kv_cache.KVCache": {
+  "groups": 1,
+  "page_size": null,
+  "pages": null,
+  "quantized": null
+ },
+ "dew.nn.moe.Situ": {
+  "beta": 1.0,
+  "linear_beta": null
+ },
+ "dew.nn.multimodal.MultimodalTransformer": {
+  "audio": null,
+  "audio_projection": null,
+  "audio_soft_tokens": null,
+  "dtype": null,
+  "extra_placeholder_ids": [],
+  "family": "required",
+  "image_token_id": "required",
+  "language_model": "required",
+  "pad_token_id": 0,
+  "precision": null,
+  "projection": "required",
+  "vision": "required"
+ },
+ "dew.nn.multimodal.VisionConditioner": {
+  "dtype": null,
+  "precision": null,
+  "projection": "required",
+  "vision": "required"
+ },
+ "dew.nn.rope.RopeScaling": {
+  "factor": "required",
+  "high_freq_factor": "required",
+  "low_freq_factor": "required",
+  "original_max_position_embeddings": "required",
+  "rope_type": "llama3"
+ },
+ "dew.nn.rope.YarnScaling": {
+  "attention_factor": null,
+  "beta_fast": 32.0,
+  "beta_slow": 1.0,
+  "factor": 40.0,
+  "mscale": null,
+  "mscale_all_dim": null,
+  "original_max_position_embeddings": 4096,
+  "rope_theta": 10000.0,
+  "rope_type": "yarn",
+  "truncate": true
+ },
  "dew.objectives.diffusion.config.AudioCondition": {
   "dtype": null,
   "param_dtype": "float32"

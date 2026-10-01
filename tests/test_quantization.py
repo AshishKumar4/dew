@@ -405,16 +405,51 @@ def test_a_gpu_refuses_grouped_quantized_convolutions(group_width, dtype, dilati
     with pytest.raises(ValueError, match="spatial_fusion"):
         quantize_for_serving(conv, variables, Quantization(dtype=dtype), x)
     served, served_variables = quantize_for_serving(conv, variables, Quantization(dtype=dtype, weight_only=True), x)
-    # Qwix's intercepted weight-only convolution keeps its provider's lax
-    # path; unwrapped Conv uses shifted products at d2/d3 on CUDA. The same
-    # products can sum in different fp32 orders, so bitwise equality no
-    # longer holds, while the reduction bound does.
-    magnitude = jax.lax.conv_general_dilated(
-        jnp.abs(x), jnp.abs(variables['params']['kernel']), (1, 1), 'SAME',
-        rhs_dilation=(dilation, dilation), dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=features // group_width, precision=jax.lax.Precision.HIGHEST)
-    assert_fp32_reduction_bound(served.apply(served_variables, x), conv.apply(variables, x),
-                                magnitude, 9 * group_width)
+    np.testing.assert_array_equal(served.apply(served_variables, x), conv.apply(variables, x))
+
+
+@pytest.mark.parametrize("kernels", ["initialized", "trained"])
+def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(kernels):
+    """The hybrid DiT's spatial fusion (depthwise, dilations 1 to 3), left out
+    of the patterns, computes under Dew's quantized training as the
+    unwrapped model does and as Qwix's own quantized training does, and
+    serves as the unwrapped model does: value and gradients bitwise equal,
+    compiled, at the zero-initialized kernels training starts from and at
+    trained ones. Dew's Conv computes a dilated depthwise convolution as
+    shifted products on CUDA, and before, Dew's provider sent an excluded one
+    through lax, so the kernels' first gradients differed and quantized
+    training of the hybrid DiT parted from Qwix's own after its first update
+    (the RTX 4080; on CPU the input's gradient differed by 4.8e-07)."""
+    qwix = pytest.importorskip("qwix")
+    from flax import linen as nn
+
+    from dew.nn.ssm import SpatialFusionConv
+
+    class Block(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return SpatialFusionConv(64, name="spatial_fusion")(x)
+
+    block = Block()
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, 64))
+    variables = block.init(jax.random.key(1), x)
+    if kernels == "trained":
+        variables = jax.tree.map(lambda leaf: 0.1 * jax.random.normal(jax.random.key(2), leaf.shape), variables)
+    cotangent = jax.random.normal(jax.random.key(3), x.shape)
+    pattern = "^(?!.*spatial_fusion).*"
+    spec = Quantization(patterns=(pattern,))
+    direct = qwix.quantize_model(block, qwix.QtProvider(
+        [qwix.QtRule(module_path=pattern, weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+
+    def value_and_gradients(module, variables):
+        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
+        return out, *transpose(cotangent)
+
+    plain = value_and_gradients(block, variables)
+    jax.tree.map(np.testing.assert_array_equal, value_and_gradients(apply_quantization(block, spec), variables), plain)
+    jax.tree.map(np.testing.assert_array_equal, value_and_gradients(direct, variables), plain)
+    served, served_variables = quantize_for_serving(block, variables, spec, x)
+    np.testing.assert_array_equal(jax.jit(served.apply)(served_variables, x), plain[0])
 
 
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():

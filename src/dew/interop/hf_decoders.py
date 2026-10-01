@@ -399,6 +399,8 @@ class DecoderFields(TypedDict, total=False):
     tie_embeddings: bool
     embedding_zero_ids: tuple[int, ...]
     dropout_rate: float
+    embedding_dropout_rate: float
+    attention_dropout_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
     force_fp32_for_softmax: bool
@@ -1982,7 +1984,8 @@ def _export_config(model) -> Mapping[str, object]:
 
 _RUNTIME_FIELDS = frozenset({
     'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
-    'bank_layers', 'dropout_rate', 'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+    'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
+    'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
 """CausalTransformer fields that say how a model runs or trains, not what it
 computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
 forward multiplies by them. `scale_after_cast` orders a norm's scale and its

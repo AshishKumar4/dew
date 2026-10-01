@@ -573,6 +573,12 @@ class CausalTransformer(nn.Module):
     routing each token to a few of its experts. None is a dense model. The
     LM objective's balance_rate is what moves a mixture's balancing bias.
 
+    `embedding_dropout_rate` drops the prepared embedding stream and
+    `attention_dropout_rate` drops normalized attention probabilities in
+    training. Both default to 0, which is what older run records computed.
+    Active attention dropout uses the reference kernel; explicit fused
+    kernels that cannot drop probabilities are refused.
+
     `causal=False` turns every layer into full attention with no cache,
     which is the encoder a masked diffusion language model denoises with.
     The parameter tree is the same either way.
@@ -708,6 +714,8 @@ class CausalTransformer(nn.Module):
     """Placeholder ids looked up as token zero, without changing labels
     (modeling_kimi_k25.py:686-690, the text-only wrapper path)."""
     dropout_rate: float = 0.0
+    embedding_dropout_rate: float = 0.0
+    attention_dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
@@ -978,6 +986,7 @@ class CausalTransformer(nn.Module):
             attention_bias=self.attention_bias,
             o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
+            attention_dropout_rate=self.attention_dropout_rate,
             attention_sinks=self.attention_sinks,
             yarn=kind.yarn,
             attn_logit_softcap=self.attn_logit_softcap,
@@ -1051,6 +1060,17 @@ class CausalTransformer(nn.Module):
         elif self.depth_scaled_init:
             raise ValueError("depth_scaled_init scales initializer_range's std; set it")
 
+    def refuse_unbuildable_dropout(self, kinds: Mapping[str, "ResolvedKind"]) -> None:
+        """Refuse invalid rates and a mixer that cannot drop probabilities."""
+        for field in ("embedding_dropout_rate", "attention_dropout_rate"):
+            rate = getattr(self, field)
+            if not 0 <= rate < 1:
+                raise ValueError(f"{field} must be within [0, 1), got {rate}")
+        if self.attention_dropout_rate:
+            for kind in kinds.values():
+                if not isinstance(kind.mixer or self.mixer or AttentionMixer(), AttentionMixer):
+                    raise ValueError("attention_dropout_rate requires ordinary attention mixers")
+
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise for a field, or a pair of fields, this model cannot build.
 
@@ -1058,6 +1078,7 @@ class CausalTransformer(nn.Module):
         it looks like, so a translated config says which entry to fix.
         """
         self.refuse_unbuildable_mup(kinds)
+        self.refuse_unbuildable_dropout(kinds)
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -1287,6 +1308,8 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype, name='embed_tokens',
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
+        if self.embedding_dropout_rate:
+            self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1828,6 +1851,8 @@ class CausalTransformer(nn.Module):
         # splits the rows or the positions.
         x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
                                            input_embeddings, embedding_positions), RESIDUAL)
+        if self.embedding_dropout_rate:
+            x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
         # with, which are the unscaled ones with any media replacement already
         # in place. A decoder that fused another encoder's outputs cannot

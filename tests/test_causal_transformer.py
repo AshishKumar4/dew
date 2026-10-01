@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
+from flax import linen as nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm.chunked import head_logits
@@ -34,6 +35,154 @@ def tiny(**overrides):
 
 def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
+
+
+@pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
+def test_decoder_dropout_is_training_only(rng, field):
+    base = tiny(dropout_rate=0, attention_impl="reference")
+    ids = tokens(rng, length=4)
+    params = base.init(rng, ids)
+    active = tiny(dropout_rate=0, attention_impl="reference", **{field: .5})
+    first = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(10)})
+    second = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(11)})
+    assert not np.array_equal(first, second)
+    expected = np.asarray(base.apply(params, ids, train=False))
+    for key in (10, 11):
+        evaluated = np.asarray(active.apply(params, ids, train=False, rngs={"dropout": jax.random.key(key)}))
+        assert evaluated.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("geometry", [{"layer_types": ("local", "local"), "kinds": {"local": {"window": 2}}},
+                                     {"layer_types": ("local", "local"), "kinds": {"local": {"chunk": 2}}},
+                                     {"num_kv_heads": 2}])
+def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
+    model = tiny(attention_dropout_rate=.5, attention_impl="reference", **geometry)
+    ids = tokens(rng, length=4)
+    params = model.init(rng, ids)
+    one = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(1)})
+    two = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(2)})
+    assert not jnp.array_equal(one, two)
+    baseline = tiny(attention_impl="reference", **geometry).apply(params, ids)
+    evaluated = model.apply(params, ids)
+    assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
+
+
+def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
+    from dew.config import ModelConfig
+    from flax.traverse_util import unflatten_dict
+    from jax import export
+
+    config = dict(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
+                  mlp_features=16, max_seq_len=8)
+    model = ModelConfig("causal_transformer", config=config, dtype="float32",
+                        matmul_precision="highest", attention_impl="reference").build()
+    assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
+    directory = Path(__file__).with_name("fixtures")
+    held = np.load(directory / "decoder-default-dropout.npz")
+    try:
+        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
+    except Exception as error:
+        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
+    with jax.default_device(jax.devices("cpu")[0]):
+        ids = jnp.asarray(held["ids"])
+        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
+                                 for name, leaf in held.items() if name.startswith("params/")})
+
+        def forward_and_gradient(params, ids):
+            forward = model.apply(params, ids, train=True)
+            gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
+            return forward, gradient
+
+        expected = before.call(params, ids)
+        actual = jax.jit(forward_and_gradient)(params, ids)
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
+
+
+def test_embedding_dropout_matches_flax_on_the_same_draw(rng):
+    class Reference(nn.Module):
+        @nn.compact
+        def __call__(self, x, train):
+            return nn.Dropout(.5, name="embedding_dropout")(x, deterministic=not train)
+
+    model = tiny(embedding_dropout_rate=.5)
+    ids = tokens(rng, length=4)
+    params = model.init(rng, ids)
+    embeddings = model.apply(params, ids, method=CausalTransformer.token_embeddings)
+    reference = Reference()
+    expected = reference.apply({}, embeddings, train=True, rngs={"dropout": rng})
+    actual = model.apply(params, embeddings, method=lambda module, values:
+                         module.embedding_dropout(values, deterministic=False), rngs={"dropout": rng})
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    evaluated = model.apply(params, embeddings, method=lambda module, values:
+                            module.embedding_dropout(values, deterministic=True))
+    assert np.asarray(evaluated).tobytes() == np.asarray(embeddings).tobytes()
+
+
+def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
+    query = jnp.zeros((1, 4, 2, 4), jnp.float32)
+    value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
+    mask = jnp.tril(jnp.ones((4, 4), bool))[None, None]
+    expected = nn.dot_product_attention(query, query, value, mask=mask, dropout_rate=.5,
+                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+                                          dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    probabilities = np.asarray(actual)[0]
+    for row in range(4):
+        kept = np.float32((1 / (row + 1)) / (1 - .5))
+        visible = probabilities[row, :, :row + 1]
+        assert np.all((visible == 0) | (visible == kept))
+        assert not np.any(probabilities[row, :, row + 1:]), "future probabilities stay zero"
+        keep_counts = np.count_nonzero(visible, axis=-1)
+        np.testing.assert_array_equal(keep_counts, np.sum(visible == kept, axis=-1))
+    assert jnp.any(actual == 0)
+    different = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+        dropout_rate=.5, dropout_rng=jax.random.key(7), deterministic=False)
+    assert not jnp.array_equal(actual, different)
+    evaluated = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
+                                              dropout_rate=.5, deterministic=True)
+    unchanged = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference")
+    assert np.asarray(evaluated).tobytes() == np.asarray(unchanged).tobytes()
+    for implementation in ("auto", "xla"):
+        routed = scaled_dot_product_attention(query, query, value, causal=True, implementation=implementation,
+                                               dropout_rate=.5, dropout_rng=rng, deterministic=False)
+        assert np.asarray(routed).tobytes() == np.asarray(expected).tobytes()
+
+
+@pytest.mark.parametrize("implementation", ["cudnn", "tpu"])
+def test_attention_dropout_refuses_kernels_that_cannot_drop_probabilities(rng, implementation):
+    query = jnp.ones((1, 4, 2, 4), jnp.float32)
+    with pytest.raises(ValueError, match="dropout"):
+        scaled_dot_product_attention(query, query, query, implementation=implementation,
+                                      dropout_rate=.5, dropout_rng=rng, deterministic=False)
+
+
+def test_attention_dropout_preserves_visibility_masks(rng):
+    query = jnp.zeros((1, 4, 2, 4), jnp.float32)
+    value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
+    documents = jnp.asarray([[1, 1, 2, 2]])
+    visible = (documents[:, :, None] == documents[:, None, :])[:, None]
+    visible = visible & jnp.tril(jnp.ones((4, 4), bool))[None, None]
+    expected = nn.dot_product_attention(query, query, value, mask=visible, dropout_rate=.5,
+                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
+        implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    assert not np.any(np.asarray(actual)[0, 2:, :, :2]), "documents never see an earlier document"
+
+
+def test_attention_dropout_refuses_a_mixer_without_probabilities(rng):
+    with pytest.raises(ValueError, match="ordinary attention mixers"):
+        tiny(attention_dropout_rate=.5, mixer={"kind": "mamba2"}).init(rng, tokens(rng, length=4))
+
+
+@pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
+@pytest.mark.parametrize("rate", [-.1, 1.1])
+def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
+    with pytest.raises(ValueError, match=field):
+        tiny(**{field: rate}).init(rng, tokens(rng, length=4))
 
 
 def decode_logits(model, params, prompt, rest):

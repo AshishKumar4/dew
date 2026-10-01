@@ -35,6 +35,7 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
+from ..mixers.attention import CausalSelfAttention
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, gated_product
 from ..precision import scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
@@ -611,7 +612,7 @@ class DecoderBlock(nn.Module):
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
         normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
+        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         state = self._write(state, "attention", self._branch(mixed, train), site)
@@ -748,11 +749,13 @@ class DecoderBlock(nn.Module):
         return x
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase):
+             prediction_phase: PredictionPhase, train: bool):
         """The token mixer over `x`. The store, the metadata and a prediction
         phase other than ordinary reach it only when the call carries them,
         since a mixer with no use for one does not take it."""
         return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
+                              **({"train": train} if isinstance(self.self_attn, CausalSelfAttention)
+                                 and self.self_attn.attention_dropout_rate else {}),
                               **({} if kv_store is None else {"kv_store": kv_store}),
                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
