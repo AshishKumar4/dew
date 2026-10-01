@@ -170,6 +170,14 @@ h1#_top,
 	font-variant-numeric: tabular-nums;
 }
 
+/* A table wider than a phone's column scrolls on its own, not the page with it. */
+@media (max-width: 50rem) {
+	.sl-markdown-content table {
+		display: block;
+		overflow-x: auto;
+	}
+}
+
 .sl-markdown-content :is(th, td) {
 	border: 0;
 	border-bottom: 1px solid var(--dew-rule);
@@ -188,25 +196,95 @@ h1#_top,
 	background: transparent;
 }
 
-/* The sidebar: quiet group labels, the current page marked with the accent. */
+/* The sidebar: plain links first, then collapsed sections behind a rule. Every
+   row has the same size and weight; the open section's label and the current
+   page (marked with the accent) are the only emphasis. */
 
+.sidebar-content .top-level > li + li {
+	margin-top: 0.125rem;
+}
+
+.sidebar-content .top-level > li:has(> a) + li:has(> details) {
+	margin-top: 0.75rem;
+	padding-top: 0.75rem;
+	border-top: 1px solid var(--dew-rule);
+}
+
+.sidebar-content a,
+.sidebar-content summary {
+	padding: 0.35rem 0.6rem;
+	border-radius: 0.4rem;
+	font-size: var(--sl-text-sm);
+	line-height: 1.4;
+}
+
+.sidebar-content a.large,
 .sidebar-content .group-label .large {
-	font-size: 0.75rem;
-	font-weight: 600;
-	text-transform: uppercase;
-	letter-spacing: 0.08em;
+	font-size: var(--sl-text-sm);
+	font-weight: 400;
+	color: var(--sl-color-gray-2);
+}
+
+.sidebar-content a:hover,
+.sidebar-content summary:hover .large {
+	color: var(--sl-color-white);
+}
+
+.sidebar-content details[open] > summary .large {
+	color: var(--sl-color-white);
+	font-weight: 500;
+}
+
+.sidebar-content summary .caret {
+	width: 1rem;
+	height: 1rem;
 	color: var(--sl-color-gray-3);
+}
+
+.sidebar-content details > ul {
+	margin: 0.125rem 0 0.5rem;
+}
+
+.sidebar-content ul ul li {
+	margin-inline-start: 0.75rem;
+	padding-inline-start: 0;
+	border-inline-start: 0;
+}
+
+.sidebar-content ul ul li + li {
+	margin-top: 0.0625rem;
 }
 
 .sidebar-content a[aria-current='page'],
 .sidebar-content a[aria-current='page']:hover {
 	background: var(--sl-color-accent-low);
 	color: var(--sl-color-white);
-	font-weight: 600;
+	font-weight: 500;
 }
 
 :root[data-theme='light'] .sidebar-content a[aria-current='page'] {
 	color: var(--sl-color-accent-high);
+}
+
+/* Docs figures come in two files, docs/assets/<name>-light.svg and
+   <name>-dark.svg, placed one after the other; each theme shows its own. */
+
+:root[data-theme='light'] .sl-markdown-content img[src*='-dark.'],
+:root:not([data-theme='light']) .sl-markdown-content img[src*='-light.'] {
+	display: none;
+}
+
+/* The figures are drawn 760 px wide for the content column. A narrow screen
+   scrolls them sideways at that width rather than shrinking the labels. */
+
+@media (max-width: 50rem) {
+	.sl-markdown-content p:has(> img[src*='-light.'], > img[src*='-dark.']) {
+		overflow-x: auto;
+	}
+	.sl-markdown-content img[src*='-light.'],
+	.sl-markdown-content img[src*='-dark.'] {
+		max-width: none;
+	}
 }
 
 /* Header and page chrome. */

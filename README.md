@@ -183,8 +183,8 @@ Set `ema_decay=None` to train without an averaged copy, then sample with `state.
 optimizer state stay fp32, so the optimizer still accumulates in full
 precision.
 
-For int8 quantization-aware training, install Qwix with `uv pip install qwix`
-and wrap the model before you construct the objective:
+For int8 quantization-aware training, install the `quantization` extra
+(`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
 
 ```python
 from dew.training.quantization import Quantization, apply_quantization
@@ -823,7 +823,7 @@ uses that path with `--attention-impl xla`.
 
 ### Standalone evaluation and local reports
 
-`evaluate` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dew-ml[plots]` for Matplotlib output.
+`evaluate` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
 
 ```python
 import itertools
@@ -882,7 +882,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
 
 This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. The tracker renders plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
 
-`Trackers` sends the same reports to several backends, and you switch a backend by changing its constructor. Install `dew-ml[wandb]`, `dew-ml[mlflow]` or `dew-ml[tensorboard]` for the backend you want:
+`Trackers` sends the same reports to several backends, and you switch a backend by changing its constructor. Install `dewml[wandb]`, `dewml[mlflow]` or `dewml[tensorboard]` for the backend you want:
 
 ```python
 from dew import LocalTracker, TensorBoardTracker, Trackers
@@ -897,7 +897,7 @@ Use this tracker in the same `with` block and `Trainer` call above. `WandbTracke
 
 ### Profiling training and inference
 
-Install `dew-ml[profile]`, or use `uv pip install -e '.[profile]'` from this checkout. Both forms run the same JAX/XProf capture:
+Install `dewml[profile]`, or use `uv pip install -e '.[profile]'` from this checkout. Both forms run the same JAX/XProf capture:
 
 ```python
 import dew
@@ -957,7 +957,7 @@ best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
 
-This prints `{'optim.learning_rate': 0.01} 1.0024` against 1.015 for the slower rate. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>` with its own `run.json`, checkpoints and tracking journal, and every finished trial is written to the ledger before it is reported, so rerunning the call continues an interrupted sweep instead of retraining. `random_search` and `grid_search` are built in; `optuna_search` needs `dew-ml[hpo]`.
+This prints `{'optim.learning_rate': 0.01} 1.0024` against 1.015 for the slower rate. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>` with its own `run.json`, checkpoints and tracking journal, and every finished trial is written to the ledger before it is reported, so rerunning the call continues an interrupted sweep instead of retraining. `random_search` and `grid_search` are built in; `optuna_search` needs `dewml[hpo]`.
 
 ## Diffusion and sampling
 
@@ -1422,7 +1422,7 @@ Add the extra for your hardware; its accelerator build of JAX matches the JAX De
 | NVIDIA GPU | `uv pip install -e ".[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
 | Google TPU | `uv pip install -e ".[tpu]"` |
 
-Installing from the repository without a checkout works the same way: `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Take the accelerator build from these extras, not from `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]`. Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)). pip can't resolve PyPI's jax extras beside that pin in one install, and a later `-U "jax[...]"` would replace the pin with any newer PyPI jax. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
+Installing from the repository without a checkout works the same way: `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Take the accelerator build from these extras, not from `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]`. Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)). pip can't resolve PyPI's jax extras beside that pin in one install, and a later `-U "jax[...]"` would replace the pin with any newer PyPI jax. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
 The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 

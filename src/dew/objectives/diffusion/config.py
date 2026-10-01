@@ -10,7 +10,10 @@ same file.
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING, ClassVar
+
+import numpy as np
 
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
@@ -144,12 +147,58 @@ class PretrainedAutoencoder:
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
         """Bind supplied params while reconstructing the model from its config."""
-        from dew.nn.autoencoders.pretrained import load_autoencoder
-        from dew.registry import resolve_dtype
+        import jax.numpy as jnp
 
-        return load_autoencoder(self.modelname, revision=self.revision, dtype=resolve_dtype(self.dtype),
+        from dew.nn.autoencoders.pretrained import load_autoencoder
+
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=jnp.dtype(self.dtype),
                                 latent_shift=self.latent_shift, latent_scale=self.latent_scale,
                                 params=params)
+
+
+@dataclasses.dataclass(frozen=True)
+class FlowGRPO:
+    """Train the model as a Flow-GRPO policy (Liu et al. 2025) on an image
+    reward: groups of rollouts through the flow SDE per prompt, scored,
+    normalized within the group and trained on the clipped likelihood ratio,
+    with the conditional KL to the initial model at weight `beta`.
+
+    The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document
+    them; `reward` names a registered image metric measured per sample
+    against its own prompt, and higher must be better (`clip_score`).
+    """
+
+    reward: str = "clip_score"
+    noise_level: float = 0.7
+    beta: float = 0.0
+    clip_range: float = 1e-4
+    adv_clip_max: float = 5.0
+    groups: int = 4
+    rollout_steps: int = 11
+    train_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reward not in metrics:
+            raise ValueError(f"reward names {self.reward!r}, which no metric is registered "
+                             f"under; the registered metrics are {sorted(metrics)}")
+
+    def rollout(self, objective):
+        """The trainer's rollout over `objective`, scored by the named metric."""
+        from dew.artifacts import ImageGrid
+        from dew.eval.common import ImageMetric
+        from dew.objectives.rl.flow import FlowRollout
+
+        metric = metrics[self.reward]()
+        if not isinstance(metric, ImageMetric):
+            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
+                             "scores each sample with an image metric's per-sample measure")
+
+        def reward(images, batch):
+            return np.asarray(metric.measure(ImageGrid(images), batch))
+
+        return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
+                           train_steps=self.train_steps)
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,11 +206,14 @@ class DiffusionRunConfig(RunConfig):
     """Describe a run, plus the diffusion objective's own knobs."""
 
     objective: str = "diffusion"
+    """The objective `build` returns, `flow_grpo` under `rl` and `diffusion`
+    otherwise; it follows `rl`, so a saved record names what trained."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
-    preset: PresetSpec = dataclasses.field(default_factory=presets.EDM)
-    """The convention the model is trained and sampled with."""
+    preset: PresetSpec | None = dataclasses.field(default_factory=presets.EDM)
+    """The convention the model is trained and sampled with. None is the one
+    the `pretrained` pipeline's scheduler reads, which a preset may restate."""
     sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
     """The solver validation samples with."""
     guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
@@ -173,14 +225,21 @@ class DiffusionRunConfig(RunConfig):
     ema_decay: float | None = 0.999
     """None disables EMA; 1.0 retains a frozen copy."""
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
-    """The text condition, under the models' `textcontext` keyword; None
-    trains unconditionally, or on `audio`."""
+    """The text condition, under the keyword its encoder's value is read by
+    (`ConditionEncoder.keyword`); None trains unconditionally, or on `audio`."""
     audio: AudioCondition | None = None
-    """The audio condition, under the same `textcontext` keyword in place of
-    text, so it needs `text` None and a `VideoDataset`, whose clips carry the
-    audio."""
+    """The audio condition, under its encoder's keyword in place of text, so
+    it needs `text` None and a `VideoDataset`, whose clips carry the audio."""
     autoencoder: PretrainedAutoencoder | None = None
     """Set for latent diffusion; None trains in pixel space."""
+    pretrained: str | None = None
+    """A published diffusion pipeline to fine-tune: a Hub repo, `repo@revision`
+    or a local directory in the diffusers layout. The checkpoint decides the
+    model, its text conditioning and its autoencoder, so `--model` carries
+    the precision settings alone and `text` and `autoencoder` are left
+    unset."""
+    rl: FlowGRPO | None = None
+    """Train with Flow-GRPO on a reward instead of the denoising loss."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered
@@ -191,14 +250,32 @@ class DiffusionRunConfig(RunConfig):
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+        object.__setattr__(self, "objective", "diffusion" if self.rl is None else "flow_grpo")
         from dew.diffusion.presets import EDM
 
+        if self.pretrained is not None:
+            scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
+            chosen = [name for name, named in (
+                ("model.architecture", self.model.architecture != scratch.architecture),
+                ("model.config", self.model.config != scratch.config),
+                ("text", self.text not in (None, TextCondition())),
+                ("audio", self.audio is not None),
+                ("autoencoder", self.autoencoder is not None)) if named]
+            if chosen:
+                raise ValueError(
+                    f"{self.pretrained} decides the model, its text conditioning and its "
+                    f"autoencoder; leave {', '.join(chosen)} unset")
+            object.__setattr__(self, "text", None)
+        elif self.preset is None:
+            raise ValueError("preset None trains on the convention a pretrained pipeline's "
+                             "scheduler reads; name a preset or --pretrained")
         # EDM's sigma draw is the space's: pixels without an autoencoder,
         # latents with one. A regime or sigmas the preset states win.
         if (isinstance(self.preset, EDM) and self.preset.regime is None
                 and (self.preset.P_mean is None or self.preset.P_std is None)):
-            regime = "pixel" if self.autoencoder is None else "latent"
-            object.__setattr__(self, "preset", dataclasses.replace(self.preset, regime=regime))
+            latent = self.autoencoder is not None or self.pretrained is not None
+            object.__setattr__(self, "preset", dataclasses.replace(
+                self.preset, regime="latent" if latent else "pixel"))
         unknown = [name for name in self.val_metrics if name not in metrics]
         if unknown:
             raise ValueError(
@@ -228,25 +305,35 @@ class DiffusionRunConfig(RunConfig):
 
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """The fields the registry builds the model from: the run's precision
-        settings and the channels the model denoises, over `model.config`."""
+        settings over `model.config`, and the channels the model denoises
+        where the architecture takes them as `output_channels`. The published
+        families name theirs as their sources do, in `model.config`."""
         fields = dict(self.model.fields())
-        sample = self.sample_field()
-        fields["output_channels"] = (sample.shape[-1] if autoencoder is None
-                                     else autoencoder.latent_channels)
+        declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
+        if "output_channels" in declared:
+            sample = self.sample_field()
+            fields["output_channels"] = (sample.shape[-1] if autoencoder is None
+                                         else autoencoder.latent_channels)
         return fields
 
     @property
     def context(self) -> TextCondition | AudioCondition | None:
-        """The condition the model reads under `textcontext`, if any."""
+        """The condition the model reads, text or audio, if any."""
         return self.text if self.text is not None else self.audio
 
     @property
     def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
         """Parameter ownership in the variables tree this config builds."""
         roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+        if self.pretrained is not None:
+            # Every published pipeline's conditioner owns a bare tree.
+            from dew.inputs.diffusion import DiffusionConditioner
+
+            return (*roots, ("encoders", DiffusionConditioner.keyword), ("autoencoder",))
         if self.context is not None:
-            prefix = ("encoders", "textcontext")
-            collections = encoders[self.context.encoder].parameter_collections
+            encoder = encoders[self.context.encoder]
+            prefix = ("encoders", encoder.keyword)
+            collections = encoder.parameter_collections
             roots.extend((prefix,) if collections is None else
                          ((*prefix, collection) for collection in collections))
         if self.autoencoder is not None:
@@ -260,30 +347,32 @@ class DiffusionRunConfig(RunConfig):
         the VAE read only configuration/tokenizer metadata and bind their
         respective subtrees without a source weight load or storage cast.
         """
-        if self.context is None and self.model.architecture in TEXT_STREAM_MODELS:
-            raise ValueError(
-                f"an unconditional run needs a model that attends without text, and "
-                f"{self.model.architecture!r} runs the text as a second stream through "
-                "every block")
-        autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
-            params=None if variables is None else variables["autoencoder"]))
-        params = (None if variables is None or self.context is None
-                  else variables["encoders"]["textcontext"])
-        if self.text is not None:
-            conditions = {"textcontext": self.text.build(params=params, dtype=self.model.dtype)}
-        elif self.audio is not None and isinstance(self.data, VideoDataset):
-            conditions = {"textcontext": self.audio.build(self.data, params=params,
-                                                          dtype=self.model.dtype)}
+        if self.pretrained is None:
+            model, conditions, autoencoder = self._scratch(variables)
+            sample, convention = self.sample_field(), None
         else:
-            conditions = {}
-        inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
-        model = models.build(self.model.architecture, self.model_fields(autoencoder))
-        process = self.preset()
-        if not isinstance(process, Process):
-            raise ValueError(
-                f"preset {presets.name_of(type(self.preset))!r} builds a "
-                f"{type(process).__name__}, and DiffusionObjective trains a Gaussian "
-                "Process; a discrete preset trains through MaskedDiffusionObjective")
+            source = self._source(variables)
+            if source.inputs is None:
+                raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
+            if source.inputs.mask is not None:
+                raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
+                                 "on masks an image dataset does not carry")
+            model, conditions, autoencoder = source.model, dict(source.inputs.conditions), source.autoencoder
+            variables, convention = source.variables, source.process
+            # The data's geometry, in the autoencoder's own pixel channels:
+            # Qwen-Image 2.1's are RGBA.
+            sample = source.inputs.sample
+        inputs = InputSpec(sample=sample, conditions=conditions)
+        process = self._process(convention)
+        if self.rl is not None:
+            from dew.objectives.rl.flow import FlowGRPOObjective
+            from dew.sampling.flow import FlowSDE
+
+            return FlowGRPOObjective(
+                model, process, inputs, sde=FlowSDE(self.rl.noise_level), beta=self.rl.beta,
+                clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
+                autoencoder=autoencoder, guidance=self.guidance, sampler=self.sampler,
+                steps=self.sampling_steps, pretrained=variables)
         return DiffusionObjective(
             model, process, inputs,
             autoencoder=autoencoder, pretrained=variables,
@@ -293,6 +382,84 @@ class DiffusionRunConfig(RunConfig):
             guidance=self.guidance,
             steps=self.sampling_steps,
         )
+
+    def rollout(self, objective: DiffusionObjective):
+        """The trainer's rollout for `objective`: Flow-GRPO's, or None for the
+        denoising loss, which trains on the batch as it comes."""
+        return None if self.rl is None else self.rl.rollout(objective)
+
+    def pinned(self) -> DiffusionRunConfig:
+        """This run with a Hub `pretrained` pinned to the commit it resolves to
+        now, so the record names the weights the run started from."""
+        if self.pretrained is None or os.path.isdir(self.pretrained):
+            return self
+        from dew.interop import sources
+        from dew.interop.pretrained import split_revision
+
+        name, revision = split_revision(self.pretrained)
+        commit = sources.snapshot(name, revision, weights=False).name
+        return dataclasses.replace(self, pretrained=f"{name}@{commit}")
+
+    def _scratch(self, variables: Variables | None):
+        """The registry's model, the run's text or audio condition and its
+        autoencoder."""
+        if self.context is None and self.model.architecture in TEXT_STREAM_MODELS:
+            raise ValueError(
+                f"an unconditional run needs a model that attends without text, and "
+                f"{self.model.architecture!r} runs the text as a second stream through "
+                "every block")
+        autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
+            params=None if variables is None else variables["autoencoder"]))
+        conditions = {}
+        if self.context is not None:
+            keyword = encoders[self.context.encoder].keyword
+            params = None if variables is None else variables["encoders"][keyword]
+            if self.text is not None:
+                conditions[keyword] = self.text.build(params=params, dtype=self.model.dtype)
+            else:
+                # __post_init__ holds audio to a VideoDataset.
+                assert self.audio is not None and isinstance(self.data, VideoDataset)
+                conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
+        model = models.build(self.model.architecture, self.model_fields(autoencoder))
+        return model, conditions, autoencoder
+
+    def _source(self, variables: Variables | None):
+        """The `pretrained` pipeline at the data's resolution: its own
+        weights, or `variables` bound over its metadata."""
+        from dew.interop.pretrained import load_diffusion_source, split_revision
+
+        assert self.pretrained is not None
+        name, revision = split_revision(self.pretrained)
+        height, width = self.sample_field().shape[-3:-1]
+        return load_diffusion_source(
+            name, revision=revision, dtype=self.model.dtype,
+            param_dtype=self.model.param_dtype or "float32",
+            attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
+
+    def _process(self, convention: Process | None) -> Process:
+        """The preset's process, which must be of the kind the pretrained
+        pipeline's scheduler reads: the same schedule family and the same
+        prediction. None is that scheduler's own."""
+        if self.preset is None:
+            assert convention is not None
+            return convention
+        process = self.preset()
+        if not isinstance(process, Process):
+            raise ValueError(
+                f"preset {presets.name_of(type(self.preset))!r} builds a "
+                f"{type(process).__name__}, and DiffusionObjective trains a Gaussian "
+                "Process; masked diffusion trains through LMRunConfig's "
+                "--objective masked_diffusion")
+        if convention is not None and (
+                type(process.schedule) is not type(convention.schedule)
+                or type(process.prediction) is not type(convention.prediction)):
+            raise ValueError(
+                f"{self.pretrained}'s scheduler reads {type(convention.schedule).__name__} with "
+                f"{type(convention.prediction).__name__}, and preset "
+                f"{presets.name_of(type(self.preset))!r} is "
+                f"{type(process.schedule).__name__} with {type(process.prediction).__name__}; "
+                "name a preset of its kind, or none for the scheduler's own")
+        return process
 
     def build_eval_metrics(self) -> list:
         """Validation metrics for `val_metrics`, each pulling its own weights

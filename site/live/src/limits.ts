@@ -7,6 +7,8 @@ export interface Limits {
 	maxSessions: number;
 	/** Longest a session lives. */
 	wallSeconds: number;
+	/** How long a spare container waits for a session to take it. */
+	warmSeconds: number;
 	/** A session with no request for this long, while no cell runs, ends. */
 	idleSeconds: number;
 	/** CPU time the kernel process may use. */
@@ -26,6 +28,7 @@ export function limitsOf(env: Env): Limits {
 		budgetSeconds: read('BUDGET_SECONDS'),
 		maxSessions: read('MAX_SESSIONS'),
 		wallSeconds: read('WALL_SECONDS'),
+		warmSeconds: read('WARM_SECONDS'),
 		idleSeconds: read('IDLE_SECONDS'),
 		cpuSeconds: read('CPU_SECONDS'),
 		ipWindowSeconds: read('IP_WINDOW_SECONDS'),

@@ -1,7 +1,7 @@
 // live.dewml.dev. The page asks for a session with a Turnstile token, gets a
 // short-lived token back, and opens the session's WebSocket with it.
 //
-//   POST /v1/sessions            {"turnstile": "<token>"} -> {id, token, socket, limits}
+//   POST /v1/sessions            {"turnstile": "<token>"} -> {id, token, socket, warm, limits}
 //   GET  /v1/sessions/<id>/ws?token=...   WebSocket to the session's kernel
 //   GET  /v1/status              {active, maxSessions, budgetUsedSeconds, budgetSeconds}
 
@@ -35,11 +35,19 @@ async function passesTurnstile(env: Env, token: string, ip: string): Promise<boo
 	form.append('remoteip', ip);
 	const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
 	if (!response.ok) return false;
-	const outcome = await response.json<{ success: boolean; hostname?: string; action?: string }>();
-	return outcome.success && listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
+	const outcome = await response.json<{
+		success: boolean;
+		hostname?: string;
+		action?: string;
+		metadata?: { result_with_testing_key?: boolean };
+	}>();
+	if (!outcome.success) return false;
+	// Cloudflare's test secret passes every token and names no real hostname or action.
+	if (outcome.metadata?.result_with_testing_key) return env.TURNSTILE_TEST_KEYS === 'accept';
+	return listed(env.TURNSTILE_HOSTNAMES).includes(outcome.hostname ?? '') && outcome.action === 'live-session';
 }
 
-async function createSession(request: Request, env: Env, ip: string, cors: HeadersInit): Promise<Response> {
+async function createSession(request: Request, env: Env, ctx: ExecutionContext, ip: string, cors: HeadersInit): Promise<Response> {
 	const body = await request.json<{ turnstile?: unknown }>().catch(() => ({ turnstile: undefined }));
 	if (typeof body.turnstile !== 'string' || body.turnstile.length === 0 || body.turnstile.length > 4096) {
 		return reply({ error: 'turnstile', message: 'The page did not send a Turnstile token.' }, 400, cors);
@@ -54,13 +62,14 @@ async function createSession(request: Request, env: Env, ip: string, cors: Heade
 			'Retry-After': String(opened.retryAfter),
 		});
 	}
+	if (opened.spare !== null) ctx.waitUntil(env.KERNEL.get(env.KERNEL.idFromName(opened.spare)).warm(opened.spare));
 	const limits = limitsOf(env);
 	// The token outlives the session a little, so a page that connects late still gets in.
 	const expires = now + (limits.wallSeconds + 60) * 1000;
 	const token = await sign(env.SESSION_SECRET, opened.id, expires);
 	const socket = `wss://${new URL(request.url).host}/v1/sessions/${opened.id}/ws?token=${encodeURIComponent(token)}`;
 	return reply(
-		{ id: opened.id, token, socket, limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
+		{ id: opened.id, token, socket, warm: opened.warm, limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
 		201,
 		cors,
 	);
@@ -76,7 +85,7 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 }
 
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const origin = request.headers.get('Origin');
 		const allowed = listed(env.ALLOWED_ORIGINS);
@@ -94,7 +103,7 @@ export default {
 		const { success } = await env.REQUESTS.limit({ key: visitorKey(ip) });
 		if (!success) return reply({ error: 'rate', message: 'Too many requests. Wait a minute.' }, 429, cors, { 'Retry-After': '60' });
 
-		if (url.pathname === '/v1/sessions' && request.method === 'POST') return createSession(request, env, ip, cors);
+		if (url.pathname === '/v1/sessions' && request.method === 'POST') return createSession(request, env, ctx, ip, cors);
 		if (url.pathname === '/v1/status' && request.method === 'GET') return reply(await coordinatorOf(env).status(Date.now()), 200, cors);
 		const socket = /^\/v1\/sessions\/([0-9a-f-]{36})\/ws$/.exec(url.pathname);
 		if (socket && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') return connect(request, env, socket[1]);

@@ -388,6 +388,22 @@
   ],
   "timeout": 15
  },
+ "dew.data.streaming.OnlineImages": {
+  "image_size": 256,
+  "loading": {
+   "class": "dew.data.dataset.Loading",
+   "sets": {
+    "threads": 512,
+    "worker_buffer": 20,
+    "workers": 16
+   }
+  },
+  "min_image_size": 128,
+  "retries": 3,
+  "seed": 0,
+  "sources": [],
+  "timeout": 15
+ },
  "dew.data.streaming.OnlineVideos": {
   "frames": 16,
   "image_size": 256,
@@ -566,6 +582,8 @@
    "class": "dew.diffusion.presets.EDM",
    "sets": {}
   },
+  "pretrained": null,
+  "rl": null,
   "sampler": {
    "class": "dew.sampling.solvers.EulerAncestral",
    "sets": {}
@@ -583,6 +601,16 @@
   "val_metrics": [
    "clip"
   ]
+ },
+ "dew.objectives.diffusion.config.FlowGRPO": {
+  "adv_clip_max": 5.0,
+  "beta": 0.0,
+  "clip_range": 0.0001,
+  "groups": 4,
+  "noise_level": 0.7,
+  "reward": "clip_score",
+  "rollout_steps": 11,
+  "train_steps": null
  },
  "dew.objectives.diffusion.config.PretrainedAutoencoder": {
   "dtype": "bfloat16",
