@@ -1536,13 +1536,21 @@ class Trainer(Generic[Loss, Effects]):
             if isinstance(choice, TrainingScalar) and choice.owner is not self.objective:
                 raise ValueError("training scalar belongs to a different objective")
             if isinstance(choice, Best):
-                return dataclasses.replace(choice, _source=owned(choice._source) if choice._source is not None else None)
+                source = choice._source
+                if source is None and (choice.metric.startswith('train/') or choice.split == 'train'):
+                    source = self.objective.values[choice.metric.removeprefix('train/')]
+                return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
-        selection = tuple(self._best_selection(owned(choice), metrics, splits) for choice in raw)
+        selection = tuple(self._best_selection(owned(Best(choice) if isinstance(choice, str) else choice), metrics, splits)
+                          for choice in raw)
+        labels = [(choice.split, choice.metric) for choice in selection
+                  if isinstance(choice._source, (Metric, TrainingScalar))]
+        if len(labels) != len(set(labels)):
+            raise ValueError("select each metric once; one Best.top already keeps all its winners")
         if stop is not None:
             metric = owned(stop.metric)
-            if isinstance(metric, Best):
-                raise TypeError("Plateau selects a metric, not a Best policy")
+            if not isinstance(metric, (Metric, TrainingScalar)):
+                raise TypeError("Plateau selects a declared metric object, not a Best policy or score function")
             stopping = self._best_selection(Best(metric, mode=stop.mode, split=stop.split), metrics, splits)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
@@ -1834,7 +1842,10 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control)
+        if control:
+            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control)
+        else:
+            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

@@ -41,13 +41,13 @@ import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
-from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
 from dew.lora import LoRA, attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.records import JSON
+from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
@@ -195,13 +195,35 @@ def _best_argument():
         str_from_instance=write)
 
 
+def _keep_argument():
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar='LATEST|JSON',
+        instance_from_str=lambda given: Keep(**json.loads(given[0])) if given[0].startswith('{') else int(given[0]),
+        is_instance=lambda keep: isinstance(keep, (int, Keep)),
+        str_from_instance=lambda keep: [json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)])
+
+
+def _cadence_argument():
+    def read(given):
+        value = given[0]
+        if value == 'None':
+            return None
+        if value == 'epoch':
+            return value
+        return int(value) if value.isdecimal() else duration(value)
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar='STEPS|DURATION|epoch', instance_from_str=read,
+        is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
+        str_from_instance=lambda value: [recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)])
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: int = 2
+    keep: Annotated[int | Keep, _keep_argument()] = 2
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
@@ -217,7 +239,7 @@ class TrainerConfig:
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
     reports no record count raises a ValueError, since it has no pass."""
-    checkpoint_every: int | str | None = "epoch"
+    checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
     trainer refuses any other answer for one."""
@@ -255,6 +277,12 @@ class TrainerConfig:
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
+        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
+            object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
+        if isinstance(self.keep, Mapping):
+            object.__setattr__(self, 'keep', _built(Keep, self.keep))
+        if isinstance(self.keep, Keep) and self.keep.where is not None:
+            raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
             choices = self.best if isinstance(self.best, (tuple, list)) else (self.best,)
             rebuilt = []
@@ -293,11 +321,12 @@ class TrainerConfig:
     def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
         """Steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
+        if isinstance(value, datetime.timedelta):
+            if value.total_seconds() <= 0:
+                raise ValueError("checkpoint_every duration must be positive")
+            return value
         if isinstance(value, str) and value != 'epoch':
-            match = re.fullmatch(r'(\d+(?:\.\d+)?)(s|m|h)', value)
-            if match is None or float(match[1]) <= 0:
-                raise ValueError("checkpoint_every must be steps, epoch, None, or a positive duration such as 30m")
-            return datetime.timedelta(seconds=float(match[1]) * {'s': 1, 'm': 60, 'h': 3600}[match[2]])
+            return duration(value)
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
@@ -368,6 +397,8 @@ def _to_json(value, annotation) -> JSON:
     """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
     registry and member types the read side rebuilds from."""
+    if isinstance(value, datetime.timedelta):
+        return recorded_duration(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(annotation)
         if held is not None and not any(type(value) is member
