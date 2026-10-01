@@ -9,14 +9,11 @@ from packaging.utils import canonicalize_name
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_the_accelerator_extras_install_what_the_pinned_jax_asks_for():
-    """`dewml[cuda12]`, `[cuda13]` and `[tpu]` are how an install gets the
-    pinned jax's accelerator build. pip can't satisfy PyPI's jax[cuda13]
-    against the pinned jax's archive URL, so `pip install "dewml @ git+..."
-    "jax[cuda13]"` failed with ResolutionImpossible. Each extra asks for the
-    packages the installed jax's extra of the same name asks for, at the same
-    versions, apart from jaxlib, which jax pins itself; a pin that moves
-    without its extras fails here."""
+def test_the_accelerator_extras_install_what_the_installed_jax_asks_for():
+    """`dewml[cuda12]`, `[cuda13]` and `[tpu]` are how one install gets jax's
+    accelerator build. Each extra asks for the packages the installed jax's
+    extra of the same name asks for, at the same versions, apart from jaxlib,
+    which jax pins itself; a jax that moves without its extras fails here."""
     extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
 
     def key(requirement: Requirement) -> tuple[str, frozenset[str], str]:
@@ -28,3 +25,13 @@ def test_the_accelerator_extras_install_what_the_pinned_jax_asks_for():
                   and not requirement.marker.evaluate({"extra": ""}) and requirement.name != "jaxlib"}
         assert wanted, f"the installed jax has no {extra} extra"
         assert {key(Requirement(line)) for line in extras.get(extra, ())} == wanted, extra
+
+
+def test_every_requirement_names_a_release():
+    """PyPI refuses a distribution whose requirements name a URL, so every
+    requirement and extra of the published dewml names a release; the jax
+    build CI runs on comes through constraints.txt."""
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]
+    lines = [*project["dependencies"], *(line for extra in project["optional-dependencies"].values()
+                                         for line in extra)]
+    assert [line for line in lines if Requirement(line).url is not None] == []

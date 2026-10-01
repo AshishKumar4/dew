@@ -41,7 +41,7 @@ jobs:
         pip install flake8 uv
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         # pyright resolves every import in src/dew, the optional readers' included.
-        pip install -e ".[$EXTRAS,gguf,torchax]"
+        pip install -e ".[$EXTRAS,gguf,torchax]" -c constraints.txt
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
@@ -84,7 +84,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[$EXTRAS]"
+        # The jax constraints.txt names: the patched 0.11.2 the multi-process
+        # cache tests need. The package job runs the release users install.
+        pip install -e ".[$EXTRAS]" -c constraints.txt
     # conftest.py persists XLA's compilations under ~/.cache/dew/xla; every
     # run restores the latest one main saved for this shard.
     - name: Restore the compilation cache
