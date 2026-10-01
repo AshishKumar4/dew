@@ -76,7 +76,9 @@ def described(value, annotation):
     fields it sets away from that class's own defaults, which the class's
     own entry holds; anything else is what the record writes. A model's
     dtype or activation, which no record writes, is named by its qualified
-    name, inside a sequence too."""
+    name, inside a sequence too. Such a name can sit under a library's
+    private path (`jax._src...`), which a release may move without the
+    default changing; the snapshot then fails, and the fix is the new name."""
     if not (dataclasses.is_dataclass(value) and not isinstance(value, type)):
         try:
             return json.loads(json.dumps(_to_json(value, annotation)))
