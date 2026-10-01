@@ -13,7 +13,7 @@ from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
 
 
 @dataclass(frozen=True, eq=False)
-class Mean:
+class Mean[Scored: Artifact]:
     """Average per-example values or additive (total, count) contributions.
 
     `better` is required so checkpoint ranking cannot infer the opposite
@@ -21,10 +21,10 @@ class Mean:
     consumes. State belongs to the evaluation pass.
     """
 
-    fn: Callable[[Artifact, Batch], ArrayLike | tuple[float, float]]
+    fn: Callable[[Scored, Batch], ArrayLike | tuple[float, float]]
     name: str
     better: Literal["higher", "lower"]
-    reads: type
+    reads: type[Scored]
 
     def __post_init__(self) -> None:
         if self.better not in ("higher", "lower"):
@@ -37,6 +37,8 @@ class Mean:
         return Shown(better=self.better)
 
     def __call__(self, artifact: Artifact, batch: Batch) -> tuple[float, float]:
+        if not isinstance(artifact, self.reads):
+            raise TypeError(f"{self.name} reads {self.reads.__name__}, not {type(artifact).__name__}")
         measured = self.fn(artifact, batch)
         if isinstance(measured, tuple):
             if len(measured) != 2:
