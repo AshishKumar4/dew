@@ -64,7 +64,7 @@ const tutorialNames: Record<string, string> = {
 	<div class="landing not-content">
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Train, evaluate, sample</h2>
-			<p class="band-lede">A decoder learns Tiny Shakespeare on one RTX 4080, then generates ROMEO and JULIET samples.</p>
+			<p class="band-lede">A decoder learns Tiny Shakespeare on {capture.meta.where}, then generates ROMEO and JULIET samples.</p>
 			<div class="run-grid">
 				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} />
