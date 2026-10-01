@@ -196,8 +196,10 @@ class AdversarialDistillationObjective(DiffusionObjective):
     its own loss with the other stopped. The discriminator adds `r1_weight`
     (ADD's gamma, 1e-5) times R1 on its real inputs, and the student
     `distillation_weight` (ADD's lambda, 2.5) times alpha_t ||x_0 -
-    sg(teacher's x_0 of the renoised x_0)||^2, summed over the sample.
-    Sampling walks `Consistency`.
+    sg(teacher's x_0 of the renoised x_0)||^2, summed over the sample;
+    LADD itself drops that term when it trains on synthetic data, and on
+    CIFAR-10 at 32 pixels the term at 2.5 dominated and the student did
+    better without it. Sampling walks `Consistency`.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: Variables,
