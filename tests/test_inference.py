@@ -31,7 +31,7 @@ from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
-from dew.sampling.pipelines import Images
+from dew.sampling.pipelines import Images, _with_drawn_tables
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -177,6 +177,32 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5
     assert type(pipe.process.prediction) is FlowMatchPredictionTransform
     assert pipe.process.sampling is None
+
+
+def test_legacy_fourier_restore_applies_saved_weights_without_initializing_them(monkeypatch):
+    """Only the missing deterministic table is drawn; saved weights are authoritative."""
+    config = run_config("unused")
+    objective = config.build()
+    original = objective.init(jax.random.key(0))
+    stored = {name: tree for name, tree in original.items() if name != "constants"}
+
+    def forbidden_init(*args, **kwargs):
+        raise AssertionError("a restored model must not initialize a second set of weights")
+
+    monkeypatch.setattr(type(objective.model), "init", forbidden_init)
+    restored = _with_drawn_tables(objective, stored)
+    for got, want in zip(jax.tree.leaves(restored["constants"]),
+                         jax.tree.leaves(original["constants"]), strict=True):
+        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
+                                      np.ascontiguousarray(want).view(np.uint8))
+    assert all(got is want for got, want in zip(jax.tree.leaves(restored["params"]),
+                                               jax.tree.leaves(stored["params"]), strict=True))
+    given = objective.encode(stored["encoders"])
+    x, t = jnp.ones((1, *objective.latent_shape)), jnp.ones((1,))
+    with jax.default_matmul_precision("highest"):
+        expected = jax.jit(objective.model.apply)(original, x, t, **given)
+        actual = jax.jit(objective.model.apply)(restored, x, t, **given)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_it_did(

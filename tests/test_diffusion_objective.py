@@ -8,6 +8,7 @@ of the objective and the trainer together.
 """
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables, scalar_loss
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
@@ -97,12 +98,12 @@ def test_build_defers_unconditional_encoding_and_reuses_its_exact_snapshot(monke
     original = StubText.encode
     calls = []
 
-    def compiled(self, params, tokens):
-        assert all(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(params))
+    def encoded(self, params, tokens):
+        assert not any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(params))
         calls.append(True)
         return original(self, params, tokens)
 
-    monkeypatch.setattr(StubText, "encode", compiled)
+    monkeypatch.setattr(StubText, "encode", encoded)
     objective = make_objective()
     assert not calls
     given = jax.tree.map(jnp.asarray, expected)
@@ -113,6 +114,29 @@ def test_build_defers_unconditional_encoding_and_reuses_its_exact_snapshot(monke
     for actual in (first, second):
         for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("kind", ["clip", "char"])
+def test_lazy_blank_keeps_the_eager_towers_bits_and_construction_precision(kind):
+    """A later trace's matmul policy must not change the original eager snapshot."""
+    if kind == "clip":
+        encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures/clip/tiny"),
+                                           dtype="float32")
+    else:
+        encoder = CharTable.from_pretrained(dtype="float32")
+    inputs = InputSpec(Field("image", (2, 2, 1)),
+                       {"textcontext": Condition(encoder, unconditional="a bird")})
+    tokens = encoder.tokenize(["a bird"])
+    with jax.default_matmul_precision("highest"):
+        expected = encoder.encode(encoder.params, tokens)
+        objective = DiffusionObjective(Zero(), presets.Flow(), inputs)
+    # As in the old constructor, the fixed prompt reads the construction
+    # policy. A differently configured caller only casts this saved result.
+    with jax.default_matmul_precision("bfloat16"):
+        actual = jax.jit(objective.blank_conditions)({"textcontext": expected})
+    for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
+                                      np.ascontiguousarray(want).view(np.uint8))
 
 
 def tree_fingerprint(tree):

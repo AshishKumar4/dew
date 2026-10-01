@@ -157,6 +157,7 @@ class DiffusionObjective(Objective[Mean]):
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.pretrained = pretrained
+        self._condition_precision = jax.config.jax_default_matmul_precision
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment = alignment
         self.end_to_end = end_to_end
@@ -211,14 +212,15 @@ class DiffusionObjective(Objective[Mean]):
         """The fixed prompts encoded once, on first use, over the bound towers.
 
         Building or shape-checking a restored model does not run its towers.
-        One compiled encode avoids dispatching every CLIP operation separately;
-        weights are arguments, not executable constants. The small host result
-        remains a constant in each training step and sampling call.
+        The encode keeps the original eager operations and construction-time
+        matmul precision, so moving its first use does not fuse or change the
+        arithmetic. The small host result remains a constant in each training
+        step and sampling call.
         """
         # The first use may be inside a training or sampling trace. Evaluate
         # outside that trace so the cached value contains arrays, not tracers.
-        with jax.ensure_compile_time_eval():
-            return jax.tree.map(np.asarray, jax.jit(self.encode)(self.encoder_params()))
+        with jax.ensure_compile_time_eval(), jax.default_matmul_precision(self._condition_precision):
+            return jax.tree.map(np.asarray, self.encode(self.encoder_params()))
 
     def blank_conditions(self, like: dict) -> dict:
         """Cast the stored unconditional conditions to the conditional branch's dtypes.

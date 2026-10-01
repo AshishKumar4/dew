@@ -20,6 +20,7 @@ def imports():
     rows = {}
     for name, code in (
             ('dew', 'import dew'),
+            ('interop', 'import dew.interop'),
             ('sampling', 'from dew.sampling import TextToImage'),
             ('hub', 'from dew.interop.hub import pull_from_hub')):
         start = time.perf_counter()

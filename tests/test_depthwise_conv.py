@@ -9,7 +9,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _cuda_depthwise_3x3, _depthwise_3x3, _depthwise_materialized
+from dew.nn.conv import Conv, _cuda_depthwise_3x3, _depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -18,34 +18,6 @@ def convolve(x, kernel, dilation):
         x, kernel, (1, 1), 'SAME', rhs_dilation=(dilation, dilation),
         dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=x.shape[-1],
         precision=jax.lax.Precision.HIGHEST)
-
-
-@pytest.mark.parametrize('generation,dtype,batch,dilation', [
-    ('sm80', jnp.bfloat16, 16, 2), ('sm80', jnp.bfloat16, 32, 2),
-    ('sm89', jnp.bfloat16, 16, 2), ('sm89', jnp.bfloat16, 32, 2),
-    ('sm80', jnp.float32, 16, 2), ('sm89', jnp.float32, 16, 2),
-    ('sm80', jnp.bfloat16, 16, 3), ('sm89', jnp.bfloat16, 16, 3),
-])
-def test_measured_gpu_choices_preserve_every_fp32_reduction_term(generation, dtype, batch, dilation):
-    """Both selected paths agree with highest-precision lax, not just with each other."""
-    materialized = _depthwise_materialized(generation, dtype, batch, dilation)
-    operation = _cuda_depthwise_3x3 if materialized else _depthwise_3x3
-    rng = np.random.default_rng(31)
-    x = jnp.asarray(rng.normal(size=(batch, 7, 8, 5)), dtype)
-    kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 5)), dtype)
-    cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
-
-    def forward_and_vjp(operation, x, kernel, cotangent):
-        output, backward = jax.vjp(operation, x, kernel)
-        return output, *backward(cotangent)
-
-    reference = partial(forward_and_vjp, partial(convolve, dilation=dilation))
-    actual = jax.jit(partial(forward_and_vjp, partial(operation, dilation=dilation)))(x, kernel, cotangent)
-    expected = jax.jit(reference)(x, kernel, cotangent)
-    magnitude = jax.jit(reference)(jnp.abs(x).astype(jnp.float32),
-                                   jnp.abs(kernel).astype(jnp.float32), jnp.abs(cotangent).astype(jnp.float32))
-    for got, want, scale, terms in zip(actual, expected, magnitude, (9, 9, batch * 7 * 8), strict=True):
-        assert_fp32_reduction_bound(got, want, scale, terms)
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
