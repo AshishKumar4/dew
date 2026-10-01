@@ -1,0 +1,202 @@
+"""Evaluation ranks precisely the weights saved, with independent best trackers."""
+import dataclasses
+import datetime
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import pytest
+from test_trainer import Counting, Data, val_batches
+
+from dew.artifacts import TokenScores
+from dew.checkpoints import Checkpoints, Keep, Ranking
+from dew.objectives.base import Aux, Objective, Shown
+from dew.training import Trainer
+from dew.training.trainer import Best, Plateau
+
+
+class Overfit(Objective):
+    def init(self, key, variables=None):
+        return {'params': {'w': jnp.zeros(())}}
+
+    def loss(self, params, batch, step):
+        weight = params['params']['w']
+        # Train to 1; validation prefers the halfway weights.
+        target = jnp.where(batch['validation'][0], 0.5, 1.0)
+        return (weight - target) ** 2, Aux({})
+
+    def evaluate(self, params, batch, step):
+        weight = params['params']['w']
+        return TokenScores(jnp.broadcast_to(weight, (4, 1)), jnp.ones((4, 1)))
+
+
+@dataclasses.dataclass
+class Value:
+    name: str
+    shown: Shown
+    reads = TokenScores
+
+    def __call__(self, artifact, batch):
+        return float(np.mean(artifact.losses))
+
+    def merge(self, left, right):
+        return (left + right) / 2
+
+    def finalize(self, value):
+        return value
+
+
+def data():
+    class Train(Counting):
+        def __next__(self):
+            batch = super().__next__()
+            return {**batch, 'validation': np.zeros(len(batch['x']), bool)}
+    def train():
+        return Train()
+    def validation():
+        for batch in val_batches(1)():
+            yield {**batch, 'validation': np.ones(len(batch['x']), bool)}
+    return Data(train=train, val=validation)
+
+
+def trainer(path, keep=1):
+    return Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(path), keep=keep))
+
+
+def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
+    run = trainer(tmp_path / 'run')
+    result = run.fit(data(), steps=12, log_every=1, eval_every=1, checkpoint_every=6)
+    run.checkpoints.wait()
+    assert int(result.step) == 12
+    assert run.checkpoints.best == 3
+    assert run.checkpoints.latest == 12
+    scores = {entry.step: entry.metrics for entry in run.checkpoints.kept()}
+    assert set(scores) == {3, 12}
+    assert scores[3]['val/loss'] < scores[12]['val/loss']
+    assert scores[3]['train/loss'] > scores[12]['train/loss']
+    restored, _ = run.checkpoints.restore({'params': result.params}, step='best')
+    assert float(restored['params']['params']['w']) == pytest.approx(0.488)
+
+
+def test_multiple_directions_and_threshold(tmp_path):
+    metric = Value('accuracy', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=6, log_every=1, eval_every=1, checkpoint_every=6,
+            metrics=[metric], best=[Best(metric, top=2), Best(lambda m: abs(m[metric] - .5), threshold=.1)])
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best:val/accuracy') == 6
+    assert run.checkpoints.resolve('best:aggregate:1') == 3
+    assert {entry.step for entry in run.checkpoints.kept()} == {3, 5, 6}
+
+
+def test_missing_and_undeclared_metrics_are_refused_before_training(tmp_path):
+    metric = Value('accuracy', Shown())
+    with pytest.raises(ValueError, match='passed in metrics'):
+        trainer(tmp_path / 'a').fit(data(), steps=2, best=metric)
+    with pytest.raises(ValueError, match='declared direction'):
+        trainer(tmp_path / 'b').fit(data(), steps=2, metrics=[metric], best=metric)
+
+
+def test_legacy_loss_and_periodic_retention(tmp_path):
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1, every=2))
+    state = run.fit(data(), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    for step, loss in [(2, .1), (3, .9), (4, .7), (5, .8)]:
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, metrics={'loss': loss})
+        checkpoints.wait()
+    assert checkpoints.best == 2
+    assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
+
+
+def test_plateau_restores_patience_and_stops_after_eligible_evaluations(tmp_path):
+    metric = Value('value', Shown(better='lower'))
+    first = trainer(tmp_path / 'run')
+    first.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=1,
+              metrics=[metric], stop=Plateau(metric, evals=3))
+    second = trainer(tmp_path / 'run')
+    state = second.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1,
+                       metrics=[metric], stop=Plateau(metric, evals=3))
+    assert int(state.step) == 4
+    assert second.checkpoints.latest == 4
+    assert second.checkpoints.control(4)['plateau:val/value']['bad'] == 3
+
+
+def test_multi_split_metric_keys_and_ambiguous_selection(tmp_path):
+    metric = Value('value', Shown(better='higher'))
+    readers = {'first': data().val, 'second': data().val}
+    with pytest.raises(ValueError, match='several validation splits'):
+        trainer(tmp_path / 'bad').fit(data(), steps=2, metrics=[metric], best=metric, validation=readers)
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, eval_every=1, checkpoint_every=4, metrics=[metric],
+            validation=readers, best=Best(lambda m: abs(m['first', metric] - .5), top=1))
+    assert run.checkpoints.best == 3
+    record = run.checkpoints.kept()[0]
+    assert {'first/value', 'second/value', 'first/loss', 'second/loss'} <= set(record.metrics)
+
+
+def test_weights_only_best_is_smaller_and_not_a_resume_state(tmp_path):
+    metric = Value('value', Shown(better='lower'))
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, eval_every=1, checkpoint_every=4,
+            metrics=[metric], best=Best(metric, weights_only=True))
+    assert run.checkpoints.best == 1
+    assert run.checkpoints.latest == 4
+    assert set(run.checkpoints.stored('best')) == {'params', 'ema'}
+    saved, _ = run.checkpoints.restore(None, 'best')
+    assert set(saved) == {'params', 'ema'}
+    with pytest.raises(ValueError, match='inference-only'):
+        run.checkpoints.restore(run.initial_state(), 'best')
+    with pytest.raises(ValueError, match='requires full'):
+        trainer(tmp_path / 'bad').fit(data(), steps=2, metrics=[metric],
+                                    best=Best(metric, weights_only=True), restore_best=True)
+
+
+def test_restore_best_returns_the_whole_earlier_state(tmp_path):
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=4, restore_best=True)
+    assert int(state.step) == 3
+    assert int(state.updates) == 3
+    assert float(state.params['params']['w']) == pytest.approx(.488)
+
+
+def test_training_values_are_selected_through_the_objective(tmp_path):
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, checkpoint_every=1, best=run.objective.loss)
+    assert run.checkpoints.best == 4
+    assert run.checkpoints.kept()[0].ranked_by == 'train/loss'
+
+
+def test_time_cadence_and_recorded_duration(tmp_path):
+    from dew.config import BestConfig, TrainerConfig
+    from dew.data import Dataset
+
+    assert TrainerConfig(checkpoint_every='30m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2)) == datetime.timedelta(minutes=30)
+    with pytest.raises(ValueError, match='positive duration'):
+        TrainerConfig(checkpoint_every='0m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2))
+    with pytest.raises(TypeError, match='code-only'):
+        BestConfig(lambda m: 0)
+    run = trainer(tmp_path / 'run', keep=Keep(latest=5))
+    run.fit(data(), steps=3, log_every=1, checkpoint_every=datetime.timedelta(microseconds=1))
+    assert [entry.step for entry in run.checkpoints.kept()] == [1, 2, 3]
+
+
+def test_keep_predicate_and_interval_union_with_latest(tmp_path):
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1, interval=datetime.timedelta(days=1),
+                                            where=lambda c: c.metrics.get('special', 0) > 0))
+    state = run.fit(data(), steps=1, log_every=1)
+    for step in range(2, 5):
+        run.checkpoints.save(step, state.replace(step=jnp.int32(step)), None,
+                             metrics={'special': float(step == 2)}, ranking=Ranking('score', step))
+        run.checkpoints.wait()
+    assert {entry.step for entry in run.checkpoints.kept()} == {1, 2, 4}
+
+
+def test_missing_scores_do_not_rank_and_declared_max_is_inferred(tmp_path):
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=1, log_every=1)
+    checkpoint = Checkpoints(str(tmp_path / 'isolated'), keep=1)
+    checkpoint.save(1, state, None, metrics={'train/loss': .1})
+    checkpoint.wait()
+    assert checkpoint.best is None
+    assert not checkpoint.would_keep(Ranking('score', np.nan))

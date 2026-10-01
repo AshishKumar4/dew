@@ -19,6 +19,7 @@ raises.
 """
 
 import dataclasses
+import datetime
 import functools
 import hashlib
 import json
@@ -170,12 +171,36 @@ class Wandb:
 
 
 @dataclasses.dataclass(frozen=True)
+class BestConfig:
+    """Recorded evaluation selector; callables belong in fit, not a run record."""
+    metric: str
+    top: int = 1
+    mode: Literal['min', 'max'] | None = None
+    threshold: float | None = None
+    weights_only: bool = False
+    split: str = 'val'
+
+    def __post_init__(self):
+        if not isinstance(self.metric, str):
+            raise TypeError("a recorded best selector names a metric; callable scores are code-only")
+
+    def build(self, metrics):
+        from dew.training.trainer import Best
+        metric = next((metric for metric in metrics if metric.name == self.metric.removeprefix(self.split + '/')), None)
+        if metric is None:
+            raise ValueError(f"best metric {self.metric!r} is not among the run's metrics")
+        return Best(metric, self.top, self.mode, self.threshold, self.weights_only, self.split)
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: int = 2
+    best: BestConfig | None = None
+    """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
@@ -189,7 +214,7 @@ class TrainerConfig:
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
     reports no record count raises a ValueError, since it has no pass."""
-    checkpoint_every: int | Literal["epoch"] | None = "epoch"
+    checkpoint_every: int | str | None = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
     trainer refuses any other answer for one."""
@@ -244,8 +269,14 @@ class TrainerConfig:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Dataset) -> int | None:
-        """Return the steps between checkpoints over `data`, or None for never."""
+    def checkpoint_interval(self, dataset: Dataset) -> int | datetime.timedelta | None:
+        """Steps, or a recorded duration such as 30m, between checkpoints."""
+        value = self.checkpoint_every
+        if isinstance(value, str) and value != 'epoch':
+            match = re.fullmatch(r'(\d+(?:\.\d+)?)(s|m|h)', value)
+            if match is None or float(match[1]) <= 0:
+                raise ValueError("checkpoint_every must be steps, epoch, None, or a positive duration such as 30m")
+            return datetime.timedelta(seconds=float(match[1]) * {'s': 1, 'm': 60, 'h': 3600}[match[2]])
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
@@ -612,6 +643,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
+                best=None if trainer.best is None else trainer.best.build(metrics),
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""

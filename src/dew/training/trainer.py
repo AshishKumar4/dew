@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import datetime
 import functools
 import sys
 import time
+import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -31,8 +33,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
 from dew.artifacts import agree_process_phase, agreed
-from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
+from dew.checkpoints import Checkpoints, Ranking
+from dew.data.dataset import Checkpointable, Closeable, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
@@ -58,6 +60,7 @@ from dew.objectives.base import (
     Objective,
     Shown,
     Step,
+    TrainingScalar,
     Variables,
     select,
 )
@@ -429,6 +432,64 @@ def recompute_more(objective) -> bool:
 
 
 @dataclasses.dataclass(frozen=True)
+class Best:
+    """Rank evaluations by a metric object or a custom score (lower by default)."""
+    metric: Metric | TrainingScalar | Callable[[Mapping[Metric | str, float]], float]
+    top: int = 1
+    mode: Literal['min', 'max'] | None = None
+    threshold: float | None = None
+    weights_only: bool = False
+    split: str | None = None
+
+    def __post_init__(self):
+        if self.top < 1 or self.mode not in (None, 'min', 'max'):
+            raise ValueError("Best needs top >= 1 and mode min or max")
+
+
+@dataclasses.dataclass(frozen=True)
+class Plateau:
+    """Stop after `evals` eligible evaluations without an improvement larger than min_delta."""
+    metric: Metric | TrainingScalar
+    evals: int = 5
+    min_delta: float = 0.0
+    mode: Literal['min', 'max'] | None = None
+    split: str | None = None
+
+    def __post_init__(self):
+        if self.evals < 1 or self.min_delta < 0:
+            raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
+
+
+class _MetricValues(Mapping):
+    def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float]):
+        self.metrics, self.scores = metrics, scores
+
+    def __getitem__(self, metric):
+        split = 'val'
+        if isinstance(metric, tuple):
+            split, metric = metric
+        if isinstance(metric, TrainingScalar):
+            return self.scores[f'train/{metric.name}']
+        if isinstance(metric, types.MethodType) and metric.__name__ == 'loss' and isinstance(metric.__self__, Objective):
+            return self.scores['train/loss']
+        if isinstance(metric, str):
+            if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
+                   for declared in self.metrics):
+                raise KeyError("index declared evaluation scores by metric object")
+            return self.scores[metric]
+        for declared in self.metrics:
+            if declared is metric:
+                return self.scores[f'{split}/{declared.name}']
+        raise KeyError("the score refers to a metric not passed to fit")
+
+    def __iter__(self):
+        return iter(self.scores)
+
+    def __len__(self):
+        return len(self.scores)
+
+
+@dataclasses.dataclass(frozen=True)
 class _FitPlan:
     """What one `Trainer.fit` call was asked for."""
 
@@ -436,10 +497,15 @@ class _FitPlan:
     steps: int
     log_every: int
     eval_every: int | None
-    checkpoint_every: int | None
+    checkpoint_every: int | datetime.timedelta | None
     local_every: int | None
     metrics: Sequence[Metric]
     preview: bool
+    best: tuple[Best, ...] = ()
+    stop: Plateau | None = None
+    validation_splits: Mapping[str, Reader] | None = None
+    restore_best: bool = False
+    validation: bool = False
 
 
 @dataclasses.dataclass
@@ -450,6 +516,10 @@ class _FitRun:
     started: float
     current: int = 0
     loss: jax.Array | None = None
+    evaluation: Evaluation | None = None
+    last_checkpoint: float = 0.0
+    stop_control: dict = dataclasses.field(default_factory=dict)
+    stopped: bool = False
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     tracing: bool = False
@@ -1090,8 +1160,10 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def fit(self, dataset: Dataset, *, steps: int, log_every: int = 100,
-            eval_every: int | None = None, checkpoint_every: int | None = None,
-            metrics: Sequence[Metric] = (), preview: bool = False) -> TrainState:
+            eval_every: int | None = None, checkpoint_every: int | datetime.timedelta | None = None,
+            metrics: Sequence[Metric] = (), preview: bool = False,
+            best: Metric | TrainingScalar | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
+            validation: Mapping[str, Reader] | None = None, restore_best: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
 
@@ -1115,6 +1187,7 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker
         receives them; scalar reporting never triggers preview work.
         """
+        selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
         self._check_validation_is_read(eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
@@ -1128,8 +1201,13 @@ class Trainer(Generic[Loss, Effects]):
         try:
             self._check_pipelined_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
-                            None if checkpoints is None else checkpoints.local_every, metrics, preview)
+                            None if checkpoints is None else checkpoints.local_every, metrics, preview,
+                            best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
+                            validation=bool(eval_every or metrics or validation))
             state, shardings, position = self.place()
+            run.last_checkpoint = time.monotonic()
+            if checkpoints is not None and checkpoints.latest is not None:
+                run.stop_control = checkpoints.control(checkpoints.latest)
             if self._opened(plan, run, state, position):
                 return state
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
@@ -1194,6 +1272,9 @@ class Trainer(Generic[Loss, Effects]):
                 raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
+        if restore_best and checkpoints is not None:
+            state, _ = checkpoints.restore(jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state), step='best')
         return state
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
@@ -1292,25 +1373,49 @@ class Trainer(Generic[Loss, Effects]):
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval)
 
-        if plan.eval_every and current % plan.eval_every == 0 and current < steps:
+        if isinstance(plan.checkpoint_every, datetime.timedelta):
+            elapsed = time.monotonic() - run.last_checkpoint
+            checkpoint_due = bool(np.asarray(multihost_utils.process_allgather(
+                np.asarray(elapsed >= plan.checkpoint_every.total_seconds()))).any())
+        else:
+            checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
+        evaluation_due = bool(plan.eval_every and current % plan.eval_every == 0)
+        if current < steps and (evaluation_due or (plan.validation and checkpoint_due)):
             with region("evaluate"):
-                run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
+                run.evaluation = self._evaluation(plan, state, shardings)
+                run.other += run.evaluation.elapsed_seconds
+        scores = {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
+        if scores:
+            scores.update({'train/loss': float(loss), **{f'train/{name}': float(value) for name, value in aux.items()}})
+        ranking = self._ranking(plan, scores)
+        candidate = evaluation_due and checkpoints is not None and any(checkpoints.would_keep(rank) for rank in ranking)
+        if scores and self._plateau(plan, run, scores):
+            run.stopped = True
+            run.stop_control['stop_reason'] = 'validation plateau'
+            self._display.note("Stopped: validation plateau")
+            candidate = checkpoints is not None
 
         # On its own clock, not the logging one, so that a cadence
         # which does not divide log_every still fires.
         if (plan.checkpoint_every and checkpoints is not None
-                and current % plan.checkpoint_every == 0 and current < steps):
-            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
+                and checkpoint_due and current < steps) or (candidate and current < steps):
+            assert checkpoints is not None
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
+                                                 training_best=not plan.validation, control=run.stop_control,
+                                                 weights_only=not checkpoint_due and not run.stopped and bool(ranking) and all(rank.weights_only for rank in ranking))
+            run.last_checkpoint = time.monotonic()
         if (plan.local_every and checkpoints is not None
                 and current % plan.local_every == 0 and current < steps):
             run.other += self._saved_local_checkpoint(
                 checkpoints, current, state, position)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
+        if run.stopped:
+            return True
         assert run.notice is not None
         if current < steps and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
-                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
+                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, training_best=not plan.validation, control=run.stop_control)
             run.preempted = current
             return True
         return False
@@ -1348,14 +1453,130 @@ class Trainer(Generic[Loss, Effects]):
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
-        if plan.eval_every and run.preempted is None:
-            run.other += self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview)
+        if plan.validation and run.preempted is None and not run.stopped:
+            run.evaluation = self._evaluation(plan, state, shardings)
+            run.other += run.evaluation.elapsed_seconds
+            if self._plateau(plan, run, run.evaluation.scores):
+                run.stopped = True
+                self._display.note("Stopped: validation plateau")
         if checkpoints is not None and interval.last_saved != current:
             # The in-loop saves are conditional, so the state the run ends
             # on may never have been written. It goes out under its real
             # step: a step-0 checkpoint holding the final weights would
             # make a resume restart the schedule from the beginning.
-            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval)
+            scores = {} if run.evaluation is None or run.evaluation.step != current else run.evaluation.scores
+            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores,
+                                                 ranking=self._ranking(plan, scores), training_best=not plan.validation,
+                                                 control=run.stop_control)
+        if checkpoints is not None:
+            checkpoints.wait()
+
+    def _fit_policies(self, best, stop, metrics, validation, checkpoint_every, restore_best):
+        if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
+            raise ValueError("checkpoint_every duration must be positive")
+        splits = ('val',) if validation is None else tuple(validation)
+        if not splits:
+            raise ValueError("validation must contain a split")
+        raw = () if best is None else tuple(best) if isinstance(best, Sequence) else (best,)
+        def owned(choice):
+            if isinstance(choice, types.MethodType):
+                if choice.__name__ == 'loss' and choice.__self__ is self.objective:
+                    return self.objective.scalar('loss')
+                raise TypeError("a training selector must be this objective's loss or declared scalar")
+            if isinstance(choice, TrainingScalar) and choice.owner is not self.objective:
+                raise ValueError("training scalar belongs to a different objective")
+            if isinstance(choice, Best):
+                return dataclasses.replace(choice, metric=owned(choice.metric))
+            return choice
+        selection = tuple(self._best_selection(owned(choice), metrics, splits) for choice in raw)
+        stopping = None if stop is None else self._best_selection(Best(owned(stop.metric), mode=stop.mode, split=stop.split), metrics, splits)
+        if stop is not None:
+            assert stopping is not None
+            stop = dataclasses.replace(stop, metric=stopping.metric, mode=stopping.mode, split=stopping.split)
+        if restore_best and any(choice.weights_only for choice in selection):
+            raise ValueError("restore_best requires full checkpoints, not weights_only snapshots")
+        return selection, stop
+
+    @staticmethod
+    def _best_selection(best: Metric | TrainingScalar | Best, metrics: Sequence[Metric], splits: Sequence[str] = ('val',)) -> Best:
+        selection = best if isinstance(best, Best) else Best(best)
+        metric = selection.metric
+        if isinstance(metric, TrainingScalar):
+            if selection.mode is None:
+                selection = dataclasses.replace(selection, mode='max' if metric.shown.better == 'higher' else 'min')
+            return dataclasses.replace(selection, split='train')
+        if isinstance(metric, (Metric, TrainingScalar)):
+            if not any(metric is declared for declared in metrics):
+                raise ValueError("best must be a metric object passed in metrics")
+            declaration = _reported(None, metrics).get(metric.name)
+            better = declaration.better if isinstance(declaration, Shown) else None
+            if selection.mode is None:
+                if better not in ('higher', 'lower'):
+                    raise ValueError("best metric has no declared direction; use Best(metric, mode='min' or 'max')")
+                selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
+        if selection.split is None:
+            if len(splits) != 1 and isinstance(metric, Metric):
+                raise ValueError("Best(metric, split=...) is required with several validation splits")
+            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
+        elif selection.split not in splits:
+            raise ValueError(f"unknown validation split {selection.split!r}")
+        return selection
+
+    @staticmethod
+    def _ranking(plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
+        if not plan.best:
+            name = ('val' if plan.validation_splits is None else next(iter(plan.validation_splits))) + '/loss' if plan.validation else 'train/loss'
+            return (Ranking(name, scores[name]),) if name in scores else ()
+        ranks = []
+        for index, selection in enumerate(plan.best):
+            metric = selection.metric
+            if isinstance(metric, (Metric, TrainingScalar)):
+                name = f'{selection.split}/{metric.name}'
+                if name not in scores:
+                    continue
+                value = scores[name]
+            else:
+                name = f'aggregate:{index}'
+                try:
+                    value = float(metric(_MetricValues(plan.metrics, scores)))
+                except KeyError:
+                    continue
+            mode = selection.mode or 'min'
+            threshold = selection.threshold
+            if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):
+                continue
+            ranks.append(Ranking(name, value, mode, selection.top, selection.weights_only))
+        return tuple(ranks)
+
+    @staticmethod
+    def _plateau(plan: _FitPlan, run: _FitRun, scores: Mapping[str, float]) -> bool:
+        stop = plan.stop
+        if stop is None:
+            return False
+        name = f'{stop.split}/{stop.metric.name}'
+        if name not in scores:
+            return False
+        value = scores[name] if stop.mode == 'min' else -scores[name]
+        key = f'plateau:{name}'
+        held = run.stop_control.get(key)
+        if held is not None and held.get('step') == run.current:
+            return held['bad'] >= stop.evals
+        if held is None or value < held['best'] - stop.min_delta:
+            run.stop_control[key] = {'best': value, 'bad': 0, 'step': run.current}
+            return False
+        held['bad'] += 1
+        held['step'] = run.current
+        return held['bad'] >= stop.evals
+
+    def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> Evaluation:
+        if plan.validation_splits is None:
+            return self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview, loss=plan.validation and self.checkpoints is not None)
+        reports = []
+        for split, reader in plan.validation_splits.items():
+            reports.append(self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview,
+                                          loss=True, reader=reader, split=split))
+        return dataclasses.replace(reports[0], scores={name: value for report in reports for name, value in report.scores.items()},
+                                   elapsed_seconds=sum(report.elapsed_seconds for report in reports))
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
@@ -1365,7 +1586,7 @@ class Trainer(Generic[Loss, Effects]):
         Scheduled with neither, it would open nothing and report nothing, so
         the contradiction is refused before the run does any work.
         """
-        if eval_every and not metrics and not (preview and self.tracker is not None):
+        if eval_every and not metrics and self.checkpoints is None and not (preview and self.tracker is not None):
             raise ValueError(
                 f"eval_every={eval_every} schedules a validation pass that nothing consumes: "
                 + ("preview=True needs a tracker to receive the samples; "
@@ -1516,7 +1737,9 @@ class Trainer(Generic[Loss, Effects]):
         return compiled[shapes]
 
     def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
-                          position: bytes | None, interval: _Interval) -> float:
+                          position: bytes | None, interval: _Interval, *, scores: Mapping[str, float] | None = None,
+                          ranking: Sequence[Ranking] = (), training_best: bool = True,
+                          control: dict | None = None, weights_only: bool = False) -> float:
         """Write one checkpoint with the interval's mean loss, report it and
         start the next interval.
 
@@ -1525,8 +1748,13 @@ class Trainer(Generic[Loss, Effects]):
         steps did not have."""
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
-        metadata = {"loss": float(interval.book[0] / interval.steps)} if interval.steps else None
-        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh))
+        metadata = dict(scores or {})
+        if interval.steps:
+            metadata['train/loss'] = float(interval.book[0] / interval.steps)
+            if not ranking and training_best:
+                ranking = (Ranking('train/loss', metadata['train/loss']),)
+        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
+                         ranking=ranking, control=control, weights_only=weights_only)
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -1635,7 +1863,8 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
-                  metrics: Sequence[Metric], preview: bool) -> float:
+                  metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
+                  reader: Reader | None = None, split: str = 'val') -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
         which is what the goodput fraction is measured against.
@@ -1643,7 +1872,6 @@ class Trainer(Generic[Loss, Effects]):
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
-        paused = time.perf_counter()
         self._display.status("evaluating")
         mesh, params = self.device_mesh, state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
@@ -1660,11 +1888,11 @@ class Trainer(Generic[Loss, Effects]):
         with (pipeline_microbatches(self.mesh.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = evaluate(
-                self.objective, params, dataset.val, metrics=metrics, key=key,
+                self.objective, params, dataset.val if reader is None else reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
-                averaged=averaged, preview=preview, mesh=mesh)
+                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split)
         self._report_evaluation(evaluation)
-        return time.perf_counter() - paused
+        return evaluation
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
         """Print one evaluation on rank zero and log its previews and scores."""
