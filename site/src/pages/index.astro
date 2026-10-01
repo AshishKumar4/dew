@@ -35,7 +35,7 @@ const objectives = [
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
 const shortHero = heroCode.slice(heroCode.indexOf('model ='));
-const replays = ['aurora', 'beach', 'lighthouse'].map((name) => {
+const replays = ['aurora', 'alpine', 'painted-mountains'].map((name) => {
 	const meta = JSON.parse(readPublic('hero', 'replay', name, 'meta.json'));
 	if (Math.round(meta.model.parameters / 1e6) !== 176 || !/^[0-9a-f]{40}$/.test(meta.model.dew_commit)) {
 		throw new Error(`replay ${name}: missing model provenance`);
@@ -48,8 +48,10 @@ const tries = [
 	{ name: 'dewml/hybrid-dit-176m', what: 'Weights and model card on the Hub.', href: 'https://huggingface.co/dewml/hybrid-dit-176m' },
 ];
 const released = outputs['08-load-a-pretrained-decoder']['cell-21'];
-const reward = records.grpo.result.curve as { step: number; reward: number }[];
-if (!reward.length) throw new Error('GRPO recording has no reward reports');
+const reward = readPublic('examples', 'framework', 'grpo', 'tracking', 'scalars.jsonl').trim().split('\n')
+	.map((line) => JSON.parse(line)).filter((row) => 'rollout/reward/mean' in row.scalars)
+	.map((row) => ({ step: row.step as number, reward: row.scalars['rollout/reward/mean'] as number }));
+if (reward.length !== records.grpo.result.steps) throw new Error('GRPO recording is missing reward reports');
 const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, reward.at(-1)!.step - 1) * 300},${140 - row.reward * 100}`).join(' ');
 const tutorialNames: Record<string, string> = {
 	'01': 'Diffusion from scratch', '02': 'Image diffusion', '03': 'Text to image', '04': 'Samplers',
@@ -87,7 +89,7 @@ const tutorialNames: Record<string, string> = {
 			<h2 class="band-title">Pretrained models</h2>
 			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
 			<Code code={snippet('pretrained-source', 'pretrained', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
-			<pre class="shown-output">{`${records.pretrained.result.text.join('\n')}\n${records.pretrained.result.steps} fine-tuning step; exported config.json and model.safetensors.`}</pre>
+			<pre class="shown-output">{`${records.pretrained.result.text.join('\n')}\n${records.pretrained.result.steps} fine-tuning step; exported the config and sharded safetensors weights.`}</pre>
 			<p class="framework-note">The training fixture is one short sentence. <a href="/reference/models/">Supported families</a> include Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders; the models page states which computations are checked.</p>
 		</section>
 
@@ -144,10 +146,10 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Reliability</h2>
 			<p class="band-lede">A checkpoint saves the numerical state and data position. On SIGTERM, <code>fit</code> stops at a synchronized step, writes that checkpoint and exits with status 143; the same command resumes it.</p>
-			<Code code={snippet('reliability')} lang="python" title="framework.py — save and resume" />
-			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}; resumed to step ${records.reliability.result.resumed_step}.\nParameters equal the uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
+			<Code code={snippet('determinism', 'reliability')} lang="python" title="framework.py — save and resume" />
+			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}; resumed to step ${records.reliability.result.resumed_step}.\nAll numerical TrainState leaves equal the uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
 			<Code code={snippet('profile')} lang="python" title="framework.py — JAX/XProf capture" />
-			<p class="framework-note">The bit-exact check above uses the small deterministic fixture, not a cross-host recovery measurement. <a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
+			<p class="framework-note">The bit-exact check uses this small fixture with deterministic GPU operations enabled before backend initialization. Default CUDA reductions need not be bit-identical; this is not a cross-host recovery measurement. <a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
 		</section>
 
 		<section class="band try" data-reveal>

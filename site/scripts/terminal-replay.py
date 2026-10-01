@@ -9,6 +9,7 @@ The original cast is kept alongside the sampled frames for reproducibility.
 import argparse
 import hashlib
 import json
+import re
 from itertools import pairwise
 from pathlib import Path
 
@@ -28,19 +29,53 @@ def frames_from_cast(cast: str, count: int = 97) -> dict:
     stream = pyte.Stream(screen)
     frames = []
     index = 0
-    for position in range(count):
-        timestamp = seconds * position / (count - 1)
-        while index < len(events) and events[index][0] <= timestamp:
-            _, kind, payload = events[index]
+    previous_key = None
+    repeated = False
+    while index < len(events):
+        while index < len(events):
+            timestamp, kind, payload = events[index]
             if kind == "o":
                 stream.feed(payload)
             index += 1
+            # A PTY may split one refresh over several reads. Snapshot after
+            # that burst, not halfway through the panel being repainted.
+            if index == len(events) or events[index][0] - timestamp > 0.002:
+                break
         rows = terminal_cells(screen, header["width"])
-        # Identical screens need no new frame, but keep the final timestamp.
-        if not frames or rows != frames[-1]["screen"] or position == count - 1:
-            frames.append({"time": timestamp, "screen": rows})
+        # A terminal can retain a fragment of an earlier, shorter live panel
+        # above the current one. The viewport starts at the latest Dew panel;
+        # the original cast still contains the uncut terminal output.
+        panels = [i for i, row in enumerate(rows)
+                  if "dew ·" in "".join(run["text"] for run in row)]
+        if panels:
+            rows = rows[panels[-1]:]
+        if not rows:
+            continue
+        text = "\n".join("".join(run["text"] for run in row) for row in rows)
+        progress = re.search(r"\b\d+/\d+\b", text)
+        ratio = progress[0] if progress else None
+        key = (ratio, 0 if ratio and ratio.startswith("0/") else len(rows))
+        frame = {"time": timestamp, "screen": rows}
+        # Keep the first and last screen at a step, omitting spinner/clock-only
+        # refreshes between them. Every new step and extra output row survives.
+        if key == previous_key and repeated:
+            frames[-1] = frame
+        else:
+            frames.append(frame)
+            repeated = key == previous_key
+        previous_key = key
+    if not frames:
+        raise ValueError("recording has no visible output")
+    if len(frames) > count:
+        frames = [frames[round(i * (len(frames) - 1) / (count - 1))] for i in range(count)]
+    frames[-1]["time"] = seconds
+    elapsed = 0
+    for previous, frame in zip([None, *frames[:-1]], frames, strict=True):
+        if previous is not None:
+            elapsed += min(0.8, max(0.6, frame["time"] - previous["time"]))
+        frame["at"] = elapsed
     return {"columns": header["width"], "seconds": seconds,
-            "speed": max(1, seconds / 24), "frames": frames,
+            "duration": elapsed, "frames": frames,
             "sha256": hashlib.sha256(cast.encode()).hexdigest()}
 
 
