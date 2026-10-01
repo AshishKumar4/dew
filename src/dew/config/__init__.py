@@ -151,6 +151,12 @@ class OptimConfig:
     """Renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`)
     after each update, EDM2's forced weight normalization, which its
     `edm2_unet` trains with (`dew.nn.mp.forced_weight_normalization`)."""
+    ema_profiles: tuple[float, ...] = ()
+    """Relative standard deviations of the power-function EMAs a run keeps
+    for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
+    et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
+    `dew.training.posthoc.reconstruct` builds an average of any other
+    relative standard deviation from the snapshots. Empty keeps none."""
 
 
 @dataclasses.dataclass(frozen=True)

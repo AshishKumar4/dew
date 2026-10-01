@@ -806,6 +806,45 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
 
 
 # ---------------------------------------------------------------------------
+# tools/check_distribution.py
+# ---------------------------------------------------------------------------
+
+def test_a_distribution_whose_requirement_names_a_url_is_refused(tmp_path, monkeypatch, capsys):
+    """A wheel and an sdist are read the way PyPI reads them, and a
+    requirement that names a URL, which PyPI refuses and `twine check`
+    passes, fails the check naming it."""
+    import tarfile
+    import zipfile
+
+    check = load("check_distribution")
+    lines = ["flax>=0.12.10", "jax @ https://github.com/AshishKumar4/jax/archive/19a48d1d.tar.gz"]
+    core = "Metadata-Version: 2.4\nName: dewml\nVersion: 0.1.0\n" + "".join(
+        f"Requires-Dist: {line}\n" for line in lines)
+    wheel = tmp_path / "dewml-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("dewml-0.1.0.dist-info/METADATA", core)
+    (tmp_path / "PKG-INFO").write_text(core)
+    sdist = tmp_path / "dewml-0.1.0.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        archive.add(tmp_path / "PKG-INFO", arcname="dewml-0.1.0/PKG-INFO")
+    assert check.requirements(wheel) == check.requirements(sdist) == lines
+
+    monkeypatch.setattr(sys, "argv", ["check_distribution.py", str(wheel), str(sdist)])
+    with pytest.raises(SystemExit, match=r"jax @ https://github\.com/AshishKumar4/jax") as refused:
+        check.main()
+    assert str(refused.value).count("jax @") == 2
+
+    clean = tmp_path / "clean" / wheel.name
+    clean.parent.mkdir()
+    with zipfile.ZipFile(clean, "w") as archive:
+        archive.writestr("dewml-0.1.0.dist-info/METADATA", core.replace(
+            f"Requires-Dist: {lines[1]}", "Requires-Dist: jax<0.11.3,>=0.11.2"))
+    monkeypatch.setattr(sys, "argv", ["check_distribution.py", str(clean)])
+    check.main()
+    assert "dewml-0.1.0-py3-none-any.whl: 2 requirements" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # tools/lint_slop.py
 # ---------------------------------------------------------------------------
 
