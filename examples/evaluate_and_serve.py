@@ -162,9 +162,9 @@ def harness(task: TextGeneration, config: Config) -> dict[str, float]:
             for metric, value in scores.items() if isinstance(value, float)}
 
 
-def draw(pipe: TextToImage, config: Config, *, seed: int) -> np.ndarray:
+def draw(pipe: TextToImage, config: Config, *, key: int) -> np.ndarray:
     """The prompts sampled once, as the uint8 images both metrics read."""
-    drawn = pipe(list(config.image_prompts), steps=config.image_steps, seed=seed).host().images
+    drawn = pipe(list(config.image_prompts), steps=config.image_steps, key=key).host().images
     return uint8_pixels(drawn)
 
 
@@ -175,7 +175,7 @@ def image_metrics(config: Config) -> dict[str, float]:
     pipe = dew.pipeline(str(config.image_run))
     if not isinstance(pipe, TextToImage):
         raise TypeError(f"--image-run holds a {type(pipe).__name__}, not a diffusion run")
-    generated = draw(pipe, config, seed=0)
+    generated = draw(pipe, config, key=0)
     scores = {"clip_score": clip_score(generated, list(config.image_prompts),
                                        modelname=config.clip_model)}
     if config.reference_images is not None:
@@ -187,7 +187,7 @@ def image_metrics(config: Config) -> dict[str, float]:
         # A held-out set is what FID is measured against, and a smoke has
         # none: a second draw of the same run is a population to measure, so
         # the metric runs end to end on a number that says nothing.
-        reference = draw(pipe, config, seed=1)
+        reference = draw(pipe, config, key=1)
     else:
         return scores
     scores["fid"] = fid(generated, reference, weights=config.inception_weights)
@@ -258,7 +258,7 @@ def main(config: Config) -> Path:
               "harness": harness(task, config),
               "images": image_metrics(config),
               "served": served(config),
-              "greedy": task(config.prompt, config.max_new_tokens, sampling=GREEDY, seed=0).text[0]}
+              "greedy": task(config.prompt, config.max_new_tokens, sampling=GREEDY, key=0).text[0]}
     config.out.mkdir(parents=True, exist_ok=True)
     path = config.out / "report.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True))

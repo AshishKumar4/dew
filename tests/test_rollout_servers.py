@@ -72,7 +72,7 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     completion, calls = engine(provider, lambda _: choice(provider, [3, 5, EOS], [-.5, -1., -.25], "stop"))
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, version=4)
     try:
-        draw = server.submit([1, 2, 9], 8, seed=11).result()
+        draw = server.submit([1, 2, 9], 8, key=11).result()
     finally:
         server.close()
     assert draw.prompt == (1, 2, 9) and draw.tokens == (3, 5, EOS) and draw.terminated
@@ -91,9 +91,9 @@ def test_a_budget_stop_is_unterminated_and_a_disagreeing_reason_is_refused(provi
     completion, _ = engine(provider, lambda _: choice(provider, [3, 5], [-.5, -1.], "length"))
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
     try:
-        assert not server.submit([1], 2, seed=0).result().terminated
+        assert not server.submit([1], 2, key=0).result().terminated
         with pytest.raises(ValueError, match="disagrees"):
-            server.submit([1], 4, seed=0).result()
+            server.submit([1], 4, key=0).result()
     finally:
         server.close()
 
@@ -108,7 +108,7 @@ def test_listed_ids_that_disagree_with_the_likelihoods_are_refused():
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
     try:
         with pytest.raises(ValueError, match="token_ids"):
-            server.submit([1], 2, seed=0).result()
+            server.submit([1], 2, key=0).result()
     finally:
         server.close()
 
@@ -130,7 +130,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
     completion, _ = engine("vllm", answer)
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, routing=True)
     try:
-        draw = server.submit([1, 2], 8, seed=0).result()
+        draw = server.submit([1, 2], 8, key=0).result()
     finally:
         server.close()
     assert draw.routed_experts is not None and draw.routed_experts.dtype == np.uint8
@@ -139,7 +139,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
     server = OpenAIRolloutServer(bare, Sampling(eos_id=EOS), pushed, routing=True)
     try:
         with pytest.raises(ValueError, match="enable-return-routed-experts"):
-            server.submit([1], 8, seed=0).result()
+            server.submit([1], 8, key=0).result()
     finally:
         server.close()
 
@@ -188,7 +188,7 @@ def test_vllms_token_route_draws_carry_the_kept_ids_and_the_routing(monkeypatch)
     sampling = Sampling(temperature=.7, top_k=20, top_p=.9, eos_id=EOS)
     server = VLLMGenerateServer("http://engine:8000/", sampling, pushed, routing=True)
     try:
-        draw = server.submit([1, 2], 4, seed=3).result()
+        draw = server.submit([1, 2], 4, key=3).result()
     finally:
         server.close()
     url, body = seen[0]
@@ -227,10 +227,10 @@ def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
     pushes = []
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), lambda *push: pushes.append(push), version=1)
     try:
-        early = server.submit([1], 4, seed=0)
+        early = server.submit([1], 4, key=0)
         assert arrived.acquire(timeout=10)
         server.load({"params": {}}, 2)
-        late = server.submit([1], 4, seed=1)
+        late = server.submit([1], 4, key=1)
         release.set()
         assert (early.result().version, late.result().version) == (1, 2)
     finally:
@@ -255,7 +255,7 @@ def test_a_failed_push_keeps_the_version():
     try:
         with pytest.raises(RuntimeError, match="400"):
             server.load({"params": {}}, 4)
-        assert server.version == 3 and server.submit([1], 1, seed=0).result().version == 3
+        assert server.version == 3 and server.submit([1], 1, key=0).result().version == 3
     finally:
         server.close()
 

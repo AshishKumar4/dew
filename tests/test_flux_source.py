@@ -253,7 +253,7 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
         assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
         rows = pipeline_record["size"] // 4
         initial = unpacked(arrays["pipeline.x_T"], rows, rows)
-        prepared = task.prepare(pipeline_record["prompts"], initial=initial, seed=0)
+        prepared = task.prepare(pipeline_record["prompts"], initial=initial, key=0)
         walked = task(prepared, key=jax.random.PRNGKey(0)).host()
         assert relative_gap(packed(np.asarray(walked.latents)), arrays["pipeline.latents"]) < 2e-5
         images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)

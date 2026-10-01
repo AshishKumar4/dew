@@ -158,6 +158,25 @@ def test_fit_trains_to_the_step_it_was_asked_for():
     assert int(state.step) == 4
 
 
+def test_integer_root_key_matches_a_typed_key_bit_exactly():
+    integer = Trainer(Regression(), optax.adam(1e-3), key=0)
+    typed = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    left = integer.fit(Data(), steps=3, log_every=1)
+    right = typed.fit(Data(), steps=3, log_every=1)
+    assert jax.tree.structure(left) == jax.tree.structure(right)
+    for actual, expected in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(actual)), np.asarray(raw_leaf(expected)))
+
+
+def test_integer_root_seed_is_recorded_at_fit_start():
+    from dew.telemetry.records import FitStarted
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=23, tracker=tracker).fit(Data(), steps=1)
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.seed == 23
+
+
 def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     refs = []
 
@@ -234,11 +253,11 @@ def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
     hand, for a config whose every trainer-held field is off its default: one
     mapping from the config's names to this constructor's, in one place."""
     config = TrainerConfig(
-        batch_size=8, seed=7, steps=3, accumulation=2, dynamic_scale=True,
+        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
         mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
     objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.seed)
+    key = jax.random.key(config.key)
     checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
 
     built = Trainer.from_config(config, objective, optimizer, key=key,

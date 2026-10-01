@@ -108,8 +108,8 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
     front = dew.pipeline(str(tmp_path))
     assert isinstance(front, TextToImage) and front.steps == pipe.steps
     np.testing.assert_array_equal(
-        front(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images,
-        pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images)
+        front(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images,
+        pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images)
 
 
 def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
@@ -161,8 +161,8 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     checkpoints.wait()
     dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
 
-    expected = TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, seed=0).host().images
-    np.testing.assert_array_equal(TextToImage.from_run(str(single))(["a lily"], steps=3, seed=0).host().images,
+    expected = TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, key=0).host().images
+    np.testing.assert_array_equal(TextToImage.from_run(str(single))(["a lily"], steps=3, key=0).host().images,
                                   expected)
     with pytest.raises(ValueError, match="keeps no EMA"):
         TextToImage.from_run(str(single), ema=True)
@@ -200,14 +200,14 @@ def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_
         before.setattr(FourierEmbedding, "setup", drawn_in_setup)
         make_run(old)
         shutil.copytree(old, resumed_before)
-        sampled = TextToImage.from_run(str(old))(["a", "b"], seed=4).host().images
+        sampled = TextToImage.from_run(str(old))(["a", "b"], key=4).host().images
         _, trained = make_run(resumed_before, steps=3)
     assert "constants" not in Checkpoints(str(old)).stored()["params"]
 
     pipe = TextToImage.from_run(str(old))
     table = pipe.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
     np.testing.assert_array_equal(np.asarray(table), tables[0])
-    np.testing.assert_array_equal(pipe(["a", "b"], seed=4).host().images, sampled)
+    np.testing.assert_array_equal(pipe(["a", "b"], key=4).host().images, sampled)
 
     _, resumed = make_run(old, steps=3)
     np.testing.assert_array_equal(
@@ -435,9 +435,9 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     live = objective.pipeline(state, ema=False)
     for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(live.params), strict=True):
         assert bound is expected
-    drawn = pipe(["a", "b"], seed=4).host().images
+    drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
-    np.testing.assert_allclose(TextToImage.from_run(str(tmp_path))(["a", "b"], seed=4).host().images, drawn,
+    np.testing.assert_allclose(TextToImage.from_run(str(tmp_path))(["a", "b"], key=4).host().images, drawn,
                                atol=2e-6, rtol=2e-6)
 
 
@@ -476,18 +476,18 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
     task = dew.pipeline(str(tmp_path))
     assert isinstance(task, TextGeneration)
     assert task.max_new_tokens == 4 and task.sampling.eos_id == (255,)
-    result = task("the ", seed=2, sampling=Sampling(temperature=0, eos_id=255))
+    result = task("the ", key=2, sampling=Sampling(temperature=0, eos_id=255))
     assert result.rows == 1 and result.host().tokens.shape == (1, 4 + 4)
     assert isinstance(result.text[0], str)
     trained = objective.pipeline(state, processor=task.processor)
     assert trained.max_new_tokens == 4
     np.testing.assert_array_equal(
-        trained("the ", seed=2, sampling=Sampling(temperature=0, eos_id=255)).host().tokens,
+        trained("the ", key=2, sampling=Sampling(temperature=0, eos_id=255)).host().tokens,
         result.host().tokens)
-    with pytest.raises(ValueError, match="exactly one of key and seed"):
-        task("the ", seed=2, key=jax.random.key(2))
+    with pytest.raises(TypeError, match="seed"):
+        task("the ", key=2)
     with pytest.raises(ValueError, match="max_new_tokens is required"):
-        dataclasses.replace(task, max_new_tokens=None)("the ", seed=2)
+        dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
 def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
@@ -568,10 +568,10 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=2 ** 6))
     specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.params)}
     assert any("fsdp" in str(spec) for spec in specs)
-    result = placed(["a", "b", "c"], steps=3, seed=7)
+    result = placed(["a", "b", "c"], steps=3, key=7)
     assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
     assert result.rows == 3
-    np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, seed=7).host().images,
+    np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, key=7).host().images,
                                atol=2e-5, rtol=2e-5)
 
 
@@ -603,7 +603,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     np.testing.assert_array_equal(start(prepared, steps=4, sampler=Heun(), key=key).images,
                                   np.clip(np.asarray(prepared.noise), -1.0, 1.0))
     with pytest.raises(ValueError, match="different source grid"):
-        start(prepared, steps=3, seed=3)
+        start(prepared, steps=3, key=3)
 
 
 def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
@@ -614,8 +614,8 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
         dew.pipeline(str(tmp_path), ema=True)
     restored = dew.pipeline(str(tmp_path))
     live = objective.pipeline(state, ema=False, processor=restored.processor)
-    np.testing.assert_array_equal(restored("the ", seed=7).host().tokens,
-                                  live("the ", seed=7).host().tokens)
+    np.testing.assert_array_equal(restored("the ", key=7).host().tokens,
+                                  live("the ", key=7).host().tokens)
 
 
 def make_block_run(directory):
@@ -681,8 +681,8 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     front = dew.pipeline(str(tmp_path), ema=False)
     direct = getattr(tasks, task_type).from_run(str(tmp_path), ema=False)
     assert type(direct) is type(front) is getattr(tasks, task_type)
-    drawn = direct(prompt, budget, seed=5)
-    expected = front(prompt, budget, seed=5)
+    drawn = direct(prompt, budget, key=5)
+    expected = front(prompt, budget, key=5)
     np.testing.assert_array_equal(drawn.host().tokens, expected.host().tokens)
     assert direct.decode(drawn) == front.decode(expected)
     assert all(isinstance(row, str) for row in direct.decode(drawn))
@@ -715,9 +715,9 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     task = dew.pipeline(str(tmp_path))
     assert task.max_new_tokens is None
     with pytest.raises(ValueError, match="max_new_tokens is required"):
-        task([[1, 2]], seed=4)
-    expected = objective.policy(state.averaged, policy)([[1, 2]], 3, seed=4).host()
-    actual = task([[1, 2]], 3, seed=4).host()
+        task([[1, 2]], key=4)
+    expected = objective.policy(state.averaged, policy)([[1, 2]], 3, key=4).host()
+    actual = task([[1, 2]], 3, key=4).host()
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
@@ -814,8 +814,8 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                 expected_params["encoders"]["textcontext"],
                 expected_encoder.tokenize([condition.unconditional]))}, given))
 
-    np.testing.assert_array_equal(restored(["a red bird"], steps=2, seed=5).host().images,
-                                  reference(["a red bird"], steps=2, seed=5).host().images)
+    np.testing.assert_array_equal(restored(["a red bird"], steps=2, key=5).host().images,
+                                  reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(owned),
                                       jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True):
@@ -862,8 +862,8 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     for reference, restored in zip(jax.tree.leaves(params), jax.tree.leaves(actual.variables), strict=True):
         assert restored.dtype == reference.dtype
         np.testing.assert_array_equal(restored, reference)
-    wanted = expected([[1, 2]], 2, seed=7).host()
-    result = actual([[1, 2]], 2, seed=7).host()
+    wanted = expected([[1, 2]], 2, key=7).host()
+    result = actual([[1, 2]], 2, key=7).host()
     np.testing.assert_array_equal(result.tokens, wanted.tokens)
     np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
 
@@ -896,8 +896,8 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     expected = dataclasses.replace(TextToImage.from_objective(objective, expected_vars),
         inputs=dataclasses.replace(objective.inputs, conditions={
             "textcontext": dataclasses.replace(original, encoder=reference_encoder)}))
-    np.testing.assert_array_equal(restored(["ab"], steps=2, seed=9).host().images,
-                                  expected(["ab"], steps=2, seed=9).host().images)
+    np.testing.assert_array_equal(restored(["ab"], steps=2, key=9).host().images,
+                                  expected(["ab"], steps=2, key=9).host().images)
 
 
 
