@@ -57,7 +57,9 @@ Where Dew loses:
 - Attention: cuDNN's fused kernels take 7.1 ms forward and backward on the
   768-wide SimpleDiT (head dimension 64, 256 tokens) against
   FlashAttention-2's 4.4 in torch, and 8.8 against 7.2 on Qwen3-0.6B (head
-  dimension 128, causal, 1024 tokens).
+  dimension 128, causal, 1024 tokens). JAX's Pallas-Triton kernel is faster
+  than cuDNN but recovers only 1.2-1.7% of these steps, at larger gradient
+  errors ("Faster kernels not adopted" below).
 - The vocabulary head, where it dominates the step: Dew keeps the logits
   and their cotangent in fp32 and multiplies the cotangent into the states
   as two bf16 products; torch rounds both to bf16. On the 3-layer decoder
@@ -951,6 +953,7 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 | tokamax `triton` RMSNorm | sm80, sm89 | 1.07x (A100), 1.53x (L4), 1.57x (RTX 4080) over XLA | tokamax dependency. |
 | fused-weight SwiGLU (tokamax `xla` formulation, one contraction for gate and up) | every GPU | 1.47x (A100), 1.47x (L4), 1.55x (RTX 4080), 1.21x (T4) over two XLA matmuls; no gain on TPU | a change to the MLP's parameter layout. |
 | tokamax `xla` head plus cross entropy | sm89 speed | 73.0 ms (L4) and 36.8 ms (RTX 4080), 1.55x and 1.58x over Dew's chunked head | tokamax dependency, and it holds 1.6-3.2 GiB where the chunked head holds 131-355 MiB. |
+| JAX's Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`), 2026-10-01 | sm89, training attention | forward plus backward, bf16, against cuDNN: 0.38 against 0.64 ms (batch 32, 256 tokens, 12 heads of 64), 0.43 against 0.81 (causal, batch 16, 512 tokens), 1.12 against 1.36 (causal, batch 4, 1024 tokens, 16 heads of 128); in the step, routed where a call has no bias, mask, window or lengths: the 768-wide SimpleDiT 76.10 to 74.81 ms, the small decoder 63.61 to 62.86 | deprecated in JAX 0.11 for tokamax; against an fp32 reference its dq and dk errors reach 8.5e-3 of their maximum where cuDNN's reach 5.3e-3 (causal, 512 tokens); no grouped-query heads. |
 | JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | a decode-path change; on TPU the XLA gather wins at batch 8 and up to 2k context. |
 
 ### The Mamba-2 SSD scan: `ssd_kernel_runs`
