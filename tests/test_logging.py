@@ -1,6 +1,7 @@
 """Default Dew diagnostics reach stderr without configuring an application's root."""
 
 import os
+import re
 import subprocess
 import sys
 
@@ -59,7 +60,8 @@ except ValueError:
 """)
     assert "restore failed" in result.stderr
     assert "Traceback" in result.stderr
-    assert "ValueError: invalid checkpoint" in result.stderr
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stderr)
+    assert "ValueError: invalid checkpoint" in plain
 
 
 def test_a_callers_existing_dew_handler_and_level_are_not_replaced():
