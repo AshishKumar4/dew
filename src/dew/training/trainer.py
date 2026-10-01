@@ -63,7 +63,7 @@ from dew.objectives.base import (
     Variables,
     select,
 )
-from dew.records import JSON
+from dew.records import JSON, boolean, integers, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
@@ -300,6 +300,31 @@ def _keeps_triton_gemm(model: nn.Module) -> bool:
     mixers = [getattr(model, 'mixer', None)]
     mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
     return any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers)
+
+
+def climb_to(objective, rung: Mapping[str, object]) -> None:
+    """Move `objective` up to the head tile and remat a checkpoint's
+    `rung` records (`Trainer._rung`), each where it stands below them: the
+    ladder `recompute_more` climbs, taken in one move."""
+    tile = rung.get('head_tile')
+    if tile is not None and _head_tile_of(objective) is None:
+        rows, columns = integers(tile, 'rung head_tile')
+        objective.tile_head((rows, columns))
+    model = _model_of(objective)
+    current = _remat_of(model)
+    ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
+              else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
+    records = [remat_record(remat) for remat in ladder]
+    here, there = remat_record('dots' if current is True else current), json_value(rung.get('remat'), 'rung remat')
+    if model is not None and here in records and there in records and records.index(there) > records.index(here):
+        objective.model = model.clone(remat=ladder[records.index(there)])
+
+
+def _head_tile_of(objective: Objective[Loss, Effects]) -> tuple[int, int] | None:
+    """The tile an objective's head computes its backward in, read at the
+    boundary with any objective: an LM objective's `head_tile`, and None for
+    a head that keeps its whole logits or an objective with no head."""
+    return getattr(objective, 'head_tile', None)
 
 
 def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
@@ -629,6 +654,12 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
+        # The fit ladder's rung beyond the objective's own head and remat: a
+        # step that fit only under XLA's default options keeps them for later
+        # compiles. A resumed run starts at its checkpoint's rung, and says so
+        # if its first compile has to climb past it (`_climb_to`).
+        self._xla_defaults = False
+        self._resumed_rung: JSON = None
 
     @classmethod
     def from_config(
@@ -820,10 +851,39 @@ class Trainer(Generic[Loss, Effects]):
                                            initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=data_partition(self.device_mesh))
+        self._climb_to(checkpoints.rung(resume))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _rung(self) -> JSON:
+        """The fit ladder's rung this trainer's step compiles at: the
+        objective's head tile, its model's remat (`remat_record`) and whether
+        the step keeps XLA's default options (`fitting_default`). A
+        checkpoint records it, since each decides the program a step runs."""
+        tile = _head_tile_of(self.objective)
+        return {'head_tile': None if tile is None else list(tile),
+                'remat': remat_record(_remat_of(_model_of(self.objective))),
+                'xla_defaults': self._xla_defaults}
+
+    def _climb_to(self, rung: JSON) -> None:
+        """Move the objective up to `rung`, a checkpoint's (`_rung`), where
+        it is above where the objective stands, never below it.
+
+        The fit check reads the free memory its own process finds, and one
+        that restores a state finds other memory than the one that built it:
+        on an A100 a Qwen3-1.7B run trained under remat 'full', and its
+        resumed process took 'minimal', ran another program and parted from
+        the uninterrupted run at step 70. So the resumed run compiles the
+        rung its checkpoint trained on, and climbs further only where that
+        does not fit."""
+        if rung is None:
+            return
+        fields = record(rung, 'rung')
+        climb_to(self.objective, fields)
+        self._xla_defaults = self._xla_defaults or boolean(fields.get('xla_defaults', False), 'rung xla_defaults')
+        self._resumed_rung = self._rung()
 
     def _placed_held(self, initializer: Initializer, abstract: TrainState,
                      shardings: Placement[TrainState]) -> Initializer:
@@ -1096,6 +1156,7 @@ class Trainer(Generic[Loss, Effects]):
             return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
+        resumed, self._resumed_rung = self._resumed_rung, None
         with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
@@ -1127,11 +1188,17 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                options = step_compiler_options(self.objective)
+                options = None if self._xla_defaults else step_compiler_options(self.objective)
                 self.executable = self.program.compile(options)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
                     self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
+                    self._xla_defaults = fits
+                if not fits and resumed is not None:
+                    print(colored(f"the step does not fit the devices at the rung its checkpoint trained on "
+                                  f"({resumed}); from here the resumed run computes otherwise than the "
+                                  f"run it continues", "yellow"), file=sys.stderr)
+                    resumed = None
                 if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
@@ -1617,7 +1684,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
         metadata = {"loss": float(interval.book[0] / interval.steps)} if interval.steps else None
-        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh))
+        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
+                         rung=self._rung())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -1631,7 +1699,8 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
+        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh),
+                               rung=self._rung())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
