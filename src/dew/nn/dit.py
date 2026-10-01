@@ -227,7 +227,10 @@ class ConditioningEmbed(nn.Module):
     `text_pooling` "all" averages every position the text tower returns, the
     padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
     their checkpoints load. `interval` adds a second time embedding, of an
-    interval's `duration`.
+    interval's `duration`. `time_scale` is the Fourier frequencies' scale:
+    the default 16 makes the embedding of a flow's model time (sigma times
+    1000) vary fast in time, which only its values need, while a loss that
+    differentiates in time (MeanFlow's, sCM's) needs it smooth.
     """
     emb_features: int
     mlp_ratio: int = 4
@@ -235,17 +238,18 @@ class ConditioningEmbed(nn.Module):
     precision: PrecisionLike = None
     text_pooling: Literal["real", "all"] = "real"
     interval: bool = False
+    time_scale: float = 16
 
     def setup(self):
         if self.interval:
             self.duration_embed = nn.Sequential([
-                FourierEmbedding(features=self.emb_features, dtype=self.dtype),
+                FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
                 nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
             ], name="duration_embed")
         self.time_embed = nn.Sequential([
-            FourierEmbedding(features=self.emb_features, dtype=self.dtype),
+            FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
             TimeProjection(features=self.emb_features * self.mlp_ratio,
                            dtype=self.dtype, precision=self.precision),
             nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),

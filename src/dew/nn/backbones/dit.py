@@ -57,7 +57,9 @@ class SimpleDiT(nn.Module):
 
     `interval` makes it an interval model (`Process.interval`), reading the
     `duration` of the interval it predicts over beside the time: MeanFlow's
-    and shortcut models' network.
+    and shortcut models' network. `time_scale` scales the time embedding's
+    Fourier frequencies (`ConditioningEmbed`); a model trained through a JVP
+    in time, MeanFlow's or an sCM student, takes a small one.
     """
     output_channels: int = 3
     patch_size: int = 16
@@ -79,6 +81,7 @@ class SimpleDiT(nn.Module):
     routes: Sequence[Sequence[float]] = ()
     patch_bottleneck: int | None = None
     interval: bool = False
+    time_scale: float = 16
 
 
     def setup(self):
@@ -97,6 +100,7 @@ class SimpleDiT(nn.Module):
             precision=self.precision,
             text_pooling=self.text_pooling,
             interval=self.interval,
+            time_scale=self.time_scale,
         )
         self.blocks = self.stack()
         self.output = PatchSequenceOutput(
