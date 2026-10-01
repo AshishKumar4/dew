@@ -37,7 +37,7 @@ TARGETS = {
         "tests/test_diffusion_process.py", "tests/test_guidance.py",
         "tests/test_shortcut.py", "tests/test_mean_flow.py")),
     "schedules": Target("src/dew/diffusion/schedules", (
-        "tests/test_schedulers.py", "tests/test_flow_matching.py",
+        "tests/test_schedule_contracts.py", "tests/test_schedulers.py", "tests/test_flow_matching.py",
         "tests/test_native_diffusion_edges.py")),
     "attention": Target("src/dew/nn/attention.py", (
         "tests/test_causal_transformer.py", "tests/test_local_attention.py",
@@ -45,6 +45,14 @@ TARGETS = {
     "sources": Target("src/dew/data/sources", (
         "tests/test_hf_data.py", "tests/test_online_loader.py",
         "tests/test_text_data.py", "tests/test_tfds_read.py", "tests/test_data_av.py")),
+}
+
+# A file batch runs the proofs of that file's behavior, not unrelated I/O or
+# reference-model suites from neighboring source modules. Directory batches
+# retain the complete target suite above.
+FILE_TESTS = {
+    "src/dew/data/sources/hf.py": ("tests/test_hf_data.py",),
+    "src/dew/diffusion/schedules/common.py": ("tests/test_schedule_contracts.py", "tests/test_schedulers.py"),
 }
 
 
@@ -116,7 +124,8 @@ def selected_target(target: Target, filename: Path | None) -> Target:
     within = path == boundary if boundary.is_file() else path.is_relative_to(boundary)
     if not within or path.suffix != ".py" or not path.is_file():
         raise ValueError(f"{filename} is not a Python source file within {target.path}")
-    return dataclasses.replace(target, path=str(path.relative_to(Path.cwd())))
+    relative = str(path.relative_to(Path.cwd()))
+    return dataclasses.replace(target, path=relative, tests=FILE_TESTS.get(relative, target.tests))
 
 
 def run(target: Target, directory: Path, shard: int, shards: int, timeout: float, *,
