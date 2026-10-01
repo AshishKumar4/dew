@@ -39,7 +39,7 @@ before(async () => {
 		convertV4MiniflareOptions({
 			modules: [{ type: 'ESModule', path: 'harness.mjs', contents: bundle.outputFiles[0].text }],
 			compatibilityDate: config.compatibility_date,
-			durableObjects: { COORDINATOR: { className: 'Coordinator', useSQLite: true } },
+			durableObjects: { COORDINATOR: { className: 'Coordinator', useSQLite: true }, KERNEL: { className: 'StubKernel', useSQLite: true } },
 			bindings: limits,
 		}),
 	);
@@ -93,4 +93,13 @@ test('a session takes the spare the last one asked for, and every spare counts w
 	assert.equal(both.budgetUsedSeconds, 2 * wall + 2 * (wall + warm), 'a spare holds its wait and a full session');
 	assert.equal(twice.reason, 'one-at-a-time', 'the spare now belongs to the second visitor');
 	assert.equal(later.active, 2, 'a session or spare that never starts is swept as unused');
+});
+
+test('after a deploy a session does not take a spare on the old image, and that spare stops', async () => {
+	const { first, second, stopped, status } = await run('redeploy');
+	assert.equal(second.ok, true);
+	assert.notEqual(second.id, first.spare, 'a spare on the old image must not serve the new page');
+	assert.equal(second.warm, false);
+	assert.equal(stopped, true, 'the old spare must be stopped');
+	assert.equal(status.active, 3, 'the two sessions and the new spare, not the old one');
 });
