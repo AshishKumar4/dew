@@ -15,8 +15,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
-import numpy as np
-
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
