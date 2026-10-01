@@ -314,9 +314,9 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     saved = []
     real_save = trainer.checkpoints.save
 
-    def spy(step, state, position, metrics=None, *, share=None):
+    def spy(step, state, position, metrics=None, *, share=None, rung=None):
         saved.append((step, None if metrics is None else sorted(metrics)))
-        return real_save(step, state, position, metrics, share=share)
+        return real_save(step, state, position, metrics, share=share, rung=rung)
 
     trainer.checkpoints.save = spy
     trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
@@ -447,6 +447,75 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
     assert position.read(resumed_place).records == 4 * BATCH
+
+
+def ladder_lm_trainer(directory, fits):
+    """An LM trainer on a decoder whose fit check answers `fits(rung)` for
+    the rung each compile is at: (whether the head is tiled, the remat's
+    record). It stands in for the free memory a process finds."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    objective = LMObjective(model, seq_len=4)
+    trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
+
+    def headroom(executable, devices, held=0):
+        rung = (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat))
+        return 0 if fits(rung) else -1
+    return trainer, objective, headroom
+
+
+def lm_windows(tmp_path):
+    from dew.data import Loading, TokenWindows
+
+    tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
+    tokens.tofile(tmp_path / "train.bin")
+    tokens.tofile(tmp_path / "val.bin")
+    return TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+
+
+def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, monkeypatch):
+    """The rung a run settles on is part of what it resumes: a process that
+    restores the state finds other free memory than the one that built it
+    (on an A100 a Qwen3-1.7B run took 'full', and its resumed process,
+    without the fresh state's hole, 'minimal', and parted from step 70). The
+    resumed run compiles the checkpoint's rung where the step fits more
+    lightly too, and trains bit for bit as the uninterrupted one."""
+    def tiled_and_minimal(rung):
+        return rung in ((True, 'minimal'), (True, 'full'))
+
+    whole, _, headroom = ladder_lm_trainer(tmp_path / "whole", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    expected = whole.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    assert (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat)) == (
+        True, 'minimal')
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
+
+
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+    """A process that cannot fit the rung its checkpoint trained on moves up
+    the ladder, never down, and says the run now computes otherwise."""
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+    capsys.readouterr()
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
+    assert trainer_module.remat_record(objective.model.remat) == 'full'
+    assert "the rung its checkpoint trained on" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
@@ -874,8 +943,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None):
-        save_local(step, state, position, share=share)
+    def save_then_stop(step, state, position, *, share=None, rung=None):
+        save_local(step, state, position, share=share, rung=rung)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
