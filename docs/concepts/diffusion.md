@@ -57,7 +57,7 @@ Three methods serve sampling. `process.noise(key, shape)` draws the starting noi
 
 ## Presets
 
-A preset is a frozen dataclass of the numbers that define a published convention, and calling it builds the process: `EDM(regime="pixel")` is the configuration and `EDM(regime="pixel")()` the `Process`. EDM's regime chooses the training noise levels: Karras et al. 2022's for pixels or EDM2's for latents. Explicit `P_mean` and `P_std` values override the regime; supplying both also works without a regime, so old run records retain their training distribution. Otherwise a preset without a regime refuses to build, and a run config fills it from whether the run has an autoencoder. A run's `run.json` stores the preset's fields, so sampling rebuilds the convention the model was trained with.
+A preset is a frozen dataclass of the numbers that define a published convention. Pass `EDM(regime="pixel")` or `Flow()` directly to `DiffusionObjective`, `DiffusionRunConfig(preset=...)` or `TextToImage`; they build the process. Calling a preset yourself builds a `Process` for direct schedule inspection or low-level sampling. EDM's regime chooses the training noise levels: Karras et al. 2022's for pixels or EDM2's for latents. Explicit `P_mean` and `P_std` values override the regime; supplying both also works without a regime, so old run records retain their training distribution. Otherwise a preset without a regime refuses to build, and a run config fills it from whether the run has an autoencoder. A run's `run.json` stores the preset's fields, so sampling rebuilds the convention the model was trained with.
 
 | Preset | Convention |
 |---|---|

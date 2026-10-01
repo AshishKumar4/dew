@@ -183,6 +183,19 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 `load_pretrained(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
+`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`tools/tokenize_text.py --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+
+```python
+from dew.interop import load_pretrained
+
+data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
+bundle = load_pretrained("Qwen/Qwen3-0.6B", max_seq_len=512)
+objective = bundle.lm_objective(seq_len=512, ema_decay=None)
+state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
+```
+
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. A separately built model can still start from an explicit variables tree, for example after adding an adapter.
+
 `save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
 
 ```python
@@ -276,15 +289,14 @@ Padding belongs to each process's own rows, so on a process pool the processes a
 
 The processor checks token IDs, placeholder counts and media shapes on the host; the compiled model does no checking. The same `ModelInputs` goes to `model.apply`, the objective and `generate`. Media are evaluated at prefill, and decode steps read the cache.
 
-To keep training, hand the loaded variables to the objective and feed the trainer `{"text": inputs}` batches:
+To keep training, build the bundle's objective and feed the trainer `{"text": inputs}` batches:
 
 ```python
 import optax
 from dew.data.dataset import Dataset
 from dew.training import Layout, MeshSpec
 
-mm_objective = LMObjective(bundle.model, inputs.tokens.shape[1] - 1,
-                           pretrained=bundle.variables, ema_decay=None, pad_id=0)
+mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,

@@ -18,6 +18,7 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
 from dew.artifacts import agreed, uint8_pixels
+from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
@@ -142,7 +143,7 @@ class TextToImage:
     """
 
     model: nn.Module
-    process: Process
+    process: Process | Preset
     inputs: InputSpec
     params: Variables
     autoencoder: AutoEncoder | None = None
@@ -158,6 +159,7 @@ class TextToImage:
     None encodes it on every call, for a source that has none."""
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "process", build_process(self.process))
         object.__setattr__(self, "params", freeze(dict(self.params)))
 
     def bind(self, variables: Variables) -> TextToImage:
@@ -236,7 +238,7 @@ class TextToImage:
         if type(steps) is not int or steps < 1:
             raise ValueError("steps must be a positive integer")
         if self.grid is None:
-            return self.process, None
+            return build_process(self.process), None
         process, times = self.grid(steps)
         return process, _time_grid(times)
 
@@ -343,7 +345,7 @@ class TextToImage:
         count = default_count if steps is None else steps
         if prepared is not None and prepared.times is not None:
             times = _time_grid(prepared.times)
-            process = self.process if prepared.process is None else prepared.process
+            process = build_process(self.process) if prepared.process is None else prepared.process
         else:
             process, times = self.prepared_process(count)
         if type(decode) is not bool:

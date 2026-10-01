@@ -391,6 +391,89 @@ def test_a_served_language_model_generates_with_its_quantized_kernels(weight_onl
     assert tokens.shape == (BATCH, 7)
 
 
+@pytest.mark.parametrize("dtype", ["int8", "fp8"])
+@pytest.mark.parametrize("weight_only", [False, True])
+def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, weight_only):
+    """Qwix 0.1.8 PTQ with fp32 compute, compared bitwise with the public task.
+
+    Greedy agreement with bf16 compute over the same fp32 master weights is
+    reported separately; quantization changes the policy.
+    """
+    import functools
+
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+    from dew.training.quantization import METHODS
+
+    qwix = pytest.importorskip("qwix")
+    model = tiny()
+    prompt = jnp.asarray(token_batch()["text"][:, :4])
+    variables = model.init(jax.random.key(0), prompt)
+    task = TextGeneration(model, variables, sampling=Sampling(temperature=0), max_new_tokens=4)
+    spec = Quantization(dtype=dtype, weight_only=weight_only, patterns=(".*_proj",))
+    served = task.quantized(spec)
+    qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
+    fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
+    rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=qtype,
+                                  act_qtype=None if weight_only else qtype, **fields)]
+    reference = qwix.quantize_model(model, qwix.PtqProvider(rules),
+                                    methods=tuple(method for method in METHODS if hasattr(model, method)))
+    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
+                                               jnp.zeros((1, 1), jnp.int32)))
+    expected_variables = {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
+    expected_logits = jax.jit(reference.apply)(expected_variables, prompt)
+    logits = jax.jit(served.model.apply)(served.variables, prompt)
+    np.testing.assert_array_equal(logits, expected_logits)
+    assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
+    assert jnp.dtype(qtype) in {leaf.dtype for leaf in jax.tree.leaves(served.variables)}
+    assert jnp.dtype(qtype) not in {leaf.dtype for leaf in jax.tree.leaves(task.variables)}
+    actual = served(prompt, seed=7).host()
+    expected = TextGeneration(reference, expected_variables, sampling=task.sampling,
+                              max_new_tokens=task.max_new_tokens)(prompt, seed=7).host()
+    for found, wanted in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(found, wanted)
+    bf16 = TextGeneration(model.clone(dtype=jnp.bfloat16), variables,
+                           sampling=task.sampling, max_new_tokens=task.max_new_tokens)(prompt, seed=7).host()
+    matches = actual.tokens[:, -4:] == bf16.tokens[:, -4:]
+    print(f"{jax.default_backend()} {dtype} weight_only={weight_only}: Qwix logit error=0; "
+          f"bf16 greedy token agreement={int(matches.sum())}/{matches.size}; "
+          f"whole continuations={int(matches.all(axis=1).sum())}/{matches.shape[0]}")
+
+
+def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
+    import sys
+
+    from dew.inference import TextGeneration
+
+    monkeypatch.setitem(sys.modules, "qwix", None)
+    with pytest.raises(ModuleNotFoundError, match=r"dewml\[quantization\]"):
+        TextGeneration(tiny(), {}).quantized(Quantization())
+
+
+def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
+    from pathlib import Path
+
+    from dew.interop import load_pretrained
+    from dew.sampling import Sampling
+
+    pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/gemma3-native-tiny"
+    source = load_pretrained(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    task = source.text_generation(sampling=Sampling(temperature=0))
+    image = np.load(directory / "raw_images.npy")[0]
+    prompt = "token7 <start_of_image> token9"
+    inputs = source.processor(prompt, images=[image])
+    spec = Quantization(weight_only=True, patterns=(".*_proj",))
+    served = task.quantized(spec, example=inputs)
+    model, variables = quantize_for_serving(task.model, task.variables, spec, inputs.tokens, **inputs.kwargs())
+    np.testing.assert_array_equal(served.model.apply(served.variables, inputs.tokens, **inputs.kwargs()),
+                                  model.apply(variables, inputs.tokens, **inputs.kwargs()))
+    generated = served(prompt, 3, seed=0, images=[image])
+    assert generated.text == task.decode(generated)
+    assert len(generated.text) == 1 and generated.text[0]
+    assert served.processor is task.processor and served.sampling == task.sampling
+
+
 @pytest.mark.parametrize("weight_only", [False, True])
 def test_a_served_bf16_module_computes_in_bf16(weight_only):
     """A quantized kernel follows the module's compute dtype as its float

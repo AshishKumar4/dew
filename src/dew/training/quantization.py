@@ -19,8 +19,8 @@ straight-through estimator on the backward pass.
 Serving is not fake-quantized. `quantize_for_serving` runs Qwix's
 post-training quantization: the returned variables hold each matched kernel
 as int8 or fp8 values with their scales, and the returned module's matmuls
-read them. `TextToImage.quantized` applies it to a text-to-image task's
-denoiser.
+read them. `TextGeneration.quantized` applies it to a language model and
+`TextToImage.quantized` to an image task's denoiser.
 
 The vocabulary head stays fp32 with the rest of Dew's fp32 zones. Its einsum
 lives in the objective's chunked cross entropy, outside any model method
@@ -47,7 +47,7 @@ import dataclasses
 import functools
 import importlib
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -478,7 +478,8 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
 
 
 def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantization,
-                         *args: Conditioning, **kwargs: Conditioning) -> tuple[nn.Module, Variables]:
+                         *args: Conditioning, **kwargs: Conditioning | Mapping[str, jax.Array]
+                         ) -> tuple[nn.Module, Variables]:
     """`model` and `variables` with the weights `spec` names stored quantized.
 
     This is Qwix's post-training quantization. The returned variables hold
@@ -500,7 +501,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     methods = tuple(method for method in METHODS if hasattr(model, method))
     served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
     abstract = jax.eval_shape(functools.partial(served.init, jax.random.key(0), *args, **kwargs))
-    return served, {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
+    parameters = jax.tree.map(jnp.asarray, variables["params"])
+    return served, {**variables, "params": qwix.quantize_params(parameters, abstract["params"])}
 
 
 @runtime_checkable
