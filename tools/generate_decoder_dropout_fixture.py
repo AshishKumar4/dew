@@ -1,4 +1,7 @@
-"""Record the zero-dropout decoder's CPU fp32 forward and gradients."""
+"""Record the zero-dropout decoder's CPU fp32 forward and gradients.
+
+The committed fixture was recorded at 42ddfc14, before the dropout change.
+"""
 from pathlib import Path
 
 import jax

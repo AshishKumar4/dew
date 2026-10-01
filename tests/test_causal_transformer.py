@@ -117,6 +117,14 @@ def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+    probabilities = np.asarray(actual)[0]
+    for row in range(4):
+        kept = np.float32((1 / (row + 1)) / (1 - .5))
+        visible = probabilities[row, :, :row + 1]
+        assert np.all((visible == 0) | (visible == kept))
+        assert not np.any(probabilities[row, :, row + 1:]), "future probabilities stay zero"
+        keep_counts = np.count_nonzero(visible, axis=-1)
+        np.testing.assert_array_equal(keep_counts, np.sum(visible == kept, axis=-1))
     assert jnp.any(actual == 0)
     different = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
         dropout_rate=.5, dropout_rng=jax.random.key(7), deterministic=False)
