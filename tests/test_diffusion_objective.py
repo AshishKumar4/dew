@@ -123,7 +123,7 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(scalar_loss(objective, variables, batch, step)[0],
                                   scalar_loss(explicit, variables, batch, step)[0])
-    direct = TextToImage(objective.model, preset, inputs, variables, steps=3)
+    direct = TextToImage.from_objective(objective, variables)
     built = TextToImage.from_objective(explicit, variables)
     np.testing.assert_array_equal(direct(["", ""], seed=2).host().images,
                                   built(["", ""], seed=2).host().images)
