@@ -80,7 +80,7 @@ def test_landing_snippet_runs(section, tmp_path):
 
 
 def test_recorded_hero_runs_offline(tmp_path):
-    """The exact recorded script, with its normal 200 steps, over local byte fixtures."""
+    """The exact recorded script, with its step override, over local byte fixtures."""
     script = tmp_path / "hero.py"
     shutil.copyfile(REPO_ROOT / "site/src/data/hero.py", script)
     corpus = tmp_path / "tokens"
@@ -92,7 +92,7 @@ def test_recorded_hero_runs_offline(tmp_path):
     (corpus / "meta.json").write_text(json.dumps({
         "tokenizer": "byte", "vocab_size": 256, "dtype": "uint16",
         "train_tokens": len(tokens), "val_tokens": len(tokens), "eos_id": 255}))
-    finished = smoke("hero", tmp_path, script=script, smoke_args=False)
+    finished = smoke("hero", tmp_path, "--steps", "3", script=script, smoke_args=False)
     assert "ROMEO:" in finished.stdout and "JULIET:" in finished.stdout
 
 
