@@ -1,8 +1,5 @@
 from functools import cache
 
-from PIL import Image
-
-from dew.artifacts import uint8_pixels
 from dew.interop import load_pretrained
 from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage
 
