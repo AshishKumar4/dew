@@ -61,6 +61,7 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from .kernels.generation import device_generation
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -159,6 +160,20 @@ def _cuda_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Ar
     return _barrier(_depthwise_3x3(inputs, kernel, dilation)).astype(lhs.dtype)
 
 
+def _depthwise_materialized(generation: str, dtype: DTypeLike, batch: int, dilation: int) -> bool:
+    """Whether the measured shifted path needs fp32 materialization.
+
+    At 16x16x768 (forward + VJP, JAX 0.11.2.post3), dilation 2 fp32
+    takes plain products on both GPUs: RTX 4080 B16 0.249 vs 0.271 ms,
+    A100 B32 0.293 vs 0.320 ms. For bf16 the RTX 4080 takes boundaries
+    (B16 0.308 vs 0.857 ms); A100 B16 takes plain (0.284 vs 0.532 ms),
+    but B32 takes boundaries (0.444 vs 1.649 ms). Dilation 3 keeps them.
+    `tools/benchmark_depthwise.py` records the fp32 reduction bounds too.
+    """
+    return not (dilation == 2 and (jnp.dtype(dtype) == jnp.dtype(jnp.float32)
+                                  or (generation == 'sm80' and batch <= 16)))
+
+
 def _conv_general_dilated(
         lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
         padding: str | Sequence[tuple[int, int]], lhs_dilation: Sequence[int] | None = None,
@@ -186,10 +201,15 @@ def _conv_general_dilated(
             and lhs.dtype == rhs.dtype and lhs.dtype in (jnp.float32, jnp.bfloat16)
             and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
-        return jax.lax.platform_dependent(
-            lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: _cuda_depthwise_3x3(x, w, dilation[0]),
-            default=convolve)
+        def cuda(x, w):
+            generation = device_generation()
+            if dilation[0] == 1 or generation not in ('sm80', 'sm89'):
+                return convolve(x, w)
+            operation = (_cuda_depthwise_3x3 if _depthwise_materialized(
+                generation, x.dtype, x.shape[0], dilation[0]) else _depthwise_3x3)
+            return operation(x, w, dilation[0])
+
+        return jax.lax.platform_dependent(lhs, rhs, cuda=cuda, default=convolve)
     return convolve(lhs, rhs)
 
 

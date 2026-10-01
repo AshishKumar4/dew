@@ -54,12 +54,12 @@ def timed(operation, args, repeats):
 def kernels(args):
     rng = np.random.default_rng(17)
     rows = []
-    for batch in (16, 32):
+    for batch in ((16, 32) if args.batch_size is None else (args.batch_size,)):
         for dtype in (jnp.float32, jnp.bfloat16):
             x = jnp.asarray(rng.normal(size=(batch, 16, 16, 768)), dtype)
             kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 768)), dtype)
             cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
-            for dilation in (1, 2, 3):
+            for dilation in args.dilations:
                 expected = jax.jit(partial(vjp, partial(reference, dilation=dilation)))(
                     x, kernel, cotangent)
                 magnitudes = jax.jit(partial(vjp, partial(reference, dilation=dilation)))(
@@ -203,6 +203,8 @@ def main():
     parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='bfloat16',
                         help='Training step compute dtype; checkpoint keeps the published dtypes.')
     parser.add_argument('--batch-size', type=int, choices=(16, 32), help='One step case in a fresh process.')
+    parser.add_argument('--dilations', type=int, nargs='+', choices=(1, 2, 3), default=(1, 2, 3),
+                        help='Depthwise kernel dilations to measure.')
     parser.add_argument('--remat', action='store_true', help='The same rematerialization policy for both paths.')
     parser.add_argument('--repeats', type=int, default=50)
     parser.add_argument('--output', type=Path, default=Path('depthwise.json'))

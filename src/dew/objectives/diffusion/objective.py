@@ -16,6 +16,7 @@ the averaged weights, through the same `sample` inference uses.
 from __future__ import annotations
 
 import copy
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -166,13 +167,6 @@ class DiffusionObjective(Objective[Mean]):
                              "needs `alignment`, a KL autoencoder and no masked-image input")
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
-        # The unconditional branch is a pure function of the frozen towers
-        # and each condition's fixed datum, so it is encoded here, once, and
-        # not inside every step and every sample. A few hundred kilobytes of
-        # host arrays, which a compiled step takes as a constant; the towers
-        # themselves stay in the state, for the reason `held_variables` gives.
-        self.unconditional_conditions = jax.tree.map(
-            np.asarray, self.encode(self.encoder_params()))
         self.unconditional_prob = unconditional_prob
         self.sampler = sampler
         self.guidance = guidance
@@ -211,6 +205,20 @@ class DiffusionObjective(Objective[Mean]):
                       for keyword, condition in self.inputs.conditions.items()}
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
+
+    @cached_property
+    def unconditional_conditions(self) -> dict:
+        """The fixed prompts encoded once, on first use, over the bound towers.
+
+        Building or shape-checking a restored model does not run its towers.
+        One compiled encode avoids dispatching every CLIP operation separately;
+        weights are arguments, not executable constants. The small host result
+        remains a constant in each training step and sampling call.
+        """
+        # The first use may be inside a training or sampling trace. Evaluate
+        # outside that trace so the cached value contains arrays, not tracers.
+        with jax.ensure_compile_time_eval():
+            return jax.tree.map(np.asarray, jax.jit(self.encode)(self.encoder_params()))
 
     def blank_conditions(self, like: dict) -> dict:
         """Cast the stored unconditional conditions to the conditional branch's dtypes.

@@ -89,6 +89,32 @@ def make_batch(count=8):
             "text": encoder.tokenize(["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"][:count])}
 
 
+def test_build_defers_unconditional_encoding_and_reuses_its_exact_snapshot(monkeypatch):
+    """Building binds the towers; their first use encodes the fixed prompt once."""
+    encoder = StubText.from_pretrained("stub")
+    tokens = encoder.tokenize([""])
+    expected = encoder.encode(encoder.params, tokens)
+    original = StubText.encode
+    calls = []
+
+    def compiled(self, params, tokens):
+        assert all(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(params))
+        calls.append(True)
+        return original(self, params, tokens)
+
+    monkeypatch.setattr(StubText, "encode", compiled)
+    objective = make_objective()
+    assert not calls
+    given = jax.tree.map(jnp.asarray, expected)
+    with jax.default_matmul_precision("highest"):
+        first = jax.jit(objective.blank_conditions)({"textcontext": given})
+        second = jax.jit(objective.blank_conditions)({"textcontext": given})
+    assert len(calls) == 1
+    for actual in (first, second):
+        for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(got, want)
+
+
 def tree_fingerprint(tree):
     # per-leaf sums accumulated in python floats, so the golden values below
     # do not depend on float32 reduction order
@@ -233,7 +259,7 @@ def encode_calls(monkeypatch, encoder) -> list:
 
 def test_the_text_tower_runs_once_a_step(monkeypatch):
     """The unconditional branch is a pure function of the frozen tower and a
-    fixed prompt, so the objective encodes it when it is built and the
+    fixed prompt, so the objective caches its first encoding and the
     compiled step encodes the batch and nothing else. Encoding it in the step
     instead ran the tower twice a step, the second time over one row of
     padding."""
@@ -241,6 +267,8 @@ def test_the_text_tower_runs_once_a_step(monkeypatch):
     params = objective.init(jax.random.PRNGKey(0))
     batch = make_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+    # First use prepares the fixed prompt independently of the compiled step.
+    _ = objective.unconditional_conditions
     calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
 
     jax.make_jaxpr(objective.loss)(params, batch, step)
@@ -249,7 +277,7 @@ def test_the_text_tower_runs_once_a_step(monkeypatch):
     assert np.shape(calls[0]["input_ids"])[0] == batch["image"].shape[0]
 
 
-def test_the_unconditional_branch_is_encoded_when_the_objective_is_built():
+def test_the_unconditional_branch_is_cached_as_host_arrays_on_first_use():
     """What the objective holds is what encoding the tower again produces, to
     the bit, and it is host arrays rather than a leaf of the state: the state
     an objective initializes has the collections it always had."""
