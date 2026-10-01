@@ -221,3 +221,72 @@ def test_unranked_first_tracker_does_not_select_a_different_trackers_best(tmp_pa
     checkpoints.wait()
     assert checkpoints.best is None
     assert checkpoints.resolve('best:clip') == 1
+
+
+def test_training_selector_aggregate_uses_bound_objective_loss(tmp_path):
+    run = trainer(tmp_path / 'run')
+    run.fit(Data(train=data()._train), steps=4, log_every=1, eval_every=1, checkpoint_every=4,
+            best=Best(lambda m: m[run.objective.loss]))
+    assert run.checkpoints.best == 4
+
+
+def test_aggregate_never_reuses_missing_metrics_and_preserves_first_tracker(tmp_path):
+    first = Value('first', Shown(better='lower'))
+    second = Value('second', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    from dew.training.trainer import _FitPlan
+    plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], False,
+                    best=(Best(lambda m: m[first] - m[second]), Best(second, mode='max', split='val')),
+                    validation=True)
+    ranks = run._ranking(plan, {'val/second': .5})
+    assert np.isnan(ranks[0].value)
+    assert ranks[1].value == .5
+
+
+def test_off_cadence_evaluations_only_write_winners_once(tmp_path):
+    run = trainer(tmp_path / 'run')
+    written = []
+    save = run.checkpoints.save
+    def record(*args, **kwargs):
+        written.append(args[0])
+        return save(*args, **kwargs)
+    run.checkpoints.save = record
+    run.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=5)
+    assert written == [1, 2, 3, 5, 8]
+    assert len(set(written)) == len(written)
+
+
+def test_aggregate_does_not_accept_strings_for_object_owned_metrics(tmp_path):
+    metric = Value('value', Shown(better='higher'))
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=2, log_every=1, eval_every=1, checkpoint_every=2,
+            metrics=[metric], best=Best(lambda m: m['val/value']))
+    assert run.checkpoints.best is None
+
+
+def test_validation_loss_reduces_additive_statistics_over_uneven_batches():
+    from dew.objectives.base import Mean
+    from dew.training import evaluate
+
+    class Weighted(Overfit):
+        def loss(self, params, batch, step):
+            values = (params['params']['w'] - batch['target']) ** 2
+            return Mean(jnp.sum(values), jnp.asarray(values.size, jnp.float32)), Aux({})
+
+    objective = Weighted()
+    variables = objective.init(jax.random.key(0))
+    batches = [{'target': np.zeros(16, np.float32)}, {'target': np.ones(8, np.float32)}]
+    result = evaluate(objective, variables, lambda partition: iter(batches), key=jax.random.key(0), loss=True)
+    assert result.scores['val/loss'] == pytest.approx(1 / 3)
+
+
+def test_validation_loss_uses_exactly_the_ema_weights_of_the_evaluated_state():
+    from dew.training import evaluate
+    objective = Overfit()
+    live = {'params': {'w': jnp.asarray(.9)}}
+    averaged = {'params': {'w': jnp.asarray(.5)}}
+    result = evaluate(objective, live, data().val, key=jax.random.key(0), averaged=averaged, step=7, loss=True)
+    assert result.step == 7
+    assert result.scores['val/loss'] == 0.
+    direct = evaluate(objective, averaged, data().val, key=jax.random.key(0), step=7, loss=True)
+    assert direct.scores == result.scores

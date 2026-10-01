@@ -460,9 +460,12 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
-class _MetricValues(Mapping):
-    def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float]):
-        self.metrics, self.scores = metrics, scores
+class _MetricValues[Statistics, Additions](Mapping):
+    def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float], objective: Objective[Statistics, Additions]):
+        self.objective = objective
+        self.metrics = tuple(metrics) + tuple(objective.scalar(name) for name in ('loss', *objective.shown)
+                                              if name == 'loss' or f'train/{name}' in scores)
+        self.scores = scores
 
     def __getitem__(self, metric):
         split = 'val'
@@ -470,7 +473,7 @@ class _MetricValues(Mapping):
             split, metric = metric
         if isinstance(metric, TrainingScalar):
             return self.scores[f'train/{metric.name}']
-        if isinstance(metric, types.MethodType) and metric.__name__ == 'loss' and isinstance(metric.__self__, Objective):
+        if isinstance(metric, types.MethodType) and metric.__name__ == 'loss' and metric.__self__ is self.objective:
             return self.scores['train/loss']
         if isinstance(metric, str):
             if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
@@ -486,7 +489,7 @@ class _MetricValues(Mapping):
         for name in self.scores:
             split, _, label = name.partition('/')
             metric = next((metric for metric in self.metrics if metric.name == label), None)
-            yield name if metric is None else metric if split == 'val' else (split, metric)
+            yield name if metric is None else metric if split == 'val' or isinstance(metric, TrainingScalar) else (split, metric)
 
     def __len__(self):
         return len(self.scores)
@@ -1387,17 +1390,14 @@ class Trainer(Generic[Loss, Effects]):
         else:
             checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         evaluation_due = bool(plan.eval_every and current % plan.eval_every == 0)
-        if current < steps and (evaluation_due or (plan.validation and checkpoint_due)):
+        if current < steps and (evaluation_due or ((plan.validation or plan.best or plan.stop) and checkpoint_due)):
             with region("evaluate"):
-                run.evaluation = self._evaluation(plan, state, shardings)
+                run.evaluation = self._evaluation(plan, state, shardings, run.training)
                 run.other += run.evaluation.elapsed_seconds
         scores = {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
-        training_selection = any(isinstance(choice.metric, TrainingScalar) for choice in plan.best) or (
-            plan.stop is not None and isinstance(plan.stop.metric, TrainingScalar))
-        if scores or (evaluation_due and training_selection):
-            scores.update({'train/loss': float(loss), **{f'train/{name}': float(value) for name, value in aux.items()}})
         ranking = self._ranking(plan, scores)
-        candidate = evaluation_due and checkpoints is not None and any(checkpoints.would_keep(rank) for rank in ranking)
+        winners = checkpoints._candidates(ranking) if evaluation_due and checkpoints is not None else ()
+        candidate = bool(winners)
         if scores and self._plateau(plan, run, scores):
             run.stopped = True
             run.stop_control['stop_reason'] = 'validation plateau'
@@ -1410,8 +1410,8 @@ class Trainer(Generic[Loss, Effects]):
                 and checkpoint_due and current < steps) or (candidate and current < steps):
             assert checkpoints is not None
             run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
-                                                 training_best=not plan.validation, control=run.stop_control,
-                                                 weights_only=not checkpoint_due and not run.stopped and bool(ranking) and all(rank.weights_only for rank in ranking))
+                                                 training_best=not plan.validation and not plan.best, control=run.stop_control,
+                                                 weights_only=not checkpoint_due and not run.stopped and bool(winners) and all(rank.weights_only for rank in winners))
             run.last_checkpoint = time.monotonic()
         if (plan.local_every and checkpoints is not None
                 and current % plan.local_every == 0 and current < steps):
@@ -1424,7 +1424,7 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         if current < steps and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
-                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, training_best=not plan.validation, control=run.stop_control)
+                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, training_best=not plan.validation and not plan.best, control=run.stop_control)
             run.preempted = current
             return True
         return False
@@ -1462,10 +1462,8 @@ class Trainer(Generic[Loss, Effects]):
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
-        if plan.validation and run.preempted is None and not run.stopped:
-            run.evaluation = self._evaluation(plan, state, shardings)
-            run.evaluation = dataclasses.replace(run.evaluation, scores={**run.evaluation.scores,
-                **{name: float(value) for name, value in run.training.items()}})
+        if (plan.validation or plan.eval_every or plan.best or plan.stop) and run.preempted is None and not run.stopped:
+            run.evaluation = self._evaluation(plan, state, shardings, run.training)
             run.other += run.evaluation.elapsed_seconds
             if self._plateau(plan, run, run.evaluation.scores):
                 run.stopped = True
@@ -1478,7 +1476,7 @@ class Trainer(Generic[Loss, Effects]):
             # make a resume restart the schedule from the beginning.
             scores = {} if run.evaluation is None or run.evaluation.step != current else run.evaluation.scores
             run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores,
-                                                 ranking=self._ranking(plan, scores), training_best=not plan.validation,
+                                                 ranking=self._ranking(plan, scores), training_best=not plan.validation and not plan.best,
                                                  control=run.stop_control)
         if checkpoints is not None:
             checkpoints.wait()
@@ -1538,8 +1536,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(f"unknown validation split {selection.split!r}")
         return selection
 
-    @staticmethod
-    def _ranking(plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
+    def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
         if not plan.best:
             name = ('val' if plan.validation_splits is None else next(iter(plan.validation_splits))) + '/loss' if plan.validation else 'train/loss'
             return (Ranking(name, scores[name]),) if name in scores else ()
@@ -1552,7 +1549,7 @@ class Trainer(Generic[Loss, Effects]):
             else:
                 name = f'aggregate:{index}'
                 try:
-                    value = float(metric(_MetricValues(plan.metrics, scores)))
+                    value = float(metric(_MetricValues(plan.metrics, scores, self.objective)))
                 except KeyError:
                     value = float('nan')
             mode = selection.mode or 'min'
@@ -1585,15 +1582,18 @@ class Trainer(Generic[Loss, Effects]):
         held['step'] = run.current
         return held['bad'] >= stop.evals
 
-    def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState]) -> Evaluation:
+    def _evaluation(self, plan: _FitPlan, state: TrainState, shardings: Placement[TrainState],
+                    training: Mapping[str, jax.Array]) -> Evaluation:
+        reports = training if self.checkpoints is not None or plan.best or plan.stop else None
+        loss = plan.validation and not plan.best and not any(metric.name == 'loss' for metric in plan.metrics)
         if plan.validation_splits is None:
-            return self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview, loss=plan.validation and self.checkpoints is not None)
-        reports = []
+            return self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview, loss=loss and self.checkpoints is not None, training=reports)
+        evaluations = []
         for split, reader in plan.validation_splits.items():
-            reports.append(self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview,
-                                          loss=True, reader=reader, split=split))
-        return dataclasses.replace(reports[0], scores={name: value for report in reports for name, value in report.scores.items()},
-                                   elapsed_seconds=sum(report.elapsed_seconds for report in reports))
+            evaluations.append(self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview,
+                                          loss=loss, reader=reader, split=split, training=reports))
+        return dataclasses.replace(evaluations[0], scores={name: value for report in evaluations for name, value in report.scores.items()},
+                                   elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
@@ -1881,7 +1881,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
                   metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
-                  reader: Reader | None = None, split: str = 'val') -> Evaluation:
+                  reader: Reader | None = None, split: str = 'val', training: Mapping[str, jax.Array] | None = None) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
         which is what the goodput fraction is measured against.
@@ -1907,7 +1907,7 @@ class Trainer(Generic[Loss, Effects]):
             evaluation = evaluate(
                 self.objective, params, dataset.val if reader is None else reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
-                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split)
+                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
         self._report_evaluation(evaluation)
         return evaluation
 
