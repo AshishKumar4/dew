@@ -162,7 +162,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.training import Trainer
 
     teacher_run = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
+        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                         "time_scale": 0.002},
                           dtype="float32", attention_impl="xla"),
         data=OxfordFlowers(image_size=4), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
@@ -179,6 +180,13 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
 
+    fast = tmp_path / "fast"
+    fast.mkdir()
+    dataclasses.replace(teacher_run, model=dataclasses.replace(teacher_run.model, config={
+        key: value for key, value in teacher_run.model.config.items() if key != "time_scale"})).save(str(fast))
+    with pytest.raises(ValueError, match="time_scale=16"):
+        dataclasses.replace(teacher_run, distill=ConsistencyDistillation(teacher=str(fast))).build()
+
     config = dataclasses.replace(teacher_run, distill=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
         max_simulation_steps=2), sampler=samplers.Consistency(), sampling_steps=3)
@@ -188,6 +196,10 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     for got, want in zip(jax.tree.leaves(params[TEACHER]), jax.tree.leaves(task.trainable(state.params)),
                          strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    # The student reads the teacher's Fourier table, built at the teacher's time scale.
+    table = params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
+    np.testing.assert_array_equal(np.asarray(table), np.asarray(
+        state.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
 
     def gradients(step):
         def loss(tree):

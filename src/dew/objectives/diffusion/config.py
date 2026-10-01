@@ -272,6 +272,27 @@ class ConsistencyDistillation:
             mean, std = (float(value) for value in getattr(self, name))
             object.__setattr__(self, name, (mean, std))
 
+    def check_teacher(self, architecture: str) -> None:
+        """Refuse sCM over a teacher whose time embedding is too fast in time.
+
+        The student starts from the teacher's variables, its Fourier table
+        among them, so the time scale the student trains through is the one
+        the teacher was trained at, whatever this run's model config says.
+        """
+        if self.consistency != "continuous" or self.consistency_weight <= 0:
+            return
+        if "time_scale" not in {field.name for field in dataclasses.fields(models[architecture])}:
+            return
+        teacher = DiffusionRunConfig.load(self.teacher)
+        scale = teacher.model_fields(None).get("time_scale",
+                                               {f.name: f.default for f in dataclasses.fields(
+                                                   models[teacher.model.architecture])}["time_scale"])
+        if scale != SMOOTH_TIME_SCALE:
+            raise ValueError(
+                f"sCM differentiates the student in time, and the student starts from a teacher trained at "
+                f"time_scale={scale}, whose time embedding is too fast in it to learn from; train the teacher "
+                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)")
+
     def teacher_variables(self, variables: Variables | None) -> Variables:
         """The teacher model's variables: a saved distilled tree's own, else
         the teacher run's published ones."""
@@ -529,12 +550,9 @@ class DiffusionRunConfig(RunConfig):
             # An interval process's model reads the interval's duration.
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
-        differentiated = self.mean_flow is not None or (self.distill is not None
-                                                        and self.distill.consistency == "continuous"
-                                                        and self.distill.consistency_weight > 0)
-        if differentiated and "time_scale" in declared and "time_scale" not in self.model.config:
-            # MeanFlow's and sCM's losses differentiate the model in time; the
-            # default time embedding is far too fast in it to learn from.
+        if self.mean_flow is not None and "time_scale" in declared and "time_scale" not in self.model.config:
+            # MeanFlow's loss differentiates the model in time; the default
+            # time embedding is far too fast in it to learn from.
             fields["time_scale"] = SMOOTH_TIME_SCALE
         if "output_channels" in declared:
             sample = self.sample_field()
@@ -616,6 +634,8 @@ class DiffusionRunConfig(RunConfig):
                 ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
+
+            self.distill.check_teacher(self.model.architecture)
 
             fields = {field.name: getattr(self.distill, field.name) for field in dataclasses.fields(self.distill)
                       if field.name != "teacher"}
