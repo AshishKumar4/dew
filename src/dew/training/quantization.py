@@ -340,29 +340,11 @@ def _grouped_convolution_gradient() -> type:
 
 
 @functools.cache
-def _providers() -> tuple[type, type]:
-    """Qwix's quantized-training and serving providers with Dew's grouped
-    convolution; importing Qwix here keeps it optional.
-
-    Both pass a matmul with a complex operand through unquantized, as the
-    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
-    quantized training quantized the real operand of the scan's
-    real-by-complex input projection, after which `jax.grad` failed on the
-    complex gradient Qwix returned for it. The training provider
-    differentiates a grouped convolution (`_grouped_convolution_gradient`).
-
-    The serving provider casts a quantized kernel's scales to the dtype a
-    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
-    through: a bf16 module then multiplied bf16 activations by fp32
-    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
-    scales two quantized operands' product in float32
-    (`_scaled_in_float32`)."""
+def _group_scaled_convolution() -> type:
+    """Qwix's provider base with Dew's grouped convolution, the base of both
+    of Dew's providers; importing Qwix here keeps it optional."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    dot_general = _qwix("qwix._src.core.dot_general")
-    einsum = _qwix("qwix._src.core.einsum")
-    quantized = _qwix("qwix._src.providers.ptq").WithAux
+    dew_conv = importlib.import_module("dew.nn.conv")
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
         """Quantizes a grouped convolution's input with one scale per feature
@@ -389,9 +371,26 @@ def _providers() -> tuple[type, type]:
         """
 
         def get_intercept_map(self):
-            # Conv's CUDA implementation must keep Qwix's scales and GPU refusal.
+            # Dew's Conv convolves through dew.nn.conv._conv_general_dilated,
+            # which on CUDA computes a dilated depthwise convolution as shifted
+            # products and so reaches no lax convolution Qwix intercepts.
             return {**super().get_intercept_map(),
-                    "dew.nn.conv._conv_general_dilated": self.conv_general_dilated}
+                    "dew.nn.conv._conv_general_dilated": self.dew_conv_general_dilated}
+
+        def dew_conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, *args, **kwargs) -> jax.Array:
+            """Dew's convolution, through this provider when a rule
+            quantizes it, so that it keeps the per-group scales and the GPU
+            refusal, and otherwise Dew's own, as the unwrapped model computes
+            it (inside this handler Qwix calls the original). Sent through
+            the provider unquantized, an excluded or weight-only dilated
+            depthwise convolution took lax's path on CUDA, and quantized
+            training of the hybrid DiT parted from Qwix's own and from the
+            unwrapped model after its zero-initialized fusion kernels'
+            first update (ColabPlan-2, the RTX 4080)."""
+            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
+            if rule is None or rule.weight_qtype is None:
+                return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
+            return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
                                  padding: str | Sequence[tuple[int, int]],
@@ -420,6 +419,35 @@ def _providers() -> tuple[type, type]:
             batch, feature = numbers.out_spec[:2]
             return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
 
+    return GroupScaledConvolution
+
+
+@functools.cache
+def _providers() -> tuple[type, type]:
+    """Qwix's quantized-training and serving providers with Dew's grouped
+    convolution; importing Qwix here keeps it optional.
+
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it. The training provider
+    differentiates a grouped convolution (`_grouped_convolution_gradient`).
+
+    The serving provider casts a quantized kernel's scales to the dtype a
+    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
+    through: a bf16 module then multiplied bf16 activations by fp32
+    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
+    qwix = _qwix()
+    conv_general = _qwix("qwix._src.core.conv_general")
+    dot_general = _qwix("qwix._src.core.dot_general")
+    einsum = _qwix("qwix._src.core.einsum")
+    quantized = _qwix("qwix._src.providers.ptq").WithAux
+    group_scaled = _group_scaled_convolution()
+
     class ComplexInFloat(qwix.QuantizationProvider):
         """Passes a matmul with a complex operand through unquantized."""
 
@@ -437,10 +465,10 @@ def _providers() -> tuple[type, type]:
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
 
-    class QtProvider(GroupScaledConvolution, ComplexInFloat, _grouped_convolution_gradient()):
+    class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
         pass
 
-    class PtqProvider(GroupScaledConvolution, ComplexInFloat, qwix.PtqProvider):
+    class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
