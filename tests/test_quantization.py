@@ -216,6 +216,105 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
     assert float(error.min()) > 0.0
 
 
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("dilation", [1, 2])
+@pytest.mark.parametrize("group_width", [1, 4])
+def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(group_width, dilation):
+    """Quantized training differentiates a grouped convolution: its value
+    and its gradients for the kernel and the input are those of Qwix's own
+    quantized training of the same convolution written ungrouped, with a
+    block-diagonal kernel, on the input divided by its group peaks as Dew
+    divides it. A grouped convolution is an ungrouped one whose kernel is
+    zero across groups, the zeros quantize to zero, and every group then
+    peaks at 1, so the two quantize to the same integers and Qwix's
+    ungrouped backward is the reference. The values are bitwise equal. The
+    gradients sum the same nonzero products in other orders (the reference's
+    zeros add exactly), so each entry differs by at most float32's bound for
+    two reductions of those products (`assert_fp32_reduction_bound`): 9 per
+    group channel and one division by the peak for the input's, one per
+    input position for the kernel's. Observed on CPU at the highest
+    precision: within 2.2e-07 relative, and 0.5% to 0.9% from the float
+    convolution's gradients, inside int8's 2%. Before, Qwix's grouped
+    backward raised (`128 // 128 != 128` for the hybrid DiT's depthwise
+    convolutions)."""
+    qwix = pytest.importorskip("qwix")
+    from qwix._src.core import conv_general, qarray
+    from reference_error import assert_fp32_reduction_bound
+
+    from dew.nn.conv import Conv
+
+    features = 64
+    groups = features // group_width
+    settings = {"features": features, "kernel_size": (3, 3), "padding": "SAME",
+                "kernel_dilation": (dilation, dilation), "use_bias": False}
+    grouped = Conv(**settings, feature_group_count=groups)
+    ungrouped = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * jnp.logspace(-3, 0, features)
+    kernel = grouped.init(jax.random.key(1), x)["params"]["kernel"]
+    cotangent = jax.random.normal(jax.random.key(2), x.shape)
+    # Output channel o reads input channel i as its group's j-th: block[j, o, i].
+    block = (jnp.arange(features)[None, None, :]
+             == (jnp.arange(features)[None, :, None] // group_width) * group_width
+             + jnp.arange(group_width)[:, None, None]).astype(kernel.dtype)
+    peaks = jnp.max(jnp.abs(x.reshape(2, 8, 8, groups, group_width)), axis=(1, 2, 4))
+    peaks = jnp.repeat(peaks, group_width, axis=1)[:, None, None, :]
+
+    def dew(kernel, x):
+        return apply_quantization(grouped, Quantization()).apply({"params": {"kernel": kernel}}, x)
+
+    def reference(kernel, x):
+        block_diagonal = jnp.einsum("hwjo,joi->hwio", kernel, block)
+        return ungrouped.apply({"params": {"kernel": block_diagonal}}, x / peaks) * peaks
+
+    def plain(kernel, x):
+        return grouped.apply({"params": {"kernel": kernel}}, x)
+
+    def value_and_gradients(function):
+        out, transpose = jax.vjp(jax.jit(function), kernel, x)
+        return (out, *transpose(cotangent))
+
+    def dequantized(array, for_lhs):
+        how = conv_general.get_how_to_quantize(
+            dimension_numbers=jax.lax.conv_dimension_numbers(x.shape, kernel.shape, ("NHWC", "HWIO", "NHWC")),
+            for_lhs=for_lhs, qtype=jnp.int8, calibration_method="absmax")
+        return qarray.dequantize(qarray.quantize(array, how))
+
+    def convolve(x, kernel):
+        return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", rhs_dilation=(dilation, dilation),
+                                            dimension_numbers=("NHWC", "HWIO", "NHWC"), feature_group_count=groups)
+
+    with jax.default_matmul_precision("highest"):
+        got, want, float_ = (value_and_gradients(function) for function in (dew, reference, plain))
+        # The absolute products each gradient sums: the dequantized operands
+        # the backward reads, and the cotangent scaled by the peaks.
+        _, transpose = jax.vjp(convolve, jnp.abs(dequantized(x / peaks, True)), jnp.abs(dequantized(kernel, False)))
+        x_magnitude, kernel_magnitude = transpose(jnp.abs(cotangent * peaks))
+    np.testing.assert_array_equal(got[0], want[0])
+    assert_fp32_reduction_bound(got[1], want[1], kernel_magnitude, int(np.prod(x.shape[:-1])))
+    assert_fp32_reduction_bound(got[2], want[2], x_magnitude / peaks, 9 * group_width + 1)
+    for got_part, float_part in zip(got[1:], float_[1:], strict=True):
+        assert 0.0 < float(jnp.linalg.norm(got_part - float_part) / jnp.linalg.norm(float_part)) < 0.02
+
+
+@pytest.mark.skipif(jax.default_backend() == "gpu",
+                    reason="Dew refuses a grouped quantized convolution on a GPU; "
+                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+def test_quantized_gradients_of_a_grouped_convolution_are_refused():
+    """Qwix 0.1.8 cannot quantize a grouped convolution's gradients, so
+    training one with `bwd_qtype` raises naming the ways around it."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    conv = Conv(features=16, kernel_size=(3, 3), padding="SAME", feature_group_count=16, use_bias=False)
+    x = jax.random.normal(jax.random.key(0), (2, 8, 8, 16))
+    variables = conv.init(jax.random.key(1), x)
+    with pytest.raises(ValueError, match=r"bwd_qtype.*spatial_fusion"):
+        apply_quantization(conv, Quantization(bwd_qtype="int8")).apply(variables, x)
+
+
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 @pytest.mark.parametrize("group_width", [1, 4])
