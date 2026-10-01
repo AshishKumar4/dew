@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import math
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -77,6 +78,7 @@ from dew.telemetry.records import (
 )
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
+    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -248,19 +250,18 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
-                    mesh: Mesh) -> tuple[jax.stages.Compiled, bool]:
+                    mesh: Mesh, held: int = 0) -> tuple[jax.stages.Compiled, bool]:
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
-    Returns the step to run and whether it fits.
+    Returns the step to run and whether it fits; `held` is `step_fits`'s.
 
     The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
     (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
-    plan their whole logits in 13.1 GiB with them, against 13.6 GiB of an
-    0.85 pool, while without them the step plans more. Within `FIT_RESERVE`
-    of the limit neither counts as fitting, and the head tiles. So the
-    fusions come back before the ladder's first rung, where they fit."""
+    keep their whole logits in 13.1 GiB with them, inside the 13.24 GiB of an
+    0.85 pool, while without them the step does not fit and tiles its head.
+    So the fusions come back before the ladder's first rung."""
     default = program.compile()
-    if not step_fits(default, mesh):
+    if not step_fits(default, mesh, held):
         return executable, False
     print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
                   "compiling it with them", "yellow"), file=sys.stderr)
@@ -319,33 +320,70 @@ DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
-# The share of each device's allocator limit a step leaves free to count as fitting. A step XLA
-# plans inside the limit can still fail to place its largest temporary at run time. On an RTX
-# 4080 (jax 0.11.2, a 2-layer Qwen3-0.6B-width decoder at 8 x 1024 tokens, whole logits, a
-# 13.1 GiB plan), a fresh process failed with RESOURCE_EXHAUSTED on its 10.3 GiB temporary in
-# 1 of 16 runs with 3.6% of the limit to spare and 2 of 16 with 5.8%, under the BFC and the
-# cuda_async allocators alike, and in none of 48 with 7.9% (pool-fraction sweep, 2026-10-01).
-# 8% is the smallest share at which that sweep did not fail, a measured edge on one card, not a
-# derived bound; a step planned within it takes the next, slower rung.
-FIT_RESERVE = 0.08
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
+    """The bytes the tightest of `devices` has to spare once the compiled
+    step's temporaries and new outputs are placed beside `held` more bytes
+    the loop keeps outside the step, None where the executable or a device
+    reports no memory. The arguments, the state and the batch, are already
+    resident and counted in use; the donated state's buffers are reused for
+    the outputs that alias them.
 
-
-def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | None:
-    """The bytes the tightest of `devices` has free once the compiled step's
-    temporaries and new outputs are placed and `FIT_RESERVE` of its limit is
-    kept back, None where the executable or a device reports no memory. The
-    arguments, the state and the batch, are already resident and counted in
-    use; the donated state's buffers are reused for the outputs that alias
-    them.
-
-    This compares against the allocator's limit; a growable allocator
-    (XLA_PYTHON_CLIENT_PREALLOCATE=false) can fragment below it."""
+    XLA's GPU step takes all its temporaries in one allocation, so it needs
+    one free block that large, not that many free bytes: on an A100 the
+    'minimal' rung of a Qwen3-1.7B fine-tune ran out of memory placing its
+    11.68 GiB of temporaries with 16.3 GiB free, split 5.9 GiB below the
+    state and 10.4 GiB above it. `placeable` reads the block from the
+    allocator. Where it `strands_temporaries`, they need room twice."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
-    needed = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
-    return min(int(m['bytes_limit'] * (1 - FIT_RESERVE)) - m['bytes_in_use'] for m in memory) - needed
+    beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
+    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
+               for d, m in zip(devices, memory, strict=True))
+
+
+def placeable(memory: Mapping[str, int]) -> int:
+    """The bytes one allocation can take from a device whose allocator
+    reports `memory` (`Device.memory_stats`), the most a step's temporaries
+    and every buffer beside them can need of one block.
+
+    XLA's GPU pool, its BFC allocator, reports its size (pool_bytes) and its
+    largest free block; a pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false)
+    can also take a new block from the part of its limit it has not taken.
+    cuda_async and a TPU's allocator report no pool, and their free bytes are
+    all there is to read."""
+    free = memory['bytes_limit'] - memory['bytes_in_use']
+    if 'pool_bytes' not in memory:
+        return free
+    return min(free, max(memory['largest_free_block_bytes'], memory['bytes_limit'] - memory['pool_bytes']))
+
+
+def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
+    """Whether the allocator of a device of `platform`, which reports
+    `memory`, can leave a step's temporaries no block to return to, so that
+    the next step needs a second block as large.
+
+    XLA's spatially partitioned BFC pool can: a preallocated pool with
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
+    There a free block below a buffer serves every small allocation before
+    the open space past it. A batch prefetched while the temporaries are
+    placed lands past them; once they are freed the next step's outputs take
+    a few bytes of their block. On an RTX 4080 a step with 6.5 GiB of
+    temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
+    runs. With the partitioning off, which `prepare_process` sets, the
+    smallest block that fits serves them instead: 4 of 4 runs placed a batch
+    past the temporaries 20 to 45 times each and finished.
+
+    cuda_async can too, and reports neither its blocks nor its pool: the
+    8192-token step there, 10.3 GiB of temporaries with 10.45 GiB free,
+    failed in 1 of 8 runs at a 0.85 pool, 1 of 8 at 0.87 and 1 of 16 at 0.91.
+    At the failure its pool held 14.2 GB with 3.0 GB in use, the device had
+    1.9 GB free, and neither gave the 11.1 GB the step asked for again."""
+    if 'pool_bytes' not in memory:
+        return platform == 'gpu'
+    partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
+    return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
 def fits_everywhere(headroom: int | None) -> bool:
@@ -361,11 +399,21 @@ def fits_everywhere(headroom: int | None) -> bool:
     return bool(np.min(gathered) >= 0)
 
 
-def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
+def step_fits(executable: jax.stages.Compiled, mesh: Mesh, held: int = 0) -> bool:
     """Whether the compiled step fits the free memory of every device of
-    `mesh`, agreed across the processes that hold them."""
+    `mesh` beside `held` bytes more on each, agreed across the processes that
+    hold them."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return fits_everywhere(step_headroom(executable, local))
+    return fits_everywhere(step_headroom(executable, local, held=held))
+
+
+def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
+    """The bytes a device holds of the batches `fit` places while a step
+    runs, beside the one the step reads: the `PREFETCH_DEPTH` it queues and
+    the one it is placing, each laid out as `shardings` places `batch`."""
+    shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
+                          * np.dtype(leaf.dtype).itemsize, batch, shardings)
+    return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
 
 
 def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
@@ -1018,6 +1066,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
+            placement = batch_shardings(mesh, batch)
+            held = prefetched_bytes(batch, placement)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             while True:
@@ -1031,16 +1081,16 @@ class Trainer(Generic[Loss, Effects]):
                     return (dataclasses.replace(advanced, step=current.step + 1), loss,
                             aux.metrics, jnp.isfinite(loss), advanced.microstep > current.microstep)
 
-                jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
+                jitted = jax.jit(step, in_shardings=(shardings, placement),
                                  out_shardings=(shardings, replicated, replicated, replicated,
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
                 options = step_compiler_options(self.objective)
                 self.executable = self.program.compile(options)
-                fits = step_fits(self.executable, mesh)
+                fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
-                    self.executable, fits = fitting_default(self.program, self.executable, mesh)
+                    self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
                 if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
