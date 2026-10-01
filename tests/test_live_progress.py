@@ -61,7 +61,7 @@ def test_a_text_model_reports_its_load_once_and_each_generation(progress, monkey
         loads.append(name)
         return lambda prompt, tokens, *, seed: (prompt, tokens, seed)
 
-    text_model = progress.ReportingModels(load)
+    text_model = progress.ReportingModels(load, progress.ReportingText)
     assert text_model("small")("a", 24, seed=0) == ("a", 24, 0)
     assert text_model("small")("b", 8, seed=1) == ("b", 8, 1)
     assert loads == ["small"]
