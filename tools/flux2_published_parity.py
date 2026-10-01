@@ -28,6 +28,10 @@ import sys
 import numpy as np
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Both sides in true float32: an A100 otherwise multiplies float32 in TF32,
+# torch's convolutions and JAX's matmuls alike, which moves a 4B model's
+# output by 1e-3.
+os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
 
 REPO = "black-forest-labs/FLUX.2-klein-4B"
 REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
@@ -58,6 +62,8 @@ def main(repo: str, revision: str) -> dict[str, float]:
     from dew.interop import sources
     from dew.interop.pretrained import _denoiser, _diffusion_vae, load_hidden_states_conditioner
 
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     directory = sources.snapshot(repo, revision, weights=("text_encoder", "transformer", "vae"))
     gaps: dict[str, float] = {}
@@ -118,4 +124,12 @@ def main(repo: str, revision: str) -> dict[str, float]:
 if __name__ == "__main__":
     repo = sys.argv[1] if len(sys.argv) > 1 else REPO
     revision = sys.argv[2] if len(sys.argv) > 2 else REVISION
-    print(json.dumps({"repo": repo, "revision": revision, "gaps": main(repo, revision)}, indent=1))
+    gaps = main(repo, revision)
+    import jax
+    import torch
+
+    precision = {"jax_default_matmul_precision": jax.config.jax_default_matmul_precision,
+                 "torch_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+                 "torch_cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+                 "devices": [str(device) for device in jax.devices()]}
+    print(json.dumps({"repo": repo, "revision": revision, "precision": precision, "gaps": gaps}, indent=1))
