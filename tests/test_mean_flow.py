@@ -150,3 +150,15 @@ def test_meanflow_refuses_the_denoising_losss_extras(extra):
     model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
     with pytest.raises(ValueError, match="own loss"):
         MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))), **extra)
+
+
+def test_the_time_embeddings_take_the_models_time_scale():
+    """`time_scale` sets the Fourier frequencies of the time and the duration
+    embeddings, the smoothness a loss differentiating in time needs."""
+    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True,
+                             time_scale=0.002)
+    variables = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
+    table = np.random.RandomState(42).normal(size=(8,)).astype(np.float32) * np.float32(0.002)
+    for name in ("time_embed", "duration_embed"):
+        frequencies = variables["constants"]["conditioning"][name]["layers_0"]["frequencies"]
+        np.testing.assert_allclose(np.asarray(frequencies), table, rtol=1e-6)
