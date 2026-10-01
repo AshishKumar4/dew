@@ -249,14 +249,94 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
 
 
 @functools.cache
+def _grouped_convolution_gradient() -> type:
+    """Qwix's quantized-training provider with Dew's gradient for a grouped
+    convolution; importing Qwix here keeps it optional."""
+    qwix = _qwix()
+    conv_general_qt = _qwix("qwix._src.core.conv_general_qt")
+    qarray = _qwix("qwix._src.core.qarray")
+
+    @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
+    def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
+                        dimension_numbers, feature_group_count, batch_group_count, out_sharding):
+        return conv_general_qt.conv_general_qt_fwd(
+            lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+            feature_group_count, batch_group_count, out_sharding)[0]
+
+    def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                         feature_group_count, batch_group_count, out_sharding, residuals, g):
+        operands = [qarray.dequantize(operand) if isinstance(operand, qarray.QArray) else operand
+                    for operand in residuals]
+
+        def convolve(lhs, rhs):
+            # A bf16 module's kernel meets Dew's float32 grouped input
+            # (`GroupScaledConvolution`); its gradient returns as bf16.
+            dtype = jnp.result_type(lhs, rhs)
+            return jax.lax.conv_general_dilated(
+                lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
+                dimension_numbers, feature_group_count, batch_group_count)
+
+        _, transpose = jax.vjp(convolve, *operands)
+        return transpose(g)
+
+    grouped_conv_qt.defvjp(conv_general_qt.conv_general_qt_fwd, straight_through)
+
+    class GroupedConvolutionGradient(qwix.QtProvider):
+        """Differentiates a quantized grouped convolution, which Qwix's
+        quantized training (0.1.8 `conv_general_qt_bwd`) cannot: its backward
+        convolves the gradient with the forward's `feature_group_count` and
+        the kernel's grouped shape, which only fits one group, so `jax.grad`
+        raised for the hybrid DiT's depthwise convolutions.
+
+        The forward is Qwix's. The backward is the one Qwix computes for an
+        ungrouped convolution with float gradients: the float convolution's
+        transpose at the dequantized operands the forward computed with,
+        here JAX's own, which handles groups. Qwix's quantized gradients
+        (`bwd_qtype`) for a grouped convolution are refused."""
+
+        def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
+                                 padding: str | Sequence[tuple[int, int]],
+                                 lhs_dilation: Sequence[int] | None = None,
+                                 rhs_dilation: Sequence[int] | None = None,
+                                 dimension_numbers: jax.lax.ConvGeneralDilatedDimensionNumbers = None,
+                                 feature_group_count: int = 1, batch_group_count: int = 1,
+                                 precision: jax.lax.PrecisionLike = None,
+                                 preferred_element_type: jax.typing.DTypeLike | None = None,
+                                 out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
+            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
+            if feature_group_count == 1 or rule is None or rule.weight_qtype is None:
+                return super().conv_general_dilated(
+                    lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                    feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
+            if rule.bwd_qtype is not None:
+                raise ValueError(
+                    "Qwix 0.1.8 cannot compute the quantized gradients of a grouped convolution, so Dew "
+                    "refuses bwd_qtype for one; leave bwd_qtype unset, or leave the convolution out of "
+                    "Quantization.patterns, as patterns=('^(?!.*spatial_fusion).*',) does for the hybrid "
+                    "DiT's depthwise convolutions")
+            if rule.tile_size:
+                raise ValueError("subchannel is not supported for conv_general_dilated.")
+            rule, op_id = self._get_current_rule_and_op_id("conv_general_dilated")
+            return grouped_conv_qt(lhs, rhs, self._create_conv_general_qt_config(rule, op_id, lhs, rhs),
+                                   window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                                   feature_group_count, batch_group_count, out_sharding)
+
+    return GroupedConvolutionGradient
+
+
+@functools.cache
 def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
     convolution; importing Qwix here keeps it optional.
 
-    The serving provider also passes complex matmuls through unquantized,
-    as the training provider does (`numerics.should_quantize`); Qwix 0.1.8's
-    PTQ raises on them instead, and the hybrid DiT's S5 scan multiplies
-    complex states. It casts a quantized kernel's scales to the dtype a
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it. The training provider
+    differentiates a grouped convolution (`_grouped_convolution_gradient`).
+
+    The serving provider casts a quantized kernel's scales to the dtype a
     module promotes its kernel to, where Qwix 0.1.8 passes the kernel
     through: a bf16 module then multiplied bf16 activations by fp32
     dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
@@ -325,15 +405,8 @@ def _providers() -> tuple[type, type]:
             batch, feature = numbers.out_spec[:2]
             return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
 
-    class QtProvider(GroupScaledConvolution, qwix.QtProvider):
-        pass
-
-    class PtqProvider(GroupScaledConvolution, qwix.PtqProvider):
-        def __init__(self, rules: Sequence[object]) -> None:
-            super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
-                _einsum_fn=_scaled_in_float32(einsum.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
+    class ComplexInFloat(qwix.QuantizationProvider):
+        """Passes a matmul with a complex operand through unquantized."""
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
@@ -348,6 +421,16 @@ def _providers() -> tuple[type, type]:
             if _real(*(operand.dtype for operand in operands)):
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
+
+    class QtProvider(GroupScaledConvolution, ComplexInFloat, _grouped_convolution_gradient()):
+        pass
+
+    class PtqProvider(GroupScaledConvolution, ComplexInFloat, qwix.PtqProvider):
+        def __init__(self, rules: Sequence[object]) -> None:
+            super().__init__(
+                rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
+                _einsum_fn=_scaled_in_float32(einsum.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(conv_general.conv_general_dilated))
 
         def promote_dtype(self, *args, **kwargs):
             # `WithAux.astype` itself raises on a QArray in Qwix 0.1.8
