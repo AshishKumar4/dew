@@ -38,7 +38,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import _FAMILIES, _wrapper_sources, translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import families, _wrapper_sources, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
@@ -255,7 +255,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
     from dew.nn.vision import deepseek_v41_vision_path, projector_weight_path
 
     config, record, model, shapes = released
-    family = _FAMILIES["deepseek_v41"]
+    family = families()["deepseek_v41"]
     text = config["text_config"]
     names = []
     for name in json.loads((RELEASED / "tensor_names.json").read_text())["names"]:

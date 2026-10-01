@@ -8,6 +8,7 @@ of the objective and the trainer together.
 """
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables, scalar_loss
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
@@ -87,6 +88,84 @@ def make_batch(count=8):
     encoder = StubText.from_pretrained("stub")
     return {"image": images,
             "text": encoder.tokenize(["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"][:count])}
+
+
+def test_build_defers_unconditional_encoding_and_reuses_its_exact_snapshot(monkeypatch):
+    """Building binds the towers; their first use encodes the fixed prompt once."""
+    encoder = StubText.from_pretrained("stub")
+    tokens = encoder.tokenize([""])
+    expected = encoder.encode(encoder.params, tokens)
+    original = StubText.encode
+    calls = []
+
+    def encoded(self, params, tokens):
+        assert not any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(params))
+        calls.append(True)
+        return original(self, params, tokens)
+
+    monkeypatch.setattr(StubText, "encode", encoded)
+    objective = make_objective()
+    assert not calls
+    given = jax.tree.map(jnp.asarray, expected)
+    with jax.default_matmul_precision("highest"):
+        first = jax.jit(objective.blank_conditions)({"textcontext": given})
+        second = jax.jit(objective.blank_conditions)({"textcontext": given})
+    assert len(calls) == 1
+    for actual in (first, second):
+        for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(got, want)
+
+
+def test_first_blank_reads_saved_weights_without_constant_folding_their_initializers():
+    """Flax's shape validation may trace an initializer, but must not execute it."""
+    initialized = []
+
+    def initializer(key, shape, dtype=jnp.float32):
+        initialized.append(isinstance(key, jax.core.Tracer))
+        return jax.random.normal(key, shape, dtype)
+
+    class Tower(nn.Module):
+        @nn.compact
+        def __call__(self, ids):
+            table = self.param("table", initializer, (VOCAB, FEATURES))
+            return table[ids]
+
+    class Encoder(StubText):
+        def encode(self, params, tokens):
+            return TextContext(hidden=Tower().apply({"params": params}, jnp.asarray(tokens["input_ids"])),
+                               mask=jnp.asarray(tokens["attention_mask"]))
+
+    encoder = Encoder.from_pretrained("stub")
+    objective = DiffusionObjective(Zero(), presets.Flow(), InputSpec(
+        Field("image", (2, 2, 1)), {"textcontext": Condition(encoder)}))
+    given = TextContext(jnp.zeros((1, TOKENS, FEATURES)), jnp.ones((1, TOKENS), jnp.int32))
+    actual = jax.jit(objective.blank_conditions)({"textcontext": given})
+    np.testing.assert_array_equal(actual["textcontext"].hidden,
+                                  np.asarray(encoder.params["table"])[encoder.tokenize([""])["input_ids"]])
+    assert initialized and all(initialized), "shape checking executed a random weight initializer"
+
+
+@pytest.mark.parametrize("kind", ["clip", "char"])
+def test_lazy_blank_keeps_the_eager_towers_bits_and_construction_precision(kind):
+    """A later trace's matmul policy must not change the original eager snapshot."""
+    if kind == "clip":
+        encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures/clip/tiny"),
+                                           dtype="float32")
+    else:
+        encoder = CharTable.from_pretrained(dtype="float32")
+    inputs = InputSpec(Field("image", (2, 2, 1)),
+                       {"textcontext": Condition(encoder, unconditional="a bird")})
+    tokens = encoder.tokenize(["a bird"])
+    with jax.default_matmul_precision("highest"):
+        expected = encoder.encode(encoder.params, tokens)
+        objective = DiffusionObjective(Zero(), presets.Flow(), inputs)
+    # As in the old constructor, the fixed prompt reads the construction
+    # policy. A differently configured caller only casts this saved result.
+    with jax.default_matmul_precision("bfloat16"):
+        actual = jax.jit(objective.blank_conditions)({"textcontext": expected})
+    for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
+                                      np.ascontiguousarray(want).view(np.uint8))
 
 
 def tree_fingerprint(tree):
@@ -233,7 +312,7 @@ def encode_calls(monkeypatch, encoder) -> list:
 
 def test_the_text_tower_runs_once_a_step(monkeypatch):
     """The unconditional branch is a pure function of the frozen tower and a
-    fixed prompt, so the objective encodes it when it is built and the
+    fixed prompt, so the objective caches its first encoding and the
     compiled step encodes the batch and nothing else. Encoding it in the step
     instead ran the tower twice a step, the second time over one row of
     padding."""
@@ -241,6 +320,8 @@ def test_the_text_tower_runs_once_a_step(monkeypatch):
     params = objective.init(jax.random.PRNGKey(0))
     batch = make_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+    # First use prepares the fixed prompt independently of the compiled step.
+    _ = objective.unconditional_conditions
     calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
 
     jax.make_jaxpr(objective.loss)(params, batch, step)
@@ -249,7 +330,7 @@ def test_the_text_tower_runs_once_a_step(monkeypatch):
     assert np.shape(calls[0]["input_ids"])[0] == batch["image"].shape[0]
 
 
-def test_the_unconditional_branch_is_encoded_when_the_objective_is_built():
+def test_the_unconditional_branch_is_cached_as_host_arrays_on_first_use():
     """What the objective holds is what encoding the tower again produces, to
     the bit, and it is host arrays rather than a leaf of the state: the state
     an objective initializes has the collections it always had."""
@@ -316,6 +397,8 @@ def test_a_sampling_call_does_not_encode_the_tasks_own_unconditional_prompt(monk
     objective = make_objective()
     params = objective.init(jax.random.PRNGKey(0))
     pipe = TextToImage.from_objective(objective, params)
+    # The first use caches the fixed prompt; later requests only encode their text.
+    _ = objective.unconditional_conditions
     calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
 
     prepared = pipe.prepare(["a bird", "a cat"], steps=3, seed=0)
