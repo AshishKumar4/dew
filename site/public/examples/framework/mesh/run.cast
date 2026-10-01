@@ -1,0 +1,2 @@
+{"version": 2, "width": 96, "height": 200, "timestamp": 1790822236, "env": {"TERM": "xterm-256color"}}
+[5.809448, "o", "{\r\n  \"axes\": {\r\n    \"data\": 1,\r\n    \"expert\": 1,\r\n    \"fsdp\": 2,\r\n    \"tensor\": 2,\r\n    \"sequence\": 1,\r\n    \"stage\": 1\r\n  },\r\n  \"devices\": [\r\n    0,\r\n    1,\r\n    2,\r\n    3\r\n  ],\r\n  \"backend\": \"cpu\",\r\n  \"training\": false\r\n}\r\n"]
