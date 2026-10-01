@@ -72,6 +72,19 @@ def test_a_transform_after_greedy_can_restore_a_sampled_distribution():
     np.testing.assert_allclose(behavior, -np.log(4.0), atol=2e-6, rtol=2e-6)
 
 
+def test_an_array_backed_logits_chain_can_be_jitted_directly():
+    """A callable chain captures processor arrays as the old closure did."""
+    state = StepState(jnp.zeros((2, 2), jnp.int32), jnp.zeros((2, 2), bool),
+                      jnp.zeros(2, jnp.int32), jnp.ones(2, bool),
+                      jax.random.split(jax.random.key(0), 2), prompt_width=1)
+    scores = jnp.asarray([[1.0, 9.0, 5.0, 7.0], [8.0, 2.0, 4.0, 1.0]], jnp.float32)
+    chain = decoding.chain((decoding.SuppressTokens(jnp.asarray([1, 3], jnp.int32)), decoding.Greedy()))
+    actual = jax.jit(chain)(state, scores)
+    expected = np.full((2, 4), -np.inf, np.float32)
+    expected[np.arange(2), [2, 0]] = 0.0
+    np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
 def test_terminal_greedy_still_refuses_an_undefined_processed_distribution(invalid):
     state = StepState(jnp.zeros((1, 2), jnp.int32), jnp.zeros((1, 2), bool),

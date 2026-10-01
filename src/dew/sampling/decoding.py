@@ -1091,12 +1091,14 @@ def components(values: LogitsTransform | Sequence[LogitsTransform]) -> tuple[Log
     return tuple(as_pytree(value) for value in values)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False)
 class LogitsChain:
     """The ordered transforms, retaining a terminal Greedy for the sampler.
 
     An arbitrary transform after Greedy may restore a nondegenerate
     distribution, so only the final built-in Greedy proves an argmax draw.
+    Like a function closure, the callable is hashed by identity, not by its
+    captured processor arrays, when passed directly to `jax.jit`.
     """
 
     transforms: tuple[LogitsTransform, ...]
