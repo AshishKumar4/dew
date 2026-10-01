@@ -113,6 +113,10 @@ class MeanFlowObjective(DiffusionObjective):
     `unconditional_prob` of the rows, whose target is then the unguided v.
     Sampling takes `steps - 1` Euler steps of the average velocity, one by
     default, with no guidance at sampling: it is trained in.
+
+    The loss differentiates the model in time, so the model's time
+    embedding must be smooth in it: `simple_dit(time_scale=0.002)`, which
+    a run config sets for it, rather than the default 16.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,

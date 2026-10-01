@@ -177,6 +177,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     optimizer whose update moves on a zero gradient, such as Adam's momentum,
     still moves it. Sampling walks the student's multistep consistency
     sampler, `Consistency`.
+
+    sCM's loss differentiates the student in time, so its time embedding
+    must be smooth in it: `simple_dit(time_scale=0.002)`, which a run config
+    sets for it, rather than the default 16.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: Variables,
