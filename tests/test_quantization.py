@@ -440,6 +440,57 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
           f"whole continuations={int(matches.all(axis=1).sum())}/{matches.shape[0]}")
 
 
+@pytest.mark.mesh
+def test_quantizing_resident_weights_keeps_their_parameter_shards():
+    from dew.inference import TextGeneration
+
+    pytest.importorskip("qwix")
+    model = tiny()
+    prompt = jnp.asarray(token_batch()["text"][:, :4])
+    variables = model.init(jax.random.key(0), prompt)
+    mesh = build_mesh(MeshSpec(fsdp=2))
+    variables = jax.device_put(variables, Layout(min_shard=1).shardings(mesh, variables))
+    served = TextGeneration(model, variables).quantized(Quantization(weight_only=True, patterns=(".*_proj",)))
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        original = variables["params"]["layers_0"]["self_attn"][name]["kernel"]
+        quantized = served.variables["params"]["layers_0"]["self_attn"][name]["kernel"].array.qvalue
+        assert "fsdp" in str(original.sharding.spec)
+        assert quantized.sharding == original.sharding
+
+
+def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix_cpu():
+    """Host kernels use Qwix 0.1.8 on CPU, then generate on the active backend."""
+    import functools
+
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+    from dew.training.quantization import METHODS
+
+    qwix = pytest.importorskip("qwix")
+    model = tiny()
+    prompt = jnp.asarray(token_batch()["text"][:, :4])
+    resident = model.init(jax.random.key(0), prompt)
+    host = jax.device_get(resident)
+    spec = Quantization(weight_only=True, patterns=(".*_proj",))
+    task = TextGeneration(model, host, sampling=Sampling(temperature=0))
+    served = task.quantized(spec)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
+    reference = qwix.quantize_model(model, qwix.PtqProvider([
+        qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
+                              op_names=("dot_general", "einsum", "dot"))]),
+        methods=tuple(method for method in METHODS if hasattr(model, method)))
+    with jax.default_device(jax.devices("cpu")[0]):
+        abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
+                                                   jnp.zeros((1, 1), jnp.int32)))
+        cpu_params = jax.device_put(host["params"], jax.devices("cpu")[0])
+        reference_variables = {**host, "params": qwix.quantize_params(cpu_params, abstract["params"])}
+    expected = TextGeneration(reference, jax.device_get(reference_variables), sampling=task.sampling)
+    np.testing.assert_array_equal(jax.jit(served.model.apply)(served.variables, prompt),
+                                  jax.jit(expected.model.apply)(expected.variables, prompt))
+    np.testing.assert_array_equal(served(prompt, 3, seed=7).host().tokens,
+                                  expected(prompt, 3, seed=7).host().tokens)
+
+
 def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
     import sys
 
