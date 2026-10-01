@@ -1487,6 +1487,27 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
+def test_a_step_planned_within_the_fit_reserve_does_not_fit():
+    """A step XLA plans inside the allocator's limit, with less than
+    FIT_RESERVE of it to spare, does not count as fitting: on an RTX 4080 such
+    a step failed to place its largest temporary in 1 to 2 of 16 runs, so the
+    ladder takes the next rung instead. One with the reserve to spare fits."""
+    from types import SimpleNamespace
+
+    from dew.training.trainer import FIT_RESERVE, step_headroom
+
+    limit, resident = 16 * 2**30, 2**30
+
+    def planned(temporaries):
+        return SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
+            output_size_in_bytes=0, alias_size_in_bytes=0, temp_size_in_bytes=temporaries))
+
+    device = SimpleNamespace(memory_stats=lambda: {"bytes_limit": limit, "bytes_in_use": resident})
+    spare = int(limit * FIT_RESERVE)
+    assert step_headroom(planned(limit - resident - spare // 2), [device]) < 0
+    assert step_headroom(planned(limit - resident - 2 * spare), [device]) > 0
+
+
 def test_accumulation_must_be_positive():
     with pytest.raises(ValueError, match="accumulation"):
         make_trainer(accumulation=0)
@@ -1495,11 +1516,13 @@ def test_accumulation_must_be_positive():
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384])
 def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
     """Compare real Trainer steps with the measured recipe: unfused whole
-    logits at 4096 tokens, fused whole logits at 8192, and a 4096-row tile
-    at 16384. Fresh processes keep conftest's deterministic XLA flags out
-    of the measurement; those flags change which whole-logits step fits.
-    The ABBA order and warmed step medians allow 4% noise, below the old
-    8%, 18%, and 3x regressions. Children need room for a preallocated pool.
+    logits at 4096 tokens, and a 4096-row tile at 8192 and 16384. At 8192
+    the fused whole logits plan 13.1 GiB of the 13.6 GiB pool, within the
+    fit check's reserve (`FIT_RESERVE`), so the step has to say it tiles.
+    Fresh processes keep conftest's deterministic XLA flags out of the
+    measurement; those flags change which whole-logits step fits. The ABBA
+    order and warmed step medians allow 4% noise, below the old 8%, 18%,
+    and 3x regressions. Children need room for a preallocated pool.
     """
     devices = jax.devices()
     if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
@@ -1533,8 +1556,8 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "true", "XLA_PYTHON_CLIENT_ALLOCATOR": "cuda_async"}
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
-        objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
-        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        objective = {"head_tile": [4096, 8192] if tokens >= 8192 else "whole"} if reference else {}
+        options = " --xla_gpu_enable_triton_gemm=false" if reference and tokens == 4096 else ""
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",
@@ -1542,6 +1565,8 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
              "--json-out", str(record)], cwd=root,
             env={**environment, "XLA_FLAGS": flags + options}, capture_output=True, text=True, timeout=180)
         assert done.returncode == 0, done.stdout + done.stderr
+        if not reference:
+            assert ("with the whole logits kept" in done.stderr) == (tokens >= 8192), done.stderr
         row, = json.loads(record.read_text())
         assert row["finite"], row
         samples[int(reference)].append(row["p50_ms"])
