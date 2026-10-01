@@ -58,6 +58,17 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     np.testing.assert_array_equal(generated, np.load(directory / 'generated.npy'))
 
 
+def test_gpt2_public_generation_matches_the_reference_continuation():
+    from dew.inference.tasks import TextGeneration
+    from dew.sampling.text import Sampling
+
+    loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
+    ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')[:1, :4]
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
+    generated = task(ids, max_new_tokens=6, seed=0)
+    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(FIXTURES / 'gpt2-tiny' / 'generated.npy'))
+
+
 @pytest.mark.parametrize('term', ['norm_bias', 'mlp_bias', 'learned_positions'])
 def test_gpt2_reference_detects_a_dropped_classic_term(term):
     loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
@@ -121,7 +132,8 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
 def test_released_gpt2_small_logits_and_generation_at_highest_fp32_precision(tmp_path):
     from tools.classic_gpt_reference import check_checkpoint
 
-    check_checkpoint('openai-community/gpt2', tmp_path / 'parity.json')
+    check_checkpoint('openai-community/gpt2', tmp_path / 'parity.json',
+                     revision='607a30d783dfa663caf39e06633721c8d4cfcd7e')
 
 
 @pytest.mark.parametrize('bias', [False, True])
