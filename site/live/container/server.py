@@ -20,15 +20,18 @@ Messages to the page, each with the id of the cell they belong to:
     {"type": "error", "ename", "evalue", "traceback": [<str>]}
     {"type": "clear"}
     {"type": "done", "status": "ok" | "error" | "aborted", "count": <int or null>}
-and, without an id: {"type": "ready", "uptime": <s>, "setup": <s>}, {"type": "restarted"},
-{"type": "closing", "reason": <str>}. The reasons are "time", "idle", "unused" and
-"kernel-failed", when the kernel did not start.
+and, without an id: {"type": "ready", "uptime": <s>, "setup": <s>, "image": <str>, "dew": <sha>},
+{"type": "restarted"}, {"type": "closing", "reason": <str>}. The reasons are "time",
+"idle", "unused" and "kernel-failed", when the kernel did not start.
 
 A new kernel runs the landing page's setup cell before the page hears "ready",
 so the model loads once per kernel, while the container waits for its page;
-"setup" says how long that took, and "uptime" how long the server had run. A
+"setup" says how long that took, "uptime" how long the server had run, "image"
+the image reference the Worker started the container from, and "dew" the Dew
+commit installed in it. A
 spare, which no page has connected to by then, also runs the page's sampling
-cell once, so the page's first run finds its programs compiled. (A compilation
+and text cells once, so the page's first runs find the text model loaded and
+both programs compiled. (A compilation
 cache baked into the image cannot do this: JAX keys a CPU program by the host's
 CPU model and features, and the build machine is never a Cloudflare host.) A
 sampling cell then reports its steps as display outputs (see progress.py).
@@ -60,10 +63,12 @@ MAX_OUTPUT = 2_000_000  # characters of output from one cell; the rest is droppe
 MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well under the relay's 32 MiB
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
+IMAGE = os.environ.get("DEW_LIVE_IMAGE", "")
+DEW_COMMIT = Path("/opt/live/dew-commit").read_text().strip()
 # The landing page's setup cell (deploy.mjs copies it here), then preload.py; and its
-# sampling cell, which a spare runs once.
+# sampling and text cells, which a spare runs once.
 PRELOAD = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler_setup.py", "preload.py"))
-WARMUP = Path("/opt/live/sampler.py").read_text()
+WARMUP = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler.py", "text.py"))
 PRELOAD_SECONDS = 300
 SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS")
 
@@ -314,7 +319,7 @@ class Session:
             if not await self.ready_or_closed():
                 return
             await self.send({"type": "ready", "uptime": round(time.monotonic() - self.started, 1),
-                             "setup": round(self.preload_seconds, 1)})
+                             "setup": round(self.preload_seconds, 1), "image": IMAGE, "dew": DEW_COMMIT})
             async for raw in socket:
                 self.last_request = time.monotonic()
                 try:
