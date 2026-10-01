@@ -5,8 +5,7 @@
 
 import { live } from '../live.mjs';
 
-const ENDPOINT = live.endpoint;
-const SITEKEY = live.turnstileSitekey;
+const { endpoint: ENDPOINT, turnstileSitekey: SITEKEY } = location.hostname === live.preview.hostname ? live.preview : live;
 
 export const liveEnabled = Boolean(ENDPOINT && SITEKEY);
 
@@ -80,7 +79,11 @@ export class LiveSession {
 	private next = 0;
 	onClose: (message: string) => void = () => {};
 
-	private constructor(private readonly socket: WebSocket) {
+	private constructor(
+		private readonly socket: WebSocket,
+		/** The kernel was a warm spare, which has already compiled the sampling cell. */
+		readonly warm: boolean,
+	) {
 		socket.addEventListener('message', (event) => {
 			const message = JSON.parse(String(event.data));
 			if (message.type === 'closing') {
@@ -116,7 +119,7 @@ export class LiveSession {
 		});
 		const body = await response.json().catch(() => ({}));
 		if (!response.ok) throw new Error(body.message ?? `The live service answered ${response.status}.`);
-		status('Starting a container with Dew and JAX. The first start can take half a minute…');
+		status('Starting a container and loading the model. This takes about a minute…');
 		const socket = new WebSocket(body.socket);
 		const { promise: ready, resolve, reject } = Promise.withResolvers<void>();
 		const onMessage = (event: MessageEvent) => {
@@ -131,7 +134,7 @@ export class LiveSession {
 			socket.removeEventListener('message', onMessage);
 			socket.removeEventListener('close', onClose);
 		}
-		return new LiveSession(socket);
+		return new LiveSession(socket, body.warm === true);
 	}
 
 	/** Run one cell; `onOutput` hears each output as it arrives. */
