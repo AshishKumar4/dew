@@ -437,7 +437,8 @@ class TrainingDisplay:
 
         if evaluations := self.evaluation_rows():
             parts.append(Text())
-            parts.append(self.metrics(evaluations, inner, options.size.height, evaluation=True))
+            used = len(console.render_lines(Group(*parts), options.update(width=inner, height=None), pad=False))
+            parts.append(self.metrics(evaluations, inner, options.size.height - used - 4, evaluation=True))
 
         title = Text.assemble(" ", ("dew", Style(color=Color.from_triplet(END), bold=True)),
                               (" · ", LABEL), (self.title, "bold"), " ")
