@@ -1008,7 +1008,7 @@ def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, save
     nested head and `norm` (conversion_mapping.py:489-508 is ^-anchored on
     the first three, so the reverse leaves them). Both spellings are the
     same weights and land on the same leaf."""
-    from dew.interop.hf_decoders import _deepseek_v4_path
+    from dew.interop.families.deepseek import _deepseek_v4_path
 
     config = translate_config(fixture_config("deepseek-v4-tiny"))
     path = _deepseek_v4_path(released, config)
