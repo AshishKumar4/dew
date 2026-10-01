@@ -18,6 +18,7 @@ import functools
 import math
 import sys
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
@@ -800,7 +801,11 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is None or resume is None:
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
-            state = jax.jit(self.initial_state, out_shardings=shardings)(initializer, key)
+            held = self._placed_held(initializer, abstract, shardings)
+            with warnings.catch_warnings():
+                # A held array no output can take over is freed as the JIT returns.
+                warnings.filterwarnings('ignore', 'Some donated buffers were not usable')
+                state = jax.jit(self.initial_state, out_shardings=shardings, donate_argnums=0)(held, key)
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
@@ -819,6 +824,39 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _placed_held(self, initializer: Initializer, abstract: TrainState,
+                     shardings: Placement[TrainState]) -> Initializer:
+        """`initializer` with a copy of each array it holds placed where the
+        state keeps the variable of its path and shape
+        (`Objective.held_variables`), for the state's JIT to take over, the
+        rest replicated.
+
+        Handed to the JIT as they are, a loaded checkpoint's arrays were placed
+        below the state it built and freed once it was: a hole as large as the
+        checkpoint under the state, 5.9 GiB on an A100 for Qwen3-1.7B, whose
+        'minimal' rung then found no free block for its temporaries
+        (`step_headroom`). Placed where the state keeps them and donated, they
+        become the state's buffers, of the variable or of an optimizer moment
+        laid out like it. The copy leaves the objective's own arrays alone."""
+        variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
+            jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
+            strict=True)}
+        replicated = NamedSharding(self.device_mesh, P())
+
+        def placement(path, leaf):
+            # An initializer binds the checkpoint as `variables`
+            # (`Objective.initializer`), so a leaf's path below that keyword
+            # is its variable's.
+            keys = [key.key if isinstance(key, jax.tree_util.DictKey) else None for key in path]
+            sharding, shape = variables.get(path[keys.index('variables') + 1:] if 'variables' in keys else (),
+                                            (replicated, None))
+            return sharding if shape == np.shape(leaf) else replicated
+
+        # A copy of an array already on the devices: device_put can reuse a
+        # buffer the target shares with the source, which donation would free.
+        owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, initializer)
+        return jax.device_put(owned, jax.tree_util.tree_map_with_path(placement, initializer))
 
     def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
                            stored: Variables, initializer, key) -> TrainState:
