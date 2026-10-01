@@ -55,7 +55,7 @@ from .linear import (
     recurrent_delta_rule,
     strictly_lower_inverse,
 )
-from .mixers.base import MixerBase, MixerContext, mixers
+from .mixer_base import MixerBase, MixerContext, mixers
 from .precision import at_least_fp32
 from .sharding import logical_axes
 

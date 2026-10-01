@@ -33,7 +33,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
-from dew.nn.mixers.base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
     RopeScaling,
