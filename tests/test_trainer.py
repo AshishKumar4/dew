@@ -1559,15 +1559,15 @@ def planned_step(temporaries, outputs=0):
         output_size_in_bytes=outputs, alias_size_in_bytes=0, temp_size_in_bytes=int(temporaries)))
 
 
-def device_memory(limit, in_use, largest=0, pool=None):
-    """A device as the fit check reads it: its allocator's memory_stats. Only
-    XLA's GPU pool (BFC) reports pool_bytes."""
+def device_memory(limit, in_use, largest=0, pool=None, platform="gpu"):
+    """A device as the fit check reads it: its platform and its allocator's
+    memory_stats. Only XLA's GPU pool (BFC) reports pool_bytes."""
     from types import SimpleNamespace
 
     stats = {"bytes_limit": int(limit), "bytes_in_use": int(in_use), "largest_free_block_bytes": int(largest)}
     if pool is not None:
         stats["pool_bytes"] = int(pool)
-    return SimpleNamespace(memory_stats=lambda: stats)
+    return SimpleNamespace(platform=platform, memory_stats=lambda: stats)
 
 
 def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
@@ -1623,14 +1623,27 @@ def test_a_growing_pool_places_temporaries_in_a_region_it_has_yet_to_take(monkey
 
 
 def test_an_allocator_without_a_pool_is_read_by_its_free_bytes(monkeypatch):
-    """cuda_async and a TPU's allocator report no pool and no free block, so
-    their free bytes are all the check reads."""
+    """A TPU's allocator reports no pool, so its free bytes are all the
+    check reads."""
     from dew.training.trainer import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "")
-    unpooled = device_memory(16 * GiB, 3 * GiB)
-    assert step_headroom(planned_step(12.9 * GiB), [unpooled]) > 0
-    assert step_headroom(planned_step(13.1 * GiB), [unpooled]) < 0
+    tpu = device_memory(16 * GiB, 3 * GiB, platform="tpu")
+    assert step_headroom(planned_step(12.9 * GiB), [tpu]) > 0
+    assert step_headroom(planned_step(13.1 * GiB), [tpu]) < 0
+
+
+def test_cuda_async_needs_room_for_the_temporaries_twice(monkeypatch):
+    """cuda_async reports no pool and no free block, and its pool can hold
+    a step's freed temporaries where the next step cannot reuse them: the
+    RTX 4080's 8192-token step, 10.3 GiB of them with 10.45 GiB free, failed
+    in 1 of 8 runs at a 0.85 pool. So the step needs room for them twice."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    unpooled = device_memory(13.24 * GiB, 2.79 * GiB)
+    assert step_headroom(planned_step(10.31 * GiB), [unpooled]) < 0
+    assert step_headroom(planned_step(5 * GiB), [unpooled]) > 0
 
 
 def test_a_step_fits_beside_the_bytes_the_loop_holds_outside_it(monkeypatch):

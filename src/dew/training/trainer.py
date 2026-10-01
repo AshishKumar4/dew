@@ -333,14 +333,14 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     'minimal' rung of a Qwen3-1.7B fine-tune ran out of memory placing its
     11.68 GiB of temporaries with 16.3 GiB free, split 5.9 GiB below the
     state and 10.4 GiB above it. `placeable` reads the block from the
-    allocator. In a `partitioned` pool the temporaries need room twice."""
+    allocator. Where it `strands_temporaries`, they need room twice."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
-    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if partitioned(m) else 1)
-               for m in memory)
+    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
+               for d, m in zip(devices, memory, strict=True))
 
 
 def placeable(memory: Mapping[str, int]) -> int:
@@ -359,23 +359,31 @@ def placeable(memory: Mapping[str, int]) -> int:
     return min(free, max(memory['largest_free_block_bytes'], memory['bytes_limit'] - memory['pool_bytes']))
 
 
-def partitioned(memory: Mapping[str, int]) -> bool:
-    """Whether a device's pool, as its allocator reports `memory`, is XLA's
-    spatially partitioned BFC pool: preallocated, with
-    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
+def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
+    """Whether the allocator of a device of `platform`, which reports
+    `memory`, can leave a step's temporaries no block to return to, so that
+    the next step needs a second block as large.
 
+    XLA's spatially partitioned BFC pool can: a preallocated pool with
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
     There a free block below a buffer serves every small allocation before
-    the open space past it. A batch prefetched while a step's temporaries are
+    the open space past it. A batch prefetched while the temporaries are
     placed lands past them; once they are freed the next step's outputs take
-    a few bytes of their block, and the step after needs a second block as
-    large in the open space. On an RTX 4080 a step with 6.5 GiB of
+    a few bytes of their block. On an RTX 4080 a step with 6.5 GiB of
     temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
     runs. With the partitioning off, which `prepare_process` sets, the
     smallest block that fits serves them instead: 4 of 4 runs placed a batch
-    past the temporaries 20 to 45 times each and finished."""
+    past the temporaries 20 to 45 times each and finished.
+
+    cuda_async can too, and reports neither its blocks nor its pool: the
+    8192-token step there, 10.3 GiB of temporaries with 10.45 GiB free,
+    failed in 1 of 8 runs at a 0.85 pool, 1 of 8 at 0.87 and 1 of 16 at 0.91.
+    At the failure its pool held 14.2 GB with 3.0 GB in use, the device had
+    1.9 GB free, and neither gave the 11.1 GB the step asked for again."""
+    if 'pool_bytes' not in memory:
+        return platform == 'gpu'
     partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
-    return ('pool_bytes' in memory and memory['pool_bytes'] >= memory['bytes_limit']
-            and partitioning.lower() not in ('false', '0'))
+    return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
 def fits_everywhere(headroom: int | None) -> bool:
