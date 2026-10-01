@@ -1837,7 +1837,8 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     must be square, and the activation one the shared MLP runs.
     """
     vision = _vision_section(hf_config)
-    if vision.get("model_type", "qwen3_5_vision") not in ("qwen3_5_vision", "qwen3_5"):
+    if vision.get("model_type", "qwen3_5_vision") not in (
+            "qwen3_5_vision", "qwen3_5", "qwen3_5_moe_vision", "qwen3_5_moe"):
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
     table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")
