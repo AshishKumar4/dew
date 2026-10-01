@@ -802,12 +802,24 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     # ulp can flip the cotangent's bf16 rounding: one bf16 ulp of an entry,
     # which is 2^-7 of an entry sitting at a power of two, the bottom of its
     # binade, and the flipped entry can be the largest.
-    # fp32 compute keeps fp32's order-of-summation bound, tripled: log Z is
-    # one running reduction (`_row_terms`) that rounds the exponential that
-    # rescales a partial sum, the product and the add where a plain sum rounds
-    # the add alone. Against float64 the whole head's gradients sit at 4.7e-6
-    # and 4.9e-6 of their maximum, the tiled head's at 2.3e-6 and 2.5e-6.
-    bound = 6e-6 if dtype == jnp.float32 else 2.0**-7
+    # In fp32 each path's log Z is one running reduction over its row
+    # (`_row_terms`). A merge rounds the exponential that rescales a partial
+    # sum, the product and the add, three roundings, and XLA's merge order is
+    # not shown here, so its depth is taken as the row's V entries, the
+    # conservative count: the sum of positive terms is off by at most
+    # gamma(3V) relative, which is log Z's absolute error from the sum, and
+    # log Z = m + log(s) rounds twice more, gamma(2) |log Z|. A probability
+    # exp(x - log Z) carries that error relative and three roundings of its
+    # own, and a gradient entry sums V of them, V more roundings. Two paths,
+    # so twice gamma(4V + 5) + gamma(2) max |log Z|, 9.8e-4 here. Measured:
+    # 4.9e-6 of the largest entry on CPU, 3.3e-5 on an RTX 4080, whose
+    # default fp32 products are TF32.
+    if dtype == jnp.float32:
+        def gamma(steps):
+            return steps * 2.0**-24 / (1 - steps * 2.0**-24)
+        bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
+    else:
+        bound = 2.0**-7
     for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
