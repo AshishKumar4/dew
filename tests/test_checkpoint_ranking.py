@@ -207,7 +207,7 @@ def test_named_config_selector_roundtrips_and_refuses_callable():
     metric = Value('accuracy', Shown(better='higher'))
     config = RunConfig(trainer=TrainerConfig(best=Best('accuracy', top=2), checkpoint_every='15m'))
     assert RunConfig.from_dict(config.to_dict()) == config
-    best = config.trainer.best_policies([metric])[0]
+    best = config.trainer.best_policies()[0]
     assert best.metric == 'accuracy' and best.top == 2
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=lambda m: 1.)
@@ -308,3 +308,19 @@ def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_
     assert objective.values.ce.owner is objective
     with pytest.raises(AttributeError, match='does not declare'):
         _ = objective.values.unknown_report
+
+
+@pytest.mark.parametrize('given', ['fid', '{"metric":"fid","top":3}',
+                                  '[{"metric":"fid"},{"metric":"clip_score","top":2}]'])
+def test_named_policy_cli_is_one_argument(given):
+    import tyro
+
+    from dew.config import TrainerConfig
+    config = tyro.cli(TrainerConfig, args=['--best', given])
+    assert config.best is not None
+
+
+def test_direct_image_metrics_declare_their_ranking_directions():
+    from dew.eval import FID, CLIPScore
+    assert FID().shown.better == 'lower'
+    assert CLIPScore().shown.better == 'higher'

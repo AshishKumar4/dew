@@ -497,7 +497,7 @@ class Plateau:
 class _MetricValues[Statistics, Additions](Mapping):
     def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float], objective: Objective[Statistics, Additions]):
         self.objective = objective
-        self.metrics = tuple(metrics) + tuple(objective.scalar(name) for name in ('loss', *objective.shown)
+        self.metrics = tuple(metrics) + tuple(objective.values[name] for name in ('loss', *objective.shown)
                                               if name == 'loss' or f'train/{name}' in scores)
         self.scores = scores
 
@@ -506,6 +506,8 @@ class _MetricValues[Statistics, Additions](Mapping):
         if isinstance(metric, tuple):
             split, metric = metric
         if isinstance(metric, TrainingScalar):
+            if metric.owner is not self.objective:
+                raise KeyError("training score belongs to another objective")
             return self.scores[f'train/{metric.name}']
         if isinstance(metric, types.MethodType) and metric.__name__ == 'loss' and metric.__self__ is self.objective:
             return self.scores['train/loss']
@@ -1249,7 +1251,7 @@ class Trainer(Generic[Loss, Effects]):
                             best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
                             validation=validation is not None or (dataset.val is not None and bool(eval_every or metrics or checkpoints)))
             state, shardings, position = self.place()
-            run.last_checkpoint = time.monotonic()
+            run.last_checkpoint = time.perf_counter()
             if checkpoints is not None and checkpoints.latest is not None:
                 run.stop_control = checkpoints.control(checkpoints.latest)
             if self._opened(plan, run, state, position):
@@ -1390,7 +1392,9 @@ class Trainer(Generic[Loss, Effects]):
         if current < steps:
             run.source = plan.dataset.train(data_partition(mesh))
             self._check_stream(run.source, mesh,
-                               checkpointing=bool(plan.checkpoint_every or plan.local_every))
+                               checkpointing=bool(plan.checkpoint_every or plan.local_every or (
+                                   checkpoints is not None and plan.eval_every and (
+                                       not plan.best or any(not choice.weights_only for choice in plan.best)))))
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
@@ -1419,7 +1423,7 @@ class Trainer(Generic[Loss, Effects]):
             self._log_interval(current, loss, aux, accepted, state, interval)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
-            elapsed = time.monotonic() - run.last_checkpoint
+            elapsed = time.perf_counter() - run.last_checkpoint
             due = np.asarray(elapsed >= plan.checkpoint_every.total_seconds())
             checkpoint_due = bool(due) if jax.process_count() == 1 else bool(
                 np.asarray(multihost_utils.process_allgather(due)).any())
@@ -1448,11 +1452,11 @@ class Trainer(Generic[Loss, Effects]):
             run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                                                  training_best=not plan.validation and not plan.best, control=run.stop_control,
                                                  weights_only=not checkpoint_due and not run.stopped and bool(winners) and all(rank.weights_only for rank in winners))
-            run.last_checkpoint = time.monotonic()
+            run.last_checkpoint = time.perf_counter()
         if (plan.local_every and checkpoints is not None
                 and current % plan.local_every == 0 and current < steps):
             run.other += self._saved_local_checkpoint(
-                checkpoints, current, state, position)
+                checkpoints, current, state, position, control=run.stop_control)
         # Asked at every step on every process, as JAX's agreement
         # needs; the last step ends the run on its own.
         if run.stopped:
@@ -1527,7 +1531,7 @@ class Trainer(Generic[Loss, Effects]):
         def owned(choice):
             if isinstance(choice, types.MethodType):
                 if choice.__name__ == 'loss' and choice.__self__ is self.objective:
-                    return self.objective.scalar('loss')
+                    return self.objective.values.loss
                 raise TypeError("a training selector must be this objective's loss or declared scalar")
             if isinstance(choice, TrainingScalar) and choice.owner is not self.objective:
                 raise ValueError("training scalar belongs to a different objective")
@@ -1823,14 +1827,14 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int,
-                                state: TrainState, position: bytes | None) -> float:
+                                state: TrainState, position: bytes | None, *, control: dict | None = None) -> float:
         """Write one checkpoint to the local directory, and report it.
 
         Returns the seconds it took. The local copy carries no metadata; it
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
+        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control)
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -1934,6 +1938,7 @@ class Trainer(Generic[Loss, Effects]):
         A CPU-owned run evaluates on the accelerator, over the same snapshot
         a step realizes, so validation reads the weights where the loss
         does."""
+        paused = time.perf_counter()
         self._display.status("evaluating")
         mesh, params = self.device_mesh, state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
@@ -1954,7 +1959,7 @@ class Trainer(Generic[Loss, Effects]):
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
         self._report_evaluation(evaluation)
-        return evaluation
+        return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
         """Print one evaluation on rank zero and log its previews and scores."""

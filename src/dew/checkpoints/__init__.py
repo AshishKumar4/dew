@@ -875,7 +875,7 @@ class Checkpoints:
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None) -> None:
+                   share: DataPartition | None = None, control: dict | None = None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -891,7 +891,7 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
                        custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas})
+                                        'ema_deltas': deltas, 'control': copy.deepcopy(control or {})})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()

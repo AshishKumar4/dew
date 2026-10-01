@@ -171,6 +171,30 @@ class Wandb:
     offline: bool = False
 
 
+def _best_argument():
+    """A metric name or JSON policies through one CLI argument."""
+    def read(given):
+        text = given[0]
+        if text == 'None':
+            return None
+        if text.startswith(('{', '[')):
+            policies = json.loads(text)
+            return tuple(Best(**policy) for policy in policies) if isinstance(policies, list) else Best(**policies)
+        return Best(text)
+
+    def write(policy):
+        if policy is None:
+            return ['None']
+        if isinstance(policy, str):
+            return [policy]
+        return [json.dumps([_to_json(entry, Best) for entry in policy] if isinstance(policy, tuple) else _to_json(policy, Best))]
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar='METRIC|JSON', instance_from_str=read,
+        is_instance=lambda policy: policy is None or isinstance(policy, (str, Best, tuple)),
+        str_from_instance=write)
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
@@ -178,7 +202,7 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: int = 2
-    best: str | Best | tuple[Best, ...] | None = None
+    best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
@@ -244,7 +268,7 @@ class TrainerConfig:
                 rebuilt.append(choice)
             object.__setattr__(self, 'best', tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0])
 
-    def best_policies(self, metrics):
+    def best_policies(self):
         if self.best is None:
             return None
         return (Best(self.best),) if isinstance(self.best, str) else (
@@ -640,7 +664,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(metrics),
+                best=trainer.best_policies(),
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
