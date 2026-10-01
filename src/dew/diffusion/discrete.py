@@ -133,7 +133,7 @@ class DiscreteProcess:
         return DiscreteDenoiser(self, model, params, inputs, mutable_mask)
 
     def generate(self, model: nn.Module, variables: Variables, inputs: ModelInputs | jax.typing.ArrayLike,
-                 max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
+                 max_new_tokens: int, *, key: int | jax.Array | None = None,
                  n: int = 1, steps: int = MDLM_STEPS, sampler: Unmask | None = None,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Runs native MDLM over one full response span.
@@ -145,7 +145,7 @@ class DiscreteProcess:
         solver = Unmask() if sampler is None else sampler
 
         def resolve() -> tuple[jax.Array, ModelInputs]:
-            request = request_key(key, seed)
+            request = request_key(key)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)

@@ -349,7 +349,7 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], seed=0)
+                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
     # The flow walk is an Euler integration with no noise draw; the key is
     # the call's contract, not a source of difference.
     walked = task(prepared, guidance=CFG(pipeline_record["guidance"]),
@@ -376,7 +376,7 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     assert task.steps == pipeline_record["default_steps"]
     assert task.guidance.scale == pipeline_record["default_guidance"]
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], seed=0)
+                            initial=arrays[f"{case}.x_T"], key=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
 

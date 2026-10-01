@@ -1165,8 +1165,8 @@ def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(g
     tokens[~valid] = 0
     inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
-    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    ordinary = task(inputs, max_new_tokens=7, key=0).host()
+    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)

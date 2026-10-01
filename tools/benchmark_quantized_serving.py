@@ -97,7 +97,7 @@ def nbytes(tree) -> int:
 def forward(pipe: TextToImage) -> dict:
     """Time the denoiser over one guided step's batch, the way sampling calls
     it (`Denoiser.raw_both`), and read its compiled memory."""
-    prepared = pipe.prepare(list(PROMPTS), seed=0, steps=STEPS)
+    prepared = pipe.prepare(list(PROMPTS), key=0, steps=STEPS)
     x, t = prepared.noise, jnp.full(prepared.noise.shape[:1], 0.5)
     variables = {name: value for name, value in pipe.params.items() if name not in ("encoders", "autoencoder")}
 
@@ -124,11 +124,11 @@ def nonfinite(array: ArrayLike) -> int:
     return int(np.size(array) - np.count_nonzero(np.isfinite(np.asarray(array, np.float32))))
 
 
-def sample(pipe: TextToImage, seed: int, decode_batch: int) -> tuple[np.ndarray, dict[str, int]]:
+def sample(pipe: TextToImage, key: int | jax.Array, decode_batch: int) -> tuple[np.ndarray, dict[str, int]]:
     """Every prompt's image as uint8 pixels, and how many non-finite values
     the latents and the decoded pixels held before the pixels were clipped
     and cast, which would hide them."""
-    latents = pipe(list(PROMPTS), seed=seed, steps=STEPS, sampler=DPMSolverMultistep(), guidance=GUIDANCE,
+    latents = pipe(list(PROMPTS), key=key, steps=STEPS, sampler=DPMSolverMultistep(), guidance=GUIDANCE,
                    decode=False).latents
     decode = jax.jit(pipe.autoencoder.decode)
     decoded = np.concatenate([np.asarray(decode(pipe.params["autoencoder"], latents[i:i + decode_batch]), np.float32)
