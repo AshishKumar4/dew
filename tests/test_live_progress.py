@@ -48,3 +48,22 @@ def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, m
     # A walk of `steps` points takes steps - 1 solver steps; the model's last call,
     # the clean prediction at the final point, runs with the decode.
     assert reports == [{"step": k, "steps": steps} for k in range(1, steps)] + [{"stage": "decode"}]
+
+
+def test_a_text_model_reports_its_load_once_and_each_generation(progress, monkeypatch):
+    """The page's text cell asks `text_model` for a model on every run; the
+    kernel loads it once, and says so, and reports each generation, the first
+    one marked, before handing the call through unchanged."""
+    reports, loads = [], []
+    monkeypatch.setattr(progress, "_show", lambda report, png=None: reports.append(report))
+
+    def load(name):
+        loads.append(name)
+        return lambda prompt, tokens, *, seed: (prompt, tokens, seed)
+
+    text_model = progress.ReportingModels(load)
+    assert text_model("small")("a", 24, seed=0) == ("a", 24, 0)
+    assert text_model("small")("b", 8, seed=1) == ("b", 8, 1)
+    assert loads == ["small"]
+    assert reports == [{"stage": "load", "model": "small"}, {"stage": "generate", "first": True},
+                       {"stage": "generate", "first": False}]

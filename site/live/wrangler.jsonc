@@ -7,33 +7,33 @@
 	"name": "dewml-live",
 	"account_id": "f44999d1ddda7012e9a87729eba250f1",
 	"main": "src/index.ts",
-	"compatibility_date": "2026-09-20",
+	"compatibility_date": "2026-09-29",
 	"routes": [{ "pattern": "live.dewml.dev", "custom_domain": true }],
 	"workers_dev": false,
 	"preview_urls": false,
 	"containers": [
 		{
-			"class_name": "Kernel",
-			"image": "./container/Dockerfile",
-			// 4 vCPUs and 12 GiB: the landing page's 176M text-to-image model samples on the CPU.
-			"instance_type": "standard-4",
-			// MAX_SESSIONS caps what runs; the headroom is for instances the platform still
-			// holds, such as one of the previous version during a rollout, which otherwise
-			// leave a session or its spare with no container.
-			"max_instances": 10,
-			// A deploy replaces a running container only after its session could have
-			// reached the wall clock (a spare's WARM_SECONDS 600 and WALL_SECONDS 1200,
-			// plus the Kernel's 15 s alarm).
-			"rollout_active_grace_period": 1815
+			// Each Kernel starts its own container (src/kernel.ts), on standard-4.
+			"class_name": "LiveKernel",
+			"scheduling_policy": "durable_object",
+			"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
 		}
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "KERNEL", "class_name": "Kernel" },
+			{ "name": "KERNEL", "class_name": "LiveKernel" },
 			{ "name": "COORDINATOR", "class_name": "Coordinator" }
 		]
 	},
-	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] }],
+	// v2 moves the containers to the durable_object scheduling policy, which needs a new
+	// class: a Kernel keeps nothing a later session reads. A Worker still on v1 takes two
+	// deploys: delete its old container application (`wrangler containers delete`), deploy
+	// up to v2 with an empty `Kernel` Durable Object still exported, then deploy v3.
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
+		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
+		{ "tag": "v3", "deleted_classes": ["Kernel"] }
+	],
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
 	"vars": {
@@ -66,16 +66,14 @@
 			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
 			"containers": [
 				{
-					"class_name": "Kernel",
-					"image": "./container/Dockerfile",
-					"instance_type": "standard-4",
-					"max_instances": 4,
-					"rollout_active_grace_period": 1815
+					"class_name": "LiveKernel",
+					"scheduling_policy": "durable_object",
+					"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
 				}
 			],
 			"durable_objects": {
 				"bindings": [
-					{ "name": "KERNEL", "class_name": "Kernel" },
+					{ "name": "KERNEL", "class_name": "LiveKernel" },
 					{ "name": "COORDINATOR", "class_name": "Coordinator" }
 				]
 			},
