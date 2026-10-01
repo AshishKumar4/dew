@@ -357,7 +357,7 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
 
     compiled = []
 
-    def headroom(executable, devices):
+    def headroom(executable, devices, held=0):
         rung = (trainer.objective.head_tile is not None,
                 trainer_module.remat_record(trainer.objective.model.remat))
         compiled.append(rung)
