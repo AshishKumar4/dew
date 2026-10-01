@@ -838,7 +838,10 @@ class Trainer(Generic[Loss, Effects]):
         'minimal' rung then found no free block for its temporaries
         (`step_headroom`). Placed where the state keeps them and donated, they
         become the state's buffers, of the variable or of an optimizer moment
-        laid out like it. The copy leaves the objective's own arrays alone."""
+        laid out like it. The copy leaves the objective's own arrays alone: a
+        checkpoint loaded to the host (`load_pretrained`) leaves no hole, while
+        arrays the objective already holds on the devices stay wherever they
+        were placed for as long as it holds them."""
         variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
             jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
             strict=True)}
