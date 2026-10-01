@@ -556,9 +556,14 @@
   "rank": "required"
  },
  "dew.objectives.diffusion.config.AdversarialDistillation": {
-  "distillation_weight": 0.0,
+  "cmap_dim": 64,
+  "distillation_weight": 2.5,
   "feature_layers": [],
-  "head_width": 256,
+  "kernel_size": [
+   9,
+   9
+  ],
+  "r1_weight": 1e-05,
   "renoise_times": [
    1.0,
    1.0

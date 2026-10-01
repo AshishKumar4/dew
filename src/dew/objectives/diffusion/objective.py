@@ -63,6 +63,9 @@ TEACHER = "teacher"
 DISCRIMINATOR = "discriminator"
 """Where an adversarial objective's discriminator heads live in `params`."""
 
+SPECTRAL = "spectral"
+"""The collection of an adversarial objective's spectral-norm vectors."""
+
 LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 """What trains beside the model under `params` and the model never reads."""
 
@@ -74,7 +77,7 @@ def _without_loss_heads(variables: Variables) -> Variables:
     and a teacher."""
     return {name: ({key: value for key, value in tree.items() if key not in LOSS_HEADS}
                    if name in ("params", "constants") else tree)
-            for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER)}
+            for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER, SPECTRAL)}
 
 
 def check_solver(process, sampler, steps: int) -> None:
