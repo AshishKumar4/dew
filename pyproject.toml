@@ -115,6 +115,9 @@ test = [
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
 ]
+# Run mutation tests in CI, one source module at a time. Pin the operators so
+# two reports describe the same mutation population.
+mutation = ["cosmic-ray==8.7.0"]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
 # FID (scipy sqrtm) and Inception weight download
