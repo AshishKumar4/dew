@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -78,7 +78,8 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
              key: jax.Array, metrics: Sequence[Metric] = (),
              step: int | jax.Array = 0, averaged: Variables | None = None,
              preview: bool = False, mesh: Mesh | None = None, split: str = "val",
-             schedule_step: int | jax.Array | None = None, loss: bool = False) -> Evaluation:
+             schedule_step: int | jax.Array | None = None, loss: bool = False,
+             training: Mapping[str, jax.Array] | None = None) -> Evaluation:
     """Evaluate a finite coordinated prefix without an optimizer or tracker.
 
     batches opens a fresh iterator over this process's share of the split
@@ -102,9 +103,9 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     """
     started = time.perf_counter()
     root = jax.process_index() == 0
-    _agree_configuration(metrics, batches, split)
+    _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
     preview_enabled = bool(broadcast_from_process_zero(root and preview))
-    event_step, context, event_words = _event(key, step, schedule_step, averaged)
+    event_step, context, event_words, training_scores = _event(key, step, schedule_step, averaged, training)
     score_key = jax.random.fold_in(context.key, 0x53434F52)
     preview_key = jax.random.fold_in(context.key, 0x50524556)
     scores: dict[str, float] = {}
@@ -116,6 +117,7 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
             objective, variables, batches, context, mesh, metrics=metrics, split=split,
             root=root, preview_enabled=preview_enabled, score_key=score_key,
             preview_key=preview_key, loss=loss)
+    scores.update(training_scores)
     elapsed = time.perf_counter() - started
     scores, elapsed = broadcast_from_process_zero((scores, elapsed))
     return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
@@ -152,7 +154,7 @@ class _Configuration:
         return [self.validation, self.split, [list(entry) for entry in self.metrics]]
 
 
-def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None:
+def _agree_configuration(metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False) -> None:
     """Check this rank's evaluation settings, then agree they match root's.
 
     Ranks that disagree about the split, the metrics or whether there is a
@@ -170,7 +172,7 @@ def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None
             metrics=tuple((metric.name, metric.reads.__module__, metric.reads.__qualname__)
                           for metric in metrics))
 
-    configuration = agreed("configuration", checked).broadcast()
+    configuration = [agreed("configuration", checked).broadcast(), loss, training]
     root_configuration = broadcast_from_process_zero(configuration)
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")
@@ -178,15 +180,16 @@ def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
-           averaged: Variables | None) -> tuple[int, Step, tuple[int, ...]]:
+           averaged: Variables | None, training: Mapping[str, jax.Array] | None = None
+           ) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
 
     The clocks come home through a collective, so a rank whose own step
     differs uses root's. The key folds in 'EVAL' and that step, so an
     evaluation never draws what a training step at the same clock drew.
     """
-    step_home, schedule_home = collective_host(
-        (step, step if schedule_step is None else schedule_step), phase="evaluation clocks")
+    step_home, schedule_home, reports = collective_host(
+        (step, step if schedule_step is None else schedule_step, dict(training or {})), phase="evaluation clocks")
 
     def event() -> tuple[int, Step, jax.Array]:
         at = int(step_home)
@@ -197,7 +200,7 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     event_step, context, event_data = agreed("evaluation context", event)
     event_words = tuple(int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity")))
-    return event_step, context, event_words
+    return event_step, context, event_words, {name: float(value) for name, value in reports.items()}
 
 
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,
@@ -271,10 +274,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             if loss_stats is not None and f'{split}/loss' not in scores:
-                reduced = loss_stats
-                if isinstance(loss_stats, (np.ndarray, np.number)) and np.ndim(loss_stats) == 0:
-                    reduced = loss_stats / scored
-                value, valid = objective.reduce_loss(jax.tree.map(jnp.asarray, reduced))
+                value, valid = objective.reduce_loss(jax.tree.map(jnp.asarray, loss_stats))
                 if not bool(valid) or not np.isfinite(float(value)):
                     raise ValueError("validation loss has no finite statistical support")
                 scores[f'{split}/loss'] = float(value)

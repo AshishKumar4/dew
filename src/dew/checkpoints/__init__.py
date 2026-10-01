@@ -157,10 +157,11 @@ class Ranking:
     weights_only: bool = False
 
 
-def _loss(metrics):
-    # New saves store a minimization rank separately. Old loss keys retain
-    # their historical meaning (training loss).
-    return metrics.get('checkpoint/rank', metrics.get('loss'))
+def _recorded_rank(metrics):
+    # Orbax records the metrics file only when best_fn is configured. The
+    # retention policy and named readers use every independently stored rank.
+    return metrics.get('loss', next((value for key, value in metrics.items()
+                                    if key.startswith('checkpoint/rank/')), None))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -578,20 +579,36 @@ class Checkpoints:
         self.keep = Keep(latest=keep) if isinstance(keep, int) else keep
         self._rank_limits: dict[str, int] = {}
         self._rank_modes: dict[str, str] = {}
+        self._pending: tuple[int, dict[str, float]] | None = None
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         self._manager = None
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
 
-    def would_keep(self, ranking: Ranking) -> bool:
-        """Whether a scored evaluation would enter that tracker's best-K set."""
-        rank = ranking.value if ranking.mode == 'min' else -ranking.value
-        if not math.isfinite(rank):
-            return False
-        key = f'checkpoint/rank/{ranking.metric}'
-        held = sorted(step.metrics[key] for step in self.kept() if key in step.metrics)
-        return len(held) < ranking.top or rank < held[ranking.top - 1]
+    def _candidates(self, rankings: Sequence[Ranking]) -> tuple[Ranking, ...]:
+        eligible = [rank for rank in rankings if math.isfinite(rank.value)]
+        if not eligible:
+            return ()
+        self._open().check_for_errors()
+        retained = {checkpoint.step: checkpoint.metrics for checkpoint in self.kept()}
+        if self._pending is not None and self._open().is_saving_in_progress():
+            step, scores = self._pending
+            retained[step] = scores
+        else:
+            self._pending = None
+        candidates = []
+        for rank in eligible:
+            score = rank.value if rank.mode == 'min' else -rank.value
+            key = f'checkpoint/rank/{rank.metric}'
+            held = sorted(scores[key] for scores in retained.values() if key in scores)
+            if len(held) < rank.top or score < held[rank.top - 1]:
+                candidates.append(rank)
+        return tuple(candidates)
+
+    def would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool:
+        """Whether an evaluation would enter any of its trackers' best-K sets."""
+        return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
     def kept(self) -> list[Kept]:
         """Committed retained steps, oldest first, with their metrics and ranking rule."""
@@ -645,7 +662,7 @@ class Checkpoints:
                     _ProfileSteps(self._profile_snapshots),
                     _RankedSteps(self),
                 ]),
-                best_fn=_loss, best_mode='min',
+                best_fn=_recorded_rank, best_mode='min',
                 create=True, enable_async_checkpointing=True)
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
@@ -790,6 +807,7 @@ class Checkpoints:
                             custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata,
                                              'rankings': rules, 'primary': primary or (rankings[0].metric if rankings else None),
                                              'control': copy.deepcopy(control or {}), 'weights_only': weights_only})
+        self._pending = (step, scores)
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
@@ -1094,3 +1112,4 @@ class Checkpoints:
                             error.add_note(f"Checkpoint wait also failed: {failure!r}")
             if error is not None:
                 raise error
+            self._pending = None
