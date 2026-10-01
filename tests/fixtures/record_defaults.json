@@ -555,6 +555,22 @@
   "alpha": "required",
   "rank": "required"
  },
+ "dew.objectives.diffusion.config.AdversarialDistillation": {
+  "distillation_weight": 0.0,
+  "feature_layers": [],
+  "head_width": 256,
+  "renoise_times": [
+   1.0,
+   1.0
+  ],
+  "student_times": [
+   1.0,
+   0.75,
+   0.5,
+   0.25
+  ],
+  "teacher": ""
+ },
  "dew.objectives.diffusion.config.AudioCondition": {
   "dtype": null,
   "param_dtype": "float32"
@@ -581,6 +597,7 @@
   "teacher_guidance": 1.0
  },
  "dew.objectives.diffusion.config.DiffusionRunConfig": {
+  "adversarial": null,
   "alignment": null,
   "audio": null,
   "autoencoder": null,
