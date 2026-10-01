@@ -101,7 +101,7 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 		wantsPlay = !wantsPlay;
 		if (wantsPlay) {
 			toggle.textContent = 'Pause';
-			if (!visible) screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
+			screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
 			resume();
 		}
 		else {
@@ -114,7 +114,7 @@ for (const panel of document.querySelectorAll<HTMLElement>('[data-terminal-repla
 		elapsed = 0;
 		frame = -1;
 		wantsPlay = true;
-		if (!visible) screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
+		screen.scrollIntoView({ block: 'center', behavior: 'smooth' });
 		resume();
 	});
 	reduced.addEventListener('change', () => {

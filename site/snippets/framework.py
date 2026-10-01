@@ -23,7 +23,7 @@ import optax
 from dew import Checkpoints, Dataset, Field, InputSpec, MeshSpec, Trainer, models
 from dew.data import ByteTokenizer, Loading, Prompts, TokenWindows
 from dew.diffusion.presets import EDM, Flow
-from dew.inference import RunProcessor, TextGeneration
+from dew.inference import RunProcessor
 from dew.inference.serving import Server
 from dew.interop import load_pretrained
 from dew.objectives.diffusion import DiffusionObjective
@@ -97,6 +97,27 @@ def diffusion(out, smoke):
             "solvers": [type(flow_solver).__name__, type(edm_solver).__name__]}
 
 
+def sample_public(out, smoke):
+    if smoke:
+        import sys
+        sys.path.insert(0, str(ROOT / "tests"))
+        from test_inference import make_run
+
+        import dew.interop.hub as hub
+        snapshot = out / "run"
+        make_run(snapshot, preset=Flow())
+        hub.pull_from_hub = lambda repo_id, revision=None: snapshot
+    # Begin snippet: sample-public
+    from dew.sampling import CFG, DPMSolverMultistep, TextToImage
+    pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
+    result = pipe(["green and purple northern lights over a frozen lake"],
+                  seed=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
+    result.pil()[0].save(out / "sample.png")
+    # End snippet: sample-public
+    assert (out / "sample.png").is_file()
+    return {"shape": list(result.host().images.shape), "image": "sample.png"}
+
+
 def jepa(out, smoke):
     data = image_fixture(32)
     # Begin snippet: jepa
@@ -115,22 +136,27 @@ def jepa(out, smoke):
 
 
 def grpo(out, smoke):
-    model = decoder()
-    tokenizer = ByteTokenizer()
-    initial = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
     from dew import LocalTracker
     tracker = LocalTracker(out / "tracking")
-    steps = 2 if smoke else 16
+    steps = 2 if smoke else 150
+    rng = np.random.default_rng(0)
+    records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
     # Begin snippet: grpo
-    def reward(data_source, completion, ground_truth, extra_info):
-        return sum(character.isalpha() for character in completion) / 8
+    model = models.build("causal_transformer", vocab_size=13, emb_features=64,
+                         num_layers=2, num_heads=4, head_dim=16,
+                         mlp_features=128, max_seq_len=16)
 
-    data = Prompts(tokenizer="byte", records=(json.dumps({"prompt": "dew"}),) * 8,
-                   max_prompt_len=8, loading=Loading(workers=0)).load(batch=8)
-    objective = GRPOObjective(model, seq_len=15, beta=0.01, pretrained=initial)
-    rollout = SampledRollout(objective, reward=reward, groups=4,
-                             max_new_tokens=8, decode=tokenizer.decode)
-    trainer = Trainer(objective, optax.adamw(1e-4), key=jax.random.key(0),
+    def reward(data_source, completion, ground_truth, extra_info):
+        tokens = [int(token) for token in completion.split()]
+        pairs = list(itertools.pairwise(tokens))
+        return sum(b == (a + 1) % 13 for a, b in pairs) / max(len(pairs), 1)
+
+    data = Prompts(tokenizer="byte", records=records, max_prompt_len=4,
+                   loading=Loading(workers=0)).load(batch=8)
+    objective = GRPOObjective(model, seq_len=11, beta=0.02)
+    rollout = SampledRollout(objective, reward=reward, groups=4, max_new_tokens=8,
+                             sampling=Sampling(temperature=1.0))
+    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
                       rollout=rollout, tracker=tracker)
     state = trainer.fit(data, steps=steps, log_every=1)
     # End snippet: grpo
@@ -140,7 +166,7 @@ def grpo(out, smoke):
              for line in (out / "tracking/scalars.jsonl").read_text().splitlines()
              if "rollout/reward/mean" in (row := json.loads(line))["scalars"]]
     assert len(curve) == steps and all(0 <= row["reward"] <= 1 for row in curve)
-    return {"steps": steps, "reward": "Alphabetic characters / 8 response bytes",
+    return {"steps": steps, "reward": "Adjacent response tokens counting up modulo 13",
             "reports": "tracking/scalars.jsonl"}
 
 
@@ -177,15 +203,18 @@ def pretrained(out, smoke):
 
 
 def serving(out, smoke):
-    tokenizer, data = text_fixture(out)
-    model = decoder()
-    state = Trainer(LMObjective(model, 64, ema_decay=None), optax.adamw(3e-3),
-                    key=jax.random.key(0)).fit(data, steps=3 if smoke else 150)
+    source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
+    bundle = load_pretrained(source, dtype="bfloat16", param_dtype="bfloat16",
+                             max_seq_len=128, mesh=MeshSpec())
+    if smoke:
+        bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))
+        prompts = ["dew", "jax"]
+    else:
+        prompts = ["The capital of France is", "The capital of Japan is"]
     # Begin snippet: serving
-    task = TextGeneration(model, state.params, RunProcessor(tokenizer),
-                          sampling=Sampling(temperature=0))
+    task = bundle.text_generation(sampling=Sampling(temperature=0))
     server = Server.from_task(task, slots=4, capacity=128)
-    results = server(["dew", "jax"], 24, seed=0)
+    results = server(prompts, 24, seed=0)
     print([result.text[0] for result in results])
     # End snippet: serving
     # Begin snippet: int8
@@ -198,7 +227,8 @@ def serving(out, smoke):
     for variant in (int8, fp8):
         quantized = Server.from_task(variant, slots=4, capacity=128)
         assert len(quantized(["dew"], 2, seed=0)) == 1
-    return {"text": [result.text[0] for result in results], "weight_formats": ["int8", "fp8"]}
+    return {"source": source, "prompts": prompts, "text": [result.text[0] for result in results],
+            "weight_formats": ["int8", "fp8"]}
 
 
 def mesh(out, smoke):
@@ -252,7 +282,7 @@ def reliability(out, smoke):
     return {"saved_step": int(state.step), "resumed_step": int(resumed.step), "bit_exact": exact}
 
 
-SECTIONS = {function.__name__: function for function in (lm, diffusion, jepa, grpo, pretrained, serving, mesh, reliability)}
+SECTIONS = {function.__name__: function for function in (lm, diffusion, sample_public, jepa, grpo, pretrained, serving, mesh, reliability)}
 
 
 def main():

@@ -65,7 +65,7 @@ def load_example(name):
     return module
 
 
-@pytest.mark.parametrize("section", ["lm", "diffusion", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"])
+@pytest.mark.parametrize("section", ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"])
 def test_landing_snippet_runs(section, tmp_path):
     smoke("landing", tmp_path, "--section", section,
           script=REPO_ROOT / "site/snippets/framework.py")
