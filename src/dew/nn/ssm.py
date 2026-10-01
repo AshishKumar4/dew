@@ -42,13 +42,31 @@ def _complex_blocks(re: jax.Array, im: jax.Array) -> jax.Array:
     return jnp.concatenate([jnp.concatenate([re, -im], 1), jnp.concatenate([im, re], 1)], 0)
 
 
-def _toeplitz(powers: jax.Array, size: int, lag: int) -> jax.Array:
-    """`[size, size, N]` with entry `(k, j)` the power `powers[k - j - lag]`
-    of each of the N poles where that index is not negative, else zero. It
-    is built from shifted copies, so its transpose is slices, not a
-    scatter."""
-    return jnp.stack([jnp.pad(powers[:max(size - j - lag, 0)], ((min(j + lag, size), 0), (0, 0)))
-                      for j in range(size)], axis=1)
+def _toeplitz(powers: jax.Array) -> jax.Array:
+    """`[L, L, N]` with entry `(k, j)` the power `powers[k - j]` of each of
+    the N poles where `k >= j`, else zero, for `powers` `[L, N]`. It is
+    built from shifted copies, so its transpose is slices, not a scatter."""
+    size = powers.shape[0]
+    return jnp.stack([jnp.pad(powers[:size - j], ((j, 0), (0, 0))) for j in range(size)], axis=1)
+
+
+def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
+    """The state each chunk starts from, `[B, 2, C, N]` in real form: zero
+    for the first chunk, then `e_(c-1)` of `e_c = pole * e_(c-1) + last_c`,
+    run by `associative_scan` over the chunks' own last states `last`
+    `[B, 2, C, N]` with `pole` the `[N]` complex power that spans one chunk."""
+    def combine(earlier, later):
+        a_re, a_im, b_re, b_im = earlier
+        c_re, c_im, d_re, d_im = later
+        return (a_re * c_re - a_im * c_im, a_re * c_im + a_im * c_re,
+                c_re * b_re - c_im * b_im + d_re, c_re * b_im + c_im * b_re + d_im)
+
+    chunks = last.shape[2]
+    span = (jnp.broadcast_to(pole.real, (1, chunks, pole.shape[0])),
+            jnp.broadcast_to(pole.imag, (1, chunks, pole.shape[0])))
+    *_, end_re, end_im = jax.lax.associative_scan(combine, (*span, last[:, 0], last[:, 1]), axis=1)
+    ends = jnp.stack([end_re, end_im], axis=1)
+    return jnp.pad(ends[:, :, :-1], ((0, 0), (0, 0), (1, 0), (0, 0)))
 
 
 def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CHUNK) -> jax.Array:
@@ -59,11 +77,11 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     real parts and then its imaginary parts on the last axis, and the states
     come back the same way, computed in real arithmetic. Positions run in
     chunks of `chunk`: inside a chunk the states are one product of the
-    powers `pole^(k - j)` with the chunk's inputs, and across chunks a second
-    product carries each chunk's last state forward by the powers
-    `pole^(chunk m)`. The powers are running products of the pole, as a scan
-    forms them, and both products run at fp32's full precision, so the
-    states round as an fp32 scan's do.
+    powers `pole^(k - j)` with the chunk's inputs, at fp32's full precision,
+    and across chunks `associative_scan` carries each chunk's last state
+    forward by `pole^chunk`. The powers are running products of the pole,
+    as a scan forms them, and the states stay within the fp32 running-error
+    bound of the scan the layer ran before (tests/test_ssm.py).
     """
     batch, steps, width = inputs.shape
     states = width // 2
@@ -75,18 +93,12 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     powers = jnp.cumprod(jnp.concatenate([one, jnp.broadcast_to(pole, (length, states))]), axis=0)
     blocks = jnp.pad(inputs, ((0, 0), (0, chunks * length - steps), (0, 0)))
     blocks = blocks.reshape(batch, chunks, length, 2, states).transpose(0, 1, 3, 2, 4)
-    within = _toeplitz(powers[:length], length, 0)
+    within = _toeplitz(powers[:length])
     local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within.real, within.imag),
                        blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
     local = local.reshape(batch, chunks, 2, length, states)
     if chunks > 1:
-        # (pole^length)^m for m = 0 .. chunks - 1.
-        strides = jnp.cumprod(jnp.concatenate([one, jnp.broadcast_to(powers[-1], (chunks - 1, states))]),
-                              axis=0)
-        across = _toeplitz(strides, chunks, 1)
-        last = local[:, :, :, -1].transpose(0, 2, 1, 3).reshape(batch, 2 * chunks, states)
-        carry = jnp.einsum("cdn,bdn->bcn", _complex_blocks(across.real, across.imag), last,
-                           precision=highest).reshape(batch, 2, chunks, 1, states)
+        carry = _carried(powers[-1], local[:, :, :, -1].transpose(0, 2, 1, 3))[:, :, :, None]
         # The state a chunk starts from, carried to each of its positions by pole^(k + 1).
         lift = powers[1:]
         local = local + jnp.stack([lift.real * carry[:, 0] - lift.imag * carry[:, 1],

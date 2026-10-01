@@ -49,12 +49,12 @@ U = 2.0 ** -24
 BATCH, FEATURES, STATE = 2, 4, 8
 
 
-def forward_chain(steps: int) -> int:
-    return 9 * steps + FEATURES + 2 * STATE + 20
+def forward_chain(steps: int, features: int = FEATURES, state: int = STATE) -> int:
+    return 9 * steps + features + 2 * state + 20
 
 
-def gradient_chain(steps: int) -> int:
-    return 2 * 9 * steps + BATCH * steps + FEATURES + 2 * STATE + 36
+def gradient_chain(steps: int, batch: int = BATCH, features: int = FEATURES, state: int = STATE) -> int:
+    return 2 * 9 * steps + batch * steps + features + 2 * state + 36
 LEAVES = ("log_A_real", "A_imag", "B_re", "B_im", "C_re", "C_im", "D", "log_dt")
 
 
@@ -225,6 +225,33 @@ def test_the_layer_gradients_are_the_recurrence_gradients(case):
     for name, value in actual.items():
         error = np.abs(np.asarray(value, np.float64) - expected[name])
         assert np.all(error <= gradient_chain(u.shape[1]) * U * terms[name]), name
+
+
+def test_a_long_sequence_stays_within_the_bound():
+    """4096 positions are 256 chunks, whose carry runs as a scan of its
+    own. Steps from 0.001 keep the slowest pole's memory across the whole
+    sequence, and outputs and gradients stay within K u of their absolute
+    terms."""
+    batch, steps, features, state = 1, 4096, 2, 4
+    layer = S5Layer(features=features, state_dim=state)
+    keys = jax.random.split(jax.random.key(1), 3)
+    u = jax.random.normal(keys[0], (batch, steps, features), jnp.float32)
+    params = layer.init(keys[1], u)["params"]
+    params = {**params, "log_dt": jnp.log(jnp.linspace(0.001, 0.05, state))}
+    w = jax.random.normal(keys[2], u.shape, jnp.float32)
+    p, u64, w64 = float64_params(params), np.asarray(u, np.float64), np.asarray(w, np.float64)
+
+    expected, _ = forward(p, u64, EXACT)
+    bound = forward_chain(steps, features, state) * U * forward(p, u64, MAGNITUDES)[0]
+    assert np.all(np.abs(np.asarray(layer.apply({"params": params}, u), np.float64) - expected) <= bound)
+
+    # Under jit: run eagerly, the scan's gradient dispatches thousands of small ops.
+    parameters, inputs = jax.jit(jax.grad(lambda params, u: jnp.sum(w * layer.apply({"params": params}, u)),
+                                          argnums=(0, 1)))(params, u)
+    exact, terms = adjoint(p, u64, w64, EXACT), adjoint(p, u64, w64, MAGNITUDES)
+    for name, value in {**{name: parameters[name] for name in LEAVES}, "u": inputs}.items():
+        error = np.abs(np.asarray(value, np.float64) - exact[name])
+        assert np.all(error <= gradient_chain(steps, batch, features, state) * U * terms[name]), name
 
 
 def test_the_forward_bound_rejects_an_euler_step(case):
