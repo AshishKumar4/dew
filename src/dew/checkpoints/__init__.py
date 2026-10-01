@@ -34,7 +34,7 @@ the newest checkpoint every process can read wins.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
 import jax
@@ -71,6 +71,37 @@ is rebuilt on resume."""
 RUN_FILE = "run.json"
 """The run record `RunConfig.save` writes into the run directory, beside the
 step directories, and `dew.io.publish` ships with a step."""
+
+
+def _is_profiles(node) -> bool:
+    """Whether `node` is a `PowerProfilesState`, or the mapping of its fields
+    a restore without a template reads it as."""
+    from dew.training.optim import PowerProfilesState
+    return isinstance(node, PowerProfilesState) or (
+        isinstance(node, Mapping) and set(node) == set(PowerProfilesState._fields))
+
+
+def _power_profiles(opt_state):
+    """The `PowerProfilesState` inside `opt_state`, or its mapping, or None
+    where the solver keeps none."""
+    held = [node for node in jax.tree.leaves(opt_state, is_leaf=_is_profiles) if _is_profiles(node)]
+    if len(held) > 1:
+        raise ValueError(f"the optimizer state holds {len(held)} power_profiles; wrap the solver once")
+    return held[0] if held else None
+
+
+def _averages_of(profiles):
+    """The averages a `PowerProfilesState`, or its mapping, holds."""
+    return profiles['averages'] if isinstance(profiles, Mapping) else profiles.averages
+
+
+def _with_averages(opt_state, averages):
+    """`opt_state` with the averages of its power profiles replaced by `averages`."""
+    def put(node):
+        if not _is_profiles(node):
+            return node
+        return {**node, 'averages': averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+    return jax.tree.map(put, opt_state, is_leaf=_is_profiles)
 
 
 def is_uri(path: str) -> bool:
@@ -427,6 +458,16 @@ def absent(expected, held) -> list[jax.tree_util.KeyPath]:
             if jax.tree_util.keystr(path) not in have]
 
 
+class _ProfileSteps(preservation.PreservationPolicy):
+    """Keep ordinary checkpoints that also serve as post-hoc EMA snapshots."""
+    def __init__(self, steps: set[int]):
+        self.steps = steps
+
+    def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
+                        context: preservation.PreservationContext) -> Sequence[bool]:
+        return [checkpoint.step in self.steps for checkpoint in checkpoints]
+
+
 class Checkpoints:
     """Holds the checkpoints of one run, in one directory.
 
@@ -460,6 +501,7 @@ class Checkpoints:
         self.local_every = local_every
         self._manager = None
         self._local_manager = None
+        self._profile_snapshots: set[int] = set()
 
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
@@ -467,6 +509,7 @@ class Checkpoints:
             options = ocp.CheckpointManagerOptions(
                 preservation_policy=preservation.AnyPreservationPolicy([
                     preservation.LatestN(n=self.keep),
+                    _ProfileSteps(self._profile_snapshots),
                     preservation.BestN(get_metric_fn=_loss, n=1,
                                        keep_checkpoints_without_metrics=False,
                                        reverse=True),
@@ -476,6 +519,10 @@ class Checkpoints:
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler())
+            for step in self._manager.all_steps():
+                custom = self._manager.metadata(step).custom_metadata or {}
+                if custom.get('profiles') is not None:
+                    self._profile_snapshots.add(step)
         return self._manager
 
     @property
@@ -526,10 +573,16 @@ class Checkpoints:
         held = int(steps[0])
         return held if held >= 0 and bool(np.all(steps == held)) else None
 
+    def _complete(self, step: int) -> bool:
+        path = epath.Path(self.path(step))
+        return path.exists() and ocp.utils.is_checkpoint_finalized(path)
+
     @property
     def latest(self) -> int | None:
-        """Return the newest step a resume can read, local or persistent."""
+        """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
+        if persistent is not None and not self._complete(persistent):
+            persistent = max((step for step in self._open().all_steps() if self._complete(step)), default=None)
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent
@@ -537,8 +590,17 @@ class Checkpoints:
 
     @property
     def best(self) -> int | None:
-        """Return the step with the lowest reported loss, or None when no save carried one."""
-        return self._open().best_step()
+        """Return the committed step with the lowest reported loss, or None."""
+        best = self._open().best_step()
+        if best is None or self._complete(best):
+            return best
+        scored = []
+        for step in self._open().all_steps():
+            if self._complete(step):
+                metrics = self._open().metadata(step).metrics
+                if metrics and 'loss' in metrics:
+                    scored.append((_loss(metrics), step))
+        return min(scored)[1] if scored else None
 
     def path(self, step: int) -> str:
         return str(epath.Path(self.directory) / str(step))
@@ -573,14 +635,48 @@ class Checkpoints:
         lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
         7B parameters, on hosts that keep the state there for want of room.
         """
+        profiles = _power_profiles(state.opt_state)
+        profile_metadata = None if profiles is None else {
+            'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         persistent = self._open()
+        if profiles is not None:
+            self._profile_snapshots.add(step)
         with region("checkpoint.submit"):
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=metrics, force=True,
-                            custom_metadata={'ema_deltas': deltas})
+                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
+
+    def profile_steps(self) -> list[int]:
+        """The complete checkpoints holding post-hoc EMA snapshots, oldest first."""
+        persistent = self._open()
+        return sorted(step for step in self._profile_snapshots if step in persistent.all_steps()
+                      and epath.Path(self.path(step)).exists()
+                      and ocp.utils.is_checkpoint_finalized(self.path(step)))
+
+    def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
+        """The updates and relative standard deviations of a snapshot, without reading its averages."""
+        custom = self._open().metadata(step).custom_metadata or {}
+        profiles = custom.get('profiles')
+        if profiles is None:
+            raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
+        return int(profiles['updates']), tuple(profiles['stds'])
+
+    def restore_profiles(self, step: int) -> tuple[Variables, ...]:
+        """Read only a snapshot's averages, as host arrays, from its retained checkpoint."""
+        persistent = self._open()
+        self.profile_metadata(step)
+        opt_state = dict(persistent.item_metadata(step))['opt_state']
+        profiles = _power_profiles(opt_state)
+        averages = tuple(_averages_of(profiles))
+        wanted = _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, opt_state), averages)
+        wanted = {'opt_state': wanted}
+        host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+        restored = persistent.restore(step, args=ocp.args.PyTreeRestore(
+            item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
+        return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
                    share: DataPartition | None = None) -> None:

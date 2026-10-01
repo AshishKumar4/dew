@@ -9,6 +9,7 @@
  },
  "dew.config.OptimConfig": {
   "clip_grads": 0.0,
+  "ema_profiles": [],
   "forced_weight_normalization": false,
   "learning_rate": 0.00027,
   "optimizer": "adamw",
