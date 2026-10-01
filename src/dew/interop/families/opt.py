@@ -14,7 +14,10 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     used.update(('hidden_size', 'num_attention_heads', 'num_hidden_layers', 'ffn_dim',
                  'max_position_embeddings', 'do_layer_norm_before', 'word_embed_proj_dim',
                  'dropout', 'layerdrop', 'init_std', 'enable_bias', 'layer_norm_elementwise_affine',
-                 'activation_function', 'tie_word_embeddings', 'vocab_size', 'use_cache'))
+                 'activation_function', 'tie_word_embeddings', 'vocab_size', 'use_cache',
+                 'prefix', 'activation_dropout'))
+    if hf.get('activation_dropout', 0):
+        _refuse('activation_dropout', 'OPT only exposes residual and attention-probability dropout')
     if hf.get('do_layer_norm_before', True) is not True:
         _refuse('do_layer_norm_before=False', 'OPT post-residual LayerNorm is not represented')
     if hf.get('_remove_final_layer_norm', False):

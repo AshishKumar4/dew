@@ -58,3 +58,12 @@ def test_opt_refuses_a_block_with_unrepresented_operations(unsupported):
         translate_config({'model_type': 'opt', 'vocab_size': 32, 'hidden_size': 16,
                           'ffn_dim': 32, 'num_hidden_layers': 2, 'num_attention_heads': 2,
                           'max_position_embeddings': 32, **unsupported})
+
+
+@pytest.mark.network
+def test_released_opt125m_logits_and_cached_generation_after_safe_repacking(tmp_path):
+    from tools.classic_gpt_reference import check_checkpoint
+
+    check_checkpoint('facebook/opt-125m', tmp_path / 'parity.json',
+                     revision='27dcfa74d334bc871f3234de431e71c6eeba5dd6',
+                     safetensors_directory=str(tmp_path / 'safetensors'))
