@@ -53,7 +53,7 @@ from .attention import (
 )
 from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
-from .mixers import MixerBase, MixerContext, mixers
+from .mixers.base import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection, logical_axes
@@ -109,7 +109,11 @@ class KPoolIndexer(nn.Module):
         self.index_kpool_compress_ape = self.param(
             'index_kpool_compress_ape', nn.initializers.zeros, (self.kpool, self.head_dim), jnp.float32)
         self.index_kpool_compress_gate = self.param(
-            'index_kpool_compress_gate', nn.initializers.zeros, (self.head_dim, self.emb_features), jnp.float32)
+            "index_kpool_compress_gate",
+            nn.initializers.zeros,
+            (self.head_dim, self.emb_features),
+            jnp.float32,
+        )
 
     def packed(self, x, valid):
         """`[B, S, 2 * head_dim + 1]`: the indexer's keys, the pool gate scores
@@ -118,7 +122,9 @@ class KPoolIndexer(nn.Module):
         keys = self.k_norm(self.wk(x))
         x, gate = promote_dtype(x, self.index_kpool_compress_gate, dtype=self.dtype)
         gate_scores = jnp.einsum('bsh,dh->bsd', x, gate, precision=self.precision)
-        return jnp.concatenate([keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1)
+        return jnp.concatenate(
+            [keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1
+        )
 
     def _pools(self, packed):
         """The pools of a packed state, `[B, P]` of them: their keys
@@ -338,13 +344,17 @@ class KPoolSparseAttention(nn.Module):
                 if prediction_phase == "draft" and length != 1:
                     raise ValueError("draft index reuse accepts one candidate per row")
                 count = min(self.index_topk // self.index_kpool, -(-self.max_seq_len // self.index_kpool))
-                width = count * self.index_kpool + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
+                width = count * self.index_kpool + (
+                    self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
+                )
                 saved = self.variable("cache", "selection_indices", jnp.full, (batch, width), -1, jnp.int32)
                 origin = self.variable("cache", "selection_position", jnp.full, (batch,), -1, jnp.int32)
                 active = jnp.any(row_valid, axis=1)
                 if committed is not None:
                     origin.value = jnp.where(active & (origin.value >= committed), -1, origin.value)
-                hit = (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
+                hit = (
+                    (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
+                )
                 frozen = jnp.broadcast_to(saved.value[:, None], (batch, length, width))
                 if allocated and prediction_phase == "draft":
                     indices = nn.cond(
@@ -359,7 +369,9 @@ class KPoolSparseAttention(nn.Module):
                     else:
                         last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
                         publish = active & ~hit
-                        saved.value = jnp.where(publish[:, None], indices[jnp.arange(batch), last], saved.value)
+                        saved.value = jnp.where(
+                            publish[:, None], indices[jnp.arange(batch), last], saved.value
+                        )
                         origin.value = jnp.where(publish, slots[jnp.arange(batch), last], origin.value)
             else:
                 indices = self.indexer.select_indices(x, q_resid, packed, visible)

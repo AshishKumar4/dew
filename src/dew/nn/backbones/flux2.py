@@ -27,7 +27,8 @@ produces, so no packing happens here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -95,9 +96,15 @@ class Flux2Block(nn.Module):
         text_shift, text_scale, text_gate, text_shift_mlp, text_scale_mlp, text_gate_mlp = text_mods
         norm = _layer_norm(self.dtype, self.epsilon)
         attended, text_attended = _FluxAttention(
-            self.heads, self.head_dim, bias=False, epsilon=self.epsilon, dtype=self.dtype,
-            precision=self.precision, attention_impl=self.attention_impl, name="attn")(
-                _modulate(norm(image), shift, scale), _modulate(norm(context), text_shift, text_scale), cos, sin)
+            self.heads,
+            self.head_dim,
+            bias=False,
+            epsilon=self.epsilon,
+            dtype=self.dtype,
+            precision=self.precision,
+            attention_impl=self.attention_impl,
+            name="attn",
+        )(_modulate(norm(image), shift, scale), _modulate(norm(context), text_shift, text_scale), cos, sin)
         # A double-stream block's attention returns both streams.
         assert text_attended is not None
         image = image + gate[:, None] * attended
@@ -135,7 +142,9 @@ class Flux2SingleBlock(nn.Module):
         projected = nn.Dense(3 * inner + 2 * self.hidden, use_bias=False, dtype=self.dtype,
                              precision=self.precision, name="to_qkv_mlp_proj")(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
-        query, key, value = (part.reshape(heads) for part in jnp.split(projected[..., :3 * inner], 3, axis=-1))
+        query, key, value = (
+            part.reshape(heads) for part in jnp.split(projected[..., : 3 * inner], 3, axis=-1)
+        )
         query = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_q")(query)
         key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_k")(key)
         rotation = (cos[None, :, None, :], sin[None, :, None, :])
@@ -143,8 +152,9 @@ class Flux2SingleBlock(nn.Module):
             apply_rotary(query, *rotation), apply_rotary(key, *rotation), value,
             implementation=self.attention_impl, precision=self.precision)
         gated, value_half = jnp.split(projected[..., 3 * inner:], 2, axis=-1)
-        joined = jnp.concatenate([attended.reshape(x.shape[0], x.shape[1], inner), nn.silu(gated) * value_half],
-                                 axis=-1)
+        joined = jnp.concatenate(
+            [attended.reshape(x.shape[0], x.shape[1], inner), nn.silu(gated) * value_half], axis=-1
+        )
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * nn.Dense(self.features, use_bias=False, dtype=self.dtype,

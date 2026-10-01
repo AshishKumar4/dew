@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Generic, overload
 
@@ -16,18 +16,21 @@ from flax import linen as nn, struct
 from flax.core import freeze
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed, uint8_pixels
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import active_profile
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -148,7 +151,7 @@ class TextToImage:
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
-    sampler: Solver[object] = DDIM()
+    sampler: Solver[object] = field(default_factory=DDIM)
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
@@ -172,7 +175,9 @@ class TextToImage:
         from dew.training.quantization import quantize_for_serving
 
         example = self.prepare("", seed=0, steps=1)
-        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
+        denoiser = {
+            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
+        }
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
         return replace(self, model=model, params={**self.params, **variables})
@@ -267,30 +272,57 @@ class TextToImage:
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
     @overload
-    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
-                key: jax.Array, seed: None = None, steps: int | None = None,
-                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
-                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
-                times: ArrayLike | Sequence[float] | None = None,
-                encode_key: jax.Array | None = None) -> DenoisingInputs: ...
+    def prepare(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]],
+        *,
+        key: jax.Array,
+        seed: None = None,
+        steps: int | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        image: ArrayLike | None = None,
+        image_latents: ArrayLike | None = None,
+        mask: ArrayLike | None = None,
+        noise: ArrayLike | None = None,
+        initial: ArrayLike | None = None,
+        times: ArrayLike | Sequence[float] | None = None,
+        encode_key: jax.Array | None = None,
+    ) -> DenoisingInputs: ...
 
     @overload
-    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
-                key: None = None, seed: int, steps: int | None = None,
-                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
-                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
-                times: ArrayLike | Sequence[float] | None = None,
-                encode_key: jax.Array | None = None) -> DenoisingInputs: ...
+    def prepare(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]],
+        *,
+        key: None = None,
+        seed: int,
+        steps: int | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        image: ArrayLike | None = None,
+        image_latents: ArrayLike | None = None,
+        mask: ArrayLike | None = None,
+        noise: ArrayLike | None = None,
+        initial: ArrayLike | None = None,
+        times: ArrayLike | Sequence[float] | None = None,
+        encode_key: jax.Array | None = None,
+    ) -> DenoisingInputs: ...
 
-    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
-                key: jax.Array | None = None, seed: int | None = None, steps: int | None = None,
-                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
-                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
-                times: ArrayLike | Sequence[float] | None = None,
-                encode_key: jax.Array | None = None) -> DenoisingInputs:
+    def prepare(
+        self,
+        prompts: str | Sequence[str | Mapping[str, object]],
+        *,
+        key: jax.Array | None = None,
+        seed: int | None = None,
+        steps: int | None = None,
+        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+        image: ArrayLike | None = None,
+        image_latents: ArrayLike | None = None,
+        mask: ArrayLike | None = None,
+        noise: ArrayLike | None = None,
+        initial: ArrayLike | None = None,
+        times: ArrayLike | Sequence[float] | None = None,
+        encode_key: jax.Array | None = None,
+    ) -> DenoisingInputs:
         """Encode conditions and construct the initial state on a concrete grid.
 
         Images are uint8 or normalized floating NHWC pixels at the task's
@@ -571,7 +603,9 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
     if not np.isfinite(array).all():
         raise ValueError(f"{name} must contain finite values")
     if name == "image" and array.dtype != np.uint8 and np.any((array < -1) | (array > 1)):
-        raise ValueError("floating image pixels must be normalized to [-1, 1]; uint8 pixels are also accepted")
+        raise ValueError(
+            "floating image pixels must be normalized to [-1, 1]; uint8 pixels are also accepted"
+        )
     return np.broadcast_to(array, (rows, *shape))
 
 
@@ -596,7 +630,10 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
             value = alpha * clean + sigma * noise
         if "mask" in samples:
             from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key)
+
+            spatial = latent_image_conditions(
+                autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key
+            )
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)

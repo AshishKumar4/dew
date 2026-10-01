@@ -192,7 +192,9 @@ class NativeRolloutServer:
                 if failure is not None:
                     future.set_exception(failure)
                 else:
-                    future.set_result(_native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
+                    future.set_result(
+                        _native_draw(ids, done.result(), version).check_stops(self.sampling.stops)
+                    )
 
             ticket.add_done_callback(resolve)
             self._lock.notify()
@@ -338,9 +340,13 @@ class SafetensorsReload:
         root = root.rstrip("/")
         # (path, JSON body, whether the answer must say {"success": true})
         if self.engine == "vllm":
-            calls = (("/pause?mode=wait", None, False), ("/collective_rpc", {"method": "reload_weights"}, False),
-                     ("/reset_prefix_cache", None, True),
-                     ("/update_weight_version", {"new_version": str(version)}, True), ("/resume", None, False))
+            calls = (
+                ("/pause?mode=wait", None, False),
+                ("/collective_rpc", {"method": "reload_weights"}, False),
+                ("/reset_prefix_cache", None, True),
+                ("/update_weight_version", {"new_version": str(version)}, True),
+                ("/resume", None, False),
+            )
         else:
             calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
                                                     "flush_cache": True, "abort_all_requests": False,
@@ -494,12 +500,16 @@ class OpenAIRolloutServer(_RequestServer):
         if engine == "sglang" and processed_logprobs:
             raise ValueError("processed_logprobs names a vLLM mode; SGLang's completions route has none")
         if engine == "sglang" and replace(sampling, temperature=1.0).transforms():
-            raise ValueError("SGLang's /v1/completions reports log-probabilities before top-k, top-p and min-p, "
-                             "which are not the behavior likelihoods of a filtering Sampling, and has no field "
-                             "for the filtered ones (native /generate's return_sampling_mask does); "
-                             "sample without filters")
+            raise ValueError(
+                "SGLang's /v1/completions reports log-probabilities before top-k, top-p and min-p, "
+                "which are not the behavior likelihoods of a filtering Sampling, and has no field "
+                "for the filtered ones (native /generate's return_sampling_mask does); "
+                "sample without filters"
+            )
         if routing and engine != "vllm":
-            raise ValueError("routing reads vLLM's per-choice routed_experts (--enable-return-routed-experts)")
+            raise ValueError(
+                "routing reads vLLM's per-choice routed_experts (--enable-return-routed-experts)"
+            )
         super().__init__(sampling, weights, version, workers)
         self._completion = completion
         self._return_ids = _RETURN_IDS[engine]
@@ -507,8 +517,14 @@ class OpenAIRolloutServer(_RequestServer):
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         # The pad id shapes Dew's packed rows; it is not a request field.
-        completion = self._completion([list(prompt)], budget, seed=seed, sampling=replace(self._sampling, pad_id=0),
-                                      logprobs=0, extra_body=self._return_ids)
+        completion = self._completion(
+            [list(prompt)],
+            budget,
+            seed=seed,
+            sampling=replace(self._sampling, pad_id=0),
+            logprobs=0,
+            extra_body=self._return_ids,
+        )
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
@@ -516,7 +532,9 @@ class OpenAIRolloutServer(_RequestServer):
         terminated = bool(tokens) and tokens[-1] in stops
         reason = completion.finish_reasons[0]
         if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
-            raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} drawn ids ending {tokens[-1:]}")
+            raise ValueError(
+                f"finish reason {reason!r} disagrees with {len(tokens)} drawn ids ending {tokens[-1:]}"
+            )
         routed = completion.routed_experts[0] if completion.routed_experts else None
         if self._routing and routed is None:
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")

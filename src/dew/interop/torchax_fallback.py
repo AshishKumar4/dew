@@ -122,7 +122,9 @@ class TorchLayout(Layout):
                 return heuristic
             if sharded_devices == 1 or math.prod(value.shape) < self.min_shard:
                 return NamedSharding(mesh, P())
-            return NamedSharding(mesh, logical_spec(axes, tuple(value.shape), rules=self.axis_rules, mesh=mesh))
+            return NamedSharding(
+                mesh, logical_spec(axes, tuple(value.shape), rules=self.axis_rules, mesh=mesh)
+            )
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree), placed)
 

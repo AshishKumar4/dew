@@ -22,14 +22,15 @@ import dataclasses
 import functools
 import hashlib
 import json
+import logging
 import operator
 import os
 import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping as MappingABC, MutableMapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
+from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
 import tyro
@@ -56,6 +57,8 @@ from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
+
+_log = logging.getLogger(__name__)
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -202,8 +205,8 @@ class TrainerConfig:
     One optimizer update a step either way, and the compiled step is traced
     once per stage."""
     dynamic_scale: bool = False
-    mesh: MeshSpec = MeshSpec()
-    layout: Layout = Layout()
+    mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
@@ -214,7 +217,8 @@ class TrainerConfig:
     wandb: Wandb | None = None
     """Optional W&B sink in addition to the local tracking journal."""
     multi_host: bool | None = None
-    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
+    """Join the JAX process pool. None asks and continues alone only when no
+    cluster is configured; True requires the pool; False never asks."""
     xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
@@ -594,8 +598,8 @@ class RunConfig:
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
-                    print("Experiment_Name:", name)
-                    print(f"Local tracking: {local.directory}")
+                    _log.info("Experiment_Name: %s", name)
+                    _log.info("Local tracking: %s", local.directory)
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)

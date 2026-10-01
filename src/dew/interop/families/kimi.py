@@ -124,8 +124,12 @@ def _situ(text: Mapping[str, object]) -> SituFields:
     beta is 1.0 (`beta or 1.0`), an unset linear beta leaves up uncapped."""
     beta = text.get('activation_situ_beta')
     linear = text.get('activation_situ_linear_beta')
-    return {'beta': float(records.number(beta, 'activation_situ_beta')) if beta else 1.0,
-            'linear_beta': None if linear is None else float(records.number(linear, 'activation_situ_linear_beta'))}
+    return {
+        "beta": float(records.number(beta, "activation_situ_beta")) if beta else 1.0,
+        "linear_beta": None
+        if linear is None
+        else float(records.number(linear, "activation_situ_linear_beta")),
+    }
 
 
 def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
@@ -211,24 +215,26 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
             'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}}
     block = text.get('attn_res_block_size')
     config: DecoderFields = {
-        'vocab_size': _record_int(text, 'vocab_size'),
-        'emb_features': hidden,
-        'num_layers': layers,
-        'num_heads': heads,
-        'num_kv_heads': heads,
-        'head_dim': hidden // heads,
-        'mlp': _situ(text) if activation == 'situ' else _ACTIVATIONS[activation],
-        'mlp_features': _record_int(text, 'intermediate_size'),
-        'max_seq_len': max_seq_len,
-        'layer_types': types,
-        'kinds': kinds,
+        "vocab_size": _record_int(text, "vocab_size"),
+        "emb_features": hidden,
+        "num_layers": layers,
+        "num_heads": heads,
+        "num_kv_heads": heads,
+        "head_dim": hidden // heads,
+        "mlp": _situ(text) if activation == "situ" else _ACTIVATIONS[activation],
+        "mlp_features": _record_int(text, "intermediate_size"),
+        "max_seq_len": max_seq_len,
+        "layer_types": types,
+        "kinds": kinds,
         # KimiRMSNorm scales after the cast (modeling_kimi.py:224-239).
-        'norm_eps': _record_float(text, 'rms_norm_eps', 1e-6),
-        'scale_after_cast': True,
-        'qk_norm': False,
-        'tie_embeddings': tied,
-        'mixture': _mixture(text, layers),
-        'attention_residuals': None if block is None else {'block_size': records.integer(block, 'attn_res_block_size')},
+        "norm_eps": _record_float(text, "rms_norm_eps", 1e-6),
+        "scale_after_cast": True,
+        "qk_norm": False,
+        "tie_embeddings": tied,
+        "mixture": _mixture(text, layers),
+        "attention_residuals": None
+        if block is None
+        else {"block_size": records.integer(block, "attn_res_block_size")},
     }
     return config
 
@@ -241,7 +247,10 @@ def _kimi_linear_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     still compete, :684-685) and the SiTU activation it does not register."""
     extended = sorted(set(hf_config) & _K3_FIELDS)
     if extended:
-        _refuse(f"config fields {extended}", "they are K3's additions, which Kimi Linear's modeling_kimi.py does not compute")
+        _refuse(
+            f"config fields {extended}",
+            "they are K3's additions, which Kimi Linear's modeling_kimi.py does not compute",
+        )
     linear = records.record(hf_config.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS)
     if extra:
@@ -332,7 +341,12 @@ def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
         if (len(tail) == 4 and tail[0] == 'experts' and tail[1].isdigit()
                 and tail[2] in _MOE_PROJECTIONS and tail[3] == 'weight'):
             return ('params', layer, 'mlp', 'experts', tail[1], _MOE_PROJECTIONS[tail[2]], 'kernel')
-        if len(tail) == 3 and tail[0] == 'shared_experts' and tail[2] == 'weight' and tail[1] in _MOE_PROJECTIONS.values():
+        if (
+            len(tail) == 3
+            and tail[0] == "shared_experts"
+            and tail[2] == "weight"
+            and tail[1] in _MOE_PROJECTIONS.values()
+        ):
             return ('params', layer, 'mlp', 'shared_experts', tail[1], 'kernel')
         if tail in (['routed_expert_down_proj', 'weight'], ['routed_expert_up_proj', 'weight']):
             return ('params', layer, 'mlp', tail[0], 'kernel')
@@ -375,7 +389,9 @@ def _kimi_linear_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.n
         if name.endswith('.self_attn.A_log'):
             log = np.asarray(value)
             if log.ndim != 4 or log.shape[:2] != (1, 1) or log.shape[3] != 1:
-                raise ValueError(f"{name} holds {log.shape}, not the [1, 1, heads, 1] the gate broadcasts over")
+                raise ValueError(
+                    f"{name} holds {log.shape}, not the [1, 1, heads, 1] the gate broadcasts over"
+                )
             prepared[name] = log.reshape(-1)
     return prepared
 

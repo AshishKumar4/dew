@@ -1,8 +1,8 @@
 """Accumulate host-local sufficient statistics for the image metrics."""
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable
 
 import jax
 import numpy as np

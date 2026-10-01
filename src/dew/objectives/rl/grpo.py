@@ -15,6 +15,7 @@ perplexity, since a validation pass never samples.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import jax
@@ -136,7 +137,7 @@ class GRPOObjective(LMObjective):
 
     # The loss is a policy-gradient surrogate: its value is no measure of
     # progress, so it is shown without a direction.
-    shown = {"loss": Shown()}
+    shown: Mapping[str, Shown] = {"loss": Shown()}
 
     _ema_is_reference = True
 

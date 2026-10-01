@@ -162,8 +162,8 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
     from dew.interop import hf_decoders
 
     alias = "dream_registered_alias"
-    family = hf_decoders._FAMILIES["dream"]
-    monkeypatch.setitem(hf_decoders._FAMILIES, alias,
+    family = hf_decoders.families()["dream"]
+    monkeypatch.setitem(hf_decoders.families(), alias,
                         dataclasses.replace(family, model_types=(*family.model_types, alias)))
     source = copytree(FIXTURES / "dream-tiny", tmp_path / "source")
     config = fixture_config("dream-tiny")

@@ -70,7 +70,7 @@ from dew.nn.attention import (
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.mixers.base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -205,7 +205,9 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             entry = jnp.sum(window_key * weights, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
             values = write_cache(values, entry[:, None], at)
-            indices = write_cache(indices[..., None], (position // rate).astype(indices.dtype)[:, None, None], at)[..., 0]
+            indices = write_cache(
+                indices[..., None], (position // rate).astype(indices.dtype)[:, None, None], at
+            )[..., 0]
             if old is not None:
                 old = tuple(jnp.where(closed[:, None, None], current[..., :width], before)
                             for current, before in zip(buffered, old, strict=True))
@@ -969,7 +971,9 @@ class DeepseekV4Mixer(MixerBase):
 
     def _built(self, attention: type[DeepseekV4Attention], ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:
-            raise ValueError("the deepseek_v4 mixer is causal: its window and compressors read the past alone")
+            raise ValueError(
+                "the deepseek_v4 mixer is causal: its window and compressors read the past alone"
+            )
         if ctx.sliding_window is None:
             raise ValueError("every deepseek_v4 layer attends a sliding window, which its kind names")
         if ctx.attention_chunk is not None:
@@ -977,7 +981,9 @@ class DeepseekV4Mixer(MixerBase):
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
         if ctx.kv_cache != KVCache():
-            raise ValueError("the deepseek_v4 mixer keeps its own compressed cache; it takes no kv_cache layout")
+            raise ValueError(
+                "the deepseek_v4 mixer keeps its own compressed cache; it takes no kv_cache layout"
+            )
         if ctx.yarn is not None and ctx.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({ctx.yarn.rope_theta}) and the layer's "

@@ -23,9 +23,10 @@ import tempfile
 import threading
 import time
 import urllib.request
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -260,7 +261,9 @@ def _fetch_shard(shard: Mapping[str, Sequence[str]], fetch: Fetch, threads: int)
     with ThreadPoolExecutor(max_workers=threads) as pool:
         # Reading the results raises a worker thread's exception here. An
         # unread executor.map would swallow it.
-        for _ in pool.map(partial(fetch_one, sink=_worker_sink, fetch=fetch, stop=_worker_stop), urls, captions):
+        for _ in pool.map(
+            partial(fetch_one, sink=_worker_sink, fetch=fetch, stop=_worker_stop), urls, captions
+        ):
             pass
 
 
@@ -410,15 +413,13 @@ class UrlStream:
     def _check_fetcher(self) -> None:
         """Raises when there is nothing left to wait for.
 
-        A live fetcher is only slow, so it earns one line on stdout instead.
+        A live fetcher is only slow, so it earns one warning instead.
         """
         if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True
-                # The one line a stalled loader owes the person watching it,
-                # asserted by tests/test_online_loader.py on stdout.
-                print(f"No sample in {self.queue_timeout}s, still fetching "
-                      f"({self.dropped} dropped so far)")
+                _log.warning("No sample in %ss, still fetching (%s dropped so far)",
+                             self.queue_timeout, self.dropped)
             return
         if self._error is not None:
             raise RuntimeError("the url fetcher died") from self._error

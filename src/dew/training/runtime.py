@@ -9,6 +9,7 @@ main().
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import resource
 import signal
@@ -35,6 +36,8 @@ from dew.pool import (
 )
 from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.config import Wandb
@@ -152,14 +155,15 @@ def prepare_process(wandb: Wandb | None = None,
             # host's libtpu need not know its flag.
             if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
                 apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
-            print(f"Joined the JAX process pool: process {jax.process_index()} "
-                  f"of {jax.process_count()}")
+            _log.info(
+                "Joined the JAX process pool: process %s of %s", jax.process_index(), jax.process_count()
+            )
             if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
                 # Before the first compile, which fixes whether the cache is used.
                 jax.config.update("jax_enable_compilation_cache", val=False)
-                print("This jax keys a computation that spans processes apart on each of them "
-                      "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
-                      "cache; docs/installation.md names the jax that keeps it")
+                _log.warning("This jax keys a computation that spans processes apart on each of them "
+                             "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
+                             "cache; docs/installation.md names the jax that keeps it")
             # One collective while the processes are still in lockstep;
             # initialize() returns on every process once the last one has
             # connected. On CPU, collectives rendezvous through the
@@ -173,7 +177,7 @@ def prepare_process(wandb: Wandb | None = None,
         from dew.training.distributed import build_mesh
         from dew.training.host import companion_mesh
         companion_mesh(build_mesh())
-    print(f"Number of devices: {jax.device_count()}")
+    _log.info("Number of devices: %s", jax.device_count())
 
 
 def _pool_keys_alike() -> bool:

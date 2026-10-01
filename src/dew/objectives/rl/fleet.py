@@ -223,7 +223,8 @@ class ContainerRunner:
     `runtime` is the Docker-compatible CLI (`docker` or `podman`). The job
     directory is mounted read-only at `/work`, the working directory; `/tmp`
     is a small writable tmpfs. Memory is capped at `memory_bytes` with no
-    swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later), the processor share at `cpus` and the
+    swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later),
+    the processor share at `cpus` and the
     process count at `pids`. At the wall deadline the client that runs
     it is killed, then the container is force-removed by name. A runtime that exits without
     creating the container (no daemon, no permission, no image) raises.
@@ -237,7 +238,9 @@ class ContainerRunner:
     python: tuple[str, ...] = ("python", "-I", "-S")
     """The image's own interpreter; the host's path does not exist inside it."""
 
-    def command(self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str) -> list[str]:
+    def command(
+        self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str
+    ) -> list[str]:
         """The runtime argv that runs `program` from `directory` in a container called `name`.
 
         The runtime writes the container's id to `cidfile` once it creates one.
@@ -278,7 +281,9 @@ class ContainerRunner:
                     # still being created, created or running.
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
-                    subprocess.run([self.runtime, "rm", "--force", name], capture_output=True, timeout=60, check=False)
+                    subprocess.run(
+                        [self.runtime, "rm", "--force", name], capture_output=True, timeout=60, check=False
+                    )
             try:
                 outcome = _outcome(process, streams, stopped, started, deadline)
             finally:
@@ -299,6 +304,10 @@ class ContainerRunner:
             return outcome
 
 
+_DEFAULT_RUNNER = ProcessRunner()
+_DEFAULT_LIMITS = SandboxLimits()
+
+
 class SandboxFleet:
     """Run programs on `workers` concurrent sandboxed workers.
 
@@ -306,7 +315,7 @@ class SandboxFleet:
     worker is busy; `submit` returns at once.
     """
 
-    def __init__(self, runner: Runner = ProcessRunner(), *, limits: SandboxLimits = SandboxLimits(),
+    def __init__(self, runner: Runner = _DEFAULT_RUNNER, *, limits: SandboxLimits = _DEFAULT_LIMITS,
                  workers: int = os.cpu_count() or 1):
         if type(workers) is not int or workers < 1:
             raise ValueError("a fleet needs at least one worker")

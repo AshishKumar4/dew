@@ -9,9 +9,9 @@ on:
         default: process
         type: choice
         options: [transaction, checkpoints, process, schedules, attention, sources]
-  # Review runs of this workflow before it is available on the default branch.
-  push:
-    branches: ["ci/mutation/**"]
+  # One module a night; ordinary pushes leave the runners to the regular gates.
+  schedule:
+    - cron: "0 2 * * *"
 
 permissions:
   contents: read
@@ -21,7 +21,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      module: ${{ steps.module.outputs.module }}
+    steps:
+      - name: Choose the night's module
+        id: module
+        env:
+          REQUESTED_MODULE: ${{ inputs.module }}
+        run: |
+          python - <<'PY'
+          import datetime
+          import os
+
+          modules = ("transaction", "checkpoints", "process", "schedules", "attention", "sources")
+          module = os.environ["REQUESTED_MODULE"] or modules[datetime.datetime.now(datetime.UTC).weekday() % 6]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"module={module}\n")
+          PY
+
   mutation:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -34,7 +55,7 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "2"
-      MODULE: ${{ inputs.module }}
+      MODULE: ${{ needs.plan.outputs.module }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,8 +70,7 @@ jobs:
           pip install -e ".[test,mutation,av,tfds]" -c constraints.txt
       - name: Run mutation tests
         run: |
-          module="${MODULE:-${GITHUB_REF_NAME#ci/mutation/}}"
-          python tools/mutation.py "$module" --shard ${{ matrix.shard }} --shards 8 \
+          python tools/mutation.py "$MODULE" --shard ${{ matrix.shard }} --shards 8 \
             --output "mutation-${{ matrix.shard }}"
       - name: Upload mutations and results
         if: always()

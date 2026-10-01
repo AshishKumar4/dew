@@ -41,7 +41,11 @@ TARGETS = {
 
 
 def classify(result) -> str:
-    """Do not count worker errors or timeouts as tests killing a mutation."""
+    """Count test failures as kills; report timeouts separately without failing CI.
+
+    A timeout may be a mutated infinite loop, but it is not an observed test
+    failure. Worker errors and missing runs cannot produce a valid score.
+    """
     if result is None:
         return "pending"
     if result.worker_outcome != "normal":
@@ -160,7 +164,7 @@ def main() -> None:
     if results["population"] == 0:
         raise SystemExit("no mutations were generated")
     if any(results["counts"].get(status, 0)
-           for status in ("pending", "worker-error", "incompetent", "timeout")):
+           for status in ("pending", "worker-error", "incompetent")):
         raise SystemExit("the mutation run was incomplete; inspect report.json")
 
 

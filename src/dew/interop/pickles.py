@@ -58,7 +58,9 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     for name in shards:
         status = (directory / name).stat()
         identity.append([name, os.path.realpath(directory / name), status.st_size, status.st_mtime_ns])
-    target = Path(dew_cache_dir()) / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
+    target = (
+        Path(dew_cache_dir()) / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
+    )
     if target.is_dir() and weight_files({entry.name for entry in target.iterdir()}, "",
                                         lambda name: json.loads((target / name).read_text())):
         return target
@@ -68,8 +70,11 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
             f"pip install 'dewml[torch]', or open their safetensors conversion at {CONVERT_SPACE} "
             "and load its refs/pr/N revision")
     target.mkdir(parents=True, exist_ok=True)
-    outputs = ([WEIGHTS_FILE] if len(shards) == 1 else
-               [f"model-{number:05d}-of-{len(shards):05d}.safetensors" for number in range(1, len(shards) + 1)])
+    outputs = (
+        [WEIGHTS_FILE]
+        if len(shards) == 1
+        else [f"model-{number:05d}-of-{len(shards):05d}.safetensors" for number in range(1, len(shards) + 1)]
+    )
     weight_map: dict[str, str] = {}
     for shard, output in zip(shards, outputs, strict=True):
         tensors = _state_dict(directory / shard)

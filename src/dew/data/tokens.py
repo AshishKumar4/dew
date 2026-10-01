@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Annotated, Iterator, Mapping, overload
+from collections.abc import Iterator, Mapping
+from typing import Annotated, overload
 
 import grain.python as pygrain
 import numpy as np

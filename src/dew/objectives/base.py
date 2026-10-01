@@ -321,7 +321,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
-            return value, jnp.asarray(True)
+            return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
     def tile_head(self) -> str | None:
