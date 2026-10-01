@@ -249,6 +249,13 @@ def teacher_model(directory: str, variables: Variables | None) -> Variables:
                                 if name not in ("encoders", "autoencoder")})
 
 
+SMOOTH_TIME_SCALE = 0.002
+"""The Fourier time scale a model trained through a derivative in time takes
+when its config names none. On a 2-D two-class toy (RTX 4080), one-step
+class accuracy at simple_dit's default 16 against 0.002 was MeanFlow 23%
+against 99%, an sCM student 11% against 98.6%."""
+
+
 @dataclasses.dataclass(frozen=True)
 class AdversarialDistillation:
     """Distill a saved flow run into a few-step student adversarially, LADD
@@ -560,6 +567,13 @@ class DiffusionRunConfig(RunConfig):
             # An interval process's model reads the interval's duration.
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
+        differentiated = self.mean_flow is not None or (self.distill is not None
+                                                        and self.distill.consistency == "continuous"
+                                                        and self.distill.consistency_weight > 0)
+        if differentiated and "time_scale" in declared and "time_scale" not in self.model.config:
+            # MeanFlow's and sCM's losses differentiate the model in time; the
+            # default time embedding is far too fast in it to learn from.
+            fields["time_scale"] = SMOOTH_TIME_SCALE
         if "output_channels" in declared:
             sample = self.sample_field()
             fields["output_channels"] = (sample.shape[-1] if autoencoder is None
