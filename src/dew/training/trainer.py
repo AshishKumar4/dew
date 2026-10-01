@@ -255,9 +255,10 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
 
     The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
     (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
-    keep their whole logits in 13.1 GiB with them and run 178.7 ms, while
-    without them the step does not fit, tiles its head and runs 211.2 ms. So
-    the fusions come back before the ladder's first rung."""
+    plan their whole logits in 13.1 GiB with them, against 13.6 GiB of an
+    0.85 pool, while without them the step plans more. Within `FIT_RESERVE`
+    of the limit neither counts as fitting, and the head tiles. So the
+    fusions come back before the ladder's first rung, where they fit."""
     default = program.compile()
     if not step_fits(default, mesh):
         return executable, False
@@ -318,12 +319,22 @@ DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
+# The share of each device's allocator limit a step leaves free to count as fitting. A step XLA
+# plans inside the limit can still fail to place its largest temporary at run time. On an RTX
+# 4080 (jax 0.11.2, a 2-layer Qwen3-0.6B-width decoder at 8 x 1024 tokens, whole logits, a
+# 13.1 GiB plan), a fresh process failed with RESOURCE_EXHAUSTED on its 10.3 GiB temporary in
+# 1 of 16 runs with 3.6% of the limit to spare and 2 of 16 with 5.8%, under the BFC and the
+# cuda_async allocators alike, and in none of 48 with 7.9%.
+FIT_RESERVE = 0.08
+
+
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | None:
     """The bytes the tightest of `devices` has free once the compiled step's
-    temporaries and new outputs are placed, None where the executable or a
-    device reports no memory. The arguments, the state and the batch, are
-    already resident and counted in use; the donated state's buffers are
-    reused for the outputs that alias them.
+    temporaries and new outputs are placed and `FIT_RESERVE` of its limit is
+    kept back, None where the executable or a device reports no memory. The
+    arguments, the state and the batch, are already resident and counted in
+    use; the donated state's buffers are reused for the outputs that alias
+    them.
 
     This compares against the allocator's limit; a growable allocator
     (XLA_PYTHON_CLIENT_PREALLOCATE=false) can fragment below it."""
@@ -332,7 +343,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | N
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     needed = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
-    return min(m['bytes_limit'] - m['bytes_in_use'] for m in memory) - needed
+    return min(int(m['bytes_limit'] * (1 - FIT_RESERVE)) - m['bytes_in_use'] for m in memory) - needed
 
 
 def fits_everywhere(headroom: int | None) -> bool:
