@@ -29,7 +29,7 @@ batch = {"image": images}
 data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                   mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
-objective = DiffusionObjective(model, Flow()(), InputSpec(Field("image", (8, 8, 3))),
+objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),
                                sampler=Euler(), steps=4)
 trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
@@ -48,7 +48,7 @@ The image batch is NHWC (batch, height, width, channels) uint8 in `[0, 255]`; th
 
 ## Process and solver
 
-`Flow()` is a preset, a frozen dataclass of the numbers that define rectified flow. Calling it builds the `Process`, which draws noise and times, builds the training target and converts the model's output; hence `Flow()()`.
+`Flow()` is a preset, a frozen dataclass of the numbers that define rectified flow. The objective builds its `Process` once, which draws noise and times, builds the training target and converts the model's output. `objective.process` exposes it for direct sampling or schedule inspection. A custom `Process` can be passed in the same position.
 
 `DiffusionObjective(steps=4)` is the number of solver steps `evaluate` samples with; `trainer.fit(..., steps=3)` is the number of training steps.
 

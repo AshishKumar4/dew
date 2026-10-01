@@ -29,7 +29,7 @@ from dew.interop import load_pretrained
 from dew.interop.hf_decoders import _FAMILIES, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
+
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -120,7 +120,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     The export writes every source name back at its stored shape, A_log as
     [1, 1, heads, 1], and reloading restores the trained weights exactly."""
     loaded, inputs, reference = source
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1, pretrained=loaded.variables,
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
                             ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
