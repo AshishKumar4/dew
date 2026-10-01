@@ -24,6 +24,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
@@ -81,13 +82,12 @@ class FlowGRPOObjective(DiffusionObjective):
     shown = {"loss": Shown(), "reward": Shown(better="higher")}
     _ema_is_reference = True
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  sde: FlowSDE = FlowSDE(), beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = CFG(3.0), sampler: Solver = Euler(),
                  steps: int = 41, pretrained: Variables | None = None):
-        sde.validate(process)
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
         if not math.isfinite(clip_range) or not 0 <= clip_range < 1:
@@ -101,6 +101,7 @@ class FlowGRPOObjective(DiffusionObjective):
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, sampler=sampler,
                          guidance=guidance, steps=steps, pretrained=pretrained)
+        sde.validate(self.process)
         if beta == 0:
             self.ema = None
         self.sde = sde

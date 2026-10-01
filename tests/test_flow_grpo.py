@@ -375,8 +375,11 @@ class ConstantVelocity(nn.Module):
 
 
 def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
-    process = Process(FlowMatchingScheduler(shift=3), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(ConstantVelocity(), process, InputSpec(Field("image", (2, 2, 1))),
+    from dew.diffusion.presets import Flow
+
+    preset = Flow(shift=3)
+    process = preset()
+    objective = FlowGRPOObjective(ConstantVelocity(), preset, InputSpec(Field("image", (2, 2, 1))),
                                   beta=0.1, guidance=None, steps=3)
     reference = objective.init(jax.random.key(51))
     live = {**reference, "params": {"speed": jnp.asarray(0.8)}}

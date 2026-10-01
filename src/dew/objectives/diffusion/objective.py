@@ -24,6 +24,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid, agreed, collective_host
+from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -66,7 +67,7 @@ class DiffusionObjective(Objective[Mean]):
     def __init__(
         self,
         model: nn.Module,
-        process: Process,
+        process: Process | Preset,
         inputs: InputSpec,
         *,
         autoencoder: AutoEncoder | None = None,
@@ -79,11 +80,12 @@ class DiffusionObjective(Objective[Mean]):
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
+        `process` is a preset or a custom `Process`; presets build once here.
         `sampler`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction.
         """
         self.model = model
-        self.process = process
+        self.process = build_process(process)
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.pretrained = pretrained
@@ -103,7 +105,7 @@ class DiffusionObjective(Objective[Mean]):
         self.ema = (None if ema_decay is None else
                     EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(process, sampler, steps)
+        check_solver(self.process, sampler, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:

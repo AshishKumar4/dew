@@ -19,6 +19,7 @@ import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
+from dew.diffusion.presets import build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
@@ -443,13 +444,7 @@ class DiffusionRunConfig(RunConfig):
         if self.preset is None:
             assert convention is not None
             return convention
-        process = self.preset()
-        if not isinstance(process, Process):
-            raise ValueError(
-                f"preset {presets.name_of(type(self.preset))!r} builds a "
-                f"{type(process).__name__}, and DiffusionObjective trains a Gaussian "
-                "Process; masked diffusion trains through LMRunConfig's "
-                "--objective masked_diffusion")
+        process = build_process(self.preset)
         if convention is not None and (
                 type(process.schedule) is not type(convention.schedule)
                 or type(process.prediction) is not type(convention.prediction)):

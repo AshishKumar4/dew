@@ -395,6 +395,23 @@ class TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
         return replace(self, variables=variables)
 
+    def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
+        """Store the weights matched by `spec` as int8 or fp8 through Qwix.
+
+        Requires `dewml[quantization]`. `example` is one prepared model
+        input for the abstract trace; a multimodal model needs its media
+        fields too. The processor and decoding controls stay unchanged.
+        Host NumPy weights quantize one kernel at a time on the default
+        device and return to host storage. If one kernel will not fit,
+        load weights onto the task's mesh before quantizing them.
+        """
+        from dew.training.quantization import quantize_for_serving
+
+        inputs = _prepared(None, example, images=None)
+        model, variables = quantize_for_serving(self.model, self.variables, spec,
+                                                inputs.tokens, **inputs.kwargs())
+        return replace(self, model=model, variables=variables)
+
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,

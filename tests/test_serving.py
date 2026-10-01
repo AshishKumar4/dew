@@ -74,6 +74,21 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
 
 
+@pytest.mark.parametrize("dtype", ["int8", "fp8"])
+def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
+    from dew.training.quantization import Quantization
+
+    pytest.importorskip("qwix")
+    bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
+    server = Server.from_task(bound, slots=2, capacity=128)
+    prompts = ["12", "567"]
+    served = server(prompts, 4, seed=3)
+    alone = [bound(prompt, 4, seed=3) for prompt in prompts]
+    assert [result.text for result in served] == [result.text for result in alone]
+    for result, expected in zip(served, alone, strict=True):
+        assert_same_generation(result, expected)
+
+
 def test_a_sampled_request_keeps_its_own_draws():
     """A served row's key is the request key folded by row zero, which is
     what a one-row task call folds, so a sampled request draws the same

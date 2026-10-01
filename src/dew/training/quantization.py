@@ -19,8 +19,8 @@ straight-through estimator on the backward pass.
 Serving is not fake-quantized. `quantize_for_serving` runs Qwix's
 post-training quantization: the returned variables hold each matched kernel
 as int8 or fp8 values with their scales, and the returned module's matmuls
-read them. `TextToImage.quantized` applies it to a text-to-image task's
-denoiser.
+read them. `TextGeneration.quantized` applies it to a language model and
+`TextToImage.quantized` to an image task's denoiser.
 
 The vocabulary head stays fp32 with the rest of Dew's fp32 zones. Its einsum
 lives in the objective's chunked cross entropy, outside any model method
@@ -47,13 +47,15 @@ import dataclasses
 import functools
 import importlib
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 if TYPE_CHECKING:
     from dew.diffusion.process import Conditioning
@@ -477,8 +479,24 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
 
 
+def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
+    """Quantize one kernel at a time, retaining its host or device placement."""
+    qwix = _qwix()
+    shapes = flatten_dict(abstract)
+    quantized = {}
+    for path, parameter in flatten_dict(parameters).items():
+        host = isinstance(parameter, np.ndarray)
+        converted = qwix.quantize_params(
+            {"weight": jnp.asarray(parameter) if host else parameter}, {"weight": shapes[path]})["weight"]
+        quantized[path] = jax.device_get(converted) if host else converted
+        # Release a host kernel's device buffers before converting the next.
+        del converted
+    return unflatten_dict(quantized)
+
+
 def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantization,
-                         *args: Conditioning, **kwargs: Conditioning) -> tuple[nn.Module, Variables]:
+                         *args: Conditioning, **kwargs: Conditioning | Mapping[str, jax.Array]
+                         ) -> tuple[nn.Module, Variables]:
     """`model` and `variables` with the weights `spec` names stored quantized.
 
     This is Qwix's post-training quantization. The returned variables hold
@@ -494,13 +512,20 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     A weight-only spec leaves convolutions in float: Qwix 0.1.8's serving
     provider quantizes a convolution's weights only together with its
     activations.
+
+    Host NumPy kernels quantize one at a time on the default device and
+    return to host storage, ready for placement. Temporary device storage is
+    bounded by one kernel, not the whole model. If one kernel will not fit,
+    place the weights with a mesh and layout before quantizing. Resident
+    JAX parameters keep their placement through Qwix's operations.
     """
     rules = _rules(spec, training=False)
     qwix = _qwix()
     methods = tuple(method for method in METHODS if hasattr(model, method))
     served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
     abstract = jax.eval_shape(functools.partial(served.init, jax.random.key(0), *args, **kwargs))
-    return served, {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
+    parameters = _serving_parameters(variables["params"], abstract["params"])
+    return served, {**variables, "params": parameters}
 
 
 @runtime_checkable
