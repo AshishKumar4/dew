@@ -1,6 +1,8 @@
+from .adversarial import AdversarialDistillationObjective
 from .alignment import Alignment
 from .block import BlockDiffusionObjective
 from .config import (
+    AdversarialDistillation,
     AudioCondition,
     ConsistencyDistillation,
     DiffusionRunConfig,
@@ -21,6 +23,8 @@ from .objective import VALIDATION_SAMPLES, DiffusionObjective
 
 __all__ = [
     "VALIDATION_SAMPLES",
+    "AdversarialDistillation",
+    "AdversarialDistillationObjective",
     "Alignment",
     "AudioCondition",
     "BlockDiffusionObjective",
