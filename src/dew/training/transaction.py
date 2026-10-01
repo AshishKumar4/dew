@@ -14,8 +14,8 @@ the same arrays step after step.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
-from typing import Generic
+from collections.abc import Callable
+from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
@@ -32,13 +32,21 @@ def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     return None if ema is None else merge(params, ema)
 
 
-def _project(tree: Variables, like: Variables) -> Variables:
-    """The leaves of tree at the paths like holds, in like's nesting."""
-    return {name: _project(tree[name], child) if isinstance(child, Mapping) else tree[name]
-            for name, child in like.items()}
+def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
+    """The leaves of tree at the key paths like holds, in like's containers."""
+    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
+    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
 
 
-def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables:
+@overload
+def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
+
+
+@overload
+def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
+
+
+def ema_update(ema, params, decay):
     """Update selected EMA leaves in their initialized storage dtypes.
 
     Arithmetic uses at least fp32 and preserves explicit fp64. Unit decay

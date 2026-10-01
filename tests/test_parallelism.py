@@ -617,21 +617,28 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
 
     Both directions of the widest change the simulated mesh allows: every
     parameter replicated, and every parameter split eight ways. A checkpoint
-    is bytes, not arithmetic, so the values have to come back equal.
+    is bytes, not arithmetic, so the values have to come back equal, the EMA
+    copy's as much as the weights'.
     """
     trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
-    before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(trained.params)]
+    before = {field: [np.asarray(leaf).copy() for leaf in jax.tree.leaves(getattr(trained, field))]
+              for field in ("params", "ema")}
+    assert any(not np.array_equal(average, live) for average, live
+               in zip(before["ema"], before["params"], strict=True)), "the EMA is its weights"
 
     reopened = make_trainer(tmp_path, fsdp=restored).fit(Data(batches), steps=1)
     assert int(reopened.step) == 1
-    leaves = jax.tree.leaves(reopened.params)
-    for saved, leaf in zip(before, leaves, strict=True):
-        np.testing.assert_array_equal(saved, np.asarray(leaf))
+    for field, saved in before.items():
+        leaves = jax.tree.leaves(getattr(reopened, field))
+        for value, leaf in zip(saved, leaves, strict=True):
+            assert value.dtype == leaf.dtype, field
+            np.testing.assert_array_equal(value.view(np.uint8), np.asarray(leaf).view(np.uint8),
+                                          err_msg=field)
 
-    sharded = [leaf for leaf in leaves if 'fsdp' in str(leaf.sharding.spec)]
-    assert bool(sharded) == (restored > 1), "the restored layout is not this run's"
-    for leaf in sharded:
-        assert leaf.addressable_shards[0].data.size == leaf.size // restored
+        sharded = [leaf for leaf in leaves if 'fsdp' in str(leaf.sharding.spec)]
+        assert bool(sharded) == (restored > 1), f"the restored {field} layout is not this run's"
+        for leaf in sharded:
+            assert leaf.addressable_shards[0].data.size == leaf.size // restored
 
 
 def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_path):
