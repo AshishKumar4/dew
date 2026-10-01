@@ -7,7 +7,8 @@ they print and plot. The container holds no secrets and has no network access.
 
 The server exits, which stops the container, when the page disconnects, after
 DEW_LIVE_IDLE_SECONDS without a request while no cell runs, or after
-DEW_LIVE_WALL_SECONDS in all. The kernel runs under RLIMIT_CPU of
+DEW_LIVE_WALL_SECONDS from the page's connection; a container no page connects
+to within DEW_LIVE_CONNECT_SECONDS exits too. The kernel runs under RLIMIT_CPU of
 DEW_LIVE_CPU_SECONDS, so a runaway cell kills the kernel and not the server.
 
 Messages from the page, as JSON:
@@ -19,8 +20,21 @@ Messages to the page, each with the id of the cell they belong to:
     {"type": "error", "ename", "evalue", "traceback": [<str>]}
     {"type": "clear"}
     {"type": "done", "status": "ok" | "error" | "aborted", "count": <int or null>}
-and, without an id: {"type": "ready"}, {"type": "restarted"}, {"type": "closing", "reason": <str>}.
-The reasons are "time", "idle", "unused" and "kernel-failed", when the kernel did not start.
+and, without an id: {"type": "ready", "uptime": <s>, "setup": <s>, "image": <str>, "dew": <sha>},
+{"type": "restarted"}, {"type": "closing", "reason": <str>}. The reasons are "time",
+"idle", "unused" and "kernel-failed", when the kernel did not start.
+
+A new kernel runs the landing page's setup cell before the page hears "ready",
+so the model loads once per kernel, while the container waits for its page;
+"setup" says how long that took, "uptime" how long the server had run, "image"
+the image reference the Worker started the container from, and "dew" the Dew
+commit installed in it. A
+spare, which no page has connected to by then, also runs the page's sampling
+and text cells once, so the page's first runs find the text model loaded and
+both programs compiled. (A compilation
+cache baked into the image cannot do this: JAX keys a CPU program by the host's
+CPU model and features, and the build machine is never a Cloudflare host.) A
+sampling cell then reports its steps as display outputs (see progress.py).
 """
 
 from __future__ import annotations
@@ -30,6 +44,7 @@ import json
 import os
 import pwd
 import time
+from pathlib import Path
 from typing import Any
 
 from jupyter_client import AsyncKernelManager
@@ -40,12 +55,22 @@ from websockets.http11 import Request, Response
 IDLE_SECONDS = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
 WALL_SECONDS = int(os.environ.get("DEW_LIVE_WALL_SECONDS", "1200"))
 CPU_SECONDS = int(os.environ.get("DEW_LIVE_CPU_SECONDS", "900"))
-CONNECT_SECONDS = 60  # a container nobody connects to within a minute exits
+# A container nobody connects to within this long exits: a minute for a session's own
+# container, WARM_SECONDS for a spare (the Worker's kernel.ts).
+CONNECT_SECONDS = int(os.environ.get("DEW_LIVE_CONNECT_SECONDS", "60"))
 MAX_CODE = 100_000  # characters in one cell
 MAX_OUTPUT = 2_000_000  # characters of output from one cell; the rest is dropped
 MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well under the relay's 32 MiB
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
+IMAGE = os.environ.get("DEW_LIVE_IMAGE", "")
+DEW_COMMIT = Path("/opt/live/dew-commit").read_text().strip()
+# The landing page's setup cell (deploy.mjs copies it here), then preload.py; and its
+# sampling and text cells, which a spare runs once.
+PRELOAD = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler_setup.py", "preload.py"))
+WARMUP = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler.py", "text.py"))
+PRELOAD_SECONDS = 300
+SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS")
 
 
 class SandboxedKernelManager(AsyncKernelManager):
@@ -61,10 +86,14 @@ class SandboxedKernelManager(AsyncKernelManager):
             "JAX_PLATFORMS": "cpu",
             "MPLBACKEND": "module://matplotlib_inline.backend_inline",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": "/opt/live",
             # Two notices about this image rather than the reader's code: it has no
             # PyTorch, and no ipywidgets for tqdm's notebook progress bars.
             "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
             "PYTHONWARNINGS": "ignore:IProgress not found",
+            # The text-to-image model's configs, read without a network, and the
+            # kernel's compilation cache (see the Dockerfile).
+            **{name: os.environ[name] for name in SAMPLER_ENV},
         }
         await super()._async_launch_kernel(
             limited, **{**kw, "env": env, "cwd": WORKDIR},
@@ -121,6 +150,8 @@ class Session:
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.closed = asyncio.Event()
         self.close_reason = ""
+        self.preload_seconds = 0.0
+        self.connected: float | None = None
 
 
     async def start_kernel(self) -> None:
@@ -129,11 +160,37 @@ class Session:
             self.client = self.manager.client()
             self.client.start_channels()
             await self.client.wait_for_ready(timeout=60)
+            await self.preload()
         except Exception as error:  # noqa: BLE001 - any failure here ends the session
             print(f"the kernel did not start: {error!r}", flush=True)
             await self.close("kernel-failed")
             return
         self.kernel_ready.set()
+
+    async def preload(self) -> None:
+        """Run the landing page's setup cell in the new kernel, before the page may send cells.
+
+        The model loads once per kernel, while the container still waits for its page;
+        a spare, with no page yet, also runs the sampling cell to compile it.
+        """
+        started = time.monotonic()
+        await self.run_quietly(PRELOAD)
+        if self.socket is None:
+            await self.run_quietly(WARMUP)
+        self.preload_seconds = time.monotonic() - started
+        print(f"the kernel was prepared in {self.preload_seconds:.1f} s", flush=True)
+
+    async def run_quietly(self, code: str) -> None:
+        """Run `code` in the kernel without sending its outputs anywhere; raise if it fails."""
+        msg_id = self.client.execute(code, silent=True, store_history=False, allow_stdin=False)
+        while True:
+            message = await self.client.get_iopub_msg(timeout=PRELOAD_SECONDS)
+            if message["parent_header"].get("msg_id") != msg_id:
+                continue
+            if message["msg_type"] == "error":
+                raise RuntimeError("a preparation cell failed: " + "\n".join(message["content"]["traceback"]))
+            if message["msg_type"] == "status" and message["content"]["execution_state"] == "idle":
+                return
 
     async def ready_or_closed(self) -> bool:
         """Wait for the kernel; False when the session closed first, as when the kernel failed to start."""
@@ -223,18 +280,20 @@ class Session:
             await self.send({"id": dropped.get("id"), "type": "done", "status": "aborted", "count": None})
         await self.manager.restart_kernel(now=True)
         await self.client.wait_for_ready(timeout=60)
+        await self.preload()
         await self.send({"type": "restarted"})
 
     async def watch(self) -> None:
-        """Close the session at the wall-clock limit, or when it sits idle."""
+        """Close the session at the wall-clock limit, when it sits idle, or when no page comes."""
         while not self.closed.is_set():
             await asyncio.sleep(5)
             now = time.monotonic()
-            if now - self.started > WALL_SECONDS:
+            if self.connected is not None and now - self.connected > WALL_SECONDS:
                 await self.close("time")
             elif self.socket is None and now - self.started > CONNECT_SECONDS:
                 await self.close("unused")
-            elif not self.busy and self.queue.empty() and now - self.last_request > IDLE_SECONDS:
+            elif self.connected is not None and not self.busy and self.queue.empty() \
+                    and now - self.last_request > IDLE_SECONDS:
                 await self.close("idle")
 
     async def close(self, reason: str) -> None:
@@ -254,12 +313,13 @@ class Session:
             await socket.close(4009, "this container already has a session")
             return
         self.socket = socket
-        self.last_request = time.monotonic()
+        self.connected = self.last_request = time.monotonic()
         runner = asyncio.create_task(self.run_queue())
         try:
             if not await self.ready_or_closed():
                 return
-            await self.send({"type": "ready"})
+            await self.send({"type": "ready", "uptime": round(time.monotonic() - self.started, 1),
+                             "setup": round(self.preload_seconds, 1), "image": IMAGE, "dew": DEW_COMMIT})
             async for raw in socket:
                 self.last_request = time.monotonic()
                 try:

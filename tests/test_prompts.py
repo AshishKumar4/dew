@@ -99,6 +99,48 @@ def test_a_string_prompt_encodes_on_its_own():
     np.testing.assert_array_equal(batch[PROMPT_KEY][:WINDOW - len(ids)], 0)
 
 
+@pytest.mark.parametrize("prompt", ["dew", "caf\u00e9", "a longer prompt"])
+def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
+    from dew.data import tokenizer_for
+
+    data = Prompts(tokenizer="byte", records=records({"prompt": prompt}) * 8,
+                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=8)
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    ids = tokenizer_for("byte").encode(prompt)[-WINDOW:]
+    expected = [0] * (WINDOW - len(ids)) + ids
+    np.testing.assert_array_equal(batch[PROMPT_KEY], np.tile(expected, (8, 1)))
+    np.testing.assert_array_equal(batch[LENGTH_KEY], np.full(8, len(ids), np.int32))
+
+
+def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
+    from tokenizers import Tokenizer, models, processors
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel({"<unk>": 0, "<bos>": 1, "<eos>": 2, "dew": 3},
+                                         unk_token="<unk>"))
+    backend.post_processor = processors.TemplateProcessing(
+        single="<bos> $A <eos>", special_tokens=[("<bos>", 1), ("<eos>", 2)])
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>",
+                                        bos_token="<bos>", eos_token="<eos>")
+    tokenizer.save_pretrained(tmp_path)
+    ids = tokenizer.encode("dew", add_special_tokens=False)
+    assert tokenizer.encode("dew") != ids
+    data = Prompts(tokenizer=str(tmp_path), records=records({"prompt": "dew"}),
+                   max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(ids):], ids)
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(ids)], 0)
+    assert int(batch[LENGTH_KEY][0]) == len(ids)
+
+
 def test_messages_render_with_the_generation_prompt():
     from dew.data.text import load_tokenizer
 

@@ -24,7 +24,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.registry import samplers
 
-from .guidance import CFG
+from .guidance import Guidance
 
 
 @struct.dataclass
@@ -175,13 +175,14 @@ class FlowTrajectory:
 
 
 def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
-                      solver: FlowSDE = FlowSDE(), guidance: CFG | None = None,
+                      solver: FlowSDE = FlowSDE(), guidance: Guidance | None = None,
                       key: jax.Array) -> FlowTrajectory:
     """Record FlowSDE transitions over the same time grid and keys as sample.
 
     steps counts grid points, including both endpoints. A ten-transition
     rollout therefore uses steps=11. Guidance is applied identically before
-    constructing each Gaussian. Rectified flow's clean prediction at t=0
+    constructing each Gaussian, and must be stateless, as the rescoring of
+    each transition reads it alone. Rectified flow's clean prediction at t=0
     is its state, so the last transition already produces the final sample.
     """
     if steps < 2:

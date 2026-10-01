@@ -297,6 +297,26 @@ class MinSNR:
         return jnp.minimum(snr, self.gamma) / prediction.target_error_scale(snr)
 
 
+@dataclass(frozen=True)
+class VelocityLoss:
+    """Scores a clean-sample prediction in velocity space on the linear path,
+    JiT's loss (Li & He 2025, "Back to Basics: Let Denoising Generative
+    Models Denoise"): with x_t = (1 - sigma) x_0 + sigma eps the velocity is
+    (x_0 - x_t) / sigma, so its error is the x_0 error over sigma^2. sigma
+    is floored at `t_eps`, as the reference clamps it, in both the target
+    and the prediction. It replaces the schedule's own weight.
+    """
+
+    t_eps: float = 0.05
+
+    def __call__(self, schedule, prediction, t):
+        if not isinstance(prediction, DirectPredictionTransform):
+            raise ValueError("the velocity loss scores a clean-sample prediction; "
+                             f"the process predicts with {type(prediction).__name__}")
+        _, sigma = schedule.rates(t)
+        return 1.0 / jnp.square(jnp.maximum(sigma, self.t_eps))
+
+
 def broadcast_rates(schedule: NoiseScheduler, t, x) -> tuple[jax.Array, jax.Array]:
     """The schedule's rates at `t`, shaped to broadcast against `x`."""
     alpha, sigma = schedule.rates(t)

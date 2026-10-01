@@ -54,11 +54,13 @@ class AutoencoderKL(nn.Module):
         if self.post_quantize:
             self.post_quant_conv = Conv(self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
 
-    def encode(self, image, key=None):
+    def moments(self, image):
+        """The posterior's mean and log-variance, stacked on the channel axis."""
         moments = self.encoder(image)
-        if self.quantize:
-            moments = self.quant_conv(moments)
-        return posterior_latent(moments, key)
+        return self.quant_conv(moments) if self.quantize else moments
+
+    def encode(self, image, key=None):
+        return posterior_latent(self.moments(image), key)
 
     def decode(self, latents):
         if self.post_quantize:

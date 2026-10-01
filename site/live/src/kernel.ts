@@ -1,29 +1,56 @@
 // One Kernel object per session: it owns that session's container, relays its
 // WebSocket, destroys the container at the wall-clock limit, and reports the
-// container's start and stop to the Coordinator.
+// container's start and stop to the Coordinator. A spare's Kernel starts its
+// container before any page connects (see coordinator.ts).
+//
+// The container application uses the durable_object scheduling policy, so this
+// object starts its container itself, through ctx.container. Such containers sit
+// out image rollouts: a deploy leaves a running one on its old image. So each
+// records the image it started from, and only a container on the current
+// deploy's image serves a page (see also Coordinator.open).
 
-import { Container } from '@cloudflare/containers';
+import { DurableObject } from 'cloudflare:workers';
 import { coordinatorOf } from './coordinator';
 import { limitsOf } from './limits';
 
 /** The header the Worker sets to the session id it verified; the object is reachable only through the Worker. */
 export const SESSION_HEADER = 'X-Dew-Session';
 
-export class Kernel extends Container<Env> {
-	defaultPort = 8888;
-	// With the page's WebSocket open the container stays up, and server.py applies the
-	// idle limit; this only stops a container whose page has gone.
-	sleepAfter = '2m';
-	enableInternet = false;
+const PORT = 8888;
+/** How long a connection waits for a new container to get a host, boot and open its port. */
+const START_MS = 150_000;
+/** How often the object checks that its container still runs, and reports it gone. */
+const WATCH_MS = 30_000;
 
-	constructor(ctx: DurableObjectState<{}>, env: Env) {
+export class LiveKernel extends DurableObject<Env> {
+	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		const limits = limitsOf(env);
-		this.envVars = {
-			DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
-			DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds),
-			DEW_LIVE_CPU_SECONDS: String(limits.cpuSeconds),
-		};
+		// The timeout belongs to this instance of the object. One that restarts, as for an
+		// alarm after an eviction, sets it again, or its container stops soon after.
+		const container = ctx.container;
+		if (container?.running) void ctx.blockConcurrencyWhile(() => container.setInactivityTimeout(this.lifetimeMs()));
+	}
+
+	/** server.py ends every session itself; this only outlasts the longest one, a spare's wait and its wall clock. */
+	private lifetimeMs(): number {
+		const { warmSeconds, wallSeconds } = limitsOf(this.env);
+		return (warmSeconds + wallSeconds + 60) * 1000;
+	}
+
+	private get container(): Container {
+		if (!this.ctx.container) throw new Error('the Kernel has no container configured');
+		return this.ctx.container;
+	}
+
+	/** The kernel image this deploy starts, which the Worker hands to Coordinator.open. */
+	image(): string {
+		return this.container.images.kernel;
+	}
+
+	/** Start the container of spare session `session`, which waits WARM_SECONDS for its page. */
+	async warm(session: string): Promise<void> {
+		await this.ctx.storage.put('session', session);
+		await this.ensureRunning(session, { DEW_LIVE_CONNECT_SECONDS: String(limitsOf(this.env).warmSeconds) });
 	}
 
 	/** Relay the page's WebSocket to the container, starting the container on the first connection. */
@@ -34,27 +61,76 @@ export class Kernel extends Container<Env> {
 		if (known === undefined) await this.ctx.storage.put('session', session);
 		else if (known !== session) return new Response('wrong session', { status: 409 });
 		if (await this.ctx.storage.get<boolean>('ended')) return new Response('this session is over', { status: 410 });
-		return this.containerFetch(new Request('http://container/ws', request), this.defaultPort);
+		try {
+			await this.ensureRunning(session, {});
+		} catch (error) {
+			return new Response(`the container did not start: ${error instanceof Error ? error.message : String(error)}`, { status: 503 });
+		}
+		return this.container.getTcpPort(PORT).fetch(new Request('http://container/ws', request));
 	}
 
-	override async onStart(): Promise<void> {
-		const session = await this.ctx.storage.get<string>('session');
-		await this.schedule(limitsOf(this.env).wallSeconds + 15, 'expire');
-		// A container the Coordinator does not count must not run: it would escape the
-		// session cap, the one-at-a-time rule and the budget.
-		const counted = session !== undefined && (await coordinatorOf(this.env).started(session, Date.now()));
-		if (!counted) await this.expire();
+	/**
+	 * Start this session's container unless it runs, and wait until server.py answers. A
+	 * container the Coordinator does not count must not run: it would escape the session
+	 * cap, the one-at-a-time rule and the budget.
+	 */
+	private async ensureRunning(session: string, env: Record<string, string>): Promise<void> {
+		const container = this.container;
+		const image = container.images.kernel;
+		if (container.running && (await this.ctx.storage.get<string>('image')) !== image) await container.destroy();
+		if (!container.running) {
+			const limits = limitsOf(this.env);
+			container.start({
+				image,
+				// 4 vCPUs and 12 GiB: the landing page's 176M text-to-image model samples on the CPU.
+				instance: 'standard-4',
+				enableInternet: false,
+				env: {
+					DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
+					DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds),
+					DEW_LIVE_CPU_SECONDS: String(limits.cpuSeconds),
+					DEW_LIVE_IMAGE: image,
+					...env,
+				},
+			});
+			await container.setInactivityTimeout(this.lifetimeMs());
+			await this.ctx.storage.put({ started: Date.now(), image });
+			await this.ctx.storage.setAlarm(Date.now() + WATCH_MS);
+			if (!(await coordinatorOf(this.env).started(session, Date.now(), image))) {
+				await this.expire();
+				throw new Error('this session is over');
+			}
+		}
+		const port = container.getTcpPort(PORT);
+		const deadline = Date.now() + START_MS;
+		for (;;) {
+			try {
+				if ((await port.fetch('http://container/')).ok) return;
+			} catch {
+				// Not listening yet.
+			}
+			if (Date.now() > deadline || !container.running) throw new Error('the container did not open its port');
+			await scheduler.wait(500);
+		}
 	}
 
-	override async onStop(): Promise<void> {
-		await this.ctx.storage.put('ended', true);
+	/** Report a container that stopped, and destroy one past the longest a session may run. */
+	override async alarm(): Promise<void> {
+		const started = (await this.ctx.storage.get<number>('started')) ?? 0;
+		const { wallSeconds, warmSeconds } = limitsOf(this.env);
+		const overdue = Date.now() > started + (warmSeconds + wallSeconds + 15) * 1000;
+		if (this.container.running && !overdue) {
+			await this.ctx.storage.setAlarm(Date.now() + WATCH_MS);
+			return;
+		}
+		await this.expire();
 		const session = await this.ctx.storage.get<string>('session');
 		if (session !== undefined) await coordinatorOf(this.env).ended(session, Date.now());
 	}
 
-	/** Kill the container now; the wall-clock schedule and the Coordinator's sweep call this. */
+	/** Kill the container now; the alarm and the Coordinator's sweep call this. */
 	async expire(): Promise<void> {
 		await this.ctx.storage.put('ended', true);
-		if (this.ctx.container?.running) await this.destroy();
+		if (this.container.running) await this.container.destroy();
 	}
 }

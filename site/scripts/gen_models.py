@@ -1,7 +1,7 @@
 """Generate the supported-models page from the registries in Dew's source.
 
 The families come from the code, not from a list kept by hand: the decoder
-table `_FAMILY_ENTRIES` and the branches of `translate_wrapper_config` in
+table `_FAMILY_ENTRIES` and the wrapper table `_WRAPPERS` in
 `dew/interop/hf_decoders.py`, the diffusers pipelines in
 `dew/interop/pretrained.py`, and the classes registered with `@models(...)`.
 DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
@@ -152,19 +152,10 @@ def decoder_families() -> list[tuple[str, str, bool]]:
 
 
 def wrappers() -> list[str]:
-    """The multimodal model_types that load, in source order: the explicit branches of
-    `translate_wrapper_config`, then the decoder families that register a `wrapper`."""
-    tree = module_tree("src/dew/interop/hf_decoders.py")
-    translator = next((node for node in tree.body
-                       if isinstance(node, ast.FunctionDef) and node.name == "translate_wrapper_config"), None)
-    if translator is None:
-        raise SystemExit("gen_models: translate_wrapper_config is gone from the source; update scripts/gen_models.py")
-    branches = [
-        node for node in ast.walk(translator)
-        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "model_type"
-        and isinstance(node.ops[0], ast.Eq) and isinstance(node.comparators[0], ast.Constant)
-    ]
-    explicit = [node.comparators[0].value for node in sorted(branches, key=lambda node: node.lineno)]
+    """The multimodal model_types that load, in source order: the keys of
+    `_WRAPPERS`, then the decoder families that register a `wrapper`."""
+    value = assigned(module_tree("src/dew/interop/hf_decoders.py"), "_WRAPPERS")
+    explicit = [key.value for key in value.keys]
     bundled = [model_type for model_type, _, wrapped in decoder_families() if wrapped and model_type not in explicit]
     return explicit + bundled
 

@@ -453,6 +453,10 @@ def small_cases(dtype: str) -> list[Case]:
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
+        # EDM2's magnitude-preserving U-Net at the plain U-Net's widths.
+        Case("edm2_unet", {"model_channels": 64, "channel_mult": [1, 2, 4], "num_blocks": 2,
+                           "attn_resolutions": [16], "channels_per_head": 64},
+             batch_size=16, image_size=64),
         Case("unet_2d_condition", {"stages": [{"features": 64, "heads": 4}, {"features": 128, "heads": 4},
                                               {"features": 256, "heads": 8, "cross_attention": False}],
                                     "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
@@ -696,26 +700,26 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
-        process = presets.EDM(regime="pixel")()
+        preset = presets.EDM(regime="pixel")
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
-            process = presets.Flow()()
+            preset = presets.Flow()
         elif isinstance(model, ZImageTransformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True)
-            process = presets.Flow()()
+            preset = presets.Flow()
         elif isinstance(model, Flux2Transformer):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained(
                 features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None)
-            process = presets.Flow()()
+            preset = presets.Flow()
         elif isinstance(model, (SD3Transformer, FluxTransformer)):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained(
                 features=model.joint_attention_dim, pooled_features=model.pooled_projection_dim,
                 guidance=3.5 if isinstance(model, FluxTransformer) and model.guidance_embeds else None)
-            process = presets.Flow()()
+            preset = presets.Flow()
         elif isinstance(model, UNet2DCondition):
             keyword = "conditioning"
             encoder = _DenoisingTextTable.from_pretrained()
@@ -724,7 +728,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
             encoder = CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES)
         inputs = InputSpec(Field(sample_key, case.sample_shape),
                            {keyword: Condition(encoder)})
-        objective = DiffusionObjective(model, process, inputs)
+        objective = DiffusionObjective(model, preset, inputs)
     return objective
 
 

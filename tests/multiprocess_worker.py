@@ -719,7 +719,7 @@ def mode_validate(args) -> dict:
              "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
     objective = DiffusionObjective(
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
-        presets.Flow()(),
+        presets.Flow(),
         InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
         guidance=None, steps=2)
     scored = ScoreRecorder()
@@ -1089,7 +1089,7 @@ def mode_builtin_preview_failures(args) -> dict:
         else:
             objective = DiffusionObjective(
                 SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
-                presets.EDM(regime="pixel")(), InputSpec(Field("image", (RES, RES, 3))),
+                presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
                 steps=2, sampler=Euler(), guidance=None)
             batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
         tracker = ScoreRecorder()
