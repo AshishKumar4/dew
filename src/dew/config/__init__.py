@@ -22,7 +22,6 @@ import dataclasses
 import functools
 import hashlib
 import json
-import logging
 import operator
 import os
 import re
@@ -51,14 +50,13 @@ from dew.records import JSON
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
 from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
-
-_log = logging.getLogger(__name__)
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -598,8 +596,9 @@ class RunConfig:
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
-                    _log.info("Experiment_Name: %s", name)
-                    _log.info("Local tracking: %s", local.directory)
+                    display = TrainingDisplay()
+                    display.note(f"Experiment_Name: {name}")
+                    display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)

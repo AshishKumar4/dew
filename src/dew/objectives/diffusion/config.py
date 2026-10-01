@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
-import dew.eval  # registers the image metrics
-import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
 from dew.diffusion.presets import build_process
@@ -31,6 +30,9 @@ from dew.sampling.guidance import CFG
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
 from .objective import DiffusionObjective
+
+import_module("dew.eval")  # registers the image metrics
+import_module("dew.nn.backbones")  # registers the models before the config's unions are built
 
 if TYPE_CHECKING:
     from dew.diffusion.presets import Preset

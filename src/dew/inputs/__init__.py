@@ -26,6 +26,8 @@ from dew import registry
 from dew.nn.vision import PIXEL_VALUES_KEY
 from dew.objectives.base import Variables
 
+# The conditioner depends on the separate encoders module, not this hub's
+# Condition and InputSpec, so the re-export needs no late cyclic import.
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
 

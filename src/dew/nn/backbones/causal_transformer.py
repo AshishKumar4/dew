@@ -654,11 +654,9 @@ class CausalTransformer(nn.Module):
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None  # None: emb_features // num_heads
     mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
-    mlp_features: int | tuple[int, ...] | None = (
-        # None: four times emb_features; a tuple: one width per layer (Gemma 3n);
-        # 0: no feed-forward (Mamba-2).
-        None
-    )
+    mlp_features: int | tuple[int, ...] | None = None
+    """None: four times emb_features; a tuple: one width per layer (Gemma 3n);
+    0: no feed-forward (Mamba-2)."""
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
@@ -753,9 +751,10 @@ class CausalTransformer(nn.Module):
     (`draft_context`). None is a model without one."""
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
-    mask_token_id: int | None = (
-        None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
-    )
+    """Gemma 3n's gaussian top-k, one fraction per layer."""
+    mask_token_id: int | None = None
+    """The vocabulary id a masked-diffusion objective corrupts to;
+    None is plain training."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is how many its parameter
