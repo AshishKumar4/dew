@@ -79,8 +79,8 @@ def check_checkpoint(checkpoint, output, revision=None):
         observations.append({'modality': 'text' if index == 0 else 'image',
                              'max_abs_error': error, 'bound': bound,
                              'sequence_length': int(expected[index].shape[1]),
-                             'key_dim': int(getattr(config.get_text_config(), 'linear_key_head_dim',
-                                                     config.get_text_config().head_dim)),
+                             'key_dim': int(config.get_text_config().to_dict().get('linear_key_head_dim',
+                                                   config.get_text_config().to_dict().get('head_dim'))),
                              'max_reference_logit': float(np.max(np.abs(expected[index]))),
                              'argmax_agreement': argmax, 'generation_agreement': agreement})
     metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
