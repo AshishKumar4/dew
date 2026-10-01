@@ -179,13 +179,16 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     A capacity of None leaves the request its own shapes and the model its
     own cache. That is what a request too large for the ceiling gets, so it
     is refused where it is refused today, and what one carrying media or
-    logical positions gets: validity is the only sequence field a filler
-    slot has a value for, since such a slot holds no coordinate and no
-    media feature.
+    logical positions gets: a filler slot holds no media feature and no
+    multi-axis coordinate. One-axis positions, which every source
+    processor's text rows carry, pad like validity: the filler is invalid,
+    so its position is never read, and the real tokens keep theirs.
     """
     if ceiling is None or budget < 1:
         return inputs, budget, None
-    if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
+    positions = inputs.token_fields.get("positions")
+    if (set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning
+            or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
     width = _bucket(inputs.tokens.shape[1], 64)
     trips = _bucket(budget, 1)
@@ -203,8 +206,10 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
     valid = inputs.token_fields.get("attention_mask")
     if valid is None:
         valid = jnp.ones(inputs.tokens.shape, bool)
-    return replace(inputs, tokens=jnp.pad(inputs.tokens, ((0, 0), (extra, 0))),
-                   token_fields={"attention_mask": jnp.pad(valid, ((0, 0), (extra, 0)))})
+    left = ((0, 0), (extra, 0))
+    fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
+    return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
+                   token_fields={**fields, "attention_mask": jnp.pad(valid, left)})
 
 
 @functools.cache
@@ -394,6 +399,23 @@ class TextGeneration:
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
         return replace(self, variables=variables)
+
+    def quantized(self, spec: Quantization, example: Rows = ((0,),)) -> TextGeneration:
+        """Store the weights matched by `spec` as int8 or fp8 through Qwix.
+
+        Requires `dewml[quantization]`. `example` is one prepared model
+        input for the abstract trace; a multimodal model needs its media
+        fields too. The processor and decoding controls stay unchanged.
+        Host NumPy weights quantize one kernel at a time on the default
+        device and return to host storage. If one kernel will not fit,
+        load weights onto the task's mesh before quantizing them.
+        """
+        from dew.training.quantization import quantize_for_serving
+
+        inputs = _prepared(None, example, images=None)
+        model, variables = quantize_for_serving(self.model, self.variables, spec,
+                                                inputs.tokens, **inputs.kwargs())
+        return replace(self, model=model, variables=variables)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,

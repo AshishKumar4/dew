@@ -327,6 +327,19 @@ CASES: Mapping[str, Case] = {
     "unipc.zero_snr_v_leading": Case("UniPCMultistepScheduler", dict(
         VP, rescale_betas_zero_snr=True, prediction_type="v_prediction",
         timestep_spacing="leading", disable_corrector=[0])),
+    # The same classes on flow sigmas, as SANA ships DPM-Solver++ and Wan
+    # UniPC: the shifted flow path, velocity read as a clean prediction, and
+    # each class's own terminal sigma.
+    "dpm_multi.flow": Case("DPMSolverMultistepScheduler", dict(
+        VP, use_flow_sigmas=True, flow_shift=3.0, prediction_type="flow_prediction")),
+    "dpm_multi.flow_sde_order3_sigma_min": Case("DPMSolverMultistepScheduler", dict(
+        VP, use_flow_sigmas=True, flow_shift=5.0, prediction_type="flow_prediction",
+        algorithm_type="sde-dpmsolver++", solver_order=3, final_sigmas_type="sigma_min")),
+    "unipc.flow": Case("UniPCMultistepScheduler", dict(
+        VP, use_flow_sigmas=True, flow_shift=5.0, prediction_type="flow_prediction")),
+    "unipc.flow_order3_sigma_min": Case("UniPCMultistepScheduler", dict(
+        VP, use_flow_sigmas=True, flow_shift=3.0, prediction_type="flow_prediction",
+        solver_order=3, final_sigmas_type="sigma_min")),
     # EDM: its own sigma convention, both schedules and the signed c_out.
     "edm.default": Case("EDMDPMSolverMultistepScheduler", EDM),
     "edm.exponential_v_threshold": Case("EDMDPMSolverMultistepScheduler", dict(

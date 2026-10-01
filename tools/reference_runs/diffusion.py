@@ -229,7 +229,7 @@ def dew_side(args, images, total, attention):
     constants = jax.tree.map(np.asarray, model.init(
         jax.random.key(0), jnp.zeros((1, *images.shape[1:])), jnp.zeros((1,)))["constants"])
     initial = {**load_tree(args.init), "constants": constants, "encoders": {}}
-    objective = FixedDraws(model, EDM(P_mean=-0.4, P_std=1.0)(), InputSpec(sample=Field("image", images.shape[1:])),
+    objective = FixedDraws(model, EDM(P_mean=-0.4, P_std=1.0), InputSpec(sample=Field("image", images.shape[1:])),
                            ema_decay=args.ema, guidance=None, pretrained=initial)
     optimizer, schedule = solver(args, total)
     devices = jax.device_count()

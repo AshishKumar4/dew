@@ -447,7 +447,8 @@ def load_rae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | No
 
 
 def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                param_dtype: str = "float32") -> tuple[RepresentationEncoder, Variables, tuple[WeightLayout, ...]]:
+                param_dtype: str = "float32", params: Variables | None = None
+                ) -> tuple[RepresentationEncoder, Variables, tuple[WeightLayout, ...]]:
     """Build a transformers `Dinov2Model` checkpoint, such as
     `facebook/dinov2-base`, as a `RepresentationEncoder` of kind
     `dinov2_plain` at the checkpoint's 518-pixel input, its parameters, and
@@ -457,10 +458,13 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
     The encoder reads ImageNet-normalized `[B, S, S, 3]` pixels at its
     `input_size`; `module.clone(input_size=224)` reads 224-pixel ones with
     the position table resized to the 16x16 grid, as `Dinov2Model` resizes
-    it for a 224-pixel image."""
+    it for a 224-pixel image.
+
+    Supplied `params` are bound unchanged: only the config is read, and no
+    source layouts are returned."""
     from dew.interop import diffusion, sources
 
-    directory = sources.snapshot(str(name_or_dir), revision)
+    directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)
     config = json.loads((directory / "config.json").read_text())
     if config.get("model_type") != "dinov2" or config.get("use_swiglu_ffn") or config.get("hidden_act") != "gelu":
         raise ValueError(f"{directory} is not a GELU Dinov2Model; the port computes that one")
@@ -472,14 +476,16 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
                          f"width) {geometry}")
     module = RepresentationEncoder("dinov2_plain", config["hidden_size"], config["num_hidden_layers"],
                                    config["patch_size"], config["image_size"], compute)
-    tensors = diffusion.component_tensors(directory, "")
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, "")
 
-    def path_of(name: str) -> tuple[str, ...] | None:
-        path = rae_path(f"encoder.{name}", np.ndim(tensors[name]))
-        return None if path is None else path[1:]
+        def path_of(name: str) -> tuple[str, ...] | None:
+            path = rae_path(f"encoder.{name}", np.ndim(tensors[name]))
+            return None if path is None else path[1:]
 
-    params, layouts = diffusion.record_layouts("dinov2", tensors, path_of, ("representation",),
-                                               param_dtype=param_dtype)
+        params, layouts = diffusion.record_layouts("dinov2", tensors, path_of, ("representation",),
+                                                   param_dtype=param_dtype)
     check_tree({"params": params}, module,
                jax.ShapeDtypeStruct((1, module.input_size, module.input_size, 3), jnp.float32))
     return module, params, layouts
