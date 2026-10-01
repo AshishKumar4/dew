@@ -386,6 +386,46 @@ def raw_leaf(leaf):
         leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
+def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
+    """Repeated token IDs share embedding-gradient updates. CUDA's default
+    scatter-add order is not repeatable; conftest enables deterministic ops
+    before the backend opens. Check every state leaf, not just parameters."""
+    from dew.data import Loading, TokenWindows
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    tokens = np.tile(np.arange(8, dtype=np.uint8), 256)
+    tokens.tofile(tmp_path / "train.bin")
+    tokens[:128].tofile(tmp_path / "val.bin")
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
+        "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
+    }))
+    data = TokenWindows(path=str(tmp_path), seq_len=16,
+                        loading=Loading(workers=0)).load(batch=8)
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                              num_heads=2, mlp_features=32, max_seq_len=32)
+    objective = LMObjective(model, seq_len=16, ema_decay=None)
+
+    def trainer(checkpoints=None):
+        return Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
+                       checkpoints=checkpoints)
+
+    baseline = trainer().fit(data, steps=3)
+    repeated = trainer().fit(data, steps=3)
+    split = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    prefix = split.fit(data, steps=2, checkpoint_every=1)
+    restarted = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    restored, _, position = restarted.place()
+    assert position is not None
+    resumed = restarted.fit(data, steps=3, checkpoint_every=1)
+    for actual, expected in ((restored, prefix), (repeated, baseline), (resumed, baseline)):
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
 def test_the_state_is_built_from_the_initializer_and_the_key_alone():
     """What `place` compiles takes the objective's held variables and the run
     key as arguments, so a loaded checkpoint reaches the device as data.
