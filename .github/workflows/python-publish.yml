@@ -1,29 +1,50 @@
 name: Publish to PyPI
 
 # Releases only. Pushes to main must not ship untested code to PyPI.
+#
+# Trusted publishing: PyPI accepts this workflow's short-lived OIDC token, so
+# the repository holds no PyPI secret. PyPI's project `dewml` names this
+# repository, this workflow file and the `pypi` environment as its publisher
+# (for the first release, a pending publisher on the account that will own
+# the project). Only the publish job can mint the token, and it runs no code
+# from the repository.
 on:
   release:
     types: [published]
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       contents: read
-      id-token: write   # trusted publishing: PyPI accepts GitHub's short-lived OIDC token, no stored secret
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build the sdist and wheel
+      - name: Build and check the sdist and wheel
         run: |
-          python -m pip install --upgrade build
+          python -m pip install --upgrade pip build twine
           python -m build
-      - name: Check the distributions
-        run: |
-          python -m pip install --upgrade twine
-          python -m twine check dist/*
+          python -m twine check --strict dist/*
+          python tools/check_distribution.py dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dewml
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1

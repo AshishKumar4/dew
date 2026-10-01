@@ -18,7 +18,7 @@ from flax.traverse_util import flatten_dict
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import _FAMILIES, _wrapper_sources, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
+
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -102,8 +102,8 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
     gradients and source layouts that drop trained parameters on export.
     """
     loaded, inputs, reference = source
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None,
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None,
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
@@ -198,8 +198,8 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
     """
     loaded, inputs, _ = source
     reference = np.load(loaded.source / "mtp_reference.npz")
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None, mtp_weight=0.2,
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None, mtp_weight=0.2,
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
@@ -272,8 +272,8 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     gave finite forward values but non-finite gradients and exported weights.
     """
     loaded, inputs, reference = video_source
-    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
-                            pretrained=loaded.variables, ema_decay=None, mtp_weight=.2,
+    objective = loaded.lm_objective(inputs.tokens.shape[1] - 1,
+                            ema_decay=None, mtp_weight=.2,
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 

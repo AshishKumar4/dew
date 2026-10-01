@@ -7,6 +7,7 @@ end-to-end run proving the objective actually learns a distribution.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from flax import linen as nn
@@ -46,6 +47,36 @@ def test_timesteps_are_logit_normal(rng):
     logits = jnp.log(steps) - jnp.log1p(-steps)
     assert abs(float(jnp.mean(logits)) - (-0.3)) < 0.05
     assert abs(float(jnp.std(logits)) - 1.4) < 0.05
+
+
+def test_mode_times_are_the_sd3_training_scripts_draws(monkeypatch):
+    """SD3's mode density (Esser et al. 2024, Eq. 20) as diffusers' SD3
+    training scripts draw it, fed the same uniform draws."""
+    torch = pytest.importorskip("torch")
+    training = pytest.importorskip("diffusers.training_utils")
+    key, count = jax.random.PRNGKey(4), 4096
+    uniform = jax.random.uniform(key, (count,), jnp.float32)
+    monkeypatch.setattr(torch, "rand", lambda size, **_: torch.from_numpy(np.asarray(uniform)))
+    expected = training.compute_density_for_timestep_sampling("mode", count, mode_scale=1.29)
+    drawn = FlowMatchingScheduler(density="mode", mode_scale=1.29).sample_t(key, count)
+    np.testing.assert_allclose(np.asarray(drawn), expected.numpy(), rtol=1e-6, atol=1e-7)
+
+
+def test_cosmap_times_follow_the_papers_density(rng):
+    """Eq. 21's density 2 / (pi (1 - 2t + 2t^2)) integrates to the CDF
+    (2 / pi) atan(t / (1 - t)); the draws' empirical CDF stays within the
+    Kolmogorov-Smirnov bound for 200k samples (1.63 / sqrt(n), p = 0.01)."""
+    count = 200_000
+    drawn = np.sort(np.asarray(FlowMatchingScheduler(density="cosmap").sample_t(rng, count),
+                               np.float64))
+    cdf = 2 / np.pi * np.arctan(drawn / (1 - drawn))
+    empirical = np.arange(1, count + 1) / count
+    assert np.max(np.abs(empirical - cdf)) < 1.63 / np.sqrt(count)
+
+
+def test_mode_scale_outside_the_monotone_range_is_refused():
+    with pytest.raises(ValueError, match="monotone"):
+        FlowMatchingScheduler(density="mode", mode_scale=2.0)
 
 
 def test_resolution_shift_is_identity_at_one():

@@ -10,6 +10,7 @@
  "dew.config.OptimConfig": {
   "clip_grads": 0.0,
   "ema_profiles": [],
+  "forced_weight_normalization": false,
   "learning_rate": 0.00027,
   "optimizer": "adamw",
   "optimizer_opts": {},
@@ -510,10 +511,18 @@
   "sigma_min": 0.002
  },
  "dew.diffusion.presets.Flow": {
+  "density": "logit_normal",
   "logit_mean": 0.0,
   "logit_std": 1.0,
   "min_snr_gamma": null,
+  "mode_scale": 1.29,
+  "resolution_shift": null,
   "shift": 1.0
+ },
+ "dew.diffusion.presets.JiT": {
+  "logit_mean": 0.8,
+  "logit_std": 0.8,
+  "t_eps": 0.05
  },
  "dew.diffusion.presets.Karras": {
   "min_snr_gamma": null,
@@ -522,6 +531,18 @@
   "sigma_max": 80.0,
   "sigma_min": 0.002
  },
+ "dew.diffusion.presets.MeanFlow": {
+  "logit_mean": -0.4,
+  "logit_std": 1.0
+ },
+ "dew.diffusion.presets.ResolutionShift": {
+  "base_shift": 0.5,
+  "base_tokens": 256,
+  "max_shift": 1.15,
+  "max_tokens": 4096,
+  "tokens": null
+ },
+ "dew.diffusion.presets.Shortcut": {},
  "dew.diffusion.presets.Sqrt": {
   "min_snr_gamma": null
  },
@@ -538,13 +559,36 @@
   "dtype": null,
   "param_dtype": "float32"
  },
+ "dew.objectives.diffusion.config.ConsistencyDistillation": {
+  "consistency": "continuous",
+  "consistency_weight": 100.0,
+  "critic_times": [
+   0.0,
+   1.6
+  ],
+  "discrete_shift": 5.0,
+  "discrete_skip": 1,
+  "discrete_steps": 48,
+  "dmd_weight": 1.0,
+  "max_simulation_steps": 4,
+  "student_times": [
+   -0.8,
+   1.6
+  ],
+  "student_update_freq": 5,
+  "tangent_warmup": 0,
+  "teacher": "",
+  "teacher_guidance": 1.0
+ },
  "dew.objectives.diffusion.config.DiffusionRunConfig": {
+  "alignment": null,
   "audio": null,
   "autoencoder": null,
   "data": {
    "class": "dew.data.images.OxfordFlowers",
    "sets": {}
   },
+  "distill": null,
   "ema_decay": 0.999,
   "guidance": {
    "class": "dew.sampling.guidance.CFG",
@@ -552,7 +596,9 @@
     "scale": 3.0
    }
   },
+  "guidance_distill": null,
   "lora": null,
+  "mean_flow": null,
   "model": {
    "class": "dew.config.ModelConfig",
    "sets": {
@@ -590,6 +636,7 @@
    "sets": {}
   },
   "sampling_steps": 200,
+  "shortcut": null,
   "text": {
    "class": "dew.objectives.diffusion.config.TextCondition",
    "sets": {}
@@ -598,6 +645,7 @@
    "class": "dew.config.TrainerConfig",
    "sets": {}
   },
+  "uncertainty": null,
   "unconditional_prob": 0.12,
   "val_metrics": [
    "clip"
@@ -613,12 +661,45 @@
   "rollout_steps": 11,
   "train_steps": null
  },
+ "dew.objectives.diffusion.config.GuidanceDistillation": {
+  "scales": [
+   1.0,
+   8.0
+  ],
+  "teacher": ""
+ },
+ "dew.objectives.diffusion.config.MeanFlowTraining": {
+  "guidance_interval": [
+   0.0,
+   1.0
+  ],
+  "instantaneous": 0.75,
+  "kappa": 0.0,
+  "norm_eps": 0.01,
+  "norm_p": 1.0,
+  "omega": 1.0
+ },
  "dew.objectives.diffusion.config.PretrainedAutoencoder": {
   "dtype": "bfloat16",
   "latent_scale": null,
   "latent_shift": null,
   "modelname": "pcuenq/sd-vae-ft-mse-flax",
   "revision": "bf16"
+ },
+ "dew.objectives.diffusion.config.RepresentationAlignment": {
+  "encoder": "facebook/dinov2-base",
+  "end_to_end": null,
+  "kernel_size": 3,
+  "layer": "dit_block_7",
+  "projector": "mlp",
+  "resolution": 224,
+  "spatial_norm": null,
+  "weight": 0.5,
+  "width": 2048
+ },
+ "dew.objectives.diffusion.config.ShortcutTraining": {
+  "bootstrap_every": 8,
+  "sections": 128
  },
  "dew.objectives.diffusion.config.TextCondition": {
   "checkpoint": "openai/clip-vit-large-patch14",
@@ -629,6 +710,13 @@
   "param_dtype": "float32",
   "revision": null,
   "unconditional": ""
+ },
+ "dew.objectives.diffusion.end_to_end.EndToEnd": {
+  "align_weight": 1.5,
+  "epsilon": 0.0001,
+  "kl_weight": 1e-06,
+  "momentum": 0.1,
+  "reconstruction_weight": 1.0
  },
  "dew.objectives.lm.config.LMRunConfig": {
   "aux_loss_alpha": null,
@@ -722,7 +810,12 @@
  },
  "dew.sampling.solvers.Euler": {},
  "dew.sampling.solvers.EulerAncestral": {},
- "dew.sampling.solvers.Heun": {},
+ "dew.sampling.solvers.Heun": {
+  "s_churn": 0.0,
+  "s_noise": 1.0,
+  "s_tmax": Infinity,
+  "s_tmin": 0.0
+ },
  "dew.sampling.solvers.KDPM2": {
   "ancestral": false
  },

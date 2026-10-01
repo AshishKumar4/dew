@@ -74,6 +74,9 @@ class HybridSSMAttentionDiT(SimpleDiT):
             raise ValueError(
                 f"block_pattern names every layer's mixer and ssm_attention_ratio "
                 f"{self.ssm_attention_ratio!r} names them by ratio; set one, not both")
+        if self.routes and self.use_2d_fusion:
+            raise ValueError("TREAD's routes leave a token subset, which 2D state fusion cannot "
+                             "lay out on the image grid; set use_2d_fusion=False to route")
         pattern = build_block_pattern(
             self.num_layers, self.ssm_attention_ratio, self.block_pattern)
         return [self.block(index, block_type) for index, block_type in enumerate(pattern)]
