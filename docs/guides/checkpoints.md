@@ -122,6 +122,15 @@ Orbax compresses every array of a checkpoint with zstd, which in the two runs be
 
 How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` with JAX's CPU backend, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. In three processes of three saves and restores each, alternating with processes running the code before this change, a compiled save blocked the step for 0.19 to 0.46 s instead of 0.04 to 0.14 s, the time to compute the planes, and landed on disk in 1.9 to 3.7 s instead of 1.8 to 2.3 s, apart from saves that took 17 to 74 s either way while the shared disk was busy. Restores took 1.45 to 1.59 s instead of 1.31 to 1.71 s. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model): there, a save blocked for 1.0 to 2.7 s and a restore took 2.0 to 3.0 s.
 
+On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2, the same checkpoint's weights and EMA (175.6M fp32 parameters, step 1.35M) gave the following timings. The variants were interleaved in one process for five saves and restores each; the table gives medians of attempts 1–4, excluding the first calls.
+
+| EMA storage | Weights and EMA | Save blocks the step | Save becomes durable | Restore |
+|---|---|---|---|---|
+| EMA as itself, zstd | 1306.0 MB | 0.49 s | 5.78 s | 2.35 s |
+| XOR byte planes, zstd | 1139.4 MB | 0.59 s | 5.28 s | 2.53 s |
+
+Both variants restored the EMA bit for bit. These are checkpoint timings, not training-step timings.
+
 Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
 
 ## Post-hoc EMA
@@ -139,7 +148,14 @@ averaged = reconstruct(run_directory, 0.07, step=40000)
 
 Each profile holds one more copy of the weights in memory. Retaining the whole checkpoint costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot: about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB, but the separate-manager design added blocking setup and a gap between commits; the one-checkpoint design keeps the state and profiles atomic. Empty `ema_profiles` retains the ordinary `keep` policy.
 
-In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state saved with and without snapshot retention blocked for median 14.9 and 15.2 ms respectively (six warmed pairs). No extra parameter bytes are transferred or serialized for a snapshot. The 176M A100 save timing is part of the combined device validation; these CPU figures do not measure PCIe transfer.
+In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state saved with and without snapshot retention blocked for median 14.9 and 15.2 ms respectively (six warmed pairs). No extra parameter bytes are transferred or serialized for a snapshot. On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention likewise added no measured blocking cost. The full state included weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each; these are medians of attempts 1–4. Restore was not timed for this comparison.
+
+| Retention | Full checkpoint | Save blocks the step | Save becomes durable |
+|---|---|---|---|
+| Inline profiles, no snapshot retention | 3762.1 MB | 1.41 s | 14.80 s |
+| Checkpoint retained as a snapshot | 3762.1 MB | 1.38 s | 14.71 s |
+
+Both variants wrote the same bytes. Snapshot retention changes which steps stay on disk, not what each save transfers.
 
 ## Preemption
 
