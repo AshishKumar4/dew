@@ -147,6 +147,10 @@ class OptimConfig:
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
     (`dew.training.optim.bf16_moments`), for adam and adamw
     only: half the optimizer state and less of the update's memory traffic."""
+    forced_weight_normalization: bool = False
+    """Renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`)
+    after each update, EDM2's forced weight normalization, which its
+    `edm2_unet` trains with (`dew.nn.mp.forced_weight_normalization`)."""
 
 
 @dataclasses.dataclass(frozen=True)

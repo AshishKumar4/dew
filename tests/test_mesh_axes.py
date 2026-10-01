@@ -773,7 +773,7 @@ def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
 
     objective = DiffusionObjective(
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=4, mlp_ratio=2),
-        presets.Flow()(), InputSpec(Field("image", (8, 8, 3))), guidance=None, steps=2)
+        presets.Flow(), InputSpec(Field("image", (8, 8, 3))), guidance=None, steps=2)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, stage=2), layout=Layout(min_shard=TINY_SHARD),
                       checkpoints=None, tracker=None)

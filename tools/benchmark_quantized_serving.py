@@ -16,6 +16,11 @@ says, and prints one JSON line:
   the latents included.
 - `clip`: the mean CLIP ViT-L/14 image-text cosine over the prompts and seeds
   0 and 1.
+- `nonfinite`, only when there are any: how many NaN or infinite values the
+  sampled latents and the decoded pixels held, over both seeds. The pixels
+  are clipped and cast to uint8 before CLIP scores them, which would turn
+  those values into ordinary pixels, so a row that has this field is a
+  failed row whatever its `clip`.
 
 A precision is `none`, `int8` or `fp8` (weights and activations), or `int8w`
 or `fp8w` (weights only). `--float` keeps the modules whose paths contain one
@@ -40,6 +45,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tyro
+from jax.typing import ArrayLike
 
 from dew.artifacts import uint8_pixels
 from dew.sampling import CFG, DPMSolverMultistep, TextToImage
@@ -113,13 +119,22 @@ def forward(pipe: TextToImage) -> dict:
             "temporaries_mib": round(memory.temp_size_in_bytes / 2**20, 1)}
 
 
-def sample(pipe: TextToImage, seed: int, decode_batch: int) -> np.ndarray:
+def nonfinite(array: ArrayLike) -> int:
+    """How many entries of `array` are NaN or infinite."""
+    return int(np.size(array) - np.count_nonzero(np.isfinite(np.asarray(array, np.float32))))
+
+
+def sample(pipe: TextToImage, seed: int, decode_batch: int) -> tuple[np.ndarray, dict[str, int]]:
+    """Every prompt's image as uint8 pixels, and how many non-finite values
+    the latents and the decoded pixels held before the pixels were clipped
+    and cast, which would hide them."""
     latents = pipe(list(PROMPTS), seed=seed, steps=STEPS, sampler=DPMSolverMultistep(), guidance=GUIDANCE,
                    decode=False).latents
-    decode = jax.jit(lambda params, z: jnp.clip(pipe.autoencoder.decode(params, z), -1.0, 1.0))
-    images = [decode(pipe.params["autoencoder"], latents[i:i + decode_batch])
-              for i in range(0, len(latents), decode_batch)]
-    return uint8_pixels(np.concatenate([np.asarray(image, np.float32) for image in images]))
+    decode = jax.jit(pipe.autoencoder.decode)
+    decoded = np.concatenate([np.asarray(decode(pipe.params["autoencoder"], latents[i:i + decode_batch]), np.float32)
+                              for i in range(0, len(latents), decode_batch)])
+    return (uint8_pixels(np.clip(decoded, -1.0, 1.0)),
+            {"latents": nonfinite(latents), "pixels": nonfinite(decoded)})
 
 
 def quality(pipe: TextToImage, decode_batch: int) -> dict:
@@ -127,14 +142,16 @@ def quality(pipe: TextToImage, decode_batch: int) -> dict:
     from dew.eval.images import DEFAULT_MODEL, clip_image_text_cosine
 
     tokens = AutoTextTokenizer(tensor_type="np", modelname=DEFAULT_MODEL)(list(PROMPTS))
-    scores, seconds = [], []
+    scores, seconds, counts = [], [], {"latents": 0, "pixels": 0}
     for seed in SEEDS:
         started = time.perf_counter()
-        pixels = sample(pipe, seed, decode_batch)
+        pixels, found = sample(pipe, seed, decode_batch)
         seconds.append(time.perf_counter() - started)
+        counts = {stage: counts[stage] + found[stage] for stage in counts}
         scores += list(np.asarray(clip_image_text_cosine(pixels, tokens["input_ids"], tokens["attention_mask"])))
     # The first seed compiles the sampler; the second is the warm time.
-    return {"sample_s": round(seconds[-1], 2), "clip": round(float(np.mean(scores)), 4)}
+    row = {"sample_s": round(seconds[-1], 2), "clip": round(float(np.mean(scores)), 4)}
+    return row | ({"nonfinite": counts} if any(counts.values()) else {})
 
 
 def main(config: Config) -> None:

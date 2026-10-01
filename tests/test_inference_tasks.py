@@ -79,6 +79,42 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
         loaded.block_generation()
 
 
+def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
+    from dew import Dataset, Trainer
+    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.lm import LMObjective
+
+    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
+                             max_seq_len=8)
+    options = dict(ema_decay=None, head_chunks=1, pad_id=0, z_loss=1e-4)
+    explicit = LMObjective(source.model, 4, pretrained=source.variables, **options)
+    bundled = source.lm_objective(4, **options)
+    key = jax.random.key(41)
+    np.testing.assert_array_equal(jax.tree.leaves(bundled.init(key))[0],
+                                  jax.tree.leaves(source.variables)[0])
+    count = max(2, jax.device_count())
+    batch = {"text": np.tile(np.asarray([[1, 3, 5, 7, 0], [2, 4, 6, 8, 9]], np.int32),
+                              (count // 2, 1))}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(13), ema=None)
+    loss = lambda objective: jax.jit(scalar_loss, static_argnums=0)(
+        objective, objective.init(key), batch, step)[0]
+    np.testing.assert_array_equal(loss(bundled), loss(explicit))
+    data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
+    states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
+        data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
+    assert int(states[1].updates) == 1
+    for actual, expected in zip(jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    assert any(not np.array_equal(actual, initial) for actual, initial in
+               zip(jax.tree.leaves(states[1].params), jax.tree.leaves(source.variables), strict=True))
+
+
+def test_a_pretrained_bundle_refuses_a_second_initial_tree():
+    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
+    with pytest.raises(ValueError, match="already supplies"):
+        source.lm_objective(4, pretrained=source.variables)
+
+
 def test_media_prompts_are_processed_once_and_keep_their_continuations():
     """Text and images reach the processor once per request, whatever the
     continuation count, and the continuations expand afterwards: each row
