@@ -26,7 +26,7 @@ COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast
 # `gemm`, since cuBLAS writes the family into one token (`s16816gemm`).
 KERNEL_CATEGORIES = (
     ("attention", ("sdpa", "fmha", "flash", "attention")),
-    ("conv", ("conv", "convolution", "fprop", "dgrad", "wgrad", "implicit")),
+    ("conv", ("conv", "conv2d", "convolution", "fprop", "dgrad", "wgrad", "wgrad2d", "implicit")),
     ("gemm", ("*gemm", "cublas", "cutlass", "nvjet", "xmma", "matmul", "dot", "splitk")),
     ("optimizer", ("multi_tensor_apply",)),
     ("loss", ("nll_loss", "cross_entropy", "softmaxforward", "softmaxbackward", "logsumexp")),

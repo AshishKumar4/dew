@@ -735,6 +735,16 @@ def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
 
 @pytest.mark.parametrize("name,category", [
     ("loop_convert_fusion", "convert"),  # whole tokens: convert is not conv
+    ("void cudnn::cnn::conv2d_grouped_direct_kernel<false, true, false, true, false, false, 0, 0, "
+     "int, float, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, __nv_bfloat16>"
+     "(cudnn::cnn::GroupedDirectFpropParams, __nv_bfloat16 const*, __nv_bfloat16 const*, "
+     "__nv_bfloat16*, float, float, float const*, float const*, __nv_bfloat16 const*, "
+     "__nv_bfloat16 const*, cudnnActivationStruct)", "conv"),
+    ("conv2d_c1_k1_nhwc_specialized", "conv"),
+    ("wgrad2d_c1_k1_nhwc", "conv"),
+    ("wgrad2d_c1_k1_nhwc_reduce", "conv"),
+    ("cudnn_generated_fort_native_sdpa_sm80_flash_bprop_wmma_f16_knob_2_64x128x64_1x4x1_cga1x1x1_kernel0_0",
+     "attention"),
     ("ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x4_tn", "gemm"),  # cuBLAS's family token
     ("ncclDevKernel_AllGather_RING_LL", "collective"),
     ("cudnn::fusion::compute_dot_do_o", "attention"),  # not the gemm its dot names

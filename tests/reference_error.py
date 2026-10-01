@@ -44,6 +44,20 @@ import numpy as np
 FACTOR = 2.0
 
 
+def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
+    """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products)).
+
+    `magnitudes` holds the elementwise sum of absolute products; `terms`
+    counts the products and any bias term in each reduction. gamma_n is
+    n*u/(1-n*u), with fp32 unit roundoff u=2^-24.
+    """
+    roundoffs = terms * np.finfo(np.float32).eps / 2
+    gamma = roundoffs / (1 - roundoffs)
+    error = np.abs(np.asarray(dew, np.float64) - np.asarray(reference, np.float64))
+    bound = 2 * gamma * np.asarray(magnitudes, np.float64)
+    assert np.all(error <= bound), (float(error.max()), float(bound.max()))
+
+
 def distance(value, truth) -> float:
     """The root-mean-square difference over every entry, in float64."""
     difference = np.asarray(value, np.float64) - np.asarray(truth, np.float64)
