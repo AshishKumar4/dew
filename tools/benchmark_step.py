@@ -446,6 +446,10 @@ def small_cases(dtype: str) -> list[Case]:
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
+        # EDM2's magnitude-preserving U-Net at the plain U-Net's widths.
+        Case("edm2_unet", {"model_channels": 64, "channel_mult": [1, 2, 4], "num_blocks": 2,
+                           "attn_resolutions": [16], "channels_per_head": 64},
+             batch_size=16, image_size=64),
         Case("unet_2d_condition", {"stages": [{"features": 64, "heads": 4}, {"features": 128, "heads": 4},
                                               {"features": 256, "heads": 8, "cross_attention": False}],
                                     "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},

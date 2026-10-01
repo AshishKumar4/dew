@@ -26,8 +26,8 @@ class AutoEncoder(ABC):
     places the weights and the checkpoint carries them.
     """
 
-    latent_shift: float | np.ndarray = 0.0
-    latent_scale: float | np.ndarray = 1.0
+    latent_shift: float | np.ndarray | jax.Array = 0.0
+    latent_scale: float | np.ndarray | jax.Array = 1.0
     params: Variables
 
     @abstractmethod

@@ -96,22 +96,31 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
 
 class PatchEmbedding(nn.Module):
     """Non-overlapping `patch_size` patches through one convolution, as a
-    row-major token sequence `[B, H_P * W_P, embedding_dim]`."""
+    row-major token sequence `[B, H_P * W_P, embedding_dim]`.
+
+    `bottleneck` factors the projection through that many channels, a
+    bias-free patch convolution and then a dense layer, as JiT's
+    `BottleneckPatchEmbed` (Li & He 2025) does for large pixel patches.
+    """
     patch_size: int
     embedding_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    bottleneck: int | None = None
 
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
         assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
-        x = Conv(features=self.embedding_dim,
+        x = Conv(features=self.bottleneck or self.embedding_dim,
                  kernel_size=(self.patch_size, self.patch_size),
                  strides=(self.patch_size, self.patch_size),
+                 use_bias=self.bottleneck is None,
                  dtype=self.dtype,
                  precision=self.precision)(x)
+        if self.bottleneck is not None:
+            x = nn.Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
         return jnp.reshape(x, (batch, -1, self.embedding_dim))
 
 
@@ -150,13 +159,15 @@ class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
     Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
-    way out and is None for raster.
+    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s, in
+    raster order only.
     """
     patch_size: int
     emb_features: int
     scan_order: str = 'raster'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    bottleneck: int | None = None
 
     def setup(self):
         assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
@@ -166,8 +177,11 @@ class PatchSequenceEmbed(nn.Module):
                 embedding_dim=self.emb_features,
                 dtype=self.dtype,
                 precision=self.precision,
+                bottleneck=self.bottleneck,
                 name="patch_embed",
             )
+        elif self.bottleneck is not None:
+            raise ValueError(f"a patch bottleneck embeds raster patches, not {self.scan_order} ones")
         else:
             # The patches arrive already permuted, so a dense projection of
             # the raw pixels replaces the strided convolution.
@@ -212,17 +226,30 @@ class ConditioningEmbed(nn.Module):
 
     `text_pooling` "all" averages every position the text tower returns, the
     padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
-    their checkpoints load.
+    their checkpoints load. `interval` adds a second time embedding, of an
+    interval's `duration`. `time_scale` is the Fourier frequencies' scale:
+    the default 16 makes the embedding of a flow's model time (sigma times
+    1000) vary fast in time, which only its values need, while a loss that
+    differentiates in time (MeanFlow's, sCM's) needs it smooth.
     """
     emb_features: int
     mlp_ratio: int = 4
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     text_pooling: Literal["real", "all"] = "real"
+    interval: bool = False
+    time_scale: float = 16
 
     def setup(self):
+        if self.interval:
+            self.duration_embed = nn.Sequential([
+                FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
+                TimeProjection(features=self.emb_features * self.mlp_ratio,
+                               dtype=self.dtype, precision=self.precision),
+                nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+            ], name="duration_embed")
         self.time_embed = nn.Sequential([
-            FourierEmbedding(features=self.emb_features, dtype=self.dtype),
+            FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
             TimeProjection(features=self.emb_features * self.mlp_ratio,
                            dtype=self.dtype, precision=self.precision),
             nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
@@ -231,8 +258,15 @@ class ConditioningEmbed(nn.Module):
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")
 
-    def __call__(self, temb, textcontext: TextContext | None = None):
+    def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)
+        if self.interval:
+            # An interval model embeds the interval's length as a second
+            # time, as MeanFlow's and shortcut models' networks do; none
+            # given is the instantaneous prediction.
+            cond_emb = cond_emb + self.duration_embed(jnp.zeros_like(temb) if duration is None else duration)
+        elif duration is not None:
+            raise ValueError("a duration reaches a model built without `interval`")
         if textcontext is not None:
             mask = textcontext.mask if self.text_pooling == "real" else jnp.ones_like(textcontext.mask)
             text_emb = self.text_proj(masked_mean(textcontext.hidden, mask))

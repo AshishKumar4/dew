@@ -35,7 +35,7 @@ from jax import lax
 from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
-from dew.diffusion.schedules import GeneralizedNoiseScheduler
+from dew.diffusion.schedules import GeneralizedNoiseScheduler, expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.registry import samplers
 
@@ -261,16 +261,56 @@ class Heun:
     """Heun's second order method (Karras et al. 2022, Algorithm 2): an Euler
     step, the derivative re-evaluated at its end, and the average of the two.
 
+    `s_churn`, `s_tmin`, `s_tmax` and `s_noise` are the algorithm's
+    stochasticity. At a sigma in [s_tmin, s_tmax] each step first raises the
+    noise level to sigma (1 + gamma), gamma = min(s_churn / N, sqrt(2) - 1)
+    for an N-interval walk, by adding fresh noise of standard deviation
+    s_noise sqrt(sigma_hat^2 - sigma^2), and then takes the Heun step from
+    there. The churn walks sigma, so it needs a variance-exploding schedule,
+    and a raised level past the schedule's top has no model time, so a walk
+    that would churn there is refused. Churned, the step evaluates the model
+    at the raised level itself, and the evaluation `sample` made at the grid
+    point goes unread, which the compiler removes.
+
     Diffusers 0.34.0's `HeunDiscreteScheduler` limits the clean prediction of
     both stages under `clip_sample`; that limit belongs to the process's
     conversion, `SourceLimitedPrediction`, so both evaluations here read the
     limited prediction without the solver knowing about it.
     """
 
+    s_churn: float = 0.0
+    s_tmin: float = 0.0
+    s_tmax: float = float("inf")
+    s_noise: float = 1.0
+
     def init(self, x, times, process, *, key):
-        return ()
+        if not self.s_churn:
+            return ()
+        schedule = _sigma_integrator("Heun's churn", process)
+        gamma = min(self.s_churn / (times.shape[0] - 1), 2 ** 0.5 - 1)
+        with jax.ensure_compile_time_eval():
+            sigmas = schedule.sigmas(jnp.asarray(times[:-1], jnp.float32))
+            churned = (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax)
+            if bool(jnp.any(churned & (sigmas * (1 + gamma) > schedule.sigma_max))):
+                raise ValueError(
+                    f"the churn raises sigma past the schedule's top, {schedule.sigma_max}, "
+                    f"where the model has no time; keep s_tmax below "
+                    f"{schedule.sigma_max / (1 + gamma):.4g}")
+        return jnp.asarray(gamma, jnp.float32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        if self.s_churn:
+            schedule = _sigma_integrator("Heun's churn", process)
+            sigma = schedule.sigmas(t)
+            gamma = jnp.where((sigma >= self.s_tmin) & (sigma <= self.s_tmax), state, 0.0)
+            raised = sigma * (1 + gamma)
+            noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+            # sqrt(raised^2 - sigma^2), in a form that stays zero at gamma 0
+            # under a fused multiply-add.
+            spread = sigma * jnp.sqrt(gamma * (2 + gamma)) * self.s_noise
+            x = x + expand(spread, x) * noise
+            t = schedule.t_of_sigma(raised)
+            denoised, _ = denoise(x, t)
         source, target = _rates(process, t, t_next, x)
         sigma_s = target[1]
         x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target)

@@ -664,4 +664,8 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
+    if config.forced_weight_normalization:
+        from dew.nn.mp import forced_weight_normalization
+
+        solver = optax.chain(solver, forced_weight_normalization())
     return solver
