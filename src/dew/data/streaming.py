@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from dew.registry import datasets
 

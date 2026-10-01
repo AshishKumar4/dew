@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 CONVENTION = "llama"
 """The registered family a verified unregistered type loads as."""
 
-_CONVENTION = replace(decoders._FAMILIES[CONVENTION], translate_config=decoders._base_config)
+_CONVENTION = replace(decoders.families()[CONVENTION], translate_config=decoders._base_config)
 """The convention reads every field `_base_config` shares, windows included,
 where the registered Llama family reads only what LlamaConfig declares; the
 probe, not the reference's declarations, is what admits a type's reading."""
@@ -297,7 +297,9 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
             try:
                 decoders._check_tree(variables, model)
             except ValueError as error:
-                raise _refuse(model_type, f"its tensors do not fill the convention's model ({error})") from error
+                raise _refuse(
+                    model_type, f"its tensors do not fill the convention's model ({error})"
+                ) from error
             # `_ROUNDING` was measured at fp32 matmul precision; a GPU's
             # default runs fp32 matmuls in TF32, which alone misses it.
             with jax.default_matmul_precision("highest"):

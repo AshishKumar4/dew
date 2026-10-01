@@ -16,9 +16,8 @@ import pytest
 from flax.traverse_util import flatten_dict
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import _FAMILIES, _wrapper_sources, translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
-
 from dew.registry import models
 from dew.sampling import Sampling, generate
 
@@ -70,10 +69,10 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(kind):
     names = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
     if kind == "dense":
         record = translate_wrapper_config(config)
-        fields, family = record["text"], _FAMILIES[config["text_config"]["model_type"]]
+        fields, family = record["text"], families()[config["text_config"]["model_type"]]
         names = _wrapper_sources(names, lambda name: None, record)[0]["language_model"]
     else:
-        fields, family = translate_config(config), _FAMILIES[config["model_type"]]
+        fields, family = translate_config(config), families()[config["model_type"]]
     # Placeholder arrays carry only the ranks the family's fused-expert split reads.
     prepared = family.prepare_weights({
         name: np.zeros((1, 2, 1) if name.endswith((".gate_up_proj", ".down_proj"))

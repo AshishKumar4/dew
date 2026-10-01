@@ -310,7 +310,7 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
     artifacts = _artifacts(produced)
     for metric in metrics:
-        def merge() -> None:
+        def merge(metric=metric) -> None:
             if not root:
                 return
             summaries.add(metric, metric(_pick(artifacts, metric.reads), home))
@@ -342,7 +342,7 @@ def _finalized(metrics: Sequence[Metric], summaries: _Accumulators, *,
     """
     scores: dict[str, float] = {}
     for metric in metrics:
-        def finalize() -> None:
+        def finalize(metric=metric) -> None:
             if root:
                 scores[f"{split}/{metric.name}"] = summaries.finalize(metric)
 

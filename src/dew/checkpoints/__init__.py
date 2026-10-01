@@ -100,7 +100,10 @@ def _with_averages(opt_state, averages):
     def put(node):
         if not _is_profiles(node):
             return node
-        return {**node, 'averages': averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+        return (
+            {**node, "averages": averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+        )
+
     return jax.tree.map(put, opt_state, is_leaf=_is_profiles)
 
 
@@ -582,7 +585,9 @@ class Checkpoints:
         """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
         if persistent is not None and not self._complete(persistent):
-            persistent = max((step for step in self._open().all_steps() if self._complete(step)), default=None)
+            persistent = max(
+                (step for step in self._open().all_steps() if self._complete(step)), default=None
+            )
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent

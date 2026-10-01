@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 
 import jax
 import jax.numpy as jnp
@@ -90,7 +90,7 @@ class Process:
 
     schedule: NoiseScheduler
     prediction: PredictionTransform
-    weighting: Weighting = ScheduleWeighting()
+    weighting: Weighting = field(default_factory=ScheduleWeighting)
     sampling: NoiseScheduler | None = None
     interval: bool = False
 
@@ -178,8 +178,11 @@ class Denoiser:
         reads its length in model time as the `duration` condition."""
         schedule = self.process.sampler_schedule
         duration = {"duration": schedule.model_time(t) - schedule.model_time(t_next)}
-        return replace(self, conditions={**self.conditions, **duration},
-                       unconditional=None if self.unconditional is None else {**self.unconditional, **duration})
+        return replace(
+            self,
+            conditions={**self.conditions, **duration},
+            unconditional=None if self.unconditional is None else {**self.unconditional, **duration},
+        )
 
     def raw(self, x_t, t) -> jax.Array:
         """The model's raw output at `(x_t, t)` under the conditions."""

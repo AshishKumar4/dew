@@ -86,7 +86,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import jax
 import numpy as np
@@ -222,9 +222,13 @@ class RolloutScheduler:
     share's later readers sample none and log nothing. `metrics` holds the
     latest record's numbers, which the trainer logs as `rollout/<name>`.
     """
-    shown = {"reward/mean": Shown(better="higher"), "lag/mean": Shown(better="lower"),
-             "pack/fill": Shown(better="higher", percent=True),
-             **{f"status/{status.value}": Shown(percent=True) for status in Status}}
+
+    shown: ClassVar[dict[str, Shown]] = {
+        "reward/mean": Shown(better="higher"),
+        "lag/mean": Shown(better="lower"),
+        "pack/fill": Shown(better="higher", percent=True),
+        **{f"status/{status.value}": Shown(percent=True) for status in Status},
+    }
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
@@ -239,7 +243,9 @@ class RolloutScheduler:
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
         if timeout is not None and not timeout > 0:
-            raise ValueError("timeout must be a positive number of seconds, or None to wait without a deadline")
+            raise ValueError(
+                "timeout must be a positive number of seconds, or None to wait without a deadline"
+            )
         check_truncation(truncation)
         if admit is not None and (type(admit) is not int or admit < 1):
             raise ValueError("admit must be a positive number of groups, or None to admit every task")
@@ -248,11 +254,24 @@ class RolloutScheduler:
                 f"ahead={ahead} and sync_every={sync_every} let a batch fall {ahead + sync_every - 1} "
                 f"updates behind, past max_lag={max_lag}")
         if max_lag > 0 and objective.behavior_importance is None:
-            raise ValueError("stale rollouts need the objective's behavior_importance, a TIS cap or an IcePop band: "
-                             "the proximal-to-behavior importance weight is the off-policy correction")
+            raise ValueError(
+                "stale rollouts need the objective's behavior_importance, a TIS cap or an IcePop band: "
+                "the proximal-to-behavior importance weight is the off-policy correction"
+            )
         self.objective, self.source, self.weights, self.tasks_of = objective, source, weights, tasks
-        self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
-        self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
+        self.width, self.rows, self.groups, self.oversample, self.admit = (
+            width,
+            rows,
+            groups,
+            oversample,
+            admit,
+        )
+        self.max_lag, self.ahead, self.sync_every, self.max_attempts = (
+            max_lag,
+            ahead,
+            sync_every,
+            max_attempts,
+        )
         self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
         self.support_capacity = support_capacity
         self.metrics: dict[str, float] = {}
@@ -395,7 +414,8 @@ class RolloutScheduler:
             self._fit(entry, group, tally)
 
     def _fit(self, entry: _Entry, group: _Group, tally: _Tally) -> None:
-        """Admit a complete group when its chains fit `rows` beside those admitted before it; cut it otherwise.
+        """Admit a complete group when its chains fit `rows` beside those
+        admitted before it; cut it otherwise.
 
         A group that cannot fit `rows` on its own is refused with a
         ValueError: `rows` is too small for the run, not for this batch.
@@ -406,8 +426,10 @@ class RolloutScheduler:
         group.lengths = chain_lengths(group.done, self.width, truncation=self.truncation)
         alone = rows_needed(group.lengths, self.width)
         if alone > self.rows:
-            raise ValueError(f"one group of task {group.task.id} needs {alone} rows of {self.width} ids, "
-                             f"more than rows={self.rows}; size rows for sessions whose calls split into chains")
+            raise ValueError(
+                f"one group of task {group.task.id} needs {alone} rows of {self.width} ids, "
+                f"more than rows={self.rows}; size rows for sessions whose calls split into chains"
+            )
         admitted = [length for complete in entry.complete for length in complete.lengths]
         if rows_needed([*admitted, *group.lengths], self.width) <= self.rows:
             entry.complete.append(group)
@@ -426,7 +448,9 @@ class RolloutScheduler:
                            if not group.abandoned and len(group.done) < self.groups]
                 for group in pending:
                     self._harvest(entry, group, updates, tally)
-                pending = [group for group in pending if not group.abandoned and len(group.done) < self.groups]
+                pending = [
+                    group for group in pending if not group.abandoned and len(group.done) < self.groups
+                ]
                 if len(entry.complete) >= target or not pending:
                     break
                 live = [sample for group in pending for sample in group.live]
@@ -451,8 +475,18 @@ class RolloutScheduler:
         rollouts, latencies, groups, tally, waited = agreed(
             "rollout admission", lambda: self._admitted(batch, updates))
         sampling = self._partition.reader == 0
-        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
-                      support_capacity=self.support_capacity) if sampling else {}
+        packed = (
+            pack(
+                rollouts,
+                self.width,
+                rows=self.rows,
+                estimator=self.estimator,
+                truncation=self.truncation,
+                support_capacity=self.support_capacity,
+            )
+            if sampling
+            else {}
+        )
         mesh = mesh_of(state.params)
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)
@@ -472,10 +506,13 @@ class RolloutScheduler:
         return packed
 
     def _admitted(self, batch: Batch, updates: int) -> tuple[list[Session], list[float], int, _Tally, float]:
-        """This process's admitted rollouts for `batch`, their latencies, the group count, the tally and the wait."""
+        """This process's admitted rollouts for `batch`, their latencies,
+        the group count, the tally and the wait."""
         with self._lock:
             if not self._registered:
-                raise ValueError("a RolloutScheduler batch comes from the stream of RolloutScheduler.tasks(dataset)")
+                raise ValueError(
+                    "a RolloutScheduler batch comes from the stream of RolloutScheduler.tasks(dataset)"
+                )
             entry = self._registered.popleft()
             upcoming = list(self._registered)[:self.ahead]
         if tuple(self.tasks_of(batch)) != entry.tasks:

@@ -22,9 +22,13 @@ import jax.numpy as jnp
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
+from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Effects, Loss, Mean, Step, Variables, mean_loss, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Mean, Step, Variables, mean_loss, merge
 from dew.training.state import Accumulation
+
+Loss = TypeVar("Loss", default=Mean | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
@@ -89,7 +93,7 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
 
 
 def _all_finite(tree) -> jax.Array:
-    finite = jnp.asarray(True)
+    finite = jnp.asarray(a=True)
     for leaf in jax.tree.leaves(tree):
         finite = finite & jnp.all(jnp.isfinite(leaf))
     return finite
@@ -115,8 +119,11 @@ def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
     decreased = scale.scale * scale.backoff_factor
     if scale.minimum_scale is not None:
         decreased = jnp.maximum(decreased, scale.minimum_scale)
-    return dataclasses.replace(scale, scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
-                               fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1))
+    return dataclasses.replace(
+        scale,
+        scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
+        fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1),
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,11 +216,11 @@ class Transaction:
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
         local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
-        local_ok = jnp.asarray(True) if state.scale is None else local_finite
+        local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
         effects = tuple(jax.tree.leaves(aux.effects))
         candidate, pooled = previous, stats
-        replay_required = jnp.asarray(False)
+        replay_required = jnp.asarray(a=False)
         if previous is None:
             _, active = self.objective.reduce_loss(stats)
         else:
@@ -317,7 +324,7 @@ class Transaction:
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
-        accepted = jnp.asarray(True) if scale is None else finite
+        accepted = jnp.asarray(a=True) if scale is None else finite
         numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
                                         microstep=state.microstep + 1)
 
@@ -334,7 +341,9 @@ class Transaction:
                     update, opt_state = self.optimizer.update(
                         native, current.opt_state, current.params["params"], qk_stats=qk)
                 else:
-                    update, opt_state = self.optimizer.update(native, current.opt_state, current.params["params"])
+                    update, opt_state = self.optimizer.update(
+                        native, current.opt_state, current.params["params"]
+                    )
                 params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
                 if self.aux_shape.effects is not None:
                     params = write_back(params, self.objective.apply_effects(
@@ -360,7 +369,7 @@ class Transaction:
             native_finite = native_finite | ~due
         else:
             numerical, native_finite = jax.lax.cond(
-                due, commit, lambda x: (x, jnp.asarray(True)), numerical)
+                due, commit, lambda x: (x, jnp.asarray(a=True)), numerical)
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
@@ -371,8 +380,12 @@ class Transaction:
             def retain(acc):
                 if not self.shared:
                     acc = dataclasses.replace(
-                        acc, batches=jax.tree.map(lambda held, x: held.at[pending.fill].set(x), acc.batches, batch),
-                        attempts=acc.attempts.at[pending.fill].set(state.step))
+                        acc,
+                        batches=jax.tree.map(
+                            lambda held, x: held.at[pending.fill].set(x), acc.batches, batch
+                        ),
+                        attempts=acc.attempts.at[pending.fill].set(state.step),
+                    )
                     if acc.variables is not None:
                         reads = {name: state.params[name] for name in acc.variables}
                         acc = dataclasses.replace(acc, variables=jax.tree.map(

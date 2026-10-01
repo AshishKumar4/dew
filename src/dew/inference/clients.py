@@ -166,7 +166,9 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
 
     supplied = options.model_dump(exclude_none=True) if isinstance(options, Options) else options
     fields = {} if supplied is None else _object(supplied, "options")
-    request_only = (_ollama_request_names("generate") | _ollama_request_names("chat")) - Options.model_fields.keys()
+    request_only = (
+        _ollama_request_names("generate") | _ollama_request_names("chat")
+    ) - Options.model_fields.keys()
     misplaced = fields.keys() & request_only
     if misplaced:
         raise ValueError(f"{sorted(misplaced)} are request fields, not Ollama options")
@@ -279,8 +281,15 @@ class OllamaCompletion:
         body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return await _ainvoke(self._async().generate, body)
 
-    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
-                    stream: bool = False, **parameters: RequestField) -> OllamaChat | AsyncIterator[OllamaChat]:
+    async def achat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> OllamaChat | AsyncIterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
         body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
         return await _ainvoke(self._async().chat, body)
@@ -393,8 +402,11 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     if tokens is None:
         # No token rows: one string, or rows that are all strings (an empty
         # list reaches `_prompts` empty and is refused there).
-        texts = _prompts(prompts if isinstance(prompts, str) else [row for row in prompts if isinstance(row, str)],
-                         budget, seed)
+        texts = _prompts(
+            prompts if isinstance(prompts, str) else [row for row in prompts if isinstance(row, str)],
+            budget,
+            seed,
+        )
         count = len(texts)
         prompt: object = prompts if isinstance(prompts, str) else texts
     else:
@@ -439,17 +451,24 @@ class OpenAICompletion:
             raise TypeError("sampling must be a Sampling value")
         if sampling.pad_id != 0:
             raise ValueError("remote text completion does not implement padded token rows")
-        if self.provider == "openai" and (sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None):
+        if self.provider == "openai" and (
+            sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None
+        ):
             raise ValueError("top-k, min-p and EOS-token controls require provider='vllm' or 'sglang'")
         native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                      "frequency_penalty": 0.0, "presence_penalty": 0.0}
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p, "repetition_penalty": 1.0}
         if sampling.eos_id is not None:
-            controls["stop_token_ids"] = list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
+            controls["stop_token_ids"] = (
+                list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
+            )
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
-            raise ValueError("top-k, min-p, repetition and EOS-token controls in extra_body require provider='vllm' or 'sglang'")
+            raise ValueError(
+                "top-k, min-p, repetition and EOS-token controls in extra_body require "
+                "provider='vllm' or 'sglang'"
+            )
         # The SDK writes extra_body over the named parameters, so the policy
         # is checked against both namespaces of the final request body.
         policy = {**native, **controls}
@@ -477,13 +496,21 @@ class OpenAICompletion:
 
     def __call__(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                  seed: int | None = None, **parameters: RequestField) -> Completion:
-        fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
+        fields, expected = _openai_fields(
+            self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
+        )
         create: Callable[..., _RawResponse[object]] = self._sync().completions.with_raw_response.create
         raw = _invoke(create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    def stream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, seed: int | None = None,
-               **parameters: RequestField) -> Stream[OpenAIResponse]:
+    def stream(
+        self,
+        prompts: str | Sequence[str] | TokenRows,
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+        **parameters: RequestField,
+    ) -> Stream[OpenAIResponse]:
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
         create: Callable[..., Stream[OpenAIResponse]] = self._sync().completions.create
@@ -498,28 +525,60 @@ class OpenAICompletion:
         request carries messages where a completion carries prompt strings.
         """
         _prompts("", max_new_tokens, seed)
-        fields = _bound(self._parameters(parameters), {"model": self.model, "messages": messages, "max_completion_tokens": max_new_tokens, "stream": stream})
+        fields = _bound(
+            self._parameters(parameters),
+            {
+                "model": self.model,
+                "messages": messages,
+                "max_completion_tokens": max_new_tokens,
+                "stream": stream,
+            },
+        )
         return fields if seed is None else _bound(fields, {"seed": seed})
 
-    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
-             stream: bool = False, **parameters: RequestField) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> ChatCompletion | Stream[ChatCompletionChunk]:
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
-        create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = self._sync().chat.completions.create
+        create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = (
+            self._sync().chat.completions.create
+        )
         return _invoke(create, fields)
 
     async def acall(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                     seed: int | None = None, **parameters: RequestField) -> Completion:
-        fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
+        fields, expected = _openai_fields(
+            self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
+        )
         raw = await _ainvoke(self._async().completions.with_raw_response.create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    async def astream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, seed: int | None = None,
-                      **parameters: RequestField) -> AsyncStream[OpenAIResponse]:
+    async def astream(
+        self,
+        prompts: str | Sequence[str] | TokenRows,
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+        **parameters: RequestField,
+    ) -> AsyncStream[OpenAIResponse]:
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
         return await _ainvoke(self._async().completions.create, fields)
 
-    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
-                    stream: bool = False, **parameters: RequestField) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    async def achat(
+        self,
+        messages: Sequence[ChatMessage],
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+        stream: bool = False,
+        **parameters: RequestField,
+    ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         return await _ainvoke(self._async().chat.completions.create, fields)

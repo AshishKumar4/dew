@@ -24,6 +24,7 @@ that collapse shows in the training curves, before a probe run.
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -86,7 +87,10 @@ class JepaObjective(Objective[Mean]):
     artifact = Representations
     # A collapsing encoder's spread falls to zero; a redundant one's
     # off-diagonal covariance rises.
-    shown = {"repr_std": Shown(better="higher"), "repr_cov_offdiag": Shown(better="lower")}
+    shown: Mapping[str, Shown] = {
+        "repr_std": Shown(better="higher"),
+        "repr_cov_offdiag": Shown(better="lower"),
+    }
 
     def __init__(
         self,

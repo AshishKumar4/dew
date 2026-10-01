@@ -36,21 +36,14 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import linen as nn
+from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
-from dew.objectives.base import (
-    Aux,
-    Batch,
-    Effects,
-    EMASpec,
-    Loss,
-    Mean,
-    Objective,
-    Prediction,
-    Step,
-    Variables,
-)
+from dew.objectives.base import Aux, Batch, EMASpec, Mean, Objective, Prediction, Step, Variables
 from dew.registry import objectives
+
+Loss = TypeVar("Loss", default=Mean | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState

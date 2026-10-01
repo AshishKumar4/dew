@@ -14,7 +14,8 @@ copies, mHC's streams, Kimi K3's depth state) through one forward
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, NamedTuple, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -597,8 +598,18 @@ class DecoderBlock(nn.Module):
             kv_store.update(store)
         return out
 
-    def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
+    def _forward(
+        self,
+        x,
+        train: bool,
+        decode: bool,
+        positions,
+        segment_ids,
+        kv_store,
+        per_layer_input,
+        attention_metadata,
+        prediction_phase: PredictionPhase = "ordinary",
+    ):
         """The block's one forward over whichever residual form it runs.
 
         The form (`_enter`, `_read`, `_write`, `_leave`) decides what the
@@ -611,14 +622,18 @@ class DecoderBlock(nn.Module):
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
         normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
+        mixed = self._mix(
+            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase
+        )
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         state = self._write(state, "attention", self._branch(mixed, train), site)
         if self.laurel_rank is not None:
             # Only the plain form admits LAuReL (setup refuses the rest).
             assert isinstance(state, _Plain)
-            state = state._replace(x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype))
+            state = state._replace(
+                x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype)
+            )
         if self.feedforward is not None:
             routes = self._routes(per_layer_input)
             state, read, site = self._read(state, "mlp")
@@ -752,10 +767,15 @@ class DecoderBlock(nn.Module):
         """The token mixer over `x`. The store, the metadata and a prediction
         phase other than ordinary reach it only when the call carries them,
         since a mixer with no use for one does not take it."""
-        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
-                              **({} if kv_store is None else {"kv_store": kv_store}),
-                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        return self.self_attn(
+            x,
+            decode=decode,
+            positions=positions,
+            segment_ids=segment_ids,
+            **({} if kv_store is None else {"kv_store": kv_store}),
+            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
+        )
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when

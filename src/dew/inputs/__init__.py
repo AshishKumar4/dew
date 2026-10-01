@@ -15,8 +15,8 @@ every diffusion loss, sample, artifact and image metric lives in;
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from dew import registry
 from dew.nn.vision import PIXEL_VALUES_KEY
 from dew.objectives.base import Variables
 
+from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
 
 
@@ -113,26 +114,30 @@ class InputSpec:
                 for condition in self.conditions.values() if condition.encoder.reads_captions}
 
     def to_json(self) -> dict:
-        return {"sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
-                "conditions": {keyword: condition.to_json()
-                               for keyword, condition in self.conditions.items()},
-                **({"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}} if self.mask is not None else {})}
+        return {
+            "sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
+            "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
+            **(
+                {"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}}
+                if self.mask is not None
+                else {}
+            ),
+        }
 
     @classmethod
     def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
         """Rebuilds the spec around supplied condition parameters, or loads
         each encoder's own weights when none are given."""
         sample = record["sample"]
-        return cls(sample=Field(sample["key"], tuple(sample["shape"])),
-                   conditions={keyword: Condition.from_json(
-                       condition, params=None if params is None else params[keyword])
-                               for keyword, condition in record["conditions"].items()},
-                   mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"])) if "mask" in record else None)
+        return cls(
+            sample=Field(sample["key"], tuple(sample["shape"])),
+            conditions={
+                keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
+                for keyword, condition in record["conditions"].items()
+            },
+            mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"])) if "mask" in record else None,
+        )
 
-
-# The conditioner builds the Condition and InputSpec declared above, so its
-# import comes after them and either import order resolves.
-from .diffusion import DiffusionConditioner
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
            "HFAudio", "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]

@@ -164,7 +164,9 @@ def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTra
     return text
 
 
-def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
+def export_weights(
+    model: nn.Module, variables: Variables, config: Mapping[str, object]
+) -> dict[str, np.ndarray]:
     """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
 
     The decoder half goes through `export_decoder_weights` and is renamed under

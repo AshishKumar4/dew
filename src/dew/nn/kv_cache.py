@@ -371,8 +371,15 @@ class KVStore:
 
         scaled = query * jnp.asarray(1.0 / math.sqrt(self.head_dim), query.dtype)
         table = self._get(TABLE)
-        return paged_attention(scaled, self._get("cached_key"), self._get("cached_value"), lengths, table,
-                               attn_logits_soft_cap=softcap, pages_per_compute_block=_pages_per_block(table.shape[1]))
+        return paged_attention(
+            scaled,
+            self._get("cached_key"),
+            self._get("cached_value"),
+            lengths,
+            table,
+            attn_logits_soft_cap=softcap,
+            pages_per_compute_block=_pages_per_block(table.shape[1]),
+        )
 
 
 def _pages_per_block(pages: int) -> int:

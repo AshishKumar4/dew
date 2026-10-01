@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import sys
@@ -134,6 +135,17 @@ def without_deterministic_ops(monkeypatch):
     kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
             if not flag.startswith("--xla_gpu_deterministic_ops")]
     monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+
+
+@pytest.fixture
+def caplog(caplog):
+    """Capture Dew's isolated logger as well as the application's root logger."""
+    logger = logging.getLogger("dew")
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 @pytest.fixture

@@ -85,7 +85,11 @@ class _ProcessEnvironment:
         self.deadline = time.monotonic() + limits.wall_seconds
         self.output = bytearray()
         self.process = launch(command, limits, directory)
-        assert self.process.stdin is not None and self.process.stdout is not None and self.process.stderr is not None
+        assert (
+            self.process.stdin is not None
+            and self.process.stdout is not None
+            and self.process.stderr is not None
+        )
         self.stdin, self.stdout, self.stderr = self.process.stdin, self.process.stdout, self.process.stderr
         for stream in (self.stdin, self.stdout, self.stderr):
             os.set_blocking(stream.fileno(), False)
@@ -210,7 +214,9 @@ class SubprocessEnvironment:
 
     def __post_init__(self) -> None:
         if sys.platform != "linux":
-            raise NotImplementedError("SubprocessEnvironment currently requires Linux resource and parent-death limits")
+            raise NotImplementedError(
+                "SubprocessEnvironment currently requires Linux resource and parent-death limits"
+            )
         if not self.command or any(not isinstance(part, str) or not part for part in self.command):
             raise ValueError("sandbox command must be a nonempty argv tuple")
 

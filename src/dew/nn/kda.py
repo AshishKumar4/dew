@@ -55,7 +55,7 @@ from .linear import (
     recurrent_delta_rule,
     strictly_lower_inverse,
 )
-from .mixers import MixerBase, MixerContext, mixers
+from .mixers.base import MixerBase, MixerContext, mixers
 from .precision import at_least_fp32
 from .sharding import logical_axes
 
@@ -118,7 +118,10 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
         v_corrected = v_i - kd_i @ s
         out = attn_inter + attn_intra @ v_corrected
         last = gc_i[..., -1:, :]
-        s = s * jnp.exp(last)[..., 0, :, None] + jnp.swapaxes(k_i * jnp.exp(last - gc_i), -1, -2) @ v_corrected
+        s = (
+            s * jnp.exp(last)[..., 0, :, None]
+            + jnp.swapaxes(k_i * jnp.exp(last - gc_i), -1, -2) @ v_corrected
+        )
         return s, out
 
     state, core = jax.lax.scan(
@@ -179,7 +182,9 @@ class KimiDeltaAttention(nn.Module):
 
     def setup(self):
         if self.conv_kernel < 2:
-            raise ValueError(f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}")
+            raise ValueError(
+                f"the causal conv needs a history, so a kernel of at least 2, got {self.conv_kernel}"
+            )
         dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
@@ -199,7 +204,9 @@ class KimiDeltaAttention(nn.Module):
             self.g_b_proj = dense(self.qkv_features, name='g_b_proj')
         # The reference's fp32 norm with its weight, then the sigmoid of the
         # gate (Glm5NextTextRMSNormGated, modeling_glm5_next.py:346-358).
-        self.o_norm = RMSNormGated(epsilon=self.norm_eps, activation='sigmoid', dtype=self.dtype, name='o_norm')
+        self.o_norm = RMSNormGated(
+            epsilon=self.norm_eps, activation="sigmoid", dtype=self.dtype, name="o_norm"
+        )
         self.o_proj = dense(self.emb_features, name='o_proj')
 
     def _decay(self, x):
@@ -289,7 +296,9 @@ class KimiDeltaAttentionMixer(MixerBase):
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
-            raise ValueError("kimi_delta_attention requires causal=True; its recurrence has no bidirectional mode")
+            raise ValueError(
+                "kimi_delta_attention requires causal=True; its recurrence has no bidirectional mode"
+            )
         return functools.partial(
             KimiDeltaAttention,
             emb_features=ctx.emb_features,

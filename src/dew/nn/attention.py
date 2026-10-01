@@ -351,7 +351,10 @@ def _cache_positions(module: nn.Module, batch: int, length: int, capacity: int, 
     return positions, allocated
 
 
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = KVCache()):
+_DEFAULT_CACHE = KVCache()
+
+
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -1004,10 +1007,19 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     resolved = resolve_implementation(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks, causal=causal,
-        sliding_window=sliding_window, mask=mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3]),
-        bias=bias)
+        implementation,
+        query,
+        key,
+        dtype=dtype,
+        precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax,
+        softcap=softcap,
+        sinks=sinks,
+        causal=causal,
+        sliding_window=sliding_window,
+        mask=mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3]),
+        bias=bias,
+    )
     if resolved not in ('cudnn', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
@@ -1882,7 +1894,9 @@ class FlaxFeedForward(nn.Module):
     approximate_gelu: bool = True
 
     def setup(self):
-        self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu)
+        self.net_0 = FlaxGEGLU(
+            self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
+        )
         self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
         self.dropout_layer = nn.Dropout(self.dropout)
 

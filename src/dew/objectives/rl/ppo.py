@@ -58,7 +58,9 @@ class ValueHead(nn.Module):
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
                  positions: jax.Array | None = None) -> jax.Array:
-        hidden = self.backbone.hidden_states(tokens, train=False, segment_ids=segment_ids, positions=positions)
+        hidden = self.backbone.hidden_states(
+            tokens, train=False, segment_ids=segment_ids, positions=positions
+        )
         return nn.Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
 
 
@@ -108,7 +110,7 @@ class PPOObjective(Objective[Mean, Variables]):
 
     # The loss is a policy-gradient surrogate plus the critic's, so only the
     # critic's own has a direction.
-    shown = {"loss": Shown(), "critic/loss": Shown(better="lower")}
+    shown: Mapping[str, Shown] = {"loss": Shown(), "critic/loss": Shown(better="lower")}
 
     _ema_is_reference = True
 
@@ -147,7 +149,9 @@ class PPOObjective(Objective[Mean, Variables]):
         """Bind the policy subtree when an episode collector supplies the full tree."""
         return _Policy(self.actor.policy(_part(variables, "policy")))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+    def pipeline(
+        self, state: TrainState, *, ema: bool = True, processor: Processor | None = None
+    ) -> TextGeneration:
         """Publish the trained actor, without the critic or the frozen KL reference."""
         actor_state = replace(state, params=_part(state.params, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
@@ -165,7 +169,9 @@ class PPOObjective(Objective[Mean, Variables]):
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        aligned = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32), values.astype(jnp.float32)], axis=1)
+        aligned = jnp.concatenate(
+            [jnp.zeros((ids.shape[0], 1), jnp.float32), values.astype(jnp.float32)], axis=1
+        )
         return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
 
     def loss(self, params: Variables, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
@@ -270,7 +276,9 @@ class PPORollout:
         return {OLD_VALUES_KEY: values.astype(np.float32), ADVANTAGES_KEY: placed_advantages.reshape(shape),
                 RETURNS_KEY: placed_returns.reshape(shape)}
 
-    def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
+    def __call__(
+        self, state: TrainState, batch: Mapping[str, object], key: jax.Array
+    ) -> dict[str, np.ndarray]:
         """Collect one cohort of episodes and return its packed rows with critic targets."""
         episodes = self.episodes.collect(state, batch, key)
         projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
@@ -284,7 +292,11 @@ class PPORollout:
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
         mesh = mesh_of(state.params)
-        device = agreed("PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected))
+        device = agreed(
+            "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
+        )
         values = agreed("PPO critic values", lambda: local_rows(self._compiled_values(state.params, device)))
-        rewards = np.asarray([0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32)
+        rewards = np.asarray(
+            [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
+        )
         return {**projected, **self._targets(np.asarray(values), projected, rewards)}

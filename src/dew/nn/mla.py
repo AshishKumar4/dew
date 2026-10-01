@@ -45,6 +45,7 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.mixers.base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -728,16 +729,12 @@ class MultiHeadLatentAttention(nn.Module):
     def _output(self, attention, x):
         """o_proj over the heads' context, gated by `x` under `output_gate`."""
         batch, length = attention.shape[:2]
-        context = checkpoint_name(attention, 'context').reshape(batch, length, self.num_heads * self.v_head_dim)
+        context = checkpoint_name(attention, "context").reshape(
+            batch, length, self.num_heads * self.v_head_dim
+        )
         if self.output_gate:
             context = context * nn.sigmoid(self.g_proj(x))
         return checkpoint_name(self.o_proj(context), 'o_proj')
-
-
-# `dsa_kpool` reads the indexer's name and the expanded cache above, and the
-# registry hub imports it while it imports this module; the registry side of
-# this module comes after them so either import order resolves.
-from dew.nn.mixers import MixerBase, MixerContext, mixers
 
 
 @mixers("mla")

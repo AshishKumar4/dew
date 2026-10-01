@@ -378,7 +378,12 @@ class ImageDataset(DatasetSpec):
         if self.val_split and scored is not None:
             scored = bounded(scored, self.val_batches)
         return Dataset(
-            train=tokenized(train_stream(train, [ImageTransform(self)], batch=batch, seed=self.seed, loading=self.loading), tokenize),
+            train=tokenized(
+                train_stream(
+                    train, [ImageTransform(self)], batch=batch, seed=self.seed, loading=self.loading
+                ),
+                tokenize,
+            ),
             val=scored,
             records=len(train),
             batch=batch,
@@ -449,7 +454,7 @@ class HFImages(ImageDataset):
 
     name: str = ""
     split: str = "train"
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
 
     def source(self, split: str | None = None):
         from .sources.hf import HFDatasetSource

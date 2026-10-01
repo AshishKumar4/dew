@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import logging
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -28,7 +29,7 @@ from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from termcolor import colored
+from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
@@ -50,9 +51,7 @@ from dew.objectives.base import (
     FROZEN,
     Aux,
     Batch,
-    Effects,
     Initializer,
-    Loss,
     Mean,
     Metric,
     Objective,
@@ -94,6 +93,8 @@ from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Transaction, compact_qk, with_ema
 
+_log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from dew.config import TrainerConfig
     from dew.data import Dataset
@@ -112,6 +113,9 @@ CompiledStep = Callable[
 """A call returns the stepped state, the scalar loss, the objective's whole
 report (`Aux.metrics`), whether that loss was finite, and whether the
 microbatch was accepted."""
+
+Loss = DefaultTypeVar("Loss", default=Mean | jax.Array | float)
+Effects = DefaultTypeVar("Effects", default=None)
 
 ObjectiveLoss = TypeVar("ObjectiveLoss")
 ObjectiveEffects = TypeVar("ObjectiveEffects")
@@ -262,8 +266,7 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     default = program.compile()
     if not step_fits(default, mesh):
         return executable, False
-    print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
-                  "compiling it with them", "yellow"), file=sys.stderr)
+    _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
     return default, True
 
 
@@ -286,8 +289,10 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
     """How the display shows what the rollout and the validation metrics
     report. Both may declare `shown`, which their protocols leave optional,
     so the trainer reads it at this boundary."""
-    return {**getattr(rollout, 'shown', {}),
-            **{metric.name: shown for metric in metrics if (shown := getattr(metric, 'shown', None)) is not None}}
+    return {
+        **getattr(rollout, "shown", {}),
+        **{metric.name: shown for metric in metrics if (shown := getattr(metric, "shown", None)) is not None},
+    }
 
 
 def _keeps_triton_gemm(model: nn.Module) -> bool:
@@ -407,8 +412,9 @@ def recompute_more(objective) -> bool:
     model's remat climbs."""
     moved = objective.tile_head()
     if moved is not None:
-        print(colored(f"the step does not fit the devices with the whole logits kept; "
-                      f"compiling it again with {moved}", "yellow"), file=sys.stderr)
+        _log.warning(
+            "the step does not fit the devices with the whole logits kept; compiling it again with %s", moved
+        )
         return True
     model = _model_of(objective)
     if model is None:
@@ -422,8 +428,9 @@ def recompute_more(objective) -> bool:
     if current not in ladder[:-1]:
         return False
     stronger = ladder[ladder.index(current) + 1]
-    print(colored(f"the step does not fit the devices under remat {current!r}; "
-                  f"compiling it again under {stronger!r}", "yellow"), file=sys.stderr)
+    _log.warning(
+        "the step does not fit the devices under remat %r; compiling it again under %r", current, stronger
+    )
     objective.model = model.clone(remat=stronger)
     return True
 
@@ -519,6 +526,10 @@ class _Interval:
         self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
 
 
+_DEFAULT_MESH = MeshSpec()
+_DEFAULT_LAYOUT = Layout()
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
 
@@ -528,8 +539,8 @@ class Trainer(Generic[Loss, Effects]):
         optimizer: optax.GradientTransformation,
         *,
         key: jax.Array,
-        mesh: MeshSpec = MeshSpec(),
-        layout: Layout = Layout(),
+        mesh: MeshSpec = _DEFAULT_MESH,
+        layout: Layout = _DEFAULT_LAYOUT,
         accumulation: int = 1,
         dynamic_scale: bool = False,
         checkpoints: Checkpoints | None = None,
@@ -553,7 +564,10 @@ class Trainer(Generic[Loss, Effects]):
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
         if step is not None and "params" in layout.host:
-            raise ValueError("Parameter-streamed training requires the trainer objective transaction; custom steps own their execution")
+            raise ValueError(
+                "Parameter-streamed training requires the trainer objective transaction; "
+                "custom steps own their execution"
+            )
         self.objective = objective
         self.optimizer = optimizer
         self.key = key
@@ -703,7 +717,9 @@ class Trainer(Generic[Loss, Effects]):
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
         if frozen is not None:
-            placed = dataclasses.replace(placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)})
+            placed = dataclasses.replace(
+                placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)}
+            )
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -923,7 +939,11 @@ class Trainer(Generic[Loss, Effects]):
                    jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
 
         def zeros(leaf):
-            dtype = jnp.promote_types(leaf.dtype, jnp.float32) if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
+            dtype = (
+                jnp.promote_types(leaf.dtype, jnp.float32)
+                if jnp.issubdtype(leaf.dtype, jnp.inexact)
+                else leaf.dtype
+            )
             return jnp.zeros(leaf.shape, dtype)
 
         def buffer(tree):

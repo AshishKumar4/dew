@@ -15,20 +15,44 @@ from dew.sampling.solvers import Solver
 
 
 @overload
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: None = None,
-                   final_denoise: bool = True) -> jax.Array: ...
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: int,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: jax.Array,
+    times: None = None,
+    final_denoise: bool = True,
+) -> jax.Array: ...
 
 
 @overload
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float],
-                   final_denoise: bool = True) -> jax.Array: ...
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: None = None,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: jax.Array,
+    times: ArrayLike | Sequence[float],
+    final_denoise: bool = True,
+) -> jax.Array: ...
 
 
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float] | None = None,
-                   final_denoise: bool = True) -> jax.Array:
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: int | None = None,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: jax.Array,
+    times: ArrayLike | Sequence[float] | None = None,
+    final_denoise: bool = True,
+) -> jax.Array:
     """`steps` points from T to 0: a solver step across each interval, then the
     model's clean prediction at the last point.
 
