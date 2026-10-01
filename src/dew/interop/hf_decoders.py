@@ -47,6 +47,7 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.interop import mamba2
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
@@ -946,7 +947,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") != "qwen3_5"
+        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1114,8 +1115,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     return {
-        "model_type": "qwen3_5",
-        "text_model_type": "qwen3_5_text",
+        "model_type": records.text(hf_config['model_type'], 'model_type'),
+        "text_model_type": f"{hf_config['model_type']}_text",
         "text": text,
         "tower": tower,
         "projector": projector,
@@ -1145,14 +1146,14 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
-    retain the decoder, tower, projector, image token ID and token count, and
+    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -1202,7 +1203,8 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+            or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
         return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
