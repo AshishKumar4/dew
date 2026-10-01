@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.mutation import Target, classify, selected_target, source_digest, summarize
+from tools.mutation import Target, classify, score_counts, selected_target, source_digest, summarize
 
 
 @pytest.mark.parametrize("worker,test,output,expected", [
@@ -33,6 +33,14 @@ def test_shards_are_weighted_by_their_mutation_counts(tmp_path):
     assert result["total"] == 8
     assert result["score"] == 5 / 7
     assert result["counts"] == {"killed": 5, "survived": 2, "timeout": 1}
+
+
+def test_pending_work_is_not_reported_as_a_completed_mutation_score():
+    summary = score_counts({"killed": 3, "survived": 1, "pending": 2})
+    assert summary["score"] is None
+    assert summary["observed_score"] == 3 / 4
+    assert summary["total"] == 6
+    assert not summary["complete"]
 
 
 @pytest.mark.parametrize("shards,populations,counts", [

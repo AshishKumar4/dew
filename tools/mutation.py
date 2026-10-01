@@ -68,6 +68,15 @@ def classify(result) -> str:
     return "worker-error"
 
 
+def score_counts(counts) -> dict:
+    """Distinguish an observed partial fraction from a completed batch's score."""
+    tested = counts.get("killed", 0) + counts.get("survived", 0)
+    observed = None if tested == 0 else counts.get("killed", 0) / tested
+    complete = not any(counts.get(status, 0) for status in ("pending", "worker-error", "incompetent"))
+    return {"counts": dict(counts), "total": sum(counts.values()),
+            "score": observed if complete else None, "observed_score": observed, "complete": complete}
+
+
 def report(database) -> dict:
     """Keep untested, invalid and surviving mutations visible in the report."""
     mutations = []
@@ -82,9 +91,10 @@ def report(database) -> dict:
             "output": None if result is None else result.output,
         })
     counts = Counter(mutation["outcome"] for mutation in mutations)
-    tested = counts["killed"] + counts["survived"]
-    return {"counts": dict(counts), "total": len(mutations),
-            "score": None if tested == 0 else counts["killed"] / tested,
+    paths = sorted({mutation["path"] for mutation in mutations})
+    files = {path: score_counts(Counter(mutation["outcome"] for mutation in mutations
+                                       if mutation["path"] == path)) for path in paths}
+    return {**score_counts(counts), "files": files,
             "mutations": sorted(mutations, key=lambda mutation: (
                 mutation["path"], mutation["line"], mutation["operator"], mutation["occurrence"]))}
 
@@ -173,14 +183,22 @@ def summarize(directory: Path) -> dict:
         raise ValueError("reports describe different mutation populations")
     if sorted(report["shard"] for report in reports) != list(range(shards)):
         raise ValueError("the report is missing a shard or contains a duplicate shard")
+    for field in ("path", "source_digest", "tests_digest"):
+        if any(report.get(field) != reports[0].get(field) for report in reports):
+            raise ValueError(f"reports disagree about {field}")
     counts = Counter()
     for report in reports:
         counts.update(report["counts"])
     if sum(counts.values()) != population:
         raise ValueError("the shard totals do not cover the full mutation population")
-    tested = counts["killed"] + counts["survived"]
-    return {"counts": dict(counts), "total": population,
-            "score": None if tested == 0 else counts["killed"] / tested}
+    paths = sorted({path for report in reports for path in report.get("files", {})})
+    files = {}
+    for path in paths:
+        outcomes = Counter()
+        for report in reports:
+            outcomes.update(report.get("files", {}).get(path, {}).get("counts", {}))
+        files[path] = score_counts(outcomes)
+    return {**score_counts(counts), "files": files}
 
 
 def main() -> None:
