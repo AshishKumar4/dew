@@ -458,8 +458,8 @@ def test_quantizing_resident_weights_keeps_their_parameter_shards():
         assert quantized.sharding == original.sharding
 
 
-def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix_cpu():
-    """Host kernels use Qwix 0.1.8 on CPU, then generate on the active backend."""
+def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
+    """Host kernels use Qwix 0.1.8 on the active backend and retain host storage."""
     import functools
 
     from dew.inference import TextGeneration
@@ -479,11 +479,9 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix_cpu():
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
         methods=tuple(method for method in METHODS if hasattr(model, method)))
-    with jax.default_device(jax.devices("cpu")[0]):
-        abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
-                                                   jnp.zeros((1, 1), jnp.int32)))
-        cpu_params = jax.device_put(host["params"], jax.devices("cpu")[0])
-        reference_variables = {**host, "params": qwix.quantize_params(cpu_params, abstract["params"])}
+    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
+                                               jnp.zeros((1, 1), jnp.int32)))
+    reference_variables = {**host, "params": qwix.quantize_params(resident["params"], abstract["params"])}
     expected = TextGeneration(reference, jax.device_get(reference_variables), sampling=task.sampling)
     np.testing.assert_array_equal(jax.jit(served.model.apply)(served.variables, prompt),
                                   jax.jit(expected.model.apply)(expected.variables, prompt))
