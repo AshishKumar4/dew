@@ -106,6 +106,8 @@ class DPOObjective(LMObjective):
         weights.
         """
         chosen_ids, _, chosen_mask, _ = self._halves(batch)
-        losses = -self.per_token_log_probs(params, chosen_ids)
+        scores = self.token_scores(params, chosen_ids, predict=True)
+        losses = scores.losses
+        assert scores.correct is not None
         weights = chosen_mask.astype(losses.dtype)
-        return TokenScores(losses=losses, weights=weights)
+        return TokenScores(losses=losses, weights=weights, correct=scores.correct)

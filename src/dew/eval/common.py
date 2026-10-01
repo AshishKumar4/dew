@@ -17,18 +17,20 @@ class Mean:
     """Average per-example values or additive (total, count) contributions.
 
     `better` is required so checkpoint ranking cannot infer the opposite
-    direction. `reads` defaults to ImageGrid; name another scoring artifact
-    for text or representation metrics. State belongs to the evaluation pass.
+    direction. `reads` explicitly names the scoring artifact the function
+    consumes. State belongs to the evaluation pass.
     """
 
     fn: Callable[[Artifact, Batch], ArrayLike | tuple[float, float]]
     name: str
     better: Literal["higher", "lower"]
-    reads: type = ImageGrid
+    reads: type
 
     def __post_init__(self) -> None:
         if self.better not in ("higher", "lower"):
             raise ValueError("better must be higher or lower")
+        if "/" in self.name:
+            raise ValueError("name must be unprefixed, such as accuracy; evaluation adds val/ or the split name")
 
     @property
     def shown(self) -> Shown:
