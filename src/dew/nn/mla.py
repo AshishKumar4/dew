@@ -49,7 +49,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
-from dew.nn.mixers.base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes

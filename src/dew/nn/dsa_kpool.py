@@ -53,7 +53,7 @@ from .attention import (
 )
 from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
-from .mixers.base import MixerBase, MixerContext, mixers
+from .mixer_base import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection, logical_axes

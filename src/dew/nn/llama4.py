@@ -31,7 +31,7 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
-from dew.nn.mixers.base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import RopeScaling, apply_rotary_interleave, rotary_freqs
 from dew.nn.sharding import logical_axes

@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-from dew.nn.mixers.base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 
 
 @mixers("gated_delta_net")

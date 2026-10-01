@@ -32,6 +32,36 @@ assert not logging.getLogger().handlers
     assert "\x1b" not in result.stderr
 
 
+def test_a_redirected_record_is_exactly_one_physical_line():
+    message = "a very long diagnostic " * 20
+    result = python(f"""
+import logging
+import dew
+logging.getLogger('dew.data').warning({message!r})
+""")
+    assert result.stdout == ""
+    assert len(result.stderr.splitlines()) == 1
+    assert message in result.stderr
+    assert "WARNING dew.data:" in result.stderr
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_logged_exceptions_keep_their_traceback_and_message(terminal):
+    result = python(f"""
+import sys
+sys.stderr.isatty = lambda: {terminal!r}
+import logging
+import dew
+try:
+    raise ValueError('invalid checkpoint')
+except ValueError:
+    logging.getLogger('dew.checkpoints').exception('restore failed')
+""")
+    assert "restore failed" in result.stderr
+    assert "Traceback" in result.stderr
+    assert "ValueError: invalid checkpoint" in result.stderr
+
+
 def test_a_callers_existing_dew_handler_and_level_are_not_replaced():
     result = python("""
 import logging
@@ -73,17 +103,20 @@ logging.getLogger('dew.training').info('device count')
 
 
 @pytest.mark.parametrize("width", [30, 120])
-def test_a_narrow_live_console_keeps_log_words_readable(width):
+@pytest.mark.parametrize("terminal", [False, True])
+def test_a_narrow_live_console_keeps_log_words_readable(width, terminal):
     result = python(f"""
 import io
 import logging
+import sys
+sys.stderr.isatty = lambda: {terminal!r}
 import dew
 from rich.console import Console
 from dew.logging import display_console
 screen = io.StringIO()
 with display_console(Console(file=screen, width={width}, force_terminal=True, color_system=None)):
     logging.getLogger('dew.training.test').warning('diagnostic above the live panel')
-assert 'diagnostic' in screen.getvalue(), screen.getvalue()
+assert 'diagnostic above the live panel' in screen.getvalue(), screen.getvalue()
 """)
     assert result.stdout == result.stderr == ""
 
@@ -98,7 +131,7 @@ from rich.console import Console
 from dew.logging import display_console
 screen = io.StringIO()
 handler, = logging.getLogger('dew').handlers
-original = handler.console
+original = handler.stream
 try:
     with display_console(Console(file=screen, force_terminal=True, color_system=None)):
         logging.getLogger('dew.training').warning('above the panel')
@@ -106,7 +139,7 @@ try:
             raise ValueError('failed display')
 except ValueError:
     pass
-assert handler.console is original
+assert handler.stream is original
 assert 'above the panel' in screen.getvalue()
 """)
     assert result.stdout == result.stderr == ""

@@ -70,7 +70,7 @@ from dew.nn.attention import (
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
-from dew.nn.mixers.base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
