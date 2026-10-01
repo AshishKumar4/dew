@@ -1084,7 +1084,9 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
                                            metrics=(Spread([]),))
 
     output = screen.getvalue()
-    assert "diagnostic above the live panel" in output
+    # Rich wraps a log line to the same terminal width as the live panel.
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    assert "diagnostic above the live panel" in " ".join(plain.split())
     assert "eval val at step" not in output
     assert evaluation_budgets and max(evaluation_budgets) < 40
     last = output.rpartition("dew · ")[2]

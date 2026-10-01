@@ -72,6 +72,22 @@ logging.getLogger('dew.training').info('device count')
     assert "device count" in result.stderr
 
 
+@pytest.mark.parametrize("width", [30, 120])
+def test_a_narrow_live_console_keeps_log_words_readable(width):
+    result = python(f"""
+import io
+import logging
+import dew
+from rich.console import Console
+from dew.logging import display_console
+screen = io.StringIO()
+with display_console(Console(file=screen, width={width}, force_terminal=True, color_system=None)):
+    logging.getLogger('dew.training.test').warning('diagnostic above the live panel')
+assert 'diagnostic' in screen.getvalue(), screen.getvalue()
+""")
+    assert result.stdout == result.stderr == ""
+
+
 @pytest.mark.parametrize("exception", [False, True])
 def test_the_live_console_is_restored_even_when_a_display_fails(exception):
     result = python(f"""
