@@ -55,8 +55,8 @@ def main(config: Config, data=None, inputs=None):
     steps = config.steps or data.epoch_steps(config.epochs)
     fields = dict(config.model, output_channels=3, dtype="bfloat16")
     model = models.build("simple_dit", **fields)
-    process = presets.EDM(regime="pixel")()
-    objective = DiffusionObjective(model, process, inputs, sampler=Heun(), guidance=CFG(3.0), steps=40)
+    objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
+                                   sampler=Heun(), guidance=CFG(3.0), steps=40)
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),

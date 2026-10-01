@@ -1087,3 +1087,61 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
     free = DPMSolverSDE()
     assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)
+
+
+############################################################################################################
+# EDM's own stochastic sampler
+############################################################################################################
+
+EDM = np.load(Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz")
+
+
+class EDMOracle(nn.Module):
+    """The closed-form D(x; sigma) `tools/edm_reference.py` runs NVlabs'
+    `edm_sampler` over; the model time on the test grid is sigma itself."""
+
+    @nn.compact
+    def __call__(self, x, sigma):
+        sigma = expand(sigma, x)
+        return jnp.tanh(x / jnp.sqrt(1 + sigma ** 2)) * 0.5 + 0.1 * jnp.sin(sigma)
+
+
+def edm_grid(steps: int) -> Process:
+    """NVlabs' rho-7 grid from 80 to 0.002 with its appended zero, as a
+    paired table whose model time is sigma."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    ramp = np.arange(steps, dtype=np.float64) / (steps - 1)
+    sigmas = np.append((80.0 ** (1 / 7) + ramp * (0.002 ** (1 / 7) - 80.0 ** (1 / 7))) ** 7, 0.0)
+    return Process(SigmaGrid(sigmas, sigmas, 80.0), DirectPredictionTransform())
+
+
+@pytest.mark.parametrize("name", ["deterministic", "churn", "churn_to_the_end"])
+def test_heun_walks_edms_algorithm_2_with_its_churn(name):
+    """Heun with S_churn, S_tmin, S_tmax and S_noise against the published
+    sampler on its own rho-7 grid and the same per-step draws, as exact as
+    the published sampler's own float32 walk."""
+    arguments = json.loads(str(EDM[f"{name}.arguments"]))
+    steps = arguments["num_steps"]
+    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
+                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
+    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
+    walked = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
+                    key=jax.random.PRNGKey(7), times=np.arange(steps, -1, -1, dtype=np.float32),
+                    final_denoise=False)
+    assert_as_exact_as_the_reference(walked, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+
+
+def test_heun_refuses_a_churn_past_the_schedules_top():
+    """gamma is sqrt(2) - 1 here, so churning at sigma 80 would evaluate the
+    model at 113, a level the grid has no time for."""
+    with pytest.raises(ValueError, match="past the schedule's top"):
+        Heun(s_churn=40.0).init(jnp.zeros((1, 2)), jnp.arange(8, -1, -1.0), edm_grid(8),
+                                key=jax.random.PRNGKey(0))
+
+
+def test_heun_churns_only_a_variance_exploding_walk():
+    with pytest.raises(ValueError, match="alpha is 1"):
+        Heun(s_churn=1.0).init(jnp.zeros((1, 2)), jnp.linspace(1.0, 0.0, 5),
+                               Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
+                               key=jax.random.PRNGKey(0))

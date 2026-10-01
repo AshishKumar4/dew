@@ -188,6 +188,8 @@ PER_ARCH = {
     "unet_2d_condition": {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
                            "blocks_per_level": 1, "precision": "default"},
     "unet_3d": {**UNET, "temporal_heads": 2},
+    "edm2_unet": {"output_channels": 3, "model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
+                  "attn_resolutions": [8], "channels_per_head": 8},
     "uvit": {**DIT, "num_layers": 2},
     "simple_udit": {**DIT, "num_layers": 2},
     "simple_dit": DIT,
@@ -256,7 +258,7 @@ def build_model(architecture, dtype="bfloat16"):
     if architecture in DECODERS:
         return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
     if architecture not in COMPOSITES:
-        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer",
+        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer", "edm2_unet",
                "flux2_transformer")
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **resolved(architecture, fields))

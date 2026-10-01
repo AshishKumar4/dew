@@ -283,11 +283,19 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--sl-color-white);
 }
 
+.band-lede {
+	max-width: 44rem;
+	margin: -1rem 0 2rem;
+	font-size: 1.05rem;
+	line-height: 1.6;
+	color: var(--sl-color-gray-2);
+}
+
 .landing .expressive-code .frame {
 	box-shadow: none;
 }
 
-/* Run it: the page's script and what it printed, side by side. */
+/* The page's script above what it printed; a tutorial cell beside its output. */
 
 .run-grid,
 .shown-grid {
@@ -327,21 +335,16 @@ html[data-has-hero][data-past-hero] header.header {
 	color: var(--dew-accent-text);
 }
 
+/* A terminal's lines are as long as its columns, so they scroll rather than
+   wrap, and sit as close as a terminal's so its box edges join. */
 .hero-output-text {
 	flex: 1;
 	margin: 0;
 	padding: 0.8rem 0.9rem;
-	min-height: 12rem;
-	overflow: auto;
-	font: 0.78rem/1.65 var(--__sl-font-mono);
+	overflow-x: auto;
+	font: 0.78rem/1.25 var(--__sl-font-mono);
 	color: var(--sl-color-gray-2);
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-}
-
-.hero-output-text .line:last-child {
-	color: var(--sl-color-white);
-	font-weight: 600;
+	white-space: pre;
 }
 
 .hero-output-meta {
@@ -357,33 +360,37 @@ html[data-has-hero][data-past-hero] header.header {
 	color: inherit;
 }
 
-.run-live {
-	display: inline-flex;
-	align-items: center;
-	gap: 0.45rem;
-	padding: 0.35rem 0.75rem;
-	border-radius: 0.45rem;
-	border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
-	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+/* The terminal's colours, in the site's palette for either theme. */
+.hero-output-text .t-bold {
+	font-weight: 700;
 	color: var(--sl-color-white);
-	font: 600 0.78rem var(--__sl-font);
-	cursor: pointer;
 }
-
-.run-live:hover {
-	background: color-mix(in srgb, var(--dew-accent-fill) 22%, transparent);
+.hero-output-text .t-red {
+	color: var(--sl-color-red);
 }
-
-.run-live .dot {
-	width: 0.45rem;
-	height: 0.45rem;
-	border-radius: 50%;
-	background: var(--dew-accent-fill);
-	box-shadow: 0 0 0 3px var(--dew-glow);
+.hero-output-text .t-green {
+	color: var(--sl-color-green);
 }
-
-[data-hero-output][data-state='running'] .run-live .dot {
-	animation: dew-pulse 1s ease-in-out infinite alternate;
+.hero-output-text .t-yellow {
+	color: var(--sl-color-orange);
+}
+.hero-output-text .t-blue {
+	color: var(--sl-color-blue);
+}
+.hero-output-text .t-magenta {
+	color: var(--sl-color-purple);
+}
+.hero-output-text .t-cyan {
+	color: var(--dew-accent-text);
+}
+.hero-output-text .t-white {
+	color: var(--sl-color-white);
+}
+.hero-output-text .t-black {
+	color: var(--sl-color-gray-5);
+}
+.hero-output-text .t-dim {
+	opacity: 0.6;
 }
 
 /* Text to image: sampling trajectories that run as they scroll past. */
@@ -451,10 +458,264 @@ html[data-has-hero][data-past-hero] header.header {
 	}
 }
 
+/* The live sampler: the editable cell (with the setup cell folded under it)
+   beside a figure that keeps its size through a run. */
+
+.live-sampler {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 1.25rem;
+	max-width: 64rem;
+}
+
+@media (min-width: 62rem) {
+	.live-sampler {
+		grid-template-columns: minmax(0, 1fr) 24rem;
+		align-items: start;
+	}
+
+	.sampler-log,
+	.sampler-colab {
+		grid-column: 1 / -1;
+	}
+}
+
+.sampler-code {
+	display: grid;
+	gap: 0.75rem;
+	min-width: 0;
+}
+
+.sampler-setup summary,
+.sampler-log summary {
+	cursor: pointer;
+	font: 500 0.75rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+}
+
+.sampler-setup .expressive-code,
+.sampler-log > div {
+	margin-top: 0.5rem;
+}
+
+.sampler-editor {
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+	background: var(--dew-output-bg);
+	overflow: hidden;
+}
+
+.sampler-editor-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 1rem;
+	padding: 0.45rem 0.6rem 0.45rem 0.9rem;
+	border-bottom: 1px solid var(--dew-rule);
+	font: 500 0.75rem var(--__sl-font-mono);
+	color: var(--dew-muted);
+}
+
+.sampler-editor-actions {
+	display: flex;
+	gap: 0.5rem;
+}
+
+.sampler-editor-actions button {
+	padding: 0.3rem 0.8rem;
+	border-radius: 0.45rem;
+	border: 1px solid var(--dew-rule);
+	background: transparent;
+	color: var(--sl-color-gray-2);
+	font: 600 0.78rem var(--__sl-font);
+	cursor: pointer;
+}
+
+.sampler-editor-actions .sampler-run {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+	color: var(--sl-color-white);
+}
+
+.sampler-editor-actions button:disabled {
+	opacity: 0.55;
+	cursor: progress;
+}
+
+.sampler-editor textarea {
+	display: block;
+	width: 100%;
+	margin: 0;
+	padding: 0.8rem 0.9rem;
+	border: 0;
+	resize: vertical;
+	background: transparent;
+	color: var(--sl-color-white);
+	font: 0.8rem/1.65 var(--__sl-font-mono);
+	white-space: pre;
+	overflow-x: auto;
+}
+
+.sampler-editor textarea:focus-visible {
+	outline: 2px solid var(--dew-accent-fill);
+	outline-offset: -2px;
+}
+
+.sampler-stage {
+	margin: 0;
+	display: grid;
+	gap: 0.6rem;
+	min-width: 0;
+}
+
+/* The frame's shape is fixed: the model draws 256 by 256. */
+.sampler-frame {
+	position: relative;
+	aspect-ratio: 1;
+	width: min(100%, 24rem);
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.6rem;
+	background: var(--dew-output-bg);
+	overflow: hidden;
+}
+
+.sampler-frame img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}
+
+.sampler-frame [hidden] {
+	display: none;
+}
+
+/* A step's preview is the model's guess at the finished image, drawn from the latent at
+   32 by 32 and blurred rather than shown as blocks; the result fades in over it. */
+.sampler-frame [data-preview] {
+	filter: blur(6px);
+	scale: 1.08;
+}
+
+.sampler-frame [data-final] {
+	animation: sampler-arrive 450ms ease-out;
+	transition: opacity 300ms ease;
+}
+
+/* The last run's image stays, faded, until the next run's first preview replaces it. */
+.sampler-stage:is([data-stage='starting'], [data-stage='sampling']) [data-final] {
+	opacity: 0.35;
+}
+
+@keyframes sampler-arrive {
+	from {
+		opacity: 0;
+	}
+}
+
+.sampler-frame-empty {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	margin: 0;
+	padding: 1rem;
+	text-align: center;
+	font-size: 0.85rem;
+	color: var(--dew-muted);
+}
+
+/* A hairline under the frame: filled by the steps done, or a moving segment while the length of a wait is unknown. */
+.sampler-bar {
+	position: relative;
+	width: min(100%, 24rem);
+	height: 2px;
+	border-radius: 1px;
+	background: var(--dew-rule);
+	overflow: hidden;
+}
+
+.sampler-bar span {
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: calc(var(--progress, 0) * 100%);
+	background: var(--dew-accent-fill);
+	transition: width 250ms ease;
+}
+
+.sampler-stage:is([data-stage='idle'], [data-stage='error']) .sampler-bar span {
+	width: 0;
+}
+
+.sampler-stage:not([data-stage='idle'], [data-stage='error']) .sampler-bar[data-determinate='false'] span {
+	width: 30%;
+	animation: sampler-wait 1.4s ease-in-out infinite;
+}
+
+@keyframes sampler-wait {
+	from {
+		translate: -100% 0;
+	}
+	to {
+		translate: 340% 0;
+	}
+}
+
+.sampler-stage figcaption {
+	min-height: 2.6rem;
+}
+
+.sampler-status,
+.sampler-detail,
+.sampler-colab {
+	margin: 0;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
+}
+
+.sampler-status {
+	color: var(--sl-color-gray-2);
+}
+
+.sampler-stage[data-stage='error'] .sampler-status {
+	color: var(--dew-error);
+}
+
+.sampler-detail {
+	font-family: var(--__sl-font-mono);
+	font-size: 0.75rem;
+	font-variant-numeric: tabular-nums;
+}
+
+.sampler-log pre {
+	margin: 0.5rem 0 0;
+	padding: 0.8rem 0.9rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+	background: var(--dew-output-bg);
+	font: 0.75rem/1.6 var(--__sl-font-mono);
+	white-space: pre-wrap;
+}
+
+.sampler-colab a {
+	color: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.sampler-frame [data-final],
+	.sampler-bar span {
+		animation: none;
+		transition: none;
+	}
+}
+
 /* Shown: cells from the tutorials and what they printed. */
 
 .shown {
 	display: grid;
+	grid-template-columns: minmax(0, 1fr);
 	gap: clamp(3rem, 8vh, 5rem);
 }
 
@@ -495,9 +756,104 @@ html[data-has-hero][data-past-hero] header.header {
 	overflow-wrap: anywhere;
 }
 
+/* Figures the examples wrote. The MoE drawing carries its own light background. */
+
+.example-figure {
+	margin: 0;
+}
+
+/* The MoE drawing is a wide figure; below its readable width it scrolls sideways. */
+.figure-scroll {
+	overflow-x: auto;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.5rem;
+}
+
+.figure-scroll img {
+	display: block;
+	width: 100%;
+	min-width: 48rem;
+	height: auto;
+	background: #fff;
+}
+
+/* The sampling example: one grid per sampler, a row per prompt and a column per seed. */
+
+.sampler-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	margin-bottom: 1.25rem;
+}
+
+.sampler-tabs label {
+	padding: 0.35rem 0.8rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 999px;
+	font: 500 0.78rem var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+	cursor: pointer;
+}
+
+.sampler-tabs label:has(input:checked) {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+	color: var(--sl-color-white);
+}
+
+.sampler-tabs label:has(input:focus-visible) {
+	outline: 2px solid var(--dew-accent-fill);
+	outline-offset: 2px;
+}
+
+.sampler-tabs input {
+	position: absolute;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.sampler-row {
+	max-width: 52rem;
+	margin-bottom: 1rem;
+}
+
+.sampler-prompt {
+	margin: 0 0 0.4rem;
+	font: 0.8rem/1.5 var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+}
+
+.sampler-images {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 0.4rem;
+}
+
+.sampler-images img {
+	display: block;
+	width: 100%;
+	height: auto;
+	border-radius: 0.3rem;
+}
+
+.sampler-settings {
+	margin: 0;
+	font-size: 0.8rem;
+	color: var(--dew-muted);
+}
+
+.example-figure figcaption {
+	max-width: 48rem;
+	margin-top: 0.8rem;
+	font-size: 0.85rem;
+	line-height: 1.55;
+	color: var(--dew-muted);
+}
+
 /* Tutorials. */
 
-.tutorial-list {
+.tutorial-list,
+.try-list {
 	display: grid;
 	grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
 	gap: 0.75rem;
@@ -506,11 +862,13 @@ html[data-has-hero][data-past-hero] header.header {
 	list-style: none;
 }
 
-.tutorial-list li {
+.tutorial-list li,
+.try-list li {
 	margin: 0;
 }
 
-.tutorial-link {
+.tutorial-link,
+.try-link {
 	display: grid;
 	grid-template-columns: auto 1fr auto;
 	align-items: baseline;
@@ -527,7 +885,8 @@ html[data-has-hero][data-past-hero] header.header {
 		transform 150ms ease;
 }
 
-.tutorial-link:hover {
+.tutorial-link:hover,
+.try-link:hover {
 	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
 	color: var(--sl-color-white);
 }
@@ -547,6 +906,25 @@ html[data-has-hero][data-past-hero] header.header {
 	font: 500 0.68rem var(--__sl-font-mono);
 	letter-spacing: 0.06em;
 	color: var(--dew-muted);
+}
+
+/* Try it: a name over what the link offers. */
+
+.try-link {
+	grid-template-columns: minmax(0, 1fr);
+	gap: 0.35rem;
+}
+
+.try-name {
+	font-weight: 560;
+	font-size: 1rem;
+	letter-spacing: -0.01em;
+}
+
+.try-what {
+	font-size: 0.85rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-2);
 }
 
 /* The footer. */
@@ -583,15 +961,6 @@ html[data-has-hero][data-past-hero] header.header {
 }
 
 @media (min-width: 62rem) {
-	.run-grid {
-		grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
-		align-items: start;
-	}
-	/* The output stays beside the code as you read down the script. */
-	.run-grid .hero-output {
-		position: sticky;
-		top: calc(var(--sl-nav-height) + 1.5rem);
-	}
 	.shown-grid {
 		grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
 	}
@@ -609,28 +978,4 @@ html[data-has-hero][data-past-hero] header.header {
 	transition:
 		opacity 700ms ease,
 		translate 700ms cubic-bezier(0.2, 0.7, 0.2, 1);
-}
-
-@media (prefers-reduced-motion: no-preference) {
-	.hero-output-text .line.streamed {
-		animation: dew-fade 150ms ease-out both;
-	}
-}
-
-@keyframes dew-fade {
-	from {
-		opacity: 0;
-	}
-	to {
-		opacity: 1;
-	}
-}
-
-@keyframes dew-pulse {
-	from {
-		opacity: 0.35;
-	}
-	to {
-		opacity: 1;
-	}
 }

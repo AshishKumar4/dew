@@ -1,6 +1,6 @@
-# Core API reference
+# Core API
 
-This page describes the interfaces the tutorials use and the contracts between them. Every public module also has its own page, generated from its docstrings; the list is at the [end of this page](#all-modules). For a complete example, read [your first training run](../getting-started.md).
+This page describes the main interfaces and the contracts between them, grouped by task. Every public module also has a page generated from its docstrings; they are listed at the [end of this page](#all-modules) and in the sidebar. The [Quickstart](../getting-started.md) uses the core of it in one script.
 
 ## Objective
 
@@ -23,7 +23,7 @@ Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `
 
 ### Collections and EMA selection
 
-A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [stateful example](../concepts/objectives.md#update-non-parameter-state).
+A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).
 
 `EMASpec(decay, select=everything)` comes from `dew.objectives.base`. `decay` maps completed optimizer-update count to a scalar. `select` accepts a tuple of keys naming a leaf; `under("params", "context_encoder")` selects that subtree, and `everything` selects all leaves. EMA arithmetic uses at least fp32 and preserves explicit fp64, then rounds each result to the initialized EMA leaf dtype. Unit decay selects the frozen leaf exactly. Router bias updates also retain the initialized bias dtype; integer load comparisons avoid converting large counts to floats.
 
@@ -49,7 +49,7 @@ Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_param
 build_mesh(spec, devices=None)
 ```
 
-`build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#lay-the-mesh-out-for-the-network). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
+`build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
 
 `Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `host` names train-state fields out of `params`, `opt_state` and `ema`. The named `opt_state` and `ema` stay in pinned host memory between steps and the step fetches them to the device. Naming `params` instead makes the CPU own the whole `TrainState`, including optimizer, EMA and accumulation: the optimizer transaction runs on a CPU companion of the mesh, and the runtime CPU device count must match the accelerator count on every process before JAX initializes. `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory; only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
 
@@ -93,7 +93,7 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
 
-`compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler travels in `TrainState`. `loss_finite` and `accepted` are separate: a finite scalar can have a rejected nonfinite gradient. The callable does not donate state or batch arrays because retained replay records and asynchronous checkpoints may own those buffers.
+`compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler travels in `TrainState`. `loss_finite` and `accepted` are separate: a finite scalar can have a rejected nonfinite gradient. The callable consumes the state it is given (`donate_argnums=0`): the returned state takes over its buffers, so no reference to the old state may be kept, `new = compiled(old, batch)`. The batch is not donated; the loader owns it.
 
 ## TrainState
 
@@ -167,7 +167,7 @@ LMObjective(model, seq_len, *, ema_decay=0.999, pad_id=None, head_chunks=4, head
 IndexerTraining(phase, weight=1.0)
 ```
 
-The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`load_pretrained` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model and initial variables. It refuses `pretrained=` because the bundle supplies those weights. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
 `pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay=None` trains without an averaged copy, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
@@ -211,8 +211,16 @@ StepState(tokens, valid, step, active, keys, prompt_width)
 Built-in transforms are pytrees, so a configuration holding arrays travels as data rather than entering a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` carries array configuration for one. Everything runs inside the compiled loop; there is no host callback. Across a pool the resolved components are compared by their structure and by the contents of their configuration arrays, so two ranks banning different tokens are refused instead of each running its own policy.
 
 ```python
+import jax
 import jax.numpy as jnp
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.sampling import Beam, Sampling, Speculative, decoding, generate
+
+# An untrained decoder with one prediction depth, which Speculative drafts with.
+model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+                          mlp_features=64, max_seq_len=64, num_nextn_predict_layers=1)
+variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+prompts = [[5, 6, 7], [8, 9, 10]]
 
 
 def favor_short(state, logits):
@@ -238,11 +246,13 @@ searched = generate(model, variables, prompts, 32, seed=0,
                     logits=(decoding.NoRepeatNGram(3),),
                     strategy=Beam(width=4, length_penalty=1.0), n=2)
 
-# Or drafted by the model's own prediction depths, with the same law as the
-# first call and fewer target forwards.
+# Drafted by the model's own prediction depths and verified by the model:
+# tokens are distributed exactly as ordinary sampling under this call's
+# policy; accepted drafts save target forwards, which untrained depths rarely give.
 drafted = generate(model, variables, prompts, 32, seed=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
+print(drawn.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
 
 The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
@@ -389,7 +399,7 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`. `dew.pipeline` is the same function. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
 ```text
-pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=True, step=None,
+pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
          revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
 LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
@@ -398,27 +408,30 @@ TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_to
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
      images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
+task.quantized(spec, example=((0,),)) -> TextGeneration
 TextGeneration.from_run / BlockGeneration.from_run / MaskedGeneration.from_run
-    (directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
+    (directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
 TextGeneration.from_pretrained / BlockGeneration.from_pretrained / MaskedGeneration.from_pretrained
-    (repo_id, *, ema=True, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
+    (repo_id, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
 BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
                 max_new_tokens=None, max_length=None, n=1)
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, process=None,
      images=None) -> CanvasGeneration
 Pretrained.text_generation(*, sampling=None) -> TextGeneration | MaskedGeneration
+Pretrained.lm_objective(seq_len, **options) -> LMObjective
 Pretrained.block_generation() -> BlockGeneration
 Pretrained.text_to_image() -> TextToImage
 PPOObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
             sampler=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
-TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None,
+TextToImage.from_run(directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
                      param_dtype=None)
-TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None,
+TextToImage.from_pretrained(repo_id, *, ema=None, mesh=None, layout=None, dtype=None,
                             param_dtype=None)
 LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
+image_task.quantized(spec) -> TextToImage
 image_task.prepare(prompts, *, key=None, seed=None, steps=None, unconditional=None,
                    image=None, image_latents=None, mask=None, noise=None, initial=None,
                    times=None, encode_key=None) -> DenoisingInputs
@@ -433,7 +446,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `max_new_tokens` takes precedence over a source default. If only `max_length` is declared, the budget is that total minus the padded prompt width. Otherwise an LM run records its `sample_tokens` and `sampling` value; an objective uses its `Samples`. With no limit the call must provide one. A call's `n` takes precedence over the task's bound count the same way, including `n=1` over a source that asks for more; omitting it uses the bound count. Equal shapes and controls reuse the compiled executable across calls and `bind`.
 
-`LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first. The three text tasks construct the same way from the kinds they generate for, and `dew.pipeline` picks the task class from the objective name in `run.json`. `pipeline`'s `dtype` selects the computation dtype and `param_dtype` the parameter storage: `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
+`LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `dew.pipeline` and every task's `from_run` and `from_pretrained` default to `ema=None`: the EMA copy merged over the live parameters when the run stored one, the live parameters otherwise; `ema=True` refuses a run without an EMA copy and `ema=False` takes the live parameters. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory; `from_pretrained` pulls a published run directory from the Hub first. The three text tasks construct the same way from the kinds they generate for, and `dew.pipeline` picks the task class from the objective name in `run.json`. `pipeline`'s `dtype` selects the computation dtype and `param_dtype` the parameter storage: `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and take their return count from `num_return_sequences`. An explicit `sampling=` replaces the policy and the chain, and the controls behind them are then neither built nor judged, so a distribution control the caller just replaced cannot block the call; the criteria, the strategy and the return count still come from the source, and every control the task keeps is judged as always. An unknown control name is always refused, because no consumer is defined for it. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
 
@@ -445,6 +458,7 @@ Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and pad
 
 Dew does not run an HTTP server. Install `[inference-clients]` and inject the official client configured for your local or deployed engine. The adapter does not own the SDK client's lifetime.
 
+<!-- not run: needs running Ollama and OpenAI-compatible servers -->
 ```python
 import ollama
 import openai
@@ -482,7 +496,7 @@ JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
 
-Import `DiffusionObjective` from `dew.objectives.diffusion`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
+Import `DiffusionObjective` from `dew.objectives.diffusion`. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
 Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normalized images/video and optional token indices plus `train` and RNG settings. It returns token features with the feature dimension last. The predictor consumes context features and context/target position indices and returns target features of the encoder width. Mask grid, patch geometry, and predictor dimensions must agree. `momentum` specifies the EMA schedule endpoints over `momentum_steps` optimizer updates; `label_key` identifies labels for representation evaluation. See the [JEPA example](../guides/representation-learning.md).
 
@@ -510,6 +524,7 @@ Unimplemented active controls fail explicitly: Lu-lambda and flow-sigma grids, U
 
 The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers scheduler objects. Ordinary stochastic walks share explicit Gaussian draws. DPM-Solver SDE runs the actual `torchsde` tree, and native solver parity uses its recorded increments; separate tests exercise the native Brownian bridge law. All native source trajectories and VJPs run in float32. Trajectories use a `1e-4` scaled-error bound. Every source VJP uses `tests/reference_error.py`: its RMS distance from the exact source evaluation must be at most twice the float32 source's. The exact evaluation constructs every scheduler table and performs step arithmetic in float64, with the same initial float32 latent, cotangent and recorded random draws. Its gradient is stored in float64, not rounded back to float32.
 
+<!-- not run: needs a local diffusion checkpoint directory -->
 ```python
 from dew.interop import load_pretrained
 from dew.objectives.diffusion import DiffusionObjective

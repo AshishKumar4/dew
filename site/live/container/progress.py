@@ -1,0 +1,152 @@
+"""Progress reports for the landing page's sampler, while a sampling cell runs.
+
+server.py wraps the setup cell's `pipe` in `Reporting` once the cell has run.
+The wrapper samples exactly as `pipe` does, with the solver it is handed
+wrapped so each step also sends its clean prediction to the host. While the
+compiled program runs, the kernel's main thread displays one output per solver
+step, whose text is {"dew-progress": {"step": k, "steps": n}} with n the
+cell's step count and whose PNG is that prediction mapped linearly from
+latents to a small RGB image, then {"dew-progress": {"stage": "decode"}} while
+the model's final clean prediction and the VAE decode run. The
+page shows these as the run's progress; any other display is the cell's own.
+
+`ReportingModels` wraps the setup cell's `text_model` the same way: it
+reports {"dew-progress": {"stage": "load", "model": name}} before a model this
+kernel has not loaded yet loads, and {"dew-progress": {"stage": "generate",
+"first": bool}} before each generation, `first` for that model's first one in
+this kernel, which compiles its program.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import queue
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
+
+import jax
+import numpy as np
+from PIL import Image
+
+# Stable Diffusion's VAE latents (sd-vae-ft-mse, as the model is trained on)
+# to RGB in [-1, 1], one row per latent channel: the least-squares linear fit
+# that ComfyUI and Diffusers' previews use for SD 1.x latents.
+LATENT_RGB = np.array([[0.3512, 0.2297, 0.3227],
+                       [0.3250, 0.4974, 0.2350],
+                       [-0.2829, 0.1762, 0.2721],
+                       [-0.2120, -0.2616, -0.7177]], np.float32)
+
+_steps: queue.SimpleQueue[np.ndarray] = queue.SimpleQueue()
+
+
+def _report(denoised: Any) -> None:
+    """Runs on the runtime's callback thread; the main thread displays."""
+    _steps.put(np.asarray(denoised[0], np.float32))
+
+
+@dataclass(frozen=True)
+class ReportingSolver:
+    """`inner`, sending each step's clean prediction to `_report`."""
+
+    inner: Any
+
+    def init(self, x, times, process, *, key):
+        return self.inner.init(x, times, process, key=key)
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise, /):
+        jax.debug.callback(_report, denoised)
+        return self.inner.step(x, t, t_next, denoised, eps, state, key, process, denoise)
+
+
+def preview_png(latent: np.ndarray) -> str | None:
+    """A latent `[H, W, 4]` as a base64 PNG of the same size; None for other shapes."""
+    if latent.ndim != 3 or latent.shape[-1] != LATENT_RGB.shape[0]:
+        return None
+    rgb = np.clip((latent @ LATENT_RGB + 1) * 127.5, 0, 255).astype(np.uint8)
+    buffer = io.BytesIO()
+    Image.fromarray(rgb).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _show(report: dict[str, Any], png: str | None = None) -> None:
+    from IPython.display import display  # the kernel's; nothing else needs IPython
+
+    data = {"text/plain": json.dumps({"dew-progress": report})}
+    if png is not None:
+        data["image/png"] = png
+    display(data, raw=True)
+
+
+class Reporting:
+    """`pipe`, reporting each sampling step while a call runs."""
+
+    def __init__(self, pipe: Any) -> None:
+        self.pipe = pipe
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.pipe, name)
+
+    def __call__(self, prompts, *, steps: int | None = None, sampler=None, decode: bool = True, **kw):
+        count = self.pipe.steps if steps is None else steps
+        # The solver steps between the grid's points; the model's last call, the
+        # clean prediction at the final point, runs with the decode.
+        process, times = self.pipe.prepared_process(count)
+        walked = len(process.times(count) if times is None else times) - 1
+        solver = ReportingSolver(self.pipe.sampler if sampler is None else sampler)
+        while not _steps.empty():
+            _steps.get_nowait()
+        # A call's first run of a program with host callbacks returns only when the
+        # program has finished, so the call runs on its own thread and this one displays.
+        with ThreadPoolExecutor(1) as pool:
+            call = pool.submit(self.pipe, prompts, steps=steps, sampler=solver, decode=decode, **kw)
+            done = 0
+            while done < walked:
+                try:
+                    latent = _steps.get(timeout=0.2)
+                except queue.Empty:
+                    if call.done() and (call.exception() is not None or _ready(call.result())):
+                        break
+                    continue
+                done += 1
+                _show({"step": done, "steps": count}, preview_png(latent))
+            if decode and done == walked:
+                _show({"stage": "decode"})
+            return call.result()
+
+
+def _ready(result: Any) -> bool:
+    return all(leaf.is_ready() for leaf in jax.tree.leaves(result))
+
+
+class ReportingModels:
+    """`load`, the setup cell's `text_model`, reporting each model's load and generations."""
+
+    def __init__(self, load: Callable[[str], Any]) -> None:
+        self.load = load
+        self.tasks: dict[str, ReportingText] = {}
+
+    def __call__(self, name: str) -> ReportingText:
+        if name not in self.tasks:
+            _show({"stage": "load", "model": name})
+            self.tasks[name] = ReportingText(self.load(name))
+        return self.tasks[name]
+
+
+class ReportingText:
+    """A text generation task, reporting each call before it runs."""
+
+    def __init__(self, task: Any) -> None:
+        self.task = task
+        self.called = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.task, name)
+
+    def __call__(self, *args, **kw):
+        _show({"stage": "generate", "first": not self.called})
+        self.called = True
+        return self.task(*args, **kw)

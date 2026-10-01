@@ -8,9 +8,10 @@ resolves a directory to the train and validation pair a run needs, by what
 the files in it are.
 
 `TokenWindowSource` reads a record as a contiguous window of `seq_len + 1`
-ids starting at `i * seq_len`, so record i's last token is record i+1's first
-and the model sees every transition exactly once. There is no decoding and
-no randomness here; the shuffle lives in the sampler.
+ids starting at `i * stride`. The default stride is `seq_len`, so record
+i's last token is record i+1's first and every transition appears once.
+Smaller strides overlap windows. There is no decoding or randomness here;
+the shuffle lives in the sampler.
 
 `TokenDocumentSource` reads a record as one document: the span from after the
 previous eos id through its own. It exists for the packed pipeline, which
@@ -327,16 +328,19 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
 class TokenWindowSource:
     """Reads fixed `seq_len + 1` windows over a token corpus, by index.
 
-    Record i is `tokens[i * seq_len : i * seq_len + seq_len + 1]`, so the
-    last token of one window is the first of the next and the model sees
-    every transition exactly once.
+    Record i starts at `i * stride`. With the default stride of `seq_len`,
+    the last token of one window is the first of the next. A stride of one
+    reads every complete contiguous window; incomplete tails are excluded.
     """
 
-    def __init__(self, tokens: TokenSource, seq_len: int):
+    def __init__(self, tokens: TokenSource, seq_len: int, *, stride: int | None = None):
         if seq_len < 1:
             raise ValueError(f"seq_len must be at least 1, got {seq_len}")
         self.tokens = tokens
         self.seq_len = seq_len
+        self.stride = seq_len if stride is None else stride
+        if self.stride < 1:
+            raise ValueError(f"stride must be at least 1, got {self.stride}")
         if len(tokens) < seq_len + 1:
             raise ValueError(
                 f"{tokens!r} holds {len(tokens)} tokens, too few for even "
@@ -345,17 +349,18 @@ class TokenWindowSource:
 
     def __repr__(self) -> str:
         # The description a saved position compares against (`describe`).
-        return f"TokenWindowSource(tokens={self.tokens!r}, seq_len={self.seq_len})"
+        stride = "" if self.stride == self.seq_len else f", stride={self.stride}"
+        return f"TokenWindowSource(tokens={self.tokens!r}, seq_len={self.seq_len}{stride})"
 
     def __len__(self) -> int:
-        return (len(self.tokens) - 1) // self.seq_len
+        return (len(self.tokens) - self.seq_len - 1) // self.stride + 1
 
     def __getitem__(self, index: int) -> dict[str, np.ndarray]:
         # A memmap slice past its end yields an empty array instead of an error,
         # so the bounds are checked here.
         if not 0 <= index < len(self):
             raise IndexError(index)
-        start = index * self.seq_len
+        start = index * self.stride
         return {"text": self.tokens[start:start + self.seq_len + 1].astype(np.int32)}
 
 
