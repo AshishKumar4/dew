@@ -44,10 +44,10 @@ def single_device(offline=True) -> dict[str, str]:
             "TOKENIZERS_PARALLELISM": "false"}
 
 
-def smoke(name, out, *arguments, offline=True):
+def smoke(name, out, *arguments, offline=True, script=None):
     """One example's `--smoke` run, in its own process, on one CPU device (`single_device`)."""
     finished = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
+        [sys.executable, str(script or REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
          "--out", str(out), *arguments],
         cwd=REPO_ROOT, env=single_device(offline), capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, (
@@ -63,6 +63,20 @@ def load_example(name):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("section", ["lm", "diffusion", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"])
+def test_landing_snippet_runs(section, tmp_path):
+    smoke("landing", tmp_path, "--section", section,
+          script=REPO_ROOT / "site/snippets/framework.py")
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert result
+    if section == "reliability":
+        assert result["bit_exact"] and result["resumed_step"] == 3
+    elif section == "serving":
+        assert len(result["text"]) == 2
+    elif section == "pretrained":
+        assert (tmp_path / "export/config.json").is_file()
 
 
 def _batches(batch, classes=None, size=RES):

@@ -1,9 +1,4 @@
 ---
-// The landing page. The hero comes from components/landing/LandingHero.astro
-// (Starlight renders it in the splash template's hero slot). Below it, each
-// section shows real code and what it produced: the page's own training script
-// and the terminal it ran on, text-to-image samples, places to try the model,
-// two examples, a tutorial cell, then the tutorials.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
@@ -11,334 +6,198 @@ import { Code } from '@astrojs/starlight/components';
 import HeroOutput from '../components/landing/HeroOutput.astro';
 import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
+import framework from '../../snippets/framework.py?raw';
 import outputs from '../generated/notebook-outputs.json';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
 import '../styles/landing.css';
 
-const hero = capture.hero;
-if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero script did not exit cleanly');
-
-// Places to run the text-to-image model; the live sampler only when this build has live kernels (src/live.mjs).
-const tries = [
-	...(live.endpoint && live.turnstileSitekey
-		? [{ name: 'Live sampler', what: 'Edit the sampling cell and run it on a live CPU kernel.', href: '/sample/' }]
-		: []),
-	{
-		name: 'Colab notebook',
-		what: 'Load the model from the Hub and sample it on a GPU.',
-		href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb',
-	},
-	{ name: 'dewml/hybrid-dit-176m', what: 'The weights and model card on the Hugging Face Hub.', href: 'https://huggingface.co/dewml/hybrid-dit-176m' },
-];
-
-// A cell from a tutorial, with what it printed on the tutorial's last complete run.
-const shown = [
-	{
-		label: 'Released weights',
-		title: 'Tutorial 8: the next token from Dew and from transformers',
-		notebook: '08-load-a-pretrained-decoder',
-		cell: 'cell-21',
-	},
-].map((entry) => {
-	const record = (outputs as Record<string, Record<string, { source?: string; stdout?: string }>>)[entry.notebook]?.[entry.cell];
-	if (!record?.source || !record.stdout) throw new Error(`index.astro: ${entry.notebook} ${entry.cell} has no recorded output`);
-	return { ...entry, source: record.source.trimEnd(), stdout: record.stdout.trimEnd() };
-});
-
-// What the two examples wrote, under public/examples/ (see examples/sample_text_to_image.py and examples/moe_mesh.py).
 const readPublic = (...parts: string[]) => readFileSync(path.join(process.cwd(), 'public', ...parts), 'utf8');
-interface Sample {
-	file: string;
-	prompt: string;
-	seed: number;
-	sampler: string;
-	steps: number;
-	guidance: number;
-	guidance_interval: [number, number];
-}
-const sampling = JSON.parse(readPublic('examples', 'sample-text-to-image', 'manifest.json')) as {
-	device: string;
-	images: Sample[];
+const snippet = (...names: string[]) => names.map((name) => {
+	const text = framework.split(`# Begin snippet: ${name}\n`)[1]?.split(`# End snippet: ${name}`)[0];
+	if (!text) throw new Error(`framework.py: missing snippet ${name}`);
+	const lines = text.split('\n');
+	const indent = Math.min(...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)![0].length));
+	return lines.map((line) => line.slice(indent)).join('\n').trim();
+}).join('\n\n');
+const recorded = (name: string) => {
+	const root = ['examples', 'framework', name];
+	return { result: JSON.parse(readPublic(...root, 'result.json')), capture: JSON.parse(readPublic(...root, 'capture.json')) };
 };
-// One grid per sampler setting (the directory each image sits in): a row per prompt, a column per seed.
-const samplerGrids = [...new Set(sampling.images.map((image) => image.file.split('/')[0]))].map((key) => {
-	const images = sampling.images.filter((image) => image.file.startsWith(`${key}/`));
-	const [first] = images;
-	const [from, to] = first.guidance_interval;
-	const interval = from === 0 && to === 1 ? '' : `, applied from ${from * 100}% to ${to * 100}% of the way`;
-	const prompts = [...new Set(images.map((image) => image.prompt))];
-	return {
-		key,
-		label: `${first.sampler}, ${first.steps} steps`,
-		settings: `${first.sampler}, ${first.steps} steps, guidance ${first.guidance}${interval}`,
-		rows: prompts.map((prompt) => ({
-			prompt,
-			images: images.filter((image) => image.prompt === prompt).sort((a, b) => a.seed - b.seed),
-		})),
-	};
-});
-const seeds = new Set(sampling.images.map((image) => image.seed)).size;
-const moeLog = readPublic('examples', 'moe-mesh', 'moe-mesh.log');
-if (!/over 8 cpu device\(s\)/.test(moeLog)) throw new Error('index.astro: the MoE caption says 8 simulated CPU devices; moe-mesh.log says otherwise');
-
-// Sampling trajectories of a text-to-image model, packed into public/hero/replay/ by scripts/replay-atlas.py.
+const names = ['lm', 'diffusion', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
+const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
+const objectives = [
+	{ name: 'lm', label: 'Language model', detail: 'Next-token prediction on repeated byte text.' },
+	{ name: 'diffusion', label: 'Diffusion', detail: 'Flow matching on eight synthetic striped images.' },
+	{ name: 'jepa', label: 'JEPA', detail: 'Predict masked patch representations, with an EMA target encoder.' },
+	{ name: 'grpo', label: 'GRPO', detail: 'Sample groups of completions and score them with a reward function.' },
+];
+const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
+const hero = capture.hero;
+const shortHero = heroCode.slice(heroCode.indexOf('model ='));
 const replays = ['aurora', 'beach', 'lighthouse'].map((name) => {
-	// Read from the project's public/, where the build runs (the page's own module is bundled elsewhere).
-	const meta = JSON.parse(readFileSync(path.join(process.cwd(), 'public', 'hero', 'replay', name, 'meta.json'), 'utf8'));
-	return {
-		name,
-		prompt: meta.prompt as string,
-		width: meta.width as number,
-		height: meta.height as number,
-		model: meta.model as { model: string; parameters: number; dew_commit: string },
-		steps: meta.steps as number,
-	};
+	const meta = JSON.parse(readPublic('hero', 'replay', name, 'meta.json'));
+	if (Math.round(meta.model.parameters / 1e6) !== 176 || !/^[0-9a-f]{40}$/.test(meta.model.dew_commit)) {
+		throw new Error(`replay ${name}: missing model provenance`);
+	}
+	return { name, ...meta };
 });
-// The note under the figures names one text-to-image model of this size: every
-// trajectory's provenance must name the same model and the Dew commit that sampled it.
-const replayModel = replays[0].model;
-if (!replays.every((replay) => replay.model.model === replayModel.model && /^[0-9a-f]{40}$/.test(replay.model.dew_commit))) {
-	throw new Error('index.astro: the replays must come from one model, each sampled with Dew at a recorded commit');
-}
-const replayParameters = `${Math.round(replayModel.parameters / 1e6)}M`;
-const replaySteps = replays[0].steps;
-
-// Short names for the tutorial cards; the tutorials' own titles are on their pages.
-const names: Record<string, string> = {
-	'01': 'Diffusion from scratch',
-	'02': 'Image diffusion',
-	'03': 'Text to image',
-	'04': 'Samplers',
-	'05': 'Language model',
-	'06': 'I-JEPA',
-	'07': 'Many devices',
-	'08': 'Pretrained decoders',
+const tries = [
+	...(live.endpoint && live.turnstileSitekey ? [{ name: 'Live sampler', what: 'Edit the cell and run it on a CPU kernel.', href: '/sample/' }] : []),
+	{ name: 'Colab notebook', what: 'Load the model and sample it on a GPU.', href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb' },
+	{ name: 'dewml/hybrid-dit-176m', what: 'Weights and model card on the Hub.', href: 'https://huggingface.co/dewml/hybrid-dit-176m' },
+];
+const released = outputs['08-load-a-pretrained-decoder']['cell-21'];
+const reward = records.grpo.result.curve as { step: number; reward: number }[];
+if (!reward.length) throw new Error('GRPO recording has no reward reports');
+const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, reward.at(-1)!.step - 1) * 300},${140 - row.reward * 100}`).join(' ');
+const tutorialNames: Record<string, string> = {
+	'01': 'Diffusion from scratch', '02': 'Image diffusion', '03': 'Text to image', '04': 'Samplers',
+	'05': 'Language model', '06': 'I-JEPA', '07': 'Many devices', '08': 'Pretrained decoders',
 };
-const cards = tutorials.map((entry) => {
-	const name = names[entry.number];
-	if (!name) throw new Error(`index.astro: no card name for tutorial ${entry.number}`);
-	return { ...entry, name };
-});
 ---
 
-<StarlightPage
-	frontmatter={{
-		title: 'Dew: train models with JAX and Flax',
-		description:
-			'Dew is a JAX and Flax framework for training language models, diffusion models and JEPA encoders, on one device or a mesh of GPUs or TPUs.',
-		template: 'splash',
-		hero: { title: 'Dew' },
-		tableOfContents: false,
-		editUrl: false,
-		lastUpdated: false,
-		pagefind: false,
-	}}
-	hasSidebar={false}
->
+<StarlightPage frontmatter={{ title: 'Dew', description: 'A JAX/Flax framework for training, generation and serving.', template: 'splash', hero: { title: 'Train models with JAX and Flax.' }, pagefind: false }} hasSidebar={false}>
 	<div class="landing not-content">
 		<section class="band run" data-reveal>
-			<h2 class="band-title">A training run</h2>
-			<p class="band-lede">
-				A byte-level decoder whose every layer routes each token to 2 of 8 experts, trained on Tiny Shakespeare for
-				300 steps on a mesh of eight CPU devices simulated in one process, then served on the same mesh. The terminal
-				is what this script left on the screen.
-			</p>
+			<h2 class="band-title">Train, evaluate, sample</h2>
+			<p class="band-lede">A two-layer byte decoder with eight local experts learns Tiny Shakespeare on one RTX 4080. The final 50,000 bytes are held out; this recording ends after 200 steps with short ROMEO and JULIET samples.</p>
 			<div class="run-grid">
-				<Code code={heroCode.trimEnd()} lang="python" title="train.py" />
-				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} />
+				<Code code={shortHero.trimEnd()} lang="python" title="train.py — dataset preparation omitted" />
+				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} />
 			</div>
+			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full runnable script</a>, including the corpus preparation. The terminal is a recording, not a live job in the browser.</p>
 		</section>
 
-		<section class="band replay" aria-label="Text to image" data-reveal data-replays>
-			<h3 class="shown-label">
-				<a href="/tutorials/03-text-to-image-with-guidance/">Text to image</a>
-			</h3>
-			<div class="replay-grid">
-				{
-					replays.map((replay) => (
-						<figure class="replay-figure" data-replay={`/hero/replay/${replay.name}`}>
-							<div class="replay-frame" style={`aspect-ratio: ${replay.width} / ${replay.height}`}>
-								<img src={`/hero/replay/${replay.name}/final.webp`} width={replay.width} height={replay.height} alt="" loading="lazy" decoding="async" />
-								<canvas aria-hidden="true" />
-							</div>
-							<figcaption>“{replay.prompt}”</figcaption>
-						</figure>
-					))
-				}
+		<section class="band" data-reveal>
+			<h2 class="band-title">One trainer for every objective</h2>
+			<p class="band-lede">The objective defines the loss, initialization and evaluation. The same <code>Trainer.fit</code> owns optimization, reporting and checkpoints.</p>
+			<div class="objective-tabs" role="radiogroup" aria-label="Training objective">
+				{objectives.map((entry, index) => <label><input type="radio" name="objective" value={entry.name} checked={index === 0} />{entry.label}</label>)}
 			</div>
-			<p class="replay-note">
-				A {replayParameters}-parameter text-to-image model at 256×256, trained with Dew. Each figure replays the
-				sampler's prediction of the finished image at every one of its {replaySteps} steps. The weights are{' '}
-				<a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.
-			</p>
+			{objectives.map((entry, index) => <div class="objective-example" data-objective={entry.name} hidden={index !== 0}>
+				<p>{entry.detail}</p>
+				<Code code={snippet(entry.name)} lang="python" title={`framework.py — ${entry.label}`} />
+				<pre class="shown-output">{`${records[entry.name].result.steps} training steps completed on ${records[entry.name].capture.meta.where}.`}</pre>
+			</div>)}
+			<p class="framework-note">These examples use tiny fixtures, not quality benchmarks. Imports and fixture preparation are in the <a href={fullScript}>runnable script</a>; the same blocks are smoke-tested in CI.</p>
 		</section>
 
-		<section class="band try" aria-label="Try the model" data-reveal>
-			<h3 class="shown-label">Try it</h3>
-			<ul class="try-list">
-				{
-					tries.map((entry) => (
-						<li>
-							<a class="try-link" href={entry.href}>
-								<span class="try-name">{entry.name}</span>
-								<span class="try-what">{entry.what}</span>
-							</a>
-						</li>
-					))
-				}
-			</ul>
+		<section class="band" data-reveal>
+			<h2 class="band-title">Pretrained models</h2>
+			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
+			<Code code={snippet('pretrained-source', 'pretrained', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
+			<pre class="shown-output">{`${records.pretrained.result.text.join('\n')}\n${records.pretrained.result.steps} fine-tuning step; exported config.json and model.safetensors.`}</pre>
+			<p class="framework-note">The training fixture is one short sentence. <a href="/reference/models/">Supported families</a> include Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders; the models page states which computations are checked.</p>
 		</section>
 
-		<section class="band shown" aria-label="Examples and tutorials">
-			<article class="shown-item" data-reveal>
-				<h3 class="shown-label">
-					<a href="/examples/#sample_text_to_imagepy">Samplers compared</a>
-				</h3>
-				<figure class="example-figure sampler-figure">
-					<div class="sampler-tabs" role="radiogroup" aria-label="Sampler">
-						{
-							samplerGrids.map((grid, index) => (
-								<label>
-									<input type="radio" name="sampler" value={grid.key} checked={index === 0} />
-									{grid.label}
-								</label>
-							))
-						}
-					</div>
-					{
-						samplerGrids.map((grid, index) => (
-							<div class="sampler-grid" data-sampler={grid.key} hidden={index !== 0}>
-								{grid.rows.map((row) => (
-									<div class="sampler-row">
-										<p class="sampler-prompt">“{row.prompt}”</p>
-										<div class="sampler-images">
-											{row.images.map((image) => (
-												<img
-													src={`/examples/sample-text-to-image/${image.file}`}
-													width="256"
-													height="256"
-													alt={`Seed ${image.seed}`}
-													loading="lazy"
-													decoding="async"
-												/>
-											))}
-										</div>
-									</div>
-								))}
-								<p class="sampler-settings">{grid.settings}.</p>
-							</div>
-						))
-					}
-					<figcaption>
-						<code>examples/sample_text_to_image.py</code> samples the text-to-image model above with each sampler, over
-						the same prompts and {seeds} seeds, recorded on an {sampling.device}.
-					</figcaption>
-				</figure>
-			</article>
-			<article class="shown-item" data-reveal>
-				<h3 class="shown-label">
-					<a href="/examples/#moe_meshpy">Mixture of experts on a mesh</a>
-				</h3>
-				<figure class="example-figure">
-					<div class="figure-scroll">
-						<img
-							src="/examples/moe-mesh/moe-mesh.svg"
-							width="1430"
-							height="662"
-							alt="Eight devices in a data by expert by fsdp grid, with the routed slots each device sends to the others, the slots each expert receives, and the training loss."
-							loading="lazy"
-							decoding="async"
-						/>
-					</div>
-					<figcaption>
-						<code>examples/moe_mesh.py</code> trains an eight-expert, top-2 decoder on a mesh of data 2, expert 2 and
-						fsdp 2, here eight CPU devices simulated in one process. Each frame is one training step: the experts its
-						batch's tokens pick, and how many routed slots each device sends to the others in the all-to-all. The last
-						frame routes the prompts and their greedy continuations after training.
-					</figcaption>
-				</figure>
-			</article>
-			{
-				shown.map((entry) => (
-					<article class="shown-item" data-reveal>
-						<h3 class="shown-label">
-							<a href={`/tutorials/${entry.notebook}/`}>{entry.label}</a>
-						</h3>
-						<div class="shown-grid">
-							<Code code={entry.source} lang="python" title={entry.title} />
-							<pre class="shown-output">{entry.stdout}</pre>
-						</div>
-					</article>
-				))
-			}
+		<section class="band replay" data-replays data-reveal>
+			<h2 class="band-title">Diffusion</h2>
+			<p class="band-lede">A process defines the noise, times and training target. A solver walks that process at generation time; it can change without retraining.</p>
+			<Code code={snippet('processes')} lang="python" title="framework.py — process and solver" />
+			<p class="framework-note">The Diffusion tab above trains a DiT with flow matching and Euler sampling. Below: a 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
+			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
+				<div class="replay-frame" style={`aspect-ratio: ${entry.width} / ${entry.height}`}>
+					<img src={`/hero/replay/${entry.name}/final.webp`} width={entry.width} height={entry.height} alt={entry.prompt} loading="lazy" decoding="async" />
+					<canvas aria-hidden="true" />
+				</div><figcaption>“{entry.prompt}”</figcaption>
+			</figure>)}</div>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Generation and serving</h2>
+			<p class="band-lede">A <code>TextGeneration</code> task binds the model, weights and decoding policy. The server batches requests over the same task, keeping each request's seed and cache.</p>
+			<Code code={snippet('serving')} lang="python" title="framework.py — batched decoding" />
+			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
+			<p class="framework-note">This tiny decoder was trained on repeated synthetic text. These one-line variants store weights in int8 or fp8; activations and matmuls stay floating point:</p>
+			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py — weight-only int8 and fp8" />
+			<p class="framework-note"><a href="/guides/inference/">Generation and serving</a> covers paging, prefix sharing, constrained decoding and the measured quantization errors.</p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Scale out</h2>
+			<p class="band-lede">Change the mesh, not the training loop. FSDP shards parameter storage, tensor parallelism splits model widths, and an expert axis shards an MoE's experts; the data axis fills the remaining devices.</p>
+			<Code code={snippet('mesh')} lang="python" title="framework.py — the same objective and data" />
+			<figure class="mesh-overview">
+				<div class="mesh-devices">{records.mesh.result.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / 2)} · tensor {index % 2}</span></div>)}</div>
+				<figcaption>Four simulated CPU devices: two FSDP shards × two tensor slices. The diagram is the mesh returned by <code>build_mesh(MeshSpec(fsdp=2, tensor=2))</code>, inspected without training. The same configuration runs a training smoke in CI.</figcaption>
+			</figure>
+			<p class="framework-note"><a href="/concepts/distributed/">Placement and sharding</a> · <a href="/guides/multi-node/">Several hosts</a> · <a href="/guides/tpu/">Cloud TPU</a></p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Post-training and RL</h2>
+			<p class="band-lede">GRPO scores groups of sampled completions and trains on their relative rewards. Here the reward counts alphabetic characters in an eight-byte response; it is a toy rule, not a measure of answer quality.</p>
+			<Code code={snippet('grpo')} lang="python" title="framework.py — rollout and reward" />
+			<figure class="reward-figure">
+				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; alphabetic characters divided by eight response bytes.`}>
+					<line x1="40" y1="40" x2="40" y2="140" /><line x1="40" y1="140" x2="340" y2="140" />
+					<text x="25" y="45" text-anchor="end">1</text><text x="25" y="145" text-anchor="end">0</text>
+					<text x="40" y="165">step 1</text><text x="340" y="165" text-anchor="end">step {reward.at(-1)!.step}</text>
+					<polyline points={rewardPoints} />
+					{reward.map((row) => <circle cx={40 + (row.step - 1) / Math.max(1, reward.at(-1)!.step - 1) * 300} cy={140 - row.reward * 100} r="2.5" />)}
+				</svg>
+				<figcaption>Mean reward per sampled completion, recorded over {records.grpo.result.steps} updates. <a href="/examples/framework/grpo/tracking/scalars.jsonl">Raw reports</a>. <a href="/guides/post-training/">SFT, DPO, PPO and Flow-GRPO</a> use the same trainer.</figcaption>
+			</figure>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Reliability</h2>
+			<p class="band-lede">A checkpoint saves the numerical state and data position. On SIGTERM, <code>fit</code> stops at a synchronized step, writes that checkpoint and exits with status 143; the same command resumes it.</p>
+			<Code code={snippet('reliability')} lang="python" title="framework.py — save and resume" />
+			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}; resumed to step ${records.reliability.result.resumed_step}.\nParameters equal the uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
+			<Code code={snippet('profile')} lang="python" title="framework.py — JAX/XProf capture" />
+			<p class="framework-note">The bit-exact check above uses the small deterministic fixture, not a cross-host recovery measurement. <a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
+		</section>
+
+		<section class="band try" data-reveal>
+			<h2 class="band-title">Try it and released weights</h2>
+			<ul class="try-list">{tries.map((entry) => <li><a class="try-link" href={entry.href}><span class="try-name">{entry.name}</span><span class="try-what">{entry.what}</span></a></li>)}</ul>
+			<div class="shown-grid"><Code code={released.source!.trimEnd()} lang="python" title="Tutorial 8 — the same exported decoder" /><pre class="shown-output">{released.stdout!.trimEnd()}</pre></div>
 		</section>
 
 		<section class="band tutorials" data-reveal>
 			<h2 class="band-title">Tutorials</h2>
-			<ol class="tutorial-list">
-				{
-					cards.map((entry) => (
-						<li>
-							<a class="tutorial-link" href={`/${entry.slug}/`}>
-								<span class="tutorial-number">{entry.number}</span>
-								<span class="tutorial-name">{entry.name}</span>
-								<span class="tutorial-device">{entry.accelerator}</span>
-							</a>
-						</li>
-					))
-				}
-			</ol>
+			<ol class="tutorial-list">{tutorials.map((entry) => <li><a class="tutorial-link" href={`/${entry.slug}/`}><span class="tutorial-number">{entry.number}</span><span class="tutorial-name">{tutorialNames[entry.number]}</span><span class="tutorial-device">{entry.accelerator}</span></a></li>)}</ol>
 		</section>
-
-		<footer class="landing-footer">
-			<span>MIT license. Research software before 1.0.</span>
-			<a href="/guides/multi-node/#what-has-and-has-not-been-run">What has been run</a>
-			<a href="https://github.com/AshishKumar4/dew">GitHub</a>
-		</footer>
+		<details class="band framework-note">
+			<summary>Example recording provenance</summary>
+			<ul>{names.map((name) => {
+				const entry = records[name].capture;
+				return <li><a href={`/examples/framework/${name}/capture.json`}>{name}</a>: {entry.meta.where}, JAX {entry.meta.jax}, Dew{' '}
+					<a href={`https://github.com/AshishKumar4/dew/commit/${entry.meta.dew}`}><code>{entry.meta.dew.slice(0, 7)}</code></a>, {entry.meta.date}, {entry.hero.seconds} s from start to end.</li>;
+			})}</ul>
+		</details>
+		<footer class="landing-footer"><span>MIT license. Research software before 1.0.</span><a href={fullScript}>Runnable page examples</a><a href="https://github.com/AshishKumar4/dew">GitHub</a></footer>
 	</div>
 </StarlightPage>
 
 <script>
 	const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-	// The sampler buttons show one grid at a time; without this script the first one shows.
-	for (const figure of document.querySelectorAll<HTMLElement>('.sampler-figure')) {
-		figure.addEventListener('change', (event) => {
+	for (const tabs of document.querySelectorAll<HTMLElement>('.objective-tabs')) {
+		tabs.addEventListener('change', (event) => {
 			const chosen = (event.target as HTMLInputElement).value;
-			for (const grid of figure.querySelectorAll<HTMLElement>('[data-sampler]')) grid.hidden = grid.dataset.sampler !== chosen;
+			for (const example of tabs.parentElement!.querySelectorAll<HTMLElement>('[data-objective]')) example.hidden = example.dataset.objective !== chosen;
 		});
 	}
-
-	// The replay section's code loads when the section comes near; with reduced motion
-	// its figures keep their finished images.
 	const replays = document.querySelector<HTMLElement>('[data-replays]');
 	if (replays && !still) {
-		const near = new IntersectionObserver(
-			(entries) => {
-				if (!entries.some((entry) => entry.isIntersecting)) return;
-				near.disconnect();
-				import('../hero/replay-section').then(({ startReplays }) => startReplays(replays));
-			},
-			{ rootMargin: '50% 0px' },
-		);
+		const near = new IntersectionObserver((entries) => {
+			if (!entries.some((entry) => entry.isIntersecting)) return;
+			near.disconnect();
+			import('../hero/replay-section').then(({ startReplays }) => startReplays(replays));
+		}, { rootMargin: '50% 0px' });
 		near.observe(replays);
 	}
-
-	// Sections rise into place as they reach the viewport; with reduced motion they are simply there.
 	if (!still) {
-		const sections = document.querySelectorAll<HTMLElement>('[data-reveal]');
-		const observer = new IntersectionObserver(
-			(entries) => {
-				for (const entry of entries) {
-					if (!entry.isIntersecting) continue;
-					entry.target.classList.add('is-in');
-					observer.unobserve(entry.target);
-				}
-			},
-			{ rootMargin: '0px 0px -12% 0px' },
-		);
+		const observer = new IntersectionObserver((entries) => {
+			for (const entry of entries) {
+				if (!entry.isIntersecting) continue;
+				entry.target.classList.add('is-in');
+				observer.unobserve(entry.target);
+			}
+		}, { rootMargin: '0px 0px -12% 0px' });
 		document.documentElement.dataset.reveal = '';
-		for (const section of sections) observer.observe(section);
+		for (const section of document.querySelectorAll<HTMLElement>('[data-reveal]')) observer.observe(section);
 	}
 </script>
