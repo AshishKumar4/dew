@@ -370,7 +370,9 @@ def partitioned(memory: Mapping[str, int]) -> bool:
     a few bytes of their block, and the step after needs a second block as
     large in the open space. On an RTX 4080 a step with 6.5 GiB of
     temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
-    runs. `prepare_process` turns the partitioning off."""
+    runs. With the partitioning off, which `prepare_process` sets, the
+    smallest block that fits serves them instead: 4 of 4 runs placed a batch
+    past the temporaries 20 to 45 times each and finished."""
     partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
     return ('pool_bytes' in memory and memory['pool_bytes'] >= memory['bytes_limit']
             and partitioning.lower() not in ('false', '0'))
