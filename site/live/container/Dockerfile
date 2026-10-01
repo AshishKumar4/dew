@@ -31,10 +31,13 @@ COPY text-models /opt/live/
 RUN python -c "from huggingface_hub import snapshot_download; [snapshot_download(repo_id=repo, revision=rev, local_dir=f'/opt/models/{repo}', allow_patterns=['*.json', '*.safetensors', '*.txt']) for repo, rev in (line.split('@') for line in open('/opt/live/text-models').read().split())]"
 
 # dew-commit holds the full SHA of the Dew commit to install; deploy.mjs writes it.
-# GitHub's archive of that commit needs no git in the image.
+# GitHub's archive of that commit needs no git in the image. It installs under the
+# commit's constraints.txt, the jax every CI run of that commit uses.
 COPY dew-commit /opt/live/
 RUN grep -Eq '^[0-9a-f]{40}$' /opt/live/dew-commit \
-	&& pip install --no-cache-dir "dewml @ https://github.com/AshishKumar4/dew/archive/$(cat /opt/live/dew-commit).tar.gz"
+	&& commit=$(cat /opt/live/dew-commit) \
+	&& pip install --no-cache-dir "dewml @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
+		-c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/constraints.txt"
 
 # The page's setup cell, run once here so the tokenizer and VAE configs are in
 # HF_HOME. The kernel then keeps compiled programs in /opt/xla, which a kernel
