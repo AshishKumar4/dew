@@ -2,3 +2,4 @@
 container/dew-commit
 container/sampler_setup.py
 container/sampler.py
+container/text.py
