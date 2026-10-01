@@ -67,14 +67,14 @@ def greedy(loaded, ids, steps):
     return generated
 
 
-def check_checkpoint(checkpoint, output):
+def check_checkpoint(checkpoint, output, revision=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    config = AutoConfig.from_pretrained(checkpoint)
+    config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     device = 'cuda' if jax.default_backend() == 'gpu' else 'cpu'
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
-                                                    attn_implementation='eager').eval().to(device)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+                                                    attn_implementation='eager', revision=revision).eval().to(device)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
     with torch.no_grad():
         expected = reference(torch.tensor(ids, device=device), use_cache=False).logits.cpu().numpy()
@@ -83,38 +83,43 @@ def check_checkpoint(checkpoint, output):
                                        pad_token_id=0).cpu().numpy()
     del reference
     torch.cuda.empty_cache()
-    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64)
+    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
+                             revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     error = float(np.max(np.abs(expected - actual)))
     # Twice the largest tiny-family error per layer per logit, in fp32 ulps,
     # matches Dew's existing verified-mapping bound (verify._ROUNDING).
     layers = config.num_hidden_layers
-    bound = 2 * 6.46 * np.finfo(np.float32).eps * layers * float(np.max(np.abs(expected)))
+    bound = float(2 * 6.46 * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
     ours = greedy(loaded, ids, 6)
-    result = {'checkpoint': checkpoint, 'revision': config._commit_hash,
+    metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
+    revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
+    result = {'checkpoint': checkpoint, 'revision': revision,
               'dtype': 'float32', 'precision': 'highest',
               'transformers': transformers.__version__, 'jax': jax.__version__,
+              'torch': torch.__version__, 'reference_attention': 'eager', 'tf32': False,
               'device': jax.devices()[0].device_kind, 'max_abs_error': error, 'bound': bound,
               'argmax_agreement': agreement, 'generated': generated.tolist(),
               'generation_agreement': bool(np.array_equal(ours, generated))}
+    assert error <= bound and agreement and result['generation_agreement'], result
     if output:
         Path(output).write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2), flush=True)
-    assert error <= bound and agreement and result['generation_agreement']
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', action='store_true')
     parser.add_argument('--checkpoint')
+    parser.add_argument('--revision')
     parser.add_argument('--output')
     args = parser.parse_args()
     if args.fixture:
         write_fixture()
     if args.checkpoint:
-        check_checkpoint(args.checkpoint, args.output)
+        check_checkpoint(args.checkpoint, args.output, args.revision)
 
 
 if __name__ == '__main__':
