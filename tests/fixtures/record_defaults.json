@@ -1,4 +1,9 @@
 {
+ "dew.checkpoints.Keep": {
+  "every": null,
+  "interval": null,
+  "latest": 2
+ },
  "dew.config.ModelConfig": {
   "architecture": "simple_dit",
   "attention_impl": "auto",
