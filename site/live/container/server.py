@@ -28,7 +28,8 @@ A new kernel runs the landing page's setup cell before the page hears "ready",
 so the model loads once per kernel, while the container waits for its page;
 "setup" says how long that took, and "uptime" how long the server had run. A
 spare, which no page has connected to by then, also runs the page's sampling
-cell once, so the page's first run finds its programs compiled. (A compilation
+and text cells once, so the page's first runs find the text model loaded and
+both programs compiled. (A compilation
 cache baked into the image cannot do this: JAX keys a CPU program by the host's
 CPU model and features, and the build machine is never a Cloudflare host.) A
 sampling cell then reports its steps as display outputs (see progress.py).
@@ -61,9 +62,9 @@ MAX_MESSAGE = 900_000  # characters in one WebSocket message to the page, well u
 KERNEL_USER = pwd.getpwnam("kernel")
 WORKDIR = os.path.join(KERNEL_USER.pw_dir, "work")
 # The landing page's setup cell (deploy.mjs copies it here), then preload.py; and its
-# sampling cell, which a spare runs once.
+# sampling and text cells, which a spare runs once.
 PRELOAD = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler_setup.py", "preload.py"))
-WARMUP = Path("/opt/live/sampler.py").read_text()
+WARMUP = "\n".join(Path("/opt/live", cell).read_text() for cell in ("sampler.py", "text.py"))
 PRELOAD_SECONDS = 300
 SAMPLER_ENV = ("HF_HOME", "HF_HUB_OFFLINE", "JAX_COMPILATION_CACHE_DIR", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS")
 
