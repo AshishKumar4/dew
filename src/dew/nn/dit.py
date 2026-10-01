@@ -482,9 +482,11 @@ class ModulatedBlock(nn.Module):
         scan_fwd = scan_indices(self.scan_order, H_P, W_P)
         if scan_fwd is None:
             return self.spatial_fusion(ssm_output.reshape(B, H_P, W_P, F)).reshape(B, S, F)
-        row_major = ssm_output[:, inverse_permutation(scan_fwd), :]
+        # A permutation reads each row once, so the gradient's scatter needs
+        # no atomic adds.
+        row_major = jnp.take(ssm_output, inverse_permutation(scan_fwd), axis=1, unique_indices=True)
         fused = self.spatial_fusion(row_major.reshape(B, H_P, W_P, F)).reshape(B, S, F)
-        return fused[:, scan_fwd, :]
+        return jnp.take(fused, scan_fwd, axis=1, unique_indices=True)
 
     @nn.compact
     def __call__(self, x, conditioning, freqs_cis, train: bool = False):
