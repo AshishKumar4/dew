@@ -98,8 +98,9 @@ def prepare_process(wandb: Wandb | None = None,
 
     A GPU pool keeps the persistent compilation cache when its jax keys a
     computation that spans processes alike on every one of them, as the jax
-    Dew pins does (`_pool_keys_alike`). With another jax it compiles without
-    the cache: some ranks would load a step that the others compile, and that
+    constraints.txt names does (`_pool_keys_alike`). With another jax, such
+    as the 0.11.2 release, it compiles without the cache and says so on every
+    process: some ranks would load a step that the others compile, and that
     compile waits for every rank for ever.
     """
     if wandb is not None and wandb.offline:
@@ -156,6 +157,9 @@ def prepare_process(wandb: Wandb | None = None,
             if jax.process_count() > 1 and jax.default_backend() == "gpu" and not _pool_keys_alike():
                 # Before the first compile, which fixes whether the cache is used.
                 jax.config.update("jax_enable_compilation_cache", val=False)
+                print("This jax keys a computation that spans processes apart on each of them "
+                      "(jax-ml/jax#40940), so the pool compiles without the persistent compilation "
+                      "cache; docs/installation.md names the jax that keeps it")
             # One collective while the processes are still in lockstep;
             # initialize() returns on every process once the last one has
             # connected. On CPU, collectives rendezvous through the
@@ -180,10 +184,10 @@ def _pool_keys_alike() -> bool:
     fingerprint, which on a GPU describes the device down to its NVLink
     links. In a pool across GPUs linked differently the processes keyed a
     step apart, and on the next run some loaded it while the others compiled
-    it and waited for ever for their shares of its sharded autotuning. Dew
-    pins a jax that hashes every process's fingerprint. A jax installed
-    around the pin, such as an image's own or a `--no-deps` install, may
-    lack it, so the private module is asked at this boundary.
+    it and waited for ever for their shares of its sharded autotuning. The
+    jax constraints.txt names hashes every process's fingerprint; the 0.11.2
+    release, which the published dewml installs, does not, so the private
+    module is asked at this boundary.
     """
     from jax._src import cache_key
 

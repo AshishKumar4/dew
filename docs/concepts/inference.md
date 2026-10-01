@@ -102,6 +102,20 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
+`TextGeneration.quantized(Quantization(...))` returns a task with matched language-model weights stored as int8 or fp8 values with their scales. It uses the same Qwix serving path and `dewml[quantization]` extra as image tasks, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes cache storage. Both can be used by `Server.from_task`.
+
+```python
+from dew.training.quantization import Quantization
+
+task = dew.pipeline("Qwen/Qwen3-0.6B", dtype="bfloat16")
+served = task.quantized(Quantization(dtype="int8", weight_only=True))
+print(served("The capital of France is", max_new_tokens=20, seed=0).text[0])
+```
+
+This example downloads a Hub checkpoint. `dtype="fp8"` selects e4m3 weights; hardware support determines whether quantized operations run natively. The default example used to trace a decoder is one numeric token. For a multimodal model, pass `example=inputs`, a `ModelInputs` prepared by its processor with the media fields its weights need.
+
+Resident JAX weights retain their placement through Qwix. Unplaced NumPy weights from a bundle quantize one kernel at a time on the default device and return to host storage, ready for placement. Temporary device storage is bounded by one kernel; if a single kernel will not fit, load with `mesh=` and `layout=` to place weights before quantization.
+
 `TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`pip install "dewml[quantization]"`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB, and in bf16 with int8 weights and activations its denoiser forward takes 21% less time, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time it saves depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time and not the bf16 one's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, which XLA:GPU computes wrongly or cannot compile, so there the model's depthwise convolutions stay out:
 
 ```python

@@ -12,23 +12,23 @@ authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
-    # flax.nnx on jax 0.11.2 (jax.experimental.hijax's HiPrim; qwix imports
-    # nnx): fixed in flax 01854da1, after 0.12.9, the latest release. Return
-    # to a release floor once one ships.
-    "flax @ https://github.com/google/flax/archive/4f42ed069731c83ef27fccb0cc42647684f80109.tar.gz",
-    # 0.11.2 with the multi-process cache-key fix (AshishKumar4/jax branch
-    # v0.11.2-cache-key-pool-fingerprints, reported as jax-ml/jax#40940): 0.11.2
-    # keys an executable by the compiling process's topology fingerprint, which
-    # differs between GPUs with and without NVLink, so a pool across both kinds
-    # loaded a step on some processes and compiled it on others, whose sharded
-    # autotuning then waited for ever. The fix hashes the fingerprints of every
-    # process a computation spans when they compile for the same accelerators,
-    # and caches nothing when they don't. A direct-URL dependency can't go into
-    # a PyPI wheel, so a published Dew needs a release floor, and a jax
-    # installed around the pin makes GPU pools compile without the cache
-    # (dew.training.runtime._pool_keys_alike). Return to a release floor once
-    # one ships the fix.
-    "jax @ https://github.com/AshishKumar4/jax/archive/19a48d1decce77ee228334d56f7a9f78bf6f478b.tar.gz",
+    # flax.nnx imports on jax 0.11.2 from 0.12.10 on (jax.experimental.hijax's
+    # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
+    # arrives through a bump the suite checks, as jax does below.
+    "flax>=0.12.10,<0.13",
+    # 0.11.2, whose accelerator builds the cuda12, cuda13 and tpu extras name;
+    # <0.11.3 admits the post releases of the build constraints.txt names.
+    # That build carries the multi-process cache-key fix (jax-ml/jax#40940),
+    # which no release has: 0.11.2 keys an executable by the compiling
+    # process's topology fingerprint, which differs between GPUs with and
+    # without NVLink, so a pool across both kinds loaded a step on some
+    # processes and compiled it on others, whose sharded autotuning then
+    # waited for ever. PyPI refuses a requirement that names a URL, so the
+    # published dewml takes the release: Dew detects a jax without the fix and
+    # compiles a GPU pool without the persistent cache
+    # (dew.training.runtime._pool_keys_alike), and CI and development installs
+    # take the build through constraints.txt.
+    "jax>=0.11.2,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -58,15 +58,19 @@ license = "MIT"
 dew = "dew.cli.main:main"
 
 [project.optional-dependencies]
-# The accelerator builds of the pinned jax, installed as `dewml[cuda13]`. pip
-# can't satisfy PyPI's jax[cuda12], jax[cuda13] or jax[tpu] against the pinned
-# jax's archive URL (ResolutionImpossible), so these repeat the pinned jax's own
-# extras of the same names; jaxlib comes from jax itself. They move with the
-# pin: tests/test_packaging.py compares them with the installed jax's extras.
+# The accelerator builds of jax 0.11.2, installed as `dewml[cuda13]`: jax's
+# own extras of the same names, repeated so that one dewml install brings the
+# build; jaxlib comes from jax itself. They move with jax:
+# tests/test_packaging.py compares them with the installed jax's extras.
 cuda12 = ["jax-cuda12-plugin[with-cuda]>=0.11.2,<=0.11.2"]
 cuda13 = ["jax-cuda13-plugin[with-cuda]>=0.11.2,<=0.11.2"]
 tpu = ["libtpu==0.0.48.*", "requests"]
-profile = ["xprof>=2.23.2,<3"]
+# dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
+# and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
+# setuptools>=77.0.3 cannot meet; the cap is the build lock's, read into the
+# wheel's requirements (openxla/xprof 496547f1), and no xprof code imports
+# setuptools. So that release is skipped, and the extra installs beside torch.
+profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # dew.training.quantization: quantized training and serving. Qwix declares
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
 quantization = ["qwix==0.1.8"]

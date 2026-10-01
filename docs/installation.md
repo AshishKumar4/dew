@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew pins JAX and Flax to GitHub builds that carry fixes it needs; `pyproject.toml` names the commits.
+This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release from PyPI. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
 
 The plain install runs JAX on the CPU, which is enough for the [Quickstart](getting-started.md).
 
@@ -39,9 +39,20 @@ Add the extra that matches the hardware:
 | NVIDIA GPU, CUDA 12 driver | `uv pip install "dewml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
 | Google TPU VM | `uv pip install "dewml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
 
-Each extra installs the accelerator build of the JAX version Dew pins (a GitHub build of 0.11.2 with a compilation-cache fix for process pools on different GPUs). Use these extras rather than PyPI's `jax[cuda13]` or `jax[tpu]`: pip cannot resolve those beside the pin, and a later `-U "jax[...]"` replaces the pinned build. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+Each extra installs the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+
+### Process pools across GPUs
+
+JAX 0.11.2 keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links. In a process pool across GPUs that are linked differently, the processes would key the same step apart: on the next run some would load it from the persistent compilation cache while the others compiled it, and that compile waits for every process for ever. The fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)) is in no JAX release yet. With the 0.11.2 release, Dew compiles a GPU pool without the persistent cache and prints on every process that it does; the pool trains correctly, but compiles its steps again on every run. To keep the cache, install the patched build of 0.11.2 that `constraints.txt` names:
+
+```bash
+uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" \
+    -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt
+```
+
+A pool of one process, and a TPU or CPU pool, needs nothing more.
 
 ## Optional extras
 
@@ -80,6 +91,8 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
+The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
+
 tokamax kernels have no extra (`dew.nn.moe` says why).
 
 ## Development install
@@ -90,10 +103,10 @@ cd dew
 uv venv --python 3.14
 source .venv/bin/activate
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision]'
+uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile]' -c constraints.txt
 ```
 
-These are the extras CI installs. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+These are the extras CI installs, on the JAX CI runs on: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Compilation cache
 

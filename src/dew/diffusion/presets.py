@@ -1,14 +1,15 @@
 """Named conventions, as the dataclasses a run's `run.json` stores.
 
-A preset is a frozen dataclass of the numbers that define a convention, and
-calling it builds the `Process`. Both training and inference build from the
-same preset, so a model is always sampled with the convention it was trained
-with. A record that holds the preset's fields rebuilds it exactly.
+A preset is a frozen dataclass of the numbers that define a convention.
+Objectives build its `Process` on construction. Calling it
+also builds a process for direct schedule inspection or low-level sampling.
+A record that holds the preset's fields rebuilds it exactly.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
@@ -19,12 +20,14 @@ from dew.diffusion.schedules import (
     KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
+from dew.diffusion.schedules.flow import Density
 from dew.diffusion.transforms import (
     DirectPredictionTransform,
     FlowMatchPredictionTransform,
     KarrasPredictionTransform,
     MinSNR,
     ScheduleWeighting,
+    VelocityLoss,
     VPredictionTransform,
     Weighting,
 )
@@ -40,6 +43,19 @@ class Preset(Protocol):
     convention's numbers, callable to the `Process` it describes."""
 
     def __call__(self) -> Process | DiscreteProcess: ...
+
+
+def build_process(convention: Process | Preset) -> Process:
+    """Resolve a Gaussian convention for a diffusion objective."""
+    process = convention if isinstance(convention, Process) else convention()
+    if not isinstance(process, Process):
+        kind = type(convention)
+        name = presets.name_of(kind) if kind in presets.values() else kind.__name__
+        raise ValueError(
+            f"preset {name!r} builds a {type(process).__name__}; "
+            "image diffusion needs a Gaussian Process. Masked diffusion trains "
+            "through LMRunConfig's --objective masked_diffusion")
+    return process
 
 
 def _weighting(min_snr_gamma: float | None) -> Weighting:
@@ -152,23 +168,129 @@ class Cosine:
             weighting=_weighting(self.min_snr_gamma))
 
 
+@dataclass(frozen=True)
+class ResolutionShift:
+    """Flux's shift by resolution (the pipelines' `calculate_shift`): mu is
+    linear in a token count, `base_shift` at `base_tokens` and `max_shift`
+    at `max_tokens`, and the shift is exp(mu).
+
+    `at` counts the image's 16 x 16-pixel cells, the grid Flux's constants
+    are stated on (an 8x autoencoder under 2x2 patches). That is a reference
+    grid, not every model's own token count: a model that tokenizes the
+    image otherwise, a 32x autoencoder under 1x1 patches for one, takes
+    `tokens` set to its own count. `DiffusionRunConfig` fills an unset
+    `tokens` from the data's resolution on that grid.
+    """
+
+    base_shift: float = 0.5
+    max_shift: float = 1.15
+    base_tokens: int = 256
+    max_tokens: int = 4096
+    tokens: int | None = None
+
+    def at(self, height: int, width: int) -> ResolutionShift:
+        """This shift at an image of `height` x `width` pixels, counted in
+        16 x 16-pixel cells."""
+        return replace(self, tokens=(height // 16) * (width // 16))
+
+    def shift(self) -> float:
+        if self.tokens is None:
+            raise ValueError("a resolution shift needs the image's token count; set tokens "
+                             "or build through DiffusionRunConfig, which fills it")
+        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
+        return math.exp(self.base_shift + slope * (self.tokens - self.base_tokens))
+
+
 @presets("flow")
 @dataclass(frozen=True)
 class Flow:
-    """Rectified flow on the linear path, velocity prediction, logit-normal
-    times, with SD3's resolution shift."""
+    """Rectified flow on the linear path with velocity prediction.
+
+    `density` is SD3's training time density (`FlowMatchingScheduler`):
+    logit-normal at `logit_mean` and `logit_std`, the heavy-tailed mode
+    density at `mode_scale`, cosmap or uniform. `shift` is SD3's static
+    resolution shift; `resolution_shift` sets it from the image size instead,
+    for training and sampling alike.
+    """
 
     shift: float = 1.0
     logit_mean: float = 0.0
     logit_std: float = 1.0
+    density: Density = "logit_normal"
+    mode_scale: float = 1.29
+    resolution_shift: ResolutionShift | None = None
     min_snr_gamma: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.resolution_shift is not None and self.shift != 1.0:
+            raise ValueError("shift is static and resolution_shift sets it from the image "
+                             "size; name one")
+
+    def __call__(self) -> Process:
+        shift = self.shift if self.resolution_shift is None else self.resolution_shift.shift()
+        return Process(
+            schedule=FlowMatchingScheduler(
+                shift=shift, logit_mean=self.logit_mean, logit_std=self.logit_std,
+                density=self.density, mode_scale=self.mode_scale),
+            prediction=FlowMatchPredictionTransform(),
+            weighting=_weighting(self.min_snr_gamma))
+
+
+@presets("mean_flow")
+@dataclass(frozen=True)
+class MeanFlow:
+    """Rectified flow on the linear path whose model predicts the average
+    velocity over an interval (`Process.interval`), MeanFlow's convention
+    (Geng et al. 2025, "Mean Flows for One-step Generative Modeling"). Its
+    training times are Gsunshine/meanflow's logit-normal at P_mean -0.4 and
+    P_std 1.0, in the same noise-at-one time as Dew's. It trains under
+    `MeanFlowObjective`, and one Euler step over the whole grid samples it.
+    """
+
+    logit_mean: float = -0.4
+    logit_std: float = 1.0
 
     def __call__(self) -> Process:
         return Process(
-            schedule=FlowMatchingScheduler(
-                shift=self.shift, logit_mean=self.logit_mean, logit_std=self.logit_std),
-            prediction=FlowMatchPredictionTransform(),
-            weighting=_weighting(self.min_snr_gamma))
+            schedule=FlowMatchingScheduler(logit_mean=self.logit_mean, logit_std=self.logit_std),
+            prediction=FlowMatchPredictionTransform(), interval=True)
+
+
+@presets("shortcut")
+@dataclass(frozen=True)
+class Shortcut:
+    """Rectified flow on the linear path whose model predicts the velocity
+    of one step of a given size (`Process.interval`), a shortcut model's
+    convention (Frans et al. 2025, "One Step Diffusion via Shortcut
+    Models"). It trains under `ShortcutObjective`, which draws its own
+    times on dyadic grids."""
+
+    def __call__(self) -> Process:
+        return Process(schedule=FlowMatchingScheduler(density="uniform"),
+                       prediction=FlowMatchPredictionTransform(), interval=True)
+
+
+@presets("jit")
+@dataclass(frozen=True)
+class JiT:
+    """JiT (Li & He 2025, "Back to Basics: Let Denoising Generative Models
+    Denoise"): rectified flow on the linear path in which the model
+    predicts the clean sample and is scored in velocity space
+    (`VelocityLoss`). Its training times are LTH14/JiT's logit-normal at
+    P_mean -0.8 and P_std 0.8 in its clean-at-one time, which is Dew's
+    noise-at-one time at `logit_mean` 0.8. The reference's `noise_scale` is
+    1, its value at 256 pixels.
+    """
+
+    logit_mean: float = 0.8
+    logit_std: float = 0.8
+    t_eps: float = 0.05
+
+    def __call__(self) -> Process:
+        return Process(
+            schedule=FlowMatchingScheduler(logit_mean=self.logit_mean, logit_std=self.logit_std),
+            prediction=DirectPredictionTransform(),
+            weighting=VelocityLoss(self.t_eps))
 
 
 @presets("sqrt")

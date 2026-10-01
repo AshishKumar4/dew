@@ -388,6 +388,46 @@ def raw_leaf(leaf):
         leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
+def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
+    """Repeated token IDs share embedding-gradient updates. CUDA's default
+    scatter-add order is not repeatable; conftest enables deterministic ops
+    before the backend opens. Check every state leaf, not just parameters."""
+    from dew.data import Loading, TokenWindows
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    tokens = np.tile(np.arange(8, dtype=np.uint8), 256)
+    tokens.tofile(tmp_path / "train.bin")
+    tokens[:128].tofile(tmp_path / "val.bin")
+    (tmp_path / "meta.json").write_text(json.dumps({
+        "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
+        "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
+    }))
+    data = TokenWindows(path=str(tmp_path), seq_len=16,
+                        loading=Loading(workers=0)).load(batch=8)
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                              num_heads=2, mlp_features=32, max_seq_len=32)
+    objective = LMObjective(model, seq_len=16, ema_decay=None)
+
+    def trainer(checkpoints=None):
+        return Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0),
+                       checkpoints=checkpoints)
+
+    baseline = trainer().fit(data, steps=3)
+    repeated = trainer().fit(data, steps=3)
+    split = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    prefix = split.fit(data, steps=2, checkpoint_every=1)
+    restarted = trainer(Checkpoints(str(tmp_path / "checkpoints")))
+    restored, _, position = restarted.place()
+    assert position is not None
+    resumed = restarted.fit(data, steps=3, checkpoint_every=1)
+    for actual, expected in ((restored, prefix), (repeated, baseline), (resumed, baseline)):
+        assert jax.tree.structure(actual) == jax.tree.structure(expected)
+        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
 def test_the_state_is_built_from_the_initializer_and_the_key_alone():
     """What `place` compiles takes the objective's held variables and the run
     key as arguments, so a loaded checkpoint reaches the device as data.
@@ -959,15 +999,41 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     narrow for the sparklines still shows each metric's name and value,
     through the evaluations, to the last frame."""
     screen = io.StringIO()
+    evaluation_budgets = []
+    render_metrics = display.TrainingDisplay.metrics
+
+    def metrics(panel, rows, inner, lines, *, evaluation=False):
+        if evaluation:
+            evaluation_budgets.append(lines)
+        return render_metrics(panel, rows, inner, lines, evaluation=evaluation)
+
+    monkeypatch.setattr(display.TrainingDisplay, "metrics", metrics)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
     make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
                                            metrics=(Spread([]),))
 
-    last = screen.getvalue().rpartition("dew · ")[2]
+    output = screen.getvalue()
+    assert "eval val at step" not in output
+    assert evaluation_budgets and max(evaluation_budgets) < 40
+    last = output.rpartition("dew · ")[2]
     for name in ("loss", "step_time_ms", "spread"):
         assert re.search(rf" {name} +\S", last), last
+    assert "val" in last and "step 6" in last, last
+    summary = output.rpartition("✓ ")[2]
+    assert "val at 6" in summary and "spread" in summary, summary
+    if width == 120:
+        assert re.search(r"spread +\S+ +[▁▂▃▄▅▆▇█]{2}", last), last
+        assert re.search(r"[▁▂▃▄▅▆▇█]{2}", summary), summary
+
+
+def test_off_a_terminal_evaluation_keeps_its_plain_line(capsys):
+    trainer = make_trainer(objective=Features())
+    trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
+    output = capsys.readouterr().out
+    assert re.search(r"eval val at step 3: spread \S+ \(24 records in \S+ s\)", output), output
+    assert re.search(r"eval val at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
 
 
 def test_a_failing_metric_fails_the_validation_pass():
@@ -1459,10 +1525,12 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
         "seq_len": 1024}
     flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
                      if not flag.startswith("--xla_gpu_deterministic_ops"))
+    # BFC fragmentation failed the 4096-token reference child's 6.5 GiB temporary in 5 of 16 lone
+    # runs (its compiled peak is 9.3 GiB of the 13.6 GiB pool); cuda_async: 0 of 24, p50 94.3 -> 94.0 ms.
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
                    "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
-                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true", "XLA_PYTHON_CLIENT_ALLOCATOR": "cuda_async"}
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
         objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}

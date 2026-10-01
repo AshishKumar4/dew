@@ -105,7 +105,7 @@ def train():
     )
     objective = DiffusionObjective(
         model,
-        EDM(regime="pixel")(),
+        EDM(regime="pixel"),
         InputSpec(Field("image", (64, 64, 3))),
     )
     trainer = Trainer(
@@ -152,10 +152,9 @@ trainer = Trainer(
 Set `ema_decay` when you construct the objective. A value closer to 1 averages weights over more updates:
 
 ```python
-process = EDM(regime="pixel")()
 objective = DiffusionObjective(
     model,
-    process,
+    EDM(regime="pixel"),
     InputSpec(Field("image", (64, 64, 3))),
     ema_decay=0.999,
 )
@@ -167,6 +166,7 @@ After training, sample from the averaged weights with `state.averaged`. Use `sta
 from dew import sample
 from dew.sampling import Heun
 
+process = objective.process
 denoise = process.denoiser(model, state.averaged, conditions={})
 images = sample(
     denoise,
@@ -1414,7 +1414,7 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-Add the extra for your hardware; its accelerator build of JAX matches the JAX Dew pins:
+Add the extra for your hardware; its accelerator build of JAX matches the JAX Dew requires:
 
 | Hardware | Install |
 |---|---|
@@ -1422,7 +1422,7 @@ Add the extra for your hardware; its accelerator build of JAX matches the JAX De
 | NVIDIA GPU | `uv pip install -e ".[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
 | Google TPU | `uv pip install -e ".[tpu]"` |
 
-Installing from the repository without a checkout works the same way: `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Take the accelerator build from these extras, not from `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]`. Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)). pip can't resolve PyPI's jax extras beside that pin in one install, and a later `-U "jax[...]"` would replace the pin with any newer PyPI jax. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
+Installing from the repository without a checkout works the same way: `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires; a later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](docs/installation.md#process-pools-across-gpus) says how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
 The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
