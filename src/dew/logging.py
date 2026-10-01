@@ -18,7 +18,6 @@ from datetime import datetime
 from rich.console import Console
 from rich.file_proxy import FileProxy
 from rich.text import Text
-from rich.traceback import Traceback
 
 _lock = threading.RLock()
 
@@ -40,6 +39,8 @@ class _TerminalDiagnostics(logging.Handler):
         line.append(" " + self.format(message))
         self.console.print(line, soft_wrap=True)
         if record.exc_info and record.exc_info[0] is not None:
+            from rich.traceback import Traceback
+
             exception_type, exception, backtrace = record.exc_info
             self.console.print(Traceback.from_exception(exception_type, exception, backtrace))
 
