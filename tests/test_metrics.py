@@ -97,6 +97,33 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit():
     assert trainer._display.evaluations["val"][-1].scores["val/accuracy"] == expected
 
 
+def test_mean_image_error_matches_each_real_row_after_a_fit():
+    from dew import Mean, Trainer
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    import optax
+
+    class Pixels(Objective):
+        def init(self, key, variables=None):
+            return {"params": {"value": jnp.asarray(0., jnp.float32)}}
+
+        def loss(self, params, batch, step):
+            return jnp.mean((params["params"]["value"] - batch["images"]) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            return ImageGrid(jnp.broadcast_to(params["params"]["value"], batch["images"].shape))
+
+    images = np.full((8, 2, 2, 1), .5, np.float32)
+    data = Dataset(train=lambda partition: iter([{"images": images}] * 4),
+                   val=lambda partition: iter([{"images": images}]), records=32, batch=8)
+    metric = Mean(lambda grid, batch: np.square(grid.images - batch["images"]).mean(axis=(1, 2, 3)),
+                  reads=ImageGrid, name="pixel_error", better="lower")
+    trainer = Trainer(Pixels(), optax.sgd(.1), key=jax.random.key(0))
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric])
+    expected = float((final.params["params"]["value"] - .5) ** 2)
+    assert trainer._display.evaluations["val"][-1].scores["val/pixel_error"] == pytest.approx(expected)
+
+
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
     features = np.asarray(jax.random.normal(rng, (256, 16)))
     mu, sigma = features.mean(axis=0), np.cov(features, rowvar=False)
