@@ -1260,7 +1260,8 @@ class _Denoiser:
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
-                           attention_impl: str, param_dtype: str = "float32") -> Pretrained:
+                           attention_impl: str, param_dtype: str = "float32",
+                           variables: Variables | None = None) -> Pretrained:
     """Read a published latent diffusion directory into native modules and variables.
 
     Two denoiser families ship this layout: a UNet reading one or two CLIP
@@ -1269,41 +1270,82 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     the family, and everything the families share - the autoencoder, the text
     towers, the geometry, the conditioning, the safety head a file declares,
     the schedule and the call policy - is read once here.
+
+    Supplied `variables` are a saved tree in this layout, bound as they are:
+    every module is built from the directory's metadata and no weight file is
+    read, so the directory needs only its configs and tokenizers.
     """
     compute = resolve_dtype(dtype)
     denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype)
+    if variables is None:
+        denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype)
+    else:
+        denoiser_variables = {name: value for name, value in variables.items()
+                              if name not in ("encoders", "autoencoder")}
+        denoiser_layouts = ()
+    held = {} if variables is None else variables["encoders"]
     policy = _call_policy(index, denoiser)
-    autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute, param_dtype=param_dtype)
+    autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(
+        directory, compute, param_dtype=param_dtype,
+        params=None if variables is None else variables["autoencoder"])
     encoder, text_layouts, components = denoiser.text.build(
         directory, index, denoiser, policy, compute,
         denoiser.sample_size * autoencoder.downscale_factor, param_dtype=param_dtype,
-        attention_impl=attention_impl)
+        attention_impl=attention_impl, params=held.get("conditioning"))
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = encoder.height, encoder.width
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(Field("image", (height, width, records.integer(vae_config["in_channels"], "in_channels"))),
-                       {"conditioning": Condition(encoder, unconditional=denoiser.text.unconditional(index))},
+                       {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
                        mask=Field("mask", (height, width, 1)) if inpaint else None)
-    encoders: dict[str, object] = {"conditioning": encoder.params}
+    encoders: dict[str, object] = {encoder.keyword: encoder.params}
     finish, safety_layouts = None, ()
     if _present(index, "safety_checker"):
         finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
-            directory, compute, param_dtype=param_dtype)
+            directory, compute, param_dtype=param_dtype, params=held.get("safety"))
         components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
     components["scheduler"] = dict(schedule.config)
     patch = denoiser.patch * autoencoder.downscale_factor
+    tokens = (height // patch) * (width // patch)
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
-                      functools.partial(schedule.sampling, origin=denoiser.origin,
-                                        tokens=(height // patch) * (width // patch)))
+                      functools.partial(schedule.sampling, origin=denoiser.origin, tokens=tokens))
     variables = {**denoiser_variables, "encoders": encoders, "autoencoder": vae_params}
     config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
     return Pretrained(denoiser.model, variables, None, config, directory, denoiser.built,
                       weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
-                      process=schedule.training_process(), inputs=inputs, autoencoder=autoencoder,
+                      process=schedule.training_process(tokens), inputs=inputs, autoencoder=autoencoder,
                       schedule=schedule, finish=finish, task=task)
+
+
+def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
+                          revision: str | None = None, attention_impl: str = "auto",
+                          size: tuple[int, int] | None = None,
+                          variables: Variables | None = None) -> Pretrained:
+    """A published diffusion pipeline, to train from its own weights.
+
+    `size` is the (height, width) in pixels the pipeline runs at instead of
+    its own: the geometry its conditioning, its training shift and its
+    sampling grid are bound to. Supplied `variables` are a saved tree of the
+    same pipeline, as a run that fine-tuned it wrote them: the modules are
+    built from the directory's metadata and bind those variables, and no
+    weight downloads.
+    """
+    directory = sources.snapshot(checkpoint, revision, weights=False)
+    if not (directory / "model_index.json").is_file():
+        raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json")
+    with open(directory / "model_index.json") as handle:
+        index = json.load(handle)
+    if variables is None:
+        # Both fetches at the commit the metadata resolved to.
+        directory = sources.snapshot(checkpoint, directory.name, weights=tuple(
+            name for name in index if _present(index, name)))
+    if size is not None:
+        index = {**index, "dew_height": size[0], "dew_width": size[1]}
+    loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
+                                    param_dtype=param_dtype, variables=variables)
+    return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
 
 
 def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
@@ -1481,9 +1523,11 @@ def _present(index: Mapping[str, object], name: str) -> bool:
     return isinstance(entry, list) and entry[0] is not None
 
 
-def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
+def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
+                   params: Variables | None = None
                    ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]:
-    """Build the published autoencoder, its parameters and their source layouts."""
+    """Build the published autoencoder, its parameters and their source layouts;
+    supplied `params` are bound without a weight read."""
     from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
     from dew.nn.autoencoders.vae import _vae_path
@@ -1491,16 +1535,18 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
     config = _component_config(directory, "vae")
     if config.get("_class_name") == "AutoencoderKLQwenImage21":
         from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
-        return load_qwen_image_vae(directory, compute, param_dtype=param_dtype)
+        return load_qwen_image_vae(directory, compute, param_dtype=param_dtype, params=params)
     model = AutoencoderKL(
         channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
         image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
         norm_groups=config["norm_num_groups"], quantize=diffusion.flag(config, "use_quant_conv", default=True),
         post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True), dtype=compute)
-    tensors = diffusion.component_tensors(directory, "vae")
-    params, layouts = diffusion.record_layouts(
-        "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
-        param_dtype=param_dtype)
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, "vae")
+        params, layouts = diffusion.record_layouts(
+            "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
+            param_dtype=param_dtype)
     autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=params, model=model,
                                      latent_shift=config.get("shift_factor") or 0.0,
                                      latent_scale=config.get("scaling_factor", 0.18215))
@@ -1662,9 +1708,11 @@ def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat1
     return encoder
 
 
-def _image_safety(directory: Path, compute, *, param_dtype: str = "float32"):
+def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
+                  params: Variables | None = None):
     """Build the safety head a file declares: the finish, its parameters, their
-    layouts and the two configs it ships."""
+    layouts and the two configs it ships; supplied `params` are bound without
+    a weight read."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
     from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
@@ -1672,18 +1720,20 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32"):
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
         transform = json.load(handle)
-    tensors = diffusion.component_tensors(directory, "safety_checker")
-    # The root scoring vectors and thresholds are state, not tower/projection
-    # weights. Preserve their FP32 contract without post-casting a whole tree.
-    state = {name: value for name, value in tensors.items()
-             if (path := _safety_path(name)) is not None and len(path) == 1}
-    weights = {name: value for name, value in tensors.items() if name not in state}
-    params, layouts = diffusion.record_layouts(
-        "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype)
-    scoring, state_layouts = diffusion.record_layouts(
-        "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32")
-    params.update(scoring)
-    layouts += state_layouts
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, "safety_checker")
+        # The root scoring vectors and thresholds are state, not tower/projection
+        # weights. Preserve their FP32 contract without post-casting a whole tree.
+        state = {name: value for name, value in tensors.items()
+                 if (path := _safety_path(name)) is not None and len(path) == 1}
+        weights = {name: value for name, value in tensors.items() if name not in state}
+        params, layouts = diffusion.record_layouts(
+            "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype)
+        scoring, state_layouts = diffusion.record_layouts(
+            "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32")
+        params.update(scoring)
+        layouts += state_layouts
     head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
     return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,

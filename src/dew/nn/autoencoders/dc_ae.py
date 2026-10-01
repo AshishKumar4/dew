@@ -24,7 +24,7 @@ the step count `num_batches_tracked` affects nothing in eval and is not read.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
+from dew import records
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
@@ -268,13 +269,14 @@ class _Encoder(nn.Module):
         if layers[0] > 0:
             x = _conv(channels[0], 3, self.dtype, "conv_in")(image)
         else:
-            x = _Down(self.image_channels, channels[1], self.unshuffle, False, self.dtype, name="conv_in")(image)
+            x = _Down(self.image_channels, channels[1], self.unshuffle, shortcut=False, dtype=self.dtype,
+                      name="conv_in")(image)
         for level, (features, count) in enumerate(zip(channels, layers, strict=True)):
             for index in range(count):
                 x = _block(self.blocks[level], features, self.head_dim, self.scales[level], "rms_norm", "silu",
                            self.dtype, f"down_blocks_{level}_{index}")(x)
             if level < len(channels) - 1 and count > 0:
-                x = _Down(features, channels[level + 1], self.unshuffle, True, self.dtype,
+                x = _Down(features, channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
         return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(x, self.latent_channels)
 
@@ -301,7 +303,7 @@ class _Decoder(nn.Module):
             count = layers[level]
             upsampled = level < len(channels) - 1 and count > 0
             if upsampled:
-                x = _Up(channels[level + 1], channels[level], self.interpolate, True, self.dtype,
+                x = _Up(channels[level + 1], channels[level], self.interpolate, shortcut=True, dtype=self.dtype,
                         name=f"up_blocks_{level}_0")(x)
             for index in range(count):
                 x = _block(self.blocks[level], channels[level], self.head_dim, self.scales[level],
@@ -311,7 +313,8 @@ class _Decoder(nn.Module):
         x = nn.relu(_RMSNorm(features, self.dtype, name="norm_out")(x))
         if layers[0] > 0:
             return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
-        return _Up(features, self.image_channels, self.interpolate, False, self.dtype, name="conv_out")(x)
+        return _Up(features, self.image_channels, self.interpolate, shortcut=False, dtype=self.dtype,
+                   name="conv_out")(x)
 
 
 class DCAEFields(TypedDict):
@@ -378,7 +381,12 @@ class DCAE(nn.Module):
 def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
     """A config entry the source takes as one value or one per level."""
     value = config[name]
-    values = (value,) * levels if isinstance(value, str) else tuple(value)
+    if isinstance(value, str):
+        values = (value,) * levels
+    elif isinstance(value, (list, tuple)):
+        values = tuple(value)
+    else:
+        raise ValueError(f"{name}={value!r}: this field is one name or one entry per level")
     if len(values) != levels:
         raise ValueError(f"{name} has {len(values)} entries for {levels} levels")
     return values
@@ -387,16 +395,18 @@ def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
 def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
     """Read an `AutoencoderDC` config into the fields `DCAE` takes, refusing
     what the port does not compute."""
-    levels = len(config["encoder_block_out_channels"])
-    if len(config["decoder_block_out_channels"]) != levels:
+    encoder_channels = records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
+    decoder_channels = records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
+    levels = len(encoder_channels)
+    if len(decoder_channels) != levels:
         raise ValueError("the encoder and decoder have different numbers of levels")
     fields = DCAEFields(
-        image_channels=config["in_channels"], latent_channels=config["latent_channels"],
-        head_dim=config["attention_head_dim"],
+        image_channels=records.integer(config["in_channels"], "in_channels"),
+        latent_channels=records.integer(config["latent_channels"], "latent_channels"),
+        head_dim=records.integer(config["attention_head_dim"], "attention_head_dim"),
         encoder_blocks=_per_level(config, "encoder_block_types", levels),
         decoder_blocks=_per_level(config, "decoder_block_types", levels),
-        encoder_channels=tuple(config["encoder_block_out_channels"]),
-        decoder_channels=tuple(config["decoder_block_out_channels"]),
+        encoder_channels=encoder_channels, decoder_channels=decoder_channels,
         encoder_layers=_per_level(config, "encoder_layers_per_block", levels),
         decoder_layers=_per_level(config, "decoder_layers_per_block", levels),
         encoder_scales=tuple(map(tuple, _per_level(config, "encoder_qkv_multiscales", levels))),
@@ -468,28 +478,28 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-               param_dtype: str = "float32", params: Variables | None = None
+               subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None
                ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
-    """Build a published DC-AE, its parameters and their source layouts from a
-    directory holding its config.json and weights, or a Hub repo such as
-    `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`. Every tensor the module
-    declares must be published, in the shape it declares.
+    """Build a published DC-AE, its parameters and their source layouts from
+    `subfolder` of a directory or Hub repo holding its config.json and
+    weights, such as `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers` (the root)
+    or a SANA pipeline (`vae`); only that component downloads. Every tensor
+    the module declares must be published, in the shape it declares.
 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned."""
     import json
 
     from dew.interop import diffusion, sources
-    from dew.interop.safetensors_io import read_weights
 
-    directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)
-    config = json.loads((directory / "config.json").read_text())
+    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,) if params is None else False)
+    config = json.loads((directory / subfolder / "config.json").read_text())
     if config.get("_class_name") != "AutoencoderDC":
-        raise ValueError(f"{directory} holds a {config.get('_class_name')}, not an AutoencoderDC")
+        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderDC")
     model = DCAE(**dc_ae_fields(config), dtype=compute)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        tensors = read_weights(directory)
+        tensors = diffusion.component_tensors(directory, subfolder)
         params, layouts = diffusion.record_layouts(
             "vae", tensors, lambda name: dc_ae_path(name, np.ndim(tensors[name])), ("autoencoder",),
             param_dtype=param_dtype)

@@ -44,9 +44,9 @@ def require_profile_support() -> _Converter:
     try:
         converter = importlib.import_module("xprof.convert.raw_to_tool_data")
     except ImportError as error:
-        raise ImportError("Profiling requires XProf; install 'dew-ml[profile]'.") from error
+        raise ImportError("Profiling requires XProf; install 'dewml[profile]'.") from error
     if not isinstance(converter, _Converter):
-        raise ImportError("Installed XProf lacks native converters; install 'dew-ml[profile]'.")
+        raise ImportError("Installed XProf lacks native converters; install 'dewml[profile]'.")
     return converter
 
 

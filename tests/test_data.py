@@ -80,7 +80,7 @@ def test_reading_a_hub_dataset_names_the_streaming_extra(monkeypatch):
     """Naming one works anywhere; the first record is what needs HF datasets."""
     source = HFDatasetSource(name="acme/pets")
     monkeypatch.setitem(sys.modules, "datasets", None)
-    with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
+    with pytest.raises(ImportError, match=r"dewml\[streaming\]"):
         len(source)
 
 
