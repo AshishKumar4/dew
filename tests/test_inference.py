@@ -328,7 +328,7 @@ def test_a_discrete_preset_is_refused_by_the_gaussian_objective():
     from dew.diffusion.discrete import MDLM
 
     config = dataclasses.replace(DiffusionRunConfig(text=None), preset=MDLM(mask_id=0))
-    with pytest.raises(ValueError, match="mdlm.*MaskedDiffusionObjective"):
+    with pytest.raises(ValueError, match="mdlm.*--objective masked_diffusion"):
         config.build()
 
 

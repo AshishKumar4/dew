@@ -1,0 +1,34 @@
+---
+// The live sampler: the text-to-image model on a kernel in a Cloudflare
+// container (site/live). The landing page links here when src/live.mjs names
+// an endpoint. site/live/deploy.mjs copies the two cells from src/data/.
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import LiveSampler from '../components/landing/LiveSampler.astro';
+import samplerCell from '../data/sampler.py?raw';
+import samplerSetup from '../data/sampler_setup.py?raw';
+import '../styles/landing.css';
+---
+
+<StarlightPage
+	frontmatter={{
+		title: 'Sample the text-to-image model',
+		description: 'Sample dewml/hybrid-dit-176m, a 176M-parameter text-to-image model trained with Dew, on a live kernel.',
+		tableOfContents: false,
+		editUrl: false,
+		lastUpdated: false,
+		pagefind: false,
+	}}
+	hasSidebar={false}
+>
+	<p>
+		<a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a> is a 176M-parameter text-to-image
+		model at 256×256, trained with Dew. Edit the prompt, the seed, the steps or the sampler and press Run.
+	</p>
+	<div class="landing not-content">
+		<LiveSampler
+			setup={samplerSetup}
+			cell={samplerCell}
+			colab="https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb"
+		/>
+	</div>
+</StarlightPage>

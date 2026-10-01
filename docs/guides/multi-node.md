@@ -1,10 +1,10 @@
-# Training on several nodes
+# Multi-node training
 
-This page shows how to start one training script on several machines, how to lay the mesh out so the slow network between them carries as little as possible, and how to rehearse all of it on one machine first. Read [distributed training](../concepts/distributed.md) before this page. It explains meshes and layouts.
+A multi-node run starts the same training script on every machine, one process per GPU (or per TPU worker), and joins the processes into one `jax.distributed` pool that `Trainer` then treats as one set of devices. `dew launch` starts the pool on one machine, over ssh on plain hosts, under Slurm or Open MPI, or on Cloud TPU VMs. `MeshSpec(replicas=N)` lays the mesh out so the slow network between nodes carries one gradient all-reduce per step. [Distributed training](../concepts/distributed.md) explains meshes and layouts.
 
-## How a process pool starts
+## Process pools
 
-Every node runs the same script. Each copy is one process of a `jax.distributed` pool. The script joins the pool when it calls `dew.training.runtime.prepare_process()`, which every built-in recipe does on its first line. Call it yourself before you create any array if you write your own script.
+Every node runs the same script, and each copy is one process of a `jax.distributed` pool. The script joins the pool when it calls `dew.training.runtime.prepare_process()`, which every built-in recipe does on its first line; a script of your own calls it before creating any array.
 
 `prepare_process` calls `jax.distributed.initialize`, which needs three facts: the address of process 0's coordinator, the number of processes and this process's rank. `dew launch` starts the processes wherever you run it, and each cluster supplies the facts in its own way:
 
@@ -21,39 +21,35 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 
 Without `--hosts`, `--hostfile` or `--tpu`, `dew launch` asks JAX's own cluster detection (`jax._src.clusters`) where it runs, so it recognizes the same Slurm, Open MPI, Cloud TPU, GKE and Kubernetes environments that `jax.distributed.initialize` does. A flag that names hosts or TPUs wins over what it detects. Add `--dry-run` to see what it would run.
 
-## Start a pool
+## dew launch
 
-On one machine, run the program after `--`:
+On one machine, `dew launch` runs the program after `--` once per GPU:
 
 ```bash
 dew launch -- python recipes/lm/train.py --trainer.multi-host True
 ```
 
-On a four-GPU machine this starts four processes, each holding one GPU through `JAX_LOCAL_DEVICE_IDS`, and prints the pool and one line per rank:
-
-```text
-pool: 4 processes on localhost, 1 GPU each, coordinator localhost:43125
-[0] rank 0 of 4 on localhost, GPU 0, pid 81234
-[1] rank 1 of 4 on localhost, GPU 1, pid 81235
-...
-[1] Joined the JAX process pool: process 1 of 4
-```
+On a four-GPU machine this starts four processes, each holding one GPU through `JAX_LOCAL_DEVICE_IDS`. The launcher prints one `pool:` line with the process count, the devices per process and the coordinator address, then one `[r] rank r of 4 on localhost, GPU r, pid ...` line per rank, and each process prints `Joined the JAX process pool: process r of 4` when it joins.
 
 Every output line carries its rank. `--processes-per-host N` runs N processes a host and splits the GPUs evenly between them, so `--processes-per-host 1` runs one process that holds every GPU. `--devices-per-process N` gives each process N GPUs. A pool that would need more GPUs than the first host shows is refused before any rank starts, and the message names both counts. If the launcher cannot count a host's GPUs, because nvidia-smi is missing there or fails, it says so on stderr and starts the pool without the check. `JAX_PLATFORMS=cpu`, in the environment or through `--env`, stops the launcher from counting GPUs. The launcher counts NVIDIA GPUs, those in `CUDA_VISIBLE_DEVICES` when it is set; on other GPUs, set `--processes-per-host`.
 
-`--env NAME=VALUE` passes a variable to every process. The name must be a shell variable name, for example `--env XLA_FLAGS=--xla_gpu_enable_latency_hiding_scheduler=true`. `--cwd DIR` names the directory each process starts in.
+`--env NAME=VALUE` passes a variable to every process. The name must be a shell variable name, for example `--env XLA_FLAGS=--xla_gpu_enable_latency_hiding_scheduler=true`. `--cwd DIR` names the directory each process starts in. `--dry-run` prints the commands without running them; on a CPU-only machine:
 
-When one process exits with an error, the launcher stops the others and exits with that code. Without this, the survivors would wait in a collective for a peer that is gone. It names the failed rank and prints its last 20 lines again after the others have stopped, so the cause is at the bottom of the output:
-
-```text
-rank 2 on localhost exited 1; stopping the other 3
-last lines of rank 2:
-[2] OSError: shard 7 is gone
+```bash
+JAX_PLATFORMS=cpu dew launch --processes-per-host 2 --dry-run -- python train.py
 ```
 
-A rank killed by a signal reads as `was killed by SIGKILL`, and the launch exits 128 plus the signal, as a shell reports it. Ctrl-C, a scheduler's SIGTERM and a closed terminal stop the whole pool the same way. The launcher sends each rank SIGTERM. A JAX process of a pool takes SIGTERM as a preemption notice: `Trainer.fit` checkpoints at the step every rank agrees on and exits with 143 (see [preemption](checkpoints.md#a-preempted-run-resumes-where-it-stopped)), and any other program keeps running. When the launcher was itself signalled it gives the ranks 300 seconds for that before SIGKILL, and a second signal kills them at once; when a rank failed, the others wait in a collective for it, so they get 10 seconds. Rank 0 is killed last: its process holds the pool's coordination service, and a rank that outlived it would abort with an XLA `Check failure` that reads as a crash of its own.
+```text
+pool: 2 processes on localhost, each with every local device, coordinator localhost:51403
+JAX_COORDINATOR_ADDRESS=localhost:51403 DEW_PROCESS_COUNT=2 DEW_PROCESS_ID=0 python train.py
+JAX_COORDINATOR_ADDRESS=localhost:51403 DEW_PROCESS_COUNT=2 DEW_PROCESS_ID=1 python train.py
+```
 
-## Launch on plain machines
+When one process exits with an error, the launcher stops the others and exits with that code; without this, the survivors would wait in a collective for a peer that is gone. It names the failed rank (`rank 2 on localhost exited 1; stopping the other 3`) and, after the others have stopped, prints `last lines of rank 2:` followed by that rank's last 20 lines, so the cause is at the bottom of the output.
+
+A rank killed by a signal reads as `was killed by SIGKILL`, and the launch exits 128 plus the signal, as a shell reports it. Ctrl-C, a scheduler's SIGTERM and a closed terminal stop the whole pool the same way. The launcher sends each rank SIGTERM. A JAX process of a pool takes SIGTERM as a preemption notice: `Trainer.fit` checkpoints at the step every rank agrees on and exits with 143 ([Checkpoints](checkpoints.md#preemption)), and any other program keeps running. When the launcher was itself signalled it gives the ranks 300 seconds for that before SIGKILL, and a second signal kills them at once; when a rank failed, the others wait in a collective for it, so they get 10 seconds. Rank 0 is killed last: its process holds the pool's coordination service, and a rank that outlived it would abort with an XLA `Check failure` that reads as a crash of its own.
+
+## Plain machines
 
 List the hosts, process 0's first, then the command after `--`:
 
@@ -65,7 +61,7 @@ dew launch --hosts node0,node1 -- /opt/dew/.venv/bin/python recipes/lm/train.py 
 
 The launcher starts the command on each host over `ssh -o BatchMode=yes`, so passwordless keys must already work. The remote side runs in the user's shell without a login profile, so a virtualenv activated there is not active: give the interpreter as an absolute path, as above. It runs a host named `localhost` directly. Each process starts in the current directory, which must exist at the same path on every host, or in the directory `--cwd` names. The coordinator listens on a port that is free on the first host when the launch starts, so pools started together on one machine never share one. Name a port with `--port` when a firewall wants a fixed one, and set `--coordinator` when the other hosts reach that host by another name.
 
-## Launch under Slurm
+## Slurm
 
 Run `dew launch` inside the allocation. It starts `srun`, and JAX reads the rank from Slurm:
 
@@ -75,7 +71,7 @@ sbatch --nodes=2 --gpus-per-node=8 --wrap "dew launch -- /opt/dew/.venv/bin/pyth
 
 This runs `srun --kill-on-bad-exit=1 --export=ALL --label --ntasks-per-node=8 ...`, with the `--env` variables in srun's environment. Each line carries its task number, and when a task fails srun names it and stops the others. JAX gives each Slurm task the one GPU at its `SLURM_LOCALID`, so a node runs one task per GPU: `--processes-per-host` when you give it, else the allocation's own `--ntasks-per-node`, else its `--gpus-per-node`, else the GPUs the node running `dew launch` sees. On a cluster whose login node has no GPUs, ask for `--gpus-per-node` rather than `--gpus`, or pass `--processes-per-host`. Every task needs a CPU of its own in the allocation, which `--ntasks-per-node` or `--cpus-per-gpu` in the sbatch request provides; with neither, srun refuses to start more tasks than the allocation has CPUs. One task per node would see a single GPU, so the launcher refuses `--devices-per-process` under Slurm. Fewer tasks a node than GPUs a node would leave the rest idle with nothing reporting it, so the launcher refuses such an allocation, or such a `--processes-per-host`, and names `--ntasks-per-node`. Inside a step of several tasks that `srun` already started, `dew launch` runs the program in place, and `prepare_process` refuses the same way a step with fewer tasks on a node than the GPUs its task sees. Inside a step of one task, such as a GPU wrapper script that runs its command under `srun`, it starts one process per GPU of the step, as on a plain machine, and each process takes its placement from the launcher, not from Slurm's variables. A program that such a step runs without `dew launch` runs as one process, unless it asks for a pool with `multi_host=True`.
 
-## Launch under Open MPI
+## Open MPI
 
 `mpirun` starts every rank itself, and JAX reads the `OMPI_*` variables. `dew launch` inside a rank runs the program in place, so both of these work:
 
@@ -86,7 +82,7 @@ mpirun -np 8 --hostfile hosts dew launch -- python train.py
 
 Each rank takes the GPU at its local rank, as under Slurm.
 
-## Launch on Cloud TPU VMs
+## Cloud TPU VMs
 
 `--tpu NAME` runs the program on every worker of a TPU VM or pod slice, from any machine where gcloud reaches the TPU:
 
@@ -106,29 +102,38 @@ Each worker then gets `MEGASCALE_NUM_SLICES`, its `MEGASCALE_SLICE_ID`, and the 
 
 On a TPU VM worker, `dew launch -- python train.py` runs the program on that worker only, because every worker has to run it and the workers cannot reach each other over ssh by default. On worker 0 of a pod it says so. Run `dew launch --tpu NAME` from your machine, or from a worker whose gcloud can reach the TPU, to start them all.
 
-## When a rank fails
+## Failures and stalls
 
 A process of a pool that fails does not wait for its peers. It prints the error, writes it to the coordination service and exits at once, instead of sitting in `jax.distributed`'s shutdown barrier for up to 300 seconds. This holds from the moment the process joins the pool, so a process whose GPU fails to open, for example because it has no memory left, ends the launch too; otherwise its peers would wait minutes for its devices. When a rank fails between steps, for example because its data loader raised, its peers may already be inside the next step's collectives, which no GPU backend times out. The failing rank's error is written before it tries to agree with them, and a watch thread in every process ends the process when a published failure has not been heard at an agreement within 60 seconds. So the whole pool ends within about a minute, under `dew launch`, `srun` or a scheduler alike.
 
-A rank can also stall without failing: blocked on a read, or in a compile that waits for its peers. Then every process stays alive and none reports anything, while the others wait inside a collective or a communicator's setup. For this case a pool bounds each device execution with XLA's execution watchdog. `prepare_process` sets `--xla_gpu_execution_terminate_timeout=30m` unless the run already set it. A process whose step, or whose sampling loop, runs longer than that ends, and the launcher, `srun` or the scheduler stops the rest. If you know how long your steps take, set a tighter value in `XLA_FLAGS` or through the recipe's `xla_flags`.
+A rank can also stall without failing: blocked on a read, or in a compile that waits for its peers. Then every process stays alive and none reports anything, while the others wait inside a collective or a communicator's setup. For this case a GPU pool bounds each device execution with XLA's execution watchdog: `prepare_process` sets `--xla_gpu_execution_terminate_timeout=30m` when the CUDA plugin is present and the run has not set it. A process whose step, or whose sampling loop, runs longer than that ends, and the launcher, `srun` or the scheduler stops the rest. If you know how long your steps take, set a tighter value in `XLA_FLAGS` or through the recipe's `xla_flags`.
 
 The watchdog bounds device executions only. Before a phase agreement's collectives, such as a checkpoint save or the end of `fit`, the ranks meet on the host, so a rank that arrives first waits there for one still busy with host work, for example process 0 uploading the final checkpoint to Weights & Biases. On the device it would sit inside a collective, which the watchdog would end. That host wait is bounded by `AGREEMENT_PATIENCE_SECONDS` in `dew.artifacts`, one day. A rank that stalls in host work before an agreement holds its peers for up to that long, so lower it when your host phases are short.
 
 A pool keeps JAX's persistent compilation cache. jax 0.11.2 keys a cached executable by the fingerprint of the compiling process's accelerator topology, which on a GPU describes the device down to its NVLink links, and only process 0 writes entries. On one four-GPU host with an NVLink pair and a PCIe pair, ranks 0 and 1 found a step in a shared cache while ranks 2 and 3 compiled it, and that compile waited for ever for its peers' shares of the sharded autotuning. Dew pins jax to 0.11.2 with a fix (reported as jax-ml/jax#40940). A computation that spans processes hashes the fingerprints of all of them, so every rank loads the same entry, provided every process compiles for the same accelerators: the same platform and runtime, CUDA driver, cuDNN and cuBLAS, and the same device kinds, compute capability and core count. A pool whose processes differ in any of these compiles those computations without the cache, and JAX logs which processes differ. A GPU pool whose jax lacks the fix, such as an image's own jax or one installed with `--no-deps` around the pin, compiles without the persistent cache: `prepare_process` turns it off before the first compile.
 
-## Lay the mesh out for the network
+## Mesh layout across nodes
 
 Devices inside one node talk over NVLink or the TPU interconnect. Nodes talk over a network that is often ten times slower. Fully sharded data parallelism (`fsdp`) gathers every layer's parameters and reduce-scatters every layer's gradients, so an fsdp axis that crosses nodes pays that slow link on every layer.
 
-Hybrid sharding keeps fsdp inside a node and replicates across nodes. Only one gradient all-reduce per step crosses the network. `MeshSpec(replicas=N)` asks for it:
+Hybrid sharding keeps fsdp inside a node and replicates across nodes, so only one gradient all-reduce per step crosses the network. `MeshSpec(replicas=N)` asks for it. For two nodes of eight GPUs:
 
+<!-- not run: needs a pool of two hosts with eight GPUs each -->
 ```python
-from dew.training import MeshSpec, Trainer
+import jax
+import optax
+from dew import Trainer, models
+from dew.objectives.lm import LMObjective
+from dew.training import MeshSpec
+from dew.training.runtime import prepare_process
 
-# Two nodes of eight GPUs: fsdp over the eight GPUs of each node,
-# and the data axis of 2 across the two nodes.
+prepare_process()
+model = models.build("causal_transformer", vocab_size=256, emb_features=512,
+                     num_layers=8, num_heads=8, max_seq_len=1024)
+# fsdp over the eight GPUs of each node, and the data axis of 2 across the nodes.
 mesh = MeshSpec(fsdp=8, replicas=2)
-trainer = Trainer(objective, optimizer, key=key, mesh=mesh)
+trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4),
+                  key=jax.random.key(0), mesh=mesh)
 ```
 
 `replicas` counts groups of granules. A granule is whatever the devices' `slice_index` groups: a TPU slice on a multislice run, and on several GPU hosts a host or an NVLink domain, however many processes each host runs, because XLA numbers GPU slices per host boot or NVLink fabric. Where every device shares one slice, as in a CPU pool or on the hosts of one TPU slice, the process is the granule. `build_mesh` then builds the mesh with JAX's `mesh_utils.create_hybrid_device_mesh`, the same call MaxText uses for multislice runs. The data axis spans the groups. The expert, tensor, sequence and stage axes stay inside one granule. When a group holds more than one granule, fsdp is the only axis that crosses between them. `replicas` must divide both the granule count and the data axis, and fsdp must divide over the granules of one group. `build_mesh` raises with the numbers when they do not fit.
@@ -139,7 +144,7 @@ With `replicas=1`, `jax.make_mesh` places the devices, which is what a single no
 
 Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not.
 
-## Split long sequences
+## Sequence parallelism
 
 `MeshSpec(sequence=N)` splits the token positions of every sequence over N devices, and each attention call exchanges data between them in one of two ways. Both give the same result as one device.
 
@@ -172,7 +177,7 @@ With Rigel's attention the ring took 1.02 to 1.79 times as long and two head gro
 
 Keep the sequence axis on the fastest links. Both exchanges run once per attention layer in the forward and the backward pass, and again when the layer is recomputed. On the 3090s the all-to-all moved 19.5 GB/s per device over the NVLink pair and 6.3 GB/s across the sockets, 64 MiB a device, and NCCL runs the PCIe pair through host memory as it runs the sockets. On the PCIe pair a 32,768-token Qwen3-0.6B-shaped training step split two ways took 7.6 s, 1.25 s of it an all-to-all that no computation overlapped. `build_mesh` puts the `sequence` axis last, on neighbouring devices, and `replicas` keeps it inside a granule.
 
-## Rehearse on one machine
+## Single-machine rehearsal
 
 Before you book nodes, run the same launch on one machine. On a machine with four GPUs, the default of one process per GPU, with NCCL on its socket transport (no NVLink, PCIe peer access or shared memory between processes), exercises the paths that run between hosts:
 
@@ -181,7 +186,7 @@ dew launch --env NCCL_P2P_DISABLE=1 --env NCCL_SHM_DISABLE=1 \
     -- python tests/distribution_worker.py --out /tmp/pool.json --mesh '{"fsdp": 2, "replicas": 2}'
 ```
 
-To catch code that assumes one filesystem, start each process in a directory of its own, with its own `HOME`, `HF_HOME` and compilation cache. A persistent checkpoint directory then has to stay on storage every process shares. Checkpoints refuse a directory the processes do not share (see [resuming training](checkpoints.md)).
+To catch code that assumes one filesystem, start each process in a directory of its own, with its own `HOME`, `HF_HOME` and compilation cache. A persistent checkpoint directory then has to stay on storage every process shares; `Checkpoints` refuses a directory the processes do not share ([Checkpoints](checkpoints.md)).
 
 Without GPUs, CPU devices stand in. This command starts four processes with two CPU devices each, the layout of four hosts with two accelerators, grouped into two replicas of two hosts:
 
@@ -192,13 +197,19 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
        --mesh '{"fsdp": 2, "replicas": 2}'
 ```
 
-`/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]]`: each fsdp group spans the two hosts of its replica. Without `replicas`, `jax.make_mesh` gives `[[0], [1], [2], [3]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
+`/tmp/pool.json` records the mesh, the losses and, for every fsdp group, the processes its devices sit on:
+
+```text
+{"processes": 4, "devices": 8, "mesh": {"data": 4, "expert": 1, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}, "fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]], "partition": {"count": 4, "readers": 1}, "placed_whole": false, "losses": [4.891427993774414, 3.6097896099090576, 2.8838775157928467], "loss_steps": [1, 2, 3]}
+```
+
+Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` and no `replicas`, `jax.make_mesh` gives `"fsdp_groups": [[0], [1], [2], [3]]`. Run as one process with `XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`, the worker records losses of 4.891427993774414, 3.609790086746216 and 2.8838775157928467, within 1e-6 of the pool's.
 
 `tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes. It also checks that a failing process stops the pool, including a rank whose loader fails in the middle of `fit` and one that stalls without failing, that a pool refuses a checkpoint directory its processes do not share, that two pools started together take a port each, and that a pool's second run loads on every process the step its first run compiled. On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
 `tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf against the reference's own deviation when the batch's sums are reordered, and the devices' FLOPs against one device's split evenly. A layout Dew refuses by design raises `dew.nn.sharding.LayoutRefused` with the reason and a layout that runs, such as a stage axis over a DiT; the tool lists those rows apart and exits nonzero only on a mismatch, repeated work or another error. `--prepare` computes each model's one-device reference into a `--references` directory in a job of one device, so a run of layouts on every device computes none.
 
-## What has and has not been run
+## Tested configurations
 
 These checks passed:
 

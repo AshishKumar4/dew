@@ -5,7 +5,7 @@ any task suite runs against a run directory. The trainer's own perplexity
 says how well a run predicts its training data and nothing about what it
 can do, which is the other question a suite answers.
 
-`lm_eval` is an optional extra (`pip install dew-ml[eval-harness]`), so this
+`lm_eval` is an optional extra (`pip install dewml[eval-harness]`), so this
 module is the only one that imports it and `dew.eval` does not import this
 module: a caller who never asks for a harness never needs it installed.
 Importing this module registers the adapter under `dew`, which is what the

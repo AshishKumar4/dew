@@ -55,15 +55,16 @@ class AutoAudioProcessor:
     def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
                  sampling_rate=None):
         from transformers import AutoFeatureExtractor
-        self.processor = AutoFeatureExtractor.from_pretrained(modelname)
+        extractor = AutoFeatureExtractor.from_pretrained(modelname)
+        self.processor = extractor
         self.tensor_type = tensor_type
-        stated = self.processor.sampling_rate if isinstance(self.processor, Sampled) else 16000
-        self.sampling_rate = sampling_rate or stated
         # An extractor that pads to a fixed window by default (Whisper's 30
         # seconds, which its encoder is built for) keeps that; one that pads
         # nothing by default (wav2vec2's) pads a batch to its longest
         # waveform, so rows of several lengths still stack.
-        padding = inspect.signature(self.processor.__call__).parameters.get("padding")
+        padding = inspect.signature(extractor.__call__).parameters.get("padding")
+        stated = extractor.sampling_rate if isinstance(extractor, Sampled) else 16000
+        self.sampling_rate = sampling_rate or stated
         self.padding = {} if padding is None else {"padding": padding.default or True}
 
     def __call__(self, audio):

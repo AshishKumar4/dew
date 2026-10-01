@@ -257,7 +257,7 @@ class LocalTracker(_OwnedTracker):
         if plots:
             import importlib.util
             if importlib.util.find_spec('matplotlib') is None:
-                raise ImportError('LocalTracker plots need dew-ml[plots]')
+                raise ImportError('LocalTracker plots need dewml[plots]')
 
     def _check(self) -> None:
         if self._closed:
