@@ -386,6 +386,67 @@ def raw_leaf(leaf):
         leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
+def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
+    from dew.data import Loading, TokenWindows
+    from dew.data.dataset import Forwarding
+
+    tokens = np.arange(29, dtype=np.uint16)
+    tokens.tofile(tmp_path / "train.bin")
+    tokens.tofile(tmp_path / "val.bin")
+
+    class WindowsRegression(Regression):
+        def loss(self, params, batch, step):
+            x = batch["text"][:, :FEATURES].astype(jnp.float32) / 32
+            return super().loss(params, {"x": x, "y": 2 * x[:, :2]}, step)
+
+    class Observed(Forwarding):
+        def __init__(self, source, seen):
+            self._source, self.seen = source, seen
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            batch = next(self._source)
+            self.seen.append(batch["text"].copy())
+            return batch
+
+        def get_state(self):
+            return self._source.get_state()
+
+        def set_state(self, state):
+            self._source.set_state(state)
+
+    def dataset(seen):
+        data = TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
+                            loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
+        return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
+
+    def trainer(directory):
+        return make_trainer(directory, objective=WindowsRegression(), optimizer=optax.adam(1e-3))
+
+    whole_seen, prefix_seen, resumed_seen = [], [], []
+    whole = trainer(tmp_path / "whole").fit(dataset(whole_seen), steps=4, checkpoint_every=1)
+    prefix = trainer(tmp_path / "split").fit(dataset(prefix_seen), steps=2, checkpoint_every=1)
+    fresh = trainer(tmp_path / "split")
+    restored, _, place = fresh.place()
+    assert position.read(place).records == 2 * BATCH
+    assert jax.tree.structure(restored) == jax.tree.structure(prefix)
+    for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
+        actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+    resumed = fresh.fit(dataset(resumed_seen), steps=4, checkpoint_every=1)
+    assert resumed_seen[0].tobytes() == whole_seen[2].tobytes(), "the first batch after resume"
+    assert jax.tree.structure(resumed) == jax.tree.structure(whole)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(whole), strict=True):
+        actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+    _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
+    _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
+    assert resumed_place == whole_place
+    assert position.read(resumed_place).records == 4 * BATCH
+
+
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
 def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
