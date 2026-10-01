@@ -5,9 +5,9 @@ size, where it trains, the global batch and the precision; a progress bar
 with the step, the rate, the time elapsed and the time left; every scalar the
 trainer, the objective and the rollout log, grouped, each with its value, a
 sparkline of its recent values and the change across them; the latest
-evaluation of each split; and, in the bottom border, the phase the run is
-in. Evaluations and notes also print above the panel, where they stay in the
-scrollback, and the run ends with a summary panel.
+evaluation of each split with its history; and, in the bottom border, the
+phase the run is in. Notes print above the panel. The run ends with a
+summary panel that keeps the final evaluations and their histories.
 
 Anywhere else (a pipe, a log file, CI, a notebook) the same numbers are
 printed as one line per logging interval. Only process zero shows anything.
@@ -200,8 +200,8 @@ class TrainingDisplay:
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
     # Metrics by group, then by logged name, in the order first logged.
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
-    # The latest evaluation of each split, and the one before it.
-    evaluations: dict[str, tuple[Evaluation, Evaluation | None]] = dataclasses.field(default_factory=dict)
+    # Each split's evaluations, in the order they completed.
+    evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
     phase: str = ""
     ended: bool = False
     # How the phase is drawn, not what the display holds: left out of equality.
@@ -279,8 +279,9 @@ class TrainingDisplay:
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
-        previous = self.evaluations.get(evaluation.split, (None,))[0]
-        self.evaluations[evaluation.split] = (evaluation, previous)
+        self.evaluations.setdefault(evaluation.split, []).append(evaluation)
+        if self.live is not None:
+            return
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
         if evaluation.uneven_shards:
             counts += ", uneven shards"
@@ -336,8 +337,9 @@ class TrainingDisplay:
         rows.append(("goodput", fraction))
         if loss is not None:
             rows.append(("final loss", Text(number(loss), "bold")))
-        for split, (evaluation, _) in self.evaluations.items():
-            rows.append((f"{split} at {evaluation.step}", self.scores(evaluation)))
+        for split, history in self.evaluations.items():
+            evaluation = history[-1]
+            rows.append((f"{split} at {evaluation.step}", self.scores(evaluation, history=True)))
         table = Table.grid(padding=(0, 2))
         table.add_column(style=LABEL, justify="right")
         table.add_column()
@@ -356,10 +358,11 @@ class TrainingDisplay:
         each group was first logged."""
         return [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
 
-    def scores(self, evaluation: Evaluation) -> Text:
-        """An evaluation's scores, each with its change since the split's
-        previous evaluation."""
-        previous = self.evaluations.get(evaluation.split, (None, None))[1]
+    def scores(self, evaluation: Evaluation, *, history: bool = False) -> Text:
+        """An evaluation's scores and their change since the previous one,
+        with a compact history when requested."""
+        evaluations = self.evaluations.get(evaluation.split, [])
+        previous = evaluations[-2] if len(evaluations) > 1 else None
         text = Text()
         for index, (name, value) in enumerate(evaluation.scores.items()):
             bare = name.removeprefix(evaluation.split + "/")
@@ -367,7 +370,21 @@ class TrainingDisplay:
             text.append("   " if index else "").append(f"{bare} ", LABEL).append(number(value, shown), "bold")
             if previous is not None and name in previous.scores:
                 text.append(" ").append_text(change(previous.scores[name], value, shown))
+            if history:
+                values = [record.scores[name] for record in evaluations if name in record.scores]
+                text.append(" ").append_text(sparkline(values[-TREND:]))
         return text
+
+    def evaluation_rows(self) -> list[tuple[str, Row]]:
+        """The latest metrics of each split, with their evaluation history."""
+        rows = []
+        for split, history in self.evaluations.items():
+            latest = history[-1]
+            for name in latest.scores:
+                bare = name.removeprefix(split + "/")
+                values = collections.deque(record.scores[name] for record in history if name in record.scores)
+                rows.append((f"{split} · step {latest.step}", Row(bare, self.shown.get(bare, PLAIN), values)))
+        return rows
 
     def rate(self) -> float | None:
         """Steps a second over the last few seconds of steps."""
@@ -414,18 +431,13 @@ class TrainingDisplay:
         if rows := self.rows():
             # What the rest of the panel takes: the borders, the header, the
             # bar and the evaluations, with the blank lines between them.
-            around = len(parts) + 4 + (len(self.evaluations) + 1 if self.evaluations else 0)
+            around = len(parts) + 4 + (len(self.evaluation_rows()) + len(self.evaluations) + 1
+                                       if self.evaluations else 0)
             parts += [Text(), self.metrics(rows, inner, options.size.height - around)]
 
-        if self.evaluations:
+        if evaluations := self.evaluation_rows():
             parts.append(Text())
-            table = Table.grid(padding=(0, 2))
-            table.add_column(style=GROUP, no_wrap=True)
-            table.add_column(style=LABEL, justify="right", no_wrap=True)
-            table.add_column()
-            for split, (evaluation, _) in self.evaluations.items():
-                table.add_row(split, f"step {evaluation.step}", self.scores(evaluation))
-            parts.append(table)
+            parts.append(self.metrics(evaluations, inner, options.size.height, evaluation=True))
 
         title = Text.assemble(" ", ("dew", Style(color=Color.from_triplet(END), bold=True)),
                               (" · ", LABEL), (self.title, "bold"), " ")
@@ -443,7 +455,7 @@ class TrainingDisplay:
         assert isinstance(frame, Text)
         return Text.assemble(" ", frame, " ", (self.phase or "training", LABEL), " ")
 
-    def metrics(self, rows: list[tuple[str, Row]], inner: int, lines: int) -> Table:
+    def metrics(self, rows: list[tuple[str, Row]], inner: int, lines: int, *, evaluation: bool = False) -> Table:
         """The metrics under their groups' headings, each as its name, its
         value, a sparkline and its change across the sparkline; those that
         have held one value share a line per group. Groups stay whole, and
@@ -481,14 +493,15 @@ class TrainingDisplay:
             steady = Text(overflow="fold")
             for row in named:
                 value = Text(number(row.values[-1], row.shown), "bold")
-                if len(row.values) >= 3 and min(row.values) == max(row.values):
+                if not evaluation and len(row.values) >= 3 and min(row.values) == max(row.values):
                     steady.append("   " if steady else "  ").append(f"{row.name} ", LABEL).append_text(value)
                     continue
                 cells: list[RenderableType] = [Text(f"  {row.name}", LABEL), value]
                 if graphs:
                     values = list(row.values)[-spark:]
                     cells += [sparkline(values),
-                              change(values[0], values[-1], row.shown) if len(values) > 1 else Text()]
+                              change(values[-2] if evaluation else values[0], values[-1], row.shown)
+                              if len(values) > 1 else Text()]
                 table.add_row(*cells)
             stack.append(Text(group, GROUP))
             if table.row_count:

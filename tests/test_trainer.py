@@ -840,9 +840,25 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     make_trainer(objective=Features()).fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3,
                                            metrics=(Spread([]),))
 
-    last = screen.getvalue().rpartition("dew · ")[2]
+    output = screen.getvalue()
+    assert "eval val at step" not in output
+    last = output.rpartition("dew · ")[2]
     for name in ("loss", "step_time_ms", "spread"):
         assert re.search(rf" {name} +\S", last), last
+    assert "val" in last and "step 6" in last, last
+    summary = output.rpartition("✓ ")[2]
+    assert "val at 6" in summary and "spread" in summary, summary
+    if width == 120:
+        assert re.search(r"spread +\S+ +[▁▂▃▄▅▆▇█]{2}", last), last
+        assert re.search(r"[▁▂▃▄▅▆▇█]{2}", summary), summary
+
+
+def test_off_a_terminal_evaluation_keeps_its_plain_line(capsys):
+    trainer = make_trainer(objective=Features())
+    trainer.fit(Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),))
+    output = capsys.readouterr().out
+    assert re.search(r"eval val at step 3: spread \S+ \(24 records in \S+ s\)", output), output
+    assert re.search(r"eval val at step 6: spread \S+ .+ \(24 records in \S+ s\)", output), output
 
 
 def test_a_failing_metric_fails_the_validation_pass():
