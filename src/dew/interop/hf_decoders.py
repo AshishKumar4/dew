@@ -87,6 +87,7 @@ _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
 _HF_ACTIVATIONS['swigluoai'] = 'silu'
+_HF_ACTIVATIONS.update({'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'})
 
 
 def _hf_activation(activation: GatedActivation) -> str:
@@ -364,8 +365,12 @@ class DecoderFields(TypedDict, total=False):
     num_kv_heads: int | None
     head_dim: int | None
     mlp: str | SituFields
+    mlp_bias: bool
     mlp_features: int | tuple[int, ...] | None
     max_seq_len: int
+    position_embedding: Literal['rotary', 'learned']
+    position_embedding_size: int | None
+    position_embedding_offset: int
     rope_theta: float
     rope_scaling: Ramp | None
     partial_rotary_factor: float | None
@@ -373,6 +378,8 @@ class DecoderFields(TypedDict, total=False):
     layer_types: tuple[str, ...] | None
     kinds: dict[str, KindFields]
     norm_eps: float
+    norm_type: Literal['rms', 'layer']
+    norm_bias: bool
     scale_offset: bool
     scale_after_cast: bool
     sandwich_norms: bool
@@ -1448,8 +1455,8 @@ def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
-    if parts == ['model', 'norm', 'weight']:
-        return ('norm', 'scale')
+    if parts in (['model', 'norm', 'weight'], ['model', 'norm', 'bias']):
+        return ('norm', 'scale' if parts[-1] == 'weight' else 'bias')
     if parts == ['model', 'embed_tokens', 'weight']:
         return ('embed_tokens', 'embedding')
     if parts == ['model', 'embed_tokens_per_layer', 'weight']:
@@ -1545,8 +1552,8 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
             if module == 'post_per_layer_input_norm':
                 return (layer, module, 'scale')
         norms = _norm_names(bool(config.get('sandwich_norms')))
-        if len(parts) == 5 and module in norms and leaf == 'weight':
-            return (layer, norms[module], 'scale')
+        if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
+            return (layer, norms[module], 'scale' if leaf == 'weight' else 'bias')
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
@@ -1998,6 +2005,8 @@ _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
     'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
     'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
+    'position_embedding_size': lambda model: (
+        model.position_embedding_size or model.max_seq_len if model.position_embedding == 'learned' else None),
 }
 """Fields whose None stands for a value the forward derives, spelled out."""
 
@@ -2042,8 +2051,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     None is the tied lm_head, whose embedding copy is written instead.
     """
     parts = dew_name.split('.')
-    if parts == ['norm', 'scale']:
-        return 'model.norm.weight'
+    if parts in (['norm', 'scale'], ['norm', 'bias']):
+        return 'model.norm.' + ('weight' if parts[-1] == 'scale' else 'bias')
     if parts == ['embed_tokens', 'embedding']:
         return 'model.embed_tokens.weight'
     if parts == ['lm_head', 'kernel']:
@@ -2061,8 +2070,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         theirs = {ours: hf for hf, ours in
                   _norm_names(_FAMILIES[records.text(config['model_type'],
                                              'model_type')].sandwich_norms).items()}
-        if len(parts) == 3 and module in theirs and leaf == 'scale':
-            return f'model.layers.{index}.{theirs[module]}.weight'
+        if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
+            return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
     raise ValueError(f"unknown parameter path {dew_name!r}")
 
 
@@ -2195,6 +2204,13 @@ from dew.interop.families.glm import (
     _glm5_next_export_weights,
     _glm_moe_dsa_config,
 )
+from dew.interop.families.gpt2 import (
+    _gpt2_config,
+    _gpt2_export,
+    _gpt2_export_weights,
+    _gpt2_path,
+    _gpt2_prepare,
+)
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
 from dew.interop.families.kimi import (
     _KDA_ZERO_PADDED,
@@ -2223,6 +2239,7 @@ from dew.interop.families.masked_diffusion import (
     _mask_token_export,
 )
 from dew.interop.families.olmo import _olmo3_config
+from dew.interop.families.opt import _opt_config, _opt_export, _opt_export_path, _opt_path
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -2236,6 +2253,18 @@ from dew.interop.families.qwen import (
 )
 
 _FAMILY_ENTRIES = (
+    DecoderFamily(('opt',), _opt_config,
+                  lambda fields: fields.get('position_embedding_offset') == 2,
+                  'opt', 'OPTForCausalLM', _opt_export,
+                  weight_path=_opt_path, export_path=_opt_export_path,
+                  preserve_source_layout=False,
+                  tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight')),
+    DecoderFamily(('gpt2',), _gpt2_config,
+                  lambda fields: fields.get('position_embedding') == 'learned',
+                  'gpt2', 'GPT2LMHeadModel', _gpt2_export,
+                  weight_path=_gpt2_path, prepare_weights=_gpt2_prepare,
+                  export_weights=_gpt2_export_weights, preserve_source_layout=False,
+                  tied_head_names=('lm_head.weight', 'transformer.wte.weight')),
     DecoderFamily(('glm5_next_text',), _glm5_next_config,
                   lambda fields: any(isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
                                      for mixer in _kind_mixers(fields)),

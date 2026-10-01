@@ -44,6 +44,17 @@ STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
+def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
+                 bias: bool, scale_offset: bool, scale_after_cast: bool,
+                 dtype: Dtype | None) -> Callable[..., nn.Module]:
+    """The decoder's norm factory, preserving each reference's variance formula."""
+    if kind == 'layer':
+        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
+                                 use_fast_variance=False, dtype=dtype)
+    return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
+                             scale_after_cast=scale_after_cast, dtype=dtype)
+
+
 @dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts some layers route to, and how the router chooses.
@@ -191,7 +202,8 @@ class GatedMLP(nn.Module):
     in place of the name is Kimi K3's SiTU, which transforms both halves
     (`dew.nn.moe.gated_product`).
 
-    Bias-free, like the gated MLP of every open decoder this loads.
+    `gelu`, `gelu_exact` and `relu` build the ungated two-projection MLP.
+    The other activations keep the gated product and its parameter layout.
 
     activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
     nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
@@ -203,6 +215,7 @@ class GatedMLP(nn.Module):
     hidden_features: int
     out_features: int
     activation: GatedActivation = 'swiglu'
+    use_bias: bool = False
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
@@ -212,9 +225,12 @@ class GatedMLP(nn.Module):
 
     def setup(self):
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        self.gate_proj = dense(self.hidden_features, name='gate_proj')
+        if self.activation not in ('gelu', 'gelu_exact', 'relu'):
+            self.gate_proj = dense(self.hidden_features, name='gate_proj')
+        elif self.activation_sparsity or self.swiglu_limit is not None:
+            raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
         self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
@@ -222,6 +238,11 @@ class GatedMLP(nn.Module):
     def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
+        if self.activation in ('gelu', 'gelu_exact', 'relu'):
+            up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+            hidden = (nn.relu(up) if self.activation == 'relu' else
+                      nn.gelu(up, approximate=self.activation == 'gelu'))
+            return checkpoint_name(self.down_proj(hidden), 'down_proj')
         gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
         up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
@@ -458,6 +479,8 @@ class DecoderBlock(nn.Module):
     emb_features: int
     wiring: BlockWiring
     norm_eps: float = 1e-5
+    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_bias: bool = False
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -484,9 +507,10 @@ class DecoderBlock(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+        norm = decoder_norm(
+            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype)
         if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')

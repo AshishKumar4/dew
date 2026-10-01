@@ -130,7 +130,7 @@ print("Stored running mean:", running_mean)
 
 `Step.step` is the number of accepted microbatches. `Step.key` is `jax.random.fold_in(root_key, state.step)`, where `state.step` counts attempts, so a rejected attempt does not reuse its random draws. Split it when a loss needs several independent random operations.
 
-The root key is part of `TrainState`. A deterministic key does not make results bitwise equal across devices, compiler versions or reduction orders. Continuing a run exactly also needs the checkpointed state and the data iterator's position.
+The root key is part of `TrainState`. A deterministic key does not make results bitwise equal across devices, compiler versions or reduction orders. Continuing a run exactly also needs the checkpointed state and the data iterator's position. On a GPU it also needs `--xla_gpu_deterministic_ops=true`, which orders the reductions; [checkpoints](../guides/checkpoints.md) covers autotuning, the other source XLA names, and what turning it off costs.
 
 ## EMA
 

@@ -1,7 +1,7 @@
 """The autoregressive transformer decoder every language model here trains.
 
-Token embedding, rotary positions, pre-norm blocks of grouped-query causal
-attention and a gated MLP, a final RMSNorm, and an fp32 head. Attention goes
+By default, token embedding, rotary positions, pre-norm blocks of grouped-query
+causal attention and a gated MLP, a final RMSNorm, and an fp32 head. Attention goes
 through the one shared kernel path in dew.nn.attention, so a run picks
 reference/xla/cudnn/tpu the same way a diffusion run does, and decoding reuses
 the same fixed-size KV cache helpers.
@@ -73,7 +73,16 @@ from ..sharding import (
     pipeline_stages,
     row_axes,
 )
-from .decoder_block import BlockWiring, DecoderBlock, GatedMLP, Mixture, MTPBlock, RematPolicy, remat_policy
+from .decoder_block import (
+    BlockWiring,
+    DecoderBlock,
+    GatedMLP,
+    Mixture,
+    MTPBlock,
+    RematPolicy,
+    decoder_norm,
+    remat_policy,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 
@@ -548,6 +557,7 @@ def _whole(value, axis: int):
 @models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
+    ("embed_positions",): (None, "embed"),
     ("lm_head",): ("embed", "vocab"),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
@@ -563,6 +573,11 @@ class CausalTransformer(nn.Module):
     tied embeddings, no softcap. Every field an open decoder varies is a
     field here, so loading Qwen3 or Gemma3 is a field mapping and not a
     subclass. The field comments below name which family sets each one.
+
+    Classic GPT blocks set `norm_type='layer'`, `norm_bias`, an ungated
+    `mlp='gelu'` (tanh) or `'gelu_exact'` (erf), `mlp_bias`, and
+    `position_embedding='learned'`. Learned positions replace rotary
+    attention and advance from each decode row's compact cache cursor.
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
     a kind does: its window, and its own rope base or head dim. Deriving the
@@ -659,8 +674,15 @@ class CausalTransformer(nn.Module):
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None           # None: emb_features // num_heads
     mlp: GatedActivation = 'swiglu'          # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
+    mlp_bias: bool = False
+    """Bias both feed-forward projections; gelu, gelu_exact and relu are ungated."""
     mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
     max_seq_len: int = 2048
+    position_embedding: Literal['rotary', 'learned'] = 'rotary'
+    position_embedding_size: int | None = None
+    """Learned table size, None for max_seq_len, independent of the decode capacity."""
+    position_embedding_offset: int = 0
+    """Reserved rows before learned position zero, two in OPT checkpoints."""
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: float | None = None  # None: every dim rotates
@@ -668,6 +690,8 @@ class CausalTransformer(nn.Module):
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
+    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_bias: bool = False
     scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
@@ -1071,6 +1095,34 @@ class CausalTransformer(nn.Module):
                 if not isinstance(kind.mixer or self.mixer or AttentionMixer(), AttentionMixer):
                     raise ValueError("attention_dropout_rate requires ordinary attention mixers")
 
+    def refuse_unbuildable_classic_fields(self):
+        """Refuse norm, position and feed-forward combinations with no counterpart."""
+        if self.norm_type not in ('rms', 'layer'):
+            raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
+        if self.norm_type == 'rms' and self.norm_bias:
+            raise ValueError('norm_bias requires LayerNorm')
+        if self.norm_type == 'layer' and self.scale_offset:
+            raise ValueError('scale_offset describes RMSNorm weights')
+        if self.position_embedding not in ('rotary', 'learned'):
+            raise ValueError('position_embedding must be rotary or learned')
+        if self.position_embedding == 'learned' and (
+                self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())):
+            raise ValueError('learned positions require the default unrotated attention mixer')
+        if self.position_embedding_size is not None and (
+                self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
+            raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
+        if self.position_embedding_offset < 0 or (self.position_embedding_offset and (
+                self.position_embedding != 'learned' or self.position_embedding_size is None
+                or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
+            raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
+        if self.position_embedding != 'rotary' and (
+                self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None):
+            raise ValueError('rotary scaling requires rotary positions')
+        if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
+            raise ValueError('the routed experts require a bias-free gated MLP')
+        if self.num_nextn_predict_layers and (self.norm_type != 'rms' or self.position_embedding != 'rotary'):
+            raise ValueError('prediction depths require RMSNorm and rotary positions')
+
     def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
         """Raise for a field, or a pair of fields, this model cannot build.
 
@@ -1079,6 +1131,7 @@ class CausalTransformer(nn.Module):
         """
         self.refuse_unbuildable_mup(kinds)
         self.refuse_unbuildable_dropout(kinds)
+        self.refuse_unbuildable_classic_fields()
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -1088,7 +1141,7 @@ class CausalTransformer(nn.Module):
             if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
                 raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
         for layer_type, kind in sorted(kinds.items()):
-            if kind.head_dim % 2:
+            if self.position_embedding == 'rotary' and kind.head_dim % 2:
                 raise ValueError(
                     "rotary positions rotate pairs, so the head dim of "
                     f"{layer_type!r} must be even, got {kind.head_dim}")
@@ -1215,7 +1268,8 @@ class CausalTransformer(nn.Module):
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
-                                      activation=self.mlp, swiglu_limit=self.swiglu_limit,
+                                      activation=self.mlp, use_bias=self.mlp_bias,
+                                      swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
@@ -1310,6 +1364,12 @@ class CausalTransformer(nn.Module):
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
             self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.position_embedding == 'learned':
+            self.embed_positions = TokenEmbedding(
+                num_embeddings=self.position_embedding_size or self.max_seq_len,
+                features=self.emb_features, dtype=self.dtype, name='embed_positions',
+                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                                else nn.initializers.normal(self.initializer_range)))
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1329,7 +1389,8 @@ class CausalTransformer(nn.Module):
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
-        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
+        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar)
@@ -1367,9 +1428,10 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = RMSNorm(
-            epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
+        self.norm = decoder_norm(
+            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype)(name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1447,6 +1509,8 @@ class CausalTransformer(nn.Module):
             prediction_slot=spec.prediction_slot,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
+            norm_type=self.norm_type,
+            norm_bias=self.norm_bias,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,
@@ -1851,6 +1915,16 @@ class CausalTransformer(nn.Module):
         # splits the rows or the positions.
         x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
                                            input_embeddings, embedding_positions), RESIDUAL)
+        if self.position_embedding == 'learned':
+            places = positions
+            if places is None:
+                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
+                         if decode else None)
+                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
+                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+                if start is not None:
+                    places = places + start[:, None]
+            x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs

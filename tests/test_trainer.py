@@ -489,6 +489,61 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
             np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
 
 
+REPEATED_CONV_STEPS = """
+import sys
+
+import jax
+import numpy as np
+import optax
+
+from dew.diffusion import presets
+from dew.inputs import Field, InputSpec
+from dew.objectives.diffusion import DiffusionObjective
+from dew.registry import models
+from dew.sampling import Euler
+from dew.training import Trainer
+
+model = models.SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
+                               sampler=Euler(), steps=2, ema_decay=None)
+trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+state = trainer.initial_state()
+batch = {"image": np.random.default_rng(0).integers(0, 256, (32, 16, 16, 3)).astype(np.uint8)}
+step = trainer.compile(state, batch)
+for _ in range(2):
+    state, *_ = step(state, batch)
+leaves = jax.tree.leaves(jax.tree.map(lambda leaf: jax.random.key_data(leaf)
+                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf, state))
+np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
+"""
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="cuDNN convolution autotuning")
+def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(tmp_path):
+    """Autotuning picks a convolution's cuDNN algorithm per process, so only
+    a second process shows whether it agrees. Two fresh processes, without a
+    compilation cache, train a DiT (a convolution embeds its patches) two
+    Adam steps under the cuda lane's flags; every state leaf agrees."""
+    from conftest import REPEATABLE_GPU_FLAGS
+
+    root = Path(__file__).resolve().parents[1]
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_autotune_level"))]
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
+                   "XLA_FLAGS": " ".join([*flags, *REPEATABLE_GPU_FLAGS]),
+                   "JAX_ENABLE_COMPILATION_CACHE": "false"}
+    runs = []
+    for index in range(2):
+        out = tmp_path / f"state-{index}.npz"
+        done = subprocess.run([sys.executable, "-c", REPEATED_CONV_STEPS, str(out)], env=environment,
+                              capture_output=True, text=True, timeout=600)
+        assert done.returncode == 0, done.stderr
+        runs.append(np.load(out))
+    assert runs[0].files == runs[1].files
+    for name in runs[0].files:
+        np.testing.assert_array_equal(runs[0][name], runs[1][name])
+
+
 def test_the_state_is_built_from_the_initializer_and_the_key_alone():
     """What `place` compiles takes the objective's held variables and the run
     key as arguments, so a loaded checkpoint reaches the device as data.
