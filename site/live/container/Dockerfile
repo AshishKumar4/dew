@@ -11,11 +11,12 @@ COPY requirements.txt /opt/live/
 RUN pip install --no-cache-dir -r /opt/live/requirements.txt
 
 # The landing page's text-to-image model, a Dew run on the Hugging Face Hub,
-# pinned in text-to-image as <repo>@<revision>. Its own layer, before Dew, so a
-# new Dew commit does not download it again.
+# pinned in text-to-image as <repo>@<revision>, in the hub cache with `main`
+# naming that revision, so the offline kernel's from_pretrained(repo) reads it.
+# Its own layer, before Dew, so a new Dew commit does not download it again.
 ENV HF_HOME=/opt/hf
 COPY text-to-image /opt/live/
-RUN python -c "from huggingface_hub import snapshot_download; repo, rev = open('/opt/live/text-to-image').read().strip().split('@'); snapshot_download(repo_id=repo, revision=rev, local_dir='/opt/models/text-to-image')"
+RUN python -c "from pathlib import Path; from huggingface_hub import snapshot_download; repo, rev = open('/opt/live/text-to-image').read().strip().split('@'); snapshot = Path(snapshot_download(repo_id=repo, revision=rev)); (snapshot.parent.parent / 'refs' / 'main').write_text(rev)"
 
 # The landing page's text models, one <repo>@<revision> a line in text-models,
 # each at /opt/models/<repo>: their weights, config and tokenizer.
