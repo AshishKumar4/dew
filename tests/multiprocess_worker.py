@@ -180,6 +180,11 @@ def as_numpy(tree):
     """
     import jax
 
+    import jax.numpy as jnp
+
+    tree = jax.tree.map(lambda leaf: jax.random.key_data(leaf)
+                        if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                        else leaf, tree)
     if jax.process_count() == 1:
         return jax.tree.map(np.asarray, tree)
     from jax.experimental import multihost_utils

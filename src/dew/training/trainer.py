@@ -702,6 +702,8 @@ class Trainer(Generic[Loss, Effects]):
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
+        # A root key is one value; a legacy key's uint32 words are not parameter axes.
+        placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
@@ -770,6 +772,8 @@ class Trainer(Generic[Loss, Effects]):
                                            initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=data_partition(self.device_mesh))
+        from dew.nn.inputs import request_key
+        state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")

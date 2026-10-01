@@ -177,6 +177,55 @@ def test_integer_root_seed_is_recorded_at_fit_start():
     assert started.seed == 23
 
 
+def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
+    def build(path=None):
+        return Trainer(Regression(), optax.adam(1e-3), key=0,
+                       checkpoints=None if path is None else Checkpoints(str(path)))
+
+    baseline = build().fit(Data(), steps=4, log_every=1)
+    split = build(tmp_path / "typed")
+    prefix = split.fit(Data(), steps=2, checkpoint_every=1, log_every=1)
+    assert jnp.issubdtype(prefix.key.dtype, jax.dtypes.prng_key)
+    fresh = build(tmp_path / "typed")
+    restored, _, _ = fresh.place()
+    assert restored.key.dtype == prefix.key.dtype
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
+    resumed = fresh.fit(Data(), steps=4, checkpoint_every=1, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+def test_legacy_key_checkpoint_restores_as_a_typed_key(tmp_path):
+    reference = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    baseline = reference.fit(Data(), steps=4, log_every=1)
+    prefix = Trainer(Regression(), optax.adam(1e-3), key=0).fit(Data(), steps=2, log_every=1)
+    legacy = dataclasses.replace(prefix, key=jax.random.key_data(prefix.key))
+    checkpoints = Checkpoints(str(tmp_path / "legacy"))
+    checkpoints.save(2, legacy, json.dumps({"index": 2}).encode(), share=DataPartition())
+    checkpoints.wait()
+    fresh = Trainer(Regression(), optax.adam(1e-3), key=0,
+                    checkpoints=Checkpoints(str(tmp_path / "legacy")))
+    restored, _, _ = fresh.place()
+    assert jnp.issubdtype(restored.key.dtype, jax.dtypes.prng_key)
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), legacy.key)
+    resumed = fresh.fit(Data(), steps=4, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_root_key_stays_replicated_on_a_multi_device_mesh():
+    trainer = Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    state, shardings, _ = trainer.place()
+    legacy = dataclasses.replace(state, key=jax.random.key_data(state.key))
+    legacy_shardings = trainer.shardings(legacy)
+    assert shardings.key.spec == legacy_shardings.key.spec == jax.sharding.PartitionSpec()
+    assert state.key.sharding.mesh == shardings.key.mesh
+    for shard in state.key.addressable_shards:
+        np.testing.assert_array_equal(jax.random.key_data(shard.data), jax.random.key_data(state.key))
+
+
 def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     refs = []
 
