@@ -287,6 +287,28 @@ ONE_SLURM_TASK = {"SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "
 
 
 @pytest.mark.mesh(devices=0)
+@pytest.mark.parametrize("flags, kept", [("", "false"), ("--xla_gpu_enable_allocator_spatial_partitioning=true", "true")])
+def test_a_gpu_process_keeps_its_temporaries_one_free_block(flags, kept):
+    """A preallocated BFC pool is spatially partitioned by default: a free
+    block below a buffer goes on serving the small allocations around a step,
+    while the open space past it waits for collective buffers. The step's
+    temporaries then lose their block on the 4080 once a prefetched batch
+    lands past them. The process turns the partitioning off, unless the run
+    named it."""
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
+    program = ("import os\n"
+               "import dew.training.runtime as runtime\n"
+               "runtime.cuda_plugin = lambda: True\n"
+               "runtime.prepare_process(multi_host=False)\n"
+               "from dew.telemetry.devices import xla_flag\n"
+               "print('partitioning', xla_flag('xla_gpu_enable_allocator_spatial_partitioning'))\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"partitioning {kept}" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
 def test_one_slurm_task_joins_no_pool():
     """srun with one task sets SLURM_JOB_ID, and JAX's Slurm detection then
     starts a one-process pool whose coordinator is the node's name. A
