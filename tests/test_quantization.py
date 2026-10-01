@@ -182,27 +182,34 @@ def test_a_scanned_quantized_stack_quantizes_what_the_plain_one_does():
 @pytest.mark.skipif(jax.default_backend() == "gpu",
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("group_width", [1, 4])
-def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width):
+def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width, dtype):
     """A grouped convolution never adds one group's inputs into another's
     outputs, so each group's activations take their own int8 scale. Over 64
     channels whose ranges span 1e-3 to 1, every output channel lands within
-    int8 rounding of float (depthwise and 4 channels per group). One scale
-    per example for all channels rounds the small groups to zero instead:
-    observed on CPU before the fix, the worst channel 100% (depthwise) and
-    107% (4 per group) off. Observed after: 1.0% and 1.2%."""
+    int8 rounding of float (depthwise and 4 channels per group), in float32
+    and in bf16 compute. The reference is the float32 convolution, at the
+    highest precision, of the inputs and kernel the module computes with.
+    One scale per example for all channels rounds the small groups to zero
+    instead: observed on CPU before the fix, the worst channel 100%
+    (depthwise) and 107% (4 per group) off. Observed after: 1.0% and 1.2%
+    in float32, 1.1% and 1.2% in bf16 (1.1% and 1.4% while Qwix scaled the
+    bf16 product in bf16)."""
     pytest.importorskip("qwix")
     from dew.nn.conv import Conv
 
     features = 64
     conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
-                feature_group_count=features // group_width, use_bias=False)
+                feature_group_count=features // group_width, use_bias=False, dtype=dtype)
     ranges = jnp.logspace(-3, 0, features)
-    x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges
-    variables = conv.init(jax.random.key(1), x)
-    plain = conv.apply(variables, x)
+    x = (jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges).astype(dtype)
+    variables = jax.tree.map(lambda leaf: leaf.astype(dtype).astype(jnp.float32), conv.init(jax.random.key(1), x))
+    with jax.default_matmul_precision("highest"):
+        plain = conv.clone(dtype=jnp.float32).apply(variables, x.astype(jnp.float32))
     quantized = apply_quantization(conv, Quantization()).apply(variables, x)
-    error = (jnp.sqrt(jnp.sum((quantized - plain) ** 2, axis=(0, 1, 2)))
+    assert quantized.dtype == dtype
+    error = (jnp.sqrt(jnp.sum((quantized.astype(jnp.float32) - plain) ** 2, axis=(0, 1, 2)))
              / jnp.sqrt(jnp.sum(plain ** 2, axis=(0, 1, 2))))
     assert float(error.max()) < 0.02, np.asarray(error)
     assert float(error.min()) > 0.0
