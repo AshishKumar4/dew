@@ -1,12 +1,10 @@
-# Your first training run
+# Quickstart
 
-This tutorial assumes you know Python, NumPy-style arrays, and the idea of lowering a loss with gradients. It explains the Flax Linen and JAX ideas the example needs as they come up. Finish [installation](installation.md) first.
+This page trains a one-layer Flax model to fit the line `y = 2x + 1` on 32 synthetic points. The script downloads nothing and runs on a CPU in a few seconds. It shows the three things every Dew run needs: a `Dataset`, an `Objective` and a `Trainer`. [Installation](installation.md) comes first.
 
-We will fit a line to 32 made-up examples. The target is `y = 2x + 1`, so you can measure the trained model's error yourself, without downloading a dataset or a pretrained checkpoint. The point is to see training work end to end. It says nothing about benchmarks or how a model generalizes.
+The blocks below form one script, `train.py`.
 
-## Prepare a batch
-
-Create `train.py` and add the blocks below in order. Together they make one complete script.
+## Data
 
 ```python
 import itertools
@@ -28,15 +26,22 @@ data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
                records=32, batch=32)
 ```
 
-Each array has shape `(32, 1)`. The first dimension is the batch, and the second holds one feature or one target. Both arrays are float32. The mean squared error has the units of the target squared, and here the target has no units.
+A batch is a dictionary of arrays whose first dimension is the batch. Here `x` and `y` are float32 arrays of shape `(32, 1)`.
 
-`Dataset` takes functions that open iterators. Its `train` function returns this one batch repeated forever. `records=32` is the number of training examples, and `batch=32` is the global batch size. `val=None` means there is no validation split. A real dataset needs separate training and validation records. Repeating one batch only shows that the optimizer works.
+`Dataset` holds functions that open iterators, not the iterators themselves:
 
-## Define initialization and loss
+| Argument | Meaning |
+|---|---|
+| `train` | `train(partition)` returns an iterator of training batches. This one repeats the same batch forever. |
+| `val` | The same for validation batches, or `None` for no validation. |
+| `records` | The number of training examples. |
+| `batch` | The global batch size. |
 
-A Flax Linen module describes a computation. It does not hold its variables. `model.init(key, sample_input)` creates the variables, and `model.apply(variables, input)` computes a prediction with them.
+Repeating one batch is enough to check that optimization works. A real run reads different batches and holds out validation records; [Training data](concepts/data.md) covers both.
 
-An `Objective` says how to initialize the variables and which loss statistics to differentiate:
+## Objective
+
+A Flax Linen module describes a computation and holds no variables. `model.init(key, sample)` creates the variables, and `model.apply(variables, inputs)` runs the computation with them. An `Objective` connects a model to the trainer: `init` returns the variables and `loss` returns the quantity to minimize.
 
 ```python
 class Regression(Objective):
@@ -59,11 +64,16 @@ model = nn.Dense(features=1)
 objective = Regression(model)
 ```
 
-`nn.Dense(features=1)` learns a weight matrix and a bias. With this input shape they are the slope and the intercept of the line. The sample passed to `init` tells Flax there is one input feature. It does not fix the batch size to one for training.
+`nn.Dense(features=1)` has a `(1, 1)` kernel and a bias: the slope and the intercept of the line. The sample passed to `init` sets the number of input features. It does not fix the batch size.
 
-`loss` receives the full Flax variables tree, a batch, and a `Step`. It returns a `Mean(total, mass)` and an `Aux` holding training metrics. Dew adds up the totals and the masses over an accumulation window, and only then divides to get the gradient. Here the mass is the number of squared-error elements. Other objectives choose their own mass, so it is not always the batch size. `step.step` counts accepted microbatches, and `step.key` is the random key for the current attempt. This loss is deterministic, so it uses neither.
+`loss(variables, batch, step)` returns two values:
 
-## Optimize the parameters
+- `Mean(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. Here the mass is the number of squared errors.
+- `Aux(metrics=...)`, scalars to log. `mean_loss` turns a `Mean` into its value.
+
+`step` is a `Step`: `step.step` counts accepted microbatches and `step.key` is a fresh random key for this attempt. This loss is deterministic and uses neither.
+
+## Training
 
 ```python
 trainer = Trainer(objective, optax.sgd(learning_rate=0.1),
@@ -71,13 +81,11 @@ trainer = Trainer(objective, optax.sgd(learning_rate=0.1),
 state = trainer.fit(data, steps=100, log_every=50)
 ```
 
-The Optax optimizer here is plain stochastic gradient descent. `Trainer` initializes the variables, places them on the visible device mesh, compiles the training step, and reads batches. The first call includes compilation, so its time does not tell you the steady-state speed.
+`Trainer` takes the objective, an Optax optimizer and a JAX random key. The key fixes the initialization and every random draw during training. `fit` initializes the variables, places them on the device mesh, compiles one training step with `jax.jit` and runs it until the step counter reaches `steps`. It logs the loss every `log_every` steps. This call writes no checkpoints, since the trainer has no `Checkpoints`, and runs no validation, since `eval_every` is not set.
 
-The key fixes the initialization and the random stream used during training. In JAX a key is an explicit value. If your loss is random, split `step.key` into one key per random operation. Using the same key twice gives the same random draw twice.
+[Key concepts](key-concepts.md) shows the order of work inside `fit`.
 
-This run uses no gradient accumulation and no dynamic loss scaling. `steps=100` is the step to stop at. The loop prints the training loss every 50 steps. It writes no checkpoints because we did not pass a `Checkpoints` object, and it runs no validation because `eval_every` is not set.
-
-## Inspect the result
+## Result
 
 ```python
 prediction = model.apply(state.params, x)
@@ -86,20 +94,27 @@ print(f"Final mean squared error: {mse:.6f}")
 assert mse < 1e-4
 ```
 
-Run the file:
-
 ```bash
 JAX_PLATFORMS=cpu python train.py
 ```
 
-When I ran it, it printed a loss of about `0.0002` at step 50 and `Final mean squared error: 0.000000` after step 100. You may see small differences on another backend or with other library versions. The assertion checks that the model learned the line, and it allows for those differences.
+```text
+Training Dense from step 0 to 100: 2 parameters, on 1 × cpu, batch 32, float32
+step  50/100  loss 2.228e-04  mse 2.228e-04  step_time_ms 0.5490  samples_per_sec 58,283  accepted 100.0%
+step 100/100  loss 1.416e-07  mse 1.416e-07  step_time_ms 0.5323  samples_per_sec 60,117  accepted 100.0%
+Trained 100 steps in 0:00:00: first step after 0.20 s, then 2009.5 step/s
+20.0% of the wall time in steps, final loss 1.416e-07
+Final mean squared error: 0.000000
+```
 
-`state.step` counts attempts, `state.microstep` counts accepted microbatches, and `state.updates` counts optimizer updates. `TrainState` also holds the variables, the optimizer state, the root key, the optional EMA, the loss-scaler history, and any unfinished accumulation window. Pass `state.params` to `model.apply`. This objective asks for no EMA, so `state.averaged` raises an error.
+The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. Other backends and library versions print slightly different numbers.
 
-## Adapt the example
+`fit` returns a `TrainState`. `state.params` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
 
-For a model with several input features, give the batch shape `(batch_size, features)` and the initialization sample shape `(1, features)`. Keep the target and prediction shapes compatible in the loss. For a nonlinear model, replace `nn.Dense` with your own Linen module. The data and the objective still have to agree on field names, shapes, and dtypes.
+## Changing the example
 
-If your data changes between steps, return an iterator over your batches instead of `itertools.repeat`. To resume from a checkpoint, that iterator must be able to save and restore its position. [Supplying training data](concepts/data.md) and [resuming training](guides/checkpoints.md) explain what it needs.
+- More input features: give the batch shape `(batch_size, features)` and the `init` sample shape `(1, features)`.
+- A nonlinear model: replace `nn.Dense` with your own Linen module. The batch fields and the objective must still agree on names, shapes and dtypes.
+- Changing data: return an iterator over your batches instead of `itertools.repeat`. To resume from a checkpoint the iterator must save and restore its position; see [Training data](concepts/data.md) and [Checkpoints](guides/checkpoints.md).
 
-Next, read [writing a custom objective](concepts/objectives.md) for state and evaluation, or [language models](concepts/language_models.md) for a built-in objective that takes tokenized input.
+[Custom objectives](concepts/objectives.md) adds evaluation and state to an objective. [Language models](concepts/language_models.md) uses a built-in objective on tokenized text.

@@ -1,10 +1,10 @@
-# Train a representation model with JEPA
+# JEPA
 
-This guide assumes you have done the [first training run](../getting-started.md) and know what image patches are. JEPA trains an encoder by predicting the representations of hidden image regions from the visible ones. The training target is an encoded representation. It is not a pixel reconstruction or a next-token label.
+`JepaObjective` trains an image or video encoder with a joint-embedding predictive architecture (I-JEPA, V-JEPA): a predictor estimates the representations of masked regions from the visible ones, and the targets come from an exponential moving average of the encoder. The loss is measured in representation space, not on pixels or tokens.
 
-## Run a small image example
+## Example
 
-This example trains for three steps on synthetic images. It shows how to build and optimize the objective; three steps will not learn useful representations.
+Three training steps on synthetic images; this shows the API and does not learn useful representations.
 
 ```python
 import itertools
@@ -34,20 +34,26 @@ assert state.ema is not None
 print("Completed three JEPA training steps.")
 ```
 
-The 16×16 images and 4×4 patches give a 4×4 grid of patches. The predictor's `grid` must match the encoder's patch geometry. The mask picks target regions on that grid. Some combinations of area and aspect ratio leave no block that fits, and the mask raises an error for them.
+16×16 images with 4×4 patches give a 4×4 grid. The predictor's `grid` must match the encoder's patch grid, and `multi_block_mask` picks target blocks on that grid; a combination of `scale` and aspect ratio that leaves no block that fits raises an error.
 
-The context encoder reads the visible patches. The predictor takes the context and the target positions and estimates the representations of the hidden regions. The target encoder is an exponential moving average of the context encoder's variables, and gradients do not flow through the targets. The target copy takes memory, so count it when you estimate memory use.
+| Part | Role |
+|---|---|
+| Context encoder (`encoder`) | Encodes the visible patches; trained by the optimizer |
+| Predictor (`predictor`) | Estimates the representations of the target blocks from the context and the target positions |
+| Target encoder | The EMA copy of the context encoder (`state.ema`); encodes the whole image, with no gradient |
 
-## Interpret the training signals
+The target encoder is a second copy of the encoder's weights and counts toward memory.
 
-The training loss is the prediction error in representation space. A low loss does not mean the embeddings are useful: if the representations collapse, unrelated images get similar embeddings and the loss can still be low. To help you catch that, the objective reports representation statistics: `repr_std`, the per-dimension standard deviation across the batch, and `repr_cov_offdiag`, the size of the off-diagonal covariance.
+## Metrics
 
-To judge the representations on a downstream task, use held-out labeled examples and a probe. Supply validation data and set `eval_every`; passing metrics alone does not turn validation on. [Evaluation and tracking](evaluation.md) explains how artifacts are reduced to metrics and how trackers behave.
+The loss is the prediction error in representation space. A low loss does not show that the representations are useful: collapsed representations, where unrelated images map to similar embeddings, can also have a low loss. The objective therefore logs two statistics of the representations: `repr_std`, the per-dimension standard deviation across the batch, and `repr_cov_offdiag`, the magnitude of the off-diagonal covariance.
 
-## Adapt the model and data
+A downstream result needs held-out labeled examples and a probe, run as validation with `eval_every` and `metrics`. [Evaluation and tracking](evaluation.md) describes how evaluation artifacts become metrics.
 
-Replace the repeated synthetic batch with a dataset whose images match the declared sample shape. Change the patch size and the predictor grid together. When you change the encoder and predictor widths, remember that the predictor reads the encoder's output width and also has its own internal width.
+## Changing the model and data
 
-`JepaObjective` also trains on video when the sample field has shape `(T, H, W, C)`; `models.JepaVideoEncoder` is the matching encoder. Video uses time as well as space, so the video tensors, patch geometry, masks and predictor all have to agree. Read the video path of `recipes/jepa/train.py` before you reuse an image configuration.
+The dataset's images must match the declared sample shape, and the patch size and predictor grid change together. The predictor reads the encoder's output width (`emb_features`) and has its own internal width (`predictor_features`).
 
-JEPA only learns representations. It does not give you a planner, a tool-use policy, a reward function or an agent runtime; those need their own training objectives and evaluation. Agentic post-training in general is still part of Dew's research and design work.
+`JepaObjective` trains on video when the sample field has shape `(T, H, W, C)`, with `models.JepaVideoEncoder` as the encoder. The video tensors, the spatio-temporal patch geometry, the masks and the predictor must agree; the video path of `recipes/jepa/train.py` is a complete configuration.
+
+The [I-JEPA tutorial](../tutorials.md) trains an encoder on real images and probes it.
