@@ -17,7 +17,7 @@ import pyte
 from capture_snippets import DATA, DimScreen, terminal_cells
 
 
-def frames_from_cast(cast: str, count: int = 97) -> dict:
+def frames_from_cast(cast: str, count: int = 41) -> dict:
     records = [json.loads(line) for line in cast.splitlines() if line.strip()]
     header, events = records[0], records[1:]
     if header.get("version") != 2 or not events:

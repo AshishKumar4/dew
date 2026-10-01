@@ -12,6 +12,7 @@ import framework from '../../snippets/framework.py?raw';
 import samplerCell from '../data/sampler.py?raw';
 import samplerSetup from '../data/sampler_setup.py?raw';
 import textCell from '../data/text.py?raw';
+import textRecording from '../data/text-recording.json';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
 import '../styles/landing.css';
@@ -84,16 +85,15 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Pretrained models</h2>
 			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
-			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
-			<Code code={snippet('pretrained-source', 'pretrained', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
-			<pre class="shown-output">{`${records.pretrained.result.text.join('\n')}\n${records.pretrained.result.steps} fine-tuning step; exported the config and sharded safetensors weights.`}</pre>
+			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
+			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
+			<pre class="shown-output">export/config.json{'\n'}export/model.safetensors.index.json</pre>
 			<p class="framework-note"><a href="/reference/models/">Supported families</a>: Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders.</p>
 		</section>
 
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">A process defines the noise, times and training target. A solver walks that process at generation time; it can change without retraining.</p>
-			<Code code={snippet('sample-public')} lang="python" title="framework.py" />
 			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<Code code={snippet('diffusion')} lang="python" title="Define and train a DiT" />
 			<p class="framework-note">A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>

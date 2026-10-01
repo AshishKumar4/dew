@@ -176,10 +176,10 @@ def pretrained(out, smoke):
     # End snippet: pretrained-source
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
-    # Begin snippet: pretrained
+    # Begin snippet: finetune-load
     bundle = load_pretrained(source, dtype="bfloat16", max_seq_len=128)
+    # End snippet: finetune-load
     task = bundle.text_generation(sampling=Sampling(temperature=0))
-    # End snippet: pretrained
     if smoke:
         task = replace(task, processor=RunProcessor(ByteTokenizer()))
         prompt = np.load(ROOT / "tests/fixtures/hf/qwen3-tiny/input_ids.npy")[:1, :8]
@@ -188,8 +188,8 @@ def pretrained(out, smoke):
         prompt = "The capital of France is"
         training_tokens = np.asarray(bundle.processor("The capital of France is Paris.").tokens[:, :9], np.int32)
     data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}), val=None, records=1, batch=1)
-    # Begin snippet: finetune
     text = task(prompt, 12, seed=0).text
+    # Begin snippet: finetune
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
