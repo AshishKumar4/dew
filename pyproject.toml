@@ -13,8 +13,9 @@ authors = [
 ]
 dependencies = [
     # flax.nnx imports on jax 0.11.2 from 0.12.10 on (jax.experimental.hijax's
-    # HiPrim; qwix imports nnx).
-    "flax>=0.12.10",
+    # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
+    # arrives through a bump the suite checks, as jax does below.
+    "flax>=0.12.10,<0.13",
     # 0.11.2, whose accelerator builds the cuda12, cuda13 and tpu extras name;
     # <0.11.3 admits the post releases of the build constraints.txt names.
     # That build carries the multi-process cache-key fix (jax-ml/jax#40940),

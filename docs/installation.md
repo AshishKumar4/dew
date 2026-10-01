@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or later from PyPI. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
+This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release from PyPI. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
 
 The plain install runs JAX on the CPU, which is enough for the [Quickstart](getting-started.md).
 
