@@ -199,7 +199,7 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: int = 2
-    best: BestConfig | None = None
+    best: str | BestConfig | tuple[BestConfig, ...] | None = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
@@ -252,6 +252,25 @@ class TrainerConfig:
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
+        if self.best is not None:
+            choices = self.best if isinstance(self.best, (tuple, list)) else (self.best,)
+            rebuilt = []
+            for choice in choices:
+                if isinstance(choice, str):
+                    choice = BestConfig(choice)
+                elif isinstance(choice, Mapping):
+                    choice = _built(BestConfig, choice)
+                if not isinstance(choice, BestConfig):
+                    raise TypeError("a recorded best selector names metrics; callable scores are code-only")
+                rebuilt.append(choice)
+            object.__setattr__(self, 'best', tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0])
+
+    def best_policies(self, metrics):
+        if self.best is None:
+            return None
+        policies = (BestConfig(self.best),) if isinstance(self.best, str) else (
+            self.best if isinstance(self.best, tuple) else (self.best,))
+        return tuple(policy.build(metrics) for policy in policies)
 
     def total_steps(self, dataset: Dataset) -> int:
         """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
@@ -643,7 +662,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
-                best=None if trainer.best is None else trainer.best.build(metrics),
+                best=trainer.best_policies(metrics),
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""

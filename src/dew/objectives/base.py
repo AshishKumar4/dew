@@ -141,9 +141,9 @@ class Shown:
 
 
 @dataclass(frozen=True)
-class TrainingScalar:
+class TrainingScalar[Statistics, Additions]:
     """An objective-owned training report selected for ranking or stopping."""
-    owner: Objective
+    owner: Objective[Statistics, Additions]
     name: str
     shown: Shown
 
@@ -311,7 +311,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
-    def scalar(self, name: str) -> TrainingScalar:
+    def scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
         """Select a declared training scalar; `objective.loss` selects the loss itself."""
         if name != 'loss' and name not in self.shown:
             raise ValueError(f"the objective does not declare training scalar {name!r}")

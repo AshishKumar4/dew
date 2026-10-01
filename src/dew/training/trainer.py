@@ -523,6 +523,7 @@ class _FitRun:
     last_checkpoint: float = 0.0
     stop_control: dict = dataclasses.field(default_factory=dict)
     stopped: bool = False
+    training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     tracing: bool = False
@@ -1373,6 +1374,7 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, steps, checkpoints = run.current, plan.steps, self.checkpoints
+        run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval)
@@ -1462,6 +1464,8 @@ class Trainer(Generic[Loss, Effects]):
             loss.block_until_ready()
         if plan.validation and run.preempted is None and not run.stopped:
             run.evaluation = self._evaluation(plan, state, shardings)
+            run.evaluation = dataclasses.replace(run.evaluation, scores={**run.evaluation.scores,
+                **{name: float(value) for name, value in run.training.items()}})
             run.other += run.evaluation.elapsed_seconds
             if self._plateau(plan, run, run.evaluation.scores):
                 run.stopped = True
@@ -1513,6 +1517,8 @@ class Trainer(Generic[Loss, Effects]):
         metric = selection.metric
         if isinstance(metric, TrainingScalar):
             if selection.mode is None:
+                if metric.shown.better is None:
+                    raise ValueError("training scalar has no declared direction; use Best(scalar, mode=...)")
                 selection = dataclasses.replace(selection, mode='max' if metric.shown.better == 'higher' else 'min')
             return dataclasses.replace(selection, split='train')
         if isinstance(metric, (Metric, TrainingScalar)):
@@ -1567,10 +1573,13 @@ class Trainer(Generic[Loss, Effects]):
         value = scores[name] if stop.mode == 'min' else -scores[name]
         key = f'plateau:{name}'
         held = run.stop_control.get(key)
+        rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}
+        if held is not None and held.get('rule') != rule:
+            raise ValueError("Plateau policy differs from the resumed checkpoint; resume with the same stopping rule")
         if held is not None and held.get('step') == run.current:
             return held['bad'] >= stop.evals
         if held is None or value < held['best'] - stop.min_delta:
-            run.stop_control[key] = {'best': value, 'bad': 0, 'step': run.current}
+            run.stop_control[key] = {'best': value, 'bad': 0, 'step': run.current, 'rule': rule}
             return False
         held['bad'] += 1
         held['step'] = run.current

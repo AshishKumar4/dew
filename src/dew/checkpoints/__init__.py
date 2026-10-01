@@ -169,6 +169,7 @@ class Kept:
     metrics: Mapping[str, float]
     ranked_by: str | None
     mode: str | None
+    kind: str = 'state'
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
 
 
@@ -576,6 +577,7 @@ class Checkpoints:
         self.directory = str(location(directory))
         self.keep = Keep(latest=keep) if isinstance(keep, int) else keep
         self._rank_limits: dict[str, int] = {}
+        self._rank_modes: dict[str, str] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         self._manager = None
@@ -601,7 +603,7 @@ class Checkpoints:
             metadata = persistent.metadata(step)
             custom = metadata.custom_metadata or {}
             selection = next(iter((custom.get('rankings') or {}).values()), {})
-            kept.append(Kept(step, metadata.metrics or {}, custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), custom.get('rankings') or {}))
+            kept.append(Kept(step, metadata.metrics or {}, custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), 'weights' if custom.get('weights_only') else 'state', custom.get('rankings') or {}))
         return kept
 
     def control(self, step: int) -> dict:
@@ -610,12 +612,19 @@ class Checkpoints:
 
     def _best_step(self, name: str | None) -> int | None:
         candidates = []
-        for checkpoint in self.kept():
-            custom = self._open().metadata(checkpoint.step).custom_metadata or {}
-            selected = name or custom.get('primary') or next(iter(custom.get('rankings') or {}), None)
-            key = 'loss' if selected is None else f'checkpoint/rank/{selected}'
+        retained = self.kept()
+        if name is None:
+            for checkpoint in reversed(retained):
+                custom = self._open().metadata(checkpoint.step).custom_metadata or {}
+                if custom.get('primary'):
+                    name = custom['primary']
+                    break
+        key = 'loss' if name is None else f'checkpoint/rank/{name}'
+        for checkpoint in retained:
             if key in checkpoint.metrics:
                 candidates.append((checkpoint.metrics[key], checkpoint.step))
+            elif name == 'train/loss' and 'loss' in checkpoint.metrics:
+                candidates.append((checkpoint.metrics['loss'], checkpoint.step))
         return min(candidates)[1] if candidates else None
 
     def resolve(self, step: int | str | None) -> int | None:
@@ -647,6 +656,7 @@ class Checkpoints:
                     self._profile_snapshots.add(step)
                 for name, rule in (custom.get('rankings') or {}).items():
                     self._rank_limits[name] = rule['top']
+                    self._rank_modes[name] = rule['mode']
         return self._manager
 
     @property
@@ -767,6 +777,10 @@ class Checkpoints:
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = {}
         for rank in rankings:
+            previous = self._rank_modes.get(rank.metric)
+            if previous is not None and previous != rank.mode:
+                raise ValueError(f"ranking direction for {rank.metric!r} differs from this run's checkpoints")
+            self._rank_modes[rank.metric] = rank.mode
             self._rank_limits[rank.metric] = rank.top
             if math.isfinite(rank.value):
                 scores[f'checkpoint/rank/{rank.metric}'] = rank.value if rank.mode == 'min' else -rank.value
