@@ -41,8 +41,10 @@ forward-mode and higher-order derivatives. CUDA retains cuDNN at dilation
 one, which is faster on the RTX 4080. Other backends retain lax.
 `tools/benchmark_depthwise.py` measures each path's
 forward and backward separately, as well as the hybrid DiT training step.
-Qwix-wrapped models (QT and PTQ, weight-only included) keep its provider's
-lax convolutions and therefore do not get this depthwise speedup.
+Under Qwix quantization (`dew.training.quantization`) a convolution that a
+rule quantizes goes through Qwix's provider, which computes it with lax, and
+so does not get this depthwise speedup; one that no rule quantizes, such as
+an excluded or weight-only one, computes here as unwrapped.
 """
 
 import math
