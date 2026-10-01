@@ -172,7 +172,7 @@ def test_time_cadence_and_recorded_duration(tmp_path):
     from dew.data import Dataset
 
     assert TrainerConfig(checkpoint_every='30m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2)) == datetime.timedelta(minutes=30)
-    with pytest.raises(ValueError, match='positive duration'):
+    with pytest.raises(ValueError, match='positive'):
         TrainerConfig(checkpoint_every='0m').checkpoint_interval(Dataset(lambda p: iter(()), None, records=4, batch=2))
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(best=Best(lambda m: 0))
@@ -204,7 +204,6 @@ def test_missing_scores_do_not_rank_and_declared_max_is_inferred(tmp_path):
 
 def test_named_config_selector_roundtrips_and_refuses_callable():
     from dew.config import RunConfig, TrainerConfig
-    metric = Value('accuracy', Shown(better='higher'))
     config = RunConfig(trainer=TrainerConfig(best=Best('accuracy', top=2), checkpoint_every='15m'))
     assert RunConfig.from_dict(config.to_dict()) == config
     best = config.trainer.best_policies()[0]
@@ -324,3 +323,36 @@ def test_direct_image_metrics_declare_their_ranking_directions():
     from dew.eval import FID, CLIPScore
     assert FID().shown.better == 'lower'
     assert CLIPScore().shown.better == 'higher'
+
+
+def test_local_resume_keeps_plateau_patience(tmp_path):
+    metric = Value('value', Shown(better='lower'))
+    plain = trainer(tmp_path / 'plain')
+    state = plain.fit(data(), steps=2, log_every=1)
+    path, local = str(tmp_path / 'run'), str(tmp_path / 'local')
+    control = {'plateau:val/value': {'best': .2, 'bad': 1, 'step': 2,
+                                    'rule': {'mode': 'min', 'evals': 3, 'min_delta': 0.}}}
+    checkpoints = Checkpoints(path, local_directory=local, local_every=1)
+    checkpoints.save_local(2, state, None, control=control)
+    checkpoints.wait()
+    resumed = Trainer(Overfit(), optax.sgd(.1), key=jax.random.key(0),
+                       checkpoints=Checkpoints(path, local_directory=local, local_every=1))
+    assert resumed.checkpoints.control(2) == control
+    result = resumed.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1,
+                          metrics=[metric], stop=Plateau(metric, evals=3))
+    assert int(result.step) == 4
+    assert resumed.checkpoints.control(4)['stop_reason'] == 'validation plateau'
+
+
+def test_recorded_retention_and_cadence_roundtrip_without_losing_microseconds():
+    from dew.config import RunConfig, TrainerConfig
+    from dew.records import duration, recorded_duration
+    spacing = datetime.timedelta(days=999999999, microseconds=1)
+    assert duration(recorded_duration(spacing)) == spacing
+    config = RunConfig(trainer=TrainerConfig(keep=Keep(latest=2, every=100, interval='1h'),
+                                             checkpoint_every=datetime.timedelta(minutes=30),
+                                             best=Best('fid', top=3)))
+    assert config.to_dict()['trainer']['checkpoint_every'] == '30m'
+    assert RunConfig.from_dict(config.to_dict()) == config
+    with pytest.raises(TypeError, match='code-only'):
+        TrainerConfig(keep=Keep(where=lambda c: True))

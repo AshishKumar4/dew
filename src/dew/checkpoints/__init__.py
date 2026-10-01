@@ -52,6 +52,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position
 from dew.objectives.base import Variables
+from dew.records import duration
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -137,13 +138,16 @@ class Keep:
     """
     latest: int = 2
     every: int | None = None
-    interval: datetime.timedelta | None = None
-    where: Callable[[Kept], bool] | None = None
+    interval: datetime.timedelta | str | None = None
+    where: Callable[[Kept], bool] | None = dataclasses.field(default=None, metadata={'record': False})
 
     def __post_init__(self):
         if self.latest < 0 or (self.every is not None and self.every < 1):
             raise ValueError("Keep needs latest >= 0 and every >= 1")
-        if self.interval is not None and self.interval.total_seconds() <= 0:
+        if isinstance(self.interval, str):
+            object.__setattr__(self, 'interval', duration(self.interval))
+        interval = duration(self.interval) if isinstance(self.interval, str) else self.interval
+        if interval is not None and interval.total_seconds() <= 0:
             raise ValueError("Keep.interval must be positive")
 
 
@@ -555,10 +559,11 @@ class _RankedSteps(preservation.PreservationPolicy):
             held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
         keep = self.checkpoints.keep
         previous = None
+        interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
         for checkpoint in sorted(checkpoints, key=lambda checkpoint: checkpoint.step):
             if keep.every and checkpoint.step % keep.every == 0:
                 held.add(checkpoint.step)
-            if keep.interval and (previous is None or checkpoint.time - previous >= keep.interval):
+            if interval and (previous is None or checkpoint.time - previous >= interval):
                 held.add(checkpoint.step)
                 previous = checkpoint.time
             if keep.where:
