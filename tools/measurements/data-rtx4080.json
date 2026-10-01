@@ -1,0 +1,215 @@
+{
+  "date": "2026-10-01",
+  "commands": {
+    "pipeline": "python tools/benchmark_image_pipeline.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 512 --repeats 3 --batch 32 --steps 60 --threads 4 --out image-pipeline.json",
+    "image_sft": "python examples/sft_diffusion_gemma_images.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --smoke --out runs/flowers-caption-smoke",
+    "masked_lm": "python examples/train_masked_lm.py --tokens /mnt/scratch/dew/tmp/dataaug-wikitext --smoke --out runs/masked-lm-smoke",
+    "augmentation_parity": "JAX_PLATFORMS=cuda python tools/benchmark_image_pipeline.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 3 --repeats 1 --decoder-only"
+  },
+  "augmentation_parity": {
+    "device": "NVIDIA GeForce RTX 4080",
+    "dtype": "float64",
+    "cases": 18,
+    "maximum_absolute_error": 0.000006542277986909539,
+    "maximum_uint8_code_error": 0,
+    "bound": 0.00024318695068359375
+  },
+  "pipeline": {
+    "hardware": {
+      "cpu": "12th Gen Intel(R) Core(TM) i9-12900K",
+      "device": "NVIDIA GeForce RTX 4080"
+    },
+    "versions": {
+      "jax": "0.11.2.post3",
+      "opencv": "5.0.0",
+      "tfds": "4.9.10",
+      "pillow": "11.3.0",
+      "torchvision": "0.29.0+cpu"
+    },
+    "images": 512,
+    "corpus_sha256": "e316cecae63e97ddc542ee047777dd092a53faf64737db12b053df7d20188106",
+    "config": {
+      "flowers": "/home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1",
+      "images": 512,
+      "repeats": 3,
+      "image_size": 128,
+      "batch": 32,
+      "steps": 60,
+      "warmup": 5,
+      "threads": 4,
+      "decoder_only": false,
+      "training": true
+    },
+    "decoders": {
+      "opencv_full": {
+        "images_per_second": 613.3364887647463,
+        "seconds": [
+          0.7975884469924495,
+          0.8347783139906824,
+          1.0541897290095221
+        ],
+        "max_pixel_error_vs_full_cv2": 0
+      },
+      "opencv_reduced": {
+        "images_per_second": 760.6947421855347,
+        "seconds": [
+          0.6869583909865469,
+          0.632102005998604,
+          0.6730689350224566
+        ],
+        "max_pixel_error_vs_full_cv2": 56
+      },
+      "pillow": {
+        "images_per_second": 554.0357146268079,
+        "seconds": [
+          0.952961431001313,
+          0.9241281500144396,
+          0.9199939009849913
+        ],
+        "max_pixel_error_vs_full_cv2": 0
+      },
+      "tfds_numpy": {
+        "images_per_second": 614.3069629525756,
+        "seconds": [
+          0.8334595420164987,
+          0.7695822720124852,
+          0.8680419019947294
+        ],
+        "max_pixel_error_vs_full_cv2": 0
+      },
+      "torchvision": {
+        "images_per_second": 645.746251314318,
+        "seconds": [
+          0.6979865029861685,
+          0.7928811029996723,
+          1.0100137190020178
+        ],
+        "max_pixel_error_vs_full_cv2": 0
+      }
+    },
+    "pipeline": {
+      "host_flip_jitter": {
+        "images_per_second": 1097.3596201497294,
+        "wall_seconds": [
+          1.7496543200104497,
+          1.8174932769907173,
+          1.4952555259806104
+        ],
+        "host_cpu_seconds": [
+          3.957335928999999,
+          4.059320193000001,
+          3.838865155999997
+        ],
+        "host_cpu_ms_per_batch": 65.95559881666665
+      },
+      "device_flip_jitter": {
+        "images_per_second": 1681.221883044418,
+        "wall_seconds": [
+          1.0917854660074227,
+          1.1923034049978014,
+          1.1420265340129845
+        ],
+        "host_cpu_seconds": [
+          3.062407646000004,
+          2.832071853000002,
+          2.7212073930000003
+        ],
+        "host_cpu_ms_per_batch": 47.20119755000004
+      },
+      "host_crop_flip_jitter": {
+        "images_per_second": 997.7318919572472,
+        "wall_seconds": [
+          2.1720599189866334,
+          1.924364666978363,
+          1.6525294409948401
+        ],
+        "host_cpu_seconds": [
+          5.042981074000004,
+          5.037156814999996,
+          4.834282969999997
+        ],
+        "host_cpu_ms_per_batch": 83.95261358333326
+      },
+      "device_crop_flip_jitter": {
+        "images_per_second": 2001.5092922674767,
+        "wall_seconds": [
+          0.9592760860105045,
+          0.8760388280206826,
+          1.2280610149900895
+        ],
+        "host_cpu_seconds": [
+          2.8790436509999964,
+          2.801664267999996,
+          3.146261000999999
+        ],
+        "host_cpu_ms_per_batch": 47.98406084999994
+      }
+    },
+    "training": {
+      "host": {
+        "images_per_second": 575.1105522535045,
+        "wall_seconds": [
+          3.366887977026636,
+          3.2782181949878577,
+          3.3384885609848425
+        ],
+        "final_loss": 0.3909294009208679,
+        "model": "SimpleDiT patch=16 width=32 layers=1 heads=4 fp32/HIGHEST",
+        "updates": 185
+      },
+      "device": {
+        "images_per_second": 873.5543694893391,
+        "wall_seconds": [
+          2.045741353998892,
+          2.1979170010017697,
+          2.3485041789826937
+        ],
+        "final_loss": 0.3970515727996826,
+        "model": "SimpleDiT patch=16 width=32 layers=1 heads=4 fp32/HIGHEST",
+        "updates": 185
+      }
+    }
+  },
+  "image_sft": {
+    "dataset": "oxford_flowers102/train",
+    "records": 1020,
+    "device": "NVIDIA GeForce RTX 4080",
+    "steps": 8,
+    "updates": 8,
+    "probe_sft_before": 11.582350730895996,
+    "probe_sft_after": 7.6400346755981445,
+    "changed_image_sft": 8.163664817810059,
+    "vision_parameter_max_delta": 0.007637426257133484,
+    "captions": [
+      "� -��x��oae\u0017�q2:�\u000b�oKq\u000f{��p��oiefOaao\\o�  ��� \u0000� ���љ��",
+      "c+aDD  [�etoi4՜ \naza Ա� a "
+    ],
+    "released_26b_qualified": false
+  },
+  "masked_lm": {
+    "corpus": "/mnt/scratch/dew/tmp/dataaug-wikitext",
+    "train_tokens": 1984069,
+    "device": "NVIDIA GeForce RTX 4080",
+    "steps": 8,
+    "updates": 8,
+    "probe_nelbo_before": 5.502782821655273,
+    "probe_nelbo_after": 4.17817497253418,
+    "sample": "Once upon a time}i��_\u0017ud� T�m\u0012 �\rW8dt�/B�s9 ��\u0018c"
+  },
+  "validation": {
+    "gpu": "32 tests passed in 47.05s: tests/test_device_image_augmentation.py tests/test_real_data_examples.py; three targeted RNG/worker tests passed in 4.73s after pinning data draws to fp32/int32",
+    "float64_draw_invariance": "CPU and GPU tests pass; an unpinned-uniform mutation fails",
+    "gates": {
+      "ruff": 0,
+      "lint_slop": 0,
+      "pyright": 0
+    }
+  },
+  "notes": [
+    "The CUDA autotuner emitted a delay-kernel timing warning during compilation. Timings use synchronized wall clock after compilation and warmup.",
+    "Full-resolution decoders agree byte-for-byte on this corpus; the existing reduced OpenCV JPEG decode differs by at most 56 pixel codes here.",
+    "Eight-update samples demonstrate the workflow, not text or caption quality.",
+    "The released 26B DiffusionGemma qualification remains separate and was not run.",
+    "No datasets or model weights were downloaded; existing Flowers and WikiText-103 caches were reused."
+  ]
+}
