@@ -16,6 +16,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import math
 import sys
 import time
 import types
@@ -93,6 +94,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.runtime import Preempted, PreemptionNotice
+from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Transaction, compact_qk, with_ema
@@ -432,21 +434,6 @@ def recompute_more(objective) -> bool:
 
 
 @dataclasses.dataclass(frozen=True)
-class Best:
-    """Rank evaluations by a metric object or a custom score (lower by default)."""
-    metric: Metric | TrainingScalar | Callable[[Mapping[Metric | str, float]], float]
-    top: int = 1
-    mode: Literal['min', 'max'] | None = None
-    threshold: float | None = None
-    weights_only: bool = False
-    split: str | None = None
-
-    def __post_init__(self):
-        if self.top < 1 or self.mode not in (None, 'min', 'max'):
-            raise ValueError("Best needs top >= 1 and mode min or max")
-
-
-@dataclasses.dataclass(frozen=True)
 class Plateau:
     """Stop after `evals` eligible evaluations without an improvement larger than min_delta."""
     metric: Metric | TrainingScalar
@@ -456,7 +443,7 @@ class Plateau:
     split: str | None = None
 
     def __post_init__(self):
-        if self.evals < 1 or self.min_delta < 0:
+        if self.evals < 1 or self.min_delta < 0 or not math.isfinite(self.min_delta):
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
@@ -1169,7 +1156,7 @@ class Trainer(Generic[Loss, Effects]):
     def fit(self, dataset: Dataset, *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | datetime.timedelta | None = None,
             metrics: Sequence[Metric] = (), preview: bool = False,
-            best: Metric | TrainingScalar | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
+            best: str | Metric | TrainingScalar | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
             validation: Mapping[str, Reader] | None = None, restore_best: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
@@ -1487,7 +1474,7 @@ class Trainer(Generic[Loss, Effects]):
         splits = ('val',) if validation is None else tuple(validation)
         if not splits:
             raise ValueError("validation must contain a split")
-        raw = () if best is None else tuple(best) if isinstance(best, Sequence) else (best,)
+        raw = () if best is None else tuple(best) if isinstance(best, Sequence) and not isinstance(best, str) else (best,)
         def owned(choice):
             if isinstance(choice, types.MethodType):
                 if choice.__name__ == 'loss' and choice.__self__ is self.objective:
@@ -1496,7 +1483,7 @@ class Trainer(Generic[Loss, Effects]):
             if isinstance(choice, TrainingScalar) and choice.owner is not self.objective:
                 raise ValueError("training scalar belongs to a different objective")
             if isinstance(choice, Best):
-                return dataclasses.replace(choice, metric=owned(choice.metric))
+                return dataclasses.replace(choice, _source=owned(choice._source) if choice._source is not None else None)
             return choice
         selection = tuple(self._best_selection(owned(choice), metrics, splits) for choice in raw)
         if stop is not None:
@@ -1510,9 +1497,15 @@ class Trainer(Generic[Loss, Effects]):
         return selection, stop
 
     @staticmethod
-    def _best_selection(best: Metric | TrainingScalar | Best, metrics: Sequence[Metric], splits: Sequence[str] = ('val',)) -> Best:
+    def _best_selection(best: str | Metric | TrainingScalar | Best, metrics: Sequence[Metric], splits: Sequence[str] = ('val',)) -> Best:
         selection = best if isinstance(best, Best) else Best(best)
-        metric = selection.metric
+        metric = selection._source
+        if metric is None:
+            name = selection.metric.removeprefix((selection.split or 'val') + '/')
+            metric = next((declared for declared in metrics if declared.name == name), None)
+            if metric is None:
+                raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
+            selection = dataclasses.replace(selection, _source=metric)
         if isinstance(metric, TrainingScalar):
             if selection.mode is None:
                 if metric.shown.better is None:
@@ -1542,7 +1535,8 @@ class Trainer(Generic[Loss, Effects]):
             return (Ranking(name, scores[name]),) if name in scores else ()
         ranks = []
         for index, selection in enumerate(plan.best):
-            metric = selection.metric
+            metric = selection._source
+            assert metric is not None
             if isinstance(metric, (Metric, TrainingScalar)):
                 name = f'{selection.split}/{metric.name}'
                 value = scores.get(name, float('nan'))
@@ -1568,6 +1562,8 @@ class Trainer(Generic[Loss, Effects]):
         if name not in scores:
             return False
         value = scores[name] if stop.mode == 'min' else -scores[name]
+        if not math.isfinite(value):
+            return False
         key = f'plateau:{name}'
         held = run.stop_control.get(key)
         rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}

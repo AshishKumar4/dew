@@ -54,6 +54,7 @@ from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
 from dew.training.quantization import Quantization, quantize
+from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
@@ -171,35 +172,13 @@ class Wandb:
 
 
 @dataclasses.dataclass(frozen=True)
-class BestConfig:
-    """Recorded evaluation selector; callables belong in fit, not a run record."""
-    metric: str
-    top: int = 1
-    mode: Literal['min', 'max'] | None = None
-    threshold: float | None = None
-    weights_only: bool = False
-    split: str = 'val'
-
-    def __post_init__(self):
-        if not isinstance(self.metric, str):
-            raise TypeError("a recorded best selector names a metric; callable scores are code-only")
-
-    def build(self, metrics):
-        from dew.training.trainer import Best
-        metric = next((metric for metric in metrics if metric.name == self.metric.removeprefix(self.split + '/')), None)
-        if metric is None:
-            raise ValueError(f"best metric {self.metric!r} is not among the run's metrics")
-        return Best(metric, self.top, self.mode, self.threshold, self.weights_only, self.split)
-
-
-@dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: int = 2
-    best: str | BestConfig | tuple[BestConfig, ...] | None = None
+    best: str | Best | tuple[Best, ...] | None = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
@@ -257,10 +236,10 @@ class TrainerConfig:
             rebuilt = []
             for choice in choices:
                 if isinstance(choice, str):
-                    choice = BestConfig(choice)
+                    choice = Best(choice)
                 elif isinstance(choice, Mapping):
-                    choice = _built(BestConfig, choice)
-                if not isinstance(choice, BestConfig):
+                    choice = _built(Best, choice)
+                if not isinstance(choice, Best) or choice._source is not None:
                     raise TypeError("a recorded best selector names metrics; callable scores are code-only")
                 rebuilt.append(choice)
             object.__setattr__(self, 'best', tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0])
@@ -268,9 +247,8 @@ class TrainerConfig:
     def best_policies(self, metrics):
         if self.best is None:
             return None
-        policies = (BestConfig(self.best),) if isinstance(self.best, str) else (
+        return (Best(self.best),) if isinstance(self.best, str) else (
             self.best if isinstance(self.best, tuple) else (self.best,))
-        return tuple(policy.build(metrics) for policy in policies)
 
     def total_steps(self, dataset: Dataset) -> int:
         """Return the run's length in steps, from `steps` or from `epochs` over `data`."""

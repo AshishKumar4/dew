@@ -9,7 +9,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, VideoGrid
-from dew.objectives.base import Batch
+from dew.objectives.base import Batch, Shown
 
 
 @contextmanager
@@ -48,6 +48,7 @@ class ImageMetric:
     measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike]
     """One measurement per image or frame, never an already averaged scalar."""
     reads: type = ImageGrid
+    shown = Shown(better='higher')
 
     def __call__(self, artifact, batch) -> tuple[float, int]:
         with metric_device():
