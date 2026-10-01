@@ -63,6 +63,16 @@ def test_the_value_round_trips_through_json():
     assert _rebuild(Quantization, record) == spec
 
 
+def test_without_qwix_quantization_names_the_extra_that_installs_it(monkeypatch):
+    """Quantizing without Qwix installed raises naming `dewml[quantization]`,
+    where Python's own error named only the missing module."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "qwix", None)
+    with pytest.raises(ModuleNotFoundError, match=r"dewml\[quantization\]"):
+        apply_quantization(tiny(), Quantization())
+
+
 def quantized_forward(spec, **overrides):
     model = tiny(**overrides)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))

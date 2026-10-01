@@ -37,9 +37,9 @@ first two. Static activation scaling (`fp8_full`) needs a calibration pass
 Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
 quantization has no reader here since the cache holds the compute dtype.
 
-Qwix is not a dependency. The import sits inside the calls that need it,
-and without the package they raise naming it, the way the tokamax branch of
-`dew.nn.moe` behaves.
+Qwix comes with the `quantization` extra (`pip install "dewml[quantization]"`).
+The import sits inside the calls that need it, and without the package they
+raise naming the extra.
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ import functools
 import importlib
 import re
 from collections.abc import Callable, Sequence
+from types import ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -142,6 +143,18 @@ class Quantization:
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
 
+def _qwix(module: str = "qwix") -> ModuleType:
+    """Qwix's `module`, imported when a call needs it; without Qwix, an error
+    that names the extra which installs it."""
+    try:
+        return importlib.import_module(module)
+    except ModuleNotFoundError as error:
+        if error.name != "qwix":
+            raise
+        raise ModuleNotFoundError('quantization runs on Qwix; install it with pip install "dewml[quantization]"',
+                                  name="qwix") from error
+
+
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
     """Return `dtype` as the JAX dtype Qwix quantizes to."""
     return jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
@@ -221,7 +234,7 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     (`GroupScaledConvolution`); its matmuls keep Qwix's scaling, and whether
     a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
     measured."""
-    qarray = importlib.import_module("qwix._src.core.qarray")
+    qarray = _qwix("qwix._src.core.qarray")
 
     def scaled(*args: P.args, **kwargs: P.kwargs) -> jax.Array:
         operands = [arg for arg in args if isinstance(arg, qarray.QArray)]
@@ -250,11 +263,11 @@ def _providers() -> tuple[type, type]:
     the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
-    qwix = importlib.import_module("qwix")
-    conv_general = importlib.import_module("qwix._src.core.conv_general")
-    dot_general = importlib.import_module("qwix._src.core.dot_general")
-    einsum = importlib.import_module("qwix._src.core.einsum")
-    quantized = importlib.import_module("qwix._src.providers.ptq").WithAux
+    qwix = _qwix()
+    conv_general = _qwix("qwix._src.core.conv_general")
+    dot_general = _qwix("qwix._src.core.dot_general")
+    einsum = _qwix("qwix._src.core.einsum")
+    quantized = _qwix("qwix._src.providers.ptq").WithAux
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
         """Quantizes a grouped convolution's input with one scale per feature
@@ -348,7 +361,7 @@ def _rules(spec: Quantization, training: bool) -> list:
     """One Qwix rule per pattern of `spec`, in its order: quantized-training
     rules with the backward fields, or serving rules. A weight-only rule
     names the matmul ops alone (`Quantization.weight_only`)."""
-    qwix = importlib.import_module("qwix")
+    qwix = _qwix()
     rule, fields = qwix.QuantizationRule, {}
     if training:
         rule, fields = qwix.QtRule, {
@@ -373,7 +386,7 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     """
     rules = _rules(spec, training=True)
     methods = tuple(method for method in METHODS if hasattr(model, method))
-    return importlib.import_module("qwix").quantize_model(model, _providers()[0](rules), methods=methods)
+    return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
 
 
 def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantization,
@@ -395,7 +408,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     activations.
     """
     rules = _rules(spec, training=False)
-    qwix = importlib.import_module("qwix")
+    qwix = _qwix()
     methods = tuple(method for method in METHODS if hasattr(model, method))
     served = qwix.quantize_model(model, _providers()[1](rules), methods=methods)
     abstract = jax.eval_shape(functools.partial(served.init, jax.random.key(0), *args, **kwargs))

@@ -66,6 +66,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
+| `quantization` | Qwix, for quantized training and serving (`dew.training.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
 
 ```bash
@@ -79,7 +80,7 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-Qwix quantization and tokamax kernels have no extra; `uv pip install qwix` adds Qwix.
+tokamax kernels have no extra (`dew.nn.moe` says why).
 
 ## Development install
 

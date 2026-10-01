@@ -183,8 +183,8 @@ Set `ema_decay=None` to train without an averaged copy, then sample with `state.
 optimizer state stay fp32, so the optimizer still accumulates in full
 precision.
 
-For int8 quantization-aware training, install Qwix with `uv pip install qwix`
-and wrap the model before you construct the objective:
+For int8 quantization-aware training, install the `quantization` extra
+(`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
 
 ```python
 from dew.training.quantization import Quantization, apply_quantization
