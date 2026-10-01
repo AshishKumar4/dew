@@ -236,7 +236,10 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
-    fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
+    streaming = any('streaming' in run.variables for run in runs)
+    if streaming and train:
+        raise ValueError("disk streaming is inference-only")
+    fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              positions=positions, segment_ids=segment_ids, kv_store=kv_store,
@@ -249,9 +252,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         which a bank holds per layer.
         """
         return [name for name in run.variables
-                if not run.is_mutable_collection(name) or name not in WRITTEN]
+                if name != 'streaming' and (not run.is_mutable_collection(name) or name not in WRITTEN)]
 
-    def first_of(index: int):
+    def first_of(index: int, dependency):
         """Fetch run `index`'s first layer's read-only variables.
 
         Returns None past the last run: the copy nothing computes with is
@@ -259,10 +262,13 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         """
         if index >= len(runs):
             return None
+        reader = runs[index].variables.get('streaming', {}).get('bank')
+        if reader is not None:
+            return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
         return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
-    staged = first_of(0)
+    staged = first_of(0, x)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -278,13 +284,14 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
         cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
-            following = first_of(index + 1)
+            following = first_of(index + 1, x)
             x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
                 banks, staged, cached, x, inputs, layer, count,
-                following=functools.partial(first_of, index + 1))
+                following=functools.partial(first_of, index + 1),
+                reader=run.variables.get('streaming', {}).get('bank'))
         staged = following
         for collection, tree in changed.items():
             for name, value in tree.items():
@@ -292,7 +299,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following):
+def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following, reader=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already in device memory.
@@ -311,7 +318,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     """
     def body(carry, index):
         hidden, current, held = carry
-        staged = _fetched_layer(banks, index + 1)
+        staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
@@ -321,7 +328,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
 
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
-    staged = following()
+    staged = following(x)
     x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
@@ -2073,6 +2080,9 @@ class CausalTransformer(nn.Module):
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
+        reader = self.variables.get('streaming', {}).get(first, {}).get('bank')
+        if reader is not None:
+            return reader.shapes()
         stacked = self.groups[0][1] > 1
 
         def shapes(leaf, drop: bool):
