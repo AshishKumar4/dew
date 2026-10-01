@@ -33,7 +33,7 @@ SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
 
 GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew"]),
-    ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization",
+    ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization", "dew.training.posthoc",
                   "dew.training.runtime", "dew.training.distributed"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.diffusion.alignment", "dew.objectives.diffusion.consistency",
