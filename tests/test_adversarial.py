@@ -3,6 +3,7 @@ each side's gradient from its own loss, and a run config over a saved
 teacher."""
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -21,21 +22,64 @@ from dew.objectives.diffusion import (
     DiffusionRunConfig,
     TextCondition,
 )
-from dew.objectives.diffusion.adversarial import hinge_discriminator, hinge_generator
-from dew.objectives.diffusion.objective import DISCRIMINATOR, TEACHER
+from dew.objectives.diffusion.adversarial import Head, hinge_discriminator, hinge_generator, r1_penalty
+from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, TEACHER
 from dew.registry import presets, samplers
 from dew.sampling import TextToImage
 from dew.training import Trainer
 
+HEAD = np.load(Path(__file__).resolve().parent / "fixtures" / "stylegan_t" / "head.npz")
+
+
+def test_a_head_is_stylegan_ts_at_grid_height_one():
+    """StyleGAN-T's DiscHead in training mode (tools/stylegan_t_reference.py)
+    on 16 sequences of 12 tokens: LADD's 2D head over a grid of height one,
+    with a (1, 9) kernel, from the same weights and spectral-norm vectors.
+    Both run in float64, so the gap is a few roundings of O(1) logits."""
+    with jax.enable_x64(True):
+        def conv(name):
+            return {"kernel": jnp.asarray(HEAD[f"{name}.kernel"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
+
+        def norm(name):
+            return {"weight": jnp.asarray(HEAD[f"{name}.weight"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
+
+        condition_width = HEAD["c"].shape[-1]
+        params = {"block_0": {"conv": conv("main.0.0"), "norm": norm("main.0.1")},
+                  "block_1": {"conv": conv("main.1.fn.0"), "norm": norm("main.1.fn.1")},
+                  "cls": conv("cls"),
+                  "cmapper_weight": jnp.asarray(HEAD["cmapper.weight"]) * np.sqrt(condition_width),
+                  "cmapper_bias": jnp.asarray(HEAD["cmapper.bias"])}
+        spectral = {"block_0": {"conv": {"u": jnp.asarray(HEAD["main.0.0.u"])}},
+                    "block_1": {"conv": {"u": jnp.asarray(HEAD["main.1.fn.0.u"])}},
+                    "cls": {"u": jnp.asarray(HEAD["cls.u"])}}
+        logits, updated = Head(kernel_size=(1, 9)).apply(
+            {"params": params, SPECTRAL: spectral}, jnp.asarray(HEAD["x"]), jnp.asarray(HEAD["c"]), update=True,
+            mutable=[SPECTRAL])
+        np.testing.assert_allclose(np.asarray(logits), HEAD["logits"], rtol=1e-10, atol=1e-12)
+        assert not np.allclose(np.asarray(updated[SPECTRAL]["cls"]["u"]), HEAD["cls.u"])
+
 
 def test_the_hinge_losses_are_the_papers():
     """relu(1 - D(real)) + relu(1 + D(fake)) for the discriminator and
-    -D(fake) for the generator, meaned over tokens and summed over heads."""
+    -D(fake) for the generator, meaned over every head's every logit."""
     real = [jnp.asarray([[2.0, 0.5], [-1.0, 0.0]]), jnp.asarray([[0.2], [3.0]])]
     fake = [jnp.asarray([[-2.0, 0.5], [1.0, -0.5]]), jnp.asarray([[0.0], [-1.5]])]
     np.testing.assert_allclose(np.asarray(hinge_discriminator(real, fake)),
-                               [(0 + 0.5) / 2 + (0 + 1.5) / 2 + 0.8 + 1.0, (2 + 1) / 2 + (2 + 0.5) / 2 + 0 + 0])
-    np.testing.assert_allclose(np.asarray(hinge_generator(fake)), [0.75 - 0.0, -0.25 + 1.5])
+                               [(0 + 0.5 + 0.8) / 3 + (0 + 1.5 + 1) / 3, (2 + 1 + 0) / 3 + (2 + 0.5 + 0) / 3])
+    np.testing.assert_allclose(np.asarray(hinge_generator(fake)), [-(-2 + 0.5 + 0) / 3, -(1 - 0.5 - 1.5) / 3])
+
+
+def test_r1_is_the_squared_gradient_of_each_heads_mean_logit_at_its_input():
+    """ADD's R1 on each head's input, against the gradient written out for a
+    quadratic head: d/dx mean(x^2 w) = 2 x w / n."""
+    features = [jnp.asarray([[1.0, 2.0], [0.5, -1.0]]), jnp.asarray([[3.0], [-2.0]])]
+    weights = [jnp.asarray([0.5, 2.0]), jnp.asarray([1.0])]
+
+    def score(features):
+        return [jnp.square(f) * w for f, w in zip(features, weights, strict=True)]
+    expected = [np.sum(np.square(2 * np.asarray(f) * np.asarray(w) / f.shape[1]), axis=1)
+                for f, w in zip(features, weights, strict=True)]
+    np.testing.assert_allclose(np.asarray(r1_penalty(score, features)), expected[0] + expected[1], rtol=1e-6)
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +101,8 @@ def runs(tmp_path_factory):
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
     student = dataclasses.replace(teacher, sampler=samplers.Consistency(), adversarial=AdversarialDistillation(
-        teacher=str(root / "teacher"), feature_layers=("dit_block_0", "dit_block_1"), distillation_weight=2.5,
-        head_width=8))
+        teacher=str(root / "teacher"), feature_layers=("dit_block_0", "dit_block_1"), cmap_dim=8,
+        kernel_size=(3, 3)))
     return student, batch
 
 
@@ -76,11 +120,13 @@ def test_each_side_trains_on_its_own_loss(runs):
     def part(name):
         def loss(tree):
             total, aux = task.loss({**params, "params": tree}, batch, step)
-            return total.total if name is None else sum(aux.metrics[key] for key in name) * total.mass
+            if name is None:
+                return total.total
+            return sum(aux.metrics[key] * (task.r1_weight if key == "r1" else 1) for key in name) * total.mass
         return jax.grad(loss)(params["params"])
 
     everything = part(None)
-    critic, student = part(("discriminator",)), part(("generator", "distillation"))
+    critic, student = part(("discriminator", "r1")), part(("generator", "distillation"))
     for got, want in zip(jax.tree.leaves(everything[DISCRIMINATOR]), jax.tree.leaves(critic[DISCRIMINATOR]),
                          strict=True):
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-7)

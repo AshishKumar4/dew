@@ -260,7 +260,7 @@ against 99%, an sCM student 11% against 98.6%."""
 @dataclasses.dataclass(frozen=True)
 class AdversarialDistillation:
     """Distill a saved flow run into a few-step student adversarially, LADD
-    with ADD's distillation term at `distillation_weight` > 0
+    with ADD's R1 penalty and distillation term
     (`AdversarialDistillationObjective`, which documents the fields).
     `teacher` is the teacher run's directory; its model is this run's
     `model`."""
@@ -269,8 +269,10 @@ class AdversarialDistillation:
     feature_layers: tuple[str, ...] = ()
     student_times: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25)
     renoise_times: tuple[float, float] = (1.0, 1.0)
-    distillation_weight: float = 0.0
-    head_width: int = 256
+    distillation_weight: float = 2.5
+    r1_weight: float = 1e-5
+    cmap_dim: int = 64
+    kernel_size: tuple[int, int] = (9, 9)
 
     def __post_init__(self) -> None:
         if not self.teacher or not self.feature_layers:
@@ -280,6 +282,8 @@ class AdversarialDistillation:
         object.__setattr__(self, "student_times", tuple(float(time) for time in self.student_times))
         mean, std = (float(value) for value in self.renoise_times)
         object.__setattr__(self, "renoise_times", (mean, std))
+        height, width = (int(size) for size in self.kernel_size)
+        object.__setattr__(self, "kernel_size", (height, width))
 
 
 @dataclasses.dataclass(frozen=True)
