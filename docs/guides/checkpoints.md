@@ -110,6 +110,19 @@ final step: 10 latest: 10
 
 Saves are asynchronous; `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing; the Orbax managers are created on first use.
 
+## The EMA copy on disk
+
+Orbax compresses every array of a checkpoint with zstd, which in the two runs below saves 6 to 9% on weights and Adam moments: past the sign and exponent, their bits look random. An EMA copy is different, because it agrees with the weights it follows in its sign, exponent and leading mantissa bits. `Checkpoints` stores each EMA leaf that has its weight's floating dtype and shape as the XOR of the two, split into byte planes: a leading `uint8` axis with one plane per byte, least significant first. The XOR is zero wherever the two agree, and the planes gather those zeros into long runs, which zstd compresses well. The step's metadata lists the leaves stored this way. `restore` and `stored` return them bit for bit, as the run trained them, in the dtype and placement the template asks for and on any mesh. Checkpoints written before this change list no such leaves and restore as they were written.
+
+| Run | EMA, zstd alone | XOR, then zstd | XOR and byte planes, then zstd |
+|---|---|---|---|
+| 176M-parameter DiT, fp32, step 1.35M | 652.7 MB | 560.3 MB | 488.6 MB (−25%) |
+| 8.7M-parameter DiT, fp32, step 750, decay 0.999 | 32.2 MB | 30.8 MB | 28.2 MB (−12%) |
+
+How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` with JAX's CPU backend, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. In three processes of three saves and restores each, alternating with processes running the code before this change, a compiled save blocked the step for 0.19 to 0.46 s instead of 0.04 to 0.14 s, the time to compute the planes, and landed on disk in 1.9 to 3.7 s instead of 1.8 to 2.3 s, apart from saves that took 17 to 74 s either way while the shared disk was busy. Restores took 1.45 to 1.59 s instead of 1.31 to 1.71 s. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model): there, a save blocked for 1.0 to 2.7 s and a restore took 2.0 to 3.0 s.
+
+Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
+
 ## Preemption
 
 A scheduler stops a job with SIGTERM and kills it a grace period later: Slurm's `KillWait`, Kubernetes' termination grace period, a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on (JAX's `reached_preemption_sync_point` in a pool, the signal itself in a lone process), writes that step's state and data position, skips the final validation, and raises `dew.training.Preempted`. Uncaught, it ends the program with exit status 143, SIGTERM's, so the scheduler sees a stopped job rather than a finished one; a Kubernetes pod failure policy can ignore that code. The same command run again resumes from the checkpoint, and with deterministic ops its losses are the uninterrupted run's to the bit.
