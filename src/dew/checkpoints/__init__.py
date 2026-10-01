@@ -33,6 +33,7 @@ the newest checkpoint every process can read wins.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import datetime
 import math
@@ -600,7 +601,7 @@ class Checkpoints:
             metadata = persistent.metadata(step)
             custom = metadata.custom_metadata or {}
             selection = next(iter((custom.get('rankings') or {}).values()), {})
-            kept.append(Kept(step, metadata.metrics or {}, next(iter(custom.get('rankings') or {}), None), selection.get('mode'), custom.get('rankings') or {}))
+            kept.append(Kept(step, metadata.metrics or {}, custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), custom.get('rankings') or {}))
         return kept
 
     def control(self, step: int) -> dict:
@@ -773,8 +774,8 @@ class Checkpoints:
         with region("checkpoint.submit"):
             persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
                             custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata,
-                                             'rankings': rules, 'primary': primary or next(iter(rules), None),
-                                             'control': control or {}, 'weights_only': weights_only})
+                                             'rankings': rules, 'primary': primary or (rankings[0].metric if rankings else None),
+                                             'control': copy.deepcopy(control or {}), 'weights_only': weights_only})
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()

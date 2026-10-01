@@ -314,14 +314,14 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     saved = []
     real_save = trainer.checkpoints.save
 
-    def spy(step, state, position, metrics=None, *, share=None):
+    def spy(step, state, position, metrics=None, *, share=None, **metadata):
         saved.append((step, None if metrics is None else sorted(metrics)))
-        return real_save(step, state, position, metrics, share=share)
+        return real_save(step, state, position, metrics, share=share, **metadata)
 
     trainer.checkpoints.save = spy
     trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
 
-    assert saved == [(2, ["loss"]), (4, ["loss"]), (6, ["loss"])]
+    assert saved == [(2, ["train/loss"]), (4, ["train/loss"]), (6, ["train/loss"])]
     assert set(trainer.checkpoints._open().all_steps()) == {2, 4, 6}
 
 
