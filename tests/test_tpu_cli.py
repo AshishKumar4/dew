@@ -659,8 +659,7 @@ def test_setup_script_renders_for_the_python_version_and_the_source(fake):
     assert "GCS_BUCKET=bucket-1" in script
     assert 'uv venv --python "$PYTHON_VERSION" "$VENV"' in script
     # A checkout installs alone, its tpu extra bringing the libtpu for the jax it
-    # pins: a jax[tpu] from PyPI can't be resolved beside the pin. A release
-    # installs after jax[tpu].
+    # requires. A release installs after jax[tpu].
     assert ('if [ "$EDITABLE" = 1 ]; then\n'
             '  step "$PACKAGE_SPEC"\n'
             '  uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"\n'
