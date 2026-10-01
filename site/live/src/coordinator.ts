@@ -6,6 +6,9 @@
 // WARM_SECONDS for a page. The next session takes the spare, if one is up, and
 // starts with the model in memory. A spare is a session row whose visitor is ''
 // until one claims it; its time counts against the budget like any other.
+// Each row records the image its container started from: a session takes only
+// a spare running the image of the current deploy, and the open that finds a
+// spare on an older image stops it.
 
 import { DurableObject } from 'cloudflare:workers';
 import { type Limits, limitsOf } from './limits';
@@ -42,7 +45,8 @@ export class Coordinator extends DurableObject<Env> {
 				created INTEGER NOT NULL,
 				started INTEGER,
 				ended INTEGER,
-				spare INTEGER NOT NULL DEFAULT 0
+				spare INTEGER NOT NULL DEFAULT 0,
+				image TEXT
 			);
 			CREATE INDEX IF NOT EXISTS sessions_ip ON sessions (ip, created);
 			CREATE INDEX IF NOT EXISTS sessions_day ON sessions (day);
@@ -51,6 +55,7 @@ export class Coordinator extends DurableObject<Env> {
 		if (!columns.some(({ name }) => name === 'spare')) {
 			ctx.storage.sql.exec('ALTER TABLE sessions ADD COLUMN spare INTEGER NOT NULL DEFAULT 0');
 		}
+		if (!columns.some(({ name }) => name === 'image')) ctx.storage.sql.exec('ALTER TABLE sessions ADD COLUMN image TEXT');
 	}
 
 	private count(query: string, ...bindings: (string | number)[]): number {
@@ -94,7 +99,8 @@ export class Coordinator extends DurableObject<Env> {
 		return Number(row.ms ?? 0) / 1000;
 	}
 
-	async open(ip: string, now: number): Promise<Opened> {
+	/** A session for visitor `ip`; `image` is the kernel image the current deploy starts. */
+	async open(ip: string, now: number, image: string): Promise<Opened> {
 		this.sweep(now);
 		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, warmSeconds, budgetSeconds } = this.limits;
 		const sql = this.ctx.storage.sql;
@@ -109,10 +115,17 @@ export class Coordinator extends DurableObject<Env> {
 			return { ok: false, reason: 'too-many-starts', retryAfter: Math.ceil((oldest - windowStart) / 1000) };
 		}
 		const day = utcDay(now);
+		const stale = sql
+			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND image IS NOT NULL AND image != ?", image)
+			.toArray();
+		for (const { id } of stale) {
+			sql.exec('UPDATE sessions SET ended = ? WHERE id = ?', now, id);
+			this.ctx.waitUntil(this.env.KERNEL.get(this.env.KERNEL.idFromName(id)).expire());
+		}
 		// A spare is already counted against the cap and the budget. One whose container has
 		// not reported its start may never get a host, so a session does not wait on it.
 		const spare = sql
-			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND started IS NOT NULL LIMIT 1")
+			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND started IS NOT NULL AND image = ? LIMIT 1", image)
 			.toArray()[0];
 		let id: string;
 		if (spare) {
@@ -144,14 +157,14 @@ export class Coordinator extends DurableObject<Env> {
 	/**
 	 * Record that a session's container is running. False when the session is already
 	 * over, for example swept as unused while its container was still booting: nothing
-	 * counts that container any more, so the Kernel must destroy it. A Kernel reports
-	 * again each time it waits for its running container, as when a page takes a spare;
-	 * the first report is the start.
+	 * counts that container any more, so the Kernel must destroy it. `image` is the image
+	 * the container started from; the first report is the start.
 	 */
-	async started(id: string, now: number): Promise<boolean> {
+	async started(id: string, now: number, image: string): Promise<boolean> {
 		const cursor = this.ctx.storage.sql.exec(
-			'UPDATE sessions SET started = COALESCE(started, ?) WHERE id = ? AND ended IS NULL',
+			'UPDATE sessions SET started = COALESCE(started, ?), image = ? WHERE id = ? AND ended IS NULL',
 			now,
+			image,
 			id,
 		);
 		return cursor.rowsWritten === 1;
