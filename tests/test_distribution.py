@@ -881,8 +881,8 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     and 2 loaded the step on one process and compiled it on the other, whose
     sharded autotuning then waited for ever for its peer's share. Each process
     here reports a fingerprint of its own, as those two did, whatever devices
-    the run has; the pinned jax hashes the fingerprints of every process a
-    computation spans."""
+    the run has; the jax constraints.txt names hashes the fingerprints of
+    every process a computation spans."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = ("import json, sys\n"
                "from pathlib import Path\n"
@@ -939,25 +939,29 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_gpu_pool_whose_jax_keys_its_processes_apart_compiles_without_the_cache():
-    """A jax installed around Dew's pin, such as an image's own, may key a
-    computation that spans processes apart on each of them. A GPU pool on one
-    turns the persistent cache off before its first compile: a rank that
-    compiled a step its peers loaded would wait for ever for their shares of
-    its autotuning. A CPU pool keeps the cache, since its compiles wait on no
-    peer."""
-    import jax
-
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_a_gpu_pool_whose_jax_keys_its_processes_apart_compiles_without_the_cache(backend):
+    """A jax without jax-ml/jax#40940, such as the 0.11.2 release the
+    published dewml installs, keys a computation that spans processes apart
+    on each of them. A GPU pool on one turns the persistent cache off before
+    its first compile, and every process says why: a rank that compiled a
+    step its peers loaded would wait for ever for their shares of its
+    autotuning. A CPU pool keeps the cache, since its compiles wait on no
+    peer. The pool's backend is the one jax reports to Dew, so a CPU pool
+    stands in for a GPU one."""
     program = ("import jax\n"
                "jax.config.update('jax_enable_compilation_cache', True)\n"
+               f"jax.default_backend = lambda: {backend!r}\n"
                "import dew.training.runtime as runtime\n"
                "runtime._pool_keys_alike = lambda: False\n"
                "runtime.prepare_process()\n"
                "print('cache', jax.process_index(), jax.config.jax_enable_compilation_cache, flush=True)\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=150)
     assert done.returncode == 0, done.stdout + done.stderr
-    kept = jax.default_backend() != "gpu"
+    kept = backend != "gpu"
     assert f"cache 0 {kept}" in done.stdout and f"cache 1 {kept}" in done.stdout, done.stdout
+    said = done.stdout.count("so the pool compiles without the persistent compilation cache")
+    assert said == (0 if kept else 2), done.stdout
 
 
 @pytest.mark.mesh(devices=2)
