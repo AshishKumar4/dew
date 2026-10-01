@@ -70,6 +70,28 @@ Training metrics are named under `train/`, and reduced validation metrics under 
 `key=0` is the same root key as `key=jax.random.key(0)`. The fit record
 also keeps the supplied integer seed.
 
+`Mean` turns per-example values or a `(total, count)` pair into a metric.
+It sums counts across uneven batches, so a small last batch has its own
+weight. Choose `better` explicitly for checkpoint ranking. `reads` defaults
+to `ImageGrid`; a text metric names `TokenScores`:
+
+```python
+from dew import Mean
+from dew.artifacts import TokenScores
+
+cross_entropy = Mean(
+    lambda scores, batch: (np.sum(scores.losses * scores.weights), np.sum(scores.weights)),
+    name="cross_entropy", better="lower", reads=TokenScores,
+)
+state = Trainer(objective, optax.adam(0.01), key=jax.random.key(0)).fit(
+    data, steps=10, eval_every=5, metrics=[cross_entropy],
+)
+```
+
+The helper starts a pass from its first contribution and finalizes on the
+host without collectives. A vector counts each example once; a pair can
+carry token counts or fractional weights. A scalar batch mean is refused.
+
 ## Previews
 
 The trainer calls `Objective.preview` once per evaluation event, only when `fit(preview=True)` is passed, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.
