@@ -4,6 +4,7 @@ XLA reads XLA_FLAGS once, when it opens a backend, so a run's flags have to
 reach the environment before the first JAX call of the process.
 """
 
+import ctypes
 import os
 
 
@@ -66,3 +67,32 @@ def deterministic_ops_requested() -> bool:
 # (`dew.training.trainer.fitting_default`). Unmeasured generations, sm86
 # among them, keep XLA's default.
 TRITON_GEMM_OFF_GENERATIONS = frozenset({'sm80', 'sm89'})
+
+
+def gpu_free_bytes(ordinal: int) -> int | None:
+    """The bytes the CUDA driver reports free on the visible GPU `ordinal`,
+    every process's allocations counted, or None where no driver answers.
+
+    An allocator's limit is a share of the GPU's memory, not memory it holds:
+    a pool that grows takes each new region from what is free when it asks,
+    and another process on the same GPU may hold the rest. The read makes the
+    device's primary context current on this thread for the call, as JAX's
+    own runtime keeps it."""
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return None
+    device, context = ctypes.c_int(), ctypes.c_void_p()
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    if (cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal)
+            or cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device)):
+        return None
+    try:
+        if cuda.cuCtxPushCurrent_v2(context):
+            return None
+        try:
+            return None if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) else free.value
+        finally:
+            cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
+    finally:
+        cuda.cuDevicePrimaryCtxRelease_v2(device)
