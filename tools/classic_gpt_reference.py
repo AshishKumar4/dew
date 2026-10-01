@@ -14,23 +14,27 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config, OPTConfig
 
 from dew.interop import load_pretrained
-from dew.interop.verify import probe_ids, scatter_weights
+from dew.interop.verify import _ROUNDING, probe_ids, scatter_weights
 
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 
-def write_fixture():
-    config = GPT2Config(vocab_size=128, n_embd=32, n_layer=2, n_head=4,
+def write_fixture(family):
+    config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
+                        num_attention_heads=4, ffn_dim=48, max_position_embeddings=64,
+                        dropout=0, attention_dropout=0, bos_token_id=1,
+                        eos_token_id=None, pad_token_id=0) if family == 'opt' else
+              GPT2Config(vocab_size=128, n_embd=32, n_layer=2, n_head=4,
                         n_positions=64, n_inner=48, resid_pdrop=0,
                         embd_pdrop=0, attn_pdrop=0, activation_function='gelu_new',
-                        bos_token_id=1, eos_token_id=None, pad_token_id=0)
+                        bos_token_id=1, eos_token_id=None, pad_token_id=0))
     model = AutoModelForCausalLM.from_config(config, attn_implementation='eager')
     scatter_weights(model)
     model = model.float().eval().to('cuda')
-    directory = FIXTURES / 'gpt2-tiny'
+    directory = FIXTURES / f'{family}-tiny'
     directory.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(directory)
     ids = probe_ids(config.vocab_size)
@@ -46,7 +50,7 @@ def write_fixture():
         'transformers': transformers.__version__, 'torch': torch.__version__,
         'dtype': 'float32', 'attention': 'eager', 'seed': 1234,
         'device': torch.cuda.get_device_name(),
-        'command': 'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture',
+        'command': f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}',
     }, indent=2) + '\n')
 
 
@@ -67,7 +71,7 @@ def greedy(loaded, ids, steps):
     return generated
 
 
-def check_checkpoint(checkpoint, output, revision=None):
+def check_checkpoint(checkpoint, output, revision=None, safetensors_directory=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
@@ -75,6 +79,13 @@ def check_checkpoint(checkpoint, output, revision=None):
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
                                                     attn_implementation='eager', revision=revision).eval().to(device)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
+    source = checkpoint
+    if safetensors_directory is not None:
+        # OPT-125m publishes pickle weights alone. Transformers converts
+        # the same tensors once; Dew's loader still reads safe tensor storage.
+        reference.save_pretrained(safetensors_directory)
+        tokenizer.save_pretrained(safetensors_directory)
+        source = safetensors_directory
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
     with torch.no_grad():
         expected = reference(torch.tensor(ids, device=device), use_cache=False).logits.cpu().numpy()
@@ -83,7 +94,7 @@ def check_checkpoint(checkpoint, output, revision=None):
                                        pad_token_id=0).cpu().numpy()
     del reference
     torch.cuda.empty_cache()
-    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
+    loaded = load_pretrained(source, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
@@ -91,7 +102,7 @@ def check_checkpoint(checkpoint, output, revision=None):
     # Twice the largest tiny-family error per layer per logit, in fp32 ulps,
     # matches Dew's existing verified-mapping bound (verify._ROUNDING).
     layers = config.num_hidden_layers
-    bound = float(2 * 6.46 * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
+    bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
     ours = greedy(loaded, ids, 6)
     metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
@@ -112,14 +123,16 @@ def check_checkpoint(checkpoint, output, revision=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', action='store_true')
+    parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
     parser.add_argument('--checkpoint')
     parser.add_argument('--revision')
+    parser.add_argument('--safetensors-directory')
     parser.add_argument('--output')
     args = parser.parse_args()
     if args.fixture:
-        write_fixture()
+        write_fixture(args.family)
     if args.checkpoint:
-        check_checkpoint(args.checkpoint, args.output, args.revision)
+        check_checkpoint(args.checkpoint, args.output, args.revision, args.safetensors_directory)
 
 
 if __name__ == '__main__':

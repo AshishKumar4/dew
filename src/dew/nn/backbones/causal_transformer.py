@@ -681,6 +681,8 @@ class CausalTransformer(nn.Module):
     position_embedding: Literal['rotary', 'learned'] = 'rotary'
     position_embedding_size: int | None = None
     """Learned table size, None for max_seq_len, independent of the decode capacity."""
+    position_embedding_offset: int = 0
+    """Reserved rows before learned position zero, two in OPT checkpoints."""
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: float | None = None  # None: every dim rotates
@@ -1109,6 +1111,10 @@ class CausalTransformer(nn.Module):
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
+        if self.position_embedding_offset < 0 or (self.position_embedding_offset and (
+                self.position_embedding != 'learned' or self.position_embedding_size is None
+                or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
+            raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
         if self.position_embedding != 'rotary' and (
                 self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None):
             raise ValueError('rotary scaling requires rotary positions')
@@ -1918,7 +1924,7 @@ class CausalTransformer(nn.Module):
                 places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
                 if start is not None:
                     places = places + start[:, None]
-            x = x + self.embed_positions(jnp.maximum(places, 0))
+            x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
