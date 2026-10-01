@@ -1,0 +1,9 @@
+{
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cu130",
+  "dtype": "float32",
+  "attention": "eager",
+  "seed": 1234,
+  "device": "NVIDIA GeForce RTX 4080",
+  "command": "PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family opt"
+}

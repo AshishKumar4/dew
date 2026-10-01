@@ -637,6 +637,7 @@
   "per_layer_input_dim": null,
   "per_layer_input_vocab": null,
   "position_embedding": "rotary",
+  "position_embedding_offset": 0,
   "position_embedding_size": null,
   "pre_norms": true,
   "precision": null,
