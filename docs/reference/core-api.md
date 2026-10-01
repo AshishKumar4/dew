@@ -167,7 +167,7 @@ LMObjective(model, seq_len, *, ema_decay=0.999, pad_id=None, head_chunks=4, head
 IndexerTraining(phase, weight=1.0)
 ```
 
-The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`load_pretrained` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model and initial variables. It refuses `pretrained=` because the bundle supplies those weights. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
 `pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay=None` trains without an averaged copy, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
@@ -408,6 +408,7 @@ TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_to
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
      images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
+task.quantized(spec, example=((0,),)) -> TextGeneration
 TextGeneration.from_run / BlockGeneration.from_run / MaskedGeneration.from_run
     (directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
 TextGeneration.from_pretrained / BlockGeneration.from_pretrained / MaskedGeneration.from_pretrained
@@ -417,6 +418,7 @@ BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, process=None,
      images=None) -> CanvasGeneration
 Pretrained.text_generation(*, sampling=None) -> TextGeneration | MaskedGeneration
+Pretrained.lm_objective(seq_len, **options) -> LMObjective
 Pretrained.block_generation() -> BlockGeneration
 Pretrained.text_to_image() -> TextToImage
 PPOObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
@@ -429,6 +431,7 @@ TextToImage.from_pretrained(repo_id, *, ema=None, mesh=None, layout=None, dtype=
                             param_dtype=None)
 LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
+image_task.quantized(spec) -> TextToImage
 image_task.prepare(prompts, *, key=None, seed=None, steps=None, unconditional=None,
                    image=None, image_latents=None, mask=None, noise=None, initial=None,
                    times=None, encode_key=None) -> DenoisingInputs
@@ -493,7 +496,7 @@ JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
 
-Import `DiffusionObjective` from `dew.objectives.diffusion`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
+Import `DiffusionObjective` from `dew.objectives.diffusion`. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `TextToImage` and `FlowGRPOObjective` accept the same values. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
 Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normalized images/video and optional token indices plus `train` and RNG settings. It returns token features with the feature dimension last. The predictor consumes context features and context/target position indices and returns target features of the encoder width. Mask grid, patch geometry, and predictor dimensions must agree. `momentum` specifies the EMA schedule endpoints over `momentum_steps` optimizer updates; `label_key` identifies labels for representation evaluation. See the [JEPA example](../guides/representation-learning.md).
 

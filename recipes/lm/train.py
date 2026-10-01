@@ -120,8 +120,7 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
 
 def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
                     max_seq_len: int, meta: dict):
-    """The decoder a --pretrained run continues, its variables, the fields
-    it was built from and the reference it was read at.
+    """The bundle a --pretrained run continues and the reference it was read at.
 
     `pretrained` is a local directory, a Hub repo or `repo@revision`; the
     reference returned pins a Hub repo to the commit it resolved to, so the
@@ -152,7 +151,6 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     loaded = load_checkpoint(
         name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=context, revision=revision)
-    model, variables, fields = loaded.model, loaded.variables, loaded.model_config
     expected = checkpoint_tokenizer(loaded.source, name)
     if meta["tokenizer"] != expected:
         raise ValueError(
@@ -162,12 +160,12 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     # A decoder's embedding table is usually padded past the tokenizer's ids
     # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
     # requirement, not matching the count.
-    if model.vocab_size < vocab_size:
+    if loaded.model.vocab_size < vocab_size:
         raise ValueError(
-            f"{pretrained} has room for {model.vocab_size} ids and the "
+            f"{pretrained} has room for {loaded.model.vocab_size} ids and the "
             f"token files use {vocab_size}")
     reference = name if loaded.revision is None else f"{name}@{loaded.revision}"
-    return model, variables, fields, reference
+    return loaded, reference
 
 
 def checkpoint_tokenizer(directory: Path, name: str) -> str:
@@ -278,13 +276,14 @@ def main(config: LmRunConfig) -> TrainState:
     samples = None if config.objective == "block_diffusion" else build_samples(config)
     context = context_length(config, samples)
 
-    pretrained = None
+    source = None
     if config.pretrained is None:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        model, pretrained, fields, reference = load_pretrained(
+        source, reference = load_pretrained(
             config.pretrained, config.model, vocab_size, context, meta)
+        model, fields = source.model, source.model_config
         # run.json names the commit the weights were read at.
         config = replace(config, pretrained=reference)
     # run.json records the resolved model as
@@ -303,27 +302,27 @@ def main(config: LmRunConfig) -> TrainState:
                "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
     validation = (metrics.perplexity(),)
+    pretrained = None if source is None else source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
                             name=name, metrics=validation, summary=summary)
     if config.objective == "block_diffusion":
         return config.train(build_block_objective(config, model, pretrained), data,
                             name=name, metrics=validation, summary=summary)
-    objective = LMObjective(
-        model,
-        config.data.seq_len,
-        ema_decay=config.ema_decay,
-        samples=samples,
-        pretrained=pretrained,
-        balance_rate=config.balance_rate,
-        aux_loss_alpha=config.aux_loss_alpha,
-        seq_aux=config.seq_aux,
-        router_z_loss=config.router_z_loss,
-        mtp_weight=config.mtp_weight,
-        indexer=config.indexer,
-        qk_stats=config.optim.optimizer == "muonclip",
-        token_accuracy=config.token_accuracy,
-    )
+    options = {
+        "ema_decay": config.ema_decay,
+        "samples": samples,
+        "balance_rate": config.balance_rate,
+        "aux_loss_alpha": config.aux_loss_alpha,
+        "seq_aux": config.seq_aux,
+        "router_z_loss": config.router_z_loss,
+        "mtp_weight": config.mtp_weight,
+        "indexer": config.indexer,
+        "qk_stats": config.optim.optimizer == "muonclip",
+        "token_accuracy": config.token_accuracy,
+    }
+    objective = (LMObjective(model, config.data.seq_len, **options) if source is None else
+                 source.lm_objective(config.data.seq_len, **options))
     return config.train(objective, data, name=name, metrics=validation, summary=summary)
 
 

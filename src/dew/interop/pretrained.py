@@ -71,6 +71,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
 
 
@@ -939,6 +940,18 @@ class Pretrained:
         """
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
+
+    def lm_objective(self, seq_len: int, **options) -> LMObjective:
+        """Build next-token training from this source's model and variables.
+
+        `options` are `LMObjective`'s training and evaluation controls;
+        this bundle supplies `pretrained` itself.
+        """
+        from dew.objectives.lm import LMObjective
+
+        if "pretrained" in options:
+            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        return LMObjective(self.model, seq_len, pretrained=self.variables, **options)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
         """Build the text generation task this source describes.

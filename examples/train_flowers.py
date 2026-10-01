@@ -46,10 +46,9 @@ def main(config: Config):
         dtype=jnp.bfloat16,
         attention_impl="auto",
     )
-    process = EDM(regime="pixel")()
     objective = DiffusionObjective(
         model,
-        process,
+        EDM(regime="pixel"),
         InputSpec(Field("image", (64, 64, 3))),
     )
     trainer = Trainer(
@@ -65,6 +64,7 @@ def main(config: Config):
         checkpoint_every=200,
     )
 
+    process = objective.process
     denoise = process.denoiser(model, state.averaged, conditions={})
     noise = process.noise(jax.random.key(1), (8, 64, 64, 3))
     images = sample(

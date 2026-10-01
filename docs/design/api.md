@@ -280,11 +280,10 @@ text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperatu
 
 ```python
 # diffusion
-process = presets.EDM(regime="pixel")()
 inputs = InputSpec(sample=Field("image", (128, 128, 3)),
                    conditions={"textcontext": Condition(encoders.CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
 objective = DiffusionObjective(models.SimpleDiT(patch_size=4, emb_features=512, num_layers=12, num_heads=8),
-                               process, inputs, sampler=samplers.Heun(), guidance=3.0, steps=40)
+                               presets.EDM(regime="pixel"), inputs, sampler=samplers.Heun(), guidance=3.0, steps=40)
 state = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                 checkpoints=Checkpoints("runs/flowers")).fit(data, steps=steps)
 
