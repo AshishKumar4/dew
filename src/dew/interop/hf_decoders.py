@@ -370,6 +370,7 @@ class DecoderFields(TypedDict, total=False):
     max_seq_len: int
     position_embedding: Literal['rotary', 'learned']
     position_embedding_size: int | None
+    position_embedding_offset: int
     rope_theta: float
     rope_scaling: Ramp | None
     partial_rotary_factor: float | None
@@ -2238,6 +2239,7 @@ from dew.interop.families.masked_diffusion import (
     _mask_token_export,
 )
 from dew.interop.families.olmo import _olmo3_config
+from dew.interop.families.opt import _opt_config, _opt_export, _opt_export_path, _opt_path
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -2251,6 +2253,12 @@ from dew.interop.families.qwen import (
 )
 
 _FAMILY_ENTRIES = (
+    DecoderFamily(('opt',), _opt_config,
+                  lambda fields: fields.get('position_embedding_offset') == 2,
+                  'opt', 'OPTForCausalLM', _opt_export,
+                  weight_path=_opt_path, export_path=_opt_export_path,
+                  preserve_source_layout=False,
+                  tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight')),
     DecoderFamily(('gpt2',), _gpt2_config,
                   lambda fields: fields.get('position_embedding') == 'learned',
                   'gpt2', 'GPT2LMHeadModel', _gpt2_export,
