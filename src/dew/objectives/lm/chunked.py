@@ -70,6 +70,21 @@ def _operand_dtype(precision: jax.lax.PrecisionLike, work: jnp.dtype):
     return jnp.bfloat16 if precision is BF16 else work
 
 
+def _head_cotangent(cotangent, precision: jax.lax.PrecisionLike):
+    """The logits' cotangent as the head's own gradient product reads it.
+
+    Under the bf16 algorithm that product rounds the fp32 cotangent to bf16
+    on a GPU, so it takes the bf16 high half `_cotangent_product` forms for
+    the state product: the same values, and XLA writes one bf16 copy of the
+    cotangent for both products where it wrote two. Qwen3-0.6B's widths, a
+    head over 4096 x 151936 logits, write 1.2 GB less a step. A CPU runs the
+    algorithm unrounded, so there the head gradient now multiplies the
+    rounded cotangent a GPU multiplies."""
+    if precision is not BF16:
+        return cotangent
+    return rounded_to(cotangent, jnp.bfloat16).astype(jnp.bfloat16)
+
+
 def _cotangent_product(subscripts: str, cotangent, operand, precision: jax.lax.PrecisionLike):
     """`cotangent` times an operand that holds the forward's values, in the
     cotangent's dtype (fp32, or wider for a float64 run).
@@ -295,8 +310,10 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             # The head's own gradient sums over every token in fp32 already
             # (`d_matrix`), and a split here costs as much again as the
             # states': Qwen3-0.6B's step 174.0 against 186.6 ms on an A100.
-            matrix_tile = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
-                                     preferred_element_type=work)
+            matrix_tile = jnp.einsum(
+                'tv,td->vd', _head_cotangent(d_raw, precision),
+                jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision=precision,
+                preferred_element_type=work)
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size)
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, prior + states_tile, start, axis=0)
@@ -373,7 +390,6 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    states = rounded_operand(hidden.reshape(-1, features).astype(work), operands)
     matrix = rounded_operand(table.astype(work), operands)
     d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
     logits, pullback = jax.vjp(lambda raw, cap: _capped(raw, cap, temperature), raw, softcap)
@@ -382,7 +398,8 @@ def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangen
     d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
                             - d_loss[:, None] * selected)
     d_states = _cotangent_product('tv,vd->td', d_raw, matrix, precision)
-    d_table = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
+    d_table = jnp.einsum('tv,td->vd', _head_cotangent(d_raw, precision),
+                         hidden.reshape(-1, features).astype(operands), precision=precision,
                          preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, d_cap)

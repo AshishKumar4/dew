@@ -848,3 +848,31 @@ def test_the_split_cotangent_reaches_its_products_in_bf16():
     dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
     assert len(dots) == 2
     assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots
+
+
+@pytest.mark.parametrize("tile", [None, RAGGED])
+def test_the_head_gradient_reads_the_cotangents_bf16_high_half(tile):
+    """Under the bf16 algorithm the head's own gradient multiplies the logits'
+    cotangent as bf16, the value the state product's high half holds, so the
+    backward hands both products one bf16 copy of it rather than a second
+    rounding: XLA wrote three bf16 copies of a 4096 x 151936 cotangent for
+    Qwen3-0.6B's head where two carry it. Every product into a gradient
+    (the ones whose result is feature-wide) multiplies bf16 operands; the
+    tiled backward's logits products read fp32-stored bf16 values under the
+    algorithm, as its forward does."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
+    program = jax.make_jaxpr(jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
+        states, matrix, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1)))(hidden, head)
+
+    def dots(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "dot_general":
+                yield equation
+            for param in equation.params.values():
+                for sub in (param if isinstance(param, tuple) else (param,)):
+                    if isinstance(sub, jax.extend.core.ClosedJaxpr | jax.extend.core.Jaxpr):
+                        yield from dots(getattr(sub, "jaxpr", sub))
+
+    found = [equation for equation in dots(program.jaxpr) if equation.outvars[0].aval.shape[-1] == 16]
+    assert len(found) >= 3, found
+    assert all(v.aval.dtype == jnp.bfloat16 for equation in found for v in equation.invars), found
