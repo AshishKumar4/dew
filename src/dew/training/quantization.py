@@ -280,6 +280,11 @@ def _providers() -> tuple[type, type]:
         NaN for an int8 depthwise convolution.
         """
 
+        def get_intercept_map(self):
+            # Conv's CUDA implementation must keep Qwix's scales and GPU refusal.
+            return {**super().get_intercept_map(),
+                    "dew.nn.conv._conv_general_dilated": self.conv_general_dilated}
+
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
                                  padding: str | Sequence[tuple[int, int]],
                                  lhs_dilation: Sequence[int] | None = None,
