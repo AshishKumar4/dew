@@ -4,10 +4,14 @@ import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import { Code } from '@astrojs/starlight/components';
 import HeroOutput from '../components/landing/HeroOutput.astro';
+import LiveSampler from '../components/landing/LiveSampler.astro';
+import LiveText from '../components/landing/LiveText.astro';
 import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
 import framework from '../../snippets/framework.py?raw';
-import outputs from '../generated/notebook-outputs.json';
+import samplerCell from '../data/sampler.py?raw';
+import samplerSetup from '../data/sampler_setup.py?raw';
+import textCell from '../data/text.py?raw';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
 import '../styles/landing.css';
@@ -26,12 +30,6 @@ const recorded = (name: string) => {
 };
 const names = ['lm', 'diffusion', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
 const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
-const objectives = [
-	{ name: 'lm', label: 'Language model', detail: 'Next-token prediction on repeated byte text.' },
-	{ name: 'diffusion', label: 'Diffusion', detail: 'Flow matching on eight synthetic striped images.' },
-	{ name: 'jepa', label: 'JEPA', detail: 'Predict masked patch representations, with an EMA target encoder.' },
-	{ name: 'grpo', label: 'GRPO', detail: 'Sample groups of completions and score them with a reward function.' },
-];
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
 const shortHero = heroCode.slice(heroCode.indexOf('model ='));
@@ -47,7 +45,6 @@ const tries = [
 	{ name: 'Colab notebook', what: 'Load the model and sample it on a GPU.', href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb' },
 	{ name: 'dewml/hybrid-dit-176m', what: 'Weights and model card on the Hub.', href: 'https://huggingface.co/dewml/hybrid-dit-176m' },
 ];
-const released = outputs['08-load-a-pretrained-decoder']['cell-21'];
 const reward = readPublic('examples', 'framework', 'grpo', 'tracking', 'scalars.jsonl').trim().split('\n')
 	.map((line) => JSON.parse(line)).filter((row) => 'rollout/reward/mean' in row.scalars)
 	.map((row) => ({ step: row.step as number, reward: row.scalars['rollout/reward/mean'] as number }));
@@ -63,41 +60,43 @@ const tutorialNames: Record<string, string> = {
 	<div class="landing not-content">
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Train, evaluate, sample</h2>
-			<p class="band-lede">A two-layer byte decoder with eight local experts learns Tiny Shakespeare on one RTX 4080. The final 50,000 bytes are held out; this recording ends after 200 steps with short ROMEO and JULIET samples.</p>
+			<p class="band-lede">A decoder learns Tiny Shakespeare on one RTX 4080, then generates ROMEO and JULIET samples.</p>
 			<div class="run-grid">
-				<Code code={shortHero.trimEnd()} lang="python" title="train.py — dataset preparation omitted" />
+				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} />
 			</div>
-			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full runnable script</a>, including the corpus preparation. The terminal is a recording, not a live job in the browser.</p>
+			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">One trainer for every objective</h2>
 			<p class="band-lede">The objective defines the loss, initialization and evaluation. The same <code>Trainer.fit</code> owns optimization, reporting and checkpoints.</p>
-			<div class="objective-tabs" role="radiogroup" aria-label="Training objective">
-				{objectives.map((entry, index) => <label><input type="radio" name="objective" value={entry.name} checked={index === 0} />{entry.label}</label>)}
-			</div>
-			{objectives.map((entry, index) => <div class="objective-example" data-objective={entry.name} hidden={index !== 0}>
-				<p>{entry.detail}</p>
-				<Code code={snippet(entry.name)} lang="python" title={`framework.py — ${entry.label}`} />
-				<pre class="shown-output">{`${records[entry.name].result.steps} training steps completed on ${records[entry.name].capture.meta.where}.`}</pre>
-			</div>)}
-			<p class="framework-note">These examples use tiny fixtures, not quality benchmarks. Imports and fixture preparation are in the <a href={fullScript}>runnable script</a>; the same blocks are smoke-tested in CI.</p>
+			<Code code={snippet('lm')} lang="python" title="framework.py" />
+			<p class="framework-note"><a href={fullScript}>Full script</a></p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Predict representations</h2>
+			<p class="band-lede">A JEPA encoder learns by predicting masked patch representations from the visible context.</p>
+			<Code code={snippet('jepa')} lang="python" title="framework.py" />
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Pretrained models</h2>
 			<p class="band-lede">Load a Hub checkpoint into a native Flax model, generate, fine-tune with the same trainer, and export under its source tensor names.</p>
+			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
 			<Code code={snippet('pretrained-source', 'pretrained', 'finetune')} lang="python" title="framework.py — Qwen3-0.6B" />
 			<pre class="shown-output">{`${records.pretrained.result.text.join('\n')}\n${records.pretrained.result.steps} fine-tuning step; exported the config and sharded safetensors weights.`}</pre>
-			<p class="framework-note">The training fixture is one short sentence. <a href="/reference/models/">Supported families</a> include Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders; the models page states which computations are checked.</p>
+			<p class="framework-note"><a href="/reference/models/">Supported families</a>: Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders.</p>
 		</section>
 
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">A process defines the noise, times and training target. A solver walks that process at generation time; it can change without retraining.</p>
-			<Code code={snippet('processes')} lang="python" title="framework.py — process and solver" />
-			<p class="framework-note">The Diffusion tab above trains a DiT with flow matching and Euler sampling. Below: a 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
+			<Code code={snippet('sample-public')} lang="python" title="framework.py" />
+			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
+			<Code code={snippet('diffusion')} lang="python" title="Define and train a DiT" />
+			<p class="framework-note">A 176M-parameter text-to-image model at 256×256, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
 				<div class="replay-frame" style={`aspect-ratio: ${entry.width} / ${entry.height}`}>
 					<img src={`/hero/replay/${entry.name}/final.webp`} width={entry.width} height={entry.height} alt={entry.prompt} loading="lazy" decoding="async" />
@@ -111,7 +110,7 @@ const tutorialNames: Record<string, string> = {
 			<p class="band-lede">A <code>TextGeneration</code> task binds the model, weights and decoding policy. The server batches requests over the same task, keeping each request's seed and cache.</p>
 			<Code code={snippet('serving')} lang="python" title="framework.py — batched decoding" />
 			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
-			<p class="framework-note">This tiny decoder was trained on repeated synthetic text. These one-line variants store weights in int8 or fp8; activations and matmuls stay floating point:</p>
+			<p class="framework-note">Store weights in int8 or fp8:</p>
 			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py — weight-only int8 and fp8" />
 			<p class="framework-note"><a href="/guides/inference/">Generation and serving</a> covers paging, prefix sharing, constrained decoding and the measured quantization errors.</p>
 		</section>
@@ -122,17 +121,17 @@ const tutorialNames: Record<string, string> = {
 			<Code code={snippet('mesh')} lang="python" title="framework.py — the same objective and data" />
 			<figure class="mesh-overview">
 				<div class="mesh-devices">{records.mesh.result.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / 2)} · tensor {index % 2}</span></div>)}</div>
-				<figcaption>Four simulated CPU devices: two FSDP shards × two tensor slices. The diagram is the mesh returned by <code>build_mesh(MeshSpec(fsdp=2, tensor=2))</code>, inspected without training. The same configuration runs a training smoke in CI.</figcaption>
+				<figcaption>Four simulated CPU devices: two FSDP shards × two tensor slices.</figcaption>
 			</figure>
 			<p class="framework-note"><a href="/concepts/distributed/">Placement and sharding</a> · <a href="/guides/multi-node/">Several hosts</a> · <a href="/guides/tpu/">Cloud TPU</a></p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Post-training and RL</h2>
-			<p class="band-lede">GRPO scores groups of sampled completions and trains on their relative rewards. Here the reward counts alphabetic characters in an eight-byte response; it is a toy rule, not a measure of answer quality.</p>
+			<p class="band-lede">GRPO scores groups of completions with a reward function. Here the reward is the fraction of adjacent tokens counting up by one, modulo 13.</p>
 			<Code code={snippet('grpo')} lang="python" title="framework.py — rollout and reward" />
 			<figure class="reward-figure">
-				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; alphabetic characters divided by eight response bytes.`}>
+				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; fraction of adjacent tokens counting up modulo 13.`}>
 					<line x1="40" y1="40" x2="40" y2="140" /><line x1="40" y1="140" x2="340" y2="140" />
 					<text x="25" y="45" text-anchor="end">1</text><text x="25" y="145" text-anchor="end">0</text>
 					<text x="40" y="165">step 1</text><text x="340" y="165" text-anchor="end">step {reward.at(-1)!.step}</text>
@@ -149,13 +148,12 @@ const tutorialNames: Record<string, string> = {
 			<Code code={snippet('determinism', 'reliability')} lang="python" title="framework.py — save and resume" />
 			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}; resumed to step ${records.reliability.result.resumed_step}.\nAll numerical TrainState leaves equal the uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
 			<Code code={snippet('profile')} lang="python" title="framework.py — JAX/XProf capture" />
-			<p class="framework-note">The bit-exact check uses this small fixture with deterministic GPU operations enabled before backend initialization. Default CUDA reductions need not be bit-identical; this is not a cross-host recovery measurement. <a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
+			<p class="framework-note"><a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
 		</section>
 
 		<section class="band try" data-reveal>
 			<h2 class="band-title">Try it and released weights</h2>
 			<ul class="try-list">{tries.map((entry) => <li><a class="try-link" href={entry.href}><span class="try-name">{entry.name}</span><span class="try-what">{entry.what}</span></a></li>)}</ul>
-			<div class="shown-grid"><Code code={released.source!.trimEnd()} lang="python" title="Tutorial 8 — the same exported decoder" /><pre class="shown-output">{released.stdout!.trimEnd()}</pre></div>
 		</section>
 
 		<section class="band tutorials" data-reveal>
@@ -175,19 +173,14 @@ const tutorialNames: Record<string, string> = {
 </StarlightPage>
 
 <script>
+	import { startReplays } from '../hero/replay-section';
 	const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
-	for (const tabs of document.querySelectorAll<HTMLElement>('.objective-tabs')) {
-		tabs.addEventListener('change', (event) => {
-			const chosen = (event.target as HTMLInputElement).value;
-			for (const example of tabs.parentElement!.querySelectorAll<HTMLElement>('[data-objective]')) example.hidden = example.dataset.objective !== chosen;
-		});
-	}
 	const replays = document.querySelector<HTMLElement>('[data-replays]');
 	if (replays && !still) {
 		const near = new IntersectionObserver((entries) => {
 			if (!entries.some((entry) => entry.isIntersecting)) return;
 			near.disconnect();
-			import('../hero/replay-section').then(({ startReplays }) => startReplays(replays));
+			void startReplays(replays);
 		}, { rootMargin: '50% 0px' });
 		near.observe(replays);
 	}

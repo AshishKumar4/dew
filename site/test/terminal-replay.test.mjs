@@ -62,6 +62,18 @@ test('recording progresses, pauses, finishes as text and replays', async () => {
 	await page.close();
 });
 
+test('Replay brings the recording into view even when clicking scrolls the screen away', async () => {
+	const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+	await page.route('**/hero/train.json', (route) => route.fulfill({ json: fixture }));
+	await page.goto(url());
+	const panel = page.locator('[data-terminal-replay]');
+	await panel.scrollIntoViewIfNeeded();
+	await page.locator('[data-terminal-restart]').click();
+	await page.waitForFunction(() => document.querySelector('[data-terminal-toggle]').textContent === 'Finished');
+	assert.equal(await panel.locator('pre').textContent(), '<finished> summary and samples\n');
+	await page.close();
+});
+
 test('reduced motion shows the static final screen without fetching frames', async () => {
 	const page = await browser.newPage({ reducedMotion: 'reduce' });
 	let requests = 0;

@@ -83,6 +83,8 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 
 <script>
 	import type { LiveSession, Output } from '../../scripts/live';
+	import { renderOutput } from '../../scripts/live';
+	import { landingKernel, reserveKernel, onKernelClose, closeKernel } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-sampler]');
 	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
@@ -107,6 +109,10 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		let stopping = false;
 		let started = 0;
 		let ticker: number | undefined;
+		onKernelClose((message) => {
+			session = undefined;
+			if (!running) show('idle', `${message} Press Run to start a new one.`);
+		});
 
 		/** Enter a stage: its name styles the figure, `text` is the status line, `fraction` fills the bar (none: indeterminate). */
 		const show = (name: string, text: string, fraction?: number) => {
@@ -165,10 +171,17 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			if (stopping) return;
 			if (message.type === 'error') log.open = true;
 			if (message.type !== 'clear') log.hidden = false;
-			import('../../scripts/live').then(({ renderOutput }) => renderOutput(output, message));
+			renderOutput(output, message);
 		};
 
 		const execute = async () => {
+			let release: () => void;
+			try {
+				release = reserveKernel();
+			} catch (error) {
+				show('error', error instanceof Error ? error.message : String(error));
+				return;
+			}
 			running = true;
 			stopping = false;
 			run.textContent = 'Stop';
@@ -178,21 +191,16 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			// On a phone the figure sits below the editor; bring it into view for the run.
 			if (stage.getBoundingClientRect().bottom > window.innerHeight) stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
 			try {
-				const { LiveSession } = await import('../../scripts/live');
 				if (!session) {
 					show('starting', 'Checking that you are not a bot');
 					tick('Waiting');
-					const opened = await LiveSession.open(holder, (text) => show('starting', text.replace(/…$/, '')));
+					const opened = await landingKernel(holder, (text) => show('starting', text.replace(/…$/, '')));
 					if (stopping) {
-						opened.close();
+						closeKernel();
 						throw new Error('Stopped.');
 					}
 					session = opened;
 					compiled = opened.warm;
-					session.onClose = (message) => {
-						session = undefined;
-						if (!running) show('idle', `${message} Press Run to start a new one.`);
-					};
 				}
 				started = performance.now();
 				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs);
@@ -206,10 +214,11 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				else show('error', 'The cell stopped with an error; the kernel output below says why.');
 			} catch (error) {
 				untick();
-				session?.close();
+				closeKernel();
 				session = undefined;
 				show(stopping ? 'idle' : 'error', stopping ? 'Stopped.' : error instanceof Error ? error.message : String(error));
 			} finally {
+				release();
 				running = false;
 				run.textContent = 'Run';
 				run.disabled = false;

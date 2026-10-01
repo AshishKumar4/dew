@@ -1,7 +1,12 @@
 {
+  "source": "Qwen/Qwen3-0.6B",
+  "prompts": [
+    "The capital of France is",
+    "The capital of Japan is"
+  ],
   "text": [
-    " trains jax models. dew ",
-    " models. dew trains jax "
+    " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The",
+    " Tokyo. The capital of the United States is Washington, D.C. The capital of France is Paris. The capital of"
   ],
   "weight_formats": [
     "int8",
