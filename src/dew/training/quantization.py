@@ -292,7 +292,15 @@ def _grouped_convolution_gradient() -> type:
         ungrouped convolution with float gradients: the float convolution's
         transpose at the dequantized operands the forward computed with,
         here JAX's own, which handles groups. Qwix's quantized gradients
-        (`bwd_qtype`) for a grouped convolution are refused."""
+        (`bwd_qtype`) for a grouped convolution are refused.
+
+        An ungrouped convolution with quantized activations quantizes its
+        float32 operands and returns the input's dtype, so Qwix scales its
+        8-bit product in float32 as `GroupScaledConvolution` does a grouped
+        one's. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
+        lowers an int8 convolution only with a float32 result, failed to
+        compile a bf16 int8 convolution (`UNIMPLEMENTED: Can't lower one or
+        more integer convolutions`, the RTX 4080)."""
 
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
                                  padding: str | Sequence[tuple[int, int]],
@@ -304,10 +312,15 @@ def _grouped_convolution_gradient() -> type:
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            if feature_group_count == 1 or rule is None or rule.weight_qtype is None:
+            if rule is None or rule.weight_qtype is None or (feature_group_count == 1 and rule.act_qtype is None):
                 return super().conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
+            if feature_group_count == 1:
+                return super().conv_general_dilated(
+                    lhs.astype(jnp.float32), rhs.astype(jnp.float32), window_strides, padding, lhs_dilation,
+                    rhs_dilation, dimension_numbers, feature_group_count, batch_group_count, precision,
+                    preferred_element_type, out_sharding).astype(lhs.dtype)
             if rule.bwd_qtype is not None:
                 raise ValueError(
                     "Qwix 0.1.8 cannot compute the quantized gradients of a grouped convolution, so Dew "

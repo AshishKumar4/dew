@@ -299,6 +299,73 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         assert 0.0 < float(jnp.linalg.norm(got_part - float_part) / jnp.linalg.norm(float_part)) < 0.02
 
 
+@pytest.mark.parametrize("dtype", ["int8", "fp8"])
+def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
+    """A bf16 convolution with quantized activations, a hybrid DiT's patch
+    embedding, computes in quantized training what Qwix's own quantized
+    training computes on float32 copies of its bf16 input and kernel,
+    rounded to bf16: the same value and gradients, bitwise, compiled, on
+    CPU and on the RTX 4080. Before, Qwix scaled the bf16 module's 8-bit
+    product in bf16, and XLA:GPU failed to compile the int8 convolution
+    (`UNIMPLEMENTED: Can't lower one or more integer convolutions`)."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    # Without the bias, which the quantization leaves alone and a bf16
+    # module adds, and differentiates, in bf16.
+    settings = {"features": 128, "kernel_size": (2, 2), "strides": (2, 2), "padding": "VALID", "use_bias": False}
+    conv = Conv(**settings, dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
+    cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
+    qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
+    reference = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+        [qwix.QtRule(module_path=".*", weight_qtype=qtype, act_qtype=qtype)]))
+
+    def dew(variables, x):
+        return apply_quantization(conv, Quantization(dtype=dtype)).apply(variables, x)
+
+    def qwix_in_float32(variables, x):
+        as_float32 = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), (variables, x))
+        return reference.apply(*as_float32).astype(jnp.bfloat16)
+
+    def value_and_gradients(function):
+        out, transpose = jax.vjp(jax.jit(function), variables, x)
+        return out, *transpose(cotangent)
+
+    got, want = value_and_gradients(dew), value_and_gradients(qwix_in_float32)
+    assert got[0].dtype == jnp.bfloat16
+    jax.tree.map(np.testing.assert_array_equal, got, want)
+
+
+def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does():
+    """Weight-only quantized training keeps convolutions in float
+    (`Quantization.weight_only`), so a bf16 convolution computes in bf16
+    what Qwix's own quantized training with the same weight-only rule
+    computes: value and gradients bitwise equal, compiled, on CPU and on the
+    RTX 4080. Only a convolution with quantized activations quantizes from
+    float32."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+
+    conv = Conv(features=128, kernel_size=(2, 2), strides=(2, 2), padding="VALID", use_bias=False,
+                dtype=jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
+    cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
+    reference = qwix.quantize_model(conv, qwix.QtProvider([qwix.QtRule(
+        module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
+
+    def value_and_gradients(module):
+        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
+        return out, *transpose(cotangent)
+
+    got = value_and_gradients(apply_quantization(conv, Quantization(weight_only=True)))
+    assert got[0].dtype == jnp.bfloat16
+    jax.tree.map(np.testing.assert_array_equal, got, value_and_gradients(reference))
+    jax.tree.map(np.testing.assert_array_equal, got, value_and_gradients(conv))
+
+
 @pytest.mark.skipif(jax.default_backend() == "gpu",
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
