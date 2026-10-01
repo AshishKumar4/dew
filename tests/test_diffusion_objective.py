@@ -77,7 +77,7 @@ def make_objective(*, guidance: CFG | None = CFG(2.0)):
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
-    return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0)(), inputs, steps=3, guidance=guidance,
+    return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
                               sampler=Euler())
 
 
@@ -111,14 +111,39 @@ class Zero(nn.Module):
         return jnp.zeros_like(x) * self.param("w", nn.initializers.ones, ())
 
 
+def test_a_preset_builds_the_same_loss_and_images_as_its_process():
+    from dew.sampling import TextToImage
+
+    preset = presets.Flow(shift=2.5, logit_mean=-0.3, min_snr_gamma=4)
+    inputs = InputSpec(Field("image", (2, 2, 1)))
+    explicit = DiffusionObjective(Zero(), preset(), inputs, guidance=None, steps=3)
+    objective = DiffusionObjective(Zero(), preset, inputs, guidance=None, steps=3)
+    variables = objective.init(jax.random.key(0))
+    batch = {"image": np.arange(8, dtype=np.uint8).reshape(2, 2, 2, 1)}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+    np.testing.assert_array_equal(scalar_loss(objective, variables, batch, step)[0],
+                                  scalar_loss(explicit, variables, batch, step)[0])
+    direct = TextToImage(objective.model, preset, inputs, variables, steps=3)
+    built = TextToImage.from_objective(explicit, variables)
+    np.testing.assert_array_equal(direct(["", ""], seed=2).host().images,
+                                  built(["", ""], seed=2).host().images)
+
+
+def test_a_masked_preset_is_refused_by_the_gaussian_objective():
+    from dew.diffusion.discrete import MDLM
+
+    with pytest.raises(ValueError, match="Gaussian Process"):
+        DiffusionObjective(Zero(), MDLM(mask_id=1), InputSpec(Field("image", (2, 2, 1))))
+
+
 def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
     """The sigma integrators hold only when alpha is 1; the cosine
     preset is VP, and the mismatch surfaces when the objective is built."""
     from dew.sampling import RK4
     unconditional = InputSpec(Field("image", (RES, RES, 3)))
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
-        DiffusionObjective(Zero(), presets.Cosine()(), unconditional, sampler=RK4())
-    DiffusionObjective(Zero(), presets.Karras()(), unconditional, sampler=RK4())
+        DiffusionObjective(Zero(), presets.Cosine(), unconditional, sampler=RK4())
+    DiffusionObjective(Zero(), presets.Karras(), unconditional, sampler=RK4())
 
 
 @pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
@@ -139,7 +164,7 @@ def test_objective_validates_the_real_terminal_grid_before_sampling():
     from dew.sampling import UniPC
 
     with pytest.raises(ValueError, match="sigma=0 target"):
-        DiffusionObjective(Zero(), presets.Flow()(), InputSpec(Field("image", (2, 2, 1))),
+        DiffusionObjective(Zero(), presets.Flow(), InputSpec(Field("image", (2, 2, 1))),
                            sampler=UniPC(3, lower_order_final=False), steps=7, guidance=None)
 
 
@@ -328,7 +353,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     from dew.nn.autoencoders import SimpleAutoEncoder
     autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(8,))
     inputs = InputSpec(Field("image", (RES, RES, 3)))
-    objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel")(), inputs,
+    objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel"), inputs,
                                    autoencoder=autoencoder)
     params = objective.init(jax.random.PRNGKey(0))
     assert set(params) == {"params", "encoders", "autoencoder"}
@@ -346,7 +371,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
             params = dict(params, autoencoder=autoencoder.params)
             return super().loss(params, batch, step)
 
-    leaky = Leaky(Zero(), presets.EDM(regime="pixel")(), inputs, autoencoder=autoencoder)
+    leaky = Leaky(Zero(), presets.EDM(regime="pixel"), inputs, autoencoder=autoencoder)
     assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
 
 
@@ -396,7 +421,7 @@ def test_a_video_objective_returns_a_video_grid():
         def __call__(self, x, temb, train=False):
             return jnp.zeros_like(x) * self.param("w", nn.initializers.ones, ())
 
-    objective = DiffusionObjective(ZeroVideo(), presets.Flow()(),
+    objective = DiffusionObjective(ZeroVideo(), presets.Flow(),
                                    InputSpec(Field("video", (2, RES, RES, 3))), steps=2, guidance=None)
     assert objective.artifact is VideoGrid
     params = objective.init(jax.random.PRNGKey(0))
@@ -452,8 +477,8 @@ def conditional_mmdit():
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
     model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
-    process = presets.EDM(sigma_max=1.0, regime="pixel")()
-    objective = DiffusionObjective(model, process, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
+    preset = presets.EDM(sigma_max=1.0, regime="pixel")
+    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
     variables = objective.init(jax.random.key(0))
     # The initialized zero output head otherwise hides conditioning gradients.
     variables = {**variables, "params": jax.tree.map(lambda leaf: leaf + 0.02, variables["params"])}
@@ -461,7 +486,7 @@ def conditional_mmdit():
     variables = {**variables, "encoders": {"textcontext": {"table": table}}}
     # The objective encodes the unconditional branch from the weights it is
     # built over, so it is rebuilt over the ones these tests sample under.
-    objective = DiffusionObjective(model, process, inputs, steps=3, sampler=Euler(),
+    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(),
                                    guidance=CFG(2.0), pretrained=variables)
     batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
              **inputs.tokenize(["ab", "cd", "ef", "gh"])}

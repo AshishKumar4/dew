@@ -30,7 +30,7 @@ from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ChatMessages, Loading, tokenizer_for
 from dew.data.chat import Role
 from dew.interop import export_run, load_pretrained
-from dew.objectives.lm import LMObjective, LMRunConfig, Samples
+from dew.objectives.lm import LMRunConfig, Samples
 from dew.registry import metrics
 from dew.training import MeshSpec, TrainState, prepare_process
 
@@ -123,8 +123,8 @@ def main(config: Config) -> Path:
                              attention_impl=run.model.attention_impl,
                              max_seq_len=config.sequence_length + run.sample_tokens)
     words = tokenizer_for(tokenizer)
-    objective = LMObjective(
-        source.model, config.sequence_length, pretrained=source.variables,
+    objective = source.lm_objective(
+        config.sequence_length,
         loss_role=Role.ASSISTANT,
         samples=Samples(words.encode("user : hello "), run.sample_tokens,
                         sampling=run.sampling, decode=words.decode))

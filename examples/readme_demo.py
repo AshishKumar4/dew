@@ -114,7 +114,7 @@ def flow_images(out: Path):
         num_heads=2, mlp_ratio=2, dtype=jnp.float32, attention_impl="xla",
     )
     objective = DiffusionObjective(
-        model, Flow()(), InputSpec(Field("image", (8, 8, 3))),
+        model, Flow(), InputSpec(Field("image", (8, 8, 3))),
         sampler=Euler(), guidance=None, steps=4,
     )
     trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(3))

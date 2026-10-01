@@ -57,7 +57,7 @@ import pytest
 
 from dew.interop import load_pretrained
 from dew.objectives.base import Step, scalar_loss
-from dew.objectives.lm import LMObjective
+
 from dew.sampling import Sampling
 
 # Pinned: the numbers above are these commits' weights, and a repository
@@ -183,8 +183,7 @@ def scoring(bundle, batch):
     ids = np.asarray(inputs.tokens)
     rows = np.concatenate(
         [ids, np.full((ids.shape[0], SEQ + 1 - ids.shape[1]), fill, ids.dtype)], axis=1)
-    objective = LMObjective(bundle.model, seq_len=SEQ, ema_decay=None, pad_id=fill,
-                            pretrained=bundle.variables)
+    objective = bundle.lm_objective(seq_len=SEQ, ema_decay=None, pad_id=fill)
     return objective, objective.init(jax.random.key(0)), rows
 
 
