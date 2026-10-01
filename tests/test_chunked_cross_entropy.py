@@ -802,8 +802,12 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     # ulp can flip the cotangent's bf16 rounding: one bf16 ulp of an entry,
     # which is 2^-7 of an entry sitting at a power of two, the bottom of its
     # binade, and the flipped entry can be the largest.
-    # fp32 compute keeps fp32's order-of-summation bound.
-    bound = 2e-6 if dtype == jnp.float32 else 2.0**-7
+    # fp32 compute keeps fp32's order-of-summation bound, tripled: log Z is
+    # one running reduction (`_row_terms`) that rounds the exponential that
+    # rescales a partial sum, the product and the add where a plain sum rounds
+    # the add alone. Against float64 the whole head's gradients sit at 4.7e-6
+    # and 4.9e-6 of their maximum, the tiled head's at 2.3e-6 and 2.5e-6.
+    bound = 6e-6 if dtype == jnp.float32 else 2.0**-7
     for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
