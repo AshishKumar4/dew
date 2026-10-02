@@ -177,7 +177,7 @@ def pretrained(out, smoke):
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
     # Begin snippet: pretrained
-    bundle = PretrainedDecoder.load(source, dtype="bfloat16", max_seq_len=128)
+    bundle = PretrainedDecoder.load(source, dtype=jnp.bfloat16, max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     # End snippet: pretrained
     if smoke:
@@ -204,7 +204,7 @@ def pretrained(out, smoke):
 
 def serving(out, smoke):
     source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
-    bundle = PretrainedDecoder.load(source, dtype="bfloat16", param_dtype="bfloat16",
+    bundle = PretrainedDecoder.load(source, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
                                     max_seq_len=128, mesh=MeshSpec())
     if smoke:
         bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))

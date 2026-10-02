@@ -94,6 +94,20 @@ def test_a_source_loads_as_its_kind_and_a_kind_refuses_another():
         PretrainedDecoder.load(FIXTURES / "llada-tiny", dtype="float32")
 
 
+def test_a_loader_takes_a_dtype_and_records_its_name():
+    """`jnp.float32` and "float32" load the same model, and the record the
+    model was built from keeps the name, which is what run.json can hold."""
+    from dew.interop import PretrainedDecoder
+
+    typed = PretrainedDecoder.load(FIXTURES / "llama-tiny", dtype=jnp.float32, param_dtype=jnp.bfloat16)
+    named = PretrainedDecoder.load(FIXTURES / "llama-tiny", dtype="float32", param_dtype="bfloat16")
+    assert typed.model_config["dtype"] == "float32"
+    assert typed.model_config == named.model_config
+    for left, right in zip(jax.tree.leaves(typed.variables), jax.tree.leaves(named.variables), strict=True):
+        assert left.dtype == right.dtype
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew import Dataset, Trainer
     from dew.objectives.base import Step

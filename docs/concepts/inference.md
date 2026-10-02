@@ -78,12 +78,14 @@ Checkpoints in a published layout load through `dew.interop.Pretrained.load`, in
 This exports the decoder from the example in the Hugging Face layout and loads it back:
 
 ```python
+import jax.numpy as jnp
+
 import dew
 from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
 PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
-loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype="float32")
+loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
 print(loaded("One day", 20, key=0).text)
@@ -106,9 +108,12 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 `TextGeneration.quantized(Quantization(...))` returns a task with matched language-model weights stored as int8 or fp8 values with their scales. It uses the same Qwix serving path and `dewml[quantization]` extra as image tasks, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes cache storage. Both can be used by `Server.from_task`.
 
 ```python
+import jax.numpy as jnp
+
+import dew
 from dew.training.quantization import Quantization
 
-task = dew.pipeline("Qwen/Qwen3-0.6B", dtype="bfloat16")
+task = dew.pipeline("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16)
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
 print(served("The capital of France is", max_new_tokens=20, key=0).text[0])
 ```
@@ -120,10 +125,12 @@ Resident JAX weights retain their placement through Qwix. Unplaced NumPy weights
 `TextToImage.quantized(Quantization(...))` returns the task with its denoiser's kernels stored as int8 or fp8 values and their scales, through Qwix's post-training quantization (`pip install "dewml[quantization]"`). The encoders and the autoencoder keep their weights. `Quantization(dtype="int8")` quantizes weights and activations, so each matmul runs in int8; `weight_only=True` keeps activations in the compute dtype, which saves the weight memory without the speed. `patterns` chooses the modules by path. On the RTX 4080 the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB, and in bf16 with int8 weights and activations its denoiser forward takes 21% less time, with its CLIP score within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time it saves depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time and not the bf16 one's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, which XLA:GPU computes wrongly or cannot compile, so there the model's depthwise convolutions stay out:
 
 ```python
+import jax.numpy as jnp
+
 from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16)
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
