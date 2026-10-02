@@ -866,7 +866,7 @@ def _evaluation_parts(case: _EvaluationCase):
     import jax
     import jax.numpy as jnp
 
-    from dew.artifacts import Representations, host
+    from dew.artifacts import Representations
     from dew.objectives.base import Aux, Objective
 
     class Numerical(Objective):
@@ -905,7 +905,7 @@ def _evaluation_parts(case: _EvaluationCase):
                 return Representations(features=local, labels=np.arange(3))
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
-            preview = host(Representations(features=features, labels=batch["x"][:, 0]))
+            preview = Representations(features=features, labels=batch["x"][:, 0])
             if case.rank == 0 and case.failure == "preview":
                 raise ValueError("preview decoding failed")
             return preview
@@ -1014,7 +1014,7 @@ def mode_evaluation_replicas(args) -> dict:
     import jax.numpy as jnp
     import optax
 
-    from dew.artifacts import Representations, host
+    from dew.artifacts import Representations
     from dew.data import Dataset
     from dew.objectives.base import Aux, Objective
     from dew.training import MeshSpec, Trainer
@@ -1052,11 +1052,7 @@ def mode_evaluation_replicas(args) -> dict:
                         key=state.key, mesh=trainer.device_mesh).scalars
     unconsumed = Evaluation.run(trainer.objective, state.params, data.val, key=state.key,
                           mesh=trainer.device_mesh).scalars
-    # Plain host stays usable on root alone for local arrays outside evaluation.
-    local = None
-    if jax.process_index() == 0:
-        local = host(jax.device_put(np.arange(3), jax.local_devices()[0])).tolist()
-    return {"measured": measured, "no_consumer": unconsumed, "local": local}
+    return {"measured": measured, "no_consumer": unconsumed}
 
 
 def mode_builtin_preview_failures(args) -> dict:
