@@ -199,7 +199,7 @@ class GatedMLP(nn.Module):
                 work = up.astype(at_least_fp32(up.dtype))
                 hidden = (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(up.dtype)
             else:
-                hidden = nn.gelu(up)
+                hidden = nn.gelu(up.astype(at_least_fp32(up.dtype))).astype(up.dtype)
             return checkpoint_name(self.down_proj(hidden), 'down_proj')
         if self.has_variable('params', 'gate_up_proj'):
             gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
