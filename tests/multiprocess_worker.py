@@ -206,7 +206,7 @@ def indexed_loader(records: int, batch: int = BATCH):
 
     return pygrain.DataLoader(
         data_source=pygrain.RangeDataSource(0, records, 1),
-        solver=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
+        sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
                                      num_epochs=1,
                                      shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
