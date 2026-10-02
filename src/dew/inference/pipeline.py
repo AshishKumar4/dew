@@ -11,7 +11,6 @@ uses the current pool's devices. A just-trained state needs no reload; its objec
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -65,7 +64,8 @@ def pipeline(
     if param_dtype != "auto":
         resolve_dtype(param_dtype)
     root = epath.Path(source)
-    if (root / RUN_FILE).is_file():
+    if root.is_dir() and (
+            (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
@@ -107,7 +107,8 @@ about a run beyond the name its `run.json` records.
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    record = json.loads((root / RUN_FILE).read_text())
+    from dew.inference.tasks import run_record
+    record = run_record(str(root), step)
     if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
         raise ValueError("run.json must name its objective kind")
     kind = record["objective"]
