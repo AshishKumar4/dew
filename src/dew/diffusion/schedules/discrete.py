@@ -24,8 +24,6 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         # The table is fixed at construction. Device float32 prefix products
         # and roots introduce backend-dependent error into every later step.
         alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)
-
-        self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
         self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
         self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
         noise_variance = 1 - alpha_cumprod
