@@ -121,7 +121,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
 
     pretrained = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
-    model, variables = pretrained.model, pretrained.variables
+    _model, variables = pretrained.model, pretrained.variables
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path

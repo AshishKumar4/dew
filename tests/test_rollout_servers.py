@@ -312,6 +312,7 @@ class Engine(BaseHTTPRequestHandler):
                                 "num_paused_requests": 0})
         self.server.flushed.append(body.get("flush_cache", True))
         self.answer(200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0})
+        return None
 
     def do_GET(self):
         path, _, query = self.path.partition("?")

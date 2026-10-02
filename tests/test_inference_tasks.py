@@ -230,7 +230,7 @@ def test_text_decodes_lazily_through_the_bound_processor():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="no processor"):
-        bare([[1, 2]], 3, key=0).text
+        _ = bare([[1, 2]], 3, key=0).text
     task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3)
     result = task(["12", "5"], key=0)
     assert calls == []
