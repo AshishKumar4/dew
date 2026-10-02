@@ -60,6 +60,11 @@ def pipeline(
 
     Loading a task also points XLA at the on-disk executable cache, so a
     restarted process reuses what it already compiled.
+
+    The narrow-rounding policy applies only when this loads before the
+    process's first JAX computation. If a notebook already used JAX,
+    restart with `XLA_FLAGS=--xla_allow_excess_precision=false` set before
+    importing it; changing the environment cannot reopen a live backend.
     """
     keep_roundings()
     _persist_compilations()
