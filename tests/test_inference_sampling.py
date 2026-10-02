@@ -183,26 +183,35 @@ def test_invalid_probability_controls_are_refused():
             Sampling(min_p=value)
 
 
-def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
-    """A source builds the complete chain in the reference's order, keeping
-    its basic policy visible as a `Sampling` value. An explicit policy
-    replaces that policy and clears the chain it was built around, while the
-    row count stays the source's."""
+def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
+    """A source's common controls are its `Sampling` value. A control the
+    policy does not carry (epsilon sampling) binds the complete chain,
+    built in the reference's order with the policy's own transforms in it.
+    An explicit policy replaces both, while the row count stays the source's."""
     from pathlib import Path
 
     from dew.interop.pretrained import Pretrained
+    from dew.sampling import decoding
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
                                            "min_p": 0.1, "num_return_sequences": 2})
     altered = replace(source, generation_config={**source.generation_config,
                                                  "repetition_penalty": 2.0, "typical_p": 0.9})
-    override = altered.text_generation(sampling=Sampling(temperature=0))
+    bound = altered.text_generation()
+    assert bound.logits is None and bound.n == 2
+    assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
+    rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
+    assert [type(transform) for transform in rare.text_generation().logits] == [
+        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopP, decoding.MinP, decoding.Typical,
+        decoding.EpsilonCutoff]
+    override = rare.text_generation(sampling=Sampling(temperature=0))
+    assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
     np.testing.assert_array_equal(plain.behavior_log_probs, 0)
-    penalized = replace(override, logits=altered.text_generation().logits)
-    assert not np.array_equal(np.asarray(plain.tokens),
-                              np.asarray(penalized([[1, 2]], 6, key=jax.random.key(1), n=1).tokens))
+    penalized = override([[1, 2]], 6, key=jax.random.key(1), n=1,
+                         sampling=Sampling(temperature=0, repetition_penalty=2.0))
+    assert not np.array_equal(np.asarray(plain.tokens), np.asarray(penalized.tokens))
 
 
 def test_one_policy_holds_the_common_controls_in_the_reference_order():
