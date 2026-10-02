@@ -1373,11 +1373,6 @@ class Trainer(Generic[Loss, Effects]):
         # scopes share whichever profiler owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            if self.mesh.stage > 1:
-                # Before the state is placed; every other mesh's batch is
-                # checked with its stream (`_check_stream`), a ramp's at each
-                # of its stages.
-                self._check_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview,
                             best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
@@ -1832,8 +1827,8 @@ class Trainer(Generic[Loss, Effects]):
         return agreed("profiling window setup", own_window)
 
     def _check_batch(self, batch: int, mesh: Mesh) -> None:
-        """Refuse, before anything is placed, a global batch the mesh cannot
-        split (`batch_divisor`): its rows shard over the batch axes as whole
+        """Refuse, before a batch is placed or the step compiles, a global
+        batch the mesh cannot split (`batch_divisor`): its rows shard over the batch axes as whole
         rows, and a pipeline cuts each device's rows again into M
         microbatches, where a device that holds none of a microbatch's rows
         computes another's again. The message names the row shards, and the
