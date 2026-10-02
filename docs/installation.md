@@ -139,16 +139,16 @@ The script downloads the data if needed and prints an `export` line with the pre
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
 import os
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 
-data = OxfordFlowers(
+data = TFDSImages(
     path=os.environ["DEW_FLOWERS_PATH"],
     image_size=64,
     loading=Loading(workers=0),
 ).load(batch=4)
 ```
 
-Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`. With `labels=None`, `OxfordFlowers` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
+Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
 
 ## Building the documentation
 

@@ -9,7 +9,7 @@ Five scripts under [`examples/`](https://github.com/AshishKumar4/dew/tree/main/e
 First prepare the records at the training resolution, then launch the same file on every worker:
 
 ```bash
-python tools/prepare_images.py --dataset oxford_flowers102 \
+python tools/prepare_images.py --dataset tfds_images \
     --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \
     --split all --image-size 256 --out prepared/flowers-256
 python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000

@@ -6,7 +6,7 @@ read is a memcpy rather than a JPEG decode:
     python -c "import tensorflow_datasets as tfds; tfds.builder('oxford_flowers102', \\
         data_dir='~/.cache/dew/datasets').download_and_prepare(\\
         file_format='array_record')"
-    python tools/prepare_images.py --dataset oxford_flowers102 \\
+    python tools/prepare_images.py --dataset tfds_images \\
         --data-path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
         --split all --image-size 256 --out prepared/flowers-256
 
@@ -15,7 +15,7 @@ Then launch the same file on every worker of the slice:
     python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
 
 `--data` reads whichever of the two layouts it is given: the TFDS version
-directory loads as `oxford_flowers102`, the `prepare_images.py` output as
+directory loads as `tfds_images`, the `prepare_images.py` output as
 `array_record_images`. The smoke run writes a handful of synthetic records in
 that second layout and trains on them on one CPU device:
 
@@ -34,7 +34,7 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ArrayRecordImages, DataPartition, Loading, OxfordFlowers
+from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
@@ -132,7 +132,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
     prepared = (ArrayRecordImages(path=path) if (config.data / "manifest.json").is_file()
-                else OxfordFlowers(path=path))
+                else TFDSImages(path=path))
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(config.model), dtype="bfloat16"),
         data=replace(prepared, image_size=config.image_size, val_batches=4),

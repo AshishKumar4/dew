@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 import numpy as np
 
 from dew.config import ModelConfig, RunConfig
-from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
+from dew.data import ImageDataset, OnlineImages, OnlineVideos, TFDSImages, VideoDataset
 from dew.diffusion.presets import EDM, Flow, MeanFlow, Shortcut, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
@@ -397,7 +397,7 @@ class DiffusionRunConfig(RunConfig):
     otherwise; it follows `rl`, so a saved record names what trained."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
+    data: CaptionedSpec = dataclasses.field(default_factory=TFDSImages)
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with. None is the one
     the `pretrained` pipeline's scheduler reads, which a preset may restate."""

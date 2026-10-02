@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.inputs import Field
 from dew.interop import save_params
 from dew.objectives.jepa import (
@@ -43,7 +43,7 @@ class Config:
 
 
 def main(config: Config, data=None):
-    data = data or OxfordFlowers(
+    data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
         image_size=config.image_size,
     ).load(batch=config.batch_size)

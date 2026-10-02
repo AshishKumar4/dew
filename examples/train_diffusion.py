@@ -14,7 +14,7 @@ import tyro
 from PIL import Image
 
 from dew.artifacts import uint8_pixels
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
@@ -49,7 +49,7 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or OxfordFlowers(
+    data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
         image_size=config.image_size,
     ).load(batch=config.batch_size, tokenize=inputs.tokenize)

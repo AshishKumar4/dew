@@ -8,7 +8,9 @@
 The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),
 and so are the preset (`preset:flow --preset.shift 3.0`), the sampler, the text
 condition (`text:None` for an unconditional run) and the autoencoder
-(`autoencoder:stable-diffusion-autoencoder`). Architecture kwargs go through
+(`autoencoder:stable-diffusion-autoencoder`). The corpora this recipe names
+(`oxford-flowers102`, the default, `cc12m`, the LAION sets) are `CORPORA` below,
+values of the specs `dew.data` reads. Architecture kwargs go through
 --model.config as one JSON object, straight to the registry. The run spec is
 `dew.objectives.diffusion.DiffusionRunConfig`, saved as run.json next to the
 checkpoints, and training and inference both build from `config.build()`.
@@ -19,16 +21,84 @@ autoencoder and convention; `rl:flow-grpo --rl.reward clip_score` trains the
 model with Flow-GRPO on that reward instead of the denoising loss.
 """
 
+import dataclasses
 import hashlib
 import json
 import re
+import typing
+from typing import Annotated
 
 import jax
 import tyro
 
+from dew.data import ArrayRecordImages, DatasetSpec, OnlineImages, TFDSImages
 from dew.objectives.diffusion import DiffusionRunConfig
+from dew.objectives.diffusion.config import CaptionedSpec
 from dew.registry import datasets, presets
 from dew.training import TrainState, prepare_process, run_timestamp
+
+# The corpora this recipe trains on, each a value of a core spec: where the
+# data lives and how it is captioned. On the command line one is a subcommand
+# (`data:cc12m --data.path /mnt/gcs`); in a run's record it is the core spec
+# with these fields, so the record reads back without this file.
+FLOWER_CAPTIONS = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
+                   "This is a photo of a {} flower", "A photo of a {} flower")
+
+# The msml612 shards live in gs://msml612-diffusion-data, read through a gcs
+# fuse mount handed over as `path`; the regional url tables are fetched as read.
+REGIONAL = "gs://dew-datasets-regional/datasets/"
+CORPORA: dict[str, DatasetSpec] = {
+    "oxford-flowers102": TFDSImages(caption_templates=FLOWER_CAPTIONS),
+    # laion-aesthetics-12M (score >= 6) plus MS-COCO 2017: 228 shards, 236 GiB, about 15M samples.
+    "laion12m-coco": ArrayRecordImages(shards=("arrayrecord2/laion12m_coco",)),
+    # laion-2B-en aesthetic >= 4.2 subset: 569 shards, 550 GiB, larger but noisier.
+    "laion2b-aesthetic": ArrayRecordImages(shards=("arrayrecord2/laion2B-en-aesthetic",)),
+    # diffusiondb (SD synthetic images and prompts): 31 shards, 60 GiB, 1.97M samples.
+    "diffusiondb": ArrayRecordImages(shards=("arrayrecord2/diffusiondb",)),
+    # Conceptual Captions 3M: 50 shards, 37 GiB, about 3.3M samples (shard 00039 missing).
+    "cc3m": ArrayRecordImages(shards=("arrayrecord2/cc3m",)),
+    # The four msml612 datasets together, about 883 GiB and 20M samples.
+    "combined-msml612": ArrayRecordImages(shards=(
+        "arrayrecord2/laion12m_coco", "arrayrecord2/laion2B-en-aesthetic",
+        "arrayrecord2/diffusiondb", "arrayrecord2/cc3m")),
+    "cc12m": ArrayRecordImages(shards=("arrayrecord2/cc12m",)),
+    # Four arrayrecord2 shard sets of the msml612 bucket, about 30M samples.
+    "combined-30m": ArrayRecordImages(shards=(
+        "arrayrecord2/laion-aesthetics-12m+mscoco-2017", "arrayrecord2/cc12m",
+        "arrayrecord2/aestheticCoyo_0.26_clip_5.5aesthetic_256plus",
+        "arrayrecord2/playground+leonardo_x4+cc3m.parquet")),
+    # Every url table in the regional bucket; the liked sets are listed several
+    # times over, which weights them up.
+    "combined-online": OnlineImages(sources=tuple(REGIONAL + name for name in (
+        "laion-aesthetics-12m+mscoco-2017", "coyo700m-aesthetic-5.4_25M",
+        "leonardo-liked-1.8m", "leonardo-liked-1.8m", "leonardo-liked-1.8m", "cc12m",
+        "playground-liked", "leonardo-liked-1.8m", "leonardo-liked-1.8m", "cc3m", "cc3m",
+        "laion2B-en-aesthetic-4.2_37M"))),
+}
+Corpus = typing.Union[tuple(Annotated[type(spec), tyro.conf.subcommand(name, default=spec)]
+                            for name, spec in CORPORA.items())]
+
+
+def corpus_name(spec: DatasetSpec) -> str:
+    """The corpus `spec` is, by the fields its `CORPORA` entry sets, or its
+    spec's registry name: what the experiment name says it trained on."""
+    for name, corpus in CORPORA.items():
+        chosen = [field.name for field in dataclasses.fields(corpus)
+                  if getattr(corpus, field.name) != getattr(type(corpus)(), field.name)]
+        if type(spec) is type(corpus) and all(
+                getattr(spec, name) == getattr(corpus, name) for name in chosen):
+            return name
+    return datasets.name_of(type(spec))
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionRecipeConfig(DiffusionRunConfig):
+    """`DiffusionRunConfig` with this recipe's corpora on the command line,
+    flowers by default."""
+
+    data: Corpus | CaptionedSpec = dataclasses.field(
+        default_factory=lambda: CORPORA["oxford-flowers102"])
+
 
 DEFAULT_EXPERIMENT_NAME = ("dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/"
                            "schd-{preset}/arch-{architecture}/lr-{learning_rate}")
@@ -40,7 +110,7 @@ def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -
     return {
         **fields,
         "architecture": config.pretrained or config.model.architecture,
-        "dataset": datasets.name_of(type(config.data)),
+        "dataset": corpus_name(config.data),
         "image_size": sample.shape[-2],
         "batch_size": config.trainer.batch_size,
         "preset": "source" if config.preset is None else presets.name_of(type(config.preset)),
@@ -95,4 +165,4 @@ def main(config: DiffusionRunConfig) -> TrainState:
 
 
 if __name__ == '__main__':
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[DiffusionRunConfig]))
+    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[DiffusionRecipeConfig]))

@@ -25,7 +25,7 @@ import numpy as np
 import optax
 import tyro
 
-from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, OxfordFlowers
+from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, TFDSImages
 from dew.data.dataset import mapped, tokenized, train_stream
 from dew.data.images import ImageTransform, class_names
 from dew.interop.diffusion_gemma import build
@@ -104,7 +104,7 @@ def caption_batch(batch, config: Config, labels):
 
 
 def flowers_data(config: Config):
-    spec = OxfordFlowers(path=config.flowers, split="train", image_size=config.image_size,
+    spec = TFDSImages(path=config.flowers, split="train", image_size=config.image_size,
                          augmentation="none", val_batches=0,
                          loading=Loading(workers=0, threads=2, read_buffer=16))
     source = spec.source()

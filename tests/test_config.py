@@ -26,7 +26,7 @@ from dew.training import Layout, MeshSpec
 def test_to_dict_and_from_dict_round_trip_a_run():
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
-        data=datasets["oxford_flowers102"](image_size=64),
+        data=datasets["tfds_images"](image_size=64),
         optim=OptimConfig(optimizer="muon", learning_rate=1e-3, weight_decay=0.1),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
@@ -40,7 +40,8 @@ def test_a_tuple_field_comes_back_a_tuple_from_a_record():
     """JSON has no tuple, so a record holds a list where the class declares
     one. The class gets its tuple back: with a list in its place the loaded
     config compares unequal to the saved one and its spec is unhashable."""
-    config = RunConfig(data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1))
+    config = RunConfig(data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+                       trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
     assert loaded == config
@@ -534,7 +535,8 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1),
+        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))
