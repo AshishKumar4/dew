@@ -65,3 +65,26 @@ def test_an_unknown_field_is_refused():
         DiffusionRunConfig.from_dict({**record, "preset": {"name": "edm", "fields": {"warp": 1.0}}})
     with pytest.raises(ValueError, match=r"unknown fields \['seed'\]"):
         RunConfig.from_dict({"trainer": {"seed": 23}})
+
+
+PUBLISHED = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "run.json"
+LIVE_PIN = ROOT / "site" / "live" / "container" / "text-to-image"
+
+
+def test_the_published_run_reads_back_as_it_was_written():
+    """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
+    publishes it, is a current record: it loads and writes back unchanged.
+    A record change that refuses it or rewrites it fails here, and the fix
+    is to re-export the published run in the same change, since the site,
+    the quick start and the live sampler all load it."""
+    held = json.loads(PUBLISHED.read_text())
+    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == held
+
+
+@pytest.mark.network
+def test_the_fixture_is_the_record_the_live_image_pins():
+    from huggingface_hub import hf_hub_download
+
+    repo, revision = LIVE_PIN.read_text().strip().split("@")
+    published = Path(hf_hub_download(repo, "run.json", revision=revision))
+    assert json.loads(published.read_text()) == json.loads(PUBLISHED.read_text())
