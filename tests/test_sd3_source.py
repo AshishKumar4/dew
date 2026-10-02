@@ -198,9 +198,10 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(process.sampler_schedule.model_time(times[:-1]),
                                     arrays[f"{tag}.times"]) < 1e-5
                 denoise = process.denoiser(model, params, {})
-                run = lambda value, denoise=denoise, times=times: sample(  # noqa: E731
-                    denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
-                    times=times, final_denoise=False)
+                def run(value, denoise=denoise, times=times):
+                    return sample(
+                                    denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
+                                    times=times, final_denoise=False)
                 x_T = jnp.asarray(arrays[f"{tag}.x_T"])
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
                 (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))

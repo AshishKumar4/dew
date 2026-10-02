@@ -18,6 +18,7 @@ same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -254,7 +255,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset

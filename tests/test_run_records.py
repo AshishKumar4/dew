@@ -16,6 +16,7 @@ import importlib.util
 import json
 import sys
 import typing
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -138,7 +139,7 @@ def recorded_defaults() -> dict[str, dict[str, object]]:
     whose fields a record holds only where the run set them, by module path:
     each recorded field's default as `snapshot_default` holds it. Flax's own
     `parent` and `name` are not a model's configuration."""
-    import dew.nn.backbones  # noqa: F401  registers every model
+    import_module("dew.nn.backbones")  # registers every model
 
     roots = [RunConfig, DiffusionRunConfig, LMRunConfig,
              recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig"),

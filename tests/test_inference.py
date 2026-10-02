@@ -10,6 +10,7 @@ trainer has just written.
 import dataclasses
 import json
 import shutil
+from importlib import import_module
 from types import SimpleNamespace
 
 import jax
@@ -17,7 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+
+import_module("test_diffusion_objective")  # registers "stub_text"
 
 import dew
 import dew.nn.backbones  # registers the models

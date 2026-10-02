@@ -9,6 +9,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 
 import json
 from dataclasses import asdict, replace
+from importlib import import_module
 from pathlib import Path
 
 import grain.python as grain
@@ -18,7 +19,7 @@ import numpy as np
 import optax
 import pytest
 
-import dew.nn.backbones.causal_transformer  # noqa: F401, registers the backbone
+import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
 from dew.data import Dataset
