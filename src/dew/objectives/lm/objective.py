@@ -1236,6 +1236,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return jax.jit(scored)
 
 
+@metrics("perplexity")
 class Perplexity:
     """Report exp of the cross entropy per counted target over a whole pass.
 
@@ -1262,11 +1263,6 @@ class Perplexity:
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))
-
-
-@metrics("perplexity")
-def perplexity() -> Perplexity:
-    return Perplexity()
 
 
 def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:

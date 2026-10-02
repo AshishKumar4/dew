@@ -221,13 +221,13 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps
     of the Karras grid, classifier-free guidance 3.
     """
-    from dew import models
+    import dew.nn.backbones  # noqa: F401  (registers the kind)
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
     from dew.nn.text_encoders import check_tree
     from dew.objectives.diffusion.config import PretrainedAutoencoder, TextCondition
-    from dew.registry import resolve_dtype
+    from dew.registry import models, resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 
     architecture = records.text(config.get("architecture"), "architecture")

@@ -14,11 +14,12 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-from dew import models  # noqa: F401  registers the models
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig, _rebuild
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
+from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
 from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving

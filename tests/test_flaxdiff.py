@@ -15,7 +15,7 @@ import orbax.checkpoint as ocp
 import pytest
 from flax.traverse_util import unflatten_dict
 
-from dew import models
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.interop.flaxdiff import (
     fourier_table,
     hybrid_dit_fields,
@@ -25,6 +25,7 @@ from dew.interop.flaxdiff import (
     simple_udit_variables,
 )
 from dew.nn.dit import TextContext
+from dew.registry import models
 
 FIXTURE = Path(__file__).parent / "fixtures" / "flaxdiff"
 

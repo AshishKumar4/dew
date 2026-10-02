@@ -36,12 +36,12 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew import models  # naming a registry fills it
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import at_namespace, host_banked, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
 from dew.training.distributed import Placement
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import build_mesh
 

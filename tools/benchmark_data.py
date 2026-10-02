@@ -30,7 +30,7 @@ from absl import flags  # noqa: E402
 flags.FLAGS.mark_as_parsed()
 
 from dew.data import DatasetSpec, OxfordFlowers  # noqa: E402
-from dew import datasets  # noqa: E402  naming a registry fills it
+from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and

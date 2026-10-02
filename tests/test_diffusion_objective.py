@@ -20,7 +20,8 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables, scalar_loss
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
@@ -74,7 +75,7 @@ class StubText(ConditionEncoder[str]):
 
 
 def make_objective(*, guidance: CFG | None = CFG(2.0)):
-    model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
@@ -558,7 +559,7 @@ GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
 def conditional_mmdit():
     encoder = CharTable.from_pretrained(tokens=3, features=6, vocab=16)
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
-    model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
+    model = SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
     preset = presets.EDM(sigma_max=1.0, regime="pixel")
     objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))

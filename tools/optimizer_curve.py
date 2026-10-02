@@ -32,8 +32,8 @@ import tyro
 from dew.config import OptimConfig
 from dew.data import Loading, TokenWindows
 from dew.objectives.lm import LMObjective
-from dew import models  # naming a registry fills it
-from dew.registry import with_precision
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+from dew.registry import models, with_precision
 from dew.training import MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.optim import build_optimizer

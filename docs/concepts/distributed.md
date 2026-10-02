@@ -21,12 +21,13 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 
-model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=2,
-                     num_heads=4, mlp_features=1024, max_seq_len=64)
+model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
+                          num_heads=4, mlp_features=1024, max_seq_len=64)
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)

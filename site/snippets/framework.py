@@ -20,14 +20,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Checkpoints, Dataset, Field, InputSpec, MeshSpec, Trainer, models
+from dew import Checkpoints, Dataset, Field, InputSpec, MeshSpec, Trainer
 from dew.data import ByteTokenizer, Loading, Prompts, TokenWindows
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor
 from dew.inference.serving import Server
 from dew.interop import load_pretrained
+from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Euler, Heun, Sampling
@@ -58,16 +59,16 @@ def image_fixture(size):
 
 
 def decoder():
-    return models.build("causal_transformer", vocab_size=256, emb_features=32,
-                        num_layers=1, num_heads=2, mlp_features=64, max_seq_len=128)
+    return CausalTransformer(vocab_size=256, emb_features=32,
+                             num_layers=1, num_heads=2, mlp_features=64, max_seq_len=128)
 
 
 def lm(out, smoke):
     _, data = text_fixture(out)
     # Begin snippet: lm
-    model = models.build("causal_transformer", vocab_size=256,
-                         emb_features=32, num_layers=1, num_heads=2,
-                         mlp_features=64, max_seq_len=128)
+    model = CausalTransformer(vocab_size=256,
+                              emb_features=32, num_layers=1, num_heads=2,
+                              mlp_features=64, max_seq_len=128)
     objective = LMObjective(model, seq_len=64, ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
@@ -79,8 +80,8 @@ def lm(out, smoke):
 def diffusion(out, smoke):
     data = image_fixture(8)
     # Begin snippet: diffusion
-    model = models.build("simple_dit", patch_size=4, emb_features=16,
-                         num_layers=1, num_heads=2, mlp_ratio=2)
+    model = SimpleDiT(patch_size=4, emb_features=16,
+                      num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
         sampler=Euler(), steps=4)
@@ -121,10 +122,10 @@ def sample_public(out, smoke):
 def jepa(out, smoke):
     data = image_fixture(32)
     # Begin snippet: jepa
-    encoder = models.build("jepa_encoder", patch_size=4, emb_features=32,
-                           num_layers=1, num_heads=2)
-    predictor = models.build("jepa_predictor", grid=(8, 8), emb_features=32,
-                             predictor_features=16, num_layers=1, num_heads=2)
+    encoder = JepaEncoder(patch_size=4, emb_features=32,
+                          num_layers=1, num_heads=2)
+    predictor = JepaPredictor(grid=(8, 8), emb_features=32,
+                              predictor_features=16, num_layers=1, num_heads=2)
     objective = JepaObjective(
         encoder, predictor, mask=multi_block_mask((8, 8)),
         sample=Field("image", (32, 32, 3)), momentum_steps=3)
@@ -142,9 +143,9 @@ def grpo(out, smoke):
     rng = np.random.default_rng(0)
     records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
     # Begin snippet: grpo
-    model = models.build("causal_transformer", vocab_size=13, emb_features=64,
-                         num_layers=2, num_heads=4, head_dim=16,
-                         mlp_features=128, max_seq_len=16)
+    model = CausalTransformer(vocab_size=13, emb_features=64,
+                              num_layers=2, num_heads=4, head_dim=16,
+                              mlp_features=128, max_seq_len=16)
 
     def reward(data_source, completion, ground_truth, extra_info):
         tokens = [int(token) for token in completion.split()]

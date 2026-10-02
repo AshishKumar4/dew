@@ -120,15 +120,16 @@ def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: s
 
 
 @metrics("clip")
-def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
+class CLIPDistance(ImageMetric):
     """Score CLIP distance, mean(1 - cos(image, text)); lower is better. It logs as
-    val/clip_similarity; `clip_score` is the standard number for a new run.
+    val/clip_similarity; `CLIPScore` is the standard number for a new run.
     """
 
-    def measure(artifact, batch):
-        return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
+    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = "text"):
+        def measure(artifact, batch):
+            return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
-    return ImageMetric(name="clip_similarity", measure=measure)
+        super().__init__(name="clip_similarity", measure=measure)
 
 
 @metrics("clip_score")
@@ -141,10 +142,3 @@ class CLIPScore(ImageMetric):
             return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
         super().__init__(name='clip_score', measure=measure)
 
-
-def clip_score_metric(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
-    """Score standard CLIPScore over a validation pass, the same number `clip_score`
-    reports for the images and prompts the pass consumed.
-    """
-
-    return CLIPScore(modelname, field)

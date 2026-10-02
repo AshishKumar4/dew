@@ -23,11 +23,11 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew import models
+import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import SafetensorsBanks, host_banked, layer_index, stream_banked
 from dew.interop.hf_decoders import translate_config
 from dew.objectives.base import merge
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.training import Layout
 from dew.training.distributed import build_mesh
 

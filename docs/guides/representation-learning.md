@@ -13,17 +13,17 @@ import jax
 import numpy as np
 import optax
 
-from dew import Field, Trainer, models
+from dew import Field, Trainer
 from dew.data import Dataset
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, multi_block_mask
 
 rng = np.random.default_rng(0)
 images = rng.integers(0, 256, size=(8, 16, 16, 3), dtype=np.uint8)
 data = Dataset(train=lambda partition: itertools.repeat({"image": images}),
                val=None, records=8, batch=8)
-encoder = models.JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
-predictor = models.JepaPredictor(grid=(4, 4), emb_features=32,
-                                 predictor_features=16, num_layers=1, num_heads=2)
+encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
+predictor = JepaPredictor(grid=(4, 4), emb_features=32,
+                          predictor_features=16, num_layers=1, num_heads=2)
 mask = multi_block_mask((4, 4), num_targets=1, scale=(0.25, 0.25))
 objective = JepaObjective(encoder, predictor, mask=mask,
                           sample=Field("image", (16, 16, 3)))
@@ -54,6 +54,6 @@ A downstream result needs held-out labeled examples and a probe, run as validati
 
 The dataset's images must match the declared sample shape, and the patch size and predictor grid change together. The predictor reads the encoder's output width (`emb_features`) and has its own internal width (`predictor_features`).
 
-`JepaObjective` trains on video when the sample field has shape `(T, H, W, C)`, with `models.JepaVideoEncoder` as the encoder. The video tensors, the spatio-temporal patch geometry, the masks and the predictor must agree; the video path of `recipes/jepa/train.py` is a complete configuration.
+`JepaObjective` trains on video when the sample field has shape `(T, H, W, C)`, with `JepaVideoEncoder` as the encoder. The video tensors, the spatio-temporal patch geometry, the masks and the predictor must agree; the video path of `recipes/jepa/train.py` is a complete configuration.
 
 The [I-JEPA tutorial](../tutorials.md) trains an encoder on real images and probes it.
