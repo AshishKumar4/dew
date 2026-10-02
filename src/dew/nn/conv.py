@@ -134,6 +134,31 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 
 
+def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The depthwise convolution as its nine shifted products, summed in the
+    kernel's row-major order in fp32 and rounded once to the input's dtype.
+
+    The optimization barrier rounds each product to fp32 before it is
+    added, where XLA would otherwise contract it into a fused multiply-add.
+    For more than 16 features that is XLA:CPU's library convolution's
+    arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
+    the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
+    here; it sums 16 features or fewer otherwise, so those keep the
+    convolution. If a jax or YNNPACK release changes that summation,
+    tests/test_depthwise_conv.py's
+    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
+    height, width = lhs.shape[1:3]
+    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
+    kernel = rhs.astype(jnp.float32)
+    products = jax.lax.optimization_barrier([
+        padded[:, i * dilation:i * dilation + height, j * dilation:j * dilation + width, :] * kernel[i, j, 0]
+        for i in range(3) for j in range(3)])
+    total = products[0]
+    for product in products[1:]:
+        total = total + product
+    return total.astype(lhs.dtype)
+
+
 def _conv_general_dilated(
         lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
         padding: str | Sequence[tuple[int, int]], lhs_dilation: Sequence[int] | None = None,
@@ -164,6 +189,8 @@ def _conv_general_dilated(
         return jax.lax.platform_dependent(
             lhs, rhs,
             cuda=convolve if dilation[0] == 1 else lambda x, w: _polyphase_depthwise_3x3(x, w, dilation[0]),
+            cpu=((lambda x, w: _shifted_depthwise_3x3(x, w, dilation[0]))
+                 if feature_group_count > 16 else convolve),
             default=convolve)
     return convolve(lhs, rhs)
 

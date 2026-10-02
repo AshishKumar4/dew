@@ -124,6 +124,35 @@ and 2.0 times slower (its expert GEMMs and the XLA path of the SSD scan).
 The MaxText row ran on another VM, before the whole-logits head took Dew's
 step from 161.9 to 141 ms.
 
+## Sampling the hybrid DiT on the CPU, 2026-10-02
+
+The landing page's live cell samples the published 176M hybrid DiT on a
+4-vCPU container: one prompt, 15 DPM-Solver++ steps under CFG 5.0, a bf16
+SD VAE decode to 256 x 256. Reproduced on one P-core of an i9-12900K (two
+threads, `taskset -c 2,3`, jax 0.11.2.post3), one warm call traced, op time
+by JAX scope, at `db1761fd`:
+
+| scope | s |
+|---|---:|
+| MLPs (dots at about 140 GFLOP/s, YNNPACK) | 8.5 |
+| 2D fusion's depthwise convolutions | 5.7 |
+| VAE decode (bf16 convolutions at about 125 GFLOP/s) | 5.3 |
+| S5 layers, with their output projections | 2.3 |
+| attention blocks | 1.9 |
+| the rest | 0.6 |
+
+The dots and the decoder's convolutions run near the core's fp32 rate. The
+depthwise convolutions did not: XLA:CPU hands a grouped convolution to
+YNNPACK, which took 6.4 ms for one 2 x 16 x 16 x 768 map, 7 MFLOP. On the
+CPU a depthwise 3x3 convolution of more than 16 features now runs as its
+nine shifted products, each rounded to fp32 before it is summed in the
+kernel's row-major order, which is YNNPACK's arithmetic bit for bit (1.4
+ms a map); YNNPACK sums 16 features or fewer otherwise, so those keep the
+convolution. Three alternating processes each way, three calls each, on a
+shared, loaded host: the cell's median 24.45 s to 21.37 (fastest 22.68 to
+20.51), and without the decode 18.96 to 15.99 (17.52 to 14.91); every
+image's sha256 is the same (`923e1b09`).
+
 ## The hybrid DiT's SSM blocks, 2026-10-01
 
 The published 176M hybrid DiT (16 blocks, 12 of them S5 blocks with the
