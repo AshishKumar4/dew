@@ -441,9 +441,9 @@ class TextGeneration:
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
         """
+        from dew.checkpoints import Checkpoints
         from dew.objectives.base import thaw
         from dew.registry import objectives
-        from dew.sampling.pipelines import restore_variables
 
         import_module("dew.objectives.lm")  # registers the saved objective kinds
         import_module("dew.objectives.rl")
@@ -451,7 +451,7 @@ class TextGeneration:
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
         objective_type = objectives[kind]
-        variables = restore_variables(directory, ema=False if objective_type._ema_is_reference else ema,
+        variables = Checkpoints(directory).variables( ema=False if objective_type._ema_is_reference else ema,
                                       step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if kind == "ppo":
             from dew.objectives.rl.ppo import _part
@@ -546,8 +546,8 @@ class BlockGeneration:
         selects the averaged weights, `mesh` and `layout` place them, and
         the two dtypes override computation and storage.
         """
+        from dew.checkpoints import Checkpoints
         from dew.interop import diffusion_gemma
-        from dew.sampling.pipelines import restore_variables
 
         record, model_config, processor = _saved_run(directory, dtype)
         canvas = model_config.config["max_seq_len"]
@@ -559,7 +559,7 @@ class BlockGeneration:
                                       attention_impl=model_config.attention_impl,
                                       max_seq_len=canvas)
         model = model.clone(text=model.text.clone(layer_scalar="trainable"))
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
         return cls(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
                    processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
@@ -634,8 +634,8 @@ class MaskedGeneration:
         The arguments carry what `TextGeneration.from_run` carries, and the
         run's preview budget becomes the response length a call omits.
         """
+        from dew.checkpoints import Checkpoints
         from dew.diffusion.discrete import MDLM
-        from dew.sampling.pipelines import restore_variables
 
         record, model_config, processor = _saved_run(directory, dtype)
         budget = _saved_budget(record)
@@ -645,7 +645,7 @@ class MaskedGeneration:
                 "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
             )
         mask_id = model.mask_token_id
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
         return cls(model, variables, MDLM(mask_id=mask_id)(), processor,
                    pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),

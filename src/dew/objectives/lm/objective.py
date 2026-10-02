@@ -712,12 +712,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def inference_record(self):
         """Describe this decoder without a training RunConfig or parameter copies."""
         from dew.config import ModelConfig, _to_json
-        from dew.registry import objectives
-        try:
-            model = ModelConfig.from_model(self.model)
-            kind = objectives.name_of(type(self))
-        except KeyError:
+        from dew.registry import models, objectives
+        if (not any(member is type(self.model) for member in models.values())
+                or not any(member is type(self) for member in objectives.values())):
             return None
+        model = ModelConfig.from_model(self.model)
+        kind = objectives.name_of(type(self))
         samples = self.samples
         return {
             'objective': kind,

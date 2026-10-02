@@ -166,7 +166,7 @@ class CheckpointBanks:
     """Serve banks by restoring a run's published weights one bank at a time.
 
     `ema` merges the averaged copy over the live weights, as
-    `dew.sampling.pipelines.restore_variables` does, so a bank holds what the
+    `Checkpoints.variables` does, so a bank holds what the
     run publishes. `step` selects a checkpoint and is resolved to the latest
     one when it is built, so every bank of one load comes from one
     checkpoint.

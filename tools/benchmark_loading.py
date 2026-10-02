@@ -33,9 +33,9 @@ def imports():
 def phases(args):
     start = time.perf_counter()
     import jax
+
     from dew.objectives.diffusion import DiffusionRunConfig
-    from dew.sampling import CFG, DPMSolverMultistep, TextToImage
-    from dew.sampling import pipelines
+    from dew.sampling import CFG, DPMSolverMultistep, TextToImage, pipelines
 
     timings = {'imports_s': time.perf_counter() - start}
 
@@ -49,7 +49,8 @@ def phases(args):
             return result
         return run
 
-    pipelines.restore_variables = measured('read_s', pipelines.restore_variables)
+    from dew.checkpoints import Checkpoints
+    Checkpoints.variables = measured('read_s', Checkpoints.variables)
     DiffusionRunConfig.build = measured('build_s', DiffusionRunConfig.build)
     pipelines._with_drawn_tables = measured('build_s', pipelines._with_drawn_tables)
     load = time.perf_counter()
