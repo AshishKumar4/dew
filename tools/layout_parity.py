@@ -305,18 +305,47 @@ def reordered(batch, seed: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
+def _drawn(params, key):
+    """`params` with every leaf its initializer left all zeros drawn from a
+    normal of std 0.02 instead, each from its own fold of `key`.
+
+    A DiT zero-initializes its output projection and its modulations, so its
+    first step's gradient reaches those layers alone: 2 of the zoo DiT's 70
+    leaves, and a layout that split anything above them wrongly would pass.
+    Every state of a comparison, the reference's, a layout's, a floor's and
+    the fp64 anchor's, comes through here from one key, so they start alike."""
+    import jax
+    import jax.numpy as jnp
+
+    def draw(index, leaf):
+        if not jnp.issubdtype(leaf.dtype, jnp.floating):
+            return leaf
+        drawn = (0.02 * jax.random.normal(jax.random.fold_in(key, index), leaf.shape)).astype(leaf.dtype)
+        return jnp.where(jnp.any(leaf != 0), leaf, drawn)
+
+    leaves, tree = jax.tree.flatten(params)
+    return jax.tree.unflatten(tree, [draw(index, leaf) for index, leaf in enumerate(leaves)])
+
+
 def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1,
              devices: int | None = None):
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
-    device, stashing each gradient the optimizer is handed."""
+    device, stashing each gradient the optimizer is handed. Its initial
+    parameters have no all-zero leaf (`_drawn`)."""
     import benchmark_step as bench
     import jax
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer, build_mesh
 
-    trainer = Trainer(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
+    class Drawn(Trainer):
+        def initial_state(self, initializer=None, key=None):
+            state = super().initial_state(initializer, key)
+            params = {**state.params, "params": _drawn(state.params["params"], jax.random.key(7))}
+            return dataclasses.replace(state, params=params, opt_state=self.optimizer.init(params["params"]))
+
+    trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), mesh=bench.mesh_spec(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
                       accumulation=accumulation, checkpoints=None, tracker=None)
@@ -647,15 +676,45 @@ def widest_floor(floors: dict[str, float], dtype: str) -> str:
     return widest
 
 
+def contraction_floor(terms: int, magnitude: float) -> float:
+    """How far two fp32 sums of the same `terms` products may land apart,
+    whose magnitudes add to `magnitude`: each is within gamma_N times it of
+    the exact sum in any order (one product and at most N - 1 adds a path),
+    gamma_N = N u / (1 - N u) with u fp32's unit roundoff, so two are within
+    twice that. tests/test_packed_grpo.py bounds its fp64 contraction alike."""
+    import numpy as np
+
+    u = float(np.finfo(np.float32).eps) / 2
+    return 2 * terms * u / (1 - terms * u) * magnitude
+
+
+def contracted_terms(batch) -> int:
+    """The terms a step's loss sums, at most: the elements of the batch's
+    largest leaf, a decoder's tokens and a denoiser's pixels."""
+    import jax
+    import numpy as np
+
+    return max(int(np.size(leaf)) for leaf in jax.tree.leaves(batch))
+
+
 def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
-           loss_floor: float, reference_loss: float) -> dict[str, Any]:
-    """Every leaf against FLOOR_FACTOR times its floor, fp32 epsilon at least."""
+           loss_floor: float, reference_loss: float, terms: int) -> dict[str, Any]:
+    """Every leaf against FLOOR_FACTOR times its floor, fp32 epsilon at
+    least, and the loss against FLOOR_FACTOR times its floor or the
+    `contraction_floor` of its `terms`, whichever is wider.
+
+    The loss floor comes from reordering the batch, which reassociates the
+    sum over rows; a layout that splits a row's own contraction, a sequence
+    or a tensor axis over the output, reassociates the sum over its elements
+    too, which no reordering of rows moves. The magnitude is the loss's own,
+    which a loss of nonnegative terms adds up to and a signed one's exceeds."""
     import numpy as np
 
     eps = float(np.finfo(np.float32).eps)
     ratios = {leaf: error / (FLOOR_FACTOR * max(floors[leaf], eps)) for leaf, error in errors.items()}
     worst = max(ratios, key=ratios.__getitem__)
-    loss_bound = FLOOR_FACTOR * max(loss_floor, eps * abs(reference_loss))
+    loss_bound = max(FLOOR_FACTOR * max(loss_floor, eps * abs(reference_loss)),
+                     contraction_floor(terms, abs(reference_loss)))
     return {"worst_leaf": worst, "worst_leaf_error": errors[worst], "worst_leaf_floor": floors[worst],
             "worst_ratio": ratios[worst], "loss_error": loss, "loss_bound": loss_bound,
             "status": "works" if ratios[worst] <= 1.0 and loss <= loss_bound else "MISMATCH"}
@@ -775,7 +834,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     lambda: trained(case, LAYOUTS[name], batch, steps=steps, devices=devices))
                 row.update(compiled, losses=losses, **judged(
                     leaf_errors(ref_gradient, gradient, dtype), floors, abs(losses[0] - ref_losses[0]),
-                    loss_floor, ref_losses[0]))
+                    loss_floor, ref_losses[0], contracted_terms(batch)))
                 if compiled["flops_per_device"] and judge.flops_per_device:
                     # Above one when devices compute what one device need not.
                     size = math.prod(compiled["mesh"].values())
