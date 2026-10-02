@@ -487,7 +487,7 @@ class TextGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -584,7 +584,7 @@ class BlockGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -671,7 +671,7 @@ class MaskedGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)

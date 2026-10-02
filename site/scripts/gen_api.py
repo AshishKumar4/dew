@@ -55,7 +55,7 @@ GROUPS: list[tuple[str, list[str]]] = [
                                 "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.guidance",
                                 "dew.sampling.decoding"]),
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
-                              "dew.interop", "dew.interop.diffusion_gemma", "dew.interop.flaxdiff"]),
+                              "dew.interop", "dew.interop.diffusion_gemma"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),

@@ -4,10 +4,10 @@ FlaxDiff (github.com/AshishKumar4/FlaxDiff) is the project Dew grew out of.
 Its trainer saved an orbax tree at every checkpoint step, `{"state":
 {"params", "ema_params", "opt_state", ...}, "best_state": {...}, ...}`, and
 logged the run's config to wandb, so the architecture lives in the config and
-not in the tree. `load_flaxdiff` reads one step and that config and returns
-the run as a `TextToImage` over Dew's own model, built with the fields that
-compute what FlaxDiff computed. This module maps names and config and
-nothing else.
+not in the tree. `TextToImage.from_flaxdiff` reads one step and that config
+and returns the run as a `TextToImage` over Dew's own model, built with the
+fields that compute what FlaxDiff computed. This module maps names and config
+and nothing else.
 
 It knows `simple_udit`, the U-shaped DiT, and `hybrid_dit`, the S5-attention
 DiT. Both project the conditioning vector without a SiLU and average the
@@ -207,9 +207,9 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
             records.text(condition.get("unconditional_input", ""), "unconditional_input"))
 
 
-def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
+def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
                   ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
-    """A FlaxDiff text-to-image run as a Dew `TextToImage`.
+    """A FlaxDiff text-to-image run as a Dew `TextToImage` (`TextToImage.from_flaxdiff`).
 
     `directory` is one checkpoint step, `config` the run config FlaxDiff's
     trainer logged (`wandb.Api().run(path).config`), and `jax_version` the jax
@@ -232,14 +232,14 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     architecture = records.text(config.get("architecture"), "architecture")
     if architecture not in _ARCHITECTURES:
-        raise ValueError(f"load_flaxdiff knows simple_udit and hybrid_dit runs, not {architecture!r}")
+        raise ValueError(f"from_flaxdiff knows simple_udit and hybrid_dit runs, not {architecture!r}")
     arguments = records.record(config.get("arguments") or {}, "arguments")
     schedule = config.get("noise_schedule") or arguments.get("noise_schedule")
     if schedule != "edm":
         raise ValueError(f"a FlaxDiff {architecture} run trains on the EDM schedule, not {schedule!r}")
     autoencoder = config.get("autoencoder")
     if autoencoder != "stable_diffusion":
-        raise ValueError(f"load_flaxdiff knows latent runs on the SD VAE, not {autoencoder!r}")
+        raise ValueError(f"from_flaxdiff knows latent runs on the SD VAE, not {autoencoder!r}")
     options = config.get("autoencoder_opts") or {}
     options = records.record(json.loads(options) if isinstance(options, str) else options,
                              "autoencoder_opts")
@@ -270,8 +270,3 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
     return TextToImage(model, EDM(regime="latent")(), inputs, params, vae, steps=200, guidance=CFG(3.0),
                        solver=EulerAncestral())
-
-
-__all__ = ["HybridDiTFields", "SimpleUDiTFields", "fourier_table",
-           "hybrid_dit_fields", "hybrid_dit_variables", "load_flaxdiff",
-           "read_checkpoint", "simple_udit_fields", "simple_udit_variables"]
