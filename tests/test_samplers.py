@@ -467,7 +467,7 @@ def relative_gap(actual, expected) -> float:
     """The largest entry of |actual - expected| over the larger of 1 and the
     largest entry of |expected|, per leading index."""
     actual, expected = np.asarray(actual), np.asarray(expected)
-    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected))
+    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected, strict=True))
 
 
 @pytest.mark.parametrize("name", sorted(DIFFUSERS_CASES))

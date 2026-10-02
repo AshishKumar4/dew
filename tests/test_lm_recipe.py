@@ -578,10 +578,10 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     assert objective.seq_len == 12, "the objective has to take the window's whole width"
     held = jax.tree.leaves(original.variables)
     distance = max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(state.params), held))
+                   for a, b in zip(jax.tree.leaves(state.params), held, strict=True))
     drawn = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
         jax.tree.leaves(recipe.build_masked_objective(
-            config, original.model, original.model_config, None).init(jax.random.key(0))), held))
+            config, original.model, original.model_config, None).init(jax.random.key(0))), held, strict=True))
     assert 1e-4 < distance < 1e-2, f"the step moved the checkpoint {distance:.3e}"
     assert drawn > 1.0, f"a fresh init is only {drawn:.3e} from the checkpoint"
 
@@ -612,7 +612,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     original = load_pretrained(checkpoint, dtype="float32", attention_impl="xla")
     initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
-                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial)))
+                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial), strict=True))
     assert difference > 1e-5
     restored = recipe.main(config)
     for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params),

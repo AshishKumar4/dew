@@ -356,7 +356,7 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None):
 
 def largest_update_difference(left, right) -> float:
     return max(float(jnp.max(jnp.abs(a - b)))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right)))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def test_muonclip_without_stats_steps_like_muon():

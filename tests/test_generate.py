@@ -193,7 +193,7 @@ def test_each_continuation_stops_at_its_own_eos(rng):
 
     drawn = np.asarray(result.tokens)[:, 4:]
     lengths, terminated = np.asarray(result.lengths), np.asarray(result.terminated)
-    for row, (length, stopped) in enumerate(zip(lengths, terminated)):
+    for row, (length, stopped) in enumerate(zip(lengths, terminated, strict=True)):
         assert not np.any(drawn[row, :length - 1] == eos)
         assert bool(drawn[row, length - 1] == eos) == bool(stopped)
         np.testing.assert_array_equal(drawn[row, length:], sampling.pad_id)

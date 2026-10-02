@@ -565,7 +565,7 @@ def test_scanned_dropout_uses_the_supplied_rng():
     repeated = loss_and_grad(variables["params"], jax.random.key(1))
     changed = loss_and_grad(variables["params"], jax.random.key(2))
 
-    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(repeated)):
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(repeated), strict=True):
         np.testing.assert_array_equal(left, right)
         assert np.isfinite(left).all()
     assert float(first[0]) != float(changed[0])

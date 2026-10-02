@@ -125,7 +125,7 @@ def test_every_cache_leaf_moves_with_its_row(kind):
     leaves = jax.tree.leaves(state.cache)
     assert leaves, "the cache has to hold something for this to prove anything"
     for before, after, moved in zip(leaves, jax.tree.leaves(restored),
-                                    jax.tree.leaves(rotated)):
+                                    jax.tree.leaves(rotated), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
         assert moved.shape == before.shape
 

@@ -74,7 +74,7 @@ def pooled(build, processes: int, batches: int, state: bytes | None = None,
         if state is not None:
             stream.set_state(state)
         shards.append(rows(itertools.islice(stream, batches)))
-    return [[row for held in zip(*step) for row in held] for step in zip(*shards)]
+    return [[row for held in zip(*step, strict=True) for row in held] for step in zip(*shards, strict=True)]
 
 
 # --------------------------------------------------------------------------

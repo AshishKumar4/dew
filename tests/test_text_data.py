@@ -765,7 +765,7 @@ def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
 
     restored = data.val(DataPartition())
     restored.set_state(state)
-    for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)]):
+    for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)], strict=True):
         np.testing.assert_array_equal(wanted, got)
 
 

@@ -1297,5 +1297,5 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(variables["params"])
     value, gradient = jax.jit(jax.value_and_grad(lambda params: loss(scanned, params)))(variables["params"])
     np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
-    for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad)):
+    for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad), strict=True):
         np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=1e-5)

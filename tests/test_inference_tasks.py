@@ -240,7 +240,7 @@ def test_text_decodes_lazily_through_the_bound_processor():
     assert rows.tokens.shape == (2, 2 + 3) and rows.tokens[1, 0] == 0
     assert result.text == task.decode(result)
     assert result.text == tuple("".join(str(token) for token in row[2:2 + length])
-                                for row, length in zip(rows.tokens, rows.lengths))
+                                for row, length in zip(rows.tokens, rows.lengths, strict=True))
 
 
 def test_a_prompt_batch_carries_validity_only_where_it_padded():

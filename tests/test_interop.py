@@ -55,7 +55,7 @@ def test_round_trip_keeps_the_tree_and_the_values(params, tmp_path):
     loaded = load_params(path)
 
     assert jax.tree_util.tree_structure(loaded) == jax.tree_util.tree_structure(params)
-    for saved, restored in zip(jax.tree.leaves(params), jax.tree.leaves(loaded)):
+    for saved, restored in zip(jax.tree.leaves(params), jax.tree.leaves(loaded), strict=True):
         assert np.array_equal(np.asarray(saved), restored)
 
 

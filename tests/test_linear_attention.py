@@ -339,7 +339,7 @@ def test_the_masked_conv_matches_the_token_scan(case, history):
 
     assert largest(out, want_out) < 1e-5
     assert largest(carried, want_carried) < 1e-5
-    for gradient, wanted in zip(grads, want_grads):
+    for gradient, wanted in zip(grads, want_grads, strict=True):
         if wanted is not None:
             assert largest(gradient, wanted) < 1e-5
 

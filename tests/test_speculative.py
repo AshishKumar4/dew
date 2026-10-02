@@ -391,7 +391,7 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
         jnp.full(2, width - 2, jnp.int32), prior_tokens=jnp.ones(2, jnp.int32))
 
     assert len(produced) == 2 == len(trained)
-    for depth, (cached, reference) in enumerate(zip(produced, trained)):
+    for depth, (cached, reference) in enumerate(zip(produced, trained, strict=True)):
         # Depth d starts d positions in, as the training pass shifts it.
         kept = np.asarray(cached)[:, depth:]
         assert kept.shape == np.asarray(reference).shape

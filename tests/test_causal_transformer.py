@@ -953,7 +953,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
     plain, spelled = scored(), scored(rotary_positions=rotary)
-    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled)):
+    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled), strict=True):
         assert jnp.max(jnp.abs(left - right)) < 1e-4 * max(1.0, float(jnp.max(jnp.abs(left))))
 
 

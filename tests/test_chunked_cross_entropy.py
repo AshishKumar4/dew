@@ -110,7 +110,7 @@ def test_both_gradients_match_the_full_vocabulary_pass(chunks):
     expected = jax.grad(full, argnums=(0, 1))(hidden, head)
     got = jax.grad(chunked, argnums=(0, 1))(hidden, head)
 
-    for name, want, have in zip(("hidden", "head"), expected, got):
+    for name, want, have in zip(("hidden", "head"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(have - want).max() <= 1e-4 * largest, name
@@ -318,7 +318,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     flat_expected = jax.tree_util.tree_flatten_with_path(expected)[0]
     flat_got = jax.tree_util.tree_leaves(got)
     assert len(flat_expected) == len(flat_got)
-    for (path, want), have in zip(flat_expected, flat_got):
+    for (path, want), have in zip(flat_expected, flat_got, strict=True):
         largest = jnp.abs(want).max()
         name = jax.tree_util.keystr(path)
         assert largest > 0, f"{name} has a zero gradient, so nothing is checked"
@@ -397,7 +397,7 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
     got_loss, got = jax.jit(jax.value_and_grad(tiled, argnums=(0, 1)))(hidden, head)
 
     assert jnp.abs(got_loss - want_loss) <= 1e-5 * jnp.abs(want_loss)
-    for name, expected, actual in zip(("hidden", "head"), want, got):
+    for name, expected, actual in zip(("hidden", "head"), want, got, strict=True):
         largest = jnp.abs(expected).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(actual - expected).max() <= 1e-5 * largest, name
@@ -421,7 +421,7 @@ def test_the_softcap_gradient_survives_saturated_logits():
 
     expected = jax.grad(full, argnums=(0, 1, 2))(hidden, head, 30.)
     got = jax.grad(tiled, argnums=(0, 1, 2))(hidden, head, 30.)
-    for name, want, have in zip(("hidden", "head", "softcap"), expected, got):
+    for name, want, have in zip(("hidden", "head", "softcap"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(have - want).max() <= 1e-5 * largest, name
@@ -500,7 +500,7 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     got = jax.grad(tiled, argnums=(0, 1))(hidden, head)
 
     assert got[0].dtype == hidden.dtype and got[1].dtype == head.dtype == dtype
-    for name, want, have in zip(("hidden", "head"), expected, got):
+    for name, want, have in zip(("hidden", "head"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         half_ulp = jnp.spacing(jnp.abs(want).astype(dtype)).astype(jnp.float32) / 2
@@ -858,7 +858,7 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
         bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
     else:
         bound = 2.0**-7
-    for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
+    for have, want in [*zip(whole[::2], tiled[::2], strict=True), *zip(whole_grads, tiled_grads, strict=True)]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
 

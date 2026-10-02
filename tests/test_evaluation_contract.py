@@ -17,7 +17,7 @@ def test_fid_pools_unequal_batches_and_singletons():
     real = rng.normal(size=(23, 7)) @ np.diag(np.arange(1, 8))
     metric = FID()
     accumulated = None
-    for gen, ref in zip(np.split(generated, [1, 5, 12]), np.split(real, [0, 8, 22])):
+    for gen, ref in zip(np.split(generated, [1, 5, 12]), np.split(real, [0, 8, 22]), strict=True):
         contribution = FIDStats(GaussianStats.from_features(gen, population="generated"),
                                 GaussianStats.from_features(ref, population="real"))
         accumulated = contribution if accumulated is None else metric.merge(accumulated, contribution)

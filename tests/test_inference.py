@@ -143,7 +143,7 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
                                 jax.tree.leaves(live.params["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
-        jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"])))
+        jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"]), strict=True))
     # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
         np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
