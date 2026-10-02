@@ -439,7 +439,10 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
     return process, KarrasOracle(sigma_data=edm["sigma_data"])
 
 
-def walk(solver, process, model, x_T, times, key=jax.random.PRNGKey(0)):
+_DEFAULT_WALK_KEY = jax.random.PRNGKey(0)
+
+
+def walk(solver, process, model, x_T, times, key=_DEFAULT_WALK_KEY):
     """Every latent after each interval of `times`, the walk `sample` takes
     (its state, its per-step keys) without the final denoise; the reference
     tool records the same latents and draws the same per-step noise."""
