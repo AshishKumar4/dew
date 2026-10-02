@@ -248,7 +248,7 @@ SFT keeps no moving average unless `ema_decay` is set, as the language-model obj
 
 ## GRPO
 
-GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly through `tokenizer_for`, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally and any other name its Hugging Face tokenizer. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
 
 ```python
 import json
