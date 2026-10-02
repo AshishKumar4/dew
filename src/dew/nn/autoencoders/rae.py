@@ -38,7 +38,7 @@ from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import AutoEncoder
+from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
@@ -411,7 +411,7 @@ def _statistic(values, grid: int, width: int, default: float) -> np.ndarray | fl
     return array.transpose(1, 2, 0)
 
 
-class RAEAutoencoder(AutoEncoder):
+class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     """Native RAE weights and the source's latent normalization,
     `(z - latents_mean) / (latents_std + 1e-5) * scaling_factor` on the way
     out and its inverse on the way in, per latent position where the
@@ -419,17 +419,10 @@ class RAEAutoencoder(AutoEncoder):
 
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):
-        self.model = model
-        self.params = params
+        super().__init__(model, params)
         self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
         self.latent_scale = scaling_factor / (
             _statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5
-        )
-        self._encode = jax.jit(
-            lambda params, images: model.apply({"params": params}, images, method=model.encode)
-        )
-        self._decode = jax.jit(
-            lambda params, latents: model.apply({"params": params}, latents, method=model.decode)
         )
 
     @property
@@ -443,12 +436,6 @@ class RAEAutoencoder(AutoEncoder):
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         *lead, _, _, _ = shape
         return (*lead, self.model.grid, self.model.grid, self.latent_channels)
-
-    def encode_batch(self, params, x, key=None):
-        return self._encode(params, x)
-
-    def decode_batch(self, params, z):
-        return self._decode(params, z)
 
 
 def load_rae(

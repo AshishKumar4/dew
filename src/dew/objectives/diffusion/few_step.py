@@ -122,7 +122,7 @@ class MeanFlowObjective(DiffusionObjective):
                              "path; build the process with presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.instantaneous = instantaneous
@@ -209,7 +209,7 @@ class ShortcutObjective(DiffusionObjective):
         if sections < 2 or sections & (sections - 1):
             raise ValueError(f"sections is a power of two, not {sections}")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.sections = sections

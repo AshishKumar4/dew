@@ -2,7 +2,7 @@
 
 from dew.sampling.pipelines import DenoisingInputs, Images, TextToImage
 
-from .banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks, host_banked, stream_banked
+from .banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks
 from .clients import Completion, OllamaCompletion, OpenAICompletion, Usage
 from .nccl import NCCLPush
 from .pipeline import RunProcessor, pipeline
@@ -44,7 +44,5 @@ __all__ = [
     "TextToImage",
     "Usage",
     "VLLMGenerateServer",
-    "host_banked",
     "pipeline",
-    "stream_banked",
 ]

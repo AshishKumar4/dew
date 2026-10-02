@@ -68,7 +68,7 @@ def dew_side(args) -> None:
     import jax
     import jax.numpy as jnp
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     rows = first_batch(args)
     targets = jnp.asarray(rows[:, 1:].reshape(-1))
@@ -76,7 +76,7 @@ def dew_side(args) -> None:
               for path in sorted(Path(args.hidden_dir).glob("torch-*.npy"))}
     table = None
     for implementation in IMPLEMENTATIONS:
-        pretrained = load_pretrained(args.model, dtype="bfloat16", param_dtype="float32",
+        pretrained = Pretrained.load(args.model, dtype="bfloat16", param_dtype="float32",
                                      attention_impl=implementation)
         model = pretrained.model
 

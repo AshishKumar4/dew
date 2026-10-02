@@ -162,7 +162,7 @@ def test_a_criterion_inside_a_block_truncates_it():
     assert int(np.asarray(drawn.valid).sum(axis=1)[0]) == 8
     stopped = run(point(5), [point(5)] * 3, 2, 8, 4, stopping=(stop,))
     np.testing.assert_array_equal(np.asarray(stopped.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(stopped.terminated), True)
+    np.testing.assert_array_equal(np.asarray(stopped.terminated), desired=True)
 
 
 def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
@@ -176,7 +176,7 @@ def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
         lambda state, logits: jnp.where((state.step < 2)[:, None], logits, -jnp.inf))
     drawn = run(point(1), [point(1)] * 3, 2, 4, 2, stopping=(stop,), transforms=(nothing_after,))
     np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(drawn.terminated), True)
+    np.testing.assert_array_equal(np.asarray(drawn.terminated), desired=True)
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, :2], 1)
 
 
@@ -186,7 +186,7 @@ def test_the_budget_bounds_the_last_block():
     for budget in (3, 5, 7):
         drawn = run(point(5), [point(5)] * 3, 2, budget, 4)
         np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), budget)
-        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], True)
+        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], desired=True)
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
@@ -404,7 +404,7 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
         jnp.full(2, width - 2, jnp.int32), prior_tokens=jnp.ones(2, jnp.int32))
 
     assert len(produced) == 2 == len(trained)
-    for depth, (cached, reference) in enumerate(zip(produced, trained)):
+    for depth, (cached, reference) in enumerate(zip(produced, trained, strict=True)):
         # Depth d starts d positions in, as the training pass shifts it.
         kept = np.asarray(cached)[:, depth:]
         assert kept.shape == np.asarray(reference).shape
@@ -645,7 +645,7 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
     ops = _operations(model, params, 0, 2)
     state, _ = _prefill(model, params, ModelInputs(cold), ops)
     produced = []
-    reseed(recording(ops, produced), state, (state.hidden,) + state.drafts,
+    reseed(recording(ops, produced), state, (state.hidden, *state.drafts),
            states[:, 1:], model.apply(params, emitted, method=model.token_embeddings),
            jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
            jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
@@ -679,7 +679,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
     state, carried = reseed(
-        ops, state, (state.hidden,) + state.drafts, hidden[:, prefix:-1],
+        ops, state, (state.hidden, *state.drafts), hidden[:, prefix:-1],
         ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
         prior_tokens=jnp.asarray([prefix], jnp.int32))

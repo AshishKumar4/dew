@@ -60,12 +60,12 @@ def sample[StateT](
     reads; `guidance` wraps it. Every step's noise comes from `key` folded
     with the step index, so a trajectory is reproducible from one key.
     An explicit `times` grid is the trajectory when given, descending and
-    concrete, for a source whose sampler pairs its own sigma and model-time
+    concrete, for a source whose solver pairs its own sigma and model-time
     tables; it decides the length, so a grid of `steps + 1` points ending
     on the terminal is legal and a single point walks nothing. Exactly one
     of `steps` and `times` is passed. `final_denoise=False` returns the last
     point's state without the closing clean prediction, the way those
-    samplers end.
+    solvers end.
 
     The trajectory is one `lax.scan`, traced at each call: under a caller's
     `jax.jit` it compiles once, as the pipelines and objectives call it,

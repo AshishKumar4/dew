@@ -119,8 +119,9 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     context, mask = arrays["padded.context"], arrays["padded.mask"]
     times = jnp.asarray(arrays["padded.times"])
     filled = np.where(mask[..., None], context, 7.0)
-    run = lambda values: model.apply({"params": params}, latent, times,  # noqa: E731
-                                     DenoisingCondition(jnp.asarray(values), mask=jnp.asarray(mask)))
+    def run(values):
+        return model.apply({"params": params}, latent, times,
+                                         DenoisingCondition(jnp.asarray(values), mask=jnp.asarray(mask)))
     np.testing.assert_allclose(run(filled), run(context), atol=1e-6)
     # Without the mask the short row reads its padding as prompt.
     unmasked = model.apply({"params": params}, latent, times, DenoisingCondition(jnp.asarray(context)))
@@ -209,7 +210,9 @@ def test_the_released_configs_and_weight_maps_translate():
             fields["axes_dims_rope"]) == (32, 32, 128, 4096, (16, 56, 56))
     names = read("transformer/diffusion_pytorch_model.safetensors.index.json")["weight_map"]
     assert len({_qwen_image_path(name) for name in names}) == len(names) == 297
-    text = _qwen_text_path(hf_decoders.translate_config(_qwen_vl_text_config(read("text_encoder/config.json"))))
+    text = _qwen_text_path(
+        hf_decoders.translate_config(_qwen_vl_text_config(read("text_encoder/config.json")))
+    )
     names = read("text_encoder/model.safetensors.index.json")["weight_map"]
     paths = [text(name) for name in names]
     assert None not in paths and len(set(paths)) == len(names) == 750
@@ -220,9 +223,9 @@ def test_the_released_configs_and_weight_maps_translate():
 
 @pytest.fixture(scope="module")
 def loaded(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded, arrays, record):
@@ -272,7 +275,7 @@ def test_the_prompt_states_are_the_decoders_own_last_layer_output():
 
 
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its 40 default steps, no guidance, the sigmas its call lays out shifted
     by the mu of this latent's token count, and the RGBA decode. Both rows
     walk in one batch, the shorter prompt padded, and each lands on the
@@ -313,7 +316,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     from dew.checkpoints import Checkpoints
     from dew.inputs.diffusion import QwenImageConditioner
     from dew.interop.diffusion import component_tensors
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
@@ -365,7 +368,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         assert written.keys() == published.keys()
         for name, tensor in published.items():
             np.testing.assert_array_equal(written[name], tensor)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     rebuilt = QwenImageConditioner.from_pretrained(
         str(export), dtype="float32", **{key: value for key, value in
                                           again.inputs.conditions["conditioning"].encoder.to_json().items()

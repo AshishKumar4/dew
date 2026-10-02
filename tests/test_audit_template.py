@@ -26,7 +26,9 @@ def audit():
 
 
 def test_a_non_hermes_template_audits_its_own_tool_call_syntax(audit):
-    report = audit.audit_template(str(ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"), "<|im_end|>")
+    report = audit.audit_template(
+        str(ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"), "<|im_end|>"
+    )
     held = {(case["observation_role"], case["reasoning_in_sampled_turn"], case["arguments_as_json_string"],
              case["sampled_compact_json"]): case["strict_prefix_holds"] for case in report["cases"]}
     assert held == {("tool", False, False, False): True, ("tool", True, False, False): True,

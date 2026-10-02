@@ -205,7 +205,7 @@ def main() -> None:
     for pipe in pipes:
         by_family.setdefault(PIPELINES[pipe][0], []).append((pipe, PIPELINES[pipe][1]))
     sections += ["## Diffusion pipelines", "",
-                 "`load_pretrained` and `dew.pipeline` read a diffusers pipeline directory by the class it names "
+                 "`Pretrained.load` and `dew.pipeline` read a diffusers pipeline directory by the class it names "
                  "in `model_index.json`.", "",
                  table(["Family", "Pipeline class", "Task"],
                        [[family, f"`{pipe}`", task] for family, entries in by_family.items() for pipe, task in entries]), ""]

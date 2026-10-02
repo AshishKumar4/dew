@@ -1,8 +1,8 @@
 """Measure FID between two populations of images.
 
-`fid(generated, reference)` scores two image sets against each other, and the
-registered `fid` metric pools the same features, statistics and distance over
-the populations a validation pass consumes.
+`FID().score(generated, reference)` scores two image sets against each other,
+and the same `FID` as a registered metric pools the same features, statistics
+and distance over the populations a validation pass consumes.
 """
 
 import functools
@@ -10,7 +10,6 @@ import logging
 import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -214,48 +213,15 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
     return distance
 
 
-def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
-        reference: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
-        *, batch_size: int = 64, weights: str | Path | None = None) -> float:
-    """Measure FID between two sets of uint8 [N, H, W, 3] images.
-
-    Each side is one array or an iterable of arrays, so a directory of samples
-    can stream past in blocks of `batch_size` rows instead of being held at
-    once. The value is the distance between the two populations passed in,
-    which is FID-50k only at 50,000 images a side.
-
-    `weights` is the feature extractor's parameters as a file, the way
-    `clip_score(modelname=)` names a local CLIP: the InceptionV3 variables tree
-    in safetensors, which `tools/convert_inception_weights.py` writes. Unset
-    downloads the published checkpoint and converts it. Two distances are
-    comparable only when both were measured with the same one, which is why
-    every distance logs which it was. With the published weights, features
-    and distance reproduce pytorch-fid 0.3.0's (bilinear resize without
-    antialiasing); tests/test_metrics.py holds the distance to 1e-5 relative.
-    """
-    if batch_size < 1:
-        raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
-    named = None if weights is None else str(weights)
-    with metric_device():
-        stats = FIDStats(
-            _pooled_stats(_unit_range_batches(generated, population="generated",
-                                              batch_size=batch_size),
-                          population="generated", weights=named),
-            _pooled_stats(_unit_range_batches(reference, population="real",
-                                              batch_size=batch_size),
-                          population="real", weights=named))
-    return _pooled_distance(stats, named)
-
-
 @metrics("fid")
 @dataclass(frozen=True)
 class FID:
-    """Scores FID over a pass, pooling statistics and taking one final distance.
+    """Fréchet Inception Distance, between two image sets (`score`) or over a
+    validation pass, pooling statistics and taking one final distance.
 
-    The call gathers the sampled grid and the batch's reference field. The
-    features, the statistics and the distance are the ones `fid` runs, so a
-    pass over 50,000 images a side reports the number `fid` reports, and
-    `weights` names the extractor's parameters there the same way.
+    As a metric the call gathers the sampled grid and the batch's reference
+    field; the features, the statistics and the distance are the ones `score`
+    computes.
     """
 
     field: str = "image"
@@ -278,3 +244,36 @@ class FID:
 
     def finalize(self, accumulated: FIDStats) -> float:
         return _pooled_distance(accumulated, self.weights)
+
+    def score(self, generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
+              reference: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike], *,
+              batch_size: int = 64) -> float:
+        """Measure FID between two sets of uint8 [N, H, W, 3] images.
+
+        Each side is one array or an iterable of arrays, so a directory of
+        samples can stream past in blocks of `batch_size` rows instead of being
+        held at once. The value is the distance between the two populations
+        passed in, which is FID-50k only at 50,000 images a side. A pass over
+        50,000 images a side reports the same number.
+
+        `weights` is the feature extractor's parameters as a file, the way
+        `CLIPScore(modelname)` names a local CLIP: the InceptionV3 variables
+        tree in safetensors, which `tools/convert_inception_weights.py` writes.
+        Unset downloads the published checkpoint and converts it. Two distances
+        are comparable only when both were measured with the same one, which is
+        why every distance logs which it was. With the published weights,
+        features and distance reproduce pytorch-fid 0.3.0's (bilinear resize
+        without antialiasing); tests/test_metrics.py holds the distance to 1e-5
+        relative.
+        """
+        if batch_size < 1:
+            raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
+        with metric_device():
+            stats = FIDStats(
+                _pooled_stats(_unit_range_batches(generated, population="generated",
+                                                  batch_size=batch_size),
+                              population="generated", weights=self.weights),
+                _pooled_stats(_unit_range_batches(reference, population="real",
+                                                  batch_size=batch_size),
+                              population="real", weights=self.weights))
+        return _pooled_distance(stats, self.weights)

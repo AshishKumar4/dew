@@ -15,10 +15,10 @@ from .selection import Best
 from .state import TrainState
 from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, WandbTracker
 from .trainer import Plateau, ProfileWindow, Rollout, Trainer
-from .transaction import ema_update, write_back
+from .transaction import ema_update
 
 __all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "Evaluation", "Keep", "Layout",
            "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Plateau", "Preempted",
            "ProfileWindow", "Quantization", "Rollout", "Step", "TensorBoardTracker", "Tracker", "Trackers",
            "TrainState", "Trainer", "WandbTracker", "ema_update", "everything", "prepare_process",
-           "run_timestamp", "under", "write_back"]
+           "run_timestamp", "under"]

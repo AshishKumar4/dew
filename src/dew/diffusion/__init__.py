@@ -1,7 +1,7 @@
 """Forward processes, noise schedules and the parameterizations over them.
 
 `Process` pairs a schedule with a prediction transform, which is what a
-run's objective and every sampler read. `presets` holds the named
+run's objective and every solver read. `presets` holds the named
 combinations, and `discrete` is the masked-token process.
 """
 

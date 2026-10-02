@@ -4,7 +4,7 @@ result = pipe(
     [prompt],
     key=0,
     steps=15,
-    sampler=DPMSolverMultistep(),
+    solver=DPMSolverMultistep(),
     guidance=CFG(5.0),
 )
 result.pil()[0]

@@ -35,8 +35,7 @@ from dew.nn.sharding import logical_axes
 from dew.registry import models
 
 from .decoder_block import GatedMLP
-from .flux import apply_rotary
-from .sd3 import _layer_norm
+from .joint import JointAttention, embedding, layer_norm
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -95,44 +94,26 @@ def _scaled(x, scale):
     return x * (1 + scale)
 
 
-@logical_axes({("attn", name): ("embed", None) for name in ("to_q", "to_k", "to_v")}
-              | {("attn", "to_out_0"): (None, "embed")})
-class _Attention(nn.Module):
+class _Attention(JointAttention):
     """`QwenImage21Attention` under the source's exact multi-pass prefill:
     image queries attend everything and text queries the text causally, padded
-    text keys excluded; queries and keys are RMS normalized per head, then
-    rotated. With the image first, each query's keys are a prefix, passed as
-    lengths that cuDNN skips rather than as a dense mask; attention does not
-    depend on key order, so this is the source's arithmetic summed in another
-    order.
+    text keys excluded. With the image first, each query's keys are a prefix,
+    passed as lengths that cuDNN skips rather than as a dense mask; attention
+    does not depend on key order, so this is the source's arithmetic summed in
+    another order.
     """
 
-    heads: int
-    head_dim: int
-    features: int
-    eps: float = 1e-6
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    image_tokens: int = 0
+    """The image's tokens, which lead the sequence."""
 
-    def _heads(self, name: str, x):
-        projected = _dense(self.heads * self.head_dim, name, self.dtype, self.precision)(x)
-        return projected.reshape(*x.shape[:2], self.heads, self.head_dim)
-
-    @nn.compact
-    def __call__(self, x, cos, sin, lengths, image: int):
-        query = RMSNorm(epsilon=self.eps, dtype=self.dtype, name="norm_q")(self._heads("to_q", x))
-        key = RMSNorm(epsilon=self.eps, dtype=self.dtype, name="norm_k")(self._heads("to_k", x))
-        value = self._heads("to_v", x)
-        query, key = apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
+    def attend(self, query, key, value, lengths):
         attend = functools.partial(scaled_dot_product_attention,
                                    implementation=self.attention_impl, precision=self.precision)
-        attended = jnp.concatenate([
+        image = self.image_tokens
+        return jnp.concatenate([
             attend(query[:, :image], key, value, key_value_seq_lengths=image + lengths),
             attend(query[:, image:], key[:, image:], value[:, image:], causal=True,
                    key_value_seq_lengths=lengths)], axis=1)
-        return _dense(self.features, "to_out_0", self.dtype, self.precision)(
-            attended.reshape(*x.shape[:2], self.heads * self.head_dim))
 
 
 class _Block(nn.Module):
@@ -149,17 +130,17 @@ class _Block(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
-    def __call__(self, x, modulation, cos, sin, lengths, image: int):
+    def __call__(self, x, modulation, rotation, lengths, image: int):
         scale, gate, scale_mlp, gate_mlp = modulation
-        attended = _Attention(self.heads, self.head_dim, self.features, self.eps,
-                              dtype=self.dtype, precision=self.precision,
-                              attention_impl=self.attention_impl, name="attn")(
-            _per_rows(_layer_norm(self.dtype, self.eps)(x), scale, image, _scaled),
-            cos, sin, lengths, image)
+        attended, _ = _Attention(self.heads, self.head_dim, bias=False, epsilon=self.eps, image_tokens=image,
+                                 dtype=self.dtype, precision=self.precision,
+                                 attention_impl=self.attention_impl, name="attn")(
+            _per_rows(layer_norm(self.dtype, self.eps)(x), scale, image, _scaled), rotation=rotation,
+            lengths=lengths)
         x = x + _per_rows(attended, gate, image, lambda rows, value: jnp.tanh(value) * rows)
         hidden = GatedMLP(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
                           precision=self.precision, name="img_mlp")(
-            _per_rows(_layer_norm(self.dtype, self.eps)(x), scale_mlp, image, _scaled))
+            _per_rows(layer_norm(self.dtype, self.eps)(x), scale_mlp, image, _scaled))
         x = x + _per_rows(hidden, gate_mlp, image, lambda rows, value: jnp.tanh(value) * rows)
         if x.dtype == jnp.float16:
             x = jnp.clip(x, -65504, 65504)
@@ -206,10 +187,9 @@ class QwenImageTransformer(nn.Module):
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""
-        hidden = _dense(self.features, "timestep_embedder_linear_1", self.dtype, self.precision)(
-            sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype)).astype(self.dtype or jnp.float32))
-        return _dense(self.features, "timestep_embedder_linear_2", self.dtype, self.precision)(
-            nn.silu(hidden))
+        sinusoids = sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype))
+        return embedding(sinusoids.astype(self.dtype or jnp.float32), self.features, "timestep_embedder",
+                         bias=False, dtype=self.dtype, precision=self.precision)
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -242,13 +222,13 @@ class QwenImageTransformer(nn.Module):
         modulation = tuple(zip(still, sampled, strict=True))
 
         angles = _rotary_angles(lengths, text, rows, columns, self.axes_dims_rope, dtype=wide)
-        cos = jnp.repeat(jnp.cos(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
-        sin = jnp.repeat(jnp.sin(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
+        rotation = tuple(jnp.repeat(turn(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
+                         for turn in (jnp.cos, jnp.sin))
         for index in range(self.num_layers):
             joint = _Block(
                 self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
                 dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                name=f"transformer_blocks_{index}")(joint, modulation, cos, sin, lengths,
+                name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
                                                      image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
@@ -256,7 +236,7 @@ class QwenImageTransformer(nn.Module):
         image = joint[:, :image_tokens]
         scale = _dense(self.features, "norm_out_linear", self.dtype, self.precision)(
             nn.silu(embedded))
-        image = _scaled(_layer_norm(self.dtype, self.eps)(image), scale[:, None])
+        image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
         output = _dense(self.out_channels, "proj_out", self.dtype, self.precision)(image)
         return output.reshape(batch, rows, columns, self.out_channels)
 

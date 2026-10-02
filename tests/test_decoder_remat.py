@@ -41,9 +41,9 @@ SHAPES = {
     "dense": {"num_nextn_predict_layers": 1},
     "sparse": {"mixture": {"experts": 4, "top_k": 2, "bias": True},
                "num_nextn_predict_layers": 1},
-    "shared": {"num_kv_shared_layers": 2, "per_layer_input_dim": 8,
+    "shared": {"kv_shared_layers": (2, 3), "per_layer_input_dim": 8,
                "use_double_wide_mlp": True, "sandwich_norms": True},
-    "altup": {"altup": {"num_inputs": 2}, "num_kv_shared_layers": 2,
+    "altup": {"altup": {"num_inputs": 2}, "kv_shared_layers": (2, 3),
               "per_layer_input_dim": 8, "laurel_rank": 4},
     "mla": {"mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
                       "qk_nope_head_dim": 4, "qk_rope_head_dim": 4, "v_head_dim": 4}},
@@ -303,8 +303,7 @@ KEPT = {
 def test_a_policy_keeps_the_residuals_it_names_in_every_layer(policy, capsys):
     model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0, remat=policy)
     variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    assert named(residuals(model, variables, capsys)) == {
-        name: model.num_layers for name in KEPT[policy]}
+    assert named(residuals(model, variables, capsys)) == dict.fromkeys(KEPT[policy], model.num_layers)
 
 
 @pytest.mark.parametrize("policy, kept", [

@@ -30,6 +30,7 @@ from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from ..conv import Conv
+from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
@@ -78,20 +79,6 @@ def _conv(features: int, kernel: int, dtype: Dtype, name: str, *, stride: int = 
     pad = kernel // 2
     return Conv(features, (kernel, kernel), strides=stride, padding=((pad, pad), (pad, pad)),
                 feature_group_count=groups, use_bias=bias, dtype=dtype, name=name)
-
-
-def _unshuffle(x):
-    """`pixel_unshuffle` by 2: channel `c * 4 + 2 * row + column`."""
-    batch, height, width, channels = x.shape
-    x = x.reshape(batch, height // 2, 2, width // 2, 2, channels).transpose(0, 1, 3, 5, 2, 4)
-    return x.reshape(batch, height // 2, width // 2, 4 * channels)
-
-
-def _shuffle(x):
-    """`pixel_shuffle` by 2, the inverse of `_unshuffle`."""
-    batch, height, width, channels = x.shape
-    x = x.reshape(batch, height, width, channels // 4, 2, 2).transpose(0, 1, 4, 2, 5, 3)
-    return x.reshape(batch, 2 * height, 2 * width, channels // 4)
 
 
 def _group_mean(x, features: int):
@@ -223,10 +210,10 @@ class _Down(nn.Module):
     @nn.compact
     def __call__(self, x):
         if self.unshuffle:
-            y = _unshuffle(_conv(self.features // 4, 3, self.dtype, "conv")(x))
+            y = pixel_unshuffle(_conv(self.features // 4, 3, self.dtype, "conv")(x))
         else:
             y = _conv(self.features, 3, self.dtype, "conv", stride=2)(x)
-        return y + _group_mean(_unshuffle(x), self.features) if self.shortcut else y
+        return y + _group_mean(pixel_unshuffle(x), self.features) if self.shortcut else y
 
 
 class _Up(nn.Module):
@@ -245,10 +232,10 @@ class _Up(nn.Module):
         if self.interpolate:
             y = _conv(self.features, 3, self.dtype, "conv")(jnp.repeat(jnp.repeat(x, 2, axis=1), 2, axis=2))
         else:
-            y = _shuffle(_conv(4 * self.features, 3, self.dtype, "conv")(x))
+            y = pixel_shuffle(_conv(4 * self.features, 3, self.dtype, "conv")(x))
         if not self.shortcut:
             return y
-        return y + _shuffle(jnp.repeat(x, 4 * self.features // self.in_features, axis=-1))
+        return y + pixel_shuffle(jnp.repeat(x, 4 * self.features // self.in_features, axis=-1))
 
 
 class _Encoder(nn.Module):

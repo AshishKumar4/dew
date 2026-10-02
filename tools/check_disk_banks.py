@@ -24,7 +24,7 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.inference.banks import SafetensorsBanks, host_banked, layer_index, stream_banked
+from dew.inference.banks import SafetensorsBanks, layer_index
 from dew.interop.hf_decoders import translate_config
 from dew.objectives.base import merge
 from dew.registry import models, with_precision
@@ -71,10 +71,10 @@ def check(config):
         record["max_seq_len"] = max(map(len, config.prompts)) + config.tokens + 1
         built = with_precision("causal_transformer", record, dtype=config.dtype, attention_impl="xla")
         model = models.build("causal_transformer", {**built, "scan_layers": True})
-        loader = host_banked if config.mode == "host" else stream_banked
+        loader = source.place if config.mode == "host" else source.stream
         layout = Layout(min_shard=1, tolerance=1.0,
                         host_parameters=("params/layers_*",) if config.mode == "host" else ())
-        variables = loader(model, source, mesh=MeshSpec().build([jax.devices()[0]]), layout=layout)
+        variables = loader(model, mesh=MeshSpec().build([jax.devices()[0]]), layout=layout)
         loaded_seconds = time.perf_counter() - started
         print("weights loaded", loaded_seconds, "peak RSS",
               resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024, file=sys.stderr, flush=True)

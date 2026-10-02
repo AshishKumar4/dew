@@ -79,7 +79,7 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -87,7 +87,7 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(data_path),
         split="train",
         image_size=64,
@@ -216,21 +216,21 @@ The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` hol
 ## Models
 
 [Supported models](https://dewml.dev/reference/models/) lists every checkpoint
-family `load_pretrained` reads, by the `model_type` in its `config.json`, and
+family `Pretrained.load` reads, by the `model_type` in its `config.json`, and
 every architecture Dew trains from scratch. The site generates the
 page from Dew's registries when it builds. The notes below cover their
 training, inference and export workflows.
 
 ### Text decoders
 
-`load_pretrained` reads the checkpoint's `config.json` and builds a
+`Pretrained.load` reads the checkpoint's `config.json` and builds a
 `CausalTransformer`. Training uses `LMObjective`, generation uses
-`dew.sampling.generate` or `Pretrained.text_generation()`, and
+`dew.sampling.generate` or `PretrainedDecoder.text_generation()`, and
 `Pretrained.save` writes `config.json`, `model.safetensors` and
 `generation_config.json` back in the Hugging Face layout.
 
 `dtype` selects computation; `param_dtype` independently selects parameter
-storage. `load_pretrained` keeps FP32 parameters by default. Pass
+storage. `Pretrained.load` keeps FP32 parameters by default. Pass
 `param_dtype="bfloat16"` to reduce weight storage without changing the
 compute dtype. Non-parameter state retains its declared precision.
 
@@ -270,7 +270,7 @@ every released tensor's shape.
 
 ### Native multimodal models
 
-`load_pretrained` returns the model, the checkpoint's own processor, and the
+`Pretrained.load` returns the model, the checkpoint's own processor, and the
 weights. The processor turns text and raw media into `ModelInputs`, which
 `LMObjective`, `Trainer` and cached generation take unchanged. The export
 carries the processor and tokenizer files beside the weights.
@@ -305,7 +305,7 @@ Diffusion Gemma (`diffusion_gemma`) generates canvases and trains with text
 and image-conditioned SFT.
 
 `BlockDiffusionObjective` trains the canvas loss from the loaded weights and
-`Pretrained.block_generation()` decodes canvases. Text SFT follows Google's
+`PretrainedBlockDecoder.block_generation()` decodes canvases. Text SFT follows Google's
 published recipe. Image-conditioned SFT uses the same `ModelInputs`, `Dataset`
 and `Trainer` path. Images condition the clean encoder; their placeholder slots
 are not text targets. `BlockGeneration` takes the matching `images=` when it
@@ -330,7 +330,7 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 
 ### Pretrained diffusion and quantized checkpoints
 
-`load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
+`Pretrained.load` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
 The loader reads these quantized storage formats:
@@ -604,12 +604,12 @@ import jax
 import optax
 
 from dew import Field, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         split="train",
         image_size=64,
@@ -664,12 +664,12 @@ import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
 
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.sampling import Sampling, generate
 
 checkpoint = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-pretrained = load_pretrained(
+pretrained = PretrainedDecoder.load(
     checkpoint,
     dtype="bfloat16",
     max_seq_len=512,
@@ -793,7 +793,7 @@ Which call continues a run depends on the artifact you kept:
 | A native checkpoint directory | The same run: optimizer state, the root key, and the data position | `Trainer(..., checkpoints=Checkpoints(directory))`, then `fit` |
 | A `TrainState` in memory | Generation from the weights you just trained | `objective.pipeline(state)` |
 | A saved run: `run.json` beside its checkpoints | Generation, with the model rebuilt from the record | `dew.pipeline(run_directory)` |
-| A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `load_pretrained(source)` for the variables |
+| A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `Pretrained.load(source)` for the variables |
 | Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.params)` |
 | A saved run another runtime has to read | The same layout, from the run alone | `dew.interop.export_run(run_directory, destination)`, or `dew export <run> <dest>` |
 
@@ -961,7 +961,7 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
-Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. The sampler uses `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
+Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. `sample` runs the solver under `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
 `TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
@@ -1011,7 +1011,7 @@ This prints `Once upon a time, there was a little girl named Lily [8]` and `True
 4 prompt tokens the row also carries. `Generation` also returns `terminated`,
 and the `behavior_log_probs` and `raw_log_probs` a policy ratio needs.
 
-A task built by `Pretrained.text_generation()` carries the checkpoint's
+A task built by `PretrainedDecoder.text_generation()` carries the checkpoint's
 processor, so it accepts strings and `decode` returns text. Without a
 processor the task takes token rows or `ModelInputs`.
 
@@ -1030,7 +1030,7 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion import presets
 from dew.inference import TextToImage
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -1040,7 +1040,7 @@ run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
     model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 128,
                                      "num_layers": 4, "num_heads": 4}),
-    data=OxfordFlowers(
+    data=TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         image_size=64,
         val_batches=0,
@@ -1064,7 +1064,7 @@ def main():
     print(sorted(path.name for path in run.iterdir()))
 
     task = TextToImage.from_run(str(run))
-    images = task(["a flower", "another flower"], steps=20, sampler=Heun(),
+    images = task(["a flower", "another flower"], steps=20, solver=Heun(),
                   key=jax.random.key(1))
     print(images.host().images.shape, int(state.updates))
 
@@ -1084,9 +1084,11 @@ its shutdown is part of the run.
 
 ### Exporting a decoder and serving it
 
-`save_pretrained_decoder` writes the Hugging Face layout and asks the tokenizer
-the run trained with to save its own files into the same directory. Another
-runtime can read that directory as it is.
+`PretrainedDecoder.from_model(model, variables, tokenizer=...)` is a model
+trained in Dew as a source bundle, and its `save(directory)` writes the
+Hugging Face layout and asks the tokenizer the run trained with to save its
+own files into the same directory. Another runtime can read that directory as
+it is.
 
 Tokenize a corpus with the tokenizer the export will carry, so the token ids
 and the exported vocabulary are the same one. `tiny-tools` is the small
@@ -1110,7 +1112,7 @@ import optax
 
 from dew import Trainer
 from dew.data import HFTokenizer, Loading, TokenCorpus, TokenWindows
-from dew.interop import load_pretrained, save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
@@ -1131,10 +1133,10 @@ state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 
-save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(export)
 print(sorted(path.name for path in export.iterdir()))
 
-task = load_pretrained(str(export), dtype="float32").text_generation()
+task = PretrainedDecoder.load(str(export), dtype="float32").text_generation()
 drawn = task("The trainer", 12, key=jax.random.key(1),
              sampling=Sampling(temperature=0.0))
 print(task.decode(drawn))
