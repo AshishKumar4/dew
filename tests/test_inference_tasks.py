@@ -81,7 +81,7 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
 
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew import Dataset, Trainer
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
 
     source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
@@ -96,8 +96,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     batch = {"text": np.tile(np.asarray([[1, 3, 5, 7, 0], [2, 4, 6, 8, 9]], np.int32),
                               (count // 2, 1))}
     step = Step(step=jnp.asarray(0), key=jax.random.key(13), ema=None)
-    loss = lambda objective: jax.jit(scalar_loss, static_argnums=0)(
-        objective, objective.init(key), batch, step)[0]
+    loss = lambda objective: jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
     np.testing.assert_array_equal(loss(bundled), loss(explicit))
     data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(

@@ -159,7 +159,7 @@ class RecordingTracker:
 def test_fit_lets_go_of_each_state_its_step_consumed():
     """A step donates the state it is handed, so once the next state exists
     nothing in fit may still hold the old one: its arrays have lost their
-    buffers, and a drain of every live array (`dew.profile`) waits on them."""
+    buffers, and a drain of every live array (`dew.Profiler`) waits on them."""
     trainer = make_trainer()
     placed, held, alive = trainer.place, [], []
 
@@ -1090,8 +1090,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None, rung=None):
-        save_local(step, state, position, share=share, rung=rung)
+    def save_then_stop(step, state, position, **options):
+        save_local(step, state, position, **options)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -1256,6 +1256,17 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
+
+
+def test_a_global_position_round_trips_and_a_partial_one_is_refused():
+    """Dew writes every field of its global position, the phases a run
+    completed among them, and reads back only a position with all of them:
+    one without its completed phases is damaged, not a shorter format."""
+    for place in (position.Global(records=16, order="Counting"),
+                  position.Global(records=20, order="B", completed=(("A", 12),))):
+        assert position.decode(position.encode(place)) == place
+    with pytest.raises(ValueError, match=r"missing \['completed'\]"):
+        position.decode(json.dumps({position.ENVELOPE: {"records": 16, "order": "Counting"}}).encode())
 
 
 def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
@@ -1519,7 +1530,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
-    compile_step, evaluate, save = trainer.compile, trainer_module.evaluate, trainer.checkpoints.save
+    compile_step, evaluate, save = trainer.compile, trainer_module.Evaluation.run, trainer.checkpoints.save
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -1540,7 +1551,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
         return save(*args, **keywords)
 
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
-    monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer_module.Evaluation, "run", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
     trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
                 metrics=(Spread([]),))
