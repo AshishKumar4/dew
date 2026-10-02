@@ -247,7 +247,8 @@ class TextToImage:
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)), ema=ema, mesh=mesh, layout=layout,
+        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
+                            ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
     @classmethod

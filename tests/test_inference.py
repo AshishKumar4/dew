@@ -210,11 +210,17 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
 
 
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):
-    make_run(tmp_path)
+    main, pinned = tmp_path / "main", tmp_path / "pinned"
+    make_run(main)
+    make_run(pinned, preset=Flow(shift=3.0))
     import dew.interop.hub as hub
-    monkeypatch.setattr(hub, "pull_from_hub", lambda repo_id, revision=None: tmp_path)
+    monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None: main if revision is None
+                        else {"pinned": pinned}[revision])
     pipe = TextToImage.from_pretrained("user/flowers-dit")
     assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
+    selected = TextToImage.from_pretrained("user/flowers-dit", revision="pinned")
+    assert isinstance(selected.process.schedule, FlowMatchingScheduler)
+    assert selected.process.schedule.shift == 3.0
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
