@@ -272,7 +272,7 @@ def main(config: Config) -> None:
     task = TextGeneration(model, state.params, RunProcessor(tokenizer), sampling=Sampling(temperature=0.0))
     server = Server.from_task(task, slots=len(starts), capacity=64)
     generations = [generation.host() for generation in
-                   server(starts, config.sequence_length - width, seed=config.seed)]
+                   server(starts, config.sequence_length - width, key=config.seed)]
     for start, generation in zip(starts, generations, strict=True):
         print(f"{start.lstrip()!r} -> {generation.text[0].split(chr(10))[0]!r}")
     sequences = np.concatenate([np.asarray(generation.tokens) for generation in generations])

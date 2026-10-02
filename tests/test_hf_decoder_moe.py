@@ -1153,8 +1153,8 @@ def test_deepseek_v4_public_speculation_preserves_padded_rows():
     tokens[~valid] = 0
     inputs = ModelInputs(jnp.asarray(tokens), {'attention_mask': jnp.asarray(valid)})
     task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
-    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    ordinary = task(inputs, max_new_tokens=7, key=0).host()
+    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     # Three rows differ from the two residual streams: a row mask must not
     # accidentally broadcast along the stream axis during predictor reseeding.
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)

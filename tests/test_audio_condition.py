@@ -164,7 +164,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     assert after < 0.7 * before
 
     pipe = objective.pipeline(state, ema=False)
-    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], seed=0).host().images
+    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], key=0).host().images
                  for hertz in (220, 880))
     assert low.shape == (1, 2, 8, 8, 3)
     assert np.abs(low - high).max() > 1e-3

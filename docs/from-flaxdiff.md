@@ -37,7 +37,7 @@ from dew.sampling import Heun
 
 config = json.load(open("run_config.json"))  # the run's saved training config
 pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
-images = pipe(["a lighthouse on a rocky coast"], seed=0, steps=25, sampler=Heun()).host().images
+images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, sampler=Heun()).host().images
 ```
 
 `images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.

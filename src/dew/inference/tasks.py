@@ -16,8 +16,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from importlib import import_module
-from typing import TYPE_CHECKING, Protocol, overload
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -112,21 +111,12 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
     return ModelInputs.from_value(request)
 
 
-def _task_inputs(
-    processor: Processor | None,
-    request: Request,
-    *,
-    images: Media | None,
-    collective: bool,
-    max_new_tokens: int | None,
-    default_tokens: int | None,
-    max_length: int | None,
-    key: jax.Array | None,
-    seed: int | None,
-) -> tuple[ModelInputs, int, jax.Array]:
+def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
+                 collective: bool, max_new_tokens: int | None, default_tokens: int | None,
+                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
-        random_key = request_key(key, seed)
+        random_key = request_key(key)
         inputs = _prepared(processor, request, images=images)
         return inputs, _budget(max_new_tokens, default_tokens, max_length,
                                inputs.tokens.shape[1]), random_key
@@ -482,22 +472,9 @@ class TextGeneration:
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, sampling: Sampling | None = None,
-                 images: Media | None = None, logits: Transforms | None = None,
-                 stopping: Criteria | None = None,
-                 strategy: Strategy | None = None) -> Generation: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, sampling: Sampling | None = None,
-                 images: Media | None = None, logits: Transforms | None = None,
-                 stopping: Criteria | None = None,
-                 strategy: Strategy | None = None) -> Generation: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -505,7 +482,7 @@ class TextGeneration:
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                          max_length=self.max_length, key=key, seed=seed)
+                                          max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
             chain = self.logits if sampling is None else None
             generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
@@ -523,7 +500,6 @@ class TextGeneration:
         with region("inference.text.decode"):
             rows = generation.host()
             return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
-
 
 
 @dataclass(frozen=True)
@@ -596,23 +572,14 @@ class BlockGeneration:
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, process: BlockProcess | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, process: BlockProcess | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                          max_length=self.max_length, key=key, seed=seed)
+                                          max_length=self.max_length, key=key)
             generated = (self.process if process is None else process).generate(
                 self.model, self.variables, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
@@ -623,7 +590,6 @@ class BlockGeneration:
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid continuation as text, empty without a processor."""
         return _canvas_text(self.processor, generation, "inference.block.decode")
-
 
 
 @dataclass(frozen=True)
@@ -693,23 +659,14 @@ class MaskedGeneration:
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
-                 n: int | None = None, steps: int | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
-
-    @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
-                 n: int | None = None, steps: int | None = None,
-                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 key: int | jax.Array | None = None, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                max_length=self.max_length, key=key, seed=seed)
+                max_length=self.max_length, key=key)
             generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
                 sampler=self.sampler, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,

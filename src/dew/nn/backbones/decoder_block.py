@@ -36,12 +36,24 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
+from ..mixers.attention import CausalSelfAttention
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, gated_product
-from ..precision import scaled
+from ..precision import at_least_fp32, scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
+
+
+def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
+                 bias: bool, scale_offset: bool, scale_after_cast: bool,
+                 dtype: Dtype | None) -> Callable[..., nn.Module]:
+    """The decoder's norm factory, preserving each reference's variance formula."""
+    if kind == 'layer':
+        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
+                                 use_fast_variance=False, dtype=dtype)
+    return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
+                             scale_after_cast=scale_after_cast, dtype=dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,7 +203,13 @@ class GatedMLP(nn.Module):
     in place of the name is Kimi K3's SiTU, which transforms both halves
     (`dew.nn.moe.gated_product`).
 
-    Bias-free, like the gated MLP of every open decoder this loads.
+    `gelu`, `gelu_exact` and `relu` build the ungated two-projection MLP.
+    The other activations keep the gated product and its parameter layout.
+    Ungated `gelu_exact` follows Torch's `1 + erf` arithmetic because
+    converted checkpoints were trained with it. `jax.nn.gelu` with
+    approximate=False evaluates through erfc, which is more accurate in the
+    negative tail but rounds it differently. Gated activations keep their
+    existing arithmetic.
 
     activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
     nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
@@ -203,6 +221,7 @@ class GatedMLP(nn.Module):
     hidden_features: int
     out_features: int
     activation: GatedActivation = 'swiglu'
+    use_bias: bool = False
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
@@ -212,9 +231,12 @@ class GatedMLP(nn.Module):
 
     def setup(self):
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        self.gate_proj = dense(self.hidden_features, name='gate_proj')
+        if self.activation not in ('gelu', 'gelu_exact', 'relu'):
+            self.gate_proj = dense(self.hidden_features, name='gate_proj')
+        elif self.activation_sparsity or self.swiglu_limit is not None:
+            raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
         self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
@@ -222,6 +244,18 @@ class GatedMLP(nn.Module):
     def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
+        if self.activation in ('gelu', 'gelu_exact', 'relu'):
+            up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+            if self.activation == 'relu':
+                hidden = nn.relu(up)
+            elif self.activation == 'gelu_exact':
+                # Torch's GELU uses 1 + erf. Flax's erfc(-x) rounds its
+                # negative tail differently before this trained projection.
+                work = up.astype(at_least_fp32(up.dtype))
+                hidden = (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(up.dtype)
+            else:
+                hidden = nn.gelu(up)
+            return checkpoint_name(self.down_proj(hidden), 'down_proj')
         gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
         up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
@@ -250,6 +284,7 @@ class BlockWiring:
 
     pre_norms: bool = True
     output_norms: bool = False
+    parallel_residual: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
 
     def __post_init__(self):
@@ -458,6 +493,8 @@ class DecoderBlock(nn.Module):
     emb_features: int
     wiring: BlockWiring
     norm_eps: float = 1e-5
+    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_bias: bool = False
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
@@ -484,9 +521,16 @@ class DecoderBlock(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+        norm = decoder_norm(
+            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype)
+        if self.wiring.parallel_residual and (
+                not self.wiring.pre_norms or self.wiring.output_norms
+                or self.feedforward is None or self.hyper_connections is not None
+                or self.altup is not None or self.residual_site is not None
+                or self.laurel_rank is not None or self.parallel is not None):
+            raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
         if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
@@ -622,12 +666,12 @@ class DecoderBlock(nn.Module):
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
         normed = self.input_layernorm(read) if self.wiring.pre_norms else read
-        mixed = self._mix(
-            normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase
-        )
+        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
-        state = self._write(state, "attention", self._branch(mixed, train), site)
+        attention_branch = self._branch(mixed, train)
+        if not self.wiring.parallel_residual:
+            state = self._write(state, "attention", attention_branch, site)
         if self.laurel_rank is not None:
             # Only the plain form admits LAuReL (setup refuses the rest).
             assert isinstance(state, _Plain)
@@ -644,7 +688,12 @@ class DecoderBlock(nn.Module):
                 hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
-            state = self._write(state, "mlp", self._branch(hidden, train), site)
+            mlp_branch = self._branch(hidden, train)
+            if self.wiring.parallel_residual:
+                # GPT-NeoX adds the two branches first, then the residual;
+                # both norms read the block's original stream.
+                mlp_branch = mlp_branch + attention_branch
+            state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
 
     def _branch(self, output, train: bool):
@@ -763,19 +812,16 @@ class DecoderBlock(nn.Module):
         return x
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
-             prediction_phase: PredictionPhase):
+             prediction_phase: PredictionPhase, train: bool):
         """The token mixer over `x`. The store, the metadata and a prediction
         phase other than ordinary reach it only when the call carries them,
         since a mixer with no use for one does not take it."""
-        return self.self_attn(
-            x,
-            decode=decode,
-            positions=positions,
-            segment_ids=segment_ids,
-            **({} if kv_store is None else {"kv_store": kv_store}),
-            **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
-        )
+        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
+                              **({"train": train} if isinstance(self.self_attn, CausalSelfAttention)
+                                 and self.self_attn.attention_dropout_rate else {}),
+                              **({} if kv_store is None else {"kv_store": kv_store}),
+                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when

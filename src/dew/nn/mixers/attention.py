@@ -132,6 +132,7 @@ class CausalSelfAttention(nn.Module):
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
+    attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
@@ -354,7 +355,7 @@ class CausalSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
+                 attention_metadata: AttentionMetadata | None = None, train: bool = False):
         B, S, _ = x.shape
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
@@ -416,7 +417,7 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.kv_store_key] = (key, value, positions)
         sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
                  if self.attention_sinks else None)
-        if self._runs_local(attention_metadata, decode):
+        if self._runs_local(attention_metadata, decode) and not (self.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
                 positions=None if logical_positions is None else positions,
@@ -429,7 +430,7 @@ class CausalSelfAttention(nn.Module):
             return self._output(attention, gate, B, S, own_value)
         masking = self._masking(query, key, value, positions, rotary_positions, append, prefix, kv_len,
                                 kv_store, segment_ids, attention_metadata, decode)
-        attention = self._attended(masking, positions, append, sinks)
+        attention = self._attended(masking, positions, append, sinks, train)
         return self._output(attention, gate, B, S, own_value)
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
@@ -590,7 +591,7 @@ class CausalSelfAttention(nn.Module):
             implementation = masked
         return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
 
-    def _attended(self, masking: _Masking, positions, append, sinks):
+    def _attended(self, masking: _Masking, positions, append, sinks, train: bool):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
@@ -605,6 +606,14 @@ class CausalSelfAttention(nn.Module):
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window,
                 mask=mask if documents is None else with_documents(mask, documents)))
+        if self.attention_dropout_rate and train:
+            return checkpoint_name(scaled_dot_product_attention(
+                query, key, value, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl, causal=causal, sliding_window=window,
+                mask=mask, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
+                dropout_rate=self.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
+                deterministic=False), 'context')
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
         if (append is not None and plain_step and self.attention_impl in ('auto', 'tpu')
@@ -741,6 +750,7 @@ class AttentionMixer(MixerBase):
             attention_bias=ctx.attention_bias,
             o_proj_bias=ctx.o_proj_bias,
             attention_scale=ctx.attention_scale,
+            attention_dropout_rate=ctx.attention_dropout_rate,
             attention_sinks=ctx.attention_sinks,
             yarn=ctx.yarn,
             attn_logit_softcap=ctx.attn_logit_softcap,

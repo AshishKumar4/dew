@@ -7,8 +7,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from importlib import import_module
-from typing import TYPE_CHECKING, Generic, overload
+from typing import TYPE_CHECKING, Generic
 
 import jax
 import jax.numpy as jnp
@@ -127,7 +126,7 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, seed=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)`.
+    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)`.
 
     `params` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
@@ -175,10 +174,8 @@ class TextToImage:
         the autoencoder keep their weights."""
         from dew.training.quantization import quantize_for_serving
 
-        example = self.prepare("", seed=0, steps=1)
-        denoiser = {
-            name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")
-        }
+        example = self.prepare("", key=0, steps=1)
+        denoiser = {name: value for name, value in self.params.items() if name not in ("encoders", "autoencoder")}
         model, variables = quantize_for_serving(self.model, denoiser, spec, example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions)
         return replace(self, model=model, params={**self.params, **variables})
@@ -272,58 +269,14 @@ class TextToImage:
             return _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
-    @overload
-    def prepare(
-        self,
-        prompts: str | Sequence[str | Mapping[str, object]],
-        *,
-        key: jax.Array,
-        seed: None = None,
-        steps: int | None = None,
-        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-        image: ArrayLike | None = None,
-        image_latents: ArrayLike | None = None,
-        mask: ArrayLike | None = None,
-        noise: ArrayLike | None = None,
-        initial: ArrayLike | None = None,
-        times: ArrayLike | Sequence[float] | None = None,
-        encode_key: jax.Array | None = None,
-    ) -> DenoisingInputs: ...
 
-    @overload
-    def prepare(
-        self,
-        prompts: str | Sequence[str | Mapping[str, object]],
-        *,
-        key: None = None,
-        seed: int,
-        steps: int | None = None,
-        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-        image: ArrayLike | None = None,
-        image_latents: ArrayLike | None = None,
-        mask: ArrayLike | None = None,
-        noise: ArrayLike | None = None,
-        initial: ArrayLike | None = None,
-        times: ArrayLike | Sequence[float] | None = None,
-        encode_key: jax.Array | None = None,
-    ) -> DenoisingInputs: ...
-
-    def prepare(
-        self,
-        prompts: str | Sequence[str | Mapping[str, object]],
-        *,
-        key: jax.Array | None = None,
-        seed: int | None = None,
-        steps: int | None = None,
-        unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
-        image: ArrayLike | None = None,
-        image_latents: ArrayLike | None = None,
-        mask: ArrayLike | None = None,
-        noise: ArrayLike | None = None,
-        initial: ArrayLike | None = None,
-        times: ArrayLike | Sequence[float] | None = None,
-        encode_key: jax.Array | None = None,
-    ) -> DenoisingInputs:
+    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
+                key: int | jax.Array | None = None, steps: int | None = None,
+                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
+                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
+                times: ArrayLike | Sequence[float] | None = None,
+                encode_key: int | jax.Array | None = None) -> DenoisingInputs:
         """Encode conditions and construct the initial state on a concrete grid.
 
         Images are uint8 or normalized floating NHWC pixels at the task's
@@ -337,7 +290,7 @@ class TextToImage:
         mesh = mesh_of(self.params)
 
         def resolve() -> _Resolved:
-            return self._resolved(mesh, prompts, key=key, seed=seed, steps=steps,
+            return self._resolved(mesh, prompts, key=key, steps=steps,
                                   unconditional=unconditional, image=image,
                                   image_latents=image_latents, mask=mask, noise=noise,
                                   initial=initial, times=times, encode_key=encode_key)
@@ -361,7 +314,7 @@ class TextToImage:
                                grid_steps=count if owns_grid else None,
                                process=process if owns_grid else None, times=selected)
 
-    def _settings(self, mesh, prompts, *, steps, guidance, sampler, key, seed, decode):
+    def _settings(self, mesh, prompts, *, steps, guidance, sampler, key, decode):
         """Everything one call settles on the host before it runs the model.
 
         A caller who hands over `DenoisingInputs` gets them checked against
@@ -374,7 +327,7 @@ class TextToImage:
             chosen = CFG(float(chosen))
         if chosen is not None and not isinstance(chosen, Guidance):
             raise ValueError("guidance must be a scale, a guidance value or None")
-        request = request_key(key, seed)
+        request = request_key(key)
         prepared = prompts if isinstance(prompts, DenoisingInputs) else None
         default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
                          else self.steps)
@@ -423,7 +376,7 @@ class TextToImage:
                 raise ValueError("prepared conditions must match the noise batch")
         return prepared
 
-    def _resolved(self, mesh, prompts, *, key, seed, steps, unconditional, image,
+    def _resolved(self, mesh, prompts, *, key, steps, unconditional, image,
                   image_latents, mask, noise, initial, times, encode_key) -> _Resolved:
         """Everything `prepare` settles on the host, in one value.
 
@@ -434,7 +387,7 @@ class TextToImage:
         rows = [prompts] if isinstance(prompts, str) else list(prompts)
         if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
             raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
-        request = request_key(key, seed)
+        request = request_key(key)
         count = self.steps if steps is None else steps
         process, source_times = self.prepared_process(count)
         selected = _time_grid(times) if times is not None else source_times
@@ -451,7 +404,7 @@ class TextToImage:
             raise ValueError("a mask requires its image pixels")
         posterior = encode_key
         if posterior is not None:
-            posterior = request_key(posterior, None)
+            posterior = request_key(posterior)
         samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
                                  mask=mask, noise=noise, initial=initial)
         controls = (plan.rows, count, selected, shape,
@@ -537,22 +490,10 @@ class TextToImage:
             null = {**null, **spatial}
         return given, null, initial_state
 
-    @overload
-    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver | None = None, key: jax.Array,
-                 seed: None = None, decode: bool = True) -> Images: ...
-
-    @overload
-    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
-                 steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver | None = None, key: None = None,
-                 seed: int, decode: bool = True) -> Images: ...
 
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
                  steps: int | None = None, guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver | None = None, key: jax.Array | None = None,
-                 seed: int | None = None, decode: bool = True) -> Images:
+                 sampler: Solver | None = None, key: int | jax.Array | None = None, decode: bool = True) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
@@ -560,7 +501,7 @@ class TextToImage:
 
         def resolve():
             return self._settings(mesh, prompts, steps=steps, guidance=guidance,
-                                  sampler=sampler, key=key, seed=seed, decode=decode)
+                                  sampler=sampler, key=key, decode=decode)
 
         settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings

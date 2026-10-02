@@ -926,7 +926,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: jax.Array | None = None, seed: int | None = None) -> Ticket:
+               key: int | jax.Array | None = None) -> Ticket:
         """Queue one request; the ticket resolves to its `Generation`.
 
         The prompt is validated as `TextGeneration` validates it, against
@@ -934,7 +934,7 @@ class Server:
         resolves at once with the prompt alone.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, jax.random.fold_in(request_key(key, seed), 0))
+        return self._enqueued(prompt, max_new_tokens, jax.random.fold_in(request_key(key), 0))
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, key: jax.Array) -> Ticket:
         if self._failed is not None:
@@ -987,14 +987,13 @@ class Server:
         self._settle()
 
     def __call__(self, prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
-                 max_new_tokens: int | None = None, *, key: jax.Array | None = None,
-                 seed: int | None = None) -> list[Generation]:
+                 max_new_tokens: int | None = None, *, key: int | jax.Array | None = None) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
         Row `i` draws with the request key folded by `i`, as the same batch
         through `TextGeneration` would.
         """
-        base = request_key(key, seed)
+        base = request_key(key)
         inputs = _prepared(self.processor, prompts, images=None)
         valid = inputs.token_fields.get("attention_mask")
         rows = np.asarray(inputs.tokens)

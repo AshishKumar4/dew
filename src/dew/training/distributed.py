@@ -656,6 +656,10 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
     return {name: np.asarray(gathered[name][source]) for name in layout}
 
 
+# The batches a `DevicePrefetchIterator` queues ahead of the step by default.
+PREFETCH_DEPTH = 2
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -674,7 +678,7 @@ class DevicePrefetchIterator:
     when arbitrary source code cannot be stopped.
     """
 
-    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
+    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
                  source_state: bytes | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")

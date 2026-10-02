@@ -72,6 +72,7 @@ class MixerContext:
     attention_bias: bool = False
     o_proj_bias: bool | None = None
     attention_scale: float | None = None
+    attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None

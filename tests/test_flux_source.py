@@ -253,7 +253,7 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
         assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
         rows = pipeline_record["size"] // 4
         initial = unpacked(arrays["pipeline.x_T"], rows, rows)
-        prepared = task.prepare(pipeline_record["prompts"], initial=initial, seed=0)
+        prepared = task.prepare(pipeline_record["prompts"], initial=initial, key=0)
         walked = task(prepared, key=jax.random.PRNGKey(0)).host()
         assert relative_gap(packed(np.asarray(walked.latents)), arrays["pipeline.latents"]) < 2e-5
         images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
@@ -316,7 +316,8 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)

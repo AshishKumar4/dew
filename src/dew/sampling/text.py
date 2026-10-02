@@ -21,7 +21,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, overload, runtime_checkable
+from typing import Generic, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -684,7 +684,7 @@ def _digest(components: Components) -> tuple[Identity, str]:
 
 def _request(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             key: jax.Array | None, seed: int | None, sampling: Sampling, n: int,
+             key: int | jax.Array | None, sampling: Sampling, n: int,
              logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
              *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[Identity, ...]]:
     """This process's validated request and the controls a pool compares.
@@ -694,7 +694,7 @@ def _request(model: nn.Module, params: Variables,
     rank enters a collective. A single process never digests: refusing a
     component only a pool could disagree about would cost it nothing.
     """
-    random_key = request_key(key, seed)
+    random_key = request_key(key)
     canonical = ModelInputs.from_value(inputs)
     ids = local_rows(canonical.tokens)
     fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
@@ -767,28 +767,9 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
-_DEFAULT_SAMPLING = Sampling()
-
-
-@overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array, sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
-
-
-@overload
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, seed: int, sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
-
-
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array | None = None, seed: int | None = None,
+             *, key: int | jax.Array | None = None,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
@@ -821,7 +802,7 @@ def generate(model: nn.Module, params: Variables,
     processes = jax.process_count() if mesh is not None else 1
 
     def resolve():
-        return _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
+        return _request(model, params, inputs, max_new_tokens, key, sampling, n,
                         logits, stopping, strategy, pooled=processes > 1)
 
     request = (agreed("generation input validation", resolve) if processes > 1 else resolve())

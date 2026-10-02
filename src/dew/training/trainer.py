@@ -16,8 +16,10 @@ import contextlib
 import dataclasses
 import functools
 import logging
+import math
 import sys
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
@@ -60,7 +62,7 @@ from dew.objectives.base import (
     Variables,
     select,
 )
-from dew.records import JSON
+from dew.records import JSON, boolean, integers, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
@@ -76,6 +78,7 @@ from dew.telemetry.records import (
 )
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
+    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -252,19 +255,18 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
-                    mesh: Mesh) -> tuple[jax.stages.Compiled, bool]:
+                    mesh: Mesh, held: int = 0) -> tuple[jax.stages.Compiled, bool]:
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
-    Returns the step to run and whether it fits.
+    Returns the step to run and whether it fits; `held` is `step_fits`'s.
 
     The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
     (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
-    plan their whole logits in 13.1 GiB with them, against 13.6 GiB of an
-    0.85 pool, while without them the step plans more. Within `FIT_RESERVE`
-    of the limit neither counts as fitting, and the head tiles. So the
-    fusions come back before the ladder's first rung, where they fit."""
+    keep their whole logits in 13.1 GiB with them, inside the 13.24 GiB of an
+    0.85 pool, while without them the step does not fit and tiles its head.
+    So the fusions come back before the ladder's first rung."""
     default = program.compile()
-    if not step_fits(default, mesh):
+    if not step_fits(default, mesh, held):
         return executable, False
     _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
     return default, True
@@ -305,6 +307,31 @@ def _keeps_triton_gemm(model: nn.Module) -> bool:
     return any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers)
 
 
+def climb_to(objective, rung: Mapping[str, object]) -> None:
+    """Move `objective` up to the head tile and remat a checkpoint's
+    `rung` records (`Trainer._rung`), each where it stands below them: the
+    ladder `recompute_more` climbs, taken in one move."""
+    tile = rung.get('head_tile')
+    if tile is not None and _head_tile_of(objective) is None:
+        rows, columns = integers(tile, 'rung head_tile')
+        objective.tile_head((rows, columns))
+    model = _model_of(objective)
+    current = _remat_of(model)
+    ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
+              else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
+    records = [remat_record(remat) for remat in ladder]
+    here, there = remat_record('dots' if current is True else current), json_value(rung.get('remat'), 'rung remat')
+    if model is not None and here in records and there in records and records.index(there) > records.index(here):
+        objective.model = model.clone(remat=ladder[records.index(there)])
+
+
+def _head_tile_of(objective: Objective[Loss, Effects]) -> tuple[int, int] | None:
+    """The tile an objective's head computes its backward in, read at the
+    boundary with any objective: an LM objective's `head_tile`, and None for
+    a head that keeps its whole logits or an objective with no head."""
+    return getattr(objective, 'head_tile', None)
+
+
 def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
     """The model's remat setting, read at the boundary with any flax module:
     a decoder's `RematPolicy`, a diffusion backbone's bool or name, and
@@ -324,33 +351,70 @@ DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
 
-# The share of each device's allocator limit a step leaves free to count as fitting. A step XLA
-# plans inside the limit can still fail to place its largest temporary at run time. On an RTX
-# 4080 (jax 0.11.2, a 2-layer Qwen3-0.6B-width decoder at 8 x 1024 tokens, whole logits, a
-# 13.1 GiB plan), a fresh process failed with RESOURCE_EXHAUSTED on its 10.3 GiB temporary in
-# 1 of 16 runs with 3.6% of the limit to spare and 2 of 16 with 5.8%, under the BFC and the
-# cuda_async allocators alike, and in none of 48 with 7.9% (pool-fraction sweep, 2026-10-01).
-# 8% is the smallest share at which that sweep did not fail, a measured edge on one card, not a
-# derived bound; a step planned within it takes the next, slower rung.
-FIT_RESERVE = 0.08
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
+    """The bytes the tightest of `devices` has to spare once the compiled
+    step's temporaries and new outputs are placed beside `held` more bytes
+    the loop keeps outside the step, None where the executable or a device
+    reports no memory. The arguments, the state and the batch, are already
+    resident and counted in use; the donated state's buffers are reused for
+    the outputs that alias them.
 
-
-def step_headroom(executable: jax.stages.Compiled, devices: Sequence) -> int | None:
-    """The bytes the tightest of `devices` has free once the compiled step's
-    temporaries and new outputs are placed and `FIT_RESERVE` of its limit is
-    kept back, None where the executable or a device reports no memory. The
-    arguments, the state and the batch, are already resident and counted in
-    use; the donated state's buffers are reused for the outputs that alias
-    them.
-
-    This compares against the allocator's limit; a growable allocator
-    (XLA_PYTHON_CLIENT_PREALLOCATE=false) can fragment below it."""
+    XLA's GPU step takes all its temporaries in one allocation, so it needs
+    one free block that large, not that many free bytes: on an A100 the
+    'minimal' rung of a Qwen3-1.7B fine-tune ran out of memory placing its
+    11.68 GiB of temporaries with 16.3 GiB free, split 5.9 GiB below the
+    state and 10.4 GiB above it. `placeable` reads the block from the
+    allocator. Where it `strands_temporaries`, they need room twice."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
-    needed = stats.output_size_in_bytes - stats.alias_size_in_bytes + stats.temp_size_in_bytes
-    return min(int(m['bytes_limit'] * (1 - FIT_RESERVE)) - m['bytes_in_use'] for m in memory) - needed
+    beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
+    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
+               for d, m in zip(devices, memory, strict=True))
+
+
+def placeable(memory: Mapping[str, int]) -> int:
+    """The bytes one allocation can take from a device whose allocator
+    reports `memory` (`Device.memory_stats`), the most a step's temporaries
+    and every buffer beside them can need of one block.
+
+    XLA's GPU pool, its BFC allocator, reports its size (pool_bytes) and its
+    largest free block; a pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false)
+    can also take a new block from the part of its limit it has not taken.
+    cuda_async and a TPU's allocator report no pool, and their free bytes are
+    all there is to read."""
+    free = memory['bytes_limit'] - memory['bytes_in_use']
+    if 'pool_bytes' not in memory:
+        return free
+    return min(free, max(memory['largest_free_block_bytes'], memory['bytes_limit'] - memory['pool_bytes']))
+
+
+def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
+    """Whether the allocator of a device of `platform`, which reports
+    `memory`, can leave a step's temporaries no block to return to, so that
+    the next step needs a second block as large.
+
+    XLA's spatially partitioned BFC pool can: a preallocated pool with
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
+    There a free block below a buffer serves every small allocation before
+    the open space past it. A batch prefetched while the temporaries are
+    placed lands past them; once they are freed the next step's outputs take
+    a few bytes of their block. On an RTX 4080 a step with 6.5 GiB of
+    temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
+    runs. With the partitioning off, which `prepare_process` sets, the
+    smallest block that fits serves them instead: 4 of 4 runs placed a batch
+    past the temporaries 20 to 45 times each and finished.
+
+    cuda_async can too, and reports neither its blocks nor its pool: the
+    8192-token step there, 10.3 GiB of temporaries with 10.45 GiB free,
+    failed in 1 of 8 runs at a 0.85 pool, 1 of 8 at 0.87 and 1 of 16 at 0.91.
+    At the failure its pool held 14.2 GB with 3.0 GB in use, the device had
+    1.9 GB free, and neither gave the 11.1 GB the step asked for again."""
+    if 'pool_bytes' not in memory:
+        return platform == 'gpu'
+    partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
+    return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
 def fits_everywhere(headroom: int | None) -> bool:
@@ -366,11 +430,21 @@ def fits_everywhere(headroom: int | None) -> bool:
     return bool(np.min(gathered) >= 0)
 
 
-def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
+def step_fits(executable: jax.stages.Compiled, mesh: Mesh, held: int = 0) -> bool:
     """Whether the compiled step fits the free memory of every device of
-    `mesh`, agreed across the processes that hold them."""
+    `mesh` beside `held` bytes more on each, agreed across the processes that
+    hold them."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return fits_everywhere(step_headroom(executable, local))
+    return fits_everywhere(step_headroom(executable, local, held=held))
+
+
+def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
+    """The bytes a device holds of the batches `fit` places while a step
+    runs, beside the one the step reads: the `PREFETCH_DEPTH` it queues and
+    the one it is placing, each laid out as `shardings` places `batch`."""
+    shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
+                          * np.dtype(leaf.dtype).itemsize, batch, shardings)
+    return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
 
 
 def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
@@ -538,7 +612,7 @@ class Trainer(Generic[Loss, Effects]):
         objective: Objective[Loss, Effects],
         optimizer: optax.GradientTransformation,
         *,
-        key: jax.Array,
+        key: int | jax.Array,
         mesh: MeshSpec = _DEFAULT_MESH,
         layout: Layout = _DEFAULT_LAYOUT,
         accumulation: int = 1,
@@ -570,7 +644,9 @@ class Trainer(Generic[Loss, Effects]):
             )
         self.objective = objective
         self.optimizer = optimizer
-        self.key = key
+        from dew.nn.inputs import request_key
+        self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
+        self.key = request_key(key)
         self.mesh = mesh
         self.layout = layout
         self.accumulation = accumulation
@@ -594,11 +670,17 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
+        # The fit ladder's rung beyond the objective's own head and remat: a
+        # step that fit only under XLA's default options keeps them for later
+        # compiles. A resumed run starts at its checkpoint's rung, and says so
+        # if its first compile has to climb past it (`_climb_to`).
+        self._xla_defaults = False
+        self._resumed_rung: JSON = None
 
     @classmethod
     def from_config(
         cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: jax.Array,
+        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
         checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
         step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
                         optax.GradientTransformation], StepFn] | None = None,
@@ -610,7 +692,7 @@ class Trainer(Generic[Loss, Effects]):
         written once, here. `mesh`, `layout`, `accumulation`,
         `dynamic_scale` and `profile` are the config fields a trainer holds.
         `key` is the run key, which `RunConfig.train` draws from
-        `config.seed`.
+        `config.key`.
 
         The rest of the config belongs to the capabilities and to the loop,
         and reaches them from their own owners. `checkpoint_dir` and `keep`
@@ -645,7 +727,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def initial_state(self, initializer: Initializer | None = None,
-                      key: jax.Array | None = None) -> TrainState:
+                      key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
         It is pure, so `fit` traces it once for its shapes and once, sharded,
@@ -660,7 +742,8 @@ class Trainer(Generic[Loss, Effects]):
         path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
-        key = self.key if key is None else key
+        from dew.nn.inputs import request_key
+        key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
         params = nn.unbox(initializer(init_key))
         if "params" not in params:
@@ -713,6 +796,8 @@ class Trainer(Generic[Loss, Effects]):
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
+        # A root key is one value; a legacy key's uint32 words are not parameter axes.
+        placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
@@ -768,7 +853,11 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is None or resume is None:
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
-            state = jax.jit(self.initial_state, out_shardings=shardings)(initializer, key)
+            held = self._placed_held(initializer, abstract, shardings)
+            with warnings.catch_warnings():
+                # A held array no output can take over is freed as the JIT returns.
+                warnings.filterwarnings('ignore', 'Some donated buffers were not usable')
+                state = jax.jit(self.initial_state, out_shardings=shardings, donate_argnums=0)(held, key)
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
@@ -783,10 +872,77 @@ class Trainer(Generic[Loss, Effects]):
                                            initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=data_partition(self.device_mesh))
+        self._climb_to(checkpoints.rung(resume))
+        from dew.nn.inputs import request_key
+        state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _rung(self) -> JSON:
+        """The fit ladder's rung this trainer's step compiles at: the
+        objective's head tile, its model's remat (`remat_record`) and whether
+        the step keeps XLA's default options (`fitting_default`). A
+        checkpoint records it, since each decides the program a step runs."""
+        tile = _head_tile_of(self.objective)
+        return {'head_tile': None if tile is None else list(tile),
+                'remat': remat_record(_remat_of(_model_of(self.objective))),
+                'xla_defaults': self._xla_defaults}
+
+    def _climb_to(self, rung: JSON) -> None:
+        """Move the objective up to `rung`, a checkpoint's (`_rung`), where
+        it is above where the objective stands, never below it.
+
+        The fit check reads the free memory its own process finds, and one
+        that restores a state finds other memory than the one that built it:
+        on an A100 a Qwen3-1.7B run trained under remat 'full', and its
+        resumed process took 'minimal', ran another program and parted from
+        the uninterrupted run at step 70. So the resumed run compiles the
+        rung its checkpoint trained on, and climbs further only where that
+        does not fit."""
+        if rung is None:
+            return
+        fields = record(rung, 'rung')
+        climb_to(self.objective, fields)
+        self._xla_defaults = self._xla_defaults or boolean(fields.get('xla_defaults', False), 'rung xla_defaults')
+        self._resumed_rung = self._rung()
+
+    def _placed_held(self, initializer: Initializer, abstract: TrainState,
+                     shardings: Placement[TrainState]) -> Initializer:
+        """`initializer` with a copy of each array it holds placed where the
+        state keeps the variable of its path and shape
+        (`Objective.held_variables`), for the state's JIT to take over, the
+        rest replicated.
+
+        Handed to the JIT as they are, a loaded checkpoint's arrays were placed
+        below the state it built and freed once it was: a hole as large as the
+        checkpoint under the state, 5.9 GiB on an A100 for Qwen3-1.7B, whose
+        'minimal' rung then found no free block for its temporaries
+        (`step_headroom`). Placed where the state keeps them and donated, they
+        become the state's buffers, of the variable or of an optimizer moment
+        laid out like it. The copy leaves the objective's own arrays alone: a
+        checkpoint loaded to the host (`load_pretrained`) leaves no hole, while
+        arrays the objective already holds on the devices stay wherever they
+        were placed for as long as it holds them."""
+        variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
+            jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
+            strict=True)}
+        replicated = NamedSharding(self.device_mesh, P())
+
+        def placement(path, leaf):
+            # An initializer binds the checkpoint as `variables`
+            # (`Objective.initializer`), so a leaf's path below that keyword
+            # is its variable's.
+            keys = [key.key if isinstance(key, jax.tree_util.DictKey) else None for key in path]
+            sharding, shape = variables.get(path[keys.index('variables') + 1:] if 'variables' in keys else (),
+                                            (replicated, None))
+            return sharding if shape == np.shape(leaf) else replicated
+
+        # A copy of an array already on the devices: device_put can reuse a
+        # buffer the target shares with the source, which donation would free.
+        owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, initializer)
+        return jax.device_put(owned, jax.tree_util.tree_map_with_path(placement, initializer))
 
     def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
                            stored: Variables, initializer, key) -> TrainState:
@@ -1027,6 +1183,7 @@ class Trainer(Generic[Loss, Effects]):
             return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
+        resumed, self._resumed_rung = self._resumed_rung, None
         with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
@@ -1038,6 +1195,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
+            placement = batch_shardings(mesh, batch)
+            held = prefetched_bytes(batch, placement)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             while True:
@@ -1051,16 +1210,22 @@ class Trainer(Generic[Loss, Effects]):
                     return (dataclasses.replace(advanced, step=current.step + 1), loss,
                             aux.metrics, jnp.isfinite(loss), advanced.microstep > current.microstep)
 
-                jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
+                jitted = jax.jit(step, in_shardings=(shardings, placement),
                                  out_shardings=(shardings, replicated, replicated, replicated,
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                options = step_compiler_options(self.objective)
+                options = None if self._xla_defaults else step_compiler_options(self.objective)
                 self.executable = self.program.compile(options)
-                fits = step_fits(self.executable, mesh)
+                fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
-                    self.executable, fits = fitting_default(self.program, self.executable, mesh)
+                    self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
+                    self._xla_defaults = fits
+                if not fits and resumed is not None:
+                    print(colored(f"the step does not fit the devices at the rung its checkpoint trained on "
+                                  f"({resumed}); from here the resumed run computes otherwise than the "
+                                  f"run it continues", "yellow"), file=sys.stderr)
+                    resumed = None
                 if fits or not recompute_more(self.objective):
                     break
             self.flops_per_step = compiled_flops(self.executable)
@@ -1271,7 +1436,7 @@ class Trainer(Generic[Loss, Effects]):
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape))
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed)
         self._report(started, current)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
@@ -1546,7 +1711,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
         metadata = {"loss": float(interval.book[0] / interval.steps)} if interval.steps else None
-        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh))
+        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
+                         rung=self._rung())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -1560,7 +1726,8 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
+        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh),
+                               rung=self._rung())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

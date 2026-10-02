@@ -40,8 +40,9 @@ def xla_flag(name: str) -> str | None:
 def deterministic_ops_requested() -> bool:
     """Whether the run asked XLA for deterministic ops.
 
-    `--xla_gpu_deterministic_ops` orders the reductions that make a GPU step
-    bitwise reproducible. Kernel selection reads it: `dew.nn.attention` keeps
+    `--xla_gpu_deterministic_ops` orders the reductions of a GPU step.
+    Autotuning, which `--xla_gpu_autotune_level=0` turns off, can pick
+    different kernels in another compilation (docs/guides/checkpoints.md). Kernel selection reads this flag: `dew.nn.attention` keeps
     cudnn's fused attention away from a run that set it.
     """
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')

@@ -78,6 +78,9 @@ test = [
     "pytest",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
+    # The legacy decoder graph test deserializes jax.export; JAX does not
+    # declare flatbuffers. This version wrote the committed export fixture.
+    "flatbuffers==25.12.19",
     "pytest-xdist",
     # CI's shards: splits the suite by tests/test_durations.json.
     "pytest-split>=0.11",

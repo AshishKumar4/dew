@@ -159,6 +159,74 @@ def test_fit_trains_to_the_step_it_was_asked_for():
     assert int(state.step) == 4
 
 
+def test_integer_root_key_matches_a_typed_key_bit_exactly():
+    integer = Trainer(Regression(), optax.adam(1e-3), key=0)
+    typed = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    left = integer.fit(Data(), steps=3, log_every=1)
+    right = typed.fit(Data(), steps=3, log_every=1)
+    assert jax.tree.structure(left) == jax.tree.structure(right)
+    for actual, expected in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(actual)), np.asarray(raw_leaf(expected)))
+
+
+def test_integer_root_seed_is_recorded_at_fit_start():
+    from dew.telemetry.records import FitStarted
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=23, tracker=tracker).fit(Data(), steps=1)
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.seed == 23
+
+
+def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
+    def build(path=None):
+        return Trainer(Regression(), optax.adam(1e-3), key=0,
+                       checkpoints=None if path is None else Checkpoints(str(path)))
+
+    baseline = build().fit(Data(), steps=4, log_every=1)
+    split = build(tmp_path / "typed")
+    prefix = split.fit(Data(), steps=2, checkpoint_every=1, log_every=1)
+    assert jnp.issubdtype(prefix.key.dtype, jax.dtypes.prng_key)
+    fresh = build(tmp_path / "typed")
+    restored, _, _ = fresh.place()
+    assert restored.key.dtype == prefix.key.dtype
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
+    resumed = fresh.fit(Data(), steps=4, checkpoint_every=1, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+def test_legacy_key_checkpoint_restores_as_a_typed_key(tmp_path):
+    reference = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    baseline = reference.fit(Data(), steps=4, log_every=1)
+    prefix = Trainer(Regression(), optax.adam(1e-3), key=0).fit(Data(), steps=2, log_every=1)
+    legacy = dataclasses.replace(prefix, key=jax.random.key_data(prefix.key))
+    checkpoints = Checkpoints(str(tmp_path / "legacy"))
+    checkpoints.save(2, legacy, json.dumps({"index": 2}).encode(), share=DataPartition())
+    checkpoints.wait()
+    fresh = Trainer(Regression(), optax.adam(1e-3), key=0,
+                    checkpoints=Checkpoints(str(tmp_path / "legacy")))
+    restored, _, _ = fresh.place()
+    assert jnp.issubdtype(restored.key.dtype, jax.dtypes.prng_key)
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), legacy.key)
+    resumed = fresh.fit(Data(), steps=4, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_root_key_stays_replicated_on_a_multi_device_mesh():
+    trainer = Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    state, shardings, _ = trainer.place()
+    legacy = dataclasses.replace(state, key=jax.random.key_data(state.key))
+    legacy_shardings = trainer.shardings(legacy)
+    assert shardings.key.spec == legacy_shardings.key.spec == jax.sharding.PartitionSpec()
+    assert state.key.sharding.mesh == shardings.key.mesh
+    for shard in state.key.addressable_shards:
+        np.testing.assert_array_equal(jax.random.key_data(shard.data), jax.random.key_data(state.key))
+
+
 def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     refs = []
 
@@ -235,11 +303,11 @@ def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
     hand, for a config whose every trainer-held field is off its default: one
     mapping from the config's names to this constructor's, in one place."""
     config = TrainerConfig(
-        batch_size=8, seed=7, steps=3, accumulation=2, dynamic_scale=True,
+        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
         mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
     objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.seed)
+    key = jax.random.key(config.key)
     checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
 
     built = Trainer.from_config(config, objective, optimizer, key=key,
@@ -315,9 +383,9 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     saved = []
     real_save = trainer.checkpoints.save
 
-    def spy(step, state, position, metrics=None, *, share=None):
+    def spy(step, state, position, metrics=None, *, share=None, rung=None):
         saved.append((step, None if metrics is None else sorted(metrics)))
-        return real_save(step, state, position, metrics, share=share)
+        return real_save(step, state, position, metrics, share=share, rung=rung)
 
     trainer.checkpoints.save = spy
     trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
@@ -450,6 +518,75 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert position.read(resumed_place).records == 4 * BATCH
 
 
+def ladder_lm_trainer(directory, fits):
+    """An LM trainer on a decoder whose fit check answers `fits(rung)` for
+    the rung each compile is at: (whether the head is tiled, the remat's
+    record). It stands in for the free memory a process finds."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    objective = LMObjective(model, seq_len=4)
+    trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
+
+    def headroom(executable, devices, held=0):
+        rung = (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat))
+        return 0 if fits(rung) else -1
+    return trainer, objective, headroom
+
+
+def lm_windows(tmp_path):
+    from dew.data import Loading, TokenWindows
+
+    tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
+    tokens.tofile(tmp_path / "train.bin")
+    tokens.tofile(tmp_path / "val.bin")
+    return TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+
+
+def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, monkeypatch):
+    """The rung a run settles on is part of what it resumes: a process that
+    restores the state finds other free memory than the one that built it
+    (on an A100 a Qwen3-1.7B run took 'full', and its resumed process,
+    without the fresh state's hole, 'minimal', and parted from step 70). The
+    resumed run compiles the checkpoint's rung where the step fits more
+    lightly too, and trains bit for bit as the uninterrupted one."""
+    def tiled_and_minimal(rung):
+        return rung in ((True, 'minimal'), (True, 'full'))
+
+    whole, _, headroom = ladder_lm_trainer(tmp_path / "whole", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    expected = whole.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    assert (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat)) == (
+        True, 'minimal')
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
+
+
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+    """A process that cannot fit the rung its checkpoint trained on moves up
+    the ladder, never down, and says the run now computes otherwise."""
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+    capsys.readouterr()
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
+    assert trainer_module.remat_record(objective.model.remat) == 'full'
+    assert "the rung its checkpoint trained on" in capsys.readouterr().err
+
+
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
 def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
@@ -488,6 +625,61 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
         assert jax.tree.structure(actual) == jax.tree.structure(expected)
         for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+REPEATED_CONV_STEPS = """
+import sys
+
+import jax
+import numpy as np
+import optax
+
+from dew.diffusion import presets
+from dew.inputs import Field, InputSpec
+from dew.objectives.diffusion import DiffusionObjective
+from dew.registry import models
+from dew.sampling import Euler
+from dew.training import Trainer
+
+model = models.SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
+                               sampler=Euler(), steps=2, ema_decay=None)
+trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+state = trainer.initial_state()
+batch = {"image": np.random.default_rng(0).integers(0, 256, (32, 16, 16, 3)).astype(np.uint8)}
+step = trainer.compile(state, batch)
+for _ in range(2):
+    state, *_ = step(state, batch)
+leaves = jax.tree.leaves(jax.tree.map(lambda leaf: jax.random.key_data(leaf)
+                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf, state))
+np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
+"""
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="cuDNN convolution autotuning")
+def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(tmp_path):
+    """Autotuning picks a convolution's cuDNN algorithm per process, so only
+    a second process shows whether it agrees. Two fresh processes, without a
+    compilation cache, train a DiT (a convolution embeds its patches) two
+    Adam steps under the cuda lane's flags; every state leaf agrees."""
+    from conftest import REPEATABLE_GPU_FLAGS
+
+    root = Path(__file__).resolve().parents[1]
+    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_autotune_level"))]
+    environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
+                   "XLA_FLAGS": " ".join([*flags, *REPEATABLE_GPU_FLAGS]),
+                   "JAX_ENABLE_COMPILATION_CACHE": "false"}
+    runs = []
+    for index in range(2):
+        out = tmp_path / f"state-{index}.npz"
+        done = subprocess.run([sys.executable, "-c", REPEATED_CONV_STEPS, str(out)], env=environment,
+                              capture_output=True, text=True, timeout=600)
+        assert done.returncode == 0, done.stderr
+        runs.append(np.load(out))
+    assert runs[0].files == runs[1].files
+    for name in runs[0].files:
+        np.testing.assert_array_equal(runs[0][name], runs[1][name])
 
 
 def test_the_state_is_built_from_the_initializer_and_the_key_alone():
@@ -820,8 +1012,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None):
-        save_local(step, state, position, share=share)
+    def save_then_stop(step, state, position, *, share=None, rung=None):
+        save_local(step, state, position, share=share, rung=rung)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -1557,25 +1749,138 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
-def test_a_step_planned_within_the_fit_reserve_does_not_fit():
-    """A step XLA plans inside the allocator's limit, with less than
-    FIT_RESERVE of it to spare, does not count as fitting: on an RTX 4080 such
-    a step failed to place its largest temporary in 1 to 2 of 16 runs, so the
-    ladder takes the next rung instead. One with the reserve to spare fits."""
+GiB = 2**30
+
+
+def planned_step(temporaries, outputs=0):
+    """A compiled step as the fit check reads it: XLA's memory analysis."""
     from types import SimpleNamespace
 
-    from dew.training.trainer import FIT_RESERVE, step_headroom
+    return SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
+        output_size_in_bytes=outputs, alias_size_in_bytes=0, temp_size_in_bytes=int(temporaries)))
 
-    limit, resident = 16 * 2**30, 2**30
 
-    def planned(temporaries):
-        return SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
-            output_size_in_bytes=0, alias_size_in_bytes=0, temp_size_in_bytes=temporaries))
+def device_memory(limit, in_use, largest=0, pool=None, platform="gpu"):
+    """A device as the fit check reads it: its platform and its allocator's
+    memory_stats. Only XLA's GPU pool (BFC) reports pool_bytes."""
+    from types import SimpleNamespace
 
-    device = SimpleNamespace(memory_stats=lambda: {"bytes_limit": limit, "bytes_in_use": resident})
-    spare = int(limit * FIT_RESERVE)
-    assert step_headroom(planned(limit - resident - spare // 2), [device]) < 0
-    assert step_headroom(planned(limit - resident - 2 * spare), [device]) > 0
+    stats = {"bytes_limit": int(limit), "bytes_in_use": int(in_use), "largest_free_block_bytes": int(largest)}
+    if pool is not None:
+        stats["pool_bytes"] = int(pool)
+    return SimpleNamespace(platform=platform, memory_stats=lambda: stats)
+
+
+def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
+    """XLA's GPU step takes its temporaries as one allocation, so it fits
+    where one free block holds them, whatever share of the limit is left.
+
+    The A100 numbers: the 176M DiT at batch 128 planned 28.3 GiB of a 29.6
+    GiB pool, 4.4% of it to spare, and ran 274.6 ms a step without remat; an
+    8% reserve sent it to 'dots' at 314.9 ms. Qwen3-1.7B's 'minimal' rung
+    needed 11.68 GiB of temporaries beside 13.3 GiB of state, and the 16.3
+    GiB free were 5.9 GiB below the state and 10.4 GiB above it: neither
+    block held them, and the run ran out of memory on its first step."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
+    limit = 29.6 * GiB
+    whole = device_memory(limit, 2.1 * GiB, largest=limit - 2.1 * GiB, pool=limit)
+    assert step_headroom(planned_step(26.2 * GiB), [whole]) > 0
+    split = device_memory(limit, 13.3 * GiB, largest=10.4 * GiB, pool=limit)
+    assert step_headroom(planned_step(11.68 * GiB), [split]) < 0
+    assert step_headroom(planned_step(10 * GiB), [split]) > 0
+
+
+def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
+    """XLA partitions a preallocated BFC pool unless the run turns it off.
+    There a batch prefetched beside a step's temporaries leaves them no
+    block to return to, and the next step needs a second block as large: the
+    RTX 4080's 4096-token step, 6.5 GiB of temporaries with 10.45 GiB free in
+    one block, failed so in 5 of 16 runs. With the partitioning off it fits."""
+    from dew.training.trainer import step_headroom
+
+    limit = 13.24 * GiB
+    pool = device_memory(limit, 2.79 * GiB, largest=10.45 * GiB, pool=limit)
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true")
+    assert step_headroom(planned_step(6.5 * GiB), [pool]) < 0
+    assert step_headroom(planned_step(5 * GiB), [pool]) > 0
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
+    assert step_headroom(planned_step(6.5 * GiB), [pool]) > 0
+    growing = device_memory(limit, 2.79 * GiB, largest=GiB, pool=4 * GiB)
+    monkeypatch.setenv("XLA_FLAGS", "")
+    assert step_headroom(planned_step(6.5 * GiB), [growing]) > 0
+
+
+def test_a_growing_pool_places_temporaries_in_a_region_it_has_yet_to_take(monkeypatch):
+    """A pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) takes a new
+    region for an allocation its free blocks cannot hold, up to its limit."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
+    assert step_headroom(planned_step(10 * GiB), [growing]) > 0
+    assert step_headroom(planned_step(13.5 * GiB), [growing]) < 0
+
+
+def test_an_allocator_without_a_pool_is_read_by_its_free_bytes(monkeypatch):
+    """A TPU's allocator reports no pool, so its free bytes are all the
+    check reads."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    tpu = device_memory(16 * GiB, 3 * GiB, platform="tpu")
+    assert step_headroom(planned_step(12.9 * GiB), [tpu]) > 0
+    assert step_headroom(planned_step(13.1 * GiB), [tpu]) < 0
+
+
+def test_cuda_async_needs_room_for_the_temporaries_twice(monkeypatch):
+    """cuda_async reports no pool and no free block, and its pool can hold
+    a step's freed temporaries where the next step cannot reuse them: the
+    RTX 4080's 8192-token step, 10.3 GiB of them with 10.45 GiB free, failed
+    in 1 of 8 runs at a 0.85 pool. So the step needs room for them twice."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    unpooled = device_memory(13.24 * GiB, 2.79 * GiB)
+    assert step_headroom(planned_step(10.31 * GiB), [unpooled]) < 0
+    assert step_headroom(planned_step(5 * GiB), [unpooled]) > 0
+
+
+def test_a_step_fits_beside_the_bytes_the_loop_holds_outside_it(monkeypatch):
+    """The batches the loop prefetches beside the step's own are placed
+    while it runs, so the step fits only with room for them too."""
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
+    pool = device_memory(16 * GiB, 3 * GiB, largest=13 * GiB, pool=16 * GiB)
+    assert step_headroom(planned_step(12 * GiB), [pool]) > 0
+    assert step_headroom(planned_step(12 * GiB), [pool], held=2 * GiB) < 0
+
+
+def test_the_fit_check_holds_room_for_the_batches_fit_prefetches(monkeypatch):
+    """`fit` queues PREFETCH_DEPTH batches and places one more while a step
+    runs, so the check holds room for that many more of the batch the step
+    compiles for, as each device holds its share."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training.distributed import PREFETCH_DEPTH, batch_shardings
+
+    seen = []
+
+    def headroom(executable, devices, held=0):
+        seen.append(held)
+        return 0
+
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {'text': jnp.zeros((8, 5), jnp.int32)}
+    trainer.compile(state, batch)
+    placed = jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
+    assert seen == [(PREFETCH_DEPTH + 1) * placed['text'].addressable_shards[0].data.nbytes]
 
 
 def test_accumulation_must_be_positive():
@@ -1586,13 +1891,14 @@ def test_accumulation_must_be_positive():
 @pytest.mark.parametrize("tokens", [4096, 8192, 16384])
 def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, tokens):
     """Compare real Trainer steps with the measured recipe: unfused whole
-    logits at 4096 tokens, and a 4096-row tile at 8192 and 16384. At 8192
-    the fused whole logits plan 13.1 GiB of the 13.6 GiB pool, within the
-    fit check's reserve (`FIT_RESERVE`), so the step has to say it tiles.
-    Fresh processes keep conftest's deterministic XLA flags out of the
-    measurement; those flags change which whole-logits step fits. The ABBA
-    order and warmed step medians allow 4% noise, below the old 8%, 18%,
-    and 3x regressions. Children need room for a preallocated pool.
+    logits at 4096 tokens, fused whole logits at 8192, and a 4096-row tile
+    at 16384. At 8192 the fused whole logits hold 10.3 GiB of temporaries
+    beside 2.8 GiB of state in the 13.24 GiB pool, and the step has to keep
+    them. Fresh processes keep conftest's deterministic XLA flags
+    out of the measurement; those flags change which whole-logits step fits.
+    The ABBA order and warmed step medians allow 4% noise, below the old 8%,
+    18%, and 3x regressions. Children need room for a preallocated pool,
+    Dew's BFC allocator as `prepare_process` sets it up.
     """
     devices = jax.devices()
     if len(devices) != 1 or "RTX 4080" not in devices[0].device_kind:
@@ -1618,16 +1924,14 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
         "seq_len": 1024}
     flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
                      if not flag.startswith("--xla_gpu_deterministic_ops"))
-    # BFC fragmentation failed the 4096-token reference child's 6.5 GiB temporary in 5 of 16 lone
-    # runs (its compiled peak is 9.3 GiB of the 13.6 GiB pool); cuda_async: 0 of 24, p50 94.3 -> 94.0 ms.
     environment = {**os.environ, "JAX_PLATFORMS": "cuda", "PYTHONPATH": str(root / "src"),
                    "JAX_DEFAULT_MATMUL_PRECISION": "default", "XLA_FLAGS": flags,
-                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction),
-                   "XLA_PYTHON_CLIENT_PREALLOCATE": "true", "XLA_PYTHON_CLIENT_ALLOCATOR": "cuda_async"}
+                   "XLA_PYTHON_CLIENT_MEM_FRACTION": str(fraction), "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
+    environment.pop("XLA_PYTHON_CLIENT_ALLOCATOR", None)
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
-        objective = {"head_tile": [4096, 8192] if tokens >= 8192 else "whole"} if reference else {}
-        options = " --xla_gpu_enable_triton_gemm=false" if reference and tokens == 4096 else ""
+        objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
+        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",
@@ -1636,13 +1940,47 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
             env={**environment, "XLA_FLAGS": flags + options}, capture_output=True, text=True, timeout=180)
         assert done.returncode == 0, done.stdout + done.stderr
         if not reference:
-            assert ("with the whole logits kept" in done.stderr) == (tokens >= 8192), done.stderr
+            assert ("with the whole logits kept" in done.stderr) == (tokens == 16384), done.stderr
         row, = json.loads(record.read_text())
         assert row["finite"], row
         samples[int(reference)].append(row["p50_ms"])
     measured, baseline = (float(np.median(values)) for values in samples)
     assert measured < baseline * 1.04, (tokens, measured, baseline)
 
+
+
+@pytest.mark.mesh
+def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(monkeypatch):
+    """A held checkpoint reaches the state's JIT as a copy placed where the
+    state keeps each variable, sharded as it is, and the JIT takes those
+    buffers over. Handed over as they are, the arrays were placed below the
+    state and freed after it was built, a hole as large as the checkpoint:
+    on an A100 Qwen3-1.7B's 'minimal' rung then found no block for its
+    temporaries. The objective's own arrays stay as they were."""
+    from jax.tree_util import Partial
+
+    held = {}
+    put = jax.device_put
+
+    def recorded(x, *args, **kwargs):
+        out = put(x, *args, **kwargs)
+        if isinstance(out, Partial):
+            held.update(jax.tree_util.tree_leaves_with_path(out.keywords["variables"]))
+        return out
+
+    monkeypatch.setattr(jax, "device_put", recorded)
+    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    state, shardings, _ = trainer.place()
+    params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
+    sharded = 0
+    for path, leaf in jax.tree_util.tree_leaves_with_path(weights):
+        copy = held[path]
+        assert copy.is_deleted(), jax.tree_util.keystr(path)
+        assert copy.sharding == params[path], jax.tree_util.keystr(path)
+        sharded += not copy.sharding.is_fully_replicated
+        assert not leaf.is_deleted()
+    assert sharded
+    jax.tree.map(np.testing.assert_array_equal, state.params, weights)
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():

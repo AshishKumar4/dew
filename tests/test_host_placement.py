@@ -201,10 +201,10 @@ def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     _, scanned, variables, tokens = pair(**SHAPES[shape])
     resident, on_host = stores(scanned, variables)
     greedy = Sampling(temperature=0.0)
-    fetched = generate(scanned, on_host, tokens, 4, seed=0, sampling=greedy)
+    fetched = generate(scanned, on_host, tokens, 4, key=0, sampling=greedy)
     assert np.array_equal(
         np.asarray(fetched.tokens),
-        np.asarray(generate(scanned, resident, tokens, 4, seed=0, sampling=greedy).tokens))
+        np.asarray(generate(scanned, resident, tokens, 4, key=0, sampling=greedy).tokens))
 
     cache = scanned.apply(on_host, 2, method="init_cache", mutable=["cache"])[1]["cache"]
     depth = SHAPES[shape]["num_layers"]

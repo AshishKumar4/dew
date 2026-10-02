@@ -44,6 +44,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew import records
+from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
@@ -1878,7 +1879,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     must be square, and the activation one the shared MLP runs.
     """
     vision = _vision_section(hf_config)
-    if vision.get("model_type", "qwen3_5_vision") not in ("qwen3_5_vision", "qwen3_5"):
+    if vision.get("model_type", "qwen3_5_vision") not in _QWEN35_VISION_TYPES:
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
     table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")

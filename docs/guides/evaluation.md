@@ -26,7 +26,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype="float32", attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, optax.adam(0.01), key=jax.random.key(0))
+trainer = Trainer(objective, optax.adam(0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(metrics.perplexity(),))
 assert int(state.step) == 10
@@ -66,6 +66,9 @@ The built-in metrics reduce their batches as follows:
 - JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on the second half. They log the mean of the batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These numbers depend on how the batch is split and are not a probe over the full dataset.
 
 Training metrics are named under `train/`, and reduced validation metrics under `val/`. Metric names must be unique within a pass.
+
+`key=0` is the same root key as `key=jax.random.key(0)`. The fit record
+also keeps the supplied integer seed.
 
 ## Previews
 

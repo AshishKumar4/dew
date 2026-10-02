@@ -125,8 +125,8 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
                                   scalar_loss(explicit, variables, batch, step)[0])
     direct = TextToImage.from_objective(objective, variables)
     built = TextToImage.from_objective(explicit, variables)
-    np.testing.assert_array_equal(direct(["", ""], seed=2).host().images,
-                                  built(["", ""], seed=2).host().images)
+    np.testing.assert_array_equal(direct(["", ""], key=2).host().images,
+                                  built(["", ""], key=2).host().images)
 
 
 def test_a_masked_preset_is_refused_by_the_gaussian_objective():
@@ -318,13 +318,13 @@ def test_a_sampling_call_does_not_encode_the_tasks_own_unconditional_prompt(monk
     pipe = TextToImage.from_objective(objective, params)
     calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
 
-    prepared = pipe.prepare(["a bird", "a cat"], steps=3, seed=0)
+    prepared = pipe.prepare(["a bird", "a cat"], steps=3, key=0)
     assert len(calls) == 1
     for used, held in zip(jax.tree.leaves(prepared.unconditional),
                           jax.tree.leaves(objective.unconditional_conditions), strict=True):
         np.testing.assert_array_equal(used, held)
 
-    pipe.prepare(["a bird", "a cat"], steps=3, seed=0, unconditional="a blurry photo")
+    pipe.prepare(["a bird", "a cat"], steps=3, key=0, unconditional="a blurry photo")
     assert len(calls) == 2
     assert np.shape(calls[1]["input_ids"]) == (1, TOKENS)
 
