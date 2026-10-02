@@ -739,11 +739,11 @@ class DiffusionRunConfig(RunConfig):
 
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
-        height, width = self.sample_field().shape[-3:-1]
         return load_diffusion_source(
             name, revision=revision, dtype=self.model.dtype,
             param_dtype=self.model.param_dtype or "float32",
-            attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
+            attention_impl=self.model.attention_impl, size=self.sample_field().shape[:-1],
+            variables=variables)
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained

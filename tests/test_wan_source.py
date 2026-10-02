@@ -5,7 +5,9 @@ instances with every parameter moved off its initialization, saves each with
 its real config and safetensors, and calls each as `WanPipeline` calls it,
 recording the output and, against a fixed cotangent, the gradients of the
 latents, the prompt states and every parameter: once in float32 and once in
-float64, the truth both float32 runs are measured from.
+float64, the truth both float32 runs are measured from. It also saves one
+tiny `WanPipeline` over the published configs and walks the unmodified call,
+guided at its default scale.
 
 The native transformer takes channels-last latents and Dew's model time,
 which is the timestep the source's pipeline passes, and returns the flow the
@@ -14,6 +16,11 @@ within twice the reference's own RMS distance from float64. Observed on CPU
 (Dew's RMS error over the reference's): published forward 1.01, gradients
 1.01; variant forward 0.96, gradients 0.99. The truth is float64 throughout:
 Dew run in float64 with a float64 rotary table lands 3e-16 (RMS) from it.
+
+The pipeline walk composes the UMT5 encoder, the transformer, UniPC and the
+VAE as the source composes them; like the other pipeline walks it is held to
+the largest difference over the largest value, 1e-5. Observed: prompt states
+3.2e-7, final latents 2.8e-6, decoded frames 2.7e-6.
 """
 
 import json
@@ -33,6 +40,7 @@ from dew.nn.backbones.wan import WanTransformer
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHED = ROOT / "tests/fixtures/hf/wan-source"
 CASES = ("published", "variant")
+FORWARD = 1e-5
 
 
 @pytest.fixture(scope="module")
@@ -130,3 +138,150 @@ def test_every_tensor_of_the_published_checkpoint_has_a_native_place():
                                      for name in names})
     placed = {tuple(key.key for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
     assert {("params", *path) for path in placed} == leaves
+
+
+@pytest.fixture(scope="module")
+def walk(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("wan-pipeline")
+    with tarfile.open(ROOT / "tests/fixtures/wan_pipeline.tar.xz") as archive:
+        archive.extractall(directory, filter="data")
+    with np.load(directory / "wan_pipeline.npz") as loaded:
+        arrays = dict(loaded)
+    return directory, json.loads((directory / "wan_pipeline.json").read_text()), arrays
+
+
+@pytest.fixture(scope="module")
+def pipeline(walk):
+    from dew.interop.pretrained import Pretrained
+
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla")
+
+
+def relative_gap(actual, expected) -> float:
+    actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
+    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
+
+
+def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk):
+    """The conditioner reads what `encode_prompt` reads: the prompt cleaned
+    (its curly quotes, the entities ftfy leaves beside a `<` for the source's
+    two unescapes, its runs of whitespace), the UMT5 states of its tokens and
+    zeros after them, the whole 512 positions."""
+    _, record, arrays = walk
+    encoder = pipeline.inputs.conditions["conditioning"].encoder
+    prompts = [*record["prompts"], ""]
+    params = pipeline.variables["encoders"]["conditioning"]
+    context = encoder.encode(params, encoder.tokenize(prompts)).context
+    for row in range(len(prompts)):
+        expected = arrays[f"context.{row}"]
+        assert context[row].shape == expected.shape == (512, record["transformer"]["text_dim"])
+        np.testing.assert_array_equal(np.asarray(context[row]) == 0, expected == 0)
+        assert relative_gap(context[row], expected) < FORWARD, row
+
+
+def test_pipeline_walk_matches_the_source(pipeline, walk):
+    """`Pretrained.load().text_to_image()` samples a clip with the source's
+    own policy, 50 steps guided at 5.0 over its UniPC grid, and at the
+    recorded step count ends on the source's latent and decodes its frames."""
+    _, record, arrays = walk
+    task = pipeline.text_to_image()
+    assert task.steps == 50 and task.guidance is not None and task.guidance.scale == record["guidance"]
+    assert pipeline.inputs.sample.shape == (record["frames"], record["height"], record["width"], 3)
+    walked = task(task.prepare(record["prompts"], initial=channels_last(arrays["x_T"]), key=0,
+                               steps=record["steps"]), key=jax.random.PRNGKey(0)).host()
+    frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    for row in range(len(record["prompts"])):
+        expected = channels_last(arrays[f"latents.{row}"][None])[0]
+        assert relative_gap(np.asarray(walked.latents)[row], expected) < FORWARD, row
+        assert relative_gap(frames[row], arrays[f"frames.{row}"]) < FORWARD, row
+
+
+def test_a_clip_the_vae_cannot_decode_whole_is_refused(walk):
+    from dew.interop.pretrained import load_diffusion_source
+
+    with pytest.raises(ValueError, match="1 \\+ 4k frames"):
+        load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", size=(8, 32, 48))
+    shorter = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", size=(5, 16, 32))
+    assert shorter.inputs.sample.shape == (5, 16, 32, 3)
+
+
+def clip_batch(objective, prompts):
+    """One clip per device, a fixed ramp of pixels, and the prompts in turn."""
+    rows, (frames, height, width, channels) = jax.device_count(), objective.inputs.sample.shape
+    pixels = np.arange(frames * height * width * channels, dtype=np.int64) % 251
+    return {"video": np.tile(pixels.astype(np.uint8).reshape(1, frames, height, width, channels),
+                             (rows, 1, 1, 1, 1)),
+            **objective.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
+
+
+def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
+    """A denoising step over the whole source: the VAE encodes the clip, UMT5
+    the prompt, and the transformer takes the gradient. The text encoder and
+    the VAE are state, so every one of their leaves survives the step, and
+    the export reloads, its clip geometry with it, to the same forward."""
+    import optax
+
+    from dew.interop.pretrained import Pretrained
+    from dew.objectives import Step
+    from dew.training import Trainer
+
+    objective = pipeline.diffusion_objective(unconditional_prob=0.0, ema_decay=None, steps=2)
+    batch = clip_batch(objective, walk[1]["prompts"])
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3))
+    initial = trainer.initial_state()
+    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def value(params) -> float:
+        loss, _ = objective.loss(params, batch, fixed)
+        return float(loss.total / loss.mass)
+
+    before = value(initial.params)
+    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted)
+    assert value(state.params) < before
+    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
+                           initial.params["params"]["proj_out"]["kernel"])
+    for held in ("encoders", "autoencoder"):
+        for got, want in zip(jax.tree.leaves(state.params[held]), jax.tree.leaves(initial.params[held]),
+                             strict=True):
+            np.testing.assert_array_equal(got, want)
+
+    pipeline.save(tmp_path / "export", variables=state.params)
+    reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
+    assert reloaded.inputs.sample.shape == pipeline.inputs.sample.shape
+    assert value(reloaded.variables) == value(state.params)
+
+
+def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk):
+    """`lora` binds the transformer's self- and cross-attention projections,
+    never UMT5's; with B at zero it samples exactly what the source does, and
+    a step moves every B while the base, the text encoder and the VAE stay
+    bitwise where they were."""
+    import optax
+
+    from dew.objectives.base import FROZEN
+    from dew.training import Trainer
+
+    prompts = walk[1]["prompts"]
+    tuned = pipeline.lora(rank=2, modules=("attn1.to_q", "attn1.to_v", "attn2.to_k", "attn2.to_out.0"),
+                          key=jax.random.key(0))
+    assert {path[1] for path in tuned.adapter.targets} == {f"blocks_{index}" for index in range(2)}
+    assert all(path[0] == "params" for path in tuned.adapter.targets)
+
+    def sampled(task):
+        return np.asarray(task(prompts, steps=2, key=1).host().images)
+
+    np.testing.assert_array_equal(sampled(tuned.text_to_image()), sampled(pipeline.text_to_image()))
+    objective = tuned.diffusion_objective(ema_decay=None, unconditional_prob=0.0)
+    batch = clip_batch(objective, prompts)
+    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))
+    initial = trainer.initial_state()
+    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted)
+    factors = jax.tree_util.tree_leaves_with_path(state.params["params"])
+    assert factors and all(path[-1].key in ("lora_A", "lora_B") for path, _ in factors)
+    assert all(bool(jnp.any(leaf)) for path, leaf in factors if path[-1].key == "lora_B")
+    for collection in (FROZEN, "encoders", "autoencoder"):
+        for before, after in zip(jax.tree.leaves(initial.params[collection]),
+                                 jax.tree.leaves(state.params[collection]), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
