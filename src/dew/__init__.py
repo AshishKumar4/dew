@@ -12,8 +12,10 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from dew.logging import configure as _configure_logging
+from dew.telemetry.devices import keep_roundings as _keep_roundings
 
 _configure_logging()
+_keep_roundings()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
