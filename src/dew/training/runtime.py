@@ -86,7 +86,7 @@ def prepare_process(wandb: Wandb | None = None,
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
     _join_process_pool(multi_host)
-    if layout is not None and "params" in layout.host:
+    if layout is not None and "variables" in layout.host:
         from dew.training.distributed import MeshSpec
         from dew.training.host import companion_mesh
         companion_mesh(MeshSpec().build())
