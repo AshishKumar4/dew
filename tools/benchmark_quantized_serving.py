@@ -76,6 +76,8 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
+    revision: str | None = None
+    """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
     decode_batch: int = 4
@@ -157,8 +159,10 @@ def quality(pipe: TextToImage, decode_batch: int) -> dict:
 
 
 def main(config: Config) -> None:
-    load = TextToImage.from_run if Path(config.model).is_dir() else TextToImage.from_pretrained
-    pipe = load(config.model, dtype=config.dtype)
+    if Path(config.model).is_dir():
+        pipe = TextToImage.from_run(config.model, dtype=config.dtype)
+    else:
+        pipe = TextToImage.from_pretrained(config.model, revision=config.revision, dtype=config.dtype)
     row = {"device": jax.devices()[0].device_kind, "dtype": config.dtype, "precision": config.precision,
            "float": list(config.float)}
     try:
