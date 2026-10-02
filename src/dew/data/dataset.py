@@ -594,6 +594,10 @@ class Dataset:
                 f"{len(held)} validation records, fewer than one batch of {batch}: a "
                 f"pass is whole batches, so it would score nothing")
         source = in_memory(records)
+        if len(source) < batch:
+            raise ValueError(
+                f"{len(source)} training records, fewer than one batch of {batch}: a "
+                f"batch would hold a record twice and an epoch would take no steps")
         return cls(
             train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
             val=None if held is None else validation_pass(held, [], batch=batch, seed=seed,

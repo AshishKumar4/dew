@@ -1568,6 +1568,13 @@ def test_held_out_records_too_few_for_one_batch_are_refused():
         Dataset.from_records(_columns(), batch=4, validation=_columns(3))
 
 
+def test_training_records_too_few_for_one_batch_are_refused():
+    """An endless stream would fill a batch by repeating records inside it,
+    and an epoch would be zero steps long."""
+    with pytest.raises(ValueError, match="3 training records, fewer than one batch of 4"):
+        Dataset.from_records(_columns(3), batch=4)
+
+
 def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
     """The in-memory route exists so a first run can checkpoint. A resumed run
     reads the records after the checkpoint and ends where an uninterrupted
