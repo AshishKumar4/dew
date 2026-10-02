@@ -1292,7 +1292,8 @@ def test_the_real_llama_4_scout_text_config_translates():
     assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (40, 8, 128)
     assert config["mixture"] == {
         "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
-        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
+        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192,
+        "layers": tuple(range(48))}
     assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
     local = config["kinds"]["chunked_attention"]
     assert local["chunk"] == 8192 and local["mixer"]["floor_scale"] == 8192.0
@@ -1405,7 +1406,7 @@ def test_the_real_gemma_4_26b_a4b_text_config_translates():
     assert config["rope_theta"] == 1000000.0
     assert config["final_logit_softcap"] == 30.0
     assert config["v_norm"] and not config["use_double_wide_mlp"]
-    assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
+    assert config["per_layer_input_dim"] is None and config["kv_shared_layers"] is None
 
 
 def test_the_released_diffusiongemma_26b_text_config_derives_what_it_does_not_name():
@@ -1504,7 +1505,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     assert config["num_kv_heads"] == 1
     assert config["kinds"]["full_attention"] == {"head_dim": 512}
     assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
-    assert config["num_kv_shared_layers"] == 20
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 20, config["num_layers"]))
     assert config["per_layer_input_dim"] == 256
     assert config["use_double_wide_mlp"]
     assert config["attention_scale"] == 1.0
@@ -1518,7 +1519,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     shared = [index for index in range(config["num_layers"])
               if set(params[f"layers_{index}"]["self_attn"]) == {"q_proj", "o_proj", "q_norm"}]
     assert shared == sorted(model.kv_sharing)
-    assert len(shared) == config["num_kv_shared_layers"]
+    assert tuple(shared) == config["kv_shared_layers"]
 
 
 @pytest.mark.network
