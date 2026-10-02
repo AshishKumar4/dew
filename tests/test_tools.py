@@ -298,6 +298,30 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
 
+def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch, tmp_path):
+    import argparse
+
+    import dew
+    from dew.sampling import Sampling
+    from test_serving import task
+
+    tool = load("benchmark_lm_serving")
+    bound = task(Sampling(temperature=0, eos_id=None))
+    prompts = np.asarray([[1, 2], [3, 4]], np.int32)
+    monkeypatch.setattr(dew, "pipeline", lambda *args, **kwargs: bound)
+    monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
+    args = argparse.Namespace(model="tiny", vocab_limit=13, prompt=2, output=4, slots=[2],
+                              requests=2, repeats=1, admission=2, decode_steps=1, kv="dense",
+                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json")
+    _, points = tool.dew_points(args)
+    assert points[0]["repeats"][0]["output_tokens"] == 8
+    saved = np.load(tmp_path / "serve-slots2.npz")
+    expected = [bound(prompt[None], 4, key=index).host() for index, prompt in enumerate(prompts)]
+    np.testing.assert_array_equal(saved["tokens"], np.concatenate([row.tokens[:, -4:] for row in expected]))
+    np.testing.assert_allclose(saved["raw"], np.concatenate([row.raw_log_probs for row in expected]),
+                               atol=2e-6, rtol=2e-6)
+
+
 def test_lm_head_variant_names_parse_as_documented():
     """A name is the head, an optional chunk count and optional suffixes:
     the rows docs/research/lm-head.md ran, plus both suffixes at once."""
