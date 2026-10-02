@@ -37,7 +37,7 @@ from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ArrayRecordImages, DataPartition, Loading, OxfordFlowers
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
-from dew.eval import clip_score, fid
+from dew.eval import FID, CLIPScore
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
@@ -69,7 +69,7 @@ class Config:
     guidance: float = 3.0
     clip_model: str = "openai/clip-vit-large-patch14"
     """The checkpoint CLIPScore is read from, for conditioning and for scoring."""
-    inception_weights: Path | None = None
+    inception_weights: str | None = None
     """The FID extractor's parameters as a file; unset downloads the published
     checkpoint. --smoke reads the committed tiny one instead."""
     model: dict = field(default_factory=lambda: {
@@ -173,7 +173,7 @@ def grid(images: np.ndarray, path: Path) -> None:
 
 def main(config: Config) -> Path:
     if config.smoke:
-        config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=SMOKE_INCEPTION)
+        config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=str(SMOKE_INCEPTION))
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
@@ -196,8 +196,8 @@ def main(config: Config) -> Path:
     grid(drawn, config.out / "samples.png")
 
     generated = uint8_pixels(drawn)
-    report = {"clip_score": clip_score(generated, list(PROMPTS), modelname=config.clip_model),
-              "fid": fid(generated, held_out(run), weights=config.inception_weights)}
+    report = {"clip_score": CLIPScore(config.clip_model).score(generated, list(PROMPTS)),
+              "fid": FID(weights=config.inception_weights).score(generated, held_out(run))}
     (config.out / "eval.json").write_text(json.dumps(report, indent=2))
     print(f"samples {config.out / 'samples.png'}  {report}")
     return run_dir
