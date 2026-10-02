@@ -1,7 +1,7 @@
 """Reads token datasets off a tokenized corpus directory.
 
 The corpus is the `train.bin`, `val.bin` and `meta.json` that
-`tools/tokenize_text.py` writes, or the same splits as ArrayRecord shards or
+`dew tokenize` writes, or the same splits as ArrayRecord shards or
 parquet (`dew.data.sources.text`).
 
 `TokenWindows` reads fixed `seq_len + 1` windows off the token stream.
@@ -390,7 +390,7 @@ class PackedTokens(DatasetSpec):
         weighted = name_ordered(self.path)
         if not weighted and not self.phases:
             raise ValueError("PackedTokens needs path= set to the directory "
-                             "tools/tokenize_text.py wrote, or several with weights")
+                             "`dew tokenize` wrote, or several with weights")
         same_tokenizer(self.corpora)
         window = self.seq_len + 1
 

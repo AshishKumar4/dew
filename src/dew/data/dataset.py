@@ -1083,6 +1083,31 @@ def rows_of(batch: Mapping[str, object]) -> int:
     raise ValueError("a batch of scalars holds no records")
 
 
+_UNSTACKED = "Expected all input elements to have the same structure"
+"""How grain's batching starts the error it raises when records' fields do
+not stack. A grain that words it otherwise raises its own error unchanged."""
+
+
+def stacked(reads: Iterator[Batch]) -> Batch:
+    """The next batch of `reads`, with grain's failure to stack its records
+    said in terms of what to change.
+
+    The usual cause is a field of varying length, as token ids are before
+    anything cuts or packs them, and grain's message names the batch's
+    structure rather than the field or the remedy.
+    """
+    try:
+        return next(reads)
+    except ValueError as failed:
+        if not str(failed).startswith(_UNSTACKED):
+            raise
+        raise ValueError(
+            "the records of one batch hold a field in different shapes, and a batch "
+            "stacks each field into one array: cut or pad a variable-length field, such "
+            "as token ids, to one length, or pack documents into fixed windows (Training "
+            "data, Packing). Grain's report of the shapes is the cause below") from failed
+
+
 class GlobalStream:
     """Reads a training stream whose saved position is one global record count.
 
@@ -1121,7 +1146,7 @@ class GlobalStream:
     def __next__(self) -> Batch:
         if self._reads is None:
             self._reads = self._open(self._records)
-        batch = next(self._reads)
+        batch = stacked(self._reads)
         # Counted after the batch: a step the stream did not deliver is not
         # a step a resume may skip.
         self._records += self._batch
