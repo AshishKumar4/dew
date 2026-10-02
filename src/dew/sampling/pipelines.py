@@ -216,7 +216,7 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
-        from dew.objectives.diffusion.objective import _without_loss_heads
+        from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, record as fields, text
         from dew.registry import objectives, solvers
 
@@ -238,7 +238,9 @@ class TextToImage:
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
                    inputs, _without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, solver=solver)
+                   guidance=guidance, solver=solver,
+                   blank=FixedBlank(inputs, params.get("encoders", {}),
+                                    jax.config.jax_default_matmul_precision))
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
