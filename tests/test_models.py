@@ -74,7 +74,7 @@ def _unet_condition():
 
 def _vae_encoder():
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
-                        double_z=True, dtype=jnp.bfloat16)
+                        dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
 
 
@@ -94,7 +94,7 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     reference's rounding (the shared reference_error rule).
     """
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
-                        norm_num_groups=8, double_z=True)
+                        norm_num_groups=8)
     host, device = jax.devices("cpu")[0], jax.devices()[0]
     rng = np.random.default_rng(43)
     image = rng.standard_normal((batch, 17, 17, 3)).astype(np.float32)
@@ -602,8 +602,7 @@ def test_a_stage_record_builds_the_value():
 
 def test_a_stage_names_the_dials_the_block_supports(rng):
     """Every `TransformerBlock` dial a stage names reaches the block the unet
-    builds from it: `use_linear_attention` and `norm_epsilon` each change the
-    output when set."""
+    builds from it: `norm_epsilon` changes the output when set."""
     x = jax.random.normal(rng, (2, 16, 16, 3))
     temb = jnp.ones((2,))
     context = text(features=64)
@@ -615,8 +614,6 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
         return model.apply(model.init(rng, x, temb, context), x, temb, context)
 
     projected = output(use_projection=True)
-    assert not jnp.allclose(projected, output(use_projection=True,
-                                              use_linear_attention=False), atol=1e-5)
     assert not jnp.allclose(projected, output(use_projection=True, norm_epsilon=1.0), atol=1e-5)
 
 
@@ -662,20 +659,12 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
 def test_a_block_pattern_that_misses_a_layer_is_refused():
     """`block_pattern` names every layer's mixer, so one shorter than
     `num_layers` is refused rather than deciding the depth. The hybrid DiT
-    built one block per named layer and the factorized stack paired its two
-    halves, so a short pattern silently returned a shallower model than the
-    config asked for, with the temporal blocks past the pattern built and
-    never run."""
-    from dew.nn.backbones.jepa import FactorizedTokenStack
-
+    built one block per named layer, so a short pattern silently returned a
+    shallower model than the config asked for."""
     hybrid = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=4,
                                    num_heads=2, block_pattern=("ssm", "attn"))
     with pytest.raises(ValueError, match="2 entries for 4 layers"):
         hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    factorized = FactorizedTokenStack(features=16, num_layers=4, num_heads=2,
-                                      block_pattern=("attn", "attn"))
-    with pytest.raises(ValueError, match="2 entries for 4 layers"):
-        factorized.init(jax.random.PRNGKey(0), jnp.zeros((1, 2, 4, 16)))
 
 
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])

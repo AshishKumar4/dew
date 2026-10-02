@@ -105,8 +105,7 @@
  },
  "dew.nn.vision.Gemma4Projector": {
   "norm_eps": 0.000001,
-  "text_width": "required",
-  "vision_width": "required"
+  "text_width": "required"
  },
  "dew.nn.vision.Gemma4Vision": {
   "head_dim": null,
@@ -128,12 +127,10 @@
   "norm_eps": 0.000001,
   "patches_per_side": "required",
   "text_width": "required",
-  "tokens_per_side": "required",
-  "vision_width": "required"
+  "tokens_per_side": "required"
  },
  "dew.nn.vision.Llama4Projector": {
-  "text_width": "required",
-  "vision_width": "required"
+  "text_width": "required"
  },
  "dew.nn.vision.Llama4Vision": {
   "hidden_size": 1408,
@@ -162,7 +159,6 @@
   "intermediate_size": 4304,
   "num_heads": 16,
   "num_position_embeddings": 2304,
-  "out_hidden_size": 3584,
   "patch_size": 16,
   "spatial_merge_size": 2,
   "temporal_patch_size": 2
@@ -822,7 +818,6 @@
   "norm_inputs": true,
   "only_pure_attention": true,
   "precision": null,
-  "use_linear_attention": true,
   "use_projection": false,
   "use_self_and_cross": true
  },
@@ -1352,25 +1347,17 @@
   "text_pooling": "real"
  },
  "dew.nn.backbones.uvit.UViT": {
-  "activation": {
-   "value": "jax._src.nn.functions.silu"
-  },
-  "add_residualblock_output": false,
   "attention_impl": "auto",
   "dtype": null,
   "emb_features": 768,
-  "explicitly_add_residual": true,
   "force_fp32_for_softmax": true,
   "norm_epsilon": 1e-05,
-  "norm_inputs": false,
   "num_heads": 12,
   "num_layers": 12,
   "output_channels": 3,
   "patch_size": 16,
   "precision": null,
-  "scan_order": "raster",
-  "use_projection": false,
-  "use_self_and_cross": false
+  "scan_order": "raster"
  },
  "dew.nn.backbones.video_dit.VideoDiT": {
   "attention_impl": "auto",

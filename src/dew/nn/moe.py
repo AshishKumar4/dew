@@ -146,25 +146,13 @@ def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
 
 def sequence_router_losses(scores: jax.Array, indices: jax.Array,
                            alpha: float) -> jax.Array:
-    """Compute one DeepSeek V2 load-times-score loss per intact sequence."""
+    """Compute one DeepSeek V2 load-times-score loss per intact sequence
+    (arXiv 2405.04434, section 2.1.4)."""
     _, length, experts = scores.shape
     scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
     chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
     load = jnp.sum(chosen, axis=(1, 2)) / (length * indices.shape[-1] / experts)
     return jnp.sum(load * jnp.mean(scores, axis=1), axis=1) * alpha
-
-
-def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
-    """Score DeepSeek V2's expert balance (arXiv 2405.04434, section 2.1.4).
-
-    Scores are [batch, sequence, experts], choices [batch, sequence, top_k].
-    `seq_aux` forms the product within each sequence before averaging rows.
-    The global variant pools all routed positions before forming the
-    product.
-    """
-    if seq_aux:
-        return jnp.mean(sequence_router_losses(scores, indices, alpha))
-    return global_router_loss(router_moments(scores, indices), alpha)
 
 
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
@@ -349,10 +337,6 @@ class Router(nn.Module):
         `[..., num_experts]`."""
         return jnp.einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                           precision=self.precision)
-
-    def scores(self, x):
-        """Each token's fp32 affinity for every expert: `[..., num_experts]`."""
-        return self._activated(self.logits(x))
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -659,15 +643,13 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
 
 
 class ExpertLinear(nn.Module):
-    """One matrix per expert, `[exp, in_features, features]`, over tokens
-    already sorted by expert, through `expert_projection` on `implementation`."""
+    """One matrix per expert, `[exp, in_features, features]`; `ExpertMLP`
+    reads the kernel and projects tokens sorted by expert through
+    `expert_projection`."""
     num_experts: int
     in_features: int
     features: int
-    implementation: str = 'auto'
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
 
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
@@ -678,10 +660,6 @@ class ExpertLinear(nn.Module):
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
                 batch_axis=(0,)))['kernel_init'],
             (self.num_experts, self.in_features, self.features), jnp.float32)
-
-    def __call__(self, tokens, group_sizes):
-        return jnp.asarray(expert_projection(
-            tokens, self.kernel, group_sizes, self.dtype, self.implementation, self.precision))
 
 
 def capacity_positions(indices: jax.Array, num_experts: int,
@@ -1112,10 +1090,7 @@ class ExpertMLP(nn.Module):
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
                 f"positive, got {self.swiglu_limit}; None leaves them unclamped")
-        expert = functools.partial(
-            ExpertLinear, num_experts=self.num_experts,
-            implementation=self.implementation, dtype=self.dtype,
-            precision=self.precision)
+        expert = functools.partial(ExpertLinear, num_experts=self.num_experts)
         self.gate_proj = expert(in_features=self.out_features,
                                 features=self.hidden_features, init_std=self.init_std,
                                 name='gate_proj')

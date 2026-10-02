@@ -317,11 +317,6 @@ class MobileAttention(nn.Module):
         return x + shortcut
 
 
-# An attention block's pre-norm is the one parameter in the tower whose module
-# path carries no role name, only the numbered block this stage mints. It is a
-# rank-one scale over the block width, which the shape heuristic places the way
-# it places the decoder's own `norm`, so it is left to it here on purpose.
-@logical_axes({}, heuristic=(("blocks_*", "norm"),))
 class MobileStage(nn.Module):
     index: int
     multiplier: float

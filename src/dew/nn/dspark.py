@@ -69,14 +69,13 @@ class DSpark:
 @logical_axes({
     ("main_proj",): (None, "embed"),
     ("confidence",): (None, None),
-}, heuristic=(("markov_embed",), ("markov_head",)))
+})
 class DSparkStage(nn.Module):
     """One drafter stage: its decoder block, the context projection on the
     first, and the norm, Markov head and confidence head on the last."""
 
     block: Callable[..., nn.Module]
     emb_features: int
-    targets: int
     vocab_size: int
     markov_rank: int
     first: bool

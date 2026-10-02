@@ -184,9 +184,9 @@ def test_the_selection_bias_never_reaches_the_gate_values():
     hidden = jnp.asarray(tensors["hidden"])
     router = deepseek_router()
     variables = router_variables(tensors, bias=True)
-    weights, indices = router.apply(variables, hidden)
+    (weights, indices), sown = router.apply(variables, hidden, mutable=["router"])
 
-    scores = router.apply(variables, hidden, method=Router.scores)
+    scores = sown["router"]["scores"][0]
     biased = scores + jnp.asarray(tensors["mlp.gate.e_score_correction_bias"])
     scale = config["routed_scaling_factor"]
 
