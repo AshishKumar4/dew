@@ -220,18 +220,13 @@ class ConditioningEmbed(nn.Module):
     tokens, summed into the single conditioning vector the adaLN modulation
     consumes.
 
-    The projection is affine and the pooling a weighted mean, so the mean of
-    the projected tokens is the projection of the mean, computed for a row
-    rather than for each of its tokens. A row with no real tokens gets no
-    text, its bias included, as it would from a mean over no tokens.
-
-    `text_pooling` "all" averages every position the text tower returns, the
-    padding rows included, the pooling FlaxDiff 0.2's DiTs trained with, so
-    their checkpoints load. `interval` adds a second time embedding, of an
-    interval's `duration`. `time_scale` is the Fourier frequencies' scale:
-    the default 16 makes the embedding of a flow's model time (sigma times
-    1000) vary fast in time, which only its values need, while a loss that
-    differentiates in time (MeanFlow's, sCM's) needs it smooth.
+    The projection is affine and the pooling a weighted mean, so the row's mean
+    is projected once; a row with no real tokens gets no text, bias included.
+    `text_pooling` "all" averages every position, padding included, as FlaxDiff
+    0.2's DiTs trained. `interval` adds a second time embedding of the
+    interval's `duration`. `time_scale` is the Fourier frequencies' scale: the
+    default 16 varies fast in a flow's model time (sigma times 1000), while a
+    loss that differentiates in time (MeanFlow's, sCM's) needs it smooth.
     """
     emb_features: int
     mlp_ratio: int = 4
@@ -336,16 +331,11 @@ _DOTS_AND_ATTENTION_OUTPUT = jax.checkpoint_policies.save_from_both_policies(
 
 
 def saved_through_remat(prim, *args, **params) -> bool:
-    """The values a rematerialized block keeps instead of recomputing.
-
-    Three kinds. Unbatched matmul outputs, which keeps the recompute cheap
-    while leaving the reference path's [B, H, Q, K] scores, a batched dot, out
-    of the residuals. Whatever `scaled_dot_product_attention` returns, which
-    it labels 'attention_output'. And the whole fused attention forward: a
-    name can only mark that primitive's output, and its backward pass also
-    needs the softmax statistics, so a policy that saves the output alone
-    still replays the entire flash forward. Saving the primitive keeps both,
-    which is what takes a step's fused forward calls from two per layer back
+    """The values a rematerialized block keeps instead of recomputing:
+    unbatched matmul outputs (leaving the reference path's [B, H, Q, K] scores
+    out), the 'attention_output' `scaled_dot_product_attention` labels, and the
+    fused attention primitive itself, whose backward also needs the softmax
+    statistics, so saving it takes a step from two fused forward calls per layer
     to one.
     """
     return (str(prim) in FUSED_ATTENTION_FORWARD
@@ -359,17 +349,12 @@ forward, 'full' recomputes the whole block from its inputs."""
 
 
 def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
-    """Optionally rematerialize a block class.
+    """Optionally rematerialize a block class under `saved_through_remat`.
 
-    Recomputing a block during the backward pass trades extra compute for a
-    large drop in activation memory, which caps trainable model size. The
-    default policy is `saved_through_remat`, which keeps the block's cheap
-    matmul outputs and its attention forward. Blocks carrying complex
-    intermediates (the S5 mixer) must pass policy=None: saving a residual
-    goes through jax.lax.reduce_precision, which only accepts floating dtypes.
-
-    `train` selects a Python branch, so it has to stay static; that also means
-    callers must pass it positionally for jax to see it as such.
+    Blocks with complex intermediates (the S5 mixer) pass policy=None, since a
+    saved residual goes through jax.lax.reduce_precision, which accepts only
+    floating dtypes. `train` selects a Python branch, so callers pass it
+    positionally for jax to treat it as static.
     """
     if not enabled:
         return block_cls
@@ -387,14 +372,10 @@ def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
-    mixer='attention' gives the standard DiT block, rotated by the `freqs_cis`
-    a call passes (None leaves the tokens unrotated); mixer='ssm' replaces
-    attention with a bidirectional S5 scan, optionally followed by
-    Spatial-Mamba style 2D state fusion, and ignores freqs_cis.
-
-    modulated=False drops the adaLN-Zero conditioning path entirely, leaving a
-    plain pre-norm residual block with learned affine norms, the ViT block a
-    JEPA encoder needs, where there is no timestep to condition on.
+    mixer='attention' is the standard DiT block, rotated by `freqs_cis` (None
+    leaves it unrotated); mixer='ssm' is a bidirectional S5 scan, optionally
+    with Spatial-Mamba 2D state fusion, and ignores freqs_cis. modulated=False
+    is the plain pre-norm block with affine norms a JEPA encoder needs.
     `adaln_silu` is `AdaLNParams.silu`.
     """
     features: int

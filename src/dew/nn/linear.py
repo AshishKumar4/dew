@@ -1,21 +1,14 @@
 """Gated DeltaNet: the linear-attention mixer of the Qwen3.5 family.
 
 The delta rule keeps an outer-product memory `S = sum_t k_t v_t^T` and
-corrects it toward the value each new key predicts, where attention only
-accumulates its keys. Two gates make it trainable at scale: a decay `g`
-that shrinks the memory before each write (Mamba's selectivity, spelled as
-a log-space cumulative product in the chunked form) and a beta that scales
-how far one write moves the memory toward its own value.
+corrects it toward the value each new key predicts. A decay `g` shrinks the
+memory before each write and a beta scales how far one write moves it.
 
-dew computes the same chunked formulation transformers 5.16.1 computes
-(`modeling_qwen3_next.py:374-453`, identical in qwen3_5 and qwen4_exp):
-per chunk of 64 tokens the intra-chunk attention `(I+A)^-1 @ v_beta`
-resolves the sequential dependencies of the delta rule inside the chunk in
-matrix form, and the memory crosses chunk boundaries through
-`k_cumdecay @ S`. A sequence never materialises anything quadratic in the
-sequence length; the largest new tensor is `[C, C]` per head per chunk.
-
-The recurrent form (one token at a time) is what a decode step runs
+The chunked form is transformers 5.16.1's (`modeling_qwen3_next.py:374-453`,
+identical in qwen3_5 and qwen4_exp): per chunk of 64 tokens `(I+A)^-1 @
+v_beta` resolves the delta rule's dependencies in matrix form and the memory
+crosses chunks through `k_cumdecay @ S`, so the largest new tensor is
+`[C, C]` per head per chunk. Decoding runs the recurrent form
 (`modeling_qwen3_next.py:456-506`):
 
     S <- S * exp(g_t)
@@ -23,24 +16,12 @@ The recurrent form (one token at a time) is what a decode step runs
     S <- S + k_t delta^T
     o_t <- S q_t
 
-Both forms live here because a model decodes with the second and trains
-with the first; tests/test_linear_attention.py holds them to the same
-numbers.
-
-The short mixer is the depthwise causal conv1d the reference applies to the
-projected qkv before the rule (`modeling_qwen3_next.py:325-365`): kernel 4,
-zero padding to the left so a token sees itself and its three predecessors,
-silu after. Decode keeps the last `kernel - 1` columns as a state, exactly
-as the reference's `update_conv_state` does.
-
-Parameter names are the checkpoint's: in_proj_qkv, in_proj_z, in_proj_b,
-in_proj_a, conv1d, A_log, dt_bias, norm, out_proj. A_log and dt_bias are
-separate leaves because the reference materialises them as parameters, and
-`g = -exp(A_log) * softplus(a + dt_bias)` reads them per value head.
-Qwen3-Next fuses the four input projections into two, `in_proj_qkvz` and
-`in_proj_ba`, whose rows are grouped by key head
-(`modeling_qwen3_next.py:540-586`); `fused_in_proj` keeps those two leaves
-and splits them the way the reference does.
+tests/test_linear_attention.py holds the two forms to the same numbers. The
+short mixer is the reference's depthwise causal conv1d on the projected qkv
+(`modeling_qwen3_next.py:325-365`): kernel 4, left zero padding, silu after,
+the last `kernel - 1` columns kept as decode state (`update_conv_state`).
+`g = -exp(A_log) * softplus(a + dt_bias)` reads `A_log` and `dt_bias` per
+value head.
 """
 
 import functools
@@ -78,19 +59,13 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     """Depthwise causal conv over [B, D, S] with the [D, K] taps.
 
     The reference pads `K - 1` zeros to the left
-    (`F.conv1d(padding=kernel_size - 1)`, modeling_qwen3_next.py:345-365)
-    so position s convolves s-K+1..s, then applies silu. `kernel` is
-    `conv1d.weight[:, 0, :]`, the checkpoint's [D, K] depthwise taps, and
-    `bias` the `[D]` per-channel bias a conv with one adds before the
-    activation (Mamba-2's `use_conv_bias`).
-
-    The taps apply as K shifted products summed in fp32, not as a grouped
-    `conv_general_dilated`: XLA's SPMD partitioner sums that conv's filter
-    gradient over every device of the mesh, the ones that hold the same rows
-    included, so a batch split over part of the mesh (fsdp beside a tensor
-    axis the conv's input does not use) doubled the taps' gradient (jax
-    0.11.2, https://github.com/openxla/xla/issues/49382). The products are
-    what a depthwise conv computes anyway.
+    (`F.conv1d(padding=kernel_size - 1)`, modeling_qwen3_next.py:345-365) and
+    applies silu; `bias` is the `[D]` per-channel bias (Mamba-2's
+    `use_conv_bias`). The taps apply as K shifted products summed in fp32, not
+    a grouped `conv_general_dilated`, whose filter gradient XLA's SPMD
+    partitioner sums over every device, replicas included, doubling it under
+    fsdp beside an unused tensor axis (jax 0.11.2,
+    https://github.com/openxla/xla/issues/49382).
     """
     _, K = kernel.shape
     length = x.shape[-1]
@@ -159,25 +134,15 @@ def _stream_order(valid):
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     """Convolve real tokens without advancing a paused row's history.
 
-    A row's real tokens keep their order and their history: the j-th of them
-    reads the K-1 real tokens before it, whatever padding sits between them,
-    and an invalid slot neither reads a window nor advances the history. That
-    is a statement about the row's stream of real tokens, so the stream is
-    what the convolution reads. `cumsum(valid) - 1` is each real token's index
-    in it; gathering by that index hands `causal_conv1d` the same ordered
-    stream a token-by-token scan fed it, behind the row's existing history,
-    in one convolution instead of S sequential windows.
-
-    `segments` `[B, S]` makes each packed document convolve alone: a tap
-    reads a real token only if it shares the output token's segment
-    (`document_conv1d` over the compact stream). The held `state` counts as
-    the first real token's document, which a decode call continues.
-
-    Masking the input of an ordinary convolution over the physical slots
-    instead is a different function: a token after an interior gap would read
-    the zeros in the gap rather than the real tokens before it. On nine slots
-    with holes at 2, 5 and 6 that moves the outputs by 5.0 in fp32, which
-    test_the_masked_conv_reads_across_a_gap measures.
+    The j-th real token of a row reads the K-1 real tokens before it, whatever
+    padding sits between, and an invalid slot neither reads nor advances the
+    history. `cumsum(valid) - 1` indexes each real token in the row's stream,
+    so one convolution over the gathered stream replaces S sequential windows.
+    `segments` `[B, S]` makes each packed document convolve alone
+    (`document_conv1d`); the held `state` belongs to the first real token's
+    document. Masking an ordinary convolution's input instead reads the zeros in
+    a gap (5.0 off in fp32 on nine slots with holes at 2, 5 and 6,
+    test_the_masked_conv_reads_across_a_gap).
     """
     batch, channels, _ = x.shape
     width = kernel.shape[1] - 1
@@ -229,17 +194,13 @@ def chunk_decay(g):
 def strictly_lower_inverse(a):
     """Return (I - A)^-1 = I + A + A^2 + ... for strictly lower triangular `a` `[..., C, C]`.
 
-    The chunked delta rules' reference loop `attn[i, :i] += sum_k attn[i, k]
-    attn[k, :i]`, iterated to the last row, computes exactly this for the
-    nilpotent A (verified against the loop at C=4 and C=64: they agree to
-    4e-15). The series is summed by doubling, S <- S + A^(2^k) S and
-    A <- A^2, which is log2(C) matmuls instead of C row updates.
-
-    The first doubling is written out, S = I + A, rather than as `A @ I`:
-    that product is A exactly, and XLA TPU rewrites a matmul against the
-    broadcast identity into a dilated convolution whose fusion with the add
+    The chunked delta rules' loop `attn[i, :i] += sum_k attn[i, k] attn[k, :i]`
+    computes exactly this for the nilpotent A (agreeing to 4e-15 at C=4 and 64).
+    Doubling, S <- S + A^(2^k) S and A <- A^2, takes log2(C) matmuls. The first
+    step is written S = I + A rather than `A @ I`: XLA TPU rewrites a matmul by
+    the broadcast identity into a dilated convolution whose fusion with the add
     fails register allocation on a v6e (`live_range_finder.cc:57 RET_CHECK`,
-    jax 0.11.2), at both matmul precisions.
+    jax 0.11.2).
     """
     chunk_size = a.shape[-1]
     inv = a + jnp.eye(chunk_size, dtype=a.dtype)
@@ -252,16 +213,11 @@ def strictly_lower_inverse(a):
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
                            chunk_size: int = CHUNK_SIZE):
-    """The chunked form of the gated delta rule, the reference's math.
-
-    Operands are [B, S, H, D] (the mixer's head layout); the computation
-    matches `torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453)
-    line for line, in fp32, and returns
-    `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in the input dtype.
-
-    The reference's sequential correction (`for i in range(1, chunk_size)`)
-    is the forward substitution that inverts `I - A` for a strictly lower
-    triangular A, which `strictly_lower_inverse` sums as a series.
+    """The chunked form of the gated delta rule, `torch_chunk_gated_delta_rule`
+    (modeling_qwen3_next.py:374-453) line for line in fp32, over [B, S, H, D]
+    operands; returns `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in
+    the input dtype. The reference's sequential correction is the forward
+    substitution `strictly_lower_inverse` sums as a series.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
@@ -382,34 +338,19 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
 
-    Projects the hidden state into q, k, v, z, b and a; runs the depthwise
-    causal conv over qkv; applies the gated delta rule chunked in training
-    and recurrently when decoding; and gates the output with the
-    RMSNormGated the reference applies: norm first, then silu(z) (or
-    sigmoid(z), which qwen4_exp's output_gate_type names).
+    Projects into q, k, v, z, b and a, runs the causal conv over qkv, applies
+    the gated delta rule (chunked in training, recurrent when decoding) and
+    gates the output with the reference's RMSNormGated: norm, then silu(z), or
+    sigmoid(z) where qwen4_exp's output_gate_type says. `num_v_heads //
+    num_k_heads` value heads share a key head (`repeat_interleave`).
 
-    `num_v_heads // num_k_heads` value heads share one key head, which is
-    what the reference's `repeat_interleave` says; q and k are broadcast to
-    the value head count before the rule, so a key's memory serves every
-    value head it covers.
-
-    The decode state is two leaves in the flax `cache` collection:
-    `recurrent_state` [B, H, Dk, Dv] and `conv_state` [B, D, K-1], both
-    allocated at the batch the first decode-mode call sees, the way
-    open_kv_cache allocates its slots. Prefill and decode share one code
-    path, and the conv state crosses the boundary between them because a
-    continuation must see the last K-1 real columns, not the zeros a fresh
-    sequence pads with.
-
-    Parameter names are the checkpoint's, so a translation only moves
-    weights: `conv1d/weight` is the depthwise taps `[D, 1, K]`, and
-    `A_log`/`dt_bias` are the `[Hv]` leaves the reference materialises as
-    parameters. With `fused_in_proj` the input projections are the two
-    leaves Qwen3-Next stores, `in_proj_qkvz` and `in_proj_ba`
-    (`Qwen3NextGatedDeltaNet.__init__`, modeling_qwen3_next.py:540-543);
-    `fix_query_key_value_ordering` (modeling_qwen3_next.py:558-586) splits
-    each row group of one key head into its q, k and the value heads' v and
-    z (b and a), which `_project` mirrors.
+    The decode state is `recurrent_state` [B, H, Dk, Dv] and `conv_state`
+    [B, D, K-1] in the `cache` collection; the conv state crosses from prefill
+    to decode so a continuation sees the last K-1 real columns. Parameter names
+    are the checkpoint's (`conv1d/weight` the `[D, 1, K]` taps, `A_log` and
+    `dt_bias` `[Hv]`). `fused_in_proj` keeps Qwen3-Next's two fused leaves,
+    `in_proj_qkvz` and `in_proj_ba`, split per key-head row group as
+    `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
     emb_features: int
@@ -594,16 +535,11 @@ class GatedDeltaNet(nn.Module):
 class DepthwiseConv1d(nn.Module):
     """The conv's taps as a raw parameter, in the checkpoint's [D, 1, K] layout.
 
-    The checkpoint stores `conv1d.weight` this way, and flax's Conv matches
-    neither its [K, D, 1] kernel order nor the reference's channel-major
-    [B, D, S] input. The leaf keeps the checkpoint's name, `weight`, because
-    a translation transposes a `kernel` as a Linear's [out, in]. The taps
-    have no matrix axis worth a name, so they take the shape heuristic.
-    `use_bias` adds the checkpoint's `conv1d.bias` [D], as Mamba 2's
-    `nn.Conv1d(groups=conv_dim)` has one (modeling_mamba2.py:392-399).
-
-    Returns the [D, K] taps and the bias (None without one), both fp32, the
-    dtype the convolution runs in.
+    flax's Conv matches neither the checkpoint's taps nor the reference's
+    channel-major input, and the leaf is `weight` so a translation does not
+    transpose it as a Linear's kernel. `use_bias` adds `conv1d.bias` [D], as
+    Mamba 2's depthwise conv has (modeling_mamba2.py:392-399). Returns the
+    [D, K] taps and the bias (or None), fp32.
     """
 
     features: int

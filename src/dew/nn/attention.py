@@ -184,20 +184,13 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     """Wrap a norm body in `jax.checkpoint` so nothing fp32 is retained.
 
-    The norms reduce in fp32 for bf16 stability. Differentiated as written,
-    the backward pass would keep two fp32 copies of the activations per
-    norm. Recomputing them keeps only the bf16 input. On one SimpleDiT step
-    this saved 2.35 GiB.
-
-    The policy saves nothing, so the backward pass holds the arguments: the
-    input, the weight and the bias. Recomputing the reductions rather than
-    naming them leaves the residuals to the policy that recomputes this
-    block (`decoder_block.RESIDUALS`).
-
-    The wrapped function takes arrays first and static arguments last. A
-    caller passes its parameters as plain arrays, so no flax lifting sits
-    between the checkpoint and the module. The forward values are unchanged;
-    only the buffer assignment moves.
+    The norms reduce in fp32 for bf16 stability, and differentiated as written
+    the backward pass would keep two fp32 copies of the activations per norm
+    (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
+    bf16 input, the weight and the bias) and leaves the residuals to the policy
+    that recomputes the block (`decoder_block.RESIDUALS`). The wrapped function
+    takes arrays first and static arguments last, so no flax lifting sits
+    between the checkpoint and the module; forward values are unchanged.
     """
     return jax.checkpoint(normalize, policy=jax.checkpoint_policies.nothing_saveable,
                           static_argnums=static_argnums)
@@ -274,22 +267,14 @@ def unweighted_rmsnorm(x, eps: float):
 class RMSNorm(nn.Module):
     """Normalize the last axis by its root mean square, reducing in fp32 by default.
 
-    `scale_offset` stores the weight as Gemma does, (1 + w), and flips the
-    initializer to zeros. The identity is the starting point either way, so
-    a Gemma checkpoint's stored weights land unchanged.
-
-    The families differ in where the scale meets the activation dtype. Gemma
-    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150).
-    Llama and Qwen3 cast first and multiply by the weight
-    (modeling_qwen3.py:61-64), which `scale_after_cast` reproduces. The two
-    agree at fp32 and differ under bf16.
-
-    timm's `RmsNorm2d` (layers/fast_norm.py `rms_norm2d`) computes
-    x * rsqrt(mean(x^2) + eps) * w in the input dtype.
-    `fp32_statistics=False` with `scale_after_cast` is that order.
-
-    The reduction runs under `normalized_in_fp32`, so the backward pass
-    keeps this call's input in its own dtype, not an fp32 copy.
+    `scale_offset` stores the weight as Gemma does, (1 + w), initialized to
+    zeros, so a Gemma checkpoint's weights land unchanged. Gemma multiplies in
+    fp32 and casts the product (modeling_gemma3.py:147-150); Llama and Qwen3
+    cast first and multiply by the weight (modeling_qwen3.py:61-64), which
+    `scale_after_cast` reproduces. The two agree at fp32 and differ under bf16.
+    `fp32_statistics=False` with `scale_after_cast` is timm's `RmsNorm2d`
+    order, x * rsqrt(mean(x^2) + eps) * w in the input dtype. The backward pass
+    keeps the input in its own dtype (`normalized_in_fp32`).
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
@@ -312,15 +297,10 @@ class RMSNorm(nn.Module):
 class LayerNorm(nn.Module):
     """Normalize the last axis as flax's `nn.LayerNorm` does, op for op.
 
-    The parameter tree, the names and the fp32 arithmetic are flax's, so a
-    checkpoint written by either loads into the other and the forward values
-    match bit for bit. What differs is the backward pass: flax keeps an fp32
-    copy of the input and the fp32 centered activations, and this keeps the
-    input as it arrived, through `normalized_in_fp32`.
-
-    The fields are the subset the tree sets. A norm over other axes, under a
-    mask, across a pmapped axis, or on the slower exact variance is flax's
-    to serve.
+    The parameter tree and the fp32 arithmetic are flax's, so checkpoints move
+    both ways and forward values match bit for bit. The backward pass keeps the
+    input as it arrived (`normalized_in_fp32`) where flax keeps fp32 copies.
+    Other axes, masks, pmapped axes and the exact variance are flax's to serve.
     """
     epsilon: float = 1e-6
     use_scale: bool = True
@@ -391,17 +371,13 @@ def _pad_rows(x, rows: int):
 def widen_value_heads(query, value):
     """Zero-pad `value`'s head axis out to the query's width.
 
-    `jax.nn.dot_product_attention` checks the value against the key's whole
-    shape, so a value narrower than the query is refused before any kernel
-    sees it. DeepSeek's latent attention is that shape: `v_head_dim` is 128
-    against a 192-wide query in every released V2/V3 config. The second
-    product is a separate sum per value column, so a zero column gives a
-    zero output column and the caller crops it off. transformers 5.16.1
-    pads FlashAttention the same way (integrations/flash_attention.py:63).
-
-    A value wider than the query has no such rewrite. Padding the query and
-    the key instead would move the kernel's 1/sqrt(d) scale off the query's
-    width, so this raises and names the reference path.
+    `jax.nn.dot_product_attention` refuses a value narrower than the key, which
+    is DeepSeek's latent attention (`v_head_dim` 128 against a 192-wide query in
+    every released V2/V3 config). Each value column is its own sum, so a zero
+    column gives a zero output column the caller crops; transformers 5.16.1 pads
+    FlashAttention the same way (integrations/flash_attention.py:63). A wider
+    value raises: padding the query and key would move the kernel's 1/sqrt(d)
+    off the query's width.
     """
     width, v_width = query.shape[-1], value.shape[-1]
     if v_width > width:
@@ -417,15 +393,11 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                     key_value_seq_lengths=None):
     """Run jax's cudnn flash attention over any sequence length.
 
-    cudnn's kernel has no backward pass for an odd query or key length; jax
-    raises NotImplementedError from inside the gradient. 77 CLIP text tokens
-    are odd, as is every concatenated text-plus-image sequence. One zero row
-    of padding makes the length even. A padded query row's output is sliced
-    off and a padded key is hidden by the kernel's own padding mask
-    (key_value_seq_lengths): the caller's lengths, which never reach past
-    the real keys, or else the real length. So every real query attends to
-    the keys it had. tests/test_kernels.py pins the equality with the xla
-    path.
+    cudnn has no backward pass for an odd query or key length (77 CLIP text
+    tokens, most text-plus-image sequences), so one zero row pads it even. The
+    padded query row is sliced off and the padded key hidden by the kernel's
+    key_value_seq_lengths, which never reach past the real keys.
+    tests/test_kernels.py pins the equality with the xla path.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -461,14 +433,11 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
 def stripe(x, shards: int, axis: int = 1):
     """Reorder `axis` so every shard holds equal causal work.
 
-    The axis is cut into 2 * shards chunks; shard i takes chunks i and
-    2 * shards - 1 - i. For two shards, [0..7] becomes [0, 1, 6, 7, 2, 3,
-    4, 5], which is MaxText's `reorder_sequence` order.
-
-    A reshape, two slices, a flip and a stack, not a gather with the
-    permutation: GSPMD lowers these to collective-permutes of the chunks
-    that change shard, half the rows. It lowers a gather along a split axis
-    to an all-gather of the whole array on every device
+    The axis is cut into 2 * shards chunks and shard i takes chunks i and
+    2 * shards - 1 - i, MaxText's `reorder_sequence` order: for two shards
+    [0..7] becomes [0, 1, 6, 7, 2, 3, 4, 5]. Reshape, slice, flip and stack
+    lower to collective-permutes of the chunks that move; a gather along a split
+    axis lowers to an all-gather of the whole array
     (tests/test_sequence_parallel.py measures both).
     """
     axis %= x.ndim
@@ -499,23 +468,15 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                 sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """Run `kernel` over a sequence the mesh's sequence axis splits.
 
-    Two exchanges are exact for every call they take.
-    `exchanged_heads_attention` (Ulysses) takes a call whose query heads
-    divide by tensor times sequence and whose query and key lengths both
-    divide by the shard count. `gathered_keys_attention` takes any head
-    count and any length: joint and cross attention over an odd length, a
-    head count the split does not divide.
-
-    Where both can run, a causal, windowed or masked call takes the
-    all-to-all. Its kernel sees whole sequences with the causal flag or the
-    window, which cuDNN and splash skip block by block, while the gather
-    hands its kernel a striped explicit mask that no kernel skips: cuDNN runs
-    it as a dense bias over every logit, twice the causal work. On a pair of
-    RTX 3090s the gather took 2.0 to 4.0 times the all-to-all's time for
-    causal grouped-query attention at 4k to 64k tokens (the tables in
-    docs/guides/multi-node.md). The all-to-all also never sends more bytes
-    for such a call (`all_to_all_moves_less`). A call with no mask does the
-    same work either way, and takes the exchange that sends fewer bytes.
+    `exchanged_heads_attention` (Ulysses) takes a call whose query heads divide
+    by tensor times sequence and whose lengths divide by the shard count;
+    `gathered_keys_attention` takes any head count and length. Where both run,
+    a causal, windowed or masked call takes the all-to-all: its kernel sees
+    whole sequences and skips masked blocks, while the gather's striped
+    explicit mask is a dense bias no kernel skips (2.0 to 4.0 times the
+    all-to-all's time for causal GQA at 4k to 64k tokens on two RTX 3090s,
+    docs/guides/multi-node.md), and it never sends more bytes. A call with no
+    mask takes the exchange that sends fewer (`all_to_all_moves_less`).
     """
     tensor = _tensor_shards(query)
     heads, kv_heads = query.shape[-2], key.shape[-2]
@@ -583,30 +544,20 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                               sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
 
-    Each shard holds S/n rows of every head. One all-to-all per operand over
-    the sequence axis hands it all S rows of H/n heads instead, the kernel
-    attends those heads over the whole sequence, and one more all-to-all
-    puts the output back in rows (Jacobs et al. 2023, arXiv:2309.14509).
-    The kernel sees whole sequences, so causality, a window, a packed
-    document mask and splash's block skipping work as on one device, every
-    shard does the same causal work without a reorder, and autodiff
-    transposes each all-to-all into the reverse one for the backward pass.
-    No shard ever holds the whole of any key or value, which is what the
-    all-gather exchange costs: a shard holds S*K*D of each against
-    S*K*D/n here.
+    One all-to-all per operand over the sequence axis turns each shard's S/n
+    rows of every head into all S rows of H/n heads; the kernel attends whole
+    sequences and one more all-to-all puts the output back in rows (Jacobs et
+    al. 2023, arXiv:2309.14509). Causality, windows, document masks and splash's
+    block skipping work as on one device, causal work is equal without a
+    reorder, autodiff transposes each all-to-all, and a shard holds S*K*D/n of
+    each key and value against the gather's S*K*D.
 
-    Heads split over the tensor axis first and the sequence axis within
-    that, so H has to divide by tensor times sequence. Grouped key and value
-    heads are repeated only as far as that split needs, to the least common
-    multiple of their count and the split, which keeps each shard's query
-    heads beside the key heads they read. A mask or bias with a head
-    dimension is split with the heads, and its query and key dimensions
-    arrive whole, as the kernel reads them. Learned sinks split with the
-    heads they belong to, and key lengths with the rows they count.
-
-    Batch rows split over every batch axis that still divides them, in mesh
-    order; a batch too small for the rest is attended alike on those axes'
-    shards, the way GSPMD replicates a dimension it cannot split.
+    Heads split over tensor first and sequence within it, so H divides by
+    tensor times sequence; key and value heads repeat only to the least common
+    multiple of their count and that split. A mask or bias head dimension,
+    learned sinks and key lengths split with what they belong to. Batch rows
+    split over every batch axis that still divides them, in mesh order, and are
+    attended alike where it does not.
     """
     mesh = jax.sharding.get_abstract_mesh()
     heads = query.shape[2]
@@ -657,24 +608,14 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     """Run `kernel` on each shard's slice of the queries against the whole
     keys and values, which every shard gathers over the sequence axis.
 
-    This takes any head count and any length, at the cost of every shard
-    holding the whole of every key and value. Batch rows split as
-    `exchanged_heads_attention` splits them. The heads split over the tensor
-    axis where the query heads divide by it, the key heads repeated to the
-    least common multiple of their count and the tensor axis as the exchange
-    repeats them, and stay whole on every tensor shard otherwise. A query
-    length the shards do not divide is padded at the end and the padding's
-    output dropped; a key length they do not divide arrives whole instead of
-    gathered.
-
-    A causal, windowed or masked call reorders the queries with `stripe` so
-    each shard holds equal causal work, and puts the output back with
-    `unstripe`. The queries' positions travel in the mask, which keeps the
-    mask and the caller's rotary angles exact under the reorder. Under the
-    reorder the kernels see that mask and not their causal flag, because a
-    striped row's position is no longer its index. A call with no mask has
-    equal work on every row and keeps its order. Key lengths count the
-    whole keys, which neither order moves.
+    Any head count and length, at the cost of every shard holding every key and
+    value. Batch rows and heads split as `exchanged_heads_attention` splits
+    them where the query heads divide by the tensor axis, and heads stay whole
+    otherwise. A query length the shards do not divide is padded and the
+    padding dropped; such a key length arrives whole. A causal, windowed or
+    masked call stripes its queries for equal work and carries their positions
+    in the mask, which the kernel reads in place of its causal flag, so the mask
+    and the caller's rotary angles stay exact.
     """
     q_len, kv_len = query.shape[1], key.shape[1]
     # Each tensor shard's query heads beside the key heads they read.
@@ -852,51 +793,30 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  sinks=None, softcap=None, segment_ids=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True):
-    """Attend over [B, S, H, D] queries, keys and values.
+    """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
-    Picks the kernel `implementation` names and returns [B, S, H, Dv]. The
-    parameter tree never changes with the kernel, so checkpoints move
-    between backends. `AttentionImpl` lists the paths; `attention_kernel`
-    dispatches to them and raises for the arguments each one cannot honour.
-
-    Keys and values may carry fewer heads than the query, which is
-    grouped-query attention; the paths that cannot group heads themselves
-    get them repeated out. The value's head width may be narrower than the
-    query's, which is DeepSeek's latent attention. The reference path takes
-    that as it is and a fused path pads and crops it (`widen_value_heads`),
-    so the kernel selection reads the query's width either way.
+    `implementation` names the kernel (`AttentionImpl`, dispatched by
+    `attention_kernel`); the parameter tree never depends on it. Keys and values
+    may carry fewer heads (grouped-query attention) and the value a narrower
+    head width (DeepSeek's latent attention, `widen_value_heads`), so kernel
+    selection reads the query alone.
 
     `causal` restricts query i to keys 0..i, top-left aligned like jax's
-    is_causal, and `sliding_window=w` narrows that to the w most recent
-    keys. Both read the row index, so decoding against a KV cache passes
-    `mask` instead: a step's single query sits at the cache index, not at
-    row 0. `bias` is an additive float array broadcastable to [B, H, Q, K];
-    T5's relative position table travels in it. `sinks` holds one learned,
-    value-free logit per query head, which the reference, xla and splash
-    paths put in the denominator. `softcap` is Gemma 2's tanh on the scaled
-    logits, which `softcapped_attention` and splash apply. `segment_ids`
-    `[B, S]` keeps each packed document of a self-attention call to itself,
-    with 0 as padding (`document_mask`); splash reads the ids, and every
-    other kernel reads the document mask built from them.
+    is_causal, and `sliding_window=w` to the w most recent of those; both read
+    the row index, so a decode step against a cache passes `mask` instead.
+    `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
+    `sinks` is one learned value-free logit per query head in the denominator.
+    `softcap` is Gemma 2's tanh on the scaled logits. `segment_ids` `[B, S]`
+    keeps each packed document to itself, 0 as padding (`document_mask`).
+    `key_value_seq_lengths` `[B]` ends each row's keys, which cuDNN skips; a
+    mask that only ends rows early costs cuDNN a dense bias per head, so pass
+    lengths for right padding.
 
-    `key_value_seq_lengths` is a `[B]` count of the keys each row attends:
-    row b reads keys 0..lengths[b]-1 and none after, which is how a
-    right-padded sequence excludes its padding. cuDNN takes it as its
-    padding mask and skips the padded keys, xla builds the mask from it, and
-    the other paths read it as `with_key_lengths` spells it out. A mask that
-    only ends each row's keys early costs cuDNN a dense additive bias read
-    once per head, so a caller whose valid keys lead the sequence passes the
-    lengths instead.
-
-    Under a mesh whose sequence axis is above one, the call runs through
-    `sequence_parallel_attention`. Active probability dropout uses Flax's
-    reference attention, independently per row, head and query. Explicit
-    fused kernels and sequence parallelism are refused for that draw.
-
-    The result leaves here under the checkpoint name 'attention_output', so
-    a remat policy can save it instead of replaying the kernel in the
-    backward pass (`remat_block` in dit.py). The name is inert outside
-    jax.checkpoint.
+    A mesh sequence axis above one runs `sequence_parallel_attention`. Active
+    dropout runs Flax's reference attention, independently per row, head and
+    query, and refuses explicit fused kernels and sequence parallelism. The
+    result carries the checkpoint name 'attention_output', so a remat policy
+    can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
     if not 0 <= dropout_rate < 1:
@@ -1000,13 +920,11 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                     softcap, sinks, segment_ids, key_value_seq_lengths):
     """Run the fused kernel `implementation` names, at the query's head width.
 
-    Every fused kernel runs one head width for the keys and the values, so a
-    narrower value rides in padded and its own columns come back out. The
-    widths a caller passes are static, so this costs no runtime branch.
-    'cudnn' refuses here whatever its kernel cannot take: sinks, a softcap,
-    deterministic ops, and dtypes and head widths outside its tiles.
-    `key_value_seq_lengths` goes to the cudnn and xla kernels as lengths and
-    to 'tpu' as the mask it means.
+    A narrower value rides in padded and its columns come back out, at no
+    runtime branch. 'cudnn' refuses here what its kernel cannot take: sinks, a
+    softcap, deterministic ops, and dtypes and head widths outside its tiles.
+    `key_value_seq_lengths` reaches cudnn and xla as lengths and 'tpu' as the
+    mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
@@ -1072,14 +990,11 @@ _FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
 def forward_mode_attention():
     """Trace the attention calls inside for `jax.jvp`.
 
-    cuDNN's and the TPU's fused kernels define their derivative in reverse
-    mode only (`jax.custom_vjp`), so forward-mode differentiation through
-    them fails. Inside this context each such call keeps the fused kernel
-    for its value and takes its tangent from the reference path's JVP,
-    which materializes the `[B, H, Q, K]` probabilities once. A
-    consistency model's tangent (sCM, rCM) runs its JVP inside it; the
-    reverse-mode pass that trains the model runs outside it, on the fused
-    kernel's own backward.
+    cuDNN's and the TPU's fused kernels are reverse-mode only (`jax.custom_vjp`).
+    Inside this context each such call keeps the fused kernel for its value and
+    takes its tangent from the reference path's JVP, which materializes the
+    `[B, H, Q, K]` probabilities once. Consistency models (sCM, rCM) run their
+    JVP inside it and train outside it, on the fused backward.
     """
     token = _FORWARD_MODE.set(True)
     try:
@@ -1149,15 +1064,14 @@ def _attention_kernel(query, key, value, dtype=None, precision=None,
                       softcap=None, segment_ids=None, key_value_seq_lengths=None):
     """Dispatch one whole-sequence attention call to the kernel it names.
 
-    'auto' resolves here, against this call's shapes and this machine's
-    backend. Splash takes sinks, a softcap and packed segment ids itself.
-    Anywhere else the segment ids become the document mask, and sinks and a
-    softcap run their own XLA paths on 'reference' and 'xla', because
-    `jax.nn.dot_product_attention` has neither argument. What is left goes
-    to `fused_attention`, after the arguments it cannot honour raise. Key
-    lengths reach the cudnn and xla kernels as they are; every other path
-    reads them as the mask they mean, which splash cannot describe, so
-    'auto' never picks 'tpu' for them.
+    'auto' resolves here, against this call's shapes and backend. Splash takes
+    sinks, a softcap and packed segment ids itself; elsewhere segment ids become
+    the document mask, and sinks and a softcap run their own XLA paths, since
+    `jax.nn.dot_product_attention` has neither. The rest goes to
+    `fused_attention` once the arguments it cannot honour have raised. Key
+    lengths reach cudnn and xla as they are and every other path as the mask
+    they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
+    them.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -1275,17 +1189,14 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
                                  force_fp32_for_softmax=True) -> str:
     """Send a call that built an explicit mask to the xla kernel.
 
-    cuDNN has no mask argument: causality and the window are flags, and jax
-    hands the kernel a bool mask as an additive bias of -2**41 in the
-    compute dtype instead (`combine_bias_and_mask` in
-    jax/_src/cudnn/fused_attention_stablehlo.py). That also makes
-    `check_is_flash_attention` refuse an odd length while training. The xla
-    kernel masks by exclusion, on every backend and with the same fp32
-    softmax. It costs 83.6 ms and 5.80 GiB a step where the fixed window on
-    cuDNN costs 75.8 ms and 4.99 GiB (docs/concepts/language_models.md).
-
-    'auto' first takes the reference path for arithmetic only it performs
-    (`reference_only`), as `resolve_implementation` does.
+    cuDNN has no mask argument: jax hands it a bool mask as an additive bias of
+    -2**41 in the compute dtype (`combine_bias_and_mask` in
+    jax/_src/cudnn/fused_attention_stablehlo.py), and `check_is_flash_attention`
+    then refuses an odd length while training. The xla kernel masks by
+    exclusion with the same fp32 softmax, at 83.6 ms and 5.80 GiB a step against
+    cuDNN's fixed window at 75.8 ms and 4.99 GiB
+    (docs/concepts/language_models.md). 'auto' first takes the reference path
+    for arithmetic only it performs (`reference_only`).
     """
     if implementation == 'auto' and reference_only(query, dtype, precision,
                                                    force_fp32_for_softmax):
@@ -1321,31 +1232,19 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     memory linear in the sequence.
 
     `window=w` is sliding attention: a query reads itself and the w - 1 keys
-    before it (Mistral, Gemma, MaxText's `sliding_window_size`). `chunk=c`
-    is chunked local attention: a query reads the keys at or before it whose
-    position shares its chunk, `position // c` (Llama 4's
-    `attention_chunk_size`, MaxText's `chunk_attn_window_size`). Exactly one
-    of the two is set.
-
-    `positions` places the chunks: `[S]` or `[B, S]`, advancing by one per
-    row inside a document, as a packed batch's do; None is the row index.
-    `segment_ids` keeps each packed document to itself (0 is padding) and
+    before it (Mistral, Gemma, MaxText's `sliding_window_size`). `chunk=c` is
+    chunked local attention: a query reads the keys at or before it in its
+    chunk, `position // c` (Llama 4's `attention_chunk_size`). Exactly one is
+    set. `positions` `[S]` or `[B, S]` places the chunks (None is the row
+    index), `segment_ids` keeps packed documents apart (0 is padding) and
     `valid` `[B, S]` drops the keys it marks False.
 
-    No `[S, S]` array is built above two spans. A sliding window that
-    cudnn or splash takes as a flag runs there, whose kernels skip the
-    blocks outside it: cudnn without sinks or packed documents, splash with
-    both, since it reads the segment ids themselves. Chunks that start at
-    row multiples fold into the batch, one causal call per chunk, which
-    every kernel takes. Everything
-    else runs banded: the queries in blocks of the span, each against its
-    own block and the one before, which holds every key a query of the
-    block may read, under a `[W, 2W]` mask per block, on cudnn as a bias
-    where cudnn runs and on xla otherwise. The logits are then `[S, 2W]` per
-    head where a dense mask costs `[S, S]`.
-    Banding pads the sequence to whole spans, so a sequence of at most two
-    spans, where `[S, S]` is no larger than `[S, 2W]`, takes the dense
-    call instead.
+    No `[S, S]` array is built above two spans. A window cudnn (no sinks or
+    packing) or splash takes as a flag runs there, skipping blocks outside it.
+    Chunks that start at row multiples fold into the batch. Everything else
+    runs banded: query blocks of the span against their own block and the one
+    before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
+    pads to whole spans, so at most two spans take the dense call.
     """
     if (window is None) == (chunk is None):
         raise ValueError("local attention takes exactly one of window and chunk")
@@ -1366,10 +1265,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=True, sliding_window=window)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
-    # its additive bias where cudnn runs. On an L4, packed (5 documents) at
-    # window 4096, 16 heads of 64 over 4, forward plus backward: 16384
-    # tokens 76.9 ms in 0.60 GiB of temporaries, 65536 tokens 316.7 ms in
-    # 2.38 GiB, where xla asked for 10.0 GiB at 8192 (docs/performance.md).
+    # its additive bias where cudnn runs (docs/performance.md: 16384 packed
+    # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
+    # asked for 10.0 GiB at 8192).
     masked = 'cudnn' if resolved == 'cudnn' else kernel_for_materialized_mask(
         implementation, query, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax)
@@ -1420,16 +1318,11 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
 def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, positions,
                          segment_ids, valid, sinks, implementation, masked):
     """`_local_blocks` over a sequence the mesh's sequence axis splits, in a
-    `shard_map`: each shard computes its own rows, and its first block reads
-    the previous shard's last `span` keys, values, positions, segment ids and
-    validity, which one `ppermute` hands it; the first shard receives zeros,
-    the rows before the sequence. That halo is all that crosses the
-    interconnect, where gathering the sequence would move all of it.
-    Chunks that start at the shards' boundaries need no halo.
-
-    The heads split over the tensor axis where they divide, the key heads
-    repeated to the least common multiple of their count and the tensor
-    axis, as the exchanges repeat them."""
+    `shard_map`: each shard computes its own rows, and one `ppermute` hands its
+    first block the previous shard's last `span` keys, values, positions,
+    segment ids and validity (zeros on the first shard). That halo is all that
+    crosses the interconnect; chunks starting at the shard boundaries need none.
+    Heads split over the tensor axis as the exchanges split them."""
     batch, length = query.shape[:2]
     span = window if window is not None else chunk
     assert span is not None
@@ -1568,47 +1461,30 @@ SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
 # device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
 SPLASH_DENSE_MASK_CELLS = 1 << 22
 
-# The shortest sequence 'auto' hands splash, from tools/qualify_splash.py on
-# one v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128,
-# 16384 tokens a step, causal). A training step, forward and backward, costs
-# splash 4.78 ms against XLA's 1.68 ms at 128 keys and 3.24 ms against 2.62 ms
-# at 256, then 2.57 against 4.64 at 512, 5.85 against 17.80 at 2048 and 28.9
-# against 144.2 at 16384, with 397 MiB of temporaries against 3180 MiB at
-# 2048. Width 64 crosses at the same length (2.59 against 4.06 ms at 512).
-# Gemma's softcap, GPT-OSS's sinks and packed segment ids cost splash at most
-# 16% more than the plain causal call at every length from 512 to 16384, and a
-# 1024-key window over packed rows less, while XLA's cost for each grows with
-# its [B, H, S, S] logits (all rows in the commit that set this).
+# The shortest sequence 'auto' hands splash. tools/qualify_splash.py on one
+# v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128, 16384
+# causal tokens a step), a training step: splash 3.24 ms against XLA's 2.62
+# at 256 keys, 2.57 against 4.64 at 512, 28.9 against 144.2 at 16384; width
+# 64 crosses at the same length. Softcap, sinks and packed ids cost splash
+# at most 16% more from 512 to 16384.
 SPLASH_MIN_LENGTH = 512
 
 
 def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=None) -> bool:
     """Report whether splash takes this call.
 
-    It needs a tpu backend, one of the two dtypes a TPU matmul reads,
-    sequence lengths its mask blocking can tile and at least
-    `SPLASH_MIN_LENGTH`, below which XLA's attention measured faster, a mask
-    it can describe, and no bias. A softcap, sinks and packed segment ids
-    are arguments of the kernel itself, so none of them is read here. Only
-    'auto' asks this, after `cudnn_runs`; an explicit 'tpu' sends the calls
-    this turns down to the older pallas flash kernel instead.
+    It needs a tpu backend, one of the two TPU matmul dtypes, sequence lengths
+    its mask blocking tiles and at least `SPLASH_MIN_LENGTH`, a mask it can
+    describe, and no bias; softcap, sinks and segment ids are kernel arguments.
+    Only 'auto' asks this, after `cudnn_runs`; an explicit 'tpu' sends what this
+    turns down to the pallas flash kernel. The head width is not read: the
+    kernel pads the value width to lanes (splash_attention_kernel.py:732) and
+    the query width is a contraction Mosaic pads.
 
-    The head width is not read, because splash does not constrain it. The
-    kernel pads the value width to a whole number of lanes and slices the
-    result back (`pl.cdiv(head_dim_v, NUM_LANES)`,
-    splash_attention_kernel.py:732). The query and key width is only a
-    dot_general's contraction dimension inside the kernel, which Mosaic pads
-    like any other minor axis. The sequence axes are the ones the kernel and
-    its mask blocking state a divisibility for.
-
-    A call under an automatic sequence axis above one is turned down as
-    well: that is `gathered_keys_attention`, whose split is GSPMD constraints
-    around a whole-sequence kernel. A pallas call with no partitioning rule
-    would have the queries gathered back to serve it, which is the split
-    that exchange exists to keep. `exchanged_heads_attention` calls the
-    kernel inside a `shard_map` that holds the sequence axis manual, where
-    `sequence_shards` is 1 and each instance holds whole sequences, so
-    splash does take the calls that exchange runs.
+    A call under an automatic sequence axis above one is turned down: that is
+    `gathered_keys_attention`, and a pallas call with no partitioning rule
+    would gather the queries back. `exchanged_heads_attention` calls the kernel
+    inside a `shard_map` where `sequence_shards` is 1, so splash takes those.
     """
     if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False
@@ -1626,32 +1502,21 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     """Attend on pallas: splash where its descriptor covers the call, flash
     everywhere else.
 
-    Splash is the block-sparse kernel. Its mask is a descriptor built while
-    the executable is, the blocks that descriptor empties are never visited,
-    and a causal or windowed long sequence costs its live blocks rather than
-    its rectangle. Packed documents are not part of the descriptor: their
-    segment ids are a kernel argument, compared per block. What it has no
-    form for is another value of the trace: there is no bias argument at
-    all, and an explicit mask has to be readable on the host. Flash takes
-    both as one additive [B, H, Q, K] array and pays the whole rectangle for
-    them, so it stays for exactly these calls:
+    Splash is block-sparse: its mask is a descriptor built with the executable,
+    so a causal or windowed sequence costs its live blocks, and packed segment
+    ids are a kernel argument. It has no bias argument and needs an explicit
+    mask readable on the host. Flash takes both as one additive [B, H, Q, K]
+    array over the whole rectangle, so it serves exactly:
 
-    - an additive `bias`, which is T5's relative position table;
-    - a `mask` that is a tracer (a KV-cache decode mask over slots, the
-      striped mask sequence parallelism builds), or one past
-      `SPLASH_DENSE_MASK_CELLS`, or one that differs by batch row;
-    - a query or key length that is not a multiple of `SPLASH_LANES`, which
-      leaves the mask blocking no block size that divides its sequence.
+    - an additive `bias` (T5's relative position table);
+    - a traced `mask` (a cache decode mask, sequence parallelism's striped
+      mask), one past `SPLASH_DENSE_MASK_CELLS`, or one that varies by row;
+    - a length that is not a multiple of `SPLASH_LANES`.
 
-    Flash has no softcap and no sinks, so a call with either that splash
-    cannot describe raises here.
-
-    `interpret` runs splash under pallas's interpreter instead of Mosaic,
-    which is what lets the same arithmetic, forward and backward, run off a
-    TPU and what the parity tests use. It is far slower than XLA's attention,
-    so it exists for an explicit 'tpu' and never for 'auto'. The flash kernel
-    takes no such argument, so the calls that fall through to it run on a TPU
-    and nowhere else.
+    Flash has no softcap and no sinks, so such a call raises. `interpret` runs
+    splash under pallas's interpreter, which is how the parity tests run its
+    arithmetic off a TPU; it is far slower than XLA, so only an explicit 'tpu'
+    uses it. The flash kernel has no interpreter and runs only on a TPU.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     descriptor = None
@@ -1685,23 +1550,15 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
                      interpret: bool):
     """Run the splash kernel over [B, S, H, D] arrays under `descriptor`.
 
-    The kernel takes one example at a time, as [H, S, D] with the head width
-    minor, so the batch rides in on a vmap and the seam is two transposes.
-    It applies no scale of its own, unlike the flash kernel's `sm_scale`, so
-    the 1/sqrt(d) goes onto the query in the query's own dtype. That is
-    where flax's reference path puts it, which makes the two agree exactly
-    in fp32 rather than to a rounding of the scale. Grouped key heads stay
-    grouped, because splash reads q_heads % kv_heads itself, so this path
-    never materializes the repeated keys the flash path needs.
-
-    `softcap` is the kernel's `attn_logits_soft_cap`, applied to the scaled
-    logits before the mask, the order of `softcapped_attention`. `sinks`
-    `[H]` seeds each head's running maximum and denominator, the logit-space
-    sink of `attention_with_sinks`, and its backward returns their gradient.
-    `segment_ids` `[B, S]` keeps each packed document to itself. The kernel
-    lets equal ids attend, so padding (id 0) reads the other padding where
-    `document_mask` lets it read nothing. No document's query reads a
-    padding key under either rule, so the rows a packed loss reads agree.
+    The kernel takes one [H, S, D] example at a time, so the batch rides a
+    vmap. It applies no scale, so 1/sqrt(d) goes onto the query in the query's
+    dtype, where flax's reference puts it, which makes the two agree exactly in
+    fp32. Grouped key heads stay grouped (splash reads q_heads % kv_heads).
+    `softcap` is applied to the scaled logits before the mask, as in
+    `softcapped_attention`; `sinks` `[H]` seed each head's running maximum and
+    denominator, as in `attention_with_sinks`, with their gradient. The kernel
+    lets equal segment ids attend, so padding (id 0) reads other padding where
+    `document_mask` reads nothing; no document's query reads padding either way.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
@@ -1719,10 +1576,8 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
     if isinstance(attended, tuple):
-        # make_splash_mha(save_residuals=True) returns the logsumexp beside
-        # the output, and this builds a kernel without it, so the pair is a
-        # kernel someone else built. Narrowed rather than asserted, because a
-        # cast is evidence nobody produced.
+        # Only a save_residuals=True kernel returns a pair, and this one is
+        # built without it; the check narrows the kernel's union return type.
         raise ValueError("splash returned residuals this path has no consumer for")
     return jnp.moveaxis(attended, -3, -2)
 
@@ -1730,13 +1585,10 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
 def splash_block_sizes(q_len: int, kv_len: int):
     """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
 
-    The greatest common divisor satisfies both of the kernel's rules at
-    once. It divides its sequence, which the mask blocking requires, and it
-    stays a multiple of `SPLASH_LANES`, which the key compute block
-    requires, because the constant and the admitted lengths are both
-    multiples of it. The backward blocks are filled in because a kernel
-    built without them raises "Need to specify backward blocks." from inside
-    its own vjp, which a training run would meet at its first gradient.
+    The greatest common divisor divides its sequence, as the mask blocking
+    requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
+    requires. The backward blocks are set because a kernel built without them
+    raises "Need to specify backward blocks." at its first gradient.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
@@ -1751,13 +1603,10 @@ def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
                            sliding_window: int | None, mask):
     """Build splash's mask for one call, or None when splash cannot describe it.
 
-    The structural part is a function of the two indices, not an array.
-    CausalMask and LocalMask carry the comparison the kernel evaluates per
-    block, so the blocks they empty leave the grid and nothing proportional
-    to Q*K is stored. Dew's window is causal already, so a window replaces
-    the causal flag here instead of sitting beside it. An explicit boolean
-    mask has no such form: it is ANDed in as dense blocks, so only a
-    concrete, small one is taken.
+    CausalMask and LocalMask are comparisons the kernel evaluates per block, so
+    emptied blocks leave the grid and nothing Q*K-sized is stored. Dew's window
+    is causal already, so it replaces the causal flag. An explicit boolean mask
+    is ANDed in as dense blocks, so only a concrete, small one is taken.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
@@ -1783,17 +1632,10 @@ def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
 def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
     """Return an explicit mask as one host [Q, K] boolean array per query head.
 
-    Returns None when splash cannot carry it, which three things cause. The
-    mask is a value of the trace: the descriptor is built while the
-    executable is, so a tracer cannot be read, and a decode mask over cache
-    slots is one. Or it has a
-    batch axis wider than one: splash indexes by head and position and has
-    no batch axis. Or it is large: unresolved blocks are stored dense inside
-    the executable, so past `SPLASH_DENSE_MASK_CELLS` the additive-bias path
-    is cheaper.
-
-    numpy and the tracer type are imported here because this is the one
-    place the mask leaves the trace, and splash's NumpyMask is a host array.
+    None when splash cannot carry it: a traced mask (the descriptor is built
+    with the executable; a decode mask over slots is one), a batch axis wider
+    than one (splash has none), or one past `SPLASH_DENSE_MASK_CELLS`, whose
+    dense blocks would cost more than the additive-bias path.
     """
     import numpy as np
     from jax.core import Tracer
@@ -1816,18 +1658,12 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
     """Run the pallas TPU flash kernel, with every mask but the documents as
     an additive bias.
 
-    The kernel has no mask argument, so a window and an explicit mask become
-    one [B, H, Q, K] float array of zeros and the dtype's minimum, added to
-    the logits. Causality is a flag it takes, and packed documents are its
-    `segment_ids`, which it compares per block, with splash's rule for the
-    padding (`splash_attention`). The array is the whole rectangle, which is
-    what splash exists to avoid, so this path runs only for the calls
-    `tpu_attention` names.
-
-    The 1/sqrt(d) goes onto the query, as on splash, and the kernel's
-    `sm_scale` stays 1: the kernel adds `ab` to the logits before it
-    multiplies by `sm_scale` (flash_attention.py:402-409), which would scale
-    T5's position bias along with them.
+    A window and an explicit mask become one [B, H, Q, K] array of zeros and the
+    dtype's minimum; causality is a flag and packed documents its `segment_ids`,
+    with splash's padding rule. That rectangle is what splash avoids, so only the
+    calls `tpu_attention` names come here. 1/sqrt(d) goes onto the query and
+    `sm_scale` stays 1, because the kernel adds `ab` before it multiplies by
+    `sm_scale` (flash_attention.py:402-409), which would scale T5's bias too.
     """
     from jax.experimental.pallas.ops.tpu.flash_attention import SegmentIds, flash_attention
 
@@ -2039,17 +1875,14 @@ class BasicTransformerBlock(nn.Module):
 
 @dataclasses.dataclass(frozen=True)
 class Stage:
-    """Describes one resolution stage's attention in a UNet.
+    """One resolution stage's attention in a UNet; a stage without is `None`.
 
-    A stage with no attention is `None` instead. Every field is a
-    `TransformerBlock` setting. The head width is the stage's channel count
-    divided by `heads`, which the unet knows and a config does not, so there
-    is no `dim_head` field. `dew.registry.from_record` builds one from a record at the build
-    boundary, so a stage arrives as `{"heads": 8}` from a command line and a
-    misspelled field raises there.
-
-    `precision` of None means the model's. `dew.registry.with_precision`
-    writes the model's dtype into every stage.
+    Every field is a `TransformerBlock` setting. The head width is the stage's
+    channel count over `heads`, which the unet knows and a config does not.
+    `dew.registry.from_record` builds one from a record (`{"heads": 8}` from a
+    command line), so a misspelled field raises at the build boundary.
+    `precision` of None means the model's, which `dew.registry.with_precision`
+    writes into every stage with the model's dtype.
     """
 
     heads: int

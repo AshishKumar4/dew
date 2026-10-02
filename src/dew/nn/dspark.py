@@ -1,24 +1,19 @@
 """DSpark: DeepSeek-V4.1's block drafter for speculative decoding.
 
-arXiv 2609.19969 section 2.4.3; the reference is `DSparkBlock`,
-`DSparkAttention`, `DSparkMarkovHead`, `DSparkConfidenceHead` and
-`Transformer.forward_spec` of the release's inference/model.py (v41:1020-1156,
-:1274-1282, at the revision tools/deepseek_v41_reference.py pins).
-
-The target model records, at each of `target_layers`, the mean over its
-residual streams of that layer's input; the drafter's first stage projects
-their concatenation to the model width and norms it (`main_proj`,
-`main_norm`). That context is what every stage's sliding attention reads
-beside its draft block: the block is the token the target just drew followed
-by `block_size - 1` noise tokens, at the positions after the context's last.
-Each stage is a decoder block of its own (mHC streams under Single-Pass
-mixing, one sliding attention whose block queries see the whole block, and
-a routed MoE with the drafter's own expert count), chained as the trunk's
-layers are. The last stage collapses the streams, norms them and scores
-them with the trunk's head; the Markov head then adds a low-rank bigram
-bias from each drafted token to the next position's logits as it drafts
-left to right, and the confidence head reads each position's collapsed
-state beside that bigram embedding.
+arXiv 2609.19969 section 2.4.3; the reference is the release's
+inference/model.py `DSparkBlock`, `DSparkAttention`, `DSparkMarkovHead`,
+`DSparkConfidenceHead` and `Transformer.forward_spec` (v41:1020-1156,
+:1274-1282, at the revision tools/deepseek_v41_reference.py pins). The
+target records the stream mean of each `target_layers` input; the first
+stage projects and norms their concatenation (`main_proj`, `main_norm`),
+the context every stage's sliding attention reads beside its draft block,
+the drawn token then `block_size - 1` noise tokens. Each stage is a decoder
+block (mHC under Single-Pass, sliding attention whose block queries see the
+whole block, a routed MoE with the drafter's expert count), chained as the
+trunk's layers are. The last stage collapses, norms and scores with the
+trunk's head; the Markov head adds a low-rank bigram bias from each drafted
+token to the next position's logits, left to right, and the confidence
+head reads each collapsed state beside that bigram embedding.
 """
 
 from __future__ import annotations
@@ -135,17 +130,9 @@ class DSparkStage(nn.Module):
 
 def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: int,
           states, tokens, *, decode: bool, valid=None, choose: Callable | None = None):
-    """One drafting pass (Transformer.forward_spec, v41:1274-1282).
-
-    `states` `[B, M, targets * D]` is the target's recorded context up to
-    the position the block drafts after, and `valid` `[B, M]` which of its
-    positions are real; `tokens` `[B]` is the token drawn there. Returns the
-    drafted ids `[B, block_size + 1]` (the drawn token first), their logits
-    `[B, block_size, vocab]` with the Markov bias added, and each
-    position's confidence `[B, block_size]`. `choose(index, logits)` draws
-    the token after block position `index` from its biased logits `[B,
-    vocab]`, greedily when None. Cached, `tokens` None only appends the
-    context to the windows, and `states` None drafts after what they hold.
+    """One drafting pass (Transformer.forward_spec, v41:1274-1282), with
+    `CausalTransformer.draft`'s arguments and returns; `states` is the context
+    `draft` reads, and the logits carry the Markov bias.
     """
     store = {}
     if states is not None:
