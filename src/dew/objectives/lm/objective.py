@@ -562,6 +562,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `processor` is what `pipeline` turns text into ids with and decodes
+    through, unless it is handed another. A bundle's `lm_objective` passes
+    the source's own.
     """
 
     artifact = TokenScores
@@ -598,6 +602,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
         token_accuracy: bool = True,
+        processor: Processor | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         decoder = _decoder(model)
@@ -610,6 +615,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.pretrained = pretrained
+        self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
@@ -701,10 +707,12 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """Publish the decoder over the state's weights as a generation task.
 
         It samples and is budgeted the way this objective's previews are,
-        and `processor` decodes.
+        and `processor`, or the objective's own when it is None, encodes and
+        decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)), processor,
+        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
+                              self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None else samples.max_new_tokens)
 
