@@ -898,8 +898,6 @@ class Trainer(Generic[Loss, Effects]):
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
-        # A root key is one value; a legacy key's uint32 words are not parameter axes.
-        placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
