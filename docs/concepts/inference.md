@@ -143,20 +143,15 @@ Results hold global arrays sharded by row, including any filler rows added so th
 ```python
 import jax
 
+from dew.config import ModelConfig
 from dew.inference import SafetensorsBanks
-from dew.interop.hf_decoders import translate_config
-from dew.registry import models, with_precision
+from dew.interop import translate_config
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                        cache_bytes=0, param_dtype="auto") as source:
-    record = translate_config(source.config)
-    record["max_seq_len"] = 128
-    model = models.build("causal_transformer", {
-        **with_precision("causal_transformer", record,
-                         dtype="bfloat16", attention_impl="xla"),
-        "scan_layers": True,
-    })
+    record = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
+    model = ModelConfig("causal_transformer", record, dtype="bfloat16", attention_impl="xla").build()
     variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
