@@ -160,7 +160,7 @@ with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
     variables = stream_banked(model, source)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
-        seed=0, sampling=Sampling(temperature=0.0)))
+        key=0, sampling=Sampling(temperature=0.0)))
 ```
 
 Use a downloaded checkpoint snapshot's local directory for the path. This path accepts unquantized registered decoder families whose translation stays lazy; it refuses a quantized codec or family preparation that might materialize the model. It does not download a Hub repository, load a tokenizer or replace `dew.pipeline`'s resident loader. Tokenize inputs separately, or bind these variables to `TextGeneration` with the matching processor.
