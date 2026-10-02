@@ -9,30 +9,29 @@ import itertools
 import json
 import os
 import shutil
-import subprocess
 import sys
 import threading
 from collections import Counter
 from pathlib import Path
 
+import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
-import grain.python as pygrain
-
-from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenWindows
+from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenWindows, write_tokens
 from dew.data.dataset import describe
-from dew.data.tokens import PackedWindows
 from dew.data.sources.text import (
     TokenBytes,
     TokenColumn,
     TokenDocumentSource,
     TokenRecords,
     TokenWindowSource,
+    dtype_for,
 )
+from dew.data.tokens import PackedWindows
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
@@ -490,7 +489,7 @@ def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, spec):
     """With val.bin missing the validation loader read train.bin, so every
     pass scored windows the model was training on."""
     _token_dir(tmp_path, train_tokens=64, eos_id=0)
-    with pytest.raises(ValueError, match=r"val\.bin.*tokenize_text\.py --val-fraction"):
+    with pytest.raises(ValueError, match=r"val\.bin.*dew tokenize --val-fraction"):
         spec(path=str(tmp_path), seq_len=8, loading=Loading(workers=0)).load(batch=4)
 
 
@@ -504,10 +503,10 @@ def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
 
 
 # ---------------------------------------------------------------------------------
-# tools/tokenize_text.py
+# write_tokens and `dew tokenize`
 # ---------------------------------------------------------------------------------
 
-def test_tokenize_tool_round_trips_through_the_source(tmp_path):
+def test_written_tokens_round_trip_through_the_source(tmp_path):
     corpus = "\n".join(
         f"document {i}: the quick brown fox jumps over the lazy dog — ünïcödé {i}"
         for i in range(40)) + "\n"
@@ -518,15 +517,10 @@ def test_tokenize_tool_round_trips_through_the_source(tmp_path):
     (raw / "nested" / "b.txt").write_text(corpus * 3, encoding="utf-8")
     out = tmp_path / "tokens"
 
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
-    result = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "tokenize_text.py"),
-         "--input", str(raw), "--out", str(out),
-         "--tokenizer", "byte", "--val-fraction", "0.1"],
-        capture_output=True, text=True, env=env)
-    assert result.returncode == 0, result.stdout + result.stderr
+    written = write_tokens(raw, out, tokenizer="byte", val_fraction=0.1)
 
     meta = json.loads((out / "meta.json").read_text())
+    assert meta == written
     assert meta["tokenizer"] == "byte"
     assert meta["vocab_size"] == 256
     assert meta["dtype"] == "uint8"
@@ -574,8 +568,46 @@ def test_tokenize_tool_round_trips_through_the_source(tmp_path):
         whole_ids[:len(val_ids)]).decode("utf-8", errors="replace")
 
 
-def test_tokenize_tool_writes_the_smallest_dtype_that_fits():
-    from tools.tokenize_text import dtype_for
+def test_documents_in_memory_are_written_one_eos_terminated_document_each(tmp_path):
+    """An iterable of strings is the route for text another library holds, a
+    Hugging Face split's column included: each string is one document."""
+    documents = ["alpha beta", "gamma", "", "delta epsilon zeta"]
+    meta = write_tokens(iter(documents), tmp_path, tokenizer="byte", val_fraction=0.0, pack=True)
+
+    eos = ByteTokenizer().eos_id
+    stream = list((tmp_path / "train.bin").read_bytes())
+    expected = [byte for text in documents if text for byte in [*text.encode(), eos]]
+    assert stream == expected, "an empty document writes nothing, not a lone eos"
+    assert meta["val_tokens"] == 0 and meta["eos_id"] == eos
+    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
+    assert len(source) == 3
+
+
+def test_a_path_that_holds_no_text_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="holds no \\*.txt file"):
+        write_tokens(tmp_path, tmp_path / "out")
+    with pytest.raises(FileNotFoundError, match="neither a text file nor a directory"):
+        write_tokens(tmp_path / "missing", tmp_path / "out")
+    with pytest.raises(ValueError, match="val_fraction"):
+        write_tokens(["text"], tmp_path / "out", val_fraction=1.0)
+
+
+def test_the_tokenize_command_writes_what_the_library_writes(tmp_path, capsys):
+    from dew.cli.main import main
+
+    raw = tmp_path / "corpus.txt"
+    raw.write_text("one line\nanother line\n" * 20, encoding="utf-8")
+
+    assert main(["tokenize", "--input", str(raw), "--out", str(tmp_path / "cli"),
+                 "--val-fraction", "0.2", "--pack"]) == 0
+    library = write_tokens(raw, tmp_path / "lib", val_fraction=0.2, pack=True)
+
+    for name in ("train.bin", "val.bin", "meta.json"):
+        assert (tmp_path / "cli" / name).read_bytes() == (tmp_path / "lib" / name).read_bytes()
+    assert f"wrote {library['train_tokens']} tokens to" in capsys.readouterr().out
+
+
+def test_written_tokens_take_the_smallest_dtype_that_fits():
     assert dtype_for(256) == np.dtype("uint8")
     assert dtype_for(257) == np.dtype("uint16")
     assert dtype_for(50257) == np.dtype("uint16")
@@ -755,13 +787,7 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
                    encoding="utf-8")
     out = tmp_path / "tokens"
 
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
-    result = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "tokenize_text.py"),
-         "--input", str(raw), "--out", str(out), "--tokenizer", "byte",
-         "--val-fraction", "0.1", "--pack"],
-        capture_output=True, text=True, env=env)
-    assert result.returncode == 0, result.stdout + result.stderr
+    write_tokens(raw, out, tokenizer="byte", val_fraction=0.1, pack=True)
     val_tokens = list((out / "val.bin").read_bytes())
     assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
 
@@ -982,6 +1008,37 @@ def _assert_mask_blocks_everything_it_should(batch, monkeypatch):
                 same_document = (query in inside and key in inside
                                  and inside[query] == inside[key])
                 assert allowed == (same_document and key <= query), (
+                    f"row {row} position {query} attending to {key}")
+
+
+def test_documents_packed_online_by_grain_keep_attention_inside_each_document(monkeypatch):
+    """The online route `docs/concepts/data.md` shows under Packing: grain's
+    concat-then-split packer names its fields the way the decoder reads
+    them, so a row it packs masks attention at document boundaries."""
+    from grain.experimental import ConcatThenSplitIterDataset
+
+    from dew.data import Dataset
+
+    seq_len = 16
+    documents = [{"text": np.full(length, value, np.int32)}
+                 for value, length in enumerate((5, 9, 3, 12, 7, 4, 11, 6), start=1)]
+
+    def packed(partition):
+        rows = pygrain.MapDataset.source(documents).repeat(None)
+        share = rows[partition.index::partition.count].to_iter_dataset()
+        return ConcatThenSplitIterDataset(share, length_struct={"text": seq_len + 1})
+
+    batch = next(Dataset.from_grain(packed, batch=4).train(DataPartition()))
+
+    assert set(batch) == {"text", "text_segment_ids", "text_positions"}
+    mask = _attention_mask(batch, monkeypatch)
+    tokens = np.asarray(batch["text"])[:, :-1]
+    assert len(set(tokens[0])) > 1, "the first row packs more than one document"
+    for row in range(tokens.shape[0]):
+        for query in range(seq_len):
+            for key in range(seq_len):
+                same_document = tokens[row, query] == tokens[row, key]
+                assert bool(mask[row, 0, query, key]) == (same_document and key <= query), (
                     f"row {row} position {query} attending to {key}")
 
 

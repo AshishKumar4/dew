@@ -7,7 +7,7 @@ takes the vocabulary from the data, not the command line.
 
     curl -o data/shakespeare.txt --create-dirs \\
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    python tools/tokenize_text.py --input data/shakespeare.txt \\
+    dew tokenize --input data/shakespeare.txt \\
         --out data/shakespeare-byte --tokenizer byte
     python recipes/lm/train.py --data.path data/shakespeare-byte \\
         --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \\
@@ -46,7 +46,7 @@ class LmRunConfig(LMRunConfig):
     Everything else a decoder run records is `dew.objectives.lm.LMRunConfig`,
     which a script that trains on some other layout of the same ids uses as
     it stands. What this adds is the one thing the recipe itself requires:
-    `--data.path` is a directory `tools/tokenize_text.py` wrote, or with
+    `--data.path` is a directory `dew tokenize` wrote, or with
     data:packed-tokens several with their weights (`--data.path a 0.7 b 0.3`).
     """
 
@@ -68,16 +68,16 @@ def read_corpora(data: TokenSpec) -> str | list[str] | None:
 
 
 def token_directories(path: str | Mapping[str, float] | list[str] | None) -> list[Path]:
-    """The directories tools/tokenize_text.py wrote, which --data.path names:
+    """The directories `dew tokenize` wrote, which --data.path names:
     one, or each corpus of a weighted mixture or of the phases."""
     if not path:
-        raise ValueError("--data.path is the token directory tools/tokenize_text.py wrote")
+        raise ValueError("--data.path is the token directory `dew tokenize` wrote")
     directories = [Path(path)] if isinstance(path, str) else [Path(name) for name in sorted(path)]
     for directory in directories:
         if not (directory / "meta.json").is_file():
             raise FileNotFoundError(
                 f"{directory / 'meta.json'} is missing: --data.path is the token directory "
-                "that tools/tokenize_text.py wrote, not a dataset name")
+                "that `dew tokenize` wrote, not a dataset name")
     return directories
 
 

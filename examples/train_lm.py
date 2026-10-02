@@ -2,7 +2,7 @@
 
     curl -o data/shakespeare.txt --create-dirs \\
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
+    dew tokenize --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """
