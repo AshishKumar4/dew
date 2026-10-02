@@ -1,28 +1,21 @@
 """Mixture of experts: the router, and the experts as one grouped matmul.
 
 Patterned on MaxText's `RoutedMoE` (`maxtext src/maxtext/layers/moe.py:419`,
-Apache 2.0). The math ported is top-k selection (`:751` `get_topk`), DeepSeek's
-group-limited routing, which selects on the biased scores and gates on the
-unbiased ones (`:881-908` `deepseek_routing`), its weight scaling
-(`:835-841`), the aux-loss-free bias update (`:238-261`, lifted below), and the
-grouped matmul over tokens sorted by expert (`:1500` `sparse_matmul`).
+Apache 2.0): top-k selection (`:751` `get_topk`), DeepSeek's group-limited
+routing, which selects on the biased scores and gates on the unbiased ones
+(`:881-908`), its weight scaling (`:835-841`), the aux-loss-free bias update
+(`:238-261`) and the grouped matmul over tokens sorted by expert (`:1500`).
 
-The two routers this reproduces are `MixtralSparseMoeBlock`, which softmaxes
-over the experts, takes the top k and renormalises, and `DeepseekV3MoE`, which
-scores with a sigmoid, selects with a per-expert bias added, limits the choice
-to the best expert groups, renormalises and scales, then adds one shared
-expert every token takes. DeepSeek V4's `DeepseekV4TopKRouter` and
-`DeepseekV4Experts` contribute the sqrt(softplus) score and the swiglu limit.
-All are transformers 5.16.1; `tests/test_moe.py` holds the fp32 parity
-numbers and `tools/moe_reference.py` writes the fixtures they run against.
+The routers reproduced are transformers 5.16.1's `MixtralSparseMoeBlock`
+(softmax, top k, renormalise), `DeepseekV3MoE` (sigmoid, select with a bias
+inside the best expert groups, renormalise, scale, add a shared expert) and
+DeepSeek V4's sqrt(softplus) score and swiglu limit. `tests/test_moe.py`
+holds the fp32 parity numbers against `tools/moe_reference.py`'s fixtures.
 
-Parameters follow the Hugging Face layout of a sparse decoder layer, with the
-experts stacked on an expert dimension: `mlp/gate/kernel` is `[embed, exp]`,
-`mlp/experts/gate_proj/kernel` and `mlp/experts/up_proj/kernel` are `[exp,
-embed, mlp]`, and `mlp/experts/down_proj/kernel` is `[exp, mlp, embed]`. A
-checkpoint's per-expert `mlp.experts.N.gate_proj.weight` tensors stack into one
-leaf, which is the layout `jax.lax.ragged_dot` takes and the `expert` mesh axis
-shards.
+Parameters follow the Hugging Face sparse layer with the experts stacked:
+`mlp/gate/kernel` `[embed, exp]`, `mlp/experts/{gate,up}_proj/kernel` `[exp,
+embed, mlp]` and `mlp/experts/down_proj/kernel` `[exp, mlp, embed]`, the
+layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
 import dataclasses
@@ -78,17 +71,15 @@ type Routes = tuple[jax.Array, jax.Array | None]
 engine used, and `[...]` booleans marking the tokens its record covers (None
 for all of them).
 
-Routing replay (R3, arXiv 2510.11370; verl 12ebe0c `router_replay_patch.py`
-over Megatron's `topk_routing_with_score_function`) trains a mixture on the
-experts the engine used, so a top-k flip between the engine's numerics and
-the trainer's cannot move a token to experts that never produced its sample.
-Only the selection is replayed: the gate weights are gathered from this
-forward's scores, so the router keeps its gradient. A token the record does
-not cover (the last sampled id, padding) keeps the router's own choice, as
-verl's replay mask does. The stack hands each layer its slice of a
-`[B, S, layers, top_k]` record (`CausalTransformer.hidden_states`). The
-sown `indices` are the replayed ones, so a balancing bias counts the experts
-the tokens went to, as Megatron's R3 path in verl does."""
+Routing replay (R3, arXiv 2510.11370; verl 12ebe0c `router_replay_patch.py`)
+trains a mixture on the engine's experts, so a top-k flip between the
+engine's numerics and the trainer's cannot move a token to experts that
+never produced its sample. Only the selection is replayed; the gate weights
+come from this forward's scores, so the router keeps its gradient. An
+uncovered token keeps the router's choice, as verl's replay mask does, and
+the sown `indices` are the replayed ones, so a balancing bias counts where
+the tokens went. The stack hands each layer its slice of a `[B, S, layers,
+top_k]` record (`CausalTransformer.hidden_states`)."""
 
 
 def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],
@@ -146,25 +137,13 @@ def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
 
 def sequence_router_losses(scores: jax.Array, indices: jax.Array,
                            alpha: float) -> jax.Array:
-    """Compute one DeepSeek V2 load-times-score loss per intact sequence."""
+    """Compute one DeepSeek V2 load-times-score loss per intact sequence
+    (arXiv 2405.04434, section 2.1.4)."""
     _, length, experts = scores.shape
     scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
     chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
     load = jnp.sum(chosen, axis=(1, 2)) / (length * indices.shape[-1] / experts)
     return jnp.sum(load * jnp.mean(scores, axis=1), axis=1) * alpha
-
-
-def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
-    """Score DeepSeek V2's expert balance (arXiv 2405.04434, section 2.1.4).
-
-    Scores are [batch, sequence, experts], choices [batch, sequence, top_k].
-    `seq_aux` forms the product within each sequence before averaging rows.
-    The global variant pools all routed positions before forming the
-    product.
-    """
-    if seq_aux:
-        return jnp.mean(sequence_router_losses(scores, indices, alpha))
-    return global_router_loss(router_moments(scores, indices), alpha)
 
 
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
@@ -202,42 +181,27 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
 class Router(nn.Module):
     """Choose which experts a token goes to, and with what weight: `[..., k]`.
 
-    The gate projection runs in fp32 whatever dtype the activations carry,
-    as DeepSeek's router does (`modeling_deepseek_v3.py:146`).
+    The gate projection runs in fp32, as DeepSeek's does
+    (`modeling_deepseek_v3.py:146`).
 
     `expert_bias` is DeepSeek's aux-loss-free balancing bias
-    (`e_score_correction_bias`, arXiv 2408.15664), kept in fp32 in the `moe`
-    collection. It enters the selection only: a token's weights are gathered
-    from the unbiased scores, so moving the bias changes which experts a token
-    uses without changing what they contribute. Nothing here writes it;
-    transformers holds it in an `nn.Buffer` and MaxText hands the update back
-    to its caller (`layers/moe.py:965-972`). `load_balance_update` is that
-    update, and the step that applies it owns the write. Gradients
-    cannot reach the bias either, since it feeds only `jax.lax.top_k`'s
-    integer indices.
+    (`e_score_correction_bias`, arXiv 2408.15664), fp32 in the `moe`
+    collection. It enters the selection only, so it changes which experts a
+    token uses and not what they contribute, and no gradient reaches it.
+    `load_balance_update` computes its update and the step that applies it owns
+    the write (MaxText `layers/moe.py:965-972` hands it back the same way).
 
-    `expert_groups` above one is DeepSeek's node limit: experts are cut into
-    that many groups, each group is scored by its two best experts, and a token
-    may only choose inside the best `groups_per_token` of them. `group_score`
-    names the group's score: 'top2' is V3's sum of its two best experts
-    (`noaux_tc`), 'max' is V2's best expert alone (`group_limited_greedy`,
-    modeling_deepseek_v2.py `DeepseekV2TopkRouter`).
-
-    `normalize_weights` divides a token's selected weights by their sum,
+    `expert_groups` above one is DeepSeek's node limit: a token chooses inside
+    the best `groups_per_token` groups, scored by `group_score`, 'top2' (V3's
+    `noaux_tc`) or 'max' (V2's `group_limited_greedy`). `normalize_weights` is
     the reference's `norm_topk_prob`; V2's released configs set it false.
 
-    `hash_vocab` set makes this DeepSeek V4's hash router
-    (`DeepseekV4HashRouter`, modeling_deepseek_v4.py:1045-1073): a token's
-    experts are the `top_k` entries of a fixed `tid2eid` table at its
-    vocabulary id, `[hash_vocab, top_k]` in the `moe` collection beside the
-    bias (the checkpoint's persistent buffer), and the learned gate still
-    weights them, gathered from the scores the same way. The caller passes
-    the token ids; the table is never written by training.
-
-    `media_bias` is DeepSeek-V4.1's second balancing bias, which selects for
-    the tokens of an image span in place of `expert_bias` (the release's
-    `bias_vl`, model.py:807-820); the caller passes the `media` mask. It sits
-    in the `moe` collection beside the other and nothing here writes it.
+    `hash_vocab` makes this DeepSeek V4's hash router (`DeepseekV4HashRouter`,
+    modeling_deepseek_v4.py:1045-1073): the experts are the `top_k` entries of a
+    fixed `tid2eid` table `[hash_vocab, top_k]` in the `moe` collection at the
+    token id the caller passes, weighted by the learned gate. `media_bias` is
+    DeepSeek-V4.1's second bias, selecting for image-span tokens in place of
+    `expert_bias` (`bias_vl`, model.py:807-820), given the `media` mask.
     """
     num_experts: int
     in_features: int
@@ -350,10 +314,6 @@ class Router(nn.Module):
         return jnp.einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                           precision=self.precision)
 
-    def scores(self, x):
-        """Each token's fp32 affinity for every expert: `[..., num_experts]`."""
-        return self._activated(self.logits(x))
-
     def _activated(self, logits):
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
@@ -382,26 +342,21 @@ class Router(nn.Module):
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
-# The grouped matmul 'auto' runs, per hardware generation (`device_generation`):
-# the measured winner, forward plus backward, at lm-moe's shape (8192 rows,
-# 768 -> 2048, 8 experts, bf16) and at 128 experts; numbers in
-# docs/performance.md. On sm80 (A100), sm86 (RTX 3090) and sm89 (L4, RTX 4080) that is JAX's
-# own Pallas kernels (`dew.nn.kernels.grouped_matmul`), 5x to 61x faster than
-# XLA, which runs ragged_dot there as a product over every expert. On a TPU
-# v5e and v6e it is XLA's ragged_dot; the one kernel that beats it at 8
-# experts (tokamax's mosaic_tpu_v2, 1.11x-1.38x) cannot be a dependency:
-# tokamax 0.0.14 pins typeguard==2.13.3 where tyro needs >=4. Every
-# generation not listed runs 'xla': sm75 cannot compile the kernels, and
-# sm90 and sm120 are unmeasured.
+# The grouped matmul 'auto' runs per hardware generation (`device_generation`):
+# the measured winner, forward plus backward, at lm-moe's shape and at 128
+# experts (docs/performance.md). On sm80, sm86 and sm89 JAX's Pallas kernels
+# run 5x to 61x faster than XLA's ragged_dot, a product over every expert.
+# On TPU v5e/v6e XLA wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8
+# experts), which is not a dependency: tokamax 0.0.14 pins typeguard==2.13.3
+# where tyro needs >=4, and only constraints.txt's main-commit pin installs
+# without it. Unlisted generations run 'xla'.
 GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas',
                                 'v5e': 'xla', 'v6e': 'xla'}
 
-# The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
-# Mosaic kernel first: on a TPU that is the v1 kernel, 4x to 13x slower than
-# XLA, and on sm89 a Mosaic GPU config that exceeds shared memory and raises.
-# Only the forward runs on tokamax (`expert_projection` differentiates on
-# XLA): its Triton backward faults (CUDA_ERROR_ILLEGAL_ADDRESS) on sm80 and
-# sm89. Unmeasured generations run tokamax's 'xla'.
+# The kernel 'tokamax' names, per generation: its own dispatch tries Mosaic
+# first, 4x to 13x slower than XLA on a TPU and over shared memory on sm89.
+# Only the forward runs on tokamax: its Triton backward faults
+# (CUDA_ERROR_ILLEGAL_ADDRESS) on sm80 and sm89.
 TOKAMAX_KERNEL_BY_GENERATION = {'sm80': 'triton', 'sm89': 'triton',
                                 'v5e': 'mosaic_tpu_v2', 'v6e': 'mosaic_tpu_v2'}
 
@@ -410,11 +365,10 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
                           precision: PrecisionLike) -> str:
     """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
 
-    'auto' takes the hardware generation's measured one
-    (`GROUPED_MATMUL_BY_GENERATION`) and 'xla' on an unmeasured generation.
-    'pallas', named or chosen, needs a GPU the kernels compile for and a
-    product they compute exactly (`ragged_dot_runs`); elsewhere it is 'xla'.
-    `operands` are the dtypes of the input and the kernel as stored.
+    'auto' takes the generation's measured one (`GROUPED_MATMUL_BY_GENERATION`).
+    'pallas' needs a GPU the kernels compile for and a product they compute
+    exactly (`ragged_dot_runs`), else 'xla'. `operands` are the input and kernel
+    dtypes as stored.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
@@ -433,17 +387,13 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                    implementation: str, precision: PrecisionLike = None,
                    preferred_element_type: Dtype | None = None) -> jax.Array:
     """Each row of `tokens`, `[rows, in]`, through the matrix of its expert in
-    `kernel`, `[exp, in, out]`, for rows already sorted by expert.
+    `kernel`, `[exp, in, out]`, for rows already sorted by expert; `group_sizes`
+    counts each expert's leading rows.
 
-    `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on. This is the raw call with JAX's own differentiation rules:
-    'tokamax' is `tokamax.ragged_dot` with the kernel named per generation
-    (`TOKAMAX_KERNEL_BY_GENERATION`, XLA elsewhere; `maxtext
-    layers/moe.py:1633`), and every other implementation is
-    `jax.lax.ragged_dot`. The Pallas kernels have no JAX differentiation
-    rule, so they run behind `expert_projection`, which adds the precision
-    contract routed experts train under and the gradients of every
-    implementation.
+    The raw call with JAX's own differentiation rules: 'tokamax' is
+    `tokamax.ragged_dot` with the kernel named per generation (`maxtext
+    layers/moe.py:1633`), everything else `jax.lax.ragged_dot`. The Pallas
+    kernels have no JAX rule, so they run behind `expert_projection`.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
@@ -489,22 +439,18 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       precision: PrecisionLike) -> jax.Array:
     """`grouped_matmul` under one precision contract for both dispatches.
 
-    The operands are cast to `dtype` (flax's promotion when None), every
-    contraction accumulates in at least fp32 and rounds once to the compute
-    dtype, so a width split over a mesh axis rounds no partial sum. The
-    tangent is `dx @ Q(kernel) + Q(x) @ dkernel` with `Q` the rounded operand
-    values and the tangents in their own dtypes: a kernel gradient keeps the
-    master dtype, an input gradient its input's, and both accumulate over
-    the widest of the compute, input and kernel dtypes. The contract does
-    not depend on placement.
+    Operands cast to `dtype` (flax's promotion when None), every contraction
+    accumulates in at least fp32 and rounds once to the compute dtype, so a
+    split width rounds no partial sum. The tangent is `dx @ Q(kernel) + Q(x) @
+    dkernel` with `Q` the rounded operands: a kernel gradient keeps the master
+    dtype, an input gradient its input's, both accumulating over the widest of
+    the compute, input and kernel dtypes, whatever the placement.
 
-    'xla' and 'tokamax' hold it in every differentiation mode: the forward
-    runs on the chosen kernel and the tangent contractions on
-    `jax.lax.ragged_dot`, whose transposes JAX defines. 'pallas' holds it in
-    first-order reverse mode (`dew.nn.kernels.grouped_matmul`); a trace the
-    kernels cannot take (`_local`) runs 'xla'. Measured against NumPy
-    float64 sums of the rounded operands and three Adam steps of the global
-    path on every expert/fsdp layout in tests/test_moe_precision.py.
+    'xla' and 'tokamax' hold it in every differentiation mode (tangents on
+    `jax.lax.ragged_dot`); 'pallas' in first-order reverse mode
+    (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
+    (`_local`) runs 'xla'. tests/test_moe_precision.py measures it against
+    float64 sums and three Adam steps on every expert/fsdp layout.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
@@ -616,28 +562,27 @@ GatedActivation = str | Situ
 
 def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
-    where torch rounds `act_fn(gate) * up`: the activation, silu ('swiglu'),
-    the tanh gelu ('geglu') or the erf gelu ('geglu_exact', `exact_gelu`),
-    runs in fp32 and rounds to the gate's dtype, and its product with up
-    rounds again. Every rounding is made in place (`rounded_to`), the
-    inputs' included, since a projection's fp32 sum can otherwise reach the
-    activation past its own cast: written as `activate(gate) * up` on bf16
-    values, jit left the roundings to XLA, and a third of Qwen3-0.6B's
-    products differed from transformers' by up to 2 ulp. fp32 and wider
-    compute round nowhere, so their product is `activate(gate) * up` as it
-    was. A `Situ` computes its own product."""
+    where torch rounds `act_fn(gate) * up`: the activation (silu 'swiglu', tanh
+    gelu 'geglu', erf gelu 'geglu_exact') runs in fp32 and rounds to the gate's
+    dtype, and the product rounds again. Every rounding is explicit
+    (`rounded_to`), the inputs' included: left to XLA, a third of Qwen3-0.6B's
+    bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
+    round nowhere. A `Situ` computes its own product."""
     if isinstance(activation, Situ):
         return activation
-    gates = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True), 'geglu_exact': exact_gelu}
+    gates = {
+        "swiglu": nn.silu,
+        "geglu": functools.partial(nn.gelu, approximate=True),
+        "geglu_exact": exact_gelu,
+    }
     if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
     activate = gates[activation]
 
     # Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
-    # differentiated as written it keeps five fp32 copies of the MLP's width
-    # per token. An unrolled stack lets XLA fuse them away; a scanned one
-    # stores them: on a TPU v6e a scanned 12-layer 512-wide decoder's step
-    # took 10.51 ms with them and 9.06 ms without, and 1.33x the memory.
+    # a scanned stack otherwise stores five fp32 copies of the MLP width per
+    # token (TPU v6e, scanned 12-layer 512-wide decoder: 10.51 ms against 9.06
+    # and 1.33x the memory).
     @functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
     def rounded_product(gate: jax.Array, up: jax.Array) -> jax.Array:
         dtype = jnp.result_type(gate, up)
@@ -655,15 +600,13 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
 
 
 class ExpertLinear(nn.Module):
-    """One matrix per expert, `[exp, in_features, features]`, over tokens
-    already sorted by expert, through `expert_projection` on `implementation`."""
+    """One matrix per expert, `[exp, in_features, features]`; `ExpertMLP`
+    reads the kernel and projects tokens sorted by expert through
+    `expert_projection`."""
     num_experts: int
     in_features: int
     features: int
-    implementation: str = 'auto'
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
 
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
@@ -675,28 +618,18 @@ class ExpertLinear(nn.Module):
                 batch_axis=(0,)))['kernel_init'],
             (self.num_experts, self.in_features, self.features), jnp.float32)
 
-    def __call__(self, tokens, group_sizes):
-        return jnp.asarray(expert_projection(
-            tokens, self.kernel, group_sizes, self.dtype, self.implementation, self.precision))
-
 
 def capacity_positions(indices: jax.Array, num_experts: int,
                        capacity_factor: float) -> tuple[jax.Array, int]:
     """Each routed slot's place in its expert's queue, and how many places a
     queue keeps.
 
-    `indices` is `[..., length, top_k]`: every leading row is one sequence of
-    `length` tokens (a rank-two routing is one sequence). A sequence queues
-    its slots at each expert in token order; a token's choices are distinct
-    experts, so they never compete for one queue. Each queue keeps
-    `capacity` places, MaxText's `expert_capacity_per_batch`
-    (`maxtext layers/moe.py` `generate_masks`): `max(ceil(length * top_k /
-    num_experts) * capacity_factor, capacity_factor)`, truncated.
-
-    Counting within a sequence is what makes the dropped slots a property of
-    the batch rather than of its placement: data, expert, fsdp and tensor
-    split whole rows, and the count runs over the whole row whatever splits
-    its positions.
+    `indices` is `[..., length, top_k]`, each leading row one sequence. A
+    sequence queues its slots at each expert in token order (a token's choices
+    are distinct experts). A queue keeps MaxText's `expert_capacity_per_batch`
+    (`layers/moe.py` `generate_masks`): `max(ceil(length * top_k / num_experts)
+    * capacity_factor, capacity_factor)`, truncated. Counting within a sequence
+    makes the dropped slots a property of the batch and not of its placement.
     """
     *_, length, top_k = indices.shape
     capacity = int(max(math.ceil(length * top_k / num_experts) * capacity_factor,
@@ -722,44 +655,27 @@ def expert_dispatch[Parameters](
     """Run every routed token through its expert, and return the slots in
     token order.
 
-    `project` takes rows sorted by expert, the group sizes, the sorted
-    expert ids and the expert-major parameters, and returns rows of the same
-    width. `parameter_axes` names each parameter's dimensions as its module
-    declares them. The caller owns the activation, the biases and the output
-    weights; `input_weights` scales each expert's input instead, as Llama 4
-    does. `x` is `[batch, length, width]` or `[tokens, width]`.
+    `project` takes rows sorted by expert, the group sizes, the sorted expert
+    ids and the expert-major parameters, and returns rows of the same width;
+    `parameter_axes` names the parameters' dimensions. The caller owns the
+    activation, biases and output weights; `input_weights` scales each expert's
+    input instead, as Llama 4 does. `x` is `[batch, length, width]` or
+    `[tokens, width]`.
 
-    `dispatch='global'` sorts and gathers the tokens where they are: on a
-    mesh, inside a `shard_map` that holds them where the residual stream
-    does (`activation_batch`, `activation_length`), so each device routes
-    its own rows through every expert and a layout computes each token once,
-    and `project` sees device-local rows, as the Pallas kernels need
-    (MaxText's `sparse_matmul_route_and_compute` has the same structure).
+    `dispatch='global'` routes the tokens where they are, in a `shard_map` that
+    holds them as the residual stream does, so each device runs its own rows
+    through every expert on device-local rows, as the Pallas kernels need
+    (MaxText's `sparse_matmul_route_and_compute`). `'exchange'` is expert
+    parallelism with the expert axis manual: each device trades buckets of its
+    slots with the shards owning their experts in `all_to_all` rounds
+    (`_exchange_shard`), keeping every slot; rows the batch axes do not divide
+    are padded. Parameters enter in their stored shards and are gathered
+    inside, so gradients leave reduce-scattered.
 
-    `'exchange'` is expert parallelism, in the same `shard_map` with the
-    expert axis manual: each device sorts its own slots by the expert shard
-    that owns them and trades buckets of them with its peers in
-    `all_to_all` rounds (`_exchange_shard`), keeping every selected slot. A
-    device's experts enter it alone, split as the `exp` rule splits them.
-    Rows the batch axes do not divide are padded until they do, so every
-    shard sends tokens of its own.
-
-    The parameters enter the map in the shards they are stored in and are
-    gathered inside it, all but a device's own experts under the exchange,
-    so their gradient leaves reduce-scattered onto those shards rather than
-    summed whole on every device.
-
-    `capacity_factor` drops instead, as GShard and MaxText do: each
-    sequence keeps `capacity_positions`' count of slots per expert, in
-    token order, and a dropped slot contributes nothing. Both dispatches
-    drop the same slots whatever the placement, and the exchange then needs
-    exactly one round, whose buckets hold what a device's sequences can
-    keep.
-
-    The parameters take part in at least fp32, so the gradient a device
-    computes for them is summed with its peers' and over the rounds in fp32
-    and meets the master dtype once, after the sum: the same arithmetic on
-    one device and on any mesh.
+    `capacity_factor` drops as GShard and MaxText do (`capacity_positions`),
+    the same slots under either dispatch and placement, and the exchange then
+    needs one round. Parameters take part in at least fp32, so gradients sum
+    across devices and rounds in fp32 and meet the master dtype once.
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
@@ -954,22 +870,13 @@ def _exchange_shard[Parameters](
     """Run one device's share of `expert_dispatch`'s exchange, inside its
     shard_map.
 
-    The device sorts its own slots by expert and sends each destination
-    shard one bucket of them in a first round. Dropless, that bucket is the
-    device's balanced share, its slots divided by the shards, and what a
-    skewed routing leaves over follows in later rounds of the same size:
-    the expert axis's maximum count, so every peer runs the same number, out
-    of the most a routing of every slot to one shard can need. Under a
-    capacity, a sequence keeps `capacity` slots per expert, so the first
-    round's bucket holds what the device's sequences (or parts of one,
-    where positions are split) can keep for one peer's experts, and no slot
-    is left over.
-
-    The first round's intermediates are kept for the backward pass like any
-    layer's. The later rounds run in a scan, checkpointed so that it keeps
-    none of theirs and recomputes each one it ran; a scan's cond stacks its
-    residuals per iteration, so the later rounds are as few as the bucket
-    size allows.
+    The device sorts its slots by expert and sends each shard one bucket in a
+    first round. Dropless, the bucket is its balanced share, and what a skewed
+    routing leaves follows in later rounds of the same size, as many as the
+    expert axis's maximum needs. Under a capacity the first bucket holds what
+    the device's sequences can keep for one peer and nothing is left over. The
+    later rounds run in a checkpointed scan, which recomputes rather than keeps
+    their intermediates, so they are as few as the bucket size allows.
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
@@ -1058,36 +965,19 @@ class ExpertMLP(nn.Module):
     """The routed experts of one layer: each token through the gated MLPs its
     router chose.
 
-    Tokens are gathered into expert order, the three projections run as grouped
-    matmuls over that order, and the results go back to token order and are
-    summed with their router weights (`maxtext layers/moe.py:940` `permute` and
-    `:1101` `unpermute`). The gather reads token rows directly, without a
-    `top_k`-fold copy of them, which is MaxText's `moe_use_direct_token_gather`.
-
-    `dispatch='global'` retains that path. `'exchange'` opts into all-to-all
-    rounds on an expert mesh axis that divides the expert count. Each round
-    uses a local-slot-sized message buffer and later rounds keep excess
-    assignments, so no slot is dropped unless `capacity_factor` asks for it
-    (`expert_dispatch`). Initialisation creates the same parameters without
-    requiring a mesh. The projections run through `expert_projection`, whose
-    precision contract is the same under both dispatches, so a routed layer
-    computes the same forward, gradients and tangents whichever moves the
-    tokens.
-
-    The sum over a token's experts runs in fp32, because that is the dtype the
-    router weights are computed in, and the result rejoins the residual stream
-    in the compute dtype.
+    Tokens gather into expert order straight from their rows (MaxText's
+    `moe_use_direct_token_gather`), the three projections run as grouped
+    matmuls, and the results return to token order summed with their router
+    weights in fp32 (`maxtext layers/moe.py:940` `permute`, `:1101`
+    `unpermute`). `dispatch` and `capacity_factor` are `expert_dispatch`'s;
+    `expert_projection` holds one precision contract under both dispatches.
 
     `swiglu_limit` is DeepSeek V4's clamp before the activation
-    (`modeling_deepseek_v4.py`, `DeepseekV4Experts._apply_gate`): the gate is
-    capped at the limit from above and the up projection on both sides, which
-    bounds what one expert can add. None is the plain gated MLP.
-
-    `scale_inputs` is Llama 4's placement of the routing weight: each
-    token's input to an expert is multiplied by its weight and the expert
-    outputs are summed unweighted (`modeling_llama4.py`,
-    `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
-    weighted sum of outputs because the gate is not linear.
+    (`DeepseekV4Experts._apply_gate`): the gate is capped from above and the up
+    projection on both sides. `scale_inputs` is Llama 4's placement of the
+    routing weight on each expert's input with outputs summed unweighted
+    (`Llama4TextMoe.forward`), not the same as weighting outputs, since the gate
+    is not linear.
     """
     num_experts: int
     hidden_features: int
@@ -1108,10 +998,7 @@ class ExpertMLP(nn.Module):
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
                 f"positive, got {self.swiglu_limit}; None leaves them unclamped")
-        expert = functools.partial(
-            ExpertLinear, num_experts=self.num_experts,
-            implementation=self.implementation, dtype=self.dtype,
-            precision=self.precision)
+        expert = functools.partial(ExpertLinear, num_experts=self.num_experts)
         self.gate_proj = expert(in_features=self.out_features,
                                 features=self.hidden_features, init_std=self.init_std,
                                 name='gate_proj')
@@ -1181,24 +1068,18 @@ class ExpertMLP(nn.Module):
 class SparseMLP(nn.Module):
     """A router over `num_experts` gated MLPs, `top_k` of them per token.
 
-    Goes where `GatedMLP` goes in a decoder block and holds the submodules a
-    Hugging Face sparse layer names: `gate` for the router, `experts` for the
-    stacked expert weights and, when `shared` is set, `shared_experts` for
-    the dense branch every token takes. `shared` is a factory taking only a
-    name, the shape of `DecoderBlock`'s slots, so the backbone hands in its
-    own `GatedMLP` at the shared width and the sum is what `DeepseekV3MoE`
-    computes: the routed output plus the shared branch of the same input.
-    With shared_gate, a learned scalar sigmoid independently weights the
-    shared branch, as Qwen3_5MoeSparseMoeBlock does.
+    Goes where `GatedMLP` goes and holds the submodules a Hugging Face sparse
+    layer names: `gate`, `experts`, and with `shared` (a factory taking a name)
+    `shared_experts`, the dense branch every token takes, added to the routed
+    output as `DeepseekV3MoE` does. `shared_gate` weights it by a learned
+    scalar sigmoid, as Qwen3_5MoeSparseMoeBlock does.
 
     `latent_features` is Kimi K3's latent MoE (`KimiSparseMoeBlock`,
     modeling_kimi_linear.py:762-838 of moonshotai/Kimi-K3 at f831ab6): the
-    router reads the full-width input, `routed_expert_down_proj` narrows it
-    to the latent width the experts run at, and the weighted sum of their
-    outputs goes through `latent_norm` (a factory taking a name, the
-    backbone's RMSNorm; None for none) and `routed_expert_up_proj` back to
-    `out_features`. The shared branch reads the full-width input. None is
-    every other mixture, whose experts run at `out_features`.
+    router reads the full width, `routed_expert_down_proj` narrows to the
+    latent width the experts run at, and their weighted sum goes through
+    `latent_norm` and `routed_expert_up_proj` back to `out_features`. The shared
+    branch reads the full width.
     """
     num_experts: int
     top_k: int

@@ -106,7 +106,7 @@ python tools/benchmark_data.py data:oxford-flowers --batch 8 \
     --data.path <prepared version directory>
 ```
 
-The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. `OxfordFlowers` reads only prepared ArrayRecords and raises a `ValueError` without `--data.path`, so the command passes it.
+The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. `TFDSImages` reads only prepared ArrayRecords and raises a `ValueError` without `--data.path`, so the command passes it.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|
@@ -115,4 +115,4 @@ The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 recor
 
 With workers, the p50 is a queue read, so the loader only shows up in the p95. At 8 workers the pipeline delivers 505 images/s. The image rows of the first step table consume 489-2036 samples/s, all but `hierarchical_mmdit` (489) above 505, so at 64px this loader keeps up with `hierarchical_mmdit` and starves the other image models; a low `train/mfu` on an image run is worth checking against the loader first. The video rows count 8-frame clips, and this image loader does not measure video throughput.
 
-These two points are not the loader's ceiling. The measured run read with 16 threads; `tools/benchmark_data.py` now has no read-thread setting of its own and reads with the dataset spec's `Loading`, whose defaults are 32 workers and 64 threads, changed with `--data.loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.
+These two points are not the loader's ceiling. The measured run read with 16 threads; `tools/benchmark_data.py` now has no read-thread setting of its own and reads with the dataset spec's `Loading`, whose defaults are no worker processes and 64 threads, changed with `--data.loading.workers` and `--data.loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.

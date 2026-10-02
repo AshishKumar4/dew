@@ -4,13 +4,14 @@ tests/test_distribution.py starts it through the launcher, so the process
 joins exactly as a multi-node run does: `prepare_process` reads the
 coordinator, count and rank `dew launch` left in the environment. The pool
 trains a few steps through `Trainer.fit` on one packed global batch, each
-process reading the share of it the mesh gives it (`data_partition`), and
+process reading the share of it the mesh gives it (`DataPartition.of`), and
 process 0 writes the losses, the partition and, for every fsdp group of the
 mesh, the processes its devices sit on. The same script on one process is
 the reference the pool is compared with.
 """
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -88,10 +89,10 @@ def main() -> None:
     from jax.experimental import multihost_utils
 
     from dew.checkpoints import Checkpoints
-    from dew.data import Dataset
+    from dew.data import DataPartition, Dataset
     from dew.objectives.lm import LMObjective
     from dew.registry import models
-    from dew.training import Layout, MeshSpec, Trainer, data_partition
+    from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import shard_batch
 
     def share(partition):
@@ -140,13 +141,21 @@ def main() -> None:
                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
                       checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
                       tracker=losses)
-    trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
-                steps=args.steps, log_every=1)
+    state = trainer.fit(Dataset(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
+                        steps=args.steps, log_every=1)
+    # Every leaf of the trained state whole, in a fixed order, so two runs'
+    # states compare by one hash.
+    digest = hashlib.sha256()
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state):
+        whole = np.asarray(multihost_utils.process_allgather(
+            jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf,
+            tiled=True))
+        digest.update(jax.tree_util.keystr(path).encode() + whole.tobytes())
 
     # A leaf whose second dimension the sequence axis splits, placed from the
     # share and gathered back whole.
     mesh = trainer.device_mesh
-    partition = data_partition(mesh)
+    partition = DataPartition.of(mesh)
     wide = np.arange(BATCH * SEQ_LEN, dtype=np.float32).reshape(BATCH, SEQ_LEN)
     rows = partition.rows(BATCH)
     placed = shard_batch(mesh, {"wide": wide[partition.index * rows:(partition.index + 1) * rows]})
@@ -161,6 +170,7 @@ def main() -> None:
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
             "losses": losses.losses,
             "loss_steps": losses.steps,
+            "state_digest": digest.hexdigest(),
         }))
 
 

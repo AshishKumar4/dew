@@ -8,6 +8,7 @@ raises a ValueError for a knob a fused kernel cannot honor.
 
 import collections
 import json
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -16,9 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src import source_info_util
+from reference_error import assert_fp32_reduction_bound
 from test_architectures import CASES as ARCHITECTURE_CASES
 
-from dew import models
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
 from dew.nn.attention import local_attention, scaled_dot_product_attention
@@ -31,7 +32,10 @@ from dew.nn.llama4 import Llama4Attention
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import dtype_name, float64_twin, resolve_dtype, with_precision
+from dew.registry import dtype_name, float64_twin, models, resolve_dtype, with_precision
+
+import_module("dew.nn.multimodal")  # registers the fixture kind
+
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -213,6 +217,11 @@ PER_ARCH = {
                          "guidance_embeds": True, "axes_dims_rope": (4, 4, 4)},
     "qwen_image_transformer": {"in_channels": 4, "out_channels": 4, "num_layers": 1, "heads": 2,
                                "head_dim": 12, "context_in_dim": 16, "axes_dims_rope": (4, 4, 4)},
+    "flux2_transformer": {"in_channels": 16, "out_channels": 16, "num_layers": 1, "num_single_layers": 1,
+                          "heads": 2, "head_dim": 16, "joint_attention_dim": 16,
+                          "timestep_guidance_channels": 32, "axes_dims_rope": (4, 4, 4, 4)},
+    "z_image_transformer": {"in_channels": 4, "dim": 32, "n_layers": 1, "n_refiner_layers": 1, "n_heads": 2,
+                            "cap_feat_dim": 16, "axes_dims": (4, 6, 6), "axes_lens": (64, 16, 16)},
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
@@ -255,7 +264,15 @@ def build_model(architecture, dtype="bfloat16"):
     if architecture in DECODERS:
         return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
     if architecture not in COMPOSITES:
-        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer", "edm2_unet")
+        own = (
+            "unet_2d_condition",
+            "sd3_transformer",
+            "flux_transformer",
+            "qwen_image_transformer",
+            "edm2_unet",
+            "flux2_transformer",
+            "z_image_transformer",
+        )
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **resolved(architecture, fields))
     text = models.build("causal_transformer", **resolved(
@@ -265,7 +282,7 @@ def build_model(architecture, dtype="bfloat16"):
     return MultimodalTransformer(
         text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                            image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=TINY["emb_features"],
+        GemmaProjector(text_width=TINY["emb_features"],
                        patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1,
         dtype=jnp.float64 if dtype == "float64" else resolve_dtype(dtype))
@@ -289,6 +306,14 @@ def tiny_inputs(architecture, rng):
         latents = jax.random.normal(rng, (1, 8, 8, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], jnp.ones((1, 10)), guidance=jnp.full((1,), 3.5))}
+    if architecture == "flux2_transformer":
+        latents = jax.random.normal(rng, (1, 4, 4, 16))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :16], guidance=jnp.full((1,), 3.5))}
+    if architecture == "z_image_transformer":
+        latents = jax.random.normal(rng, (1, 4, 4, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :16], mask=text.mask)}
     if architecture == "qwen_image_transformer":
         latents = jax.random.normal(rng, (1, 4, 4, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
@@ -464,6 +489,27 @@ def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
     assert rounded.dtype == source
     assert jnp.array_equal(rounded, x.astype(target).astype(source), equal_nan=True)
     assert not jnp.array_equal(rounded, x)
+
+
+@pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
+def test_a_rounding_survives_the_reduction_it_feeds(helper):
+    """XLA:CPU's YNNPACK reduce fusion sums the unrounded values of a bare
+    `astype` round trip, even with excess precision off (openxla/xla#49978);
+    the helpers' optimization barrier keeps the rounding a sum and a mean
+    of squares read, as a norm's statistics do."""
+    from dew.nn import precision
+    x = np.random.default_rng(0).normal(size=(8, 4096)).astype(np.float32) * 3
+    rounded = x.astype(jnp.bfloat16).astype(np.float64)
+    held = jax.jit(lambda v: getattr(precision, helper)(v, jnp.bfloat16).astype(jnp.float32))
+    sums = np.asarray(jax.jit(lambda v: jnp.sum(held(v), axis=-1))(x), np.float64)
+    squares = np.asarray(jax.jit(lambda v: jnp.mean(jnp.square(held(v)), axis=-1))(x), np.float64)
+    assert_fp32_reduction_bound(sums, rounded.sum(-1), np.abs(rounded).sum(-1), x.shape[-1])
+    mean_square = np.mean(rounded ** 2, -1)
+    assert_fp32_reduction_bound(squares, mean_square, mean_square, x.shape[-1] + 2)
+    # The bound is a worst case (4.8 on these sums), wider than what dropping
+    # the rounding moves them (at most 0.96), so each sum must also be nearer
+    # the rounded values' than the unrounded ones'.
+    assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
 def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():

@@ -16,11 +16,7 @@ Scope is per rule, because the rules are not all about the same thing:
   comment and an unsplittable function are defects anywhere, so those do.
 - SLOP008 is about the suite only.
 
-Enforcement is staged. `ENFORCED` names the rules the tree is at zero for, and
-those are the ones that fail the gate; `ADOPTING` names the rest, which print
-with a per-rule file count and do not set the exit status. A rule moves from
-`ADOPTING` to `ENFORCED` in the same commit that takes its count to zero, so
-the gate is green from the first commit and gets stricter, never redder.
+Every rule fails the gate, and none has a per-finding suppression.
 
 Analysis boundaries, stated the way anti-slop states its own: this reads one
 file's AST, with no imported definitions and no inference across calls.
@@ -43,15 +39,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Which rules fail the gate. A rule is enforced once the tree is at zero for
-# it, and it moves here in the same commit that takes it to zero; until then it
-# is counted, printed per rule with the file count, and left out of the exit
-# status. Adopting is not suppressing: every finding prints, and a rule never
-# moves back. There are no per-finding suppressions in either set.
-ENFORCED = frozenset({"SLOP001", "SLOP002", "SLOP003", "SLOP004", "SLOP005",
-                      "SLOP006", "SLOP007", "SLOP008", "SLOP009"})
-ADOPTING: frozenset[str] = frozenset()
-
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
 # data pipeline already depend on. Every other open dictionary in a contract is
@@ -73,7 +60,7 @@ VAGUE = {"tmp", "temp", "obj", "thing", "info", "item", "items", "val", "helper"
          "util", "utils", "manager", "handler", "res", "ret", "arr", "lst", "dct", "num",
          "cnt", "idx", "flag", "foo", "bar", "data", "result", "results"}
 VAGUE_SUFFIXES = ("_impl", "_v2", "_new", "_old", "_copy")
-# Three words the tree earns. `value` is the attention V, `Mean.value` and the
+# Three words the tree earns. `value` is the attention V, `Ratio.value` and the
 # partner of `key` in 296 more places; `values` is the same plural, the critic
 # values of GAE among them; `out` is the output array a numeric function
 # returns, which is what numpy calls its own out= parameter. Counted at 405,
@@ -572,13 +559,9 @@ def main() -> int:
             counts[finding.code] = counts.get(finding.code, 0) + 1
             files.setdefault(finding.code, set()).add(finding.path)
     for code, count in sorted(counts.items()):
-        where = f"{count} in {len(files[code])} files"
-        state = "enforced" if code in ENFORCED else "adopting"
-        print(f"{code} ({state}): {where}", file=sys.stderr)
-    failures = sum(count for code, count in counts.items() if code in ENFORCED)
-    adopting = ", ".join(f"{code} {counts[code]}" for code in sorted(counts)
-                         if code in ADOPTING) or "none"
-    print(f"enforced: {failures} findings; adopting: {adopting}", file=sys.stderr)
+        print(f"{code}: {count} in {len(files[code])} files", file=sys.stderr)
+    failures = sum(counts.values())
+    print(f"{failures} findings", file=sys.stderr)
     return 1 if failures else 0
 
 

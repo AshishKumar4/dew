@@ -14,15 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.core import Tracer
-from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
-
-ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
-TreeT = TypeVar("TreeT")
 
 # What a caller hands a host processor as one media argument: pixels or audio
 # samples in an array, a PIL image, or one entry per row of either. The source's
@@ -48,11 +44,9 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     """Pad ragged token rows and their scalar token fields on the host.
 
     Filler IDs carry no content; attention_mask alone marks real slots. Rows
-    that all fill the width take no filler, so no attention_mask comes back.
-    Absent validity is how a host says every slot is real. An all-true mask
-    would say the same thing in a form the model cannot read the contents
-    of, and it would cost it the fused attention kernel.
-    Tokenizer state is not involved in this numeric layout operation.
+    that all fill the width come back without one: absent validity says every
+    slot is real, which an all-true mask would hide from the model and cost it
+    the fused attention kernel.
     """
     if padding_side not in ("left", "right"):
         raise ValueError("padding_side must be left or right")
@@ -60,21 +54,27 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     if type(pad_id) is not int or not 0 <= pad_id <= limits.max:
         raise ValueError("pad_id must be a nonnegative int32 token id")
     arrays = [np.asarray(row) for row in rows]
-    if not arrays or any(row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays):
+    if not arrays or any(
+        row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays
+    ):
         raise ValueError("each prompt must contain a nonempty integer token row")
     if any(np.any((row < 0) | (row > limits.max)) for row in arrays):
         raise ValueError("token IDs must be nonnegative int32 values")
     width = max(row.size for row in arrays)
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
-    slots = [slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays]
+    slots = [
+        slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays
+    ]
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
     padded = {"attention_mask": valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
-        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)):
+        if len(aligned) != len(arrays) or any(
+            value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
+        ):
             raise ValueError(f"token field {name!r} must align with the token rows")
         if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
             raise ValueError("attention_mask must contain only zero or one")
@@ -88,19 +88,26 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     return tokens, padded
 
 
+def host_token_rows(array: np.ndarray) -> np.ndarray:
+    """Integer `[B, S]` token ids normalized on the host without a device round-trip."""
+    if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError("tokens must be an integer [B, S] array")
+    bounds = np.iinfo(np.int32)
+    if np.any(array < bounds.min) or np.any(array > bounds.max):
+        raise ValueError("token IDs must be representable as int32")
+    return array.astype(np.int32, copy=False)
+
+
 @struct.dataclass
 class ModelInputs:
     """Token rows with sequence-aligned fields and row-aligned conditioning.
 
-    Every leaf has batch axis zero. ``token_fields`` also has sequence axis
-    one, with the same length as ``tokens``. ``conditioning`` holds media
-    payloads and their valid lengths; it contains no text-slot coordinates.
-    A token field such as ``image_indices`` identifies the media feature read
-    at that text slot, with -1 for text. Slicing a prompt therefore preserves
-    feature identity without rewriting indices hidden in media payloads.
-
-    The processor validates field names and values for its model on the host.
-    These shape-preserving operations also work inside JIT.
+    Every leaf has batch axis zero, and ``token_fields`` sequence axis one at
+    ``tokens``' length. ``conditioning`` holds media payloads and their valid
+    lengths; a token field such as ``image_indices`` names the media feature
+    read at each text slot (-1 for text), so slicing a prompt keeps feature
+    identity. The processor validates fields on the host; these shape-preserving
+    operations also work inside JIT.
     """
 
     tokens: jax.Array
@@ -119,13 +126,7 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
-            array = np.asarray(value)
-            if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
-                raise ValueError("tokens must be an integer [B, S] array")
-            bounds = np.iinfo(np.int32)
-            if np.any(array < bounds.min) or np.any(array > bounds.max):
-                raise ValueError("token IDs must be representable as int32")
-            prepared = cls(jnp.asarray(array, jnp.int32))
+            prepared = cls(jnp.asarray(host_token_rows(np.asarray(value))))
         prepared.validate()
         return prepared
 
@@ -138,10 +139,14 @@ class ModelInputs:
                     "mutable", "capture_intermediates", "attention_pairwise_mask",
                     "attention_key_positions"}
         if reserved.intersection(self.token_fields):
-            raise ValueError(f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}")
+            raise ValueError(
+                f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
+            )
         for name, value in self.token_fields.items():
             if value.ndim < 2 or value.shape[:2] != self.tokens.shape:
-                raise ValueError(f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}")
+                raise ValueError(
+                    f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}"
+                )
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -276,12 +281,9 @@ def _validity_agnostic[TreeT](tree: TreeT) -> TreeT:
 def assembly_signature(tree: InputTree, controls: tuple = ()) -> np.ndarray:
     """`generation_signature` of the tree with validity left out.
 
-    Whether a process's own rows needed padding is rank-local, so a digest
-    that counted validity would refuse a pool that agrees on everything else.
-    This one still carries every other field, shape, dtype and control, so a
-    real schema disagreement is still refused, and it is fixed-width and
-    computed from local structure alone, which is what lets it be the first
-    thing a pool agrees on.
+    Whether a process's own rows needed padding is rank-local, so this digest,
+    which still carries every other field, shape, dtype and control, is the
+    fixed-width first thing a pool agrees on.
     """
     return generation_signature(_validity_agnostic(tree), controls)
 
@@ -314,18 +316,12 @@ def agreed_validity[TreeT: InputTree](tree: TreeT, processes: int, *, controls: 
                                       phase: str = "input") -> TreeT:
     """One validity schema for the whole pool, agreed before arrays are built.
 
-    A host that padded nothing carries no validity, which is what keeps
-    attention on its fused kernel. Padding is a property of a process's own
-    rows, so one process can omit the field while another carries it, and the
-    same step would then receive two different pytrees. Where any process
-    carries validity for a site, every process materializes it; where none
-    does, the omission stays.
-
-    The collectives are fixed-shape and their number does not depend on what
-    this process holds: the validity-agnostic signature is agreed first, and
-    the site count that sizes the presence vector comes from that agreed
-    schema. Both run on the calling thread, so call this where the caller's
-    other collectives are issued, in the same order on every process.
+    A host that padded nothing carries no validity, which keeps attention on its
+    fused kernel, so processes may differ; where any process carries validity
+    for a site, every process materializes it. The collectives are fixed-shape
+    and fixed in number (the validity-agnostic signature first, then the
+    presence vector its schema sizes) and run on the calling thread, so call
+    this in the same order as the caller's other collectives on every process.
     """
     if processes <= 1:
         return tree
@@ -361,12 +357,13 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     if isinstance(leaf, jax.Array) and leaf.is_fully_addressable and not host:
         return leaf
     if not isinstance(leaf, jax.Array) or leaf.is_fully_addressable:
-        return np.asarray(leaf)
+        return np.asarray(jax.device_get(leaf))
     if leaf.ndim == 0:
-        return np.asarray(leaf.addressable_shards[0].data)
+        return np.asarray(jax.device_get(leaf.addressable_shards[0].data))
     pieces: dict[tuple[int, ...], np.ndarray] = {}
     for shard in leaf.addressable_shards:
-        pieces.setdefault(tuple(part.start or 0 for part in shard.index), np.asarray(shard.data))
+        pieces.setdefault(tuple(part.start or 0 for part in shard.index),
+                          np.asarray(jax.device_get(shard.data)))
     blocks = []
     for start in sorted({key[0] for key in pieces}):
         columns = sorted(key for key in pieces if key[0] == start)
@@ -375,19 +372,29 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
-def request_key(key: jax.Array | None, seed: int | None) -> jax.Array:
-    """One typed PRNG key from either a key or an integer seed, never both."""
-    if (key is None) == (seed is None):
-        raise ValueError("pass exactly one of key and seed")
-    if seed is not None:
-        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
-            raise ValueError("seed must be an integer")
-        return jax.random.key(int(seed))
-    assert key is not None
+def request_key(key: int | jax.Array | None) -> jax.Array:
+    """Normalize an integer seed or a single JAX key to one typed PRNG key."""
+    if key is None or isinstance(key, bool):
+        raise ValueError("key must be an integer seed or a single JAX PRNG key")
+    if isinstance(key, (int, np.integer)):
+        return jax.random.key(int(key))
     typed = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
     if typed.shape != ():
         raise ValueError("key must be a single JAX PRNG key")
     return typed
+
+
+def key_seed(key: int | jax.Array | None) -> int | None:
+    """The normalized key as an integer for an external sampler's wire seed.
+
+    Threefry's key(n) stores [0, n], so summing the words preserves an
+    integer seed at the external server. Split keys can collide in 32 bits.
+    Native samplers keep the full key instead of this wire representation.
+    """
+    if key is None:
+        return None
+    words = np.asarray(jax.random.key_data(request_key(key))).reshape(-1)
+    return sum(int(word) for word in words) % (1 << 32)
 
 
 def continuation_keys(key: jax.Array, n: int) -> jax.Array:
@@ -484,7 +491,7 @@ class RowPlan:
         """Place padded host or device rows, row-sharded on a mesh."""
         sharding = self.sharding
         if sharding is None:
-            return jax.tree.map(jnp.asarray, tree)
+            return jax.device_put(tree)
 
         def put(leaf):
             rows = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
@@ -501,14 +508,17 @@ class RowPlan:
         A request key replicated over a multi-process mesh is not
         addressable, and folding it would hand
         `make_array_from_process_local_data` rows this process cannot place.
-        Every replica holds the same key data, so the rows fold from this
-        process's own replica and stay device-resident throughout.
+        Every replica holds the same key data, so on a mesh the rows fold
+        from this process's first replica, on its one device, and are sliced
+        from there to their devices. Folded on every device of a replicated
+        key, they went through the host to be split: jax reshards a
+        multi-device array whose shards hold no target slice by reading it.
         """
-        local = key if key.is_fully_addressable else key.addressable_data(0)
-        indices = jnp.arange(self.count, dtype=jnp.uint32,
-                             device=local.sharding) + self.process * self.rows
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         sharding = self.sharding
+        local = key if sharding is None else key.addressable_data(0)
+        start = self.process * self.rows
+        indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
+        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         if sharding is None:
             return row_keys
         sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
@@ -517,3 +527,6 @@ class RowPlan:
     def host(self, leaf) -> np.ndarray:
         """This process's real rows of a result leaf as a host array."""
         return local_rows(leaf)[:self.rows]
+
+
+__all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "RowPlan"]

@@ -85,9 +85,12 @@ def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
         # The stored buffer is the source's, perturbed away from its own
         # sin/cos initializer, so a model that rebuilt it would not match.
         assert relative_gap(buffers["pos_embed"], arrays[f"{name}.position_buffer"]) == 0.0
-        gradients = jax.jit(jax.grad(
-            lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
-                params, latent, condition.context, condition.pooled)
+        gradients = jax.jit(
+            jax.grad(
+                lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe),
+                argnums=(0, 1, 2, 3),
+            )
+        )(params, latent, condition.context, condition.pooled)
         assert relative_gap(gradients[1].transpose(0, 3, 1, 2), arrays[f"{name}.grad_latent"]) < 1e-5
         assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
         assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
@@ -125,10 +128,10 @@ def test_every_declared_sd3_tensor_is_mapped_or_a_named_buffer(source):
 def test_unsupported_sd3_controls_are_refused():
     """A geometry control whose active meaning this model does not carry fails
     at load rather than being dropped."""
-    config = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2,
-                  attention_head_dim=8, num_attention_heads=2, joint_attention_dim=12,
-                  caption_projection_dim=16, pooled_projection_dim=10, out_channels=4,
-                  pos_embed_max_size=8)
+    config = {"sample_size": 16, "patch_size": 2, "in_channels": 4, "num_layers": 2,
+                  "attention_head_dim": 8, "num_attention_heads": 2, "joint_attention_dim": 12,
+                  "caption_projection_dim": 16, "pooled_projection_dim": 10, "out_channels": 4,
+                  "pos_embed_max_size": 8}
     assert sd3_fields(config)["qk_norm"] is None
     with pytest.raises(ValueError, match="qk_norm"):
         sd3_fields({**config, "qk_norm": "layer_norm"})
@@ -195,9 +198,9 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(process.sampler_schedule.model_time(times[:-1]),
                                     arrays[f"{tag}.times"]) < 1e-5
                 denoise = process.denoiser(model, params, {})
-                run = lambda value: sample(  # noqa: E731
-                    denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
-                    times=times, final_denoise=False)
+                def run(value, *, denoise=denoise, times=times):
+                    return sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
+                                  times=times, final_denoise=False)
                 x_T = jnp.asarray(arrays[f"{tag}.x_T"])
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
                 (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))
@@ -257,7 +260,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     shards, and the prediction and the parameter gradient are compared against
     the same walk on a mesh that keeps sequences whole.
     """
-    from dew.training import Layout, MeshSpec, build_mesh
+    from dew.training import Layout, MeshSpec
 
     with np.load(source / "sd3_transformer.npz") as arrays:
         config = json.loads(str(arrays["rect_cropped.config"]))
@@ -277,7 +280,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
         return jnp.sum(output * probe)
 
     def run(spec):
-        mesh = build_mesh(spec)
+        mesh = spec.build()
         placement = Layout().shardings(mesh, {"params": params})["params"]
         with jax.set_mesh(mesh):
             placed = jax.device_put(params, placement)
@@ -286,7 +289,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     whole, split = run(MeshSpec(fsdp=4)), run(MeshSpec(fsdp=2, sequence=2))
     assert relative_gap(split[0], whole[0]) < 1e-5
     gaps = [relative_gap(a, b) for a, b in zip(jax.tree.leaves(split[1]),
-                                               jax.tree.leaves(whole[1]))]
+                                               jax.tree.leaves(whole[1]), strict=True)]
     assert max(gaps) < 1e-5, max(gaps)
 
 
@@ -311,10 +314,10 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     second case ships no third encoder, whose segment is the zero block the
     source writes at its CLIP window rather than at the sequence it asked for.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     for prefix, rows in (("", pipeline_record["prompts"]), ("negative_", pipeline_record["negatives"])):
@@ -334,7 +337,7 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
 
 @pytest.mark.parametrize("case", PIPELINE_CASES)
 def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case):
-    """`load_pretrained().text_to_image()` reproduces the source's own call.
+    """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     The published directory decides everything: the transformer, the wide
     latent VAE with its shift and scale, the flow schedule's shifted sigmas,
@@ -342,14 +345,14 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     grid is bound to. The walk starts from the source's own latents so only
     the trajectory is under test.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.sampling.guidance import CFG
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], seed=0)
+                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
     # The flow walk is an Euler integration with no noise draw; the key is
     # the call's contract, not a source of difference.
     walked = task(prepared, guidance=CFG(pipeline_record["guidance"]),
@@ -368,15 +371,15 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     declares that class takes them: not the fifty steps and 7.5 of the older
     UNet pipelines, and not anything a test passes in.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     assert task.steps == pipeline_record["default_steps"]
     assert task.guidance.scale == pipeline_record["default_guidance"]
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
-                            initial=arrays[f"{case}.x_T"], seed=0)
+                            initial=arrays[f"{case}.x_T"], key=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
 
@@ -385,15 +388,15 @@ def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path)
     """A declared class another family's denoiser drives is refused: the
     shared unet/transformer check cannot tell Flux's transformer from SD3's,
     so the gate reads the pipeline family."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = tmp_path / "pipeline"
     shutil.copytree(source / "pipeline", directory)
     index = json.loads((directory / "model_index.json").read_text())
     index["_class_name"] = "FluxPipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="FluxPipeline.*StableDiffusion3Pipeline"):
-        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    with pytest.raises(ValueError, match=r"FluxPipeline.*StableDiffusion3Pipeline"):
+        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 
 def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):
@@ -410,12 +413,12 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, pretrained=loaded.variables,
@@ -459,11 +462,12 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     np.testing.assert_array_equal(again.variables["buffers"]["pos_embed"], buffer)
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),

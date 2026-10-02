@@ -34,8 +34,7 @@ exact-GELU MLP and lays the image out as its decoder reads it.
 
 import dataclasses
 import functools
-from collections.abc import Callable
-from typing import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +44,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew import records
+from dew._model_types import _QWEN35_VISION_TYPES
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
@@ -120,52 +120,46 @@ class SiglipVisionTransformer(nn.Module):
     checkpoints carry is not built; the Gemma path reads the sequence alone.
     """
 
-    hidden_size: int = 768
-    intermediate_size: int = 3072
-    num_layers: int = 12
-    num_heads: int = 12
-    image_size: int = 224
-    patch_size: int = 16
-    num_channels: int = 3
-    hidden_act: str = "gelu_pytorch_tanh"
-    layer_norm_eps: float = 1e-6
+    config: "SiglipVision"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.hidden_size % self.num_heads:
+        cfg = self.config
+        if cfg.hidden_size % cfg.num_heads:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must split over num_heads "
-                f"({self.num_heads})")
-        patches = (self.image_size // self.patch_size) ** 2
+                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
+                f"({cfg.num_heads})")
+        patches = (cfg.image_size // cfg.patch_size) ** 2
         # torch Conv2d carries a bias unless told otherwise; the CLIP tower's
         # convolution is the bias-free exception, not the rule.
         self.patch_embedding = Conv(
-            self.hidden_size, (self.patch_size, self.patch_size),
-            strides=(self.patch_size, self.patch_size), padding="VALID",
+            cfg.hidden_size, (cfg.patch_size, cfg.patch_size),
+            strides=(cfg.patch_size, cfg.patch_size), padding="VALID",
             use_bias=True, dtype=self.dtype, precision=self.precision,
             name="patch_embedding")
-        self.position_embedding = nn.Embed(patches, self.hidden_size,
+        self.position_embedding = nn.Embed(patches, cfg.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
             CLIPEncoderLayer(
-                self.hidden_size, self.num_heads, self.intermediate_size, causal=False,
-                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
-                activation=self.hidden_act, name=f"layers_{index}")
-            for index in range(self.num_layers)]
+                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, causal=False,
+                layer_norm_eps=cfg.layer_norm_eps, dtype=self.dtype, precision=self.precision,
+                activation=cfg.hidden_act, name=f"layers_{index}")
+            for index in range(cfg.num_layers)]
         self.post_layernorm = LayerNorm(
-            epsilon=self.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
+            epsilon=cfg.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
 
     def __call__(self, pixel_values) -> jax.Array:
+        cfg = self.config
         pixel_values = jnp.asarray(pixel_values)
         batch, channels, height, width = pixel_values.shape
-        expected = (self.num_channels, self.image_size, self.image_size)
+        expected = (cfg.num_channels, cfg.image_size, cfg.image_size)
         if (channels, height, width) != expected:
             raise ValueError(
                 f"pixel_values of {channels}x{height}x{width} are not the "
                 f"{'x'.join(map(str, expected))} this checkpoint was trained with")
         patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
-        hidden_states = patches.reshape(batch, -1, self.hidden_size)
+        hidden_states = patches.reshape(batch, -1, cfg.hidden_size)
         hidden_states = hidden_states + self.position_embedding(
             jnp.arange(hidden_states.shape[1]))
         for layer in self.layers:
@@ -189,12 +183,7 @@ class SiglipVision(TowerBase):
     layer_norm_eps: float = 1e-6
 
     def build(self) -> nn.Module:
-        return SiglipVisionTransformer(
-            hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
-            num_layers=self.num_layers, num_heads=self.num_heads,
-            image_size=self.image_size, patch_size=self.patch_size,
-            num_channels=self.num_channels, hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps)
+        return SiglipVisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
@@ -245,10 +234,9 @@ class GemmaProjectorModule(nn.Module):
 @projectors("gemma")
 @dataclasses.dataclass(frozen=True)
 class GemmaProjector(ProjectorBase):
-    """Gemma's projector fields: the trunk width, the decoder width, and the
-    patch grid pooled into the soft-token grid."""
+    """Gemma's projector fields: the decoder width and the patch grid pooled
+    into the soft-token grid."""
 
-    vision_width: int
     text_width: int
     patches_per_side: int
     tokens_per_side: int
@@ -427,70 +415,61 @@ class Llama4VisionTransformer(nn.Module):
     text width.
     """
 
-    hidden_size: int = 1408
-    intermediate_size: int = 5632
-    num_layers: int = 32
-    num_heads: int = 16
-    image_size: int = 336
-    patch_size: int = 14
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-    pixel_shuffle_ratio: float = 0.5
-    projector_input_dim: int = 4096
-    projector_output_dim: int = 4096
+    config: "Llama4Vision"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.hidden_size % self.num_heads:
+        cfg = self.config
+        if cfg.hidden_size % cfg.num_heads:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must split over num_heads "
-                f"({self.num_heads})")
-        grid = self.image_size // self.patch_size
-        if grid * self.patch_size != self.image_size:
+                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
+                f"({cfg.num_heads})")
+        grid = cfg.image_size // cfg.patch_size
+        if grid * cfg.patch_size != cfg.image_size:
             raise ValueError(
-                f"image_size ({self.image_size}) must tile patch_size "
-                f"({self.patch_size})")
+                f"image_size ({cfg.image_size}) must tile patch_size "
+                f"({cfg.patch_size})")
         self.patch_embedding = nn.Dense(
-            self.hidden_size, use_bias=False, dtype=self.dtype,
+            cfg.hidden_size, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="patch_embedding")
         self.class_embedding = self.param(
-            "class_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
-            (self.hidden_size,))
+            "class_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
+            (cfg.hidden_size,))
         self.positional_embedding = self.param(
-            "positional_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
-            (grid * grid + 1, self.hidden_size))
-        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
+            "positional_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
+            (grid * grid + 1, cfg.hidden_size))
+        norm = functools.partial(LayerNorm, epsilon=cfg.layer_norm_eps,
                                  dtype=self.dtype)
         self.layernorm_pre = norm(name="layernorm_pre")
         self.layers = [
             Llama4VisionEncoderLayer(
-                self.hidden_size, self.num_heads, self.intermediate_size, grid,
-                self.rope_theta, layer_norm_eps=self.layer_norm_eps,
+                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid,
+                cfg.rope_theta, layer_norm_eps=cfg.layer_norm_eps,
                 dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
-            for index in range(self.num_layers)]
+            for index in range(cfg.num_layers)]
         self.layernorm_post = norm(name="layernorm_post")
         self.vision_adapter = Llama4VisionAdapter(
-            self.pixel_shuffle_ratio, self.projector_input_dim, self.projector_output_dim,
+            cfg.pixel_shuffle_ratio, cfg.projector_input_dim, cfg.projector_output_dim,
             dtype=self.dtype, precision=self.precision, name="vision_adapter")
 
     def __call__(self, pixel_values) -> jax.Array:
+        cfg = self.config
         pixel_values = jnp.asarray(pixel_values)
         batch, channels, height, width = pixel_values.shape
-        expected = (self.num_channels, self.image_size, self.image_size)
+        expected = (cfg.num_channels, cfg.image_size, cfg.image_size)
         if (channels, height, width) != expected:
             raise ValueError(
                 f"pixel_values of {channels}x{height}x{width} are not the "
                 f"{'x'.join(map(str, expected))} this checkpoint was trained with")
-        grid = self.image_size // self.patch_size
+        grid = cfg.image_size // cfg.patch_size
         patches = pixel_values.reshape(
-            batch, channels, grid, self.patch_size, grid, self.patch_size)
+            batch, channels, grid, cfg.patch_size, grid, cfg.patch_size)
         patches = patches.transpose(0, 2, 4, 1, 3, 5)
         hidden_states = self.patch_embedding(
-            patches.reshape(batch, grid * grid, channels * self.patch_size ** 2))
+            patches.reshape(batch, grid * grid, channels * cfg.patch_size ** 2))
         class_token = jnp.broadcast_to(
-            self.class_embedding.astype(hidden_states.dtype), (batch, 1, self.hidden_size))
+            self.class_embedding.astype(hidden_states.dtype), (batch, 1, cfg.hidden_size))
         hidden_states = jnp.concatenate([hidden_states, class_token], axis=1)
         hidden_states = hidden_states + self.positional_embedding.astype(hidden_states.dtype)
         hidden_states = self.layernorm_pre(hidden_states)
@@ -519,14 +498,7 @@ class Llama4Vision(TowerBase):
     projector_output_dim: int = 4096
 
     def build(self) -> nn.Module:
-        return Llama4VisionTransformer(
-            hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
-            num_layers=self.num_layers, num_heads=self.num_heads,
-            image_size=self.image_size, patch_size=self.patch_size,
-            num_channels=self.num_channels, layer_norm_eps=self.layer_norm_eps,
-            rope_theta=self.rope_theta, pixel_shuffle_ratio=self.pixel_shuffle_ratio,
-            projector_input_dim=self.projector_input_dim,
-            projector_output_dim=self.projector_output_dim)
+        return Llama4VisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
@@ -552,9 +524,8 @@ class Llama4ProjectorModule(nn.Module):
 @projectors("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Projector(ProjectorBase):
-    """Llama 4's projector fields: the tower output width and the text width."""
+    """Llama 4's projector fields: the text width."""
 
-    vision_width: int
     text_width: int
 
     def build(self) -> nn.Module:
@@ -636,15 +607,21 @@ class Gemma4VisionAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
+    head_dim: int | None = None
+
+    @property
+    def features_per_head(self) -> int:
+        return self.hidden_size // self.num_heads if self.head_dim is None else self.head_dim
 
     def setup(self):
         dense = functools.partial(Gemma4ClippableLinear, use_bias=False,
                                   use_clipped_linears=self.use_clipped_linears,
                                   dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.hidden_size, name="q_proj")
-        self.k_proj = dense(self.num_key_value_heads * (self.hidden_size // self.num_heads),
+        head_dim = self.features_per_head
+        self.q_proj = dense(self.num_heads * head_dim, name="q_proj")
+        self.k_proj = dense(self.num_key_value_heads * head_dim,
                             name="k_proj")
-        self.v_proj = dense(self.num_key_value_heads * (self.hidden_size // self.num_heads),
+        self.v_proj = dense(self.num_key_value_heads * head_dim,
                             name="v_proj")
         self.o_proj = dense(self.hidden_size, name="o_proj")
         self.q_norm = RMSNorm(epsilon=self.rms_norm_eps, dtype=self.dtype, name="q_norm")
@@ -654,7 +631,7 @@ class Gemma4VisionAttention(nn.Module):
 
     def __call__(self, hidden_states, cos, sin, valid=None) -> jax.Array:
         batch, length, _ = hidden_states.shape
-        head_dim = self.hidden_size // self.num_heads
+        head_dim = self.features_per_head
         # The norms read the heads (modeling_gemma4.py,
         # Gemma4VisionAttention.forward): project, split, then normalize.
         query = self.q_norm(self.q_proj(hidden_states).reshape(batch, length, -1, head_dim))
@@ -670,7 +647,7 @@ class Gemma4VisionAttention(nn.Module):
             scores = jnp.where(valid[:, None, None, :], scores, jnp.finfo(scores.dtype).min)
         probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(query.dtype)
         attended = jnp.einsum("bhqk,bkhd->bqhd", probs, value, precision=self.precision)
-        return self.o_proj(attended.reshape(batch, length, self.hidden_size))
+        return self.o_proj(attended.reshape(batch, length, self.num_heads * head_dim))
 
 
 class Gemma4VisionMLP(nn.Module):
@@ -724,12 +701,14 @@ class Gemma4VisionEncoderLayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
+    head_dim: int | None = None
 
     def setup(self):
         norm = functools.partial(RMSNorm, epsilon=self.rms_norm_eps, dtype=self.dtype)
         self.input_layernorm = norm(name="input_layernorm")
         self.self_attn = Gemma4VisionAttention(
             self.hidden_size, self.num_heads, self.num_key_value_heads,
+            head_dim=self.head_dim,
             rms_norm_eps=self.rms_norm_eps,
             dtype=self.dtype, precision=self.precision,
             use_clipped_linears=self.use_clipped_linears, name="self_attn")
@@ -759,70 +738,66 @@ class Gemma4VisionTransformer(nn.Module):
     static under JIT; callers select valid features using processor lengths.
     """
 
-    hidden_size: int = 1152
-    intermediate_size: int = 4304
-    num_layers: int = 27
-    num_heads: int = 16
-    num_key_value_heads: int = 16
-    patch_size: int = 16
-    pooling_kernel_size: int = 3
-    position_embedding_size: int = 10240
-    hidden_act: str = "gelu_pytorch_tanh"
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 100.0
+    config: "Gemma4Vision"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    standardize: bool = False
-    use_clipped_linears: bool = False
 
     def setup(self):
-        if self.hidden_size % self.num_heads:
+        cfg = self.config
+        if cfg.head_dim is None and cfg.hidden_size % cfg.num_heads:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must split over num_heads "
-                f"({self.num_heads})")
-        if self.hidden_size // self.num_heads % 4:
+                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
+                f"({cfg.num_heads})")
+        head_dim = cfg.hidden_size // cfg.num_heads if cfg.head_dim is None else cfg.head_dim
+        if head_dim <= 0 or head_dim % 4:
             raise ValueError(
-                f"the head width ({self.hidden_size // self.num_heads}) must split "
+                f"the head width ({head_dim}) must split "
                 "over the two rotary dims and their halves")
-        if self.num_heads % self.num_key_value_heads:
+        if cfg.num_heads % cfg.num_key_value_heads:
             raise ValueError(
-                f"num_heads ({self.num_heads}) must repeat num_key_value_heads "
-                f"({self.num_key_value_heads})")
+                f"num_heads ({cfg.num_heads}) must repeat num_key_value_heads "
+                f"({cfg.num_key_value_heads})")
         self.patch_embed = nn.Dense(
-            self.hidden_size, use_bias=False, dtype=self.dtype,
+            cfg.hidden_size, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="patch_embed")
         self.position_table = self.param(
             "position_table", nn.initializers.normal(0.02),
-            (2, self.position_embedding_size, self.hidden_size))
+            (2, cfg.position_embedding_size, cfg.hidden_size))
         self.layers = [
             Gemma4VisionEncoderLayer(
-                self.hidden_size, self.intermediate_size, self.num_heads,
-                self.num_key_value_heads, self.hidden_act,
-                rms_norm_eps=self.rms_norm_eps,
+                cfg.hidden_size, cfg.intermediate_size, cfg.num_heads,
+                cfg.num_key_value_heads, cfg.hidden_act,
+                head_dim=cfg.head_dim,
+                rms_norm_eps=cfg.rms_norm_eps,
                 dtype=self.dtype, precision=self.precision,
-                use_clipped_linears=self.use_clipped_linears, name=f"layers_{index}")
-            for index in range(self.num_layers)]
-        if self.standardize:
-            self.std_bias = self.variable("constants", "std_bias", jnp.zeros, (self.hidden_size,), jnp.float32)
-            self.std_scale = self.variable("constants", "std_scale", jnp.ones, (self.hidden_size,), jnp.float32)
+                use_clipped_linears=cfg.use_clipped_linears, name=f"layers_{index}")
+            for index in range(cfg.num_layers)]
+        if cfg.standardize:
+            self.std_bias = self.variable(
+                "constants", "std_bias", jnp.zeros, (cfg.hidden_size,), jnp.float32
+            )
+            self.std_scale = self.variable(
+                "constants", "std_scale", jnp.ones, (cfg.hidden_size,), jnp.float32
+            )
 
     def __call__(self, pixel_values, pixel_position_ids=None) -> jax.Array:
+        cfg = self.config
         pixels = jnp.asarray(pixel_values)
-        kernel = self.pooling_kernel_size
+        kernel = cfg.pooling_kernel_size
         if pixels.ndim == 4:
             if pixel_position_ids is not None:
                 raise ValueError("position IDs accompany patch pixels, not NCHW images")
             batch, channels, height, width = pixels.shape
-            stride = self.patch_size * kernel
+            stride = cfg.patch_size * kernel
             if channels != 3 or height % stride or width % stride:
                 raise ValueError(f"Gemma4 images must have three channels and sides divisible by {stride}")
-            rows, columns = height // self.patch_size, width // self.patch_size
-            patches = pixels.reshape(batch, channels, rows, self.patch_size, columns, self.patch_size)
+            rows, columns = height // cfg.patch_size, width // cfg.patch_size
+            patches = pixels.reshape(batch, channels, rows, cfg.patch_size, columns, cfg.patch_size)
             pixels = patches.transpose(0, 2, 4, 3, 5, 1).reshape(batch, rows * columns, -1)
             x = jnp.tile(jnp.arange(columns), rows)
             y = jnp.repeat(jnp.arange(rows), columns)
             pixel_position_ids = jnp.broadcast_to(jnp.stack([x, y], axis=-1), (batch, rows * columns, 2))
-        if pixels.ndim != 3 or pixels.shape[-1] != 3 * self.patch_size ** 2:
+        if pixels.ndim != 3 or pixels.shape[-1] != 3 * cfg.patch_size ** 2:
             raise ValueError("Gemma4 patch pixels must be [B, patches, 3 * patch_size**2]")
         if pixel_position_ids is None or pixel_position_ids.shape != (*pixels.shape[:2], 2):
             raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
@@ -836,7 +811,8 @@ class Gemma4VisionTransformer(nn.Module):
         table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
-        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta,
+        head_dim = cfg.head_dim or cfg.hidden_size // cfg.num_heads
+        cos, sin = _gemma4_rope_tables(pixel_position_ids, head_dim, cfg.rope_theta,
                                        dtype=at_least_fp32(hidden_states.dtype))
         for layer in self.layers:
             hidden_states = layer(hidden_states, cos, sin, valid)
@@ -846,9 +822,11 @@ class Gemma4VisionTransformer(nn.Module):
         values = jnp.where(valid[..., None], hidden_states, 0).astype(jnp.float32) / kernel ** 2
         # Segment sums avoid the reference pooler's [patches, soft_tokens]
         # one-hot matrix while preserving its position-indexed block average.
-        pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(values, indices)
-        pooled = pooled * self.hidden_size ** 0.5
-        if self.standardize:
+        pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(
+            values, indices
+        )
+        pooled = pooled * cfg.hidden_size ** 0.5
+        if cfg.standardize:
             pooled = (pooled - self.std_bias.value) * self.std_scale.value
         return pooled.astype(hidden_states.dtype)
 
@@ -871,17 +849,11 @@ class Gemma4Vision(TowerBase):
     rope_theta: float = 100.0
     standardize: bool = False
     use_clipped_linears: bool = False
+    head_dim: int | None = None
+    """None retains hidden_size // num_heads; checkpoints may project a wider head."""
 
     def build(self) -> nn.Module:
-        return Gemma4VisionTransformer(
-            hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
-            num_layers=self.num_layers, num_heads=self.num_heads,
-            num_key_value_heads=self.num_key_value_heads, patch_size=self.patch_size,
-            pooling_kernel_size=self.pooling_kernel_size,
-            position_embedding_size=self.position_embedding_size,
-            hidden_act=self.hidden_act, rms_norm_eps=self.rms_norm_eps,
-            rope_theta=self.rope_theta, standardize=self.standardize,
-            use_clipped_linears=self.use_clipped_linears)
+        return Gemma4VisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
@@ -914,9 +886,8 @@ class Gemma4ProjectorModule(nn.Module):
 @projectors("gemma4")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Projector(ProjectorBase):
-    """Gemma 4's projector fields: the tower width, the decoder width."""
+    """Gemma 4's projector fields: the decoder width and the norm epsilon."""
 
-    vision_width: int
     text_width: int
     norm_eps: float = 1e-6
 
@@ -1046,58 +1017,55 @@ class Qwen35VisionTransformer(nn.Module):
     pre-merge sequence; the projector owns the merger.
     """
 
-    depth: int = 27
-    hidden_size: int = 1152
-    hidden_act: str = "gelu_pytorch_tanh"
-    intermediate_size: int = 4304
-    num_heads: int = 16
-    in_channels: int = 3
-    patch_size: int = 16
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-    num_position_embeddings: int = 2304
+    config: "Qwen35Vision"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.hidden_size % self.num_heads:
+        cfg = self.config
+        if cfg.hidden_size % cfg.num_heads:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must split over num_heads "
-                f"({self.num_heads})")
+                f"hidden_size ({cfg.hidden_size}) must split over num_heads "
+                f"({cfg.num_heads})")
         self.patch_embed = nn.Dense(
-            self.hidden_size, use_bias=True, dtype=self.dtype,
+            cfg.hidden_size, use_bias=True, dtype=self.dtype,
             precision=self.precision, name="patch_embed")
-        self.position_table = nn.Embed(self.num_position_embeddings, self.hidden_size,
+        self.position_table = nn.Embed(cfg.num_position_embeddings, cfg.hidden_size,
                                        dtype=self.dtype, name="position_table")
         self.blocks = [
             Qwen35VisionBlock(
-                self.hidden_size, self.intermediate_size, self.num_heads,
-                self.hidden_act, dtype=self.dtype, precision=self.precision,
+                cfg.hidden_size, cfg.intermediate_size, cfg.num_heads,
+                cfg.hidden_act, dtype=self.dtype, precision=self.precision,
                 name=f"blocks_{index}")
-            for index in range(self.depth)]
+            for index in range(cfg.depth)]
 
     def __call__(self, pixel_values, grid_thw=None) -> jax.Array:
+        cfg = self.config
         pixels = jnp.asarray(pixel_values)
-        merge = self.spatial_merge_size
-        patch = self.patch_size
+        merge = cfg.spatial_merge_size
+        patch = cfg.patch_size
         if pixels.ndim == 4:
             if grid_thw is not None:
                 raise ValueError("grid_thw accompanies packed pixels, not NCHW images")
             batch, channels, height, width = pixels.shape
             stride = patch * merge
-            if channels != self.in_channels or height % stride or width % stride:
-                raise ValueError(f"pixel_values must be {self.in_channels}-channel images tiled by {stride}px blocks")
+            if channels != cfg.in_channels or height % stride or width % stride:
+                raise ValueError(
+                    f"pixel_values must be {cfg.in_channels}-channel images tiled by {stride}px blocks"
+                )
             rows, columns = height // patch, width // patch
             blocks = pixels.reshape(batch, channels, rows // merge, merge, patch,
                                     columns // merge, merge, patch)
             blocks = blocks.transpose(0, 2, 5, 3, 6, 1, 4, 7)
             flat = blocks.reshape(batch, rows * columns, channels, 1, patch, patch)
             frames = jnp.broadcast_to(flat, (batch, rows * columns, channels,
-                                            self.temporal_patch_size, patch, patch))
+                                            cfg.temporal_patch_size, patch, patch))
             pixels = frames.reshape(batch, rows * columns, -1)
             grid_thw = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
-        if pixels.ndim != 3 or pixels.shape[-1] != self.in_channels * self.temporal_patch_size * patch ** 2:
-            raise ValueError("packed Qwen pixels must be [B, patches, C * temporal_patch_size * patch_size**2]")
+        if pixels.ndim != 3 or pixels.shape[-1] != cfg.in_channels * cfg.temporal_patch_size * patch ** 2:
+            raise ValueError(
+                "packed Qwen pixels must be [B, patches, C * temporal_patch_size * patch_size**2]"
+            )
         batch, length, _ = pixels.shape
         if grid_thw is None or grid_thw.shape != (batch, 3):
             raise ValueError("packed Qwen pixels require aligned [B, 3] grid_thw")
@@ -1111,7 +1079,7 @@ class Qwen35VisionTransformer(nn.Module):
         hidden_states = self.patch_embed(pixels)
         table = jnp.asarray(self.position_table.embedding, hidden_states.dtype)
         hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
-        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads,
+        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), cfg.hidden_size // cfg.num_heads,
                                      dtype=at_least_fp32(hidden_states.dtype))
         valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
         frames = jnp.arange(length)[None, :] // area
@@ -1135,17 +1103,10 @@ class Qwen35Vision(TowerBase):
     patch_size: int = 16
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
-    out_hidden_size: int = 3584
     num_position_embeddings: int = 2304
 
     def build(self) -> nn.Module:
-        return Qwen35VisionTransformer(
-            depth=self.depth, hidden_size=self.hidden_size, hidden_act=self.hidden_act,
-            intermediate_size=self.intermediate_size, num_heads=self.num_heads,
-            in_channels=self.in_channels, patch_size=self.patch_size,
-            spatial_merge_size=self.spatial_merge_size,
-            temporal_patch_size=self.temporal_patch_size,
-            num_position_embeddings=self.num_position_embeddings)
+        return Qwen35VisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(patch_size=self.patch_size, block_size=self.spatial_merge_size,
@@ -1244,36 +1205,32 @@ class DeepseekV41VisionTransformer(nn.Module):
     `[images, rows, columns, hidden_size]`, which the aligner groups.
     """
 
-    num_hidden_layers: int
-    hidden_size: int
-    num_attention_heads: int
-    intermediate_size: int
-    patch_size: int
-    rope_theta: float
+    config: "DeepseekV41Vision"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, pixel_values) -> jax.Array:
+        cfg = self.config
         pixels = jnp.asarray(pixel_values)
-        patch = self.patch_size
+        patch = cfg.patch_size
         images, channels, height, width = pixels.shape
         if height % patch or width % patch:
             raise ValueError(f"pixel_values must tile into {patch}px patches, got {height}x{width}")
         rows, columns = height // patch, width // patch
         patches = pixels.reshape(images, channels, rows, patch, columns, patch).transpose(0, 2, 4, 1, 3, 5)
-        hidden_states = nn.Dense(self.hidden_size, dtype=self.dtype, precision=self.precision,
+        hidden_states = nn.Dense(cfg.hidden_size, dtype=self.dtype, precision=self.precision,
                                  name="patch_embed")(patches.reshape(images, rows * columns, -1))
         grid = jnp.stack(jnp.meshgrid(jnp.arange(rows), jnp.arange(columns), indexing="ij"), axis=-1)
         cos, sin = _grid_rope_tables(grid.reshape(1, rows * columns, 2),
-                                     self.hidden_size // self.num_attention_heads, self.rope_theta,
+                                     cfg.hidden_size // cfg.num_attention_heads, cfg.rope_theta,
                                      dtype=at_least_fp32(hidden_states.dtype))
-        for index in range(self.num_hidden_layers):
+        for index in range(cfg.num_hidden_layers):
             hidden_states = DeepseekV41VisionBlock(
-                self.hidden_size, self.num_attention_heads, self.intermediate_size,
+                cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size,
                 dtype=self.dtype, precision=self.precision, name=f"blocks_{index}")(hidden_states, cos, sin)
         hidden_states = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(hidden_states)
-        return hidden_states.reshape(images, rows, columns, self.hidden_size)
+        return hidden_states.reshape(images, rows, columns, cfg.hidden_size)
 
 
 @towers("deepseek_v41")
@@ -1289,10 +1246,7 @@ class DeepseekV41Vision(TowerBase):
     rope_theta: float = 10000.0
 
     def build(self) -> nn.Module:
-        return DeepseekV41VisionTransformer(
-            num_hidden_layers=self.num_hidden_layers, hidden_size=self.hidden_size,
-            num_attention_heads=self.num_attention_heads, intermediate_size=self.intermediate_size,
-            patch_size=self.patch_size, rope_theta=self.rope_theta)
+        return DeepseekV41VisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(patch_size=self.patch_size, channels=3)
@@ -1322,14 +1276,21 @@ class DeepseekV41ProjectorModule(nn.Module):
         images, rows, columns, _ = image_features.shape
         padded = jnp.pad(image_features, ((0, 0), (0, -rows % ratio), (0, -columns % ratio), (0, 0)))
         high, wide = padded.shape[1] // ratio, padded.shape[2] // ratio
-        squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(0, 1, 3, 5, 2, 4)
+        squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(
+            0, 1, 3, 5, 2, 4
+        )
         dense = functools.partial(nn.Dense, self.out_width, dtype=self.dtype, precision=self.precision)
         aligned = dense(name="w2")(jax.nn.gelu(dense(name="w1")(
             squares.reshape(images, high, wide, -1)), approximate=False))
         start, newline, end = (
-            self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(aligned.dtype)
-            for name in ("image_start", "image_newline", "image_end"))
-        lines = jnp.concatenate([aligned, jnp.broadcast_to(newline, (images, high, 1, self.out_width))], axis=2)
+            self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(
+                aligned.dtype
+            )
+            for name in ("image_start", "image_newline", "image_end")
+        )
+        lines = jnp.concatenate(
+            [aligned, jnp.broadcast_to(newline, (images, high, 1, self.out_width))], axis=2
+        )
         return jnp.concatenate([jnp.broadcast_to(start, (images, 1, self.out_width)),
                                 lines.reshape(images, high * (wide + 1), self.out_width),
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
@@ -1571,11 +1532,15 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
             "middle layer this trunk never returns")
     rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
     theta = records.number(rope.get("rope_theta", vision.get("rope_theta", 10000.0)), "rope_theta")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(vision.get("projector_dropout", 0.0), "projector_dropout"):
+    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(
+        vision.get("projector_dropout", 0.0), "projector_dropout"
+    ):
         raise ValueError("attention_dropout/projector_dropout is training-time")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
-    output_dim = records.integer(vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim")
+    output_dim = records.integer(
+        vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim"
+    )
     if output_dim != records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
@@ -1589,7 +1554,9 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "image_size": _image_size(vision.get("image_size", 336), "image_size"),
         "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": records.number(vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"),
+        "layer_norm_eps": records.number(
+            vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
+        ),
         "rope_theta": theta,
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
@@ -1599,7 +1566,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
 
 def translate_gemma_projector_config(vision: Mapping[str, object], text_width: int,
                                      mm_tokens_per_image: object) -> Mapping[str, object]:
-    """A Gemma wrapper's projector fields: trunk width, decoder width, grids."""
+    """A Gemma wrapper's projector fields: decoder width, grids."""
     if isinstance(mm_tokens_per_image, bool) or not isinstance(mm_tokens_per_image, int):
         raise ValueError(
             f"mm_tokens_per_image is {mm_tokens_per_image!r}, the soft-token count "
@@ -1609,13 +1576,14 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"mm_tokens_per_image ({mm_tokens_per_image}) is not a square, this "
             "projector pools a grid into a grid")
-    patches = records.integer(vision["image_size"], "image_size") // records.integer(vision["patch_size"], "patch_size")
+    patches = records.integer(vision["image_size"], "image_size") // records.integer(
+        vision["patch_size"], "patch_size"
+    )
     if patches % side:
         raise ValueError(
             f"{patches} patches per side do not split over {side} soft tokens per side")
     return {
         "kind": "gemma",
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,
@@ -1623,14 +1591,9 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
     }
 
 
-def translate_llama4_projector_config(vision: Mapping[str, object],
-                                      text_width: int) -> Mapping[str, object]:
-    """A Llama 4 wrapper's projector fields: tower output width, text width."""
-    return {
-        "kind": "llama4",
-        "vision_width": records.integer(vision["projector_output_dim"], "projector_output_dim"),
-        "text_width": int(text_width),
-    }
+def translate_llama4_projector_config(text_width: int) -> Mapping[str, object]:
+    """A Llama 4 wrapper's projector fields: the text width."""
+    return {"kind": "llama4", "text_width": int(text_width)}
 
 
 _GEMMA4_VISION_TENSORS = {
@@ -1679,7 +1642,11 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
         hf_name.split("."))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
-    collection = "constants" if path[-1] in ("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max") else "params"
+    collection = (
+        "constants"
+        if path[-1] in ("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max")
+        else "params"
+    )
     return (collection, *path)
 
 
@@ -1707,18 +1674,17 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The head
-    width derives from the hidden size and the head count; a config carrying
-    any other width refuses. Standardization and activation clipping retain
+    width comes from head_dim or the hidden size divided by the head count.
+    Standardization and activation clipping retain
     their reference buffers outside the trainable parameter collection.
     """
     vision = _vision_section(hf_config)
     hidden = records.integer(vision["hidden_size"], "hidden_size")
     heads = records.integer(vision["num_attention_heads"], "num_attention_heads")
     head_dim = vision.get("head_dim", hidden // heads)
-    if records.integer(head_dim, "head_dim") != hidden // heads or hidden % heads:
+    if records.integer(head_dim, "head_dim") <= 0 or records.integer(head_dim, "head_dim") % 4:
         raise ValueError(
-            f"head_dim ({head_dim}) is not hidden_size ({hidden}) over "
-            f"num_attention_heads ({heads}), the width this trunk derives")
+            f"head_dim ({head_dim}) must split into the two rotary dimensions and their halves")
     activation = str(vision.get("hidden_activation", vision.get("hidden_act",
                                                                 "gelu_pytorch_tanh")))
     if activation not in ("gelu_pytorch_tanh", "gelu"):
@@ -1744,10 +1710,15 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": heads,
-        "num_key_value_heads": records.integer(vision.get("num_key_value_heads", heads), "num_key_value_heads"),
+        "num_key_value_heads": records.integer(
+            vision.get("num_key_value_heads", heads), "num_key_value_heads"
+        ),
+        "head_dim": records.integer(head_dim, "head_dim"),
         "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
         "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": records.integer(vision.get("position_embedding_size", 10240), "position_embedding_size"),
+        "position_embedding_size": records.integer(
+            vision.get("position_embedding_size", 10240), "position_embedding_size"
+        ),
         "hidden_act": activation,
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
         "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
@@ -1758,10 +1729,9 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
 
 def translate_gemma4_projector_config(vision: Mapping[str, object],
                                       text_width: int) -> Mapping[str, object]:
-    """A Gemma 4 wrapper's projector fields: tower width, decoder width."""
+    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
     return {
         "kind": "gemma4",
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }
@@ -1776,7 +1746,12 @@ _QWEN35_VISION_TENSORS = {
 
 def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
-    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit() or parts[-1] not in ("weight", "bias"):
+    if (
+        len(parts) < 4
+        or parts[0] != "blocks"
+        or not parts[1].isdigit()
+        or parts[-1] not in ("weight", "bias")
+    ):
         return None
     block, leaf = f"blocks_{parts[1]}", parts[-1]
     if len(parts) == 4 and parts[2] in ("norm1", "norm2"):
@@ -1837,7 +1812,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
     must be square, and the activation one the shared MLP runs.
     """
     vision = _vision_section(hf_config)
-    if vision.get("model_type", "qwen3_5_vision") not in ("qwen3_5_vision", "qwen3_5"):
+    if vision.get("model_type", "qwen3_5_vision") not in _QWEN35_VISION_TYPES:
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
     table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")
@@ -1861,18 +1836,18 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "patch_size": records.integer(vision["patch_size"], "patch_size"),
         "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
-        "out_hidden_size": records.integer(vision["out_hidden_size"], "out_hidden_size"),
         "num_position_embeddings": table,
     }
 
 
-def translate_qwen35_projector_config(vision: Mapping[str, object],
+def translate_qwen35_projector_config(hf_config: Mapping[str, object],
                                       text_width: int) -> Mapping[str, object]:
     """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output.
 
     The merged features enter the text embeddings directly, so a merger width
     beside the decoder width refuses.
     """
+    vision = _vision_section(hf_config)
     merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
     if merged != int(text_width):
         raise ValueError(
@@ -1881,7 +1856,7 @@ def translate_qwen35_projector_config(vision: Mapping[str, object],
     return {
         "kind": "qwen3_5",
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision["spatial_merge_size"], "spatial_merge_size"),
+        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "out_width": merged,
     }
 
@@ -2003,7 +1978,9 @@ class Gemma3nProjectorModule(nn.Module):
 
     def setup(self):
         if min(self.vision_width, self.text_width, self.vocab_size) < 1 or self.vocab_offset < 0:
-            raise ValueError("vision/text widths and vocab_size must be positive; vocab_offset is nonnegative")
+            raise ValueError(
+                "vision/text widths and vocab_size must be positive; vocab_offset is nonnegative"
+            )
         if self.norm_eps <= 0:
             raise ValueError("norm_eps must be positive")
         self.embedding = nn.Embed(self.vocab_size, self.vision_width, dtype=self.dtype,
@@ -2198,10 +2175,14 @@ TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
 _TOWER_WEIGHTS = {"siglip": translate_siglip_vision_weights, "llama4": translate_llama4_vision_weights,
                   "qwen3_5": translate_qwen35_vision_weights, "gemma3n": translate_gemma3n_vision_weights,
                   "deepseek_v41": translate_deepseek_v41_vision_weights}
-_PROJECTOR_WEIGHTS = {"gemma": translate_gemma_projector_weights, "llama4": translate_llama4_projector_weights,
-                      "gemma4": translate_gemma4_projector_weights, "qwen3_5": translate_qwen35_projector_weights,
-                      "gemma3n": translate_gemma3n_projector_weights,
-                      "deepseek_v41": translate_deepseek_v41_projector_weights}
+_PROJECTOR_WEIGHTS = {
+    "gemma": translate_gemma_projector_weights,
+    "llama4": translate_llama4_projector_weights,
+    "gemma4": translate_gemma4_projector_weights,
+    "qwen3_5": translate_qwen35_projector_weights,
+    "gemma3n": translate_gemma3n_projector_weights,
+    "deepseek_v41": translate_deepseek_v41_projector_weights,
+}
 
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:

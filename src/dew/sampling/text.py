@@ -1,8 +1,9 @@
 """Cached text generation with explicit lengths and sampling likelihoods.
 
 `generate` validates a request on the host, prefills the prompt once, and
-hands the decode loop to a `Strategy`. `Sampling` is the default policy:
-temperature, top-k, top-p and min-p with an EOS criterion. `Generation`
+hands the decode loop to a `Strategy`. `Sampling` is the default policy: the
+common generation controls as one value, compiled in Transformers' order,
+with an EOS criterion. `Generation`
 carries the tokens with one length and two log probabilities per row, the
 behaviour policy's and the model's own.
 
@@ -21,7 +22,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, Protocol, overload, runtime_checkable
+from typing import Generic, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -30,13 +31,12 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
-from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     PredictionPhase,
     RowPlan,
@@ -46,21 +46,29 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
-from dew.nn.kv_cache import Layered, refuse_unassigned
+from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
+    FrequencyPenalty,
     Greedy,
     LogitsTransform,
+    MinNewTokens,
     MinP,
+    NoRepeatNGram,
+    PresencePenalty,
+    RepetitionPenalty,
     StepState,
     Stopping,
     Temperature,
     TopK,
     TopP,
+    Typical,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -80,14 +88,9 @@ SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunction
 
 @runtime_checkable
 class Bounded(Protocol):
-    """A model that declares its vocabulary and the capacity of its cache.
-
-    `nn.Module` declares neither; a decoder (`CausalTransformer`, the
-    multimodal wrapper, a test policy) declares both, and the host checks
-    read them to refuse an id outside the vocabulary or a request that
-    would overflow the cache. A model that declares neither is checked
-    for neither.
-    """
+    """A model that declares its vocabulary and cache capacity, which the host
+    checks read to refuse an id outside the vocabulary or a request that would
+    overflow the cache; a model that declares neither is checked for neither."""
 
     @property
     def vocab_size(self) -> int: ...
@@ -98,11 +101,8 @@ class Bounded(Protocol):
 
 @runtime_checkable
 class Exposing(Protocol):
-    """A decoder that hands back its hidden states beside its logits.
-
-    A strategy that drafts seeds its draft from them. A model without the
-    method still decodes; it only cannot draft.
-    """
+    """A decoder that hands back its hidden states beside its logits, which a
+    drafting strategy seeds from; without them a model decodes but cannot draft."""
 
     def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
                           ) -> tuple[jax.Array, jax.Array]: ...
@@ -110,12 +110,8 @@ class Exposing(Protocol):
 
 @runtime_checkable
 class Selective(Protocol):
-    """A decoder that scores one position per row instead of them all.
-
-    Its prefill runs the head on the slot the first draw reads and nothing
-    else; a model without the method scores every prompt position and pays
-    for the ones it discards.
-    """
+    """A decoder that scores one position per row instead of them all, so its
+    prefill runs the head only on the slot the first draw reads."""
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
                              ) -> tuple[jax.Array, jax.Array]: ...
@@ -147,6 +143,19 @@ class BlockDrafting(Protocol):
     def dspark(self) -> DSpark | None: ...
 
 
+# Transformers' `_get_logits_processor` order, by its own control names: the
+# processors, then the sampling warpers. Presence and frequency penalties are
+# vLLM's (and OpenAI's) and sit beside the repetition penalty, where vLLM
+# applies its penalties together. `Sampling` holds the common controls; a
+# source's generation config hands the rest in as built transforms.
+PROCESSORS = ("sequence_bias", "encoder_repetition_penalty", "repetition_penalty", "presence_penalty",
+              "frequency_penalty", "no_repeat_ngram_size", "encoder_no_repeat_ngram_size", "bad_words_ids",
+              "min_length", "min_new_tokens", "forced_bos_token_id", "forced_eos_token_id",
+              "remove_invalid_values", "exponential_decay_length_penalty", "suppress_tokens",
+              "begin_suppress_tokens")
+WARPERS = ("temperature", "top_h", "top_k", "top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff")
+
+
 @dataclass(frozen=True)
 class Sampling:
     """Token selection and termination. Zero temperature is deterministic argmax.
@@ -154,34 +163,83 @@ class Sampling:
     ``top_k=None`` keeps the vocabulary. EOS counts as a sampled action;
     subsequent output slots contain ``pad_id`` and have no likelihood.
 
-    A ``Sampling`` value compiles to temperature, top-k, top-p and min-p
-    transforms when a request has no explicit logits chain. An explicit
-    chain replaces those transforms. The EOS criterion still joins the
+    The penalties, ``no_repeat_ngram_size``, ``min_new_tokens`` and
+    ``typical_p`` are Transformers' controls of the same names, and
+    ``presence_penalty`` and ``frequency_penalty`` vLLM's; each one's
+    default changes nothing. ``stop`` ends a row whose text ends with one
+    of the strings, compiled against a task's processor.
+
+    ``eos_id`` and ``pad_id`` are facts of the model and its tokenizer, so a
+    task fills the ones a policy leaves None with its own, as Transformers'
+    `generate` does; plain `generate` has no task, stops on no EOS unless
+    one is named, and pads with 0.
+
+    A ``Sampling`` value compiles to its transforms in Transformers' order
+    when a request has no explicit logits chain. An explicit chain replaces
+    those transforms. The EOS and stop-string criteria still join the
     request's stopping criteria.
     """
 
     temperature: float = 1.0
     top_k: int | None = None
     eos_id: int | tuple[int, ...] | None = None
-    pad_id: int = 0
+    pad_id: int | None = None
     top_p: float = 1.0
     min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    no_repeat_ngram_size: int = 0
+    min_new_tokens: int = 0
+    typical_p: float = 1.0
+    stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
         if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
             raise ValueError("top_k must be a positive integer or None")
-        for name, value in (("top_p", self.top_p), ("min_p", self.min_p)):
+        for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
             if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be finite and between zero and one")
-        if type(self.pad_id) is not int or self.pad_id < 0:
+        if isinstance(self.repetition_penalty, bool) or not (
+                math.isfinite(self.repetition_penalty) and self.repetition_penalty > 0):
+            raise ValueError("repetition_penalty must be finite and positive")
+        for name, value in (("presence_penalty", self.presence_penalty),
+                            ("frequency_penalty", self.frequency_penalty)):
+            if isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        for name, value in (("no_repeat_ngram_size", self.no_repeat_ngram_size),
+                            ("min_new_tokens", self.min_new_tokens)):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.pad_id is not None and (type(self.pad_id) is not int or self.pad_id < 0):
             raise ValueError("pad_id must be a non-negative token id")
         if self.eos_id is not None:
             stops = (self.eos_id,) if isinstance(self.eos_id, int) else tuple(self.eos_id)
             if not stops or any(type(token) is not int or token < 0 for token in stops):
                 raise ValueError("eos_id must contain non-negative token ids")
             object.__setattr__(self, "eos_id", stops)
+        if isinstance(self.stop, str):
+            raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
+        if any(not isinstance(string, str) or not string for string in self.stop):
+            raise ValueError("stop must hold non-empty strings")
+        # A record reads a JSON list back; the policy holds a tuple.
+        object.__setattr__(self, "stop", tuple(self.stop))
+
+    @property
+    def pad(self) -> int:
+        """The id output slots after EOS hold: `pad_id`, or 0 when nothing filled it."""
+        return 0 if self.pad_id is None else self.pad_id
+
+    def active(self, names: Sequence[str]) -> list[str]:
+        """Return the named controls this policy sets away from their defaults.
+
+        A remote engine that cannot apply a control the way Dew does refuses
+        the ones this names, rather than drawing without them.
+        """
+        neutral = Sampling()
+        return [name for name in names if getattr(self, name) != getattr(neutral, name)]
 
     @property
     def stops(self) -> tuple[int, ...]:
@@ -194,25 +252,71 @@ class Sampling:
 
         Zero temperature is the argmax, and the sample-only filters are
         inactive there, which is what `generate()` does with `do_sample=False`.
+        A caller that adds a transform of its own writes
+        `logits=policy.transforms() + (mine,)`.
         """
-        if self.temperature == 0:
-            return (Greedy(),)
-        tail: list[LogitsTransform] = []
-        if self.temperature != 1.0:
-            tail.append(Temperature(self.temperature))
-        if self.top_k is not None:
-            tail.append(TopK(self.top_k))
-        if self.top_p < 1.0:
-            tail.append(TopP(self.top_p))
-        if self.min_p > 0.0:
-            tail.append(MinP(self.min_p))
-        return tuple(tail)
+        return ordered_transforms(self)
 
     def criteria(self) -> tuple[Stopping, ...]:
         """The EOS criterion this policy adds after a caller's criteria."""
         if self.eos_id is None:
             return ()
         return (EndOfSequence(jnp.asarray(self.eos_id, jnp.int32)),)
+
+
+def with_ids_of(policy: Sampling, defaults: Sampling) -> Sampling:
+    """Return `policy` with the EOS and pad ids it leaves None taken from `defaults`.
+
+    A task's policy holds its model's and tokenizer's ids, so a call that
+    replaces the policy keeps stopping and padding where the task does.
+    """
+    return replace(policy, eos_id=defaults.eos_id if policy.eos_id is None else policy.eos_id,
+                   pad_id=defaults.pad_id if policy.pad_id is None else policy.pad_id)
+
+
+def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = types.MappingProxyType({}),
+                       *, searching: bool = False) -> tuple[LogitsTransform, ...]:
+    """Build `policy`'s chain, with `extra` beside it, in Transformers' order.
+
+    `extra` holds transforms for the controls a `Sampling` does not carry, by
+    their Transformers names in `PROCESSORS` and `WARPERS`, plus
+    `renormalize_logits`, which runs last; a source's generation config is
+    what names them. Zero temperature ends the processors with the argmax
+    and runs no warper, and a beam search (`searching`) picks its own
+    continuations, so its chain ends after the processors.
+    """
+    eos = None if policy.eos_id is None else jnp.asarray(policy.eos_id, jnp.int32)
+    if policy.min_new_tokens and eos is None:
+        raise ValueError("min_new_tokens holds EOS back, and this policy names no eos_id; "
+                         "set it, or let a task fill it")
+    own: dict[str, LogitsTransform | None] = {
+        "repetition_penalty": (RepetitionPenalty(policy.repetition_penalty)
+                               if policy.repetition_penalty != 1.0 else None),
+        "presence_penalty": PresencePenalty(policy.presence_penalty) if policy.presence_penalty else None,
+        "frequency_penalty": FrequencyPenalty(policy.frequency_penalty) if policy.frequency_penalty else None,
+        "no_repeat_ngram_size": (NoRepeatNGram(policy.no_repeat_ngram_size)
+                                 if policy.no_repeat_ngram_size else None),
+        "min_new_tokens": (MinNewTokens(policy.min_new_tokens, eos)
+                           if eos is not None and policy.min_new_tokens else None),
+        "temperature": Temperature(policy.temperature) if policy.temperature not in (0.0, 1.0) else None,
+        "top_k": None if policy.top_k is None else TopK(policy.top_k),
+        "top_p": TopP(policy.top_p) if policy.top_p < 1.0 else None,
+        "min_p": MinP(policy.min_p) if policy.min_p > 0.0 else None,
+        "typical_p": Typical(policy.typical_p) if policy.typical_p < 1.0 else None,
+    }
+    misplaced = sorted(set(extra) & set(own) | set(extra) - {*PROCESSORS, *WARPERS, "renormalize_logits"})
+    if misplaced:
+        raise ValueError(f"{misplaced} are not controls a chain takes beside a Sampling policy")
+    present = {**extra, **{name: transform for name, transform in own.items() if transform is not None}}
+    chain = [present[name] for name in PROCESSORS if name in present]
+    if not searching:
+        if policy.temperature == 0:
+            chain.append(Greedy())
+        else:
+            chain += [present[name] for name in WARPERS if name in present]
+    if "renormalize_logits" in extra:
+        chain.append(extra["renormalize_logits"])
+    return tuple(chain)
 
 
 @struct.dataclass
@@ -267,21 +371,12 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
              cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
-    A decoder that scores one position per row runs its head on the slot the
-    first draw reads and nothing else: the head over a whole prompt is the
-    largest array a prefill allocates, [rows, width, vocab], and the loop
-    keeps one row of it. A decoder without that method scores every position
-    and pays for the ones it discards.
-
-    A model with prediction depths also gets their independent cache, seeded
-    over the prompt: each depth reads the target's hidden state at one
-    position with the token at the next, at that token's own position, which
-    is the history a checkpoint's predictor was trained behind. A depth left
-    empty would draft the first block from nothing. A block drafter's
-    windows take the context of every real prompt position.
-
-    `cache` continues a cache the caller already holds, whose cursors say
-    where each row's prompt resumes; None allocates an empty one.
+    A `Selective` decoder skips the prompt-wide head, the largest array a
+    prefill allocates, `[rows, width, vocab]`. Prediction depths get their
+    cache seeded over the prompt (`_seeded_depths`), so the first block does
+    not draft from nothing, and a block drafter's windows take every real
+    prompt position's context. `cache` continues a cache the caller holds,
+    whose cursors say where each prompt resumes; None allocates an empty one.
     """
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
@@ -295,11 +390,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
-        {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])], rngs=None,
-        method=("states_and_logits_at" if selective else
-                "states_and_logits" if exposed else None), capture_intermediates=False,
-        **inputs.kwargs())
+        {**params, "cache": held},
+        *scored,
+        decode=True,
+        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
+        rngs=None,
+        method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
+        capture_intermediates=False,
+        **inputs.kwargs(),
+    )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
         states = _context(model, params, updated)
@@ -333,7 +432,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
     cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
+        cache.update(
+            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
+        )
     return unflatten_dict(cache)
 
 
@@ -365,7 +466,7 @@ def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
                    if logical is None
                    else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
     compact = states[jnp.arange(batch)[:, None], order[..., 0]]
-    state, _, carried = strategies.reseed(
+    state, carried = strategies.reseed(
         ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
         jnp.take_along_axis(embeddings, order, axis=1)[:, 1:],
         jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
@@ -449,12 +550,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
-    """The `(propose, embed)` pair a drafting strategy runs the depths with.
-
-    `propose` runs one prediction depth over a candidate token at an explicit
-    target position; `embed` prepares the token embeddings a replayed block
-    hands back to the depths.
-    """
+    """`DecodeOps.propose` and `DecodeOps.embed` over the model's prediction depths."""
     def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array | None,
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
@@ -479,13 +575,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
 
 
 def _block_drafting(model: nn.Module, params: Variables):
-    """The `(record, draft)` pair a block drafter runs with.
-
-    `record` appends the context of a stretch's real positions to the
-    drafter's windows; `draft` drafts the block after what they hold from
-    each row's drawn token, handing each position's logits to `choose`,
-    which draws the next token.
-    """
+    """`DecodeOps.record` and `DecodeOps.draft` over the model's block drafter."""
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
         _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
                                  method="draft", mutable=["cache"])
@@ -531,11 +621,9 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
-               n: int) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs whose validity
-    field is present only where a prompt is actually padded."""
+def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+                  max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
+    """Shared host validation; return validity without placing unused device inputs."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -556,9 +644,18 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
     if vocab is not None and np.any((ids >= vocab) & ~media):
         raise ValueError("text token ids must be inside the vocabulary")
-    if vocab is not None and (sampling.pad_id >= vocab or
+    if vocab is not None and (sampling.pad >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
+    return valid
+
+
+def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
+               n: int) -> ModelInputs:
+    """Host checks shared by every caller; returns device inputs whose validity
+    field is present only where a prompt is actually padded."""
+    valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():
@@ -676,7 +773,7 @@ def _digest(components: Components) -> tuple[Identity, str]:
 
 def _request(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             key: jax.Array | None, seed: int | None, sampling: Sampling, n: int,
+             key: int | jax.Array | None, sampling: Sampling, n: int,
              logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
              *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[Identity, ...]]:
     """This process's validated request and the controls a pool compares.
@@ -686,7 +783,7 @@ def _request(model: nn.Module, params: Variables,
     rank enters a collective. A single process never digests: refusing a
     component only a pool could disagree about would cost it nothing.
     """
-    random_key = request_key(key, seed)
+    random_key = request_key(key)
     canonical = ModelInputs.from_value(inputs)
     ids = local_rows(canonical.tokens)
     fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
@@ -696,7 +793,7 @@ def _request(model: nn.Module, params: Variables,
     _refuse_exchange(model)
     prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
-    controls = (max_new_tokens, n, sampling.pad_id) + ((_digest(components),) if pooled else ())
+    controls = (max_new_tokens, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, random_key, components, controls
 
 
@@ -759,26 +856,13 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
-@overload
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
-
-
-@overload
-def generate(model: nn.Module, params: Variables,
-             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, seed: int, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms | None = None, stopping: Criteria | None = None,
-             strategy: Strategy | None = None) -> Generation: ...
+_DEFAULT_SAMPLING = Sampling()
 
 
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array | None = None, seed: int | None = None,
-             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
+             *, key: int | jax.Array | None = None,
+             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 
@@ -806,11 +890,15 @@ def generate(model: nn.Module, params: Variables,
     than replacing it. ``strategy`` replaces the per-row draw loop; ``None``
     uses ``Sample``.
     """
+    if sampling.stop:
+        raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
+                         "have; generate through a TextGeneration with a processor, or pass "
+                         "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
 
     def resolve():
-        return _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
+        return _request(model, params, inputs, max_new_tokens, key, sampling, n,
                         logits, stopping, strategy, pooled=processes > 1)
 
     request = (agreed("generation input validation", resolve) if processes > 1 else resolve())
@@ -823,7 +911,8 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     padded = _padded(plan, prepared)
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
-                                               plan.keys(random_key), max_new_tokens, sampling.pad_id, n,
+                                               plan.keys(random_key), max_new_tokens, sampling.pad, n,
                                                *components)
-    failure.throw()
+    # The error's flags are the one read a request waits on.
+    jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

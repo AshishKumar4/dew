@@ -13,7 +13,9 @@ conversations, which is what `dew.data.ChatMessages` reads and renders with
 the checkpoint's own chat template. The run writes the PEFT adapter directory
 `LoRA.save` produces, which transformers loads, then loads the base again
 through `dew.pipeline`, merges the adapter into it and writes the decoded
-canvases to `samples.txt`.
+canvases to `samples.txt`. Image-conditioned training on real Oxford Flowers
+is `examples/sft_diffusion_gemma_images.py`; it uses a fresh small model,
+not the released 26B model's qualification.
 
     JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 """
@@ -23,12 +25,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 import tyro
 
 import dew
 from dew.data import ChatMessages, Loading
-from dew.interop import load_pretrained
+from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.base import thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -89,7 +92,7 @@ def main(config: Config) -> Path:
             raise ValueError("--chat names the conversations to fine-tune on: a hub "
                              "dataset id, a .jsonl file or a parquet file")
 
-    source = load_pretrained(config.model, dtype="bfloat16", param_dtype="float32")
+    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32)
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
     adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,
@@ -125,10 +128,10 @@ def main(config: Config) -> Path:
     # The other half of the workflow, from the files alone: the base weights
     # back through `dew.pipeline`, the adapter directory read onto them, and
     # the factors folded into the kernels so the task runs the base model.
-    base = dew.pipeline(config.model, dtype="float32")
+    base = dew.pipeline(config.model, dtype=jnp.float32)
     trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
     task = base.bind(trained.merge(weights))
-    generated = task(PROMPTS, config.response_tokens, seed=3)
+    generated = task(PROMPTS, config.response_tokens, key=3)
     (config.out / "samples.txt").write_text("\n".join(task.decode(generated)) + "\n")
     print(f"adapter {adapter_dir}  samples {config.out / 'samples.txt'}")
     return adapter_dir

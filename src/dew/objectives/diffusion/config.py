@@ -11,26 +11,29 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
-import dew.eval  # registers the image metrics
-import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
-from dew.data import ImageDataset, OnlineImages, OnlineVideos, OxfordFlowers, VideoDataset
-from dew.diffusion.presets import build_process
+from dew.data import ImageDataset, OnlineImages, OnlineVideos, TFDSImages, VideoDataset
+from dew.diffusion.presets import EDM, Flow, MeanFlow, Shortcut, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import FROZEN, Variables
-from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
+from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers
 from dew.sampling.guidance import CFG
+from dew.sampling.solvers import EulerAncestral
 
 from .alignment import REPRESENTATION, Alignment
 from .end_to_end import AUTOENCODER, EndToEnd
 from .objective import DiffusionObjective
+
+import_module("dew.eval")  # registers the image metrics
+import_module("dew.nn.backbones")  # registers the models before the config's unions are built
 
 if TYPE_CHECKING:
     from dew.diffusion.presets import Preset
@@ -40,13 +43,13 @@ if TYPE_CHECKING:
     # only the run sees it. Statically the fields are typed as every member
     # of those tables, which a reader and a checker need.
     PresetSpec = Preset
-    SamplerSpec = Solver
+    SolverSpec = Solver
     # The run reads captions through `load(tokenize=)`, which the token
     # datasets do not take; `sample_field` refuses those at runtime.
     CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
 else:
     PresetSpec = presets.union
-    SamplerSpec = samplers.union
+    SolverSpec = solvers.union
     CaptionedSpec = datasets.union
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
@@ -201,7 +204,7 @@ class FlowGRPO:
                              "scores each sample with an image metric's per-sample measure")
 
         def reward(images, batch):
-            return np.asarray(metric.measure(ImageGrid(images), batch))
+            return np.asarray(metric.fn(ImageGrid(images), batch))
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
@@ -239,13 +242,13 @@ class ShortcutTraining:
 def teacher_model(directory: str, variables: Variables | None) -> Variables:
     """A distilled run's teacher model variables: a saved distilled tree's
     own copy, else the teacher run's published ones."""
-    from dew.sampling.pipelines import restore_variables
+    from dew.checkpoints import Checkpoints
 
     from .objective import TEACHER, _without_loss_heads
 
     if variables is not None:
         return variables[TEACHER]
-    restored = restore_variables(directory, ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    restored = Checkpoints(directory).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
     return _without_loss_heads({name: tree for name, tree in restored.items()
                                 if name not in ("encoders", "autoencoder")})
 
@@ -334,8 +337,10 @@ class ConsistencyDistillation:
         if scale != SMOOTH_TIME_SCALE:
             raise ValueError(
                 f"sCM differentiates the student in time, and the student starts from a teacher trained at "
-                f"time_scale={scale}, whose time embedding is too fast in it to learn from; train the teacher "
-                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)")
+                f"time_scale={scale}, whose time embedding is too fast in it to learn from; "
+                "train the teacher "
+                f"with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only (consistency_weight=0)"
+            )
 
     def teacher_variables(self, variables: Variables | None) -> Variables:
         return teacher_model(self.teacher, variables)
@@ -360,12 +365,17 @@ class GuidanceDistillation:
     def teacher_objective(self, variables: Variables | None) -> tuple[DiffusionObjective, Variables]:
         """The teacher run's objective over its variables: a saved student
         tree's copy of them, else the run's published ones."""
-        from dew.sampling.pipelines import restore_variables
+        from dew.checkpoints import Checkpoints
 
         from .objective import TEACHER
 
-        held = (variables[TEACHER] if variables is not None else
-                restore_variables(self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None))
+        held = (
+            variables[TEACHER]
+            if variables is not None
+            else Checkpoints(self.teacher).variables(
+                ema=None, step=None, mesh=None, layout=None, param_dtype=None
+            )
+        )
         return DiffusionRunConfig.load(self.teacher).build(variables=held), held
 
 
@@ -418,11 +428,11 @@ class DiffusionRunConfig(RunConfig):
     otherwise; it follows `rl`, so a saved record names what trained."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
-    preset: PresetSpec | None = dataclasses.field(default_factory=presets.EDM)
+    data: CaptionedSpec = dataclasses.field(default_factory=TFDSImages)
+    preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with. None is the one
     the `pretrained` pipeline's scheduler reads, which a preset may restate."""
-    sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
+    solver: SolverSpec = dataclasses.field(default_factory=EulerAncestral)
     """The solver validation samples with."""
     guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
     """How validation samples are guided, scale and interval; None samples
@@ -453,9 +463,18 @@ class DiffusionRunConfig(RunConfig):
     (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
     preset's fixed weighting."""
     alignment: RepresentationAlignment | None = None
+    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
+    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     mean_flow: MeanFlowTraining | None = None
+    """Train with MeanFlow's loss instead of the denoising loss; the preset
+    is `mean_flow` and sampling is unguided, since the guidance is trained
+    in."""
     shortcut: ShortcutTraining | None = None
+    """Train a shortcut model instead of the denoising loss; the preset is
+    `shortcut`, and sampling is unguided."""
     distill: ConsistencyDistillation | None = None
+    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
+    instead of the denoising loss; sampling is unguided."""
     guidance_distill: GuidanceDistillation | None = None
     adversarial: AdversarialDistillation | None = None
     """Distill a saved flow run adversarially (LADD, ADD); sampling is
@@ -463,15 +482,6 @@ class DiffusionRunConfig(RunConfig):
     """Distill a saved run's classifier-free guidance into this model's
     guidance input; sampling reads the conditioner's guidance value and no
     second branch."""
-    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
-    instead of the denoising loss; sampling is unguided."""
-    """Train a shortcut model instead of the denoising loss; the preset is
-    `shortcut`, and sampling is unguided."""
-    """Train with MeanFlow's loss instead of the denoising loss; the preset
-    is `mean_flow` and sampling is unguided, since the guidance is trained
-    in."""
-    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
-    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered
@@ -488,7 +498,6 @@ class DiffusionRunConfig(RunConfig):
                            "rcm" if self.distill is not None else
                            "guidance_distillation" if self.guidance_distill is not None else
                            "ladd" if self.adversarial is not None else "diffusion")
-        from dew.diffusion.presets import EDM, Flow
 
         extras = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "distill", "uncertainty")
                   if getattr(self, name) is not None]
@@ -503,21 +512,23 @@ class DiffusionRunConfig(RunConfig):
         others = [name for name in ("rl", "alignment", "mean_flow", "shortcut", "uncertainty")
                   if getattr(self, name) is not None]
         if self.distill is not None and (others or self.guidance is not None
-                                         or not isinstance(self.preset, presets.Flow)):
-            raise ValueError("rCM distills on its own losses under the flow preset and samples unguided: "
-                             f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
-                             " unset")
+                                         or not isinstance(self.preset, Flow)):
+            raise ValueError(
+                "rCM distills on its own losses under the flow preset and samples unguided: "
+                f"set guidance None, and leave {others or 'rl, alignment, mean_flow, shortcut, uncertainty'}"
+                " unset"
+            )
         if (self.mean_flow is not None or self.shortcut is not None) and self.uncertainty is not None:
             raise ValueError("MeanFlow and shortcut models train on their own losses, which read no "
                              "learned uncertainty weighting; leave uncertainty unset")
         if self.mean_flow is not None and (self.rl is not None or self.alignment is not None
                                            or self.guidance is not None
-                                           or not isinstance(self.preset, presets.MeanFlow)):
+                                           or not isinstance(self.preset, MeanFlow)):
             raise ValueError("MeanFlow trains on its own loss under the mean_flow preset, guided in "
                              "training (omega, kappa): set guidance None, and neither rl nor alignment")
         if self.shortcut is not None and (self.rl is not None or self.alignment is not None
                                           or self.mean_flow is not None or self.guidance is not None
-                                          or not isinstance(self.preset, presets.Shortcut)):
+                                          or not isinstance(self.preset, Shortcut)):
             raise ValueError("a shortcut model trains on its own loss under the shortcut preset and "
                              "samples unguided: set guidance None, and none of rl, alignment, mean_flow")
         if self.alignment is not None and (self.rl is not None or self.pretrained is not None):
@@ -658,7 +669,7 @@ class DiffusionRunConfig(RunConfig):
             return FlowGRPOObjective(
                 model, process, inputs, sde=FlowSDE(self.rl.noise_level), beta=self.rl.beta,
                 clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
-                autoencoder=autoencoder, guidance=self.guidance, sampler=self.sampler,
+                autoencoder=autoencoder, guidance=self.guidance, solver=self.solver,
                 steps=self.sampling_steps, pretrained=variables)
         if self.mean_flow is not None:
             from .few_step import MeanFlowObjective
@@ -666,7 +677,7 @@ class DiffusionRunConfig(RunConfig):
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.adversarial is not None:
             from .adversarial import AdversarialDistillationObjective
 
@@ -675,7 +686,7 @@ class DiffusionRunConfig(RunConfig):
             return AdversarialDistillationObjective(
                 model, process, inputs, teacher=teacher_model(self.adversarial.teacher, variables), **fields,
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.guidance_distill is not None:
             from .guidance_distillation import GuidanceDistillationObjective
 
@@ -683,17 +694,20 @@ class DiffusionRunConfig(RunConfig):
             return GuidanceDistillationObjective(
                 model, process, inputs, teacher=teacher, teacher_variables=held,
                 scales=self.guidance_distill.scales, autoencoder=autoencoder, pretrained=variables,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
 
             self.distill.check_teacher(self.model.architecture)
 
-            fields = {field.name: getattr(self.distill, field.name) for field in dataclasses.fields(self.distill)
-                      if field.name != "teacher"}
+            fields = {
+                field.name: getattr(self.distill, field.name)
+                for field in dataclasses.fields(self.distill)
+                if field.name != "teacher"
+            }
             return ConsistencyDistillationObjective(
                 model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, sampler=self.sampler,
+                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, solver=self.solver,
                 guidance=None, steps=self.sampling_steps)
         if self.shortcut is not None:
             from .few_step import ShortcutObjective
@@ -701,13 +715,13 @@ class DiffusionRunConfig(RunConfig):
             return ShortcutObjective(
                 model, process, inputs, **dataclasses.asdict(self.shortcut),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
             model, process, inputs,
             autoencoder=autoencoder, pretrained=variables,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
-            sampler=self.sampler,
+            solver=self.solver,
             guidance=self.guidance,
             steps=self.sampling_steps,
             uncertainty=self.uncertainty,
@@ -777,7 +791,7 @@ class DiffusionRunConfig(RunConfig):
         name, revision = split_revision(self.pretrained)
         height, width = self.sample_field().shape[-3:-1]
         return load_diffusion_source(
-            name, revision=revision, dtype=self.model.dtype,
+            name, revision=revision, dtype=self.model.dtype or "bfloat16",
             param_dtype=self.model.param_dtype or "float32",
             attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
 

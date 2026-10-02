@@ -43,7 +43,7 @@ from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.rope import rotary_freqs
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
 EXCHANGES = {"all_to_all": exchanged_heads_attention, "all_gather": gathered_keys_attention}
@@ -141,23 +141,23 @@ def packed_mask(segments):
 
 
 CALLS = {
-    "causal": dict(causal=True),
-    "window": dict(causal=True, sliding_window=5),
-    "packed": dict(mask=packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))),
+    "causal": {"causal": True},
+    "window": {"causal": True, "sliding_window": 5},
+    "packed": {"mask": packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))},
     # Query-broadcast rows must survive the reorder without being expanded.
-    "broadcast_mask": dict(
-        causal=True, mask=(jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]),
-    "broadcast_bias": dict(
-        causal=True, bias=jnp.linspace(-4.0, 4.0, SEQ_LEN)[None, None, None, :]),
-    "bias": dict(causal=True,
-                 bias=jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))),
-    "full": dict(),
+    "broadcast_mask": {
+        "causal": True, "mask": (jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]},
+    "broadcast_bias": {
+        "causal": True, "bias": jnp.linspace(-4.0, 4.0, SEQ_LEN)[None, None, None, :]},
+    "bias": {"causal": True,
+                 "bias": jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))},
+    "full": {},
     # One learned logit per query head, split with the heads by the exchange.
-    "sinks": dict(causal=True, sinks=jax.random.normal(jax.random.key(4), (4,))),
+    "sinks": {"causal": True, "sinks": jax.random.normal(jax.random.key(4), (4,))},
     # Each row's keys end at its own length; the rows split with the batch.
-    "key_lengths": dict(key_value_seq_lengths=jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
-    "causal_key_lengths": dict(causal=True, key_value_seq_lengths=jnp.asarray(
-        [16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
+    "key_lengths": {"key_value_seq_lengths": jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)},
+    "causal_key_lengths": {"causal": True, "key_value_seq_lengths": jnp.asarray(
+        [16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)},
 }
 
 
@@ -183,7 +183,7 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
     query, key, value = heads(jax.random.key(0), kv_heads=2)
     call = dict(CALLS[name], implementation=implementation)
     whole = scaled_dot_product_attention(query, key, value, **call)
-    with jax.set_mesh(build_mesh(SPLIT)):
+    with jax.set_mesh(SPLIT.build()):
         split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, key, value)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
@@ -209,7 +209,7 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
 
     whole = jax.grad(loss(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)),
                      argnums=(0, 1, 2))(query, key, value)
-    with jax.set_mesh(build_mesh(spec)):
+    with jax.set_mesh(spec.build()):
         split = jax.jit(jax.grad(loss(lambda q, k, v: through("all_to_all", q, k, v, **call)),
                                  argnums=(0, 1, 2)))(query, key, value)
     for got, want in zip(split, whole, strict=True):
@@ -217,7 +217,7 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
 
 
 def placed_on(spec, query, key, value, sequence=True):
-    mesh = build_mesh(spec)
+    mesh = spec.build()
     rows = NamedSharding(mesh, P(("data", "expert", "fsdp"), "sequence" if sequence else None))
     return mesh, jax.device_put((query, key, value), rows)
 
@@ -255,16 +255,16 @@ def test_the_byte_count_picks_the_exchange_for_a_call_with_no_mask():
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("case, spec, shape, call, exchanged", [
-    ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), dict(causal=True), True),
+    ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), {"causal": True}, True),
     # H=4, K=1, n=4: 2(4 + 4)/4 = 4 units against the gather's 2 + 2 * 4/4 = 4.
     # A masked call takes the all-to-all even at a tie in bytes, whose kernel
     # skips the masked blocks.
     ("causal_one_key_head", MeshSpec(fsdp=2, sequence=4), (BATCH, SEQ_LEN, 4, 1),
-     dict(causal=True), True),
-    ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), dict(), False),
+     {"causal": True}, True),
+    ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), {}, False),
     ("heads_the_split_cannot_divide", MeshSpec(tensor=2, sequence=4),
-     (BATCH, SEQ_LEN, 4, 2), dict(causal=True), False),
-    ("odd_joint_length", SPLIT, (BATCH, 15, 4, 4), dict(), False),
+     (BATCH, SEQ_LEN, 4, 2), {"causal": True}, False),
+    ("odd_joint_length", SPLIT, (BATCH, 15, 4, 4), {}, False),
 ], ids=lambda value: value if isinstance(value, str) else "")
 def test_every_call_takes_the_exchange_its_shape_admits(case, spec, shape, call, exchanged):
     """The choice is per call and falls to the gather for any shape the
@@ -276,7 +276,7 @@ def test_every_call_takes_the_exchange_its_shape_admits(case, spec, shape, call,
     key, value = (jax.random.normal(k, (batch, length, kv_heads, 8)) for k in keys[1:])
     assert exchanges_heads(spec, query, key, value, **call) is exchanged
     whole = scaled_dot_product_attention(query, key, value, **call)
-    with jax.set_mesh(build_mesh(spec)):
+    with jax.set_mesh(spec.build()):
         split = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))(
             query, key, value)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
@@ -292,7 +292,7 @@ def test_splash_runs_inside_the_exchange():
     shape = (2, 256, 4, 8)
     query, key, value = (jax.random.normal(k, shape, jnp.float32) for k in (q_key, k_key, v_key))
     whole = scaled_dot_product_attention(query, key, value, causal=True)
-    with jax.set_mesh(build_mesh(MeshSpec(fsdp=2, sequence=2))):
+    with jax.set_mesh(MeshSpec(fsdp=2, sequence=2).build()):
         split = jax.jit(lambda q, k, v: through(
             "all_to_all", q, k, v, causal=True, implementation="tpu"))(query, key, value)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
@@ -324,7 +324,7 @@ def test_cudnn_runs_inside_either_exchange(exchange, causal, without_determinist
             *(x.astype(jnp.float32) for x in (query, key, value)))
     whole = outputs(lambda q, k, v: scaled_dot_product_attention(
         q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
-    with jax.set_mesh(build_mesh(MeshSpec(sequence=2), jax.devices()[:2])):
+    with jax.set_mesh(MeshSpec(sequence=2).build(jax.devices()[:2])):
         split = outputs(lambda q, k, v: through(
             exchange, q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
 
@@ -340,10 +340,12 @@ def test_cudnn_runs_inside_either_exchange(exchange, causal, without_determinist
 @pytest.mark.mesh
 def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
     query, key, value = heads(jax.random.key(0), kv_heads=2)
-    with jax.set_mesh(build_mesh(MeshSpec(tensor=2, sequence=4))):
-        with pytest.raises(ValueError, match="gathered_keys_attention"):
-            jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
-                query, key, value)
+    with (
+        jax.set_mesh(MeshSpec(tensor=2, sequence=4).build()),
+        pytest.raises(ValueError, match="gathered_keys_attention"),
+    ):
+        jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
+            query, key, value)
 
 
 LOCAL_LENGTH = 32
@@ -364,13 +366,13 @@ def local_inputs():
 
 
 LOCAL_CALLS = {
-    "window": dict(window=5),
-    "window_packed": dict(window=5, packed=True),
-    "window_valid_sinks": dict(window=5, valid=True, sinks=True),
+    "window": {"window": 5},
+    "window_packed": {"window": 5, "packed": True},
+    "window_valid_sinks": {"window": 5, "valid": True, "sinks": True},
     # Chunks of 4 start at every shard's first row; chunks of 6 straddle them.
-    "chunk_aligned": dict(chunk=4),
-    "chunk_straddling": dict(chunk=6),
-    "chunk_positions": dict(chunk=6, positions=True, packed=True),
+    "chunk_aligned": {"chunk": 4},
+    "chunk_straddling": {"chunk": 6},
+    "chunk_positions": {"chunk": 6, "positions": True, "packed": True},
 }
 
 
@@ -434,7 +436,7 @@ def test_local_attention_splits_over_the_sequence_with_one_halo(name, spec):
     gradients of the queries, keys and values match whole sequences."""
     call = LOCAL_CALLS[name]
     whole, _ = local_outputs(call, 4, 2)
-    split, text = local_outputs(call, 4, 2, build_mesh(spec))
+    split, text = local_outputs(call, 4, 2, spec.build())
     # An HLO collective names the axes it runs over after the mesh: `{'sequence'}`.
     over_sequence = [line for line in text.splitlines()
                      if " all-gather(" in line and re.search(r"\] \{[^}]*'sequence'", line)]
@@ -447,9 +449,9 @@ def test_local_attention_splits_over_the_sequence_with_one_halo(name, spec):
 def test_a_window_wider_than_a_shard_takes_the_exchange():
     """Eight shards of 4 rows cannot hold a window of 5 in one neighbour, so
     the call runs whole through the sequence exchange, and still matches."""
-    call = dict(window=5, packed=True)
+    call = {"window": 5, "packed": True}
     whole, _ = local_outputs(call, 8, 8)
-    split, text = local_outputs(call, 8, 8, build_mesh(MeshSpec(sequence=8)))
+    split, text = local_outputs(call, 8, 8, MeshSpec(sequence=8).build())
     assert "all-to-all" in text
     assert_close_by_leaf(split, whole)
 
@@ -497,16 +499,16 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
 
 
 @pytest.mark.mesh
-def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
-    """A full attention module: rotary angles from the row's position, then
-    the causal mask. Both were applied in sequence order, and the exchanged
-    call has to match them exactly (observed 4.8e-7)."""
-    module = NormalAttention(query_dim=32, heads=4, dim_head=8, causal=True)
+def test_rotary_positions_survive_the_exchange():
+    """A full attention module: rotary angles from the row's position,
+    applied in sequence order, and the exchanged call has to match them
+    exactly (observed 4.8e-7)."""
+    module = NormalAttention(query_dim=32, heads=4, dim_head=8)
     x = jax.random.normal(jax.random.key(1), (BATCH, SEQ_LEN, 32), jnp.float32)
     freqs = rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0, dtype=np.float32)
     variables = module.init(jax.random.key(2), x, freqs_cis=freqs)
     whole = module.apply(variables, x, freqs_cis=freqs)
-    with jax.set_mesh(build_mesh(SPLIT)):
+    with jax.set_mesh(SPLIT.build()):
         split = jax.jit(lambda v, x: module.apply(v, x, freqs_cis=freqs))(variables, x)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
@@ -516,10 +518,9 @@ def test_decoding_is_refused_under_a_sequence_axis():
     model = tiny()
     tokens = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
-    with jax.set_mesh(build_mesh(SPLIT)):
-        with pytest.raises(ValueError, match="sequence axis of 2"):
-            jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
-                variables, tokens)
+    with jax.set_mesh(SPLIT.build()), pytest.raises(ValueError, match="sequence axis of 2"):
+        jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
+            variables, tokens)
 
 
 # --------------------------------------------------------------------------
@@ -673,7 +674,7 @@ def mamba_parity(split: str, packed: bool, dtype, seed: int = 0) -> list[tuple[s
         return outputs
 
     whole = both(mamba_layer(dtype))(variables, hidden)
-    with jax.set_mesh(build_mesh(MAMBA_SPLITS[split])):
+    with jax.set_mesh(MAMBA_SPLITS[split].build()):
         program = jax.jit(both(mamba_layer(dtype)))
         text = program.lower(variables, hidden).as_text()
         sharded = program(variables, hidden)

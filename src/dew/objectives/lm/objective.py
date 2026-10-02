@@ -59,15 +59,14 @@ from dew.objectives.base import (
     FROZEN,
     Aux,
     EMASpec,
-    Mean,
     Objective,
     PathFilter,
     Prediction,
+    Ratio,
     Shown,
     Step,
     Variables,
     freeze,
-    mean_loss,
     merge,
     merge_totals,
     thaw,
@@ -275,7 +274,11 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     for name in columns:
         if name in prepared.token_fields:
             raise ValueError(f"{name} must come from either ModelInputs or the packing column")
-    return dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns}) if columns else prepared
+    return (
+        dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns})
+        if columns
+        else prepared
+    )
 
 
 def prompt_batch(prompt) -> jax.Array:
@@ -300,7 +303,7 @@ class Samples:
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     decode: Callable[[list[int]], str] = lambda ids: str(ids)
 
 
@@ -380,8 +383,8 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
 
-def router_z_terms(routing: Variables, weight: float) -> tuple[Mean, ...]:
-    """ST-MoE's router z-loss (arXiv 2202.08906, eq. 5), one `Mean` per router:
+def router_z_terms(routing: Variables, weight: float) -> tuple[Ratio, ...]:
+    """ST-MoE's router z-loss (arXiv 2202.08906, eq. 5), one `Ratio` per router:
     `weight` times the squared log partition of the gate logits, summed over
     the positions the router saw and divided by their count. The count adds
     across micro-batches, so a step's term is its routed positions' mean, and
@@ -392,7 +395,7 @@ def router_z_terms(routing: Variables, weight: float) -> tuple[Mean, ...]:
     for node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
         work = log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))
-        terms.append(Mean(weight * jnp.sum(jnp.square(work)), jnp.asarray(work.size, work.dtype)))
+        terms.append(Ratio(weight * jnp.sum(jnp.square(work)), jnp.asarray(work.size, work.dtype)))
     return tuple(terms)
 
 
@@ -447,10 +450,10 @@ class Scores(NamedTuple):
 @struct.dataclass
 class LMStatistics:
     """Hold the prediction's statistics beside independently normalized router terms."""
-    prediction: Mean
-    sequence: tuple[Mean, ...]
+    prediction: Ratio
+    sequence: tuple[Ratio, ...]
     global_routers: tuple[RouterMoments, ...]
-    router_z: tuple[Mean, ...] = ()
+    router_z: tuple[Ratio, ...] = ()
 
 
 def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable: PathFilter | None,
@@ -466,8 +469,11 @@ def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable
     return _is_indexer if indexer.phase == "warmup" else None
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 @objectives("lm")
-class LMObjective(Objective[Mean | LMStatistics, Variables]):
+class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews.
 
     `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
@@ -492,8 +498,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     the full pass. It also slices the forward that an evaluation or a
     scoring pass runs.
 
+    `ema_decay` keeps an exponential moving average of the trained leaves
+    at that decay, and evaluation and previews then read the average. None,
+    the default, keeps none: no second copy of the weights, and validation
+    scores the weights that trained.
+
     `pretrained` is a variables dict to start from instead of a fresh
-    init. A `dew.interop.load_pretrained(...)` bundle's `lm_objective`
+    init. A `dew.interop.PretrainedDecoder.load(...)` bundle's `lm_objective`
     builds the objective with its model and variables together. The
     trainer takes its whole initial state from `init`.
 
@@ -503,8 +514,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     CausalTransformer's mixture. Unset leaves the bias where it is.
 
     `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
-    (`dew.nn.moe.deepseek_v2_aux_loss`), summed over every sparse
-    layer, and `seq_aux` chooses its per-sequence form. The released V2
+    (`dew.nn.moe.global_router_loss`), summed over every sparse
+    layer, and `seq_aux` chooses its per-sequence form
+    (`dew.nn.moe.sequence_router_losses`). The released V2
     configs carry both under these names. Unset adds nothing.
 
     `loss_role` counts only the targets whose `text_roles` entry matches
@@ -557,10 +569,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `processor` is what `pipeline` turns text into ids with and decodes
+    through, unless it is handed another. A bundle's `lm_objective` passes
+    the source's own.
     """
 
     artifact = TokenScores
-    shown = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
+    shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
     keeps_whole_logits: ClassVar[bool] = True
@@ -576,7 +592,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         model,
         seq_len: int,
         *,
-        ema_decay: float | None = 0.999,
+        ema_decay: float | None = None,
         pad_id: int | None = None,
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -593,6 +609,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
         token_accuracy: bool = True,
+        processor: Processor | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         decoder = _decoder(model)
@@ -605,6 +622,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
         self.samples = samples
         self.pretrained = pretrained
+        self.processor = processor
         self.balance_rate = balance_rate
         _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
@@ -665,7 +683,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if "params" not in pretrained:
             raise ValueError(
                 "pretrained is the variables dict ({'params': ...}) that "
-                "load_pretrained and model.init return")
+                "Pretrained.load and model.init return")
         pretrained = thaw(pretrained)
         if not self._warmup:
             return pretrained
@@ -682,7 +700,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return merge(variables, pretrained)
 
 
-    def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
+    def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
         """Expose the model over this training tree as a generation task.
 
         A rollout binds one snapshot of the policy and draws every completion
@@ -691,14 +709,36 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         return TextGeneration(self.model, thaw(params), sampling=sampling)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+    def inference_record(self):
+        """Describe this decoder without a training RunConfig or parameter copies."""
+        from dew.config import ModelConfig, _to_json
+        from dew.registry import models, objectives
+        if (not any(member is type(self.model) for member in models.values())
+                or not any(member is type(self) for member in objectives.values())):
+            return None
+        model = ModelConfig.from_model(self.model)
+        kind = objectives.name_of(type(self))
+        samples = self.samples
+        return {
+            'objective': kind,
+            'model': _to_json(model, ModelConfig),
+            'seq_len': self.seq_len,
+            'sample_tokens': 0 if samples is None else samples.max_new_tokens,
+            'sampling': _to_json(Sampling() if samples is None else samples.sampling, Sampling),
+            'tokenizer': None,
+        }
+
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> TextGeneration:
         """Publish the decoder over the state's weights as a generation task.
 
         It samples and is budgeted the way this objective's previews are,
-        and `processor` decodes.
+        and `processor`, or the objective's own when it is None, encodes and
+        decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)), processor,
+        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)),
+                              self.processor if processor is None else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None else samples.max_new_tokens)
 
@@ -706,7 +746,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (),
-                     routes: tuple[jax.Array, jax.Array | None] | None = None):
+                     routes: tuple[jax.Array, jax.Array | None] | None = None,
+                     predict: bool | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -755,7 +796,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks, tile=self.head_tile,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=self.token_accuracy)
+            precision=self.model.precision, predict=self.token_accuracy if predict is None else predict)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -825,12 +866,12 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
         return weights
 
-    def tile_head(self) -> str | None:
-        """Move a head that keeps its whole logits to the generation's tile
-        (`chunked.chunked_tile`), and say what it moved to."""
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
+        """Move a head that keeps its whole logits to `tile`, by default the
+        generation's (`chunked.chunked_tile`), and say what it moved to."""
         if self.head_tile is not None:
             return None
-        self.head_tile = chunked_tile()
+        self.head_tile = chunked_tile() if tile is None else tile
         return f"the head tiled {self.head_tile}"
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
@@ -975,7 +1016,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         return total / len(kls), mass
 
-    def _warmup_loss(self, params, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
+    def _warmup_loss(self, params, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Score the dense warm-up: the indexer's KL alone.
 
         The main loss is never scored, since nothing it reaches moves.
@@ -994,7 +1035,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return Mean(self.indexer.weight * total, mass), Aux(reported, qk_stats=qk)
+        return Ratio(self.indexer.weight * total, mass), Aux(reported, qk_stats=qk)
 
     def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
         """Split a `[B, seq_len + 1]` batch into its inputs and shifted targets."""
@@ -1004,14 +1045,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         return tokens[:, :-1], tokens[:, 1:]
 
-    def loss(self, params, batch, step: Step) -> tuple[Mean | LMStatistics, Aux[Variables]]:
+    def loss(self, params, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(params, batch, step)
         statistics, aux, _ = self._scored_loss(params, batch, step, train=True)
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Mean, Aux[Variables], Prediction]:
+                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Variables], Prediction]:
         """Score the loss with the logits, the target weights and the outputs
         of `layers` behind it, for a teacher to compare (`Objective.predict`).
 
@@ -1030,7 +1071,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
-        assert isinstance(statistics, Mean)
+        assert isinstance(statistics, Ratio)
         variables = thaw(params)
         head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
         logits = constrain(head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
@@ -1038,7 +1079,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
-                     ) -> tuple[Mean | LMStatistics, Aux[Variables], Scores]:
+                     ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from."""
         prepared = _batch_text(batch)
         rate = self.balance_rate
@@ -1050,33 +1091,33 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
         mass = jax.lax.stop_gradient(jnp.sum(weights))
-        prediction = Mean(jnp.sum(losses * weights), mass)
-        ce, _ = mean_loss(prediction)
+        prediction = Ratio(jnp.sum(losses * weights), mass)
+        ce, _ = prediction.mean()
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
             reported["token_accuracy"] = jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
-            # entropy, so one Mean carries both.
+            # entropy, so one Ratio carries both.
             z_total = self.z_loss * jnp.sum(jnp.square(log_z) * weights)
             reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
-            prediction = Mean(prediction.total + z_total, mass)
+            prediction = Ratio(prediction.total + z_total, mass)
         if self.mtp_weight is not None:
             # Depths retain the main target denominator and configured depth average.
             mtp_total = jnp.mean(jnp.stack([
                 jnp.sum(depth_losses * depth_weights)
                 for depth_losses, depth_weights in depths]))
-            reported["mtp_ce"], _ = mean_loss(Mean(mtp_total, mass))
-            prediction = Mean(prediction.total + self.mtp_weight * mtp_total, mass)
+            reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
+            prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
         if self.indexer is not None:
             # The KL shares the cross entropy's denominator, as the depths
-            # do, so one Mean carries the step: the queries counted differ
+            # do, so one Ratio carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
             total, queries = self._indexer_term(kls, prepared)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
-            prediction = Mean(prediction.total + self.indexer.weight * total, mass)
-        statistics: Mean | LMStatistics = prediction
+            prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
+        statistics: Ratio | LMStatistics = prediction
         if alpha is not None:
             statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
         if self.router_z_loss:
@@ -1085,9 +1126,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 raise ValueError(
                     "router_z_loss needs routers that sow their gate's log partition "
                     "(dew.nn.moe.Router); this model's routers sow none")
-            statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Mean)
+            statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Ratio)
                           else dataclasses.replace(statistics, router_z=router_z))
-            reported["router_z_loss"] = jnp.sum(jnp.stack([mean_loss(term)[0] for term in router_z]))
+            reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
         effects = None
         if rate is not None:
             effects, load = self._router_load(params, routing)
@@ -1098,7 +1139,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
-    def _router_statistics(self, prediction: Mean, routing, alpha: float
+    def _router_statistics(self, prediction: Ratio, routing, alpha: float
                            ) -> tuple[LMStatistics, jax.Array]:
         """Add the balance loss's own statistics beside the prediction's.
 
@@ -1109,13 +1150,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if not routing:
             raise ValueError("aux_loss_alpha requires a model with a mixture")
         routers = _router_scores(routing)
-        sequence = tuple(Mean(jnp.sum(sequence_router_losses(s, i, alpha)),
+        sequence = tuple(Ratio(jnp.sum(sequence_router_losses(s, i, alpha)),
                               jnp.asarray(s.shape[0], jnp.promote_types(s.dtype, jnp.float32)))
                          for s, i in routers) if self.seq_aux else ()
         global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
         statistics = LMStatistics(prediction, sequence, global_routers)
         combined, _ = self.reduce_loss(statistics)
-        prediction_loss, _ = mean_loss(prediction)
+        prediction_loss, _ = prediction.mean()
         return statistics, combined - prediction_loss
 
     def _router_load(self, params: Variables, routing) -> tuple[Variables, dict[str, jax.Array]]:
@@ -1137,12 +1178,12 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return counts, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
                         "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
 
-    def reduce_loss(self, stats: Mean | LMStatistics) -> tuple[jax.Array, jax.Array]:
-        if isinstance(stats, Mean):
-            return mean_loss(stats)
-        value, active = mean_loss(stats.prediction)
+    def reduce_loss(self, stats: Ratio | LMStatistics) -> tuple[jax.Array, jax.Array]:
+        if isinstance(stats, Ratio):
+            return stats.mean()
+        value, active = stats.prediction.mean()
         for term in stats.sequence:
-            auxiliary, supported = mean_loss(term)
+            auxiliary, supported = term.mean()
             value, active = value + auxiliary, active | supported
         for term in stats.global_routers:
             if self.aux_loss_alpha is None:
@@ -1150,7 +1191,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             value = value + global_router_loss(term, self.aux_loss_alpha)
             active = active | (term.positions > 0)
         for term in stats.router_z:
-            auxiliary, supported = mean_loss(term)
+            auxiliary, supported = term.mean()
             value, active = value + auxiliary, active | supported
         return value, active
 
@@ -1168,8 +1209,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present."""
         params = params if step.ema is None else step.ema
-        losses, weights = self._scored(params, _batch_text(batch), self._batch_roles(batch))
-        return TokenScores(losses=losses, weights=weights)
+        losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
+        return TokenScores(losses=losses, weights=weights, correct=correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1207,12 +1248,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _scored(self):
         """Compile the teacher-forced scores once per objective."""
         def scored(params, prepared, roles):
-            scores = self.token_scores(params, prepared, roles=roles)
-            return scores.losses, scores.weights
+            scores = self.token_scores(params, prepared, roles=roles, predict=True)
+            assert scores.correct is not None
+            return scores.losses, scores.weights, scores.correct
 
         return jax.jit(scored)
 
 
+@metrics("perplexity")
 class Perplexity:
     """Report exp of the cross entropy per counted target over a whole pass.
 
@@ -1239,11 +1282,6 @@ class Perplexity:
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))
-
-
-@metrics("perplexity")
-def perplexity() -> Perplexity:
-    return Perplexity()
 
 
 def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:

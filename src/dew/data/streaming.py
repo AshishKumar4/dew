@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from dew.registry import datasets
 
@@ -77,30 +78,6 @@ class OnlineImages(DatasetSpec):
 
         return Dataset(train=tokenized(stream, tokenize), val=None,
                        records=len(rows), batch=batch)
-
-
-@datasets("combined_online")
-@dataclasses.dataclass(frozen=True)
-class CombinedOnline(OnlineImages):
-    """Reads every url dataset in the dew-datasets-regional bucket.
-
-    The liked sets are listed several times over, which weights them up.
-    """
-
-    sources: tuple[str, ...] = (
-        "gs://dew-datasets-regional/datasets/laion-aesthetics-12m+mscoco-2017",
-        "gs://dew-datasets-regional/datasets/coyo700m-aesthetic-5.4_25M",
-        "gs://dew-datasets-regional/datasets/leonardo-liked-1.8m",
-        "gs://dew-datasets-regional/datasets/leonardo-liked-1.8m",
-        "gs://dew-datasets-regional/datasets/leonardo-liked-1.8m",
-        "gs://dew-datasets-regional/datasets/cc12m",
-        "gs://dew-datasets-regional/datasets/playground-liked",
-        "gs://dew-datasets-regional/datasets/leonardo-liked-1.8m",
-        "gs://dew-datasets-regional/datasets/leonardo-liked-1.8m",
-        "gs://dew-datasets-regional/datasets/cc3m",
-        "gs://dew-datasets-regional/datasets/cc3m",
-        "gs://dew-datasets-regional/datasets/laion2B-en-aesthetic-4.2_37M",
-    )
 
 
 @datasets("online_videos")

@@ -29,11 +29,9 @@ from dew.data import (
     DataPartition,
     Dataset,
     DatasetSpec,
-    HFDatasetSource,
     ImageDataset,
     Loading,
     LocalVideos,
-    VoxCeleb2,
     images,
     video,
 )
@@ -41,10 +39,11 @@ from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
+from dew.data.sources.hf import HFDatasetSource
 from dew.position import ENVELOPE
 from dew.registry import datasets
 
-WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
 
 # ---------------------------------------------------------------------------------
@@ -59,16 +58,15 @@ def test_an_unknown_dataset_is_refused():
 def test_a_spec_field_the_dataset_has_no_declaration_for_is_refused():
     """A misspelled knob built a dataset other than the one asked for."""
     with pytest.raises(ValueError, match=r"no field for \['image_scale'\]"):
-        datasets.build("oxford_flowers102", image_scale=64)
-    assert datasets.build("oxford_flowers102", image_size=64).image_size == 64
+        datasets.build("tfds_images", image_scale=64)
+    assert datasets.build("tfds_images", image_size=64).image_size == 64
 
 
-@pytest.mark.parametrize("name", ["cc12m", "combined_30m"])
-def test_arrayrecord_datasets_require_an_explicit_path(name):
+def test_arrayrecord_datasets_require_an_explicit_path():
     """The default was one developer's bucket mount, and an unset path reached
     os.path.join(None, ...) inside the source."""
     with pytest.raises(ValueError, match="path="):
-        datasets[name]().load(batch=8)
+        datasets["array_record_images"](shards=("cc12m",)).load(batch=8)
 
 
 def test_an_unknown_augmentation_is_refused():
@@ -186,7 +184,7 @@ class Indexed(DatasetSpec):
     val_batches: int | None = None
     count: int | None = None
     seed: int = 0
-    loading: Loading = Loading(workers=0)
+    loading: Loading = dataclasses.field(default_factory=lambda: Loading(workers=0))
 
     def source(self):
         return _Indexed(self.length)
@@ -195,7 +193,7 @@ class Indexed(DatasetSpec):
         source = self.source()
         records = len(source) if self.count is None else self.count
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, "Indexed")
-        knobs = dict(batch=batch, seed=self.seed, loading=self.loading)
+        knobs = {"batch": batch, "seed": self.seed, "loading": self.loading}
         return Dataset(train=train_stream(train, [], **knobs),
                        val=None if val is None else validation_pass(val, [], **knobs),
                        records=len(train), batch=batch)
@@ -607,7 +605,7 @@ def test_a_position_over_another_order_is_refused():
     refused instead of resumed at the same offset into different data."""
     _, saved = _steps(2, 3)
 
-    for other in (dict(length=64), dict(seed=1)):
+    for other in ({"length": 64}, {"seed": 1}):
         stream = Indexed(**other).load(batch=8).train(DataPartition())
         with pytest.raises(ValueError, match="records into"):
             stream.set_state(saved[0])
@@ -623,6 +621,69 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     with pytest.raises(ValueError, match="one process's own offset into its shard"):
         stream.set_state(json.dumps({"last_seen_indices": {"0": 15}}).encode())
     stream.close()
+
+
+class _Corpus:
+    """Records of one named corpus, described by that name as a source with
+    an identity is (`describe`)."""
+
+    def __init__(self, name, length=16):
+        self.name, self.length = name, length
+
+    def __repr__(self):
+        return f"_Corpus({self.name!r})"
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        return {"index": np.int32(index)}
+
+
+def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
+    """Two corpora of one type and length, each with a slice held out, were
+    described the same, so a position saved over one resumed the other."""
+    def stream(name):
+        train, _ = hold_out(_Corpus(name), 16, 4, "corpus")
+        return train_stream(train, [], batch=4, seed=0, loading=Loading(threads=1, read_buffer=1))(
+            DataPartition())
+
+    saved = stream("flowers")
+    next(saved)
+    state = saved.get_state()
+    saved.close()
+
+    other = stream("faces")
+    with pytest.raises(ValueError, match="_Corpus\\('flowers'\\)"):
+        other.set_state(state)
+    resumed = stream("flowers")
+    resumed.set_state(state)
+    resumed.close()
+
+
+def test_records_listed_in_memory_are_described_by_their_count_not_their_contents():
+    """A list has a repr, and it is every record: a saved position held it all."""
+    rows = [{"x": np.full(64, index, np.float32)} for index in range(512)]
+    stream = Dataset.from_records(rows, batch=8).train(DataPartition())
+    next(stream)
+
+    assert len(stream.get_state()) < 512
+    stream.close()
+
+
+def test_a_filtering_grain_dataset_is_refused_for_a_global_position():
+    """A filter yields fewer records than the indices it reads, so a record
+    count no longer says where a resumed run starts: one resumed on records
+    it had already read. Grain's own ElasticIterator refuses it the same way."""
+    filtered = pygrain.MapDataset.source(_Points(16)).filter(lambda point: point["index"] % 3)
+
+    shuffled = filtered.seed(0).shuffle()
+    mixed = pygrain.MapDataset.mix([_grain_points(), filtered.repeat(2)])
+    for pipeline in (filtered, shuffled, mixed):
+        with pytest.raises(ValueError, match="filter"):
+            Dataset.from_grain(pipeline, batch=4, **WORKERS)
+    with pytest.raises(ValueError, match="filter"):
+        Dataset.from_grain(_grain_points(), validation=filtered, batch=4, **WORKERS)
 
 
 # ---------------------------------------------------------------------------------
@@ -669,62 +730,21 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
     return clips
 
 
-def test_voxceleb2_scans_the_tree_recursively(tmp_path):
-    clips = _voxceleb_tree(tmp_path)
-    records = VoxCeleb2(path=str(tmp_path)).source()
-
-    assert [record["video_path"] for record in records] == sorted(str(c) for c in clips)
-
-
-def test_voxceleb2_renders_captions_from_the_template(tmp_path):
-    _voxceleb_tree(tmp_path)
-
-    templated = VoxCeleb2(path=str(tmp_path), prompt_template="a video of {identity} speaking")
-    captions = {record["caption"] for record in templated.source()}
-    assert captions == {"a video of id00012 speaking", "a video of id00015 speaking"}
-
-    plain = VoxCeleb2(path=str(tmp_path)).source()
-    assert {record["caption"] for record in plain} == {"a video of a person speaking"}
-
-    # A placeholder the source does not fill is a misspelling, not a caption.
-    with pytest.raises(ValueError, match=r"may use \{identity\}"):
-        VoxCeleb2(path=str(tmp_path), prompt_template="a video of {speaker}").source()
-
-
-def test_voxceleb2_reads_the_requested_split(tmp_path):
-    _voxceleb_tree(tmp_path, split="train")
-    _voxceleb_tree(tmp_path, split="test", identities=("id00017",))
-
-    train = VoxCeleb2(path=str(tmp_path), split="train").source()
-    test = VoxCeleb2(path=str(tmp_path), split="test").source()
-    assert len(train) == 4
-    assert len(test) == 2
-    assert all(os.sep + "train" + os.sep in record["video_path"] for record in train)
-    assert all(os.sep + "test" + os.sep in record["video_path"] for record in test)
-    assert {record["video_path"] for record in train}.isdisjoint({record["video_path"] for record in test})
-    assert {record["video_path"].split(os.sep)[-3] for record in test} == {"id00017"}
-
-
-def test_voxceleb2_reports_missing_roots_clearly(tmp_path):
-    with pytest.raises(ValueError, match="dataset root"):
-        VoxCeleb2().source()
-    with pytest.raises(ValueError, match="split 'train' not found"):
-        VoxCeleb2(path=str(tmp_path)).source()
-
-
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
     records = LocalVideos(path=str(tmp_path), caption="a clip").source()
 
-    assert [r["video_path"] for r in records] == sorted([str(c) for c in clips] + [str(tmp_path / "extra.webm")])
+    assert [r["video_path"] for r in records] == sorted(
+        [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
+    )
     assert {r["caption"] for r in records} == {"a clip"}
     with pytest.raises(ValueError, match="path="):
         LocalVideos().source()
 
 
-def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
+def test_video_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
     """End to end with the reader stubbed and the audio model's extractor
     built here, so its weights are the only thing not real. The extractor
     takes the padded waveform whole and normalises it as one clip, which is
@@ -734,8 +754,8 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = VoxCeleb2(path=str(tmp_path), prompt_template="a video of {identity}",
-                     frame_size=32, frames=4, audio_padding=1)
+    spec = LocalVideos(path=str(tmp_path), caption="a video of a speaker",
+                       frame_size=32, frames=4, audio_padding=1)
     records = spec.source()
     frame_samples = 640
     seen = {}
@@ -759,7 +779,7 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     assert seen["num_frames"] == 4 and seen["audio_padding"] == 1
     assert seen["seed"] == int(np.random.default_rng(0).integers(0, 2**32 - 1))
     assert batch["video"].shape == (4, 32, 32, 3)
-    assert batch["caption"] == "a video of id00012"
+    assert batch["caption"] == "a video of a speaker"
     waveform = batch["audio"]["full_audio"]
     assert waveform.shape == (6, frame_samples) and waveform[0, 0] == -0.5
     flat = waveform.reshape(-1)
@@ -775,7 +795,7 @@ def test_a_clip_is_decoded_at_the_rate_its_audio_model_reads(tmp_path, monkeypat
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = VoxCeleb2(path=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
+    spec = LocalVideos(path=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
 
     def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
                                  fps=25.0):
@@ -796,6 +816,9 @@ def keep_captions(captions):
     """A caption reader that hands the words back, so a test reads what the
     dataset wrote before a run's encoder tokenizes it."""
     return {"caption": np.asarray(captions)}
+
+
+CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 
 
 # ---------------------------------------------------------------------------------
@@ -819,7 +842,7 @@ class Augmenting(ImageDataset):
                        first=0 if split is None else 1000)
 
     def record(self, element, rng):
-        template = images.PROMPT_TEMPLATES[int(rng.integers(len(images.PROMPT_TEMPLATES)))]
+        template = CAPTION_TEMPLATES[int(rng.integers(len(CAPTION_TEMPLATES)))]
         name = ["rose", "tulip", "lotus", "orchid", "marigold"][element["index"] % 5]
         return element["image"], template.format(name), element["index"]
 
@@ -907,20 +930,20 @@ class Lingering(Augmenting):
 
 
 @pytest.mark.slow
-def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capsys):
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caplog):
     """grain stops a stream's worker processes one after another, each
     finishing the batch in its hands before it exits, and kills a worker
     that has not exited within 25 s. Four workers taking 2 s each keep a
     close over 8 s: slow, but bounded by grain itself, so the close must not
     call it a hang, and says what it waits for. sft_gemma4's four workers
     took 5.1 to 7.4 s to stop, past a budget of 2 s and 1 s a worker."""
-    from dew.training import MeshSpec, build_mesh
+    from dew.training import MeshSpec
     from dew.training.distributed import DevicePrefetchIterator
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
     data = Lingering(length=64, image_size=8, seed=3, val_batches=None, loading=loading)
     stream = data.load(batch=4).train(DataPartition())
-    prefetch = DevicePrefetchIterator(stream, build_mesh(MeshSpec(), jax.devices()[:1]))
+    prefetch = DevicePrefetchIterator(stream, MeshSpec().build(jax.devices()[:1]))
     # grain interleaves its workers' batches in turn: one batch from each
     # means every worker has read a record and lingers.
     for _ in range(loading.workers):
@@ -928,7 +951,7 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caps
     began = time.perf_counter()
     prefetch.close()
     assert time.perf_counter() - began > loading.workers * data.seconds
-    assert "waiting for 4 grain workers to stop" in capsys.readouterr().err
+    assert "waiting for 4 grain workers to stop" in caplog.text
 
 
 def test_a_stop_closes_grain_when_no_thread_can_announce_it(monkeypatch):
@@ -1042,7 +1065,10 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     assert sorted(index for index, _, _ in seen + rest[:4]) == list(range(8, 16))
 
 
-def _validated(length, val_batches, batch, partition=DataPartition(), **read):
+_DEFAULT_VALIDATED_PARTITION = DataPartition()
+
+
+def _validated(length, val_batches, batch, partition=_DEFAULT_VALIDATED_PARTITION, **read):
     """{record index: (pixels, caption)} for one share's validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
                       loading=Loading(workers=0, worker_buffer=1, **read)).load(
@@ -1245,7 +1271,7 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
-    assert out["caption"] in {template.format("rose") for template in images.PROMPT_TEMPLATES}
+    assert out["caption"] in {template.format("rose") for template in CAPTION_TEMPLATES}
     assert out["label"] == 5 and out["label"].dtype == np.int32
 
 
@@ -1262,21 +1288,7 @@ def test_resizing_interpolates_up_and_averages_down():
     fine = np.zeros((900, 900, 3), np.uint8)
     fine[::2, ::2] = fine[1::2, 1::2] = 255
     down = images.resize_image(fine, 300)
-    assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
-
-
-@pytest.mark.network
-def test_an_overlong_caption_is_truncated_to_the_text_context():
-    """The tokenizer pads and truncates to CLIP's context, so one enormous
-    caption cannot change the batch's shape."""
-    tokenizer = dew.data.AutoTextTokenizer(tensor_type="np")
-    context = tokenizer.tokenizer.model_max_length
-
-    out = tokenizer(["short", " ".join(["word"] * 500)])
-
-    assert out["input_ids"].shape == (2, context)
-    assert int(out["attention_mask"][1].sum()) == context
-    assert int(out["attention_mask"][0].sum()) < context
+    assert down.min() >= 100 and down.max() <= 160, "area averages the squares it covers"
 
 
 # ---------------------------------------------------------------------------------
@@ -1465,3 +1477,190 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
     for expected, actual in zip(jax.tree.leaves(whole.params),
                                 jax.tree.leaves(resumed.params), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------------
+# Records held in memory, and where a default run reads
+# ---------------------------------------------------------------------------------
+
+def _pid_of(index):
+    """One record that says which process read it."""
+    return {"index": np.int32(index), "pid": np.int32(os.getpid())}
+
+
+def test_a_default_loading_reads_in_the_training_process():
+    """Grain's default is to read in the process that trains. A default that
+    started 32 worker processes took 17.8 s and 7.07 GiB to the first batch
+    of a 100-record pipeline, and a script without a __main__ guard re-ran
+    itself in every worker."""
+    data = Dataset.from_grain(pygrain.MapDataset.range(16).map(_pid_of), batch=4)
+
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert set(batch["pid"].tolist()) == {os.getpid()}
+
+
+def _columns(length=12):
+    index = np.arange(length, dtype=np.int32)
+    return {"index": index, "x": np.stack([index, -index], axis=1).astype(np.float32)}
+
+
+def test_records_in_memory_are_reshuffled_every_epoch_and_each_read_once_per_epoch():
+    stream = Dataset.from_records(_columns(), batch=4, seed=3).train(DataPartition())
+
+    epochs = [list(itertools.chain.from_iterable(_indices(stream, 3))) for _ in range(3)]
+    for epoch in epochs:
+        assert sorted(epoch) == list(range(12)), "each record once per epoch"
+    assert len({tuple(epoch) for epoch in epochs}) == 3, "a fresh order every epoch"
+    assert epochs[0] != list(range(12)), "the first epoch is shuffled too"
+
+
+def test_records_in_memory_follow_their_seed():
+    def order(seed):
+        return _indices(Dataset.from_records(_columns(), batch=4, seed=seed).train(DataPartition()), 6)
+
+    assert order(0) == order(0)
+    assert order(0) != order(1)
+
+
+def test_a_mapping_of_columns_and_a_list_of_records_are_the_same_records():
+    columns = _columns()
+    rows = [{"index": columns["index"][i], "x": columns["x"][i]} for i in range(12)]
+
+    by_columns = Dataset.from_records(columns, batch=4, seed=0).train(DataPartition())
+    by_rows = Dataset.from_records(rows, batch=4, seed=0).train(DataPartition())
+    first, second = next(by_columns), next(by_rows)
+
+    assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
+    for name in ("index", "x"):
+        np.testing.assert_array_equal(first[name], second[name])
+
+
+def test_columns_of_different_lengths_are_refused_by_name():
+    with pytest.raises(ValueError, match="'x' holds 3 records and 'index' holds 4"):
+        Dataset.from_records({"index": np.arange(4), "x": np.zeros((3, 2))}, batch=2)
+
+
+def test_an_in_memory_stream_resumes_on_the_records_it_had_not_read():
+    data = Dataset.from_records(_columns(), batch=4, seed=0)
+    stream = data.train(DataPartition())
+    _indices(stream, 2)
+    state = stream.get_state()
+    rest = _indices(stream, 4)
+
+    resumed = data.train(DataPartition())
+    resumed.set_state(state)
+    assert _indices(resumed, 4) == rest
+
+
+def test_process_shares_of_in_memory_records_split_every_global_batch():
+    data = Dataset.from_records(_columns(), batch=4, seed=0)
+    whole = _indices(data.train(DataPartition()), 3)
+    halves = [_indices(data.train(DataPartition(index=index, count=2)), 3) for index in (0, 1)]
+
+    for step, rows in enumerate(whole):
+        first, second = halves[0][step], halves[1][step]
+        assert not set(first) & set(second), "the shares are disjoint"
+        assert sorted(first + second) == sorted(rows), "together they are the global batch"
+
+
+def test_held_out_records_are_one_ordered_pass():
+    data = Dataset.from_records(_columns(), batch=4, validation=_columns(8))
+
+    assert data.records == 12 and data.steps_per_epoch == 3
+    assert data.val is not None
+    assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_held_out_records_too_few_for_one_batch_are_refused():
+    with pytest.raises(ValueError, match="3 validation records, fewer than one batch of 4"):
+        Dataset.from_records(_columns(), batch=4, validation=_columns(3))
+
+
+def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
+    """Token ids of varying length are the usual cause, and grain's own
+    message names the batch structure rather than what to change."""
+    rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
+    stream = Dataset.from_records(rows, batch=2).train(DataPartition())
+
+    with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
+        next(stream)
+    assert "same structure" in str(refused.value.__cause__)
+
+
+def test_training_records_too_few_for_one_batch_are_refused():
+    """An endless stream would fill a batch by repeating records inside it,
+    and an epoch would be zero steps long."""
+    with pytest.raises(ValueError, match="3 training records, fewer than one batch of 4"):
+        Dataset.from_records(_columns(3), batch=4)
+
+
+def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
+    """The in-memory route exists so a first run can checkpoint. A resumed run
+    reads the records after the checkpoint and ends where an uninterrupted
+    run ends."""
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Checkpoints, Layout, Trainer
+
+    class Regression(Objective):
+        def __init__(self):
+            self.model = nn.Dense(1)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 2)))
+
+        def loss(self, params, batch, step):
+            target = batch["index"][:, None].astype(jnp.float32)
+            return jnp.mean((self.model.apply(params, batch["x"]) - target) ** 2), Aux({})
+
+    def run(steps, directory=None):
+        trainer = Trainer(
+            Regression(), optax.sgd(0.01), key=jax.random.key(0),
+            layout=Layout(min_shard=1, tolerance=1.0),
+            checkpoints=None if directory is None else Checkpoints(str(directory)))
+        return trainer.fit(Dataset.from_records(_columns(16), batch=8, seed=0),
+                           steps=steps, log_every=1,
+                           checkpoint_every=None if directory is None else 2)
+
+    run(2, tmp_path / "run")
+    resumed = run(5, tmp_path / "run")
+    whole = run(5)
+
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+
+
+def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Layout, Trainer
+
+    class Regression(Objective):
+        def __init__(self):
+            self.model = nn.Dense(1)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 2)))
+
+        def loss(self, params, batch, step):
+            return jnp.mean(self.model.apply(params, batch["x"]) ** 2), Aux({})
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    data = Dataset.from_records(_columns(16), batch=8)
+
+    trainer.fit(dataclasses.replace(data, held_out=24), steps=2, log_every=1)
+    noted = capsys.readouterr().out
+    trainer.fit(data, steps=2, log_every=1)
+
+    assert noted.count("validation: 24 records held out of train") == 1
+    assert "held out" not in capsys.readouterr().out

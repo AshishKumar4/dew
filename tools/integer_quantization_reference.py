@@ -26,7 +26,7 @@ import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM
 
-from dew.interop import codecs, load_pretrained
+from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
 
 REPOS = {
@@ -60,7 +60,7 @@ def library_weight(awq_utils, config: dict, tensors: dict, name: str) -> np.ndar
 
 
 def logits(directory: Path, dtype: str) -> np.ndarray:
-    loaded = load_pretrained(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
     return np.asarray(loaded.model.apply(loaded.variables, IDS.astype(np.int32)), np.float32)
 
 
@@ -118,7 +118,7 @@ def main() -> None:
                  "logits_bf16_vs_transformers_fp32": float(np.max(np.abs(logits(directory, "bfloat16") - theirs)))}
         with tempfile.TemporaryDirectory() as scratch:
             # 'auto' keeps each dense tensor in the dtype the source stored it in.
-            loaded = load_pretrained(directory, dtype="float32", param_dtype="auto", attention_impl="reference")
+            loaded = Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference")
             loaded.save(scratch)
             written = read_weights(scratch)
             entry["saved_bytes_differ"] = sorted(

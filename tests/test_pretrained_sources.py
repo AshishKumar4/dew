@@ -105,7 +105,7 @@ def test_a_pipeline_downloads_only_the_component_files_it_reads(hub, monkeypatch
     monkeypatch.setattr(pretrained, "_load_diffusion_source", lambda directory, index, **kwargs:
                         pretrained.Pretrained(None, {}, None, index, directory, {}))
 
-    loaded = pretrained.load_pretrained(repo)
+    loaded = pretrained.Pretrained.load(repo)
 
     assert loaded.source == fake.snapshot and loaded.revision == fake.commit
     assert sorted(fake.fetched) == sorted(
@@ -119,8 +119,12 @@ def write_index(directory, weight_map, stem="model"):
 
 def test_a_local_checkpoint_reads_the_indexed_shards_and_not_a_consolidated_copy(tmp_path):
     one, two = np.ones((2, 2), np.float32), np.zeros((2,), np.float32)
-    safetensors_numpy.save_file({"model.embed_tokens.weight": one}, str(tmp_path / "model-00001-of-00002.safetensors"))
-    safetensors_numpy.save_file({"model.norm.weight": two}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    safetensors_numpy.save_file(
+        {"model.embed_tokens.weight": one}, str(tmp_path / "model-00001-of-00002.safetensors")
+    )
+    safetensors_numpy.save_file(
+        {"model.norm.weight": two}, str(tmp_path / "model-00002-of-00002.safetensors")
+    )
     safetensors_numpy.save_file({"tok_embeddings.weight": one}, str(tmp_path / "consolidated.safetensors"))
     write_index(tmp_path, {"model.embed_tokens.weight": "model-00001-of-00002.safetensors",
                            "model.norm.weight": "model-00002-of-00002.safetensors"})
@@ -131,11 +135,19 @@ def test_a_local_checkpoint_reads_the_indexed_shards_and_not_a_consolidated_copy
 
 
 def test_a_tensor_in_two_shards_is_refused_by_name(tmp_path):
-    safetensors_numpy.save_file({"model.norm.weight": np.ones(2, np.float32)}, str(tmp_path / "a.safetensors"))
-    safetensors_numpy.save_file({"model.norm.weight": np.zeros(2, np.float32)}, str(tmp_path / "b.safetensors"))
-    write_index(tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"})
+    safetensors_numpy.save_file(
+        {"model.norm.weight": np.ones(2, np.float32)}, str(tmp_path / "a.safetensors")
+    )
+    safetensors_numpy.save_file(
+        {"model.norm.weight": np.zeros(2, np.float32)}, str(tmp_path / "b.safetensors")
+    )
+    write_index(
+        tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"}
+    )
 
-    with pytest.raises(ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"):
+    with pytest.raises(
+        ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"
+    ):
         sources.load_shards(tmp_path)
 
 
@@ -145,7 +157,9 @@ def test_a_text_encoder_reads_its_weights_and_not_the_fp16_variant_beside_them(t
     from dew.nn import text_encoders
 
     weight = np.arange(4, dtype=np.float32)
-    safetensors_numpy.save_file({"text_model.final_layer_norm.weight": weight}, str(tmp_path / "model.safetensors"))
+    safetensors_numpy.save_file(
+        {"text_model.final_layer_norm.weight": weight}, str(tmp_path / "model.safetensors")
+    )
     safetensors_numpy.save_file({"text_model.final_layer_norm.weight": weight.astype(np.float16)},
                                 str(tmp_path / "model.fp16.safetensors"))
 
@@ -200,7 +214,9 @@ MAMBA2_130M_CONVERSION = "ea6060f68a4289e9c06f80effa896629ba519216"
 """The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 
-def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, conversion, monkeypatch, tmp_path, caplog):
+def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(
+    hub, conversion, monkeypatch, tmp_path, caplog
+):
     """state-spaces/mamba2-130m ships only pytorch_model.bin; refs/pr/1 on
     that commit adds model.safetensors, and only that file downloads."""
     import huggingface_hub
@@ -210,8 +226,13 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
     pull = FakeHub(FIXTURES / "mamba2-130m-ssm", tmp_path / "pull")
     pull.commit, pull.files = MAMBA2_130M_CONVERSION, [*main.files, "model.safetensors"]
     pull.snapshot = tmp_path / "pull" / "snapshots" / MAMBA2_130M_CONVERSION
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, *, revision=None, **kwargs: (
-        pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main)(repo_id, revision=revision, **kwargs))
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda repo_id, *, revision=None, **kwargs: (
+            pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main
+        )(repo_id, revision=revision, **kwargs),
+    )
 
     with caplog.at_level("WARNING"):
         directory = sources.snapshot("state-spaces/mamba2-130m", None)
@@ -244,7 +265,7 @@ def test_a_gguf_repo_names_its_files_and_the_gguf_file_that_loads_one(hub):
     fake = hub("qwen3-4b-gguf")
 
     with pytest.raises(FileNotFoundError, match="gguf_file="):
-        pretrained.load_pretrained("unsloth/Qwen3-4B-GGUF")
+        pretrained.Pretrained.load("unsloth/Qwen3-4B-GGUF")
     assert fake.fetched == []
 
 
@@ -367,7 +388,10 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
 
     scaling = YarnScaling(**record["yarn"])
     assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
-    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy())) < 1e-7
+    assert (
+        np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
+        < 1e-7
+    )
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
 
 
@@ -398,7 +422,7 @@ def leaf_dtypes(variables):
 def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
     """transformers' dtype='auto' rule: config.json's dtype, else the
     dtype of the first floating tensor."""
-    loaded = pretrained.load_pretrained(bf16_source(tmp_path, **stated), dtype="float32",
+    loaded = pretrained.Pretrained.load(bf16_source(tmp_path, **stated), dtype="float32",
                                         param_dtype="auto", attention_impl="xla")
 
     assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
@@ -410,6 +434,121 @@ def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
     task = dew.pipeline(str(bf16_source(tmp_path)), dtype="float32", param_dtype="auto")
 
     assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}
+
+
+def test_pipeline_preserves_a_bf16_residual_before_its_norm(tmp_path):
+    """A fresh inference process observes the same stored BF16 sum as training."""
+    import subprocess
+    import sys
+
+    source = bf16_source(tmp_path)
+    script = """
+import sys
+import dew
+task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dew.nn.attention import RMSNorm
+a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
+b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
+norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
+variables = norm.init(jax.random.key(2), a)
+stored = jax.jit(jnp.add)(a, b)
+expected = jax.jit(norm.apply)(variables, stored)
+actual = jax.jit(lambda a, b: norm.apply(variables, a + b))(a, b)
+np.testing.assert_array_equal(actual, expected)
+"""
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_allow_excess_precision"))
+    result = subprocess.run([sys.executable, "-c", script, str(source)], capture_output=True, text=True,
+                            env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=90)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+@pytest.mark.parametrize("entry", ["typed", "trainer"])
+def test_import_policy_covers_typed_loading_and_plain_trainer(tmp_path, entry):
+    """Real callers that do not run pipeline/prepare_process keep declared BF16 sums."""
+    import subprocess
+    import sys
+
+    source = bf16_source(tmp_path)
+    script = """
+import sys
+import dew
+import jax
+import jax.numpy as jnp
+import numpy as np
+if sys.argv[2] == "typed":
+    from dew.interop.pretrained import Pretrained
+    from dew.sampling import Sampling
+    task = Pretrained.load(sys.argv[1], dtype="bfloat16", param_dtype="auto").text_generation(
+        sampling=Sampling(temperature=0, eos_id=None))
+    generated = task(np.asarray([[1,2,3]], np.int32), 3, key=0).host()
+    assert int(generated.lengths[0]) == 3
+else:
+    import optax
+    from dew.objectives import Objective
+    from dew.objectives.base import Aux
+    from dew.training import Trainer
+    class Probe(Objective):
+        def init(self, key, variables=None):
+            return {"params": {"w": jnp.ones(1)}}
+        def loss(self, variables, batch, step):
+            return jnp.sum(variables["params"]["w"] ** 2), Aux({})
+    trainer = Trainer(Probe(), optax.sgd(0.1), key=0)
+    trainer.initial_state()
+from dew.nn.attention import RMSNorm
+a = jax.random.normal(jax.random.key(0), (512,64), jnp.bfloat16)
+b = (jax.random.normal(jax.random.key(1), (512,64)) * 0.37).astype(jnp.bfloat16)
+norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
+variables = norm.init(jax.random.key(2), a)
+stored = jax.jit(jnp.add)(a,b)
+expected = jax.jit(norm.apply)(variables,stored)
+actual = jax.jit(lambda a,b: norm.apply(variables,a+b))(a,b)
+np.testing.assert_array_equal(actual,expected)
+"""
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_allow_excess_precision"))
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(source), entry],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"},
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_import_after_live_jax_warns_once_without_claiming_a_flag():
+    """The late-import path neither reopens the backend nor advertises a new policy."""
+    import subprocess
+    import sys
+
+    script = """
+import logging
+import os
+import jax
+import jax.numpy as jnp
+jax.block_until_ready(jnp.add(1,2))
+captured=[]
+class Capture(logging.Handler):
+    def emit(self,record):
+        captured.append(record.getMessage())
+logger=logging.getLogger("dew.telemetry.devices")
+logger.addHandler(Capture())
+import dew
+from dew.telemetry.devices import keep_roundings,xla_flag
+keep_roundings()
+assert xla_flag("xla_allow_excess_precision") is None
+assert len(captured)==1,captured
+assert "Restart" in captured[0] and "before importing JAX" in captured[0],captured
+"""
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_allow_excess_precision"))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=60)
+    assert result.returncode == 0, result.stderr[-4000:]
 
 
 @pytest.mark.parametrize("name", ["qwen3-tiny", "llama-tiny", "mistral-tiny", "gemma3-tiny",
@@ -424,7 +563,7 @@ def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
     config = {**fixture_config(name), "max_position_embeddings": 40960}
     (source / "config.json").write_text(json.dumps(config))
 
-    loaded = pretrained.load_pretrained(source, dtype="float32", attention_impl="xla")
+    loaded = pretrained.Pretrained.load(source, dtype="float32", attention_impl="xla")
     loaded.save(tmp_path / "saved")
 
     assert loaded.model.max_seq_len == 8192
@@ -452,9 +591,9 @@ def test_a_cached_repo_id_loads_offline_when_the_commit_lists_files_never_downlo
     (repo / "refs" / "main").write_text(commit)
     script = """
 import sys
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 for revision in (None, sys.argv[1]):
-    print(load_pretrained("dew/qwen3-tiny", revision=revision, dtype="float32").revision)
+    print(Pretrained.load("dew/qwen3-tiny", revision=revision, dtype="float32").revision)
 """
     run = subprocess.run([sys.executable, "-c", script, commit], capture_output=True, text=True,
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "HF_HUB_CACHE": str(tmp_path / "hub"),

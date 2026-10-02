@@ -1,27 +1,18 @@
 """The MoE grouped matmul on JAX's Pallas kernels, `gmm` and `tgmm`.
 
-`ragged_dot.py` beside this file holds the kernels, vendored from the jax
-source tree. This module owns what Dew adds around them: the predicate that
-says which products they compute exactly (`ragged_dot_runs`) and the custom
-VJP that trains through them (`grouped_projection`), in MaxText's megablox
-shape: the forward is `gmm`, the input gradient `gmm` against the transposed
-kernel, the kernel gradient `tgmm`.
+`ragged_dot.py` vendors the kernels; this module adds which products they
+compute exactly (`ragged_dot_runs`) and the custom VJP that trains through
+them (`grouped_projection`), in MaxText's megablox shape: forward `gmm`,
+input gradient `gmm` against the transposed kernel, kernel gradient `tgmm`.
 
-The kernels are Triton kernels, compiled only for a CUDA lowering. The
-choice is made where the call lowers, with `jax.lax.platform_dependent`: a
-computation placed on the CPU of a GPU host lowers to `jax.lax.ragged_dot`
-even though the process's default backend is the GPU. An explicit request
-for the kernels interprets them on the CPU, which is how the CPU suite
-checks them.
-
-jax 0.11.2 deprecates the Pallas Triton backend and warns at every
-lowering. These kernels stay on compute capability 8.0 to 8.9 on purpose:
-JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses
-wgmma, which sm_80 and sm_89 do not have, and tokamax's sm80 Mosaic config
-exceeds an Ada card's shared memory and has no backward. Where they run is
-`dew.nn.kernels.generation.triton_runs`. jax 0.11.2 warns at each lowering
-that the Triton backend is deprecated; Dew leaves that warning to the
-user's filters (docs/performance.md records the deprecation).
+They are Triton kernels, compiled only for a CUDA lowering, chosen where the
+call lowers (`jax.lax.platform_dependent`), so a CPU computation on a GPU
+host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on
+the CPU, as the CPU suite checks them. They stay on sm80 to sm89 despite
+jax 0.11.2 deprecating Pallas Triton (it warns at each lowering, left to the
+user's filters): JAX's Mosaic GPU grouped matmul needs wgmma, which those
+lack, and tokamax's sm80 Mosaic config overflows an Ada card's shared memory
+and has no backward (`dew.nn.kernels.generation.triton_runs`).
 """
 
 from __future__ import annotations
@@ -113,7 +104,9 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     index_dtype = jnp.int32 if tokens.shape[0] <= np.iinfo(np.int32).max else jnp.int64
     if group_sizes.dtype == jnp.int64:
         group_sizes = group_sizes.astype(index_dtype)
-    grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(group_sizes, dtype=index_dtype)
+    grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
+        group_sizes, dtype=index_dtype
+    )
     out = jax.lax.ragged_dot(
         jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)

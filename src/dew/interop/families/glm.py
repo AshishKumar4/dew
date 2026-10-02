@@ -122,10 +122,14 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
     mixture: MixtureFields | None = None
     if routed:
         geometry = _deepseek_layout(hf_config, layers, used, sparse_layers=routed)
-        mixture = {**geometry, 'score_function': 'sigmoid', 'bias': True,
-                   'norm_topk_prob': norm_topk,
-                   'groups': _record_int({'n_group': hf_config.get('n_group') or 1}, 'n_group'),
-                   'groups_per_token': _record_int({'topk_group': hf_config.get('topk_group') or 1}, 'topk_group')}
+        mixture = {
+            **geometry,
+            "score_function": "sigmoid",
+            "bias": True,
+            "norm_topk_prob": norm_topk,
+            "groups": _record_int({"n_group": hf_config.get("n_group") or 1}, "n_group"),
+            "groups_per_token": _record_int({"topk_group": hf_config.get("topk_group") or 1}, "topk_group"),
+        }
     else:
         used.update(('n_routed_experts', 'num_local_experts', 'num_experts_per_tok',
                      'routed_scaling_factor', 'n_group', 'topk_group', 'n_shared_experts',
@@ -169,14 +173,19 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
             'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}}
     mixture, routed = _glm5_mixture(hf_config, used, layers)
     hc_fields = ('hc_mult', 'hc_eps', 'hc_sinkhorn_iters')
-    config.update(kinds=kinds, mixture=mixture,
-                  hyper_connections={'hc_mult': _record_int(hf_config, 'hc_mult'),
-                                     'hc_eps': _record_float(hf_config, 'hc_eps'),
-                                     'hc_sinkhorn_iters': _record_int(hf_config, 'hc_sinkhorn_iters'),
-                                     'head': 'mean'},
-                  swiglu_limit=_record_float(hf_config, 'swiglu_limit'),
-                  index_share_for_mtp_iteration=bool(hf_config.get('index_share_for_mtp_iteration', False)),
-                  num_nextn_predict_layers=_single_prediction_depth(hf_config, used, 'num_nextn_predict_layers'))
+    config.update(
+        kinds=kinds,
+        mixture=mixture,
+        hyper_connections={
+            "hc_mult": _record_int(hf_config, "hc_mult"),
+            "hc_eps": _record_float(hf_config, "hc_eps"),
+            "hc_sinkhorn_iters": _record_int(hf_config, "hc_sinkhorn_iters"),
+            "head": "mean",
+        },
+        swiglu_limit=_record_float(hf_config, "swiglu_limit"),
+        index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
+        num_nextn_predict_layers=_single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),
+    )
     # Native NextN uses normalized trunk states and a plain NoPE depth, not
     # trunk mHC (SGLang 97c6978 deepseek_nextn.py:177-187,247-298). The
     # existing full-attention kind is k-pool/NoPE; mtp_hyper_connections
@@ -229,7 +238,9 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
             _refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
-    if model.num_nextn_predict_layers and ('full_attention' not in types or model.num_layers - 1 not in routed):
+    if model.num_nextn_predict_layers and (
+        "full_attention" not in types or model.num_layers - 1 not in routed
+    ):
         _refuse('num_nextn_predict_layers', 'the source NextN depth requires a routed NoPE block')
     fields: dict[str, object] = {
         'layer_types': ['deepseek_sparse_attention' if kind == 'full_attention' else kind for kind in types],
@@ -255,7 +266,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         **dataclasses.asdict(sparse),
     }
     if mixture is not None:
-        represented = {'experts', 'top_k', 'layers', 'every', 'scaling', 'groups',
+        represented = {'experts', 'top_k', 'layers', 'scaling', 'groups',
                        'groups_per_token', 'expert_features', 'shared_features', 'norm_topk_prob',
                        'implementation', 'dispatch'}
         defaults = Mixture(experts=mixture.experts, score_function='sigmoid', bias=True)
@@ -263,13 +274,22 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
                        'GLM5 uses biased grouped sigmoid routing with top-two group scores')
         width = mixture.expert_features or model.hidden_features
         if mixture.shared_features < width or mixture.shared_features % width:
-            _refuse('mixture.shared_features', 'GLM5 needs an integral positive count of shared expert widths')
+            _refuse(
+                "mixture.shared_features", "GLM5 needs an integral positive count of shared expert widths"
+            )
         fields.update(
-            n_routed_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
-            moe_intermediate_size=width, n_shared_experts=mixture.shared_features // width,
-            routed_scaling_factor=mixture.scaling, n_group=mixture.groups, topk_group=mixture.groups_per_token,
-            norm_topk_prob=mixture.norm_topk_prob, scoring_func='sigmoid', topk_method='noaux_tc',
-            moe_router_dtype='float32')
+            n_routed_experts=mixture.experts,
+            num_experts_per_tok=mixture.top_k,
+            moe_intermediate_size=width,
+            n_shared_experts=mixture.shared_features // width,
+            routed_scaling_factor=mixture.scaling,
+            n_group=mixture.groups,
+            topk_group=mixture.groups_per_token,
+            norm_topk_prob=mixture.norm_topk_prob,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            moe_router_dtype="float32",
+        )
     return fields
 
 
@@ -353,9 +373,11 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     config.update(
         o_proj_bias=False,
         partial_rotary_factor=None if factor == 1.0 else factor,
-        partial_rotary_type='default',
+        partial_rotary_type="default",
         mixture=_deepseek_mixture(hf_config, layers, used),
-        num_nextn_predict_layers=records.integer(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers'),
+        num_nextn_predict_layers=records.integer(
+            hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
+        ),
     )
     return config
 
@@ -377,7 +399,9 @@ def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
             and int(parts[2]) >= records.integer(config['num_layers'], 'num_layers')):
         return _dew_path(name, config)
-    if int(parts[2]) >= records.integer(config["num_layers"], 'num_layers') + records.integer(config.get("num_nextn_predict_layers", 0), 'num_nextn_predict_layers'):
+    if int(parts[2]) >= records.integer(config["num_layers"], "num_layers") + records.integer(
+        config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
+    ):
         raise ValueError(f"{name} names an undeclared prediction depth")
     depth = f"mtp_{int(parts[2]) - records.integer(config['num_layers'], 'num_layers')}"
     tail = parts[3:]
@@ -477,5 +501,7 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                        'index_rope_interleave': True}
     if shared:
         config['kv_shared_layers'] = shared
-    config['num_nextn_predict_layers'] = records.integer(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+    config["num_nextn_predict_layers"] = records.integer(
+        hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
+    )
     return config

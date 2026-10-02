@@ -12,10 +12,11 @@ additive loss statistics with Aux reports. These values are JAX PyTrees.
 
 from __future__ import annotations
 
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifact, Artifacts
+from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -55,33 +57,32 @@ type PathFilter = Callable[[Path], bool]
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
 type Initializer = Partial
-"""An objective's `init` as one value a JIT can take: a
-`jax.tree_util.Partial`, whose bound arguments are pytree children rather
-than closure cells, so a JIT that builds the initial state receives the held
-variables as arguments instead of compiling them in as constants. A plain
-function is not one of these; `jax.jit` cannot take it as an argument."""
+"""An objective's `init` with its held variables bound as `Partial` children,
+which a JIT takes as arguments (`Objective.initializer` says why)."""
 
 @struct.dataclass
-class Mean:
-    """Carry a scalar sum together with the mass it is averaged over.
+class Ratio:
+    """Keep a numerator and its denominator apart until the reduction.
 
-    The mass is nonnegative and does not depend on the parameters. Zero
+    They sum across microbatches and devices before `mean` divides.
+
+    The denominator (mass) is nonnegative and does not depend on the parameters. Zero
     mass declares a zero numerator and no contribution.
     """
     total: jax.Array
     mass: jax.Array
 
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Reduce a shared-denominator estimator, including empty support:
+        the mean, or zero where the mass is zero, and whether any mass was."""
+        mass = jax.lax.stop_gradient(self.mass)
+        active = mass > 0
+        dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
+        value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
+        return jnp.where(active, value, 0), active
 
-def mean_loss(stats: Mean) -> tuple[jax.Array, jax.Array]:
-    """Reduce a shared-denominator estimator, including empty support."""
-    mass = jax.lax.stop_gradient(stats.mass)
-    active = mass > 0
-    dtype = jnp.result_type(stats.total.dtype, mass.dtype, jnp.float32)
-    value = stats.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
-    return jnp.where(active, value, 0), active
 
-
-Loss = TypeVar("Loss", default=Mean | jax.Array | float)
+Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 
@@ -138,6 +139,38 @@ class Shown:
     percent: bool = False
     group: str | None = None
 
+
+
+@dataclass(frozen=True)
+class TrainingScalar[Statistics, Additions]:
+    """An objective-owned training report selected for ranking or stopping."""
+    owner: Objective[Statistics, Additions]
+    name: str
+    shown: Shown
+
+
+class TrainingScalars[Statistics, Additions]:
+    """Typed, completable attributes for the objective's declared training reports.
+
+    Dynamic objectives may use item lookup. Undeclared attributes fail at
+    access, before a fit starts; completion lists the objective's own names.
+    """
+    loss: TrainingScalar[Statistics, Additions]
+
+    def __init__(self, owner: Objective[Statistics, Additions]):
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        try:
+            return self._owner._scalar(name)
+        except ValueError as missing:
+            raise AttributeError(str(missing)) from missing
+
+    def __getitem__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        return self._owner._scalar(name)
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(object.__dir__(self)) | {'loss'} | set(self._owner.shown))
 
 
 @struct.dataclass
@@ -303,33 +336,72 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
+    @property
+    def _validation_loss(self):
+        """Reuse the statistics program only while its model and head stay fixed.
+
+        Fit's ladder replaces the immutable Flax model and may change a
+        tiled head. Argument shapes alone cannot identify those programs.
+        Keep only the current specialization, not a history of old models.
+        """
+        held = vars(self)
+        model, head = held.get('model'), held.get('head_tile')
+        cached = held.get('_validation_loss_cache')
+        if cached is None or cached[0] is not model or cached[1] != head:
+            compiled = jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+            cached = (model, head, compiled)
+            self._validation_loss_cache = cached
+        return cached[2]
+
+    @functools.cached_property
+    def _validation_reduction(self):
+        """`reduce_loss` compiled once, for the statistics a validation pass sums."""
+        return jax.jit(self.reduce_loss)
+
+    @property
+    def scalars(self) -> TrainingScalars[Loss, Effects]:
+        return TrainingScalars(self)
+
+    def _scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
+        """Select a declared training scalar; `objective.loss` selects the loss itself."""
+        if name != 'loss' and name not in self.shown:
+            raise ValueError(f"the objective does not declare training scalar {name!r}")
+        return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
+
     @abstractmethod
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """Additive loss statistics and the reports from one realized batch.
 
-        Mean declares a shared normalization mass. A plain scalar is one
+        Ratio declares a shared normalization mass. A plain scalar is one
         unit-mass term. Composite statistics are objective-owned Flax PyTrees;
         their leaves add across records before reduce_loss is evaluated.
         """
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
-        if isinstance(stats, Mean):
-            return mean_loss(stats)
+        if isinstance(stats, Ratio):
+            return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
             value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
-            return value, jnp.asarray(True)
+            return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
-    def tile_head(self) -> str | None:
+    def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
+        """Evaluate and reduce the canonical statistics, for direct JAX differentiation."""
+        stats, aux = self.loss(variables, batch, step)
+        value, _ = self.reduce_loss(stats)
+        return value, aux
+
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that holds its whole logits for the backward to a
-        bounded tile and say what it moved to, or None when there was nothing
-        to move: the fit ladder's first rung
-        (`dew.training.trainer.recompute_more`), which logs it. An objective
-        with no such head has nothing to move."""
+        bounded tile, `tile` or the objective's own, and say what it moved
+        to, or None when there was nothing to move: the fit ladder's first
+        rung (`dew.training.trainer.recompute_more`), which logs it, and the
+        rung a resumed run takes back. An objective with no such head has
+        nothing to move."""
         return None
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
@@ -337,12 +409,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Mean, Aux[Effects], Prediction]:
+                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
         """The loss over `batch` as `loss` computes it, with the prediction
         behind it: the statistics, the reports, and the token logits with the
         weight of every position and the hidden states of `layers`.
 
-        The statistics are one `Mean` over the positions the weights count,
+        The statistics are one `Ratio` over the positions the weights count,
         so a distillation can mix in terms over the same mass. `train` gates
         dropout the way `loss` has it on; a frozen teacher scores with it
         off. Objectives that score no token logits raise.
@@ -358,18 +430,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def _pipeline_weights(self, state: TrainState, ema: bool) -> Variables:
-        if self._ema_is_reference or not ema:
+    def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
+        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.params
         return state.averaged
 
-    def pipeline(self, state: TrainState, *, ema: bool = True) -> Task:
+    def inference_record(self) -> JSON:
+        """The registered model and task settings a saved step can rebuild.
+
+        An objective without a declared inference contract returns None;
+        raw state restore remains available for custom research methods.
+        """
+
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
         """The trained model as its inference task over `state`'s weights.
 
-        Ordinary generative objectives require `state.averaged` when `ema`
-        is True; False selects live parameters. Reference-policy objectives
-        publish the trained policy, never their frozen loss reference. Arrays
-        retain their placement. Objectives without a generation task raise.
+        `ema` None takes `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, as `dew.pipeline` reads a
+        run; True requires the average and False selects live parameters.
+        Reference-policy objectives publish the trained policy, never their
+        frozen loss reference. Arrays retain their placement. Objectives
+        without a generation task raise.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -387,17 +468,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
 
 
-def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
-                batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
-    """Evaluate and reduce canonical statistics for direct JAX differentiation."""
-    stats, aux = objective.loss(variables, batch, step)
-    value, _ = objective.reduce_loss(stats)
-    return value, aux
-
-
 S = TypeVar("S")
 
 
+@runtime_checkable
 class Metric(Protocol[S]):
     """Reduce a validation pass to one scalar, on the host.
 
@@ -444,3 +518,28 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
+
+
+__all__ = [
+    "FROZEN",
+    "Aux",
+    "Batch",
+    "EMASpec",
+    "Metric",
+    "Objective",
+    "Path",
+    "PathFilter",
+    "Prediction",
+    "Ratio",
+    "Shown",
+    "Step",
+    "TrainingScalar",
+    "TrainingScalars",
+    "Variables",
+    "everything",
+    "freeze",
+    "merge",
+    "select",
+    "thaw",
+    "under",
+]

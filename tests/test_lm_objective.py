@@ -11,27 +11,28 @@ trainer drives it on both a data-parallel and an FSDP mesh. The real
 sampler runs in test_lm_recipe.
 """
 
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-from dew.objectives.base import scalar_loss
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective, Samples
-from dew.registry import metrics
+from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 VOCAB = 8
 SEQ = 16
@@ -58,7 +59,7 @@ class TinyCausalLM(nn.Module):
     num_layers: int = 2
     max_seq_len: int = 64
     dropout_rate: float = 0.0
-    final_logit_softcap: Optional[float] = None
+    final_logit_softcap: float | None = None
     precision = None
 
     def setup(self):
@@ -157,7 +158,7 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     batch = token_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     expected = reference_cross_entropy(logits, tokens[:, 1:])
@@ -175,7 +176,7 @@ def test_padded_targets_are_left_out_of_the_average():
     tokens = np.asarray(batch[TEXT_KEY])
     assert (tokens[:, 1:] == pad_id).any(), "this batch has no padding to skip"
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     masked = reference_cross_entropy(logits, tokens[:, 1:], pad_id=pad_id)
@@ -189,7 +190,7 @@ def test_a_batch_of_only_padding_does_not_divide_by_zero():
     params = objective.init(jax.random.key(0))
     batch = {TEXT_KEY: jnp.full((2, SEQ + 1), 5, jnp.int32)}
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
 
 
@@ -198,7 +199,7 @@ def test_aux_reports_perplexity_and_token_accuracy():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
 
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
@@ -217,7 +218,7 @@ def test_a_batch_with_no_room_for_the_shift_is_rejected():
     batch = {TEXT_KEY: jnp.zeros((2, SEQ), jnp.int32)}
 
     with pytest.raises(ValueError, match=f"{SEQ + 1} ids per row"):
-        scalar_loss(objective, params, batch, step_at())
+        objective.scalar_loss(params, batch, step_at())
 
 
 def test_dropout_runs_on_the_step_key():
@@ -227,9 +228,9 @@ def test_dropout_runs_on_the_step_key():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    first, _ = scalar_loss(objective, params, batch, step_at(key=1))
-    again, _ = scalar_loss(objective, params, batch, step_at(key=1))
-    other, _ = scalar_loss(objective, params, batch, step_at(key=2))
+    first, _ = objective.scalar_loss(params, batch, step_at(key=1))
+    again, _ = objective.scalar_loss(params, batch, step_at(key=1))
+    other, _ = objective.scalar_loss(params, batch, step_at(key=2))
 
     assert float(first) == pytest.approx(float(again))
     assert float(first) != pytest.approx(float(other))
@@ -247,7 +248,7 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     params = objective.init(jax.random.key(0))
     inputs = token_batch()[TEXT_KEY][:, :-1]
     hidden = objective.model.apply(params, inputs, method=Bf16LM.hidden_states)
-    loss, aux = scalar_loss(objective, params, token_batch(), step_at())
+    loss, aux = objective.scalar_loss(params, token_batch(), step_at())
 
     assert hidden.dtype == jnp.bfloat16
     assert objective.model.apply(params, inputs).dtype == jnp.float32
@@ -263,7 +264,7 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
     assert (targets == 0).any(), "this batch has no padding to skip"
 
-    _, aux = scalar_loss(objective, params, batch, step_at())
+    _, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
     kept = targets != 0
@@ -285,6 +286,13 @@ def test_init_builds_the_tree_from_int32_ids():
     params = objective.init(jax.random.key(0))
     assert set(params) == {"params"}
     assert params["params"]["lm_head"]["kernel"].shape == (16, VOCAB)
+
+
+def test_an_lm_keeps_no_average_unless_asked():
+    """Validation and previews read an average when one is kept, so an LM
+    keeps none by default: a short run then scores the weights it trained."""
+    assert make_objective().ema is None
+    assert make_objective(ema_decay=0.999).ema is not None
 
 
 def test_the_ema_tracks_the_whole_parameter_tree():
@@ -335,7 +343,7 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     """
     trainer = make_trainer(tmp_path, fsdp=fsdp)
     batch = next(cycle_batches(seed=7))
-    scored = jax.jit(lambda params: scalar_loss(trainer.objective, params, batch, step_at())[0])
+    scored = jax.jit(lambda params: trainer.objective.scalar_loss(params, batch, step_at())[0])
     before = float(scored(trainer.initial_state().params))
 
     state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
@@ -350,6 +358,21 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
 
 
 # --- evaluation ------------------------------------------------------------
+
+def test_evaluation_correctness_is_the_same_full_forward_argmax():
+    from dew.nn.backbones import CausalTransformer
+
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=8, attention_impl="reference")
+    objective = LMObjective(model, seq_len=4, ema_decay=None, token_accuracy=False)
+    tokens = jnp.asarray([[1, 2, 3, 4, 1], [4, 3, 2, 1, 4]], jnp.int32)
+    params = objective.init(jax.random.key(0))
+    scores = objective.evaluate(params, {"text": tokens}, Step(jnp.asarray(0), jax.random.key(1), None))
+    logits = model.apply(params, tokens[:, :-1], train=False)
+    expected = jnp.argmax(logits, axis=-1) == tokens[:, 1:]
+    np.testing.assert_array_equal(np.asarray(scores.correct), np.asarray(expected))
+    assert scores.correct.shape == scores.losses.shape == scores.weights.shape
+
 
 def test_evaluation_scores_every_target_of_the_batch():
     objective = make_objective()
@@ -399,7 +422,11 @@ def test_preview_generates_reproducible_text_from_ema():
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
                               dtype="float32", attention_impl="xla")
-    objective = LMObjective(model, seq_len=SEQ, samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)))
+    objective = LMObjective(
+        model,
+        seq_len=SEQ,
+        samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)),
+    )
     params = objective.init(jax.random.key(0))
     ema = jax.tree.map(lambda leaf: leaf + 0.1, params)
     averaged = objective.preview(params, token_batch(), step_at(key=5, ema=ema))
@@ -423,10 +450,18 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     """exp(sum(loss * weight) / sum(weight)) over the pass: a batch with more
     counted targets moves the score more, which the mean of per-batch means
     gets wrong the moment counts differ."""
-    metric = metrics.perplexity()
+    metric = Perplexity()
     assert metric.reads is TokenScores
-    heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)))
-    light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]))
+    heavy = TokenScores(
+        losses=jnp.full((1, 4), 1.0),
+        weights=jnp.ones((1, 4)),
+        correct=jnp.zeros_like(jnp.full((1, 4), 1.0), dtype=bool),
+    )
+    light = TokenScores(
+        losses=jnp.full((1, 4), 3.0),
+        weights=jnp.array([[1.0, 0, 0, 0]]),
+        correct=jnp.zeros_like(jnp.full((1, 4), 3.0), dtype=bool),
+    )
 
     score = metric.finalize(metric.merge(metric(heavy, None), metric(light, None)))
 
@@ -435,19 +470,38 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
 
 def test_a_batch_with_no_counted_target_weighs_nothing():
-    metric = metrics.perplexity()
-    scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)))
-    empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)))
+    metric = Perplexity()
+    scored = TokenScores(
+        losses=jnp.full((1, 4), 2.0),
+        weights=jnp.ones((1, 4)),
+        correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool),
+    )
+    empty = TokenScores(
+        losses=jnp.zeros((1, 4)),
+        weights=jnp.zeros((1, 4)),
+        correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool),
+    )
 
-    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(np.exp(2.0))
+    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(
+        np.exp(2.0)
+    )
     with pytest.raises(ValueError, match="no counted target"):
         metric.finalize(metric(empty, None))
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
-    metric = metrics.perplexity()
-    values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2))), None)
-              for ce in (0.0, 2.0)]
+    metric = Perplexity()
+    values = [
+        metric(
+            TokenScores(
+                losses=jnp.full((1, 2), ce),
+                weights=jnp.ones((1, 2)),
+                correct=jnp.zeros_like(jnp.full((1, 2), ce), dtype=bool),
+            ),
+            None,
+        )
+        for ce in (0.0, 2.0)
+    ]
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)
@@ -473,10 +527,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                eval_every=1, metrics=(metrics.perplexity(),))
+    state = trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+                        eval_every=1, metrics=(Perplexity(),))
 
-    state = trainer.initial_state()
     total, count = 0.0, 0.0
     for batch in batches:
         scores = trainer.objective.evaluate(state.params, batch, step_at())
@@ -484,10 +537,9 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
         count += float(jnp.sum(scores.weights))
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
     assert len(logged) == 1
-    # The initial parameters moved one step before the pass, so the pass
-    # scores are close, not equal; what the assertion pins is the weighting.
+    # The pass scores the weights the step left, so it matches them.
     assert 0 < count < 2 * BATCH * SEQ
-    assert logged[0] == pytest.approx(np.exp(total / count), rel=5e-2)
+    assert logged[0] == pytest.approx(np.exp(total / count), rel=1e-6)
 
 
 # --- packed batches --------------------------------------------------------
@@ -651,8 +703,8 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
              "text_positions": positions}
 
-    packed, _ = scalar_loss(objective, params, batch, step_at())
-    unpacked, _ = scalar_loss(objective, params, {TEXT_KEY: tokens}, step_at())
+    packed, _ = objective.scalar_loss(params, batch, step_at())
+    unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
 
     losses, weights = objective.token_scores(
         params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
@@ -684,7 +736,7 @@ def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": segment_ids}
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
     scores = objective.evaluate(params, batch, step_at())
     assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
@@ -710,7 +762,7 @@ def test_loss_role_counts_only_assistant_targets():
     batch = assistant_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     kept = np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT
@@ -729,7 +781,7 @@ def test_loss_role_without_the_roles_column_raises():
     params = objective.init(jax.random.key(0))
 
     with pytest.raises(ValueError, match="text_roles"):
-        scalar_loss(objective, params, token_batch(), step_at())
+        objective.scalar_loss(params, token_batch(), step_at())
 
 
 def test_a_roles_column_is_ignored_without_loss_role():
@@ -739,7 +791,7 @@ def test_a_roles_column_is_ignored_without_loss_role():
     params = objective.init(jax.random.key(0))
     batch = assistant_batch()
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
@@ -755,7 +807,7 @@ def test_a_misaligned_roles_column_is_refused():
     batch[ROLES_KEY] = jnp.zeros((batch[TEXT_KEY].shape[0], SEQ), jnp.int8)
 
     with pytest.raises(ValueError, match="one per token"):
-        scalar_loss(objective, params, batch, step_at())
+        objective.scalar_loss(params, batch, step_at())
 
 
 def test_evaluation_weights_follow_loss_role():
@@ -790,8 +842,8 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     weights = (tokens[:, 1:] != pad_id).astype(np.float64)
     expected, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
 
-    loss, aux = scalar_loss(make_objective(pad_id=pad_id, z_loss=coefficient), params, batch, step_at())
-    without, plain_aux = scalar_loss(plain, params, batch, step_at())
+    loss, aux = make_objective(pad_id=pad_id, z_loss=coefficient).scalar_loss(params, batch, step_at())
+    without, plain_aux = plain.scalar_loss(params, batch, step_at())
 
     assert float(loss) == pytest.approx(expected, abs=1e-6)
     assert float(aux.metrics["z_loss"]) == pytest.approx(z_term, abs=1e-6)
@@ -817,7 +869,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
     _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:],
                                        np.ones(tokens[:, 1:].shape), coefficient)
     expected, = pullback(jnp.asarray(cotangent, jnp.float32))
-    actual = jax.grad(lambda p: scalar_loss(objective, {"params": p}, batch, step_at())[0])(params["params"])
+    actual = jax.grad(lambda p: objective.scalar_loss({"params": p}, batch, step_at())[0])(params["params"])
 
     for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
         scale = max(float(jnp.abs(want).max()), 1.0)

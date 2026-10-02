@@ -76,7 +76,14 @@ def active_profile() -> Profiler | None:
 
 
 def _drain() -> None:
-    jax.block_until_ready(jax.live_arrays())
+    """Wait for the work in flight: every live array, then the effects.
+
+    An array some code still holds after a step donated it can list as live
+    with only its first buffer left, since XLA counts an array deleted by
+    that buffer (jax 0.11.2), and waiting on it raises. Its work is done,
+    and the step's outputs are the arrays to wait on, so it is passed over."""
+    jax.block_until_ready([array for array in jax.live_arrays()
+                           if not any(shard.data.is_deleted() for shard in array.addressable_shards)])
     jax.effects_barrier()
 
 
@@ -105,9 +112,13 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
             record: dict[str, JSON] = {"tool": tool, "session": str(session.relative_to(directory))}
             records.append(record)
             if tool in ("graph_viewer", "memory_viewer", "trace_viewer@", "trace_viewer"):
-                record.update(status="interactive", reason="Use the native XProf viewer and retained trace/HLO files")
+                record.update(
+                    status="interactive", reason="Use the native XProf viewer and retained trace/HLO files"
+                )
                 continue
-            if not tool or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in tool):
+            if not tool or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in tool
+            ):
                 error = ValueError(f"Unexpected native tool name: {tool!r}")
                 record.update(status="error", error=str(error))
                 failures.append(error)
@@ -123,7 +134,9 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
                         record.update(status="unavailable", reason="Native converter returned no data")
                         continue
                     if not isinstance(payload, (bytes, str)):
-                        raise TypeError(f"Native {tool} returned {type(payload).__name__}; expected bytes or str")
+                        raise TypeError(
+                            f"Native {tool} returned {type(payload).__name__}; expected bytes or str"
+                        )
                     extension = {"application/json": ".json", "text/html": ".html",
                                  "text/plain": ".txt", "application/octet-stream": ".bin"}.get(mime, ".bin")
                     suffix = (f"-session-{index}" if len(sessions) > 1 else "")
@@ -305,7 +318,4 @@ def region(name: str) -> AbstractContextManager[None]:
     return nullcontext() if active is None else active.region(name)
 
 
-def profile(directory: str | os.PathLike[str] | None = None, *,
-            options: jax.profiler.ProfileOptions | None = None) -> Profiler:
-    """Configure native profiling; capture starts only on enter or start()."""
-    return Profiler(directory, options=options)
+__all__ = ["Profiler", "region"]

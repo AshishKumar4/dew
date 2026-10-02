@@ -4,14 +4,15 @@ translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 helpers around them fetch a repo (or read a local directory) and read the
 safetensors shards in their stored dtype without torch. Parameter binding
-defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
+defaults to FP32, independently of compute dtype, so dew.interop.Pretrained.load
 builds a model whose variables a forward pass takes straight away, and
-save_pretrained_decoder writes one back out in the HF layout.
+`PretrainedDecoder.from_model(...).save` writes one back out in the HF layout.
 
-Each family is one `DecoderFamily` entry in `_FAMILY_ENTRIES`, keyed by its
+Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. `_FAMILY_ENTRIES` at the bottom of this file is the list of
-covered families; read it rather than a copy of it here.
+vocabulary. Its `Renames` and `Packed` entries are read one way on load and
+the other on export. `family_entries()` loads that table on first use; read
+it for the covered families rather than a copy here.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
@@ -21,51 +22,35 @@ raises a ValueError naming it.
 """
 
 import dataclasses
+import functools
 import json
 import operator
 import os
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from functools import partial
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Collection,
-    Literal,
-    Mapping,
-    NoReturn,
-    Protocol,
-    TypedDict,
-    Unpack,
-    runtime_checkable,
-)
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
-import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop import mamba2
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
+from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
-from dew.interop.streaming import LazyTree, SourceLeaf, materialize
+from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, RematPolicy
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.deepseek_v4 import DeepseekV4Mixer
-from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
-from dew.nn.kda import KimiDeltaAttentionMixer
 from dew.nn.kv_cache import KVCache
-from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase
-from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mixers.mamba2 import Mamba2Mixer
-from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import check_tree, checkpoint_dtype, insert
 from dew.objectives.base import Variables
@@ -87,6 +72,7 @@ _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
 _HF_ACTIVATIONS['swigluoai'] = 'silu'
+_HF_ACTIVATIONS.update({'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'})
 
 
 def _hf_activation(activation: GatedActivation) -> str:
@@ -189,7 +175,10 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
 
 def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
     """Return the `_INERT_FIELDS` a config carries, refusing a value that is not inert."""
-    rules = {**_INERT_FIELDS[None], **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {})}
+    rules = {
+        **_INERT_FIELDS[None],
+        **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {}),
+    }
     present = set(rules) & set(hf_config)
     for key in sorted(present):
         if not rules[key](key, hf_config):
@@ -291,7 +280,6 @@ class MixtureFields(TypedDict, total=False):
     experts: int
     top_k: int
     layers: tuple[int, ...] | None
-    every: int | None
     score_function: str
     norm_topk_prob: bool
     scaling: float
@@ -364,8 +352,12 @@ class DecoderFields(TypedDict, total=False):
     num_kv_heads: int | None
     head_dim: int | None
     mlp: str | SituFields
+    mlp_bias: bool
     mlp_features: int | tuple[int, ...] | None
     max_seq_len: int
+    position_embedding: Literal['rotary', 'learned']
+    position_embedding_size: int | None
+    position_embedding_offset: int
     rope_theta: float
     rope_scaling: Ramp | None
     partial_rotary_factor: float | None
@@ -373,10 +365,13 @@ class DecoderFields(TypedDict, total=False):
     layer_types: tuple[str, ...] | None
     kinds: dict[str, KindFields]
     norm_eps: float
+    norm_type: Literal['rms', 'layer']
+    norm_bias: bool
     scale_offset: bool
     scale_after_cast: bool
     sandwich_norms: bool
     pre_norms: bool
+    parallel_residual: bool
     qk_norm: bool
     qk_norm_scope: str
     v_norm: bool
@@ -399,6 +394,8 @@ class DecoderFields(TypedDict, total=False):
     tie_embeddings: bool
     embedding_zero_ids: tuple[int, ...]
     dropout_rate: float
+    embedding_dropout_rate: float
+    attention_dropout_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
     force_fp32_for_softmax: bool
@@ -412,7 +409,6 @@ class DecoderFields(TypedDict, total=False):
     causal: bool
     per_layer_input_dim: int | None
     per_layer_input_vocab: int | None
-    num_kv_shared_layers: int
     kv_shared_layers: tuple[int, ...] | None
     mixer: Mapping[str, object] | MixerBase | None
     """The mixer as its registry record, or as the built value a family
@@ -513,13 +509,18 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
             _refuse(f"{field} (rope_type 'llama3') fields",
                     f"the llama3 ramp reads exactly {list(_LLAMA3_FIELDS)}; "
                     f"missing {missing}, unexpected {extra}")
-        return _Rope(theta, {
-            'rope_type': 'llama3',
-            'factor': records.number(entry['factor'], 'factor'),
-            'low_freq_factor': records.number(entry['low_freq_factor'], 'low_freq_factor'),
-            'high_freq_factor': records.number(entry['high_freq_factor'], 'high_freq_factor'),
-            'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
-        })
+        return _Rope(
+            theta,
+            {
+                "rope_type": "llama3",
+                "factor": records.number(entry["factor"], "factor"),
+                "low_freq_factor": records.number(entry["low_freq_factor"], "low_freq_factor"),
+                "high_freq_factor": records.number(entry["high_freq_factor"], "high_freq_factor"),
+                "original_max_position_embeddings": records.integer(
+                    entry["original_max_position_embeddings"], "original_max_position_embeddings"
+                ),
+            },
+        )
     if rope_type == 'yarn' and yarn_max_pos is not None:
         # The base an entry names, or the shared default until `_at_base`
         # stamps in the one the entry's layers resolved to: a released
@@ -639,7 +640,11 @@ def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     if layers is not None:
         used.add('layer_types')
         return records.strings(layers, 'layer_types')
-    return default if default is not None else ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return (
+        default
+        if default is not None
+        else ("full_attention",) * records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
+    )
 
 
 def _kinds(layer_types: tuple[str, ...], window: int | None,
@@ -706,22 +711,30 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
                 "the mixer's YaRN ramp runs over the whole rope width")
     factor = entry.get('factor')
     if factor is None:
-        factor = (float(max_pos)
-                  / records.number(entry['original_max_position_embeddings'], 'original_max_position_embeddings'))
+        factor = float(max_pos) / records.number(
+            entry["original_max_position_embeddings"], "original_max_position_embeddings"
+        )
     return {
-        'rope_type': 'yarn',
-        'rope_theta': theta,
-        'factor': records.number(factor, f'{field} factor'),
-        'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
-        'beta_fast': records.number(entry.get('beta_fast') or 32, 'beta_fast'),
-        'beta_slow': records.number(entry.get('beta_slow') or 1, 'beta_slow'),
-        'mscale': (None if entry.get('mscale') is None
-                   else records.number(entry['mscale'], 'mscale')),
-        'mscale_all_dim': (None if entry.get('mscale_all_dim') is None
-                           else records.number(entry['mscale_all_dim'], 'mscale_all_dim')),
-        'truncate': bool(entry.get('truncate', True)),
-        'attention_factor': (None if entry.get('attention_factor') is None
-                             else records.number(entry['attention_factor'], 'attention_factor')),
+        "rope_type": "yarn",
+        "rope_theta": theta,
+        "factor": records.number(factor, f"{field} factor"),
+        "original_max_position_embeddings": records.integer(
+            entry["original_max_position_embeddings"], "original_max_position_embeddings"
+        ),
+        "beta_fast": records.number(entry.get("beta_fast") or 32, "beta_fast"),
+        "beta_slow": records.number(entry.get("beta_slow") or 1, "beta_slow"),
+        "mscale": (None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
+        "mscale_all_dim": (
+            None
+            if entry.get("mscale_all_dim") is None
+            else records.number(entry["mscale_all_dim"], "mscale_all_dim")
+        ),
+        "truncate": bool(entry.get("truncate", True)),
+        "attention_factor": (
+            None
+            if entry.get("attention_factor") is None
+            else records.number(entry["attention_factor"], "attention_factor")
+        ),
     }
 
 
@@ -791,7 +804,9 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'layer_types' in reads:
         layer_types = _specified_layer_types(hf_config, used, layer_types)
     elif layer_types is None:
-        layer_types = ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+        layer_types = ("full_attention",) * records.integer(
+            hf_config["num_hidden_layers"], "num_hidden_layers"
+        )
     stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
     if 'sliding_window' in reads:
         used.add('sliding_window')
@@ -879,7 +894,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     # whole model and whose text_config holds the decoder;
     # translate_wrapper_config reads the wrappers that load. A wrapper whose
     # own model_type is a registered family (kimi_k25) is read here instead.
-    if model_type not in _FAMILIES and 'text_config' in hf_config:
+    if model_type not in families() and 'text_config' in hf_config:
         # google/gemma-4-E2B is one of these. The decoder is real and its
         # text_config translates, but the repo is a multimodal model whose
         # weights sit under model.language_model.* beside vision and audio
@@ -891,10 +906,10 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
                 "no counterpart here; its decoder is the text_config, which "
                 "translates on its own, and its weights are the "
                 "model.language_model.* half of the checkpoint")
-    if model_type not in _FAMILIES:
+    if model_type not in families():
         _refuse(f"model_type {model_type!r}",
-                f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
-    config, unknown = _translated(hf_config, _FAMILIES[records.text(model_type, 'model_type')])
+                f"expected one of {', '.join(repr(name) for name in families())}")
+    config, unknown = _translated(hf_config, families()[records.text(model_type, 'model_type')])
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
                 "CausalTransformer has no counterpart, so translating them "
@@ -927,17 +942,22 @@ def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tup
     return config, unknown
 
 
-def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
+def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
+                  declared_type: str | None = None) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         _refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     used.add("text_config")
+    if declared_type is not None and 'model_type' not in text:
+        # The wrapper config class supplies its declared nested class when
+        # reading a raw dict. Checkpoint copies need not repeat that tag.
+        text = {**text, 'model_type': declared_type}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") != "qwen3_5"
+        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1008,7 +1028,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_llama4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
@@ -1048,7 +1068,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
         projector = vision_nn.translate_gemma4_projector_config(
-            {"hidden_size": encoder.output_proj_dims, "rms_norm_eps": encoder.rms_norm_eps}, text_width)
+            {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
@@ -1065,7 +1085,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
-    text = _wrapper_text(hf_config, used)
+    text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
@@ -1098,15 +1118,15 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     return {
-        "model_type": "qwen3_5",
-        "text_model_type": "qwen3_5_text",
+        "model_type": records.text(hf_config['model_type'], 'model_type'),
+        "text_model_type": f"{hf_config['model_type']}_text",
         "text": text,
         "tower": tower,
         "projector": projector,
@@ -1136,14 +1156,14 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
-    retain the decoder, tower, projector, image token ID and token count, and
+    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -1184,7 +1204,9 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     bare = name.removeprefix("model.")
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
-        return "language_model", tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+        return "language_model", tail if tail.startswith(
+            ("model.", "lm_head.weight", "mtp.")
+        ) else f"model.{tail}"
     if bare.startswith(projector_prefix):
         return "projector", bare[len(projector_prefix):]
     if bare.startswith(tower_prefix):
@@ -1193,7 +1215,8 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+            or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
         return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
@@ -1358,7 +1381,9 @@ def translate_wrapper_weights(
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
+        variables["audio_tower"] = audio_nn.audio_weights(
+            tables["audio_tower"], encoder, param_dtype=param_dtype
+        )
         variables["audio_projector"] = {"params": vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
     return variables
@@ -1443,109 +1468,162 @@ def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
     return None if path is None else ('params', *path)
 
 
+# The decoder's tensors outside its layers, read one way on load and the
+# other on export.
+_TRUNK: Mapping[str, tuple[str, ...]] = {
+    'model.norm.weight': ('norm', 'scale'), 'model.norm.bias': ('norm', 'bias'),
+    'model.embed_tokens.weight': ('embed_tokens', 'embedding'),
+    'model.embed_positions.weight': ('embed_positions', 'embedding'),
+    'model.embed_tokens_per_layer.weight': ('embed_tokens_per_layer', 'embedding'),
+    'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
+    'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
+}
+_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
+# Gemma 4's per-layer residual. Gate and projection are kernels, the post
+# norm is a scale. The values norm carries no weight, so it maps nothing.
+_PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
+                     'post_per_layer_input_norm': 'scale'}
+
+
+type Renames = tuple[tuple[str, str], ...]
+"""A family's own names onto the ones `_dew_path` reads, as (source, shared)
+pairs of dotted fragments: a load respells left to right, an export right to
+left, so one table holds both directions."""
+
+
+def _renamed(name: str, renames: Renames, *, export: bool = False) -> str:
+    """Respell `name` through `renames` in one pass over its dotted parts.
+
+    At each part the first pair whose fragment starts there replaces it and
+    the pass moves past it, so a respelled part is never read again and the
+    reverse pass undoes the forward one.
+    """
+    pairs = [(old.split('.'), new) for old, new in
+             ((shared, source) if export else (source, shared) for source, shared in renames)]
+    parts, spelled, index = name.split('.'), [], 0
+    while index < len(parts):
+        for old, new in pairs:
+            if parts[index:index + len(old)] == old:
+                spelled.append(new)
+                index += len(old)
+                break
+        else:
+            spelled.append(parts[index])
+            index += 1
+    return '.'.join(spelled)
+
+
+def _renamed_path(renames: Renames, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """`_dew_path` of a family whose names differ from the shared ones by `renames`."""
+    return _dew_path(_renamed(name, renames), config)
+
+
+def _renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`_hf_name` respelled in the family's own names: `_renamed_path` backwards."""
+    name = _hf_name(dew_name, config)
+    return None if name is None else _renamed(name, renames, export=True)
+
+
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
-    if parts == ['model', 'norm', 'weight']:
-        return ('norm', 'scale')
-    if parts == ['model', 'embed_tokens', 'weight']:
-        return ('embed_tokens', 'embedding')
-    if parts == ['model', 'embed_tokens_per_layer', 'weight']:
-        return ('embed_tokens_per_layer', 'embedding')
-    if parts == ['model', 'per_layer_model_projection', 'weight']:
-        return ('per_layer_model_projection', 'kernel')
-    if parts == ['model', 'per_layer_projection_norm', 'weight']:
-        return ('per_layer_projection_norm', 'scale')
+    if hf_name in _TRUNK:
+        return _TRUNK[hf_name]
     if len(parts) == 3 and parts[:2] == ['model', 'hc_head'] and parts[2] in _V4_HEAD:
         return ('hc_head', parts[2])
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
 
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        layer, module, leaf = f'layers_{parts[2]}', parts[3], parts[-1]
-        if config.get('hyper_connections') is not None:
-            if len(parts) == 4 and module.startswith(('hc_attn_', 'hc_ffn_')):
-                site, suffix = module[3:].split('_', 1)
-                if suffix in ('fn', 'base', 'scale'):
-                    return (layer, f'{site}_hc', suffix)
-            if module == 'self_attn':
-                tail = tuple(parts[4:])
-                if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
-                    return (layer, module, *tail)
-                if len(tail) == 2 and tail[1] == 'weight':
-                    if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                        return (layer, module, *tail)
-                    if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
-                        return (layer, module, tail[0], 'kernel')
-                if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
-                        'index_kpool_compress_ape', 'index_kpool_compress_gate'):
-                    return (layer, module, *tail)
-        if module in _PROJECTIONS and len(parts) == 6:
-            sublayer = parts[4]
-            if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
-                # torch Linear holds [out, in]; nn.Dense keeps [in, out]
-                return (layer, module, sublayer,
-                        'kernel' if leaf == 'weight' else 'bias')
-            if (module == 'self_attn' and sublayer in _HEAD_NORMS
-                    and leaf == 'weight'):
-                return (layer, module, sublayer, 'scale')
-            if (module == 'self_attn' and sublayer in _MLA_PROJECTIONS
-                    and leaf in ('weight', 'bias')):
-                return (layer, module, sublayer,
-                        'kernel' if leaf == 'weight' else 'bias')
-            if (module == 'self_attn' and sublayer in _MLA_NORMS
-                    and leaf == 'weight'):
-                return (layer, module, sublayer, 'scale')
-        if (len(parts) == 7 and module == 'self_attn'
-                and parts[4] == 'indexer'):
-            # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
-            # and k_norm.{weight,bias}: the sparse selector's own tensors.
-            sublayer, leaf = parts[5], parts[6]
-            if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
-                return (layer, 'self_attn', 'indexer', sublayer, 'kernel')
-            if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
-                return (layer, 'self_attn', 'indexer', sublayer,
-                        'scale' if leaf == 'weight' else 'bias')
-        if module == 'self_attn':
-            tail = _v4_attention_leaf(parts[4:])
-            if tail is not None:
-                return (layer, module, *tail)
-        if (len(parts) == 5 and module in ('attn_hc', 'ffn_hc')
-                and leaf in _V4_HC):
-            # mHC's residual mapping around each sublayer, its tensors in
-            # the reference's own layout (modeling_deepseek_v4.py:902-913).
-            return (layer, module, leaf)
-        if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
-                and parts[5].isdigit() and parts[6] in _MOE_SHARED
-                and leaf == 'weight'):
-            # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
-            # tensor per expert, stacked by _stack_experts below.
-            return (layer, 'mlp', 'experts', parts[5], parts[6], 'kernel')
-        if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
-                and parts[5] in _MOE_SHARED and leaf == 'weight'):
-            # The dense shared experts beside them, one MLP however many the
-            # config counts.
-            return (layer, 'mlp', 'shared_experts', parts[5], 'kernel')
-        if (module == 'linear_attn'
-                and records.strings(config['layer_types'], 'layer_types')[int(parts[2])]
-                == 'linear_attention'):
-            tail = tuple(parts[4:])
-            if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
-                return (layer, 'self_attn', tail[0], 'kernel')
-            if tail in _LINEAR_LEAVES:
-                return (layer, 'self_attn', *tail)
-        # Gemma 4's per-layer residual. Gate and projection are kernels, the
-        # post norm is a scale. The values norm carries no weight, so it maps
-        # nothing.
-        if len(parts) == 5 and leaf == 'weight':
-            if module in ('per_layer_input_gate', 'per_layer_projection'):
-                return (layer, module, 'kernel')
-            if module == 'post_per_layer_input_norm':
-                return (layer, module, 'scale')
-        norms = _norm_names(bool(config.get('sandwich_norms')))
-        if len(parts) == 5 and module in norms and leaf == 'weight':
-            return (layer, norms[module], 'scale')
+        path = _layer_param_path(parts, config)
+        if path is not None:
+            return (f'layers_{parts[2]}', *path)
     raise ValueError(f"unknown tensor name {hf_name!r}")
+
+
+def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The path within one decoder layer, before adding its layer-bank name."""
+    module, leaf = parts[3], parts[-1]
+    if config.get('hyper_connections') is not None:
+        path = _hyper_connection_param_path(parts)
+        if path is not None:
+            return path
+    if module in _PROJECTIONS and len(parts) == 6:
+        sublayer = parts[4]
+        if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
+            # torch Linear holds [out, in]; nn.Dense keeps [in, out]
+            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
+        if module == 'self_attn' and sublayer in _HEAD_NORMS and leaf == 'weight':
+            return (module, sublayer, 'scale')
+        if module == 'self_attn' and sublayer in _MLA_PROJECTIONS and leaf in ('weight', 'bias'):
+            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
+        if module == 'self_attn' and sublayer in _MLA_NORMS and leaf == 'weight':
+            return (module, sublayer, 'scale')
+    if module == 'self_attn':
+        return _attention_param_path(parts)
+    if len(parts) == 5 and module in ('attn_hc', 'ffn_hc') and leaf in _V4_HC:
+        # mHC's residual mapping around each sublayer, its tensors in
+        # the reference's own layout (modeling_deepseek_v4.py:902-913).
+        return (module, leaf)
+    if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
+            and parts[5].isdigit() and parts[6] in _MOE_SHARED and leaf == 'weight'):
+        # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
+        # tensor per expert, stacked by _stack_experts below.
+        return ('mlp', 'experts', parts[5], parts[6], 'kernel')
+    if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
+            and parts[5] in _MOE_SHARED and leaf == 'weight'):
+        # The dense shared experts beside them, one MLP however many the
+        # config counts.
+        return ('mlp', 'shared_experts', parts[5], 'kernel')
+    if (module == 'linear_attn'
+            and records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
+        tail = tuple(parts[4:])
+        if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
+            return ('self_attn', tail[0], 'kernel')
+        if tail in _LINEAR_LEAVES:
+            return ('self_attn', *tail)
+    if len(parts) == 5 and leaf == 'weight' and module in _PER_LAYER_INPUTS:
+        return (module, _PER_LAYER_INPUTS[module])
+    norms = _norm_names(bool(config.get('sandwich_norms')))
+    if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
+        return (norms[module], 'scale' if leaf == 'weight' else 'bias')
+    return None
+
+
+def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
+    """The V4 stream mappings and attention leaves in a hyper-connected layer."""
+    module = parts[3]
+    if len(parts) == 4 and module.startswith(('hc_attn_', 'hc_ffn_')):
+        site, suffix = module[3:].split('_', 1)
+        if suffix in ('fn', 'base', 'scale'):
+            return (f'{site}_hc', suffix)
+    if module == 'self_attn':
+        tail = tuple(parts[4:])
+        if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
+            return (module, *tail)
+        if len(tail) == 2 and tail[1] == 'weight':
+            if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
+                return (module, *tail)
+            if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
+                return (module, tail[0], 'kernel')
+        if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
+                'index_kpool_compress_ape', 'index_kpool_compress_gate'):
+            return (module, *tail)
+    return None
+
+
+def _attention_param_path(parts: list[str]) -> tuple[str, ...] | None:
+    """The sparse selector's leaves, followed by DeepSeek V4's nested leaves."""
+    if len(parts) == 7 and parts[4] == 'indexer':
+        # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
+        # and k_norm.{weight,bias}: the sparse selector's own tensors.
+        sublayer, leaf = parts[5], parts[6]
+        if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
+            return ('self_attn', 'indexer', sublayer, 'kernel')
+        if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
+            return ('self_attn', 'indexer', sublayer, 'scale' if leaf == 'weight' else 'bias')
+    tail = _v4_attention_leaf(parts[4:])
+    return None if tail is None else ('self_attn', *tail)
 
 
 def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
@@ -1625,19 +1703,14 @@ def translate_weights(
 ) -> Variables:
     """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
 
-    Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
-    `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
-    post_attention_layernorm and post_feedforward_layernorm land on the
-    sandwich norms, where Gemma applies them.
+    Each tensor goes through its family's `prepare_weights` and `weight_path`;
+    a 2-D kernel is transposed from torch's [out, in] to Dense's [in, out],
+    and per-expert tensors stack onto an expert axis.
 
     A tied checkpoint carries lm_head.weight as well, as a copy of the
     embedding (Qwen3-0.6B does). The copy is checked and dropped. The tree has
     one leaf for the two, and a checkpoint whose "tied" head is a different
     matrix would otherwise load as a model that computes something else.
-    DeepSeek's routed experts arrive one tensor per expert and stack onto
-    an expert dimension here; its dense shared experts, MLA projections
-    and indexer map by pattern like everything else, and its routers'
-    balancing bias lands in the `moe` collection beside `params`.
     param_dtype changes floating parameter storage, independently of compute
     dtype. Router and frozen state remain FP32; integer indices retain their
     native dtype. Conversion happens per leaf before its layout copy.
@@ -1654,7 +1727,7 @@ def translate_weights(
     `language_model.`.
     """
     family = (_family_for_config(config) if model_type is None
-              else _FAMILIES[model_type])
+              else families()[model_type])
     # A tied head and a depth's embedding and head are checked copies of
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
@@ -1665,7 +1738,7 @@ def translate_weights(
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
-    for name, tensor in family.prepare_weights(hf_tensors).items():
+    for name, tensor in family.prepare_weights(hf_tensors, config).items():
         path = family.weight_path(name, config)
         if path is None or name in copies:
             continue
@@ -1673,8 +1746,12 @@ def translate_weights(
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
-        insert(variables, path, SourceLeaf((stored,), dtype, transposed=path[-1] == 'kernel' and stored.ndim == 2),
-               name)
+        insert(
+            variables,
+            path,
+            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
+            name,
+        )
     _stack_experts(params)
     return variables if lazy else materialize(variables)
 
@@ -1710,7 +1787,8 @@ def translate_denoiser_weights(
 
 
 class ExportTokenizer(Protocol):
-    """A tokenizer that writes its own HF files. The byte vocabulary has none, so it is recorded by name only."""
+    """A tokenizer that writes its own HF files. The byte vocabulary has
+    none, so it is recorded by name only."""
 
     def save_pretrained(self, directory: str, /) -> tuple[str, ...] | None:
         """Return the files it wrote, which transformers returns and this module does not read."""
@@ -1726,6 +1804,11 @@ class NamedTokenizer(Protocol):
     name: str
 
 
+GENERATION_DEFAULTS: Mapping[str, object] = MappingProxyType({"do_sample": True, "use_cache": True})
+"""The generation_config.json an export writes when nothing names one: sampling
+with the KV cache, which is what transformers' generate reads by default."""
+
+
 def save_export_assets(
     directory,
     *,
@@ -1739,11 +1822,7 @@ def save_export_assets(
     A name is resolved through `tokenizer_for` from local files only and recorded under
     `tokenizer_name`, which is the whole record for the byte vocabulary.
     """
-    values: dict[str, object] = (
-        {"do_sample": True, "use_cache": True}
-        if generation_config is None
-        else dict(generation_config)
-    )
+    values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
     name: str | None = None
     writer: ExportTokenizer | None = None
     if isinstance(tokenizer, str):
@@ -1766,39 +1845,7 @@ def save_export_assets(
         json.dump(values, handle, indent=2)
 
 
-def save_pretrained_decoder(model, variables, directory, *,
-                            tokenizer: str | ExportTokenizer | None = None,
-                            generation_config: Mapping[str, object] | None = None,
-                            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-    """Write a decoder back out in the HF layout: config.json and its weights,
-    in shards of at most `max_shard_size` with their index once they exceed it.
-
-    Derive the config from native computation and encode all variable
-    collections through the matching family. Source-bound exports instead
-    retain their source layout in Pretrained.save. Gemma4 writes frozen or
-    trainable layer-scalar values into HF buffers; reloading that layout
-    preserves computation, not the native scalar training policy.
-
-    `tokenizer` is the vocabulary the weights were trained against, by object
-    or by name; `save_export_assets` writes its files beside them, so one call
-    leaves a directory `load_pretrained` reads back with its processor.
-    `Pretrained.save` writes a decoder's weights through the same encoder
-    (`Pretrained.export`), so the two leave the same weights behind.
-    """
-    from dew.interop.safetensors_io import save_hf_layout
-
-    if not isinstance(model, CausalTransformer):
-        raise ValueError(
-            f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    config = _export_config(model)
-    _refuse_lossy_export(model, config)
-    hf_tensors = export_decoder_weights(model, variables, config)
-
-    save_hf_layout(hf_tensors, config, directory, max_shard_size)
-    save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
-
-
-def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+def export_decoder_weights(model: nn.Module, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Encode whole native variables as canonical model.* / lm_head.* tensors.
 
@@ -1814,9 +1861,9 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     if not isinstance(model, CausalTransformer):
         raise TypeError('decoder weight export requires a CausalTransformer')
     model_type = config.get('model_type')
-    if not isinstance(model_type, str) or model_type not in _FAMILIES:
+    if not isinstance(model_type, str) or model_type not in families():
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
-    family = _FAMILIES[model_type]
+    family = families()[model_type]
     tied = (bool(config['tie_word_embeddings']) if 'tie_word_embeddings' in config
             else records.boolean(family.translate_config(config, set()).get('tie_embeddings'),
                        'tie_embeddings'))
@@ -1831,41 +1878,86 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'per-layer input embeddings, KV sharing and the values norm have '
             'no counterpart in this dense tensor encoder: per_layer_input_dim, '
-            'num_kv_shared_layers, kv_shared_layers or v_norm is set')
+            'kv_shared_layers or v_norm is set')
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
     if (model.output_gate or model.partial_rotary_factor is not None
             or any(mixer is not None and not isinstance(mixer, AttentionMixer) for mixer in mixers)):
         raise ValueError(
             'the attention output gate, a partial rotary and a mixer other than attention '
             'have no counterpart in this dense tensor encoder')
-    family = _FAMILIES[records.text(config['model_type'], 'model_type')]
+    family = families()[records.text(config['model_type'], 'model_type')]
     if model.mixture is not None and family.export_path is _hf_name:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
+    return _decoder_tensors(model, variables, config)
+
+
+def _decoder_tensors(model: CausalTransformer, variables: Mapping[str, object],
+                     config: Mapping[str, object]) -> LazyTensors:
+    """Write every leaf under the name the family's `export_path` gives it.
+
+    Each leaf is stored as the load oriented it, a 2-D kernel transposed, and
+    the family's `packed` tensors are built from their parts. Gemma 4's layer
+    scalars are read from the collection `model.layer_scalar` names.
+    """
+    family = families()[records.text(config['model_type'], 'model_type')]
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
-    # Each tensor comes to the host when it is read, so a sharded writer
-    # holds one shard of the export, not all of it.
-    sources: dict[str, tuple[jax.Array | np.ndarray, bool]] = {}
-    specs: dict[str, jax.ShapeDtypeStruct] = {}
-    for name, value in flatten_dict(dict(params), sep='.').items():
+    tree = variables if 'params' in variables else {'params': params}
+    leaves = dict(flatten_dict(dict(params), sep='.'))
+    constants = tree.get('constants')
+    if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
+        leaves.update((name, value) for name, value in flatten_dict(dict(constants), sep='.').items()
+                      if name.endswith('.layer_scalar'))
+    layouts: dict[str, WeightLayout] = {}
+    for name, value in leaves.items():
         target = family.export_path(name, config)
-        if target is not None:
-            if not isinstance(value, (jax.Array, np.ndarray)):
-                raise TypeError(f'{name} is a {type(value).__name__}, not an array')
-            kernel = name.endswith('.kernel')
-            sources[target] = (value, kernel)
-            specs[target] = jax.ShapeDtypeStruct(value.shape[::-1] if kernel else value.shape, value.dtype)
+        if target is None:
+            continue
+        if not isinstance(value, (jax.Array, np.ndarray)):
+            raise TypeError(f'{name} is a {type(value).__name__}, not an array')
+        if target in layouts:
+            raise ValueError(f'{name} and {layouts[target].paths[0]} both write {target}')
+        kernel = name.endswith('.kernel') and value.ndim == 2
+        layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
+                                       if kernel else value.shape, (1, 0) if kernel else None)
+    return _layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
 
-    def build(target: str) -> np.ndarray:
-        # A kernel is transposed on its device and copied to the host
-        # contiguous: numpy copies a transposed bfloat16 kernel at 0.15 GiB/s
-        # on the RTX 3090 box's CPU, where the round trip over PCIe moves
-        # several GiB/s.
-        value, kernel = sources[target]
-        return np.asarray(jnp.asarray(value).T) if kernel else np.ascontiguousarray(np.asarray(value))
 
-    return LazyTensors(specs, build)
+def _packed_layouts(layouts: Mapping[str, WeightLayout],
+                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+    """`layouts` with each `packed` source tensor built from its parts' layouts,
+    in the place of its first part."""
+    source: dict[str, WeightLayout] = {}
+    for name, layout in layouts.items():
+        found = next(((packing, part) for packing in packed for part in packing.parts
+                      if name.endswith(part)), None)
+        if found is None:
+            source[name] = layout
+            continue
+        packing, part = found
+        stem = name.removesuffix(part)
+        missing = [stem + other for other in packing.parts if stem + other not in layouts]
+        if missing:
+            raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
+        if part == packing.parts[0]:
+            source[stem + packing.name] = packing.layout(
+                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+    return source
+
+
+def _layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, object],
+                    scalar_mode: str | None = None,
+                    retained: Mapping[str, np.ndarray] | None = None) -> LazyTensors:
+    """The layouts' tensors and `retained` beside them, each built when it is
+    read, so a sharded writer holds one shard of the export, not all of it."""
+    kept = retained or {}
+    specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
+                for name, value in kept.items()},
+             **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables, scalar_mode))
+                for name, layout in layouts.items()}}
+    return LazyTensors(specs, lambda name: (
+        layouts[name].export(variables, scalar_mode) if name in layouts else kept[name]))
 
 
 def _export_config(model) -> Mapping[str, object]:
@@ -1982,19 +2074,23 @@ def _export_config(model) -> Mapping[str, object]:
 
 _RUNTIME_FIELDS = frozenset({
     'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
-    'bank_layers', 'dropout_rate', 'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+    'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
+    'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
 """CausalTransformer fields that say how a model runs or trains, not what it
 computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
 forward multiplies by them. `scale_after_cast` orders a norm's scale and its
 cast to the compute dtype, which are the same product in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
-    'num_kv_heads': lambda model: model.kv_heads,
-    'head_dim': lambda model: model.features_per_head,
-    'layer_types': lambda model: model.per_layer_types,
-    'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
-    'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
-    'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
+    "num_kv_heads": lambda model: model.kv_heads,
+    "head_dim": lambda model: model.features_per_head,
+    "layer_types": lambda model: model.per_layer_types,
+    "kinds": lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
+    "partial_rotary_factor": lambda model: model.partial_rotary_factor or 1.0,
+    "per_layer_input_vocab": lambda model: model.per_layer_input_vocab or model.vocab_size,
+    "position_embedding_size": lambda model: (
+        model.position_embedding_size or model.max_seq_len if model.position_embedding == "learned" else None
+    ),
 }
 """Fields whose None stands for a value the forward derives, spelled out."""
 
@@ -2029,8 +2125,10 @@ def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object])
         raise ValueError(
             f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
-            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, so transformers would compute "
-            "another model; no exported family carries this computation")
+            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
+            "so transformers would compute "
+            "another model; no exported family carries this computation"
+        )
 
 
 def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -2039,16 +2137,16 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     None is the tied lm_head, whose embedding copy is written instead.
     """
     parts = dew_name.split('.')
-    if parts == ['norm', 'scale']:
-        return 'model.norm.weight'
-    if parts == ['embed_tokens', 'embedding']:
-        return 'model.embed_tokens.weight'
+    if tuple(parts) in _TRUNK_NAMES:
+        return _TRUNK_NAMES[tuple(parts)]
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
 
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
         module, leaf = parts[1], parts[-1]
+        if len(parts) == 3 and _PER_LAYER_INPUTS.get(module) == leaf:
+            return f'model.layers.{index}.{module}.weight'
         if len(parts) == 4 and module in _PROJECTIONS:
             if parts[2] in _PROJECTIONS[module] and leaf in ('kernel', 'bias'):
                 return (f'model.layers.{index}.{module}.{parts[2]}.'
@@ -2056,11 +2154,65 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
         theirs = {ours: hf for hf, ours in
-                  _norm_names(_FAMILIES[records.text(config['model_type'],
+                  _norm_names(families()[records.text(config['model_type'],
                                              'model_type')].sandwich_norms).items()}
-        if len(parts) == 3 and module in theirs and leaf == 'scale':
-            return f'model.layers.{index}.{theirs[module]}.weight'
+        if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
+            return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
     raise ValueError(f"unknown parameter path {dew_name!r}")
+
+
+@dataclass(frozen=True)
+class Packed:
+    """One source tensor that holds several the path map reads: `parts`,
+    concatenated on `axis`, then permuted by `transpose`.
+
+    Each name is a suffix after the stem a tensor and its parts share. A load
+    splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
+    and an export packs their leaves back (`layout`), so the one entry is
+    both directions.
+    """
+
+    name: str
+    parts: tuple[str, ...]
+    axis: int = -1
+    transpose: tuple[int, ...] | None = None
+
+    def split(self, name: str, tensor: np.ndarray) -> dict[str, np.ndarray]:
+        """The parts of the source tensor `name`, as views of it."""
+        stem = name.removesuffix(self.name)
+        stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        return {stem + part: piece for part, piece in
+                zip(self.parts, np.split(stored, len(self.parts), axis=self.axis), strict=True)}
+
+    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+        """The layout of the source tensor `name`, from each part's one-leaf layout."""
+        ndim = len(parts[0].shape)
+        # A part's axis k is its leaf's axis order[k].
+        order = parts[0].transpose or tuple(range(ndim))
+        axis = self.axis % ndim
+        shape = [*parts[0].shape]
+        shape[axis] = sum(part.shape[axis] for part in parts)
+        back = tuple(range(ndim)) if self.transpose is None else tuple(
+            int(k) for k in np.argsort(self.transpose))
+        transpose = tuple(order[k] for k in back)
+        return WeightLayout(name, tuple(path for part in parts for path in part.paths),
+                            tuple(shape[k] for k in back),
+                            None if transpose == tuple(range(ndim)) else transpose,
+                            None if len(parts) == 1 else order[axis] - ndim)
+
+
+# Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch
+# Linears, `gate_up_proj` `[E, 2 * expert, hidden]` with the gate in the first
+# rows and `down_proj` `[E, hidden, expert]`, where dew stacks `[E, in, out]`.
+_FUSED_EXPERTS = (Packed('.experts.gate_up_proj', ('.experts.gate_proj', '.experts.up_proj'), -1, (0, 2, 1)),
+                  Packed('.experts.down_proj', ('.experts.down_proj',), -1, (0, 2, 1)))
+
+
+class WeightPreparer(Protocol):
+    """Checkpoint storage transforms, with translated geometry where layout needs it."""
+
+    def __call__(self, tensors: Mapping[str, np.ndarray],
+                 config: Mapping[str, object] | None = None, /) -> Mapping[str, np.ndarray]: ...
 
 
 @dataclass(frozen=True)
@@ -2087,18 +2239,24 @@ class DecoderFamily:
     export_path: Callable[[str, Mapping[str, object]], str | None] = _hf_name
     export_weights: Callable[[CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
-    """Whole-variable encoder; dense families retain their export_path loop."""
+    """Whole-variable encoder; the families with one add their checks or
+    storage to the shared writer (`_decoder_tensors`)."""
     sandwich_norms: bool = False
-    prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
-    """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
-    split their fused expert kernels. A quantized format is undone before this,
-    by `load_pretrained`, which records what it undid for the export."""
+    prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
+    """Storage the path map cannot read as stored that no `packed` entry
+    describes: GPT-2's causal buffers, GPT-NeoX's head-interleaved qkv,
+    DeepSeek V4's grouped output projection. A quantized format is undone
+    before this, by `Pretrained.load`, which records what it undid for the
+    export."""
+    packed: tuple[Packed, ...] = ()
+    """Source tensors that hold several the path map reads, split on load and
+    packed again on export: fused experts and GPT-2's Conv1D projections."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""
     zero_padded: tuple[str, ...] = ()
     """Suffixes of the 1-D source tensors a checkpoint stores longer than their
-    leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare_weights` checks and
+    leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare` checks and
     trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
     constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = lambda directory, record: {}
     """The `constants` entries a family derives from its source directory beside
@@ -2108,10 +2266,27 @@ class DecoderFamily:
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
 
+    def prepare_weights(self, tensors: Mapping[str, np.ndarray],
+                        config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """The checkpoint's tensors as the path map reads them: `prepare`'s, with
+        every `packed` tensor split into its parts."""
+        prepared = self.prepare(tensors, config)
+        if not self.packed:
+            return prepared
+        split: dict[str, np.ndarray] = {}
+        for name, tensor in prepared.items():
+            packing = self.packing(name)
+            split.update({name: tensor} if packing is None else packing.split(name, tensor))
+        return split
+
+    def packing(self, name: str) -> Packed | None:
+        """The `packed` entry the source tensor `name` is, if any."""
+        return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+
 
 def _bundled(model_type: str) -> DecoderFamily | None:
     """The family that reads the media bundle released under `model_type`, or None."""
-    family = _FAMILIES.get(model_type)
+    family = families().get(model_type)
     return family if family is not None and family.wrapper is not None else None
 
 
@@ -2157,242 +2332,20 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
     check_tree(variables, model, np.zeros((1, 2), np.int32))
 
 
-# The family modules stand below the shared readers they call, so reaching one
-# of them first leaves the hub complete before its body runs. Their names are
-# bound here alone: the table below is the one place a family is registered.
-from dew.interop.families.deepseek import (
-    _deepseek_config,
-    _deepseek_v2_mixture,
-    _deepseek_v4_config,
-    _deepseek_v4_path,
-    _deepseek_v4_prepare,
-    _kimi_k25_config,
-    _kimi_k25_path,
-)
-from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
-from dew.interop.families.gemma import (
-    _gemma2_config,
-    _gemma2_export,
-    _gemma3_config,
-    _gemma3_export,
-    _gemma3n_config,
-    _gemma3n_path,
-    _gemma4_config,
-    _gemma4_export,
-    _gemma4_export_weights,
-    _gemma4_path,
-    _gemma4_prepare,
-    _gemma_config,
-)
-from dew.interop.families.glm import (
-    _glm4_moe_config,
-    _glm4_moe_path,
-    _glm5_next_config,
-    _glm5_next_export,
-    _glm5_next_export_weights,
-    _glm_moe_dsa_config,
-)
-from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
-from dew.interop.families.kimi import (
-    _KDA_ZERO_PADDED,
-    _kimi_k3_config,
-    _kimi_k3_path,
-    _kimi_k3_prepare,
-    _kimi_linear_config,
-    _kimi_linear_path,
-    _kimi_linear_prepare,
-)
-from dew.interop.families.llama import (
-    _llama_config,
-    _ministral_config,
-    _mistral_config,
-    _mixtral_config,
-    _mixtral_path,
-)
-from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
-from dew.interop.families.masked_diffusion import (
-    _diffusion_gemma_export,
-    _diffusion_gemma_text_config,
-    _dream_config,
-    _llada_config,
-    _llada_export_path,
-    _llada_path,
-    _mask_token_export,
-)
-from dew.interop.families.olmo import _olmo3_config
-from dew.interop.families.qwen import (
-    _qwen2_config,
-    _qwen3_config,
-    _qwen3_export,
-    _qwen3_moe_config,
-    _qwen3_next_config,
-    _qwen35_config,
-    _qwen35_moe_config,
-    _qwen35_moe_path,
-    _qwen35_path,
-)
+# Each family imports these shared readers, so its table is loaded only
+# after their module is complete, including when a cold import starts in a
+# family module. decoder_families.ENTRIES is the single ordered registration.
+@functools.cache
+def family_entries() -> tuple[DecoderFamily, ...]:
+    """The registered layouts, loaded after their shared readers are defined."""
+    from dew.interop.decoder_families import ENTRIES
+    return ENTRIES
 
-_FAMILY_ENTRIES = (
-    DecoderFamily(('glm5_next_text',), _glm5_next_config,
-                  lambda fields: any(isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
-                                     for mixer in _kind_mixers(fields)),
-                  'glm5_next_text', 'Glm5NextTextForCausalLM', _glm5_next_export,
-                  weight_path=_glm4_moe_path, export_weights=_glm5_next_export_weights, preserve_source_layout=True),
-    DecoderFamily(('diffusion_gemma_text',), _diffusion_gemma_text_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and (fields.get('v_norm')
-                                           or fields.get('per_layer_input_dim')
-                                           or fields.get('num_kv_shared_layers'))),
-                  'diffusion_gemma_text', 'DiffusionGemmaForBlockDiffusion',
-                  _diffusion_gemma_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
-                  export_weights=_gemma4_export_weights, preserve_source_layout=False),
-    DecoderFamily(('dream', 'Dream'), _dream_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and fields.get('attention_bias')
-                                      and fields.get('o_proj_bias') is False),
-                  'dream', 'DreamModel', _mask_token_export, preserve_source_layout=True),
-    DecoderFamily(('llada',), _llada_config,
-                  lambda fields: bool(fields.get('causal') is False
-                                      and not fields.get('attention_bias')
-                                      and fields.get('mixture') is None
-                                      and not (fields.get('v_norm')
-                                               or fields.get('per_layer_input_dim')
-                                               or fields.get('num_kv_shared_layers'))
-                                      and not fields.get('output_gate')
-                                      and not fields.get('qk_norm')),
-                  'llada', 'LLaDAModelLM', _mask_token_export,
-                  weight_path=_llada_path, export_path=_llada_export_path, preserve_source_layout=True),
-    DecoderFamily(('gpt_oss',), _gpt_oss_config,
-                  lambda fields: fields.get('mlp') == 'swigluoai',
-                  'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
-                  weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path,
-                  preserve_source_layout=False),
-    DecoderFamily(('llama4_text',), _llama4_config,
-                  lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
-                  'llama4_text', 'Llama4ForCausalLM', _llama4_export,
-                  weight_path=_llama4_path, prepare_weights=_llama4_prepare, preserve_source_layout=True),
-    DecoderFamily(('glm4_moe',), _glm4_moe_config,
-                  lambda fields: (fields.get('partial_rotary_type') == 'default'
-                                  and (mixture := _mixture_value(fields)) is not None
-                                  and mixture.bias),
-                  'glm4_moe', 'Glm4MoeForCausalLM', lambda model: {},
-                  weight_path=_glm4_moe_path, preserve_source_layout=True),
-    # GLM's sparse block is V3.2's with the indexer rotating interleaved
-    # pairs, which no DeepSeek release does, so that field names the family.
-    DecoderFamily(('glm_moe_dsa',), _glm_moe_dsa_config,
-                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
-                                  and mixer.index_topk is not None
-                                  and mixer.index_rope_interleave),
-                  'glm_moe_dsa', 'GlmMoeDsaForCausalLM', lambda model: {},
-                  weight_path=_glm4_moe_path, preserve_source_layout=True),
-    DEEPSEEK_V41,
-    # V4's block is nothing another family builds: the mixer kind names its
-    # window, its compressor and its grouped output projection at once.
-    DecoderFamily(('deepseek_v4',), _deepseek_v4_config,
-                  lambda fields: isinstance(_mixer_value(fields), DeepseekV4Mixer),
-                  'deepseek_v4', 'DeepseekV4ForCausalLM', lambda model: {},
-                  weight_path=_deepseek_v4_path, prepare_weights=_deepseek_v4_prepare,
-                  preserve_source_layout=True,
-                  tied_head_names=('head.weight', 'embed.weight')),
-    DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
-                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
-                                  and mixer.index_topk is not None),
-                  'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    DecoderFamily(('deepseek_v2',), partial(_deepseek_config, mixture=_deepseek_v2_mixture),
-                  lambda fields: (isinstance(_mixer_value(fields), MLAMixer)
-                                  and (mixture := _mixture_value(fields)) is not None
-                                  and not mixture.bias),
-                  'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    # Kimi and DeepSeek V3 share a computation; only source provenance names Kimi.
-    # Derived-model export therefore never selects Kimi via `matches`.
-    DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    # Kimi K2.5 wraps that same computation in a vision repo, so it is
-    # provenance-only too, and its own tensor names are the wrapper's.
-    DecoderFamily(('kimi_k25',), _kimi_k25_config, lambda fields: False,
-                  'kimi_k25', 'Kimi_K25ForConditionalGeneration', lambda model: {},
-                  weight_path=_kimi_k25_path, preserve_source_layout=True,
-                  tied_head_names=('language_model.lm_head.weight',
-                                   'language_model.model.embed_tokens.weight')),
-    # Kimi Linear's released remote code; provenance-only, like K2.5.
-    DecoderFamily(('kimi_linear',), _kimi_linear_config, lambda fields: False,
-                  'kimi_linear', 'KimiLinearForCausalLM', lambda model: {},
-                  weight_path=_kimi_linear_path, prepare_weights=_kimi_linear_prepare,
-                  preserve_source_layout=True),
-    # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
-    DecoderFamily(('kimi_k3',), _kimi_k3_config, lambda fields: False,
-                  'kimi_k3', 'KimiK3ForConditionalGeneration', lambda model: {},
-                  weight_path=_kimi_k3_path, prepare_weights=_kimi_k3_prepare, zero_padded=_KDA_ZERO_PADDED,
-                  preserve_source_layout=True,
-                  tied_head_names=('language_model.lm_head.weight',
-                                   'language_model.model.embed_tokens.weight')),
-    DecoderFamily(('deepseek_v3',), _deepseek_config,
-                  lambda fields: isinstance(_mixer_value(fields), MLAMixer),
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
-    DecoderFamily(('qwen3_next',), _qwen3_next_config,
-                  lambda fields: any(isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj
-                                     for mixer in _kind_mixers(fields)),
-                  'qwen3_next', 'Qwen3NextForCausalLM', lambda model: {},
-                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
-    DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
-                  lambda fields: bool(fields.get('output_gate') and _mixture_value(fields) is not None),
-                  'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
-                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
-    DecoderFamily((_QWEN35,), _qwen35_config,
-                  lambda fields: bool(fields.get('output_gate')
-                                      or 'linear_attention' in (fields.get('layer_types') or ())),
-                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path, preserve_source_layout=True),
-    DecoderFamily(('olmo3',), _olmo3_config,
-                  lambda fields: not fields.get('pre_norms'),
-                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True, preserve_source_layout=True),
-    DecoderFamily(('gemma3n_text',), _gemma3n_config,
-                  lambda fields: fields.get('altup') is not None,
-                  'gemma3n_text', 'Gemma3nForCausalLM', _gemma3_export, sandwich_norms=True,
-                  weight_path=_gemma3n_path, preserve_source_layout=True),
-    DecoderFamily(('gemma4_text',), _gemma4_config,
-                  lambda fields: bool(fields.get('v_norm') or fields.get('per_layer_input_dim')
-                                      or fields.get('num_kv_shared_layers')),
-                  'gemma4_text', 'Gemma4ForCausalLM', _gemma4_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
-                  export_weights=_gemma4_export_weights, preserve_source_layout=True),
-    DecoderFamily((_GEMMA,), _gemma3_config,
-                  lambda fields: bool(fields.get('sandwich_norms') and fields.get('qk_norm')),
-                  _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True, preserve_source_layout=False),
-    DecoderFamily(('gemma2',), _gemma2_config,
-                  lambda fields: bool(fields.get('sandwich_norms')),
-                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True, preserve_source_layout=False),
-    DecoderFamily(('gemma',), _gemma_config,
-                  lambda fields: bool(fields.get('embedding_scale')),
-                  'gemma', 'GemmaForCausalLM', lambda model: {}, preserve_source_layout=False),
-    DecoderFamily(('qwen3_moe',), _qwen3_moe_config,
-                  lambda fields: bool(fields.get('qk_norm') and fields.get('mixture') is not None),
-                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export, preserve_source_layout=True),
-    DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields.get('qk_norm')),
-                  'qwen3', 'Qwen3ForCausalLM', _qwen3_export, preserve_source_layout=False),
-    DecoderFamily(('qwen2',), _qwen2_config,
-                  lambda fields: bool(fields.get('attention_bias') and fields.get('o_proj_bias') is False),
-                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export, preserve_source_layout=False),
-    DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields.get('mixture') is not None,
-                  'mixtral', 'MixtralForCausalLM', lambda model: {},
-                  weight_path=_mixtral_path, preserve_source_layout=True),
-    # MistralConfig has no layer_types: its window is on every layer.
-    DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
-                  'mistral', 'MistralForCausalLM', lambda model: {'layer_types': None},
-                  preserve_source_layout=False),
-    DecoderFamily(('mamba2',), mamba2.config_from_hf,
-                  lambda fields: isinstance(_mixer_value(fields), Mamba2Mixer),
-                  'mamba2', 'Mamba2ForCausalLM', lambda model: {},
-                  weight_path=mamba2.weight_path, export_path=mamba2.export_path,
-                  preserve_source_layout=True,
-                  tied_head_names=('lm_head.weight', 'backbone.embeddings.weight')),
-    DecoderFamily(('ministral',), _ministral_config,
-                  lambda fields: 'sliding_attention' in (fields.get('layer_types') or ()),
-                  'ministral', 'MinistralForCausalLM', lambda model: {}, preserve_source_layout=False),
-    DecoderFamily(('llama',), _llama_config, lambda fields: True,
-                  'llama', 'LlamaForCausalLM', lambda model: {}, preserve_source_layout=False),
-)
-_FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
+
+@functools.cache
+def families() -> dict[str, DecoderFamily]:
+    """The single mutable name table, also used for registered source aliases."""
+    return {name: family for family in family_entries() for name in family.model_types}
 
 def _backbone_defaults() -> DecoderFields:
     """Return what the backbone takes for a field a config leaves unset, so a partial
@@ -2411,7 +2364,7 @@ _BACKBONE_DEFAULTS = _backbone_defaults()
 
 
 def _family_of(fields: DecoderFields) -> DecoderFamily:
-    return next(family for family in _FAMILY_ENTRIES if family.matches(fields))
+    return next(family for family in family_entries() if family.matches(fields))
 
 
 def _family_for_config(config: DecoderFields) -> DecoderFamily:

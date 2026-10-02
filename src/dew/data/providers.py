@@ -25,19 +25,22 @@ Each provider's own options are one frozen value of its own type,
 argument `load` takes. An option of the other provider is then a type its
 spec has no field for rather than a name checked at run time.
 
-`preprocess(record, rng)` is where a record becomes batch fields. It has no
-default, because a provider's rows are its own shape and a loader that
-guessed would decode images meant to stay bytes or drop a column a run needs.
+`preprocess(record, rng)` is where a record becomes batch fields. Without
+one, a row's fields reach the batch as they are, only as arrays (`fields`):
+nothing is decoded, renamed or dropped, because a provider's rows are its
+own shape and a loader that guessed would decode images meant to stay bytes
+or drop a column a run needs.
 """
 
 from __future__ import annotations
 
 import copy
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Callable, Iterator, Mapping, Sequence, Sized
+from typing import TYPE_CHECKING
 
 import grain.python as pygrain
+import jax
 import numpy as np
 
 from dew.registry import datasets
@@ -71,13 +74,6 @@ PROVIDERS = ("tfds", "hf")
 
 Row = Mapping[str, object]
 Preprocess = Callable[[Row, np.random.Generator], Row]
-
-
-@runtime_checkable
-class Counted(Protocol):
-    """Reports how many records a source holds."""
-
-    def __len__(self) -> int: ...
 
 
 
@@ -166,6 +162,64 @@ def phased_dataset(phases: Sequence[tuple[Sequence[Corpus], int | None]],
                    batch=batch)
 
 
+def fields(record: Row, within: str = "") -> Batch:
+    """A provider row as batch fields: its values as arrays in JAX's dtypes.
+
+    A list column becomes one array, so a batch holds it as `[batch, n]`
+    rather than as n separate `[batch]` fields, which is what grain makes of
+    a list. Each array takes the dtype JAX would place it in
+    (`jax.dtypes.canonicalize_dtype`), so the 64-bit numbers `datasets` and
+    Python hand back are 32-bit unless the process enables x64. Strings and
+    bytes stay as they are, and nested mappings keep their structure;
+    `within` is the path a nested mapping's fields are named under in an
+    error. An integer the placed dtype cannot hold is refused by name rather
+    than wrapped round.
+    """
+    held: dict[str, object] = {}
+    for name, value in record.items():
+        where = f"{within}{name}"
+        if isinstance(value, Mapping):
+            held[name] = fields(value, f"{where}.")
+        elif value is None or isinstance(value, (str, bytes)):
+            held[name] = value
+        else:
+            held[name] = _narrowed(where, np.asarray(value))
+    return held
+
+
+def _narrowed(name: str, array: np.ndarray) -> np.ndarray:
+    """`array` in the dtype JAX would place it in, refused when its values do not fit."""
+    if array.dtype == object:
+        raise ValueError(
+            f"field {name!r} holds values of different shapes or types, which make no "
+            f"one array; pass preprocess= to say what the field becomes")
+    if array.dtype.kind not in "biufc":
+        # Strings, bytes and dates are no JAX dtype; they reach the batch as numpy holds them.
+        return array
+    narrow = np.dtype(jax.dtypes.canonicalize_dtype(array.dtype))
+    if narrow == array.dtype:
+        return array
+    if narrow.kind in "iu" and array.size:
+        limits = np.iinfo(narrow)
+        outside = array[(array < limits.min) | (array > limits.max)]
+        if outside.size:
+            raise ValueError(
+                f"field {name!r} holds {outside.flat[0]}, outside the {narrow} range a "
+                f"device holds it in; pass preprocess= to keep it another way")
+    return array.astype(narrow)
+
+
+class Formatting(pygrain.MapTransform):
+    """`fields` as the transformation the workers run when there is no `preprocess`."""
+
+    def map(self, element: object) -> Batch:
+        if not isinstance(element, Mapping):
+            raise TypeError(
+                f"a provider record is a mapping of fields; this one is "
+                f"{type(element).__name__}")
+        return fields(element)
+
+
 class Preprocessing(pygrain.RandomMapTransform):
     """`preprocess` as the grain transformation that runs inside the workers."""
 
@@ -202,7 +256,7 @@ def counted(source: object, given: int | None, name: str) -> int:
     number says, and a smaller one would report an epoch the run never
     trains.
     """
-    if not isinstance(source, Counted):
+    if not isinstance(source, Sized):
         if given is None:
             raise ValueError(
                 f"{name} reports no record count, so load() needs records= set "
@@ -265,8 +319,8 @@ class ProviderDataset(DatasetSpec):
 
     @property
     def transforms(self) -> list[pygrain.Transformation]:
-        """`preprocess` as the transformation the workers run, or none."""
-        return [] if self.preprocess is None else [Preprocessing(self.preprocess)]
+        """`preprocess` as the transformation the workers run, or the row as arrays."""
+        return [Formatting() if self.preprocess is None else Preprocessing(self.preprocess)]
 
     def read(self, name: str, split: str) -> Records:
         """One split of one of this spec's datasets, read by index."""
@@ -293,7 +347,7 @@ class ProviderDataset(DatasetSpec):
 class PreparedTFDS(ProviderDataset):
     """Reads splits of a prepared TFDS builder where preparation left them."""
 
-    options: PreparedOptions = TFDSOptions()
+    options: PreparedOptions = dataclasses.field(default_factory=TFDSOptions)
 
     def read(self, name: str, split: str) -> Records:
         return self.options.source(name, split)
@@ -316,7 +370,7 @@ class HubDataset(ProviderDataset):
 
     streaming: bool = False
     shuffle_buffer: int = 0
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
 
     def read(self, name: str, split: str) -> Records:
         from .sources.hf import HFDatasetSource
@@ -394,12 +448,15 @@ _GIVEN = "the dataset load() was given"
 """What a table a caller built is called, in a refusal and in a record count."""
 
 
+_DEFAULT_LOADING = Loading()
+
+
 def load(source: Named, *, batch: int,
          options: HFOptions | TFDSOptions | None = None, split: str = "train",
          val_split: str | None = None, val_batches: int | None = None,
          records: int | None = None, preprocess: Preprocess | None = None,
          seed: int = 0, shuffle_buffer: int = 0, streaming: bool = False,
-         loading: Loading = Loading(),
+         loading: Loading = _DEFAULT_LOADING,
          dataset: ArrowDataset | IterableDataset | None = None) -> Dataset:
     """The `Dataset` behind `source`, read where the provider already holds it.
 
@@ -496,9 +553,8 @@ def _stream(name: str, split: str, *, options: HFOptions,
                         world_size=partition.count,
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)
-        piped: pygrain.IterDataset = source
-        if preprocess is not None:
-            piped = piped.random_map(Preprocessing(preprocess), seed=seed)
+        piped: pygrain.IterDataset = (source.map(Formatting()) if preprocess is None
+                                      else source.random_map(Preprocessing(preprocess), seed=seed))
         batches = ThreadPrefetchIterDataset(
             piped.batch(partition.rows(batch), drop_remainder=True),
             prefetch_buffer_size=max(1, loading.worker_buffer))

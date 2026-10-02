@@ -16,8 +16,9 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file, save_file
 
-from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, translate, weight_path
-from dew.interop.pretrained import load_pretrained
+from dew.interop.hf_decoders import translate_weights
+from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, weight_path
+from dew.interop.pretrained import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -71,21 +72,33 @@ def test_every_fixture_tensor_has_a_place_and_an_unknown_one_none(hf_config, ten
     assert paths["backbone.norm_f.weight"] == ("params", "norm", "scale")
     assert paths["lm_head.weight"] == ("params", "lm_head", "kernel")
     assert paths["backbone.layers.1.norm.weight"] == ("params", "layers_1", "input_layernorm", "scale")
-    assert paths["backbone.layers.0.mixer.conv1d.bias"] == ("params", "layers_0", "self_attn", "conv1d", "bias")
-    assert paths["backbone.layers.0.mixer.in_proj.weight"] == ("params", "layers_0", "self_attn", "in_proj", "kernel")
+    assert paths["backbone.layers.0.mixer.conv1d.bias"] == (
+        "params",
+        "layers_0",
+        "self_attn",
+        "conv1d",
+        "bias",
+    )
+    assert paths["backbone.layers.0.mixer.in_proj.weight"] == (
+        "params",
+        "layers_0",
+        "self_attn",
+        "in_proj",
+        "kernel",
+    )
     assert weight_path("lm_head.weight", {"tie_embeddings": True}) is None
     with pytest.raises(ValueError, match="no place"):
         weight_path("backbone.layers.0.mlp.up_proj.weight", config)
 
 
 def test_the_translated_weights_reproduce_the_reference_logits(hf_config, tensors):
-    """The whole checkpoint: the fixture's tensors through `translate`, the
+    """The whole checkpoint: the fixture's tensors through `translate_weights`, the
     model `config_from_hf` names, against the reference's fp32 logits on
     the fixture's own tokens. Largest observed difference 9.4e-07 on logits
     of magnitude 1.7; every argmax equal."""
     config = config_from_hf(hf_config)
     model = CausalTransformer(**config, max_seq_len=16)
-    variables = translate(tensors, config)
+    variables = translate_weights(tensors, config, "mamba2")
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     template = jax.eval_shape(model.init, jax.random.key(0), ids)
     assert jax.tree.map(jnp.shape, template) == jax.tree.map(jnp.shape, variables)
@@ -100,10 +113,10 @@ def test_the_translated_weights_reproduce_the_reference_logits(hf_config, tensor
 def test_a_tied_head_is_checked_and_dropped(hf_config, tensors):
     config = config_from_hf({**hf_config, "tie_word_embeddings": True})
     tied = {**tensors, "lm_head.weight": tensors["backbone.embeddings.weight"]}
-    variables = translate(tied, config)
+    variables = translate_weights(tied, config, "mamba2")
     assert "lm_head" not in variables["params"]
-    with pytest.raises(ValueError, match="tied"):
-        translate(tensors, config)
+    with pytest.raises(ValueError, match="not the embedding it claims to copy"):
+        translate_weights(tensors, config, "mamba2")
 
 
 def test_the_source_pins_the_reference():
@@ -124,9 +137,9 @@ def test_export_path_inverts_weight_path(hf_config, tensors):
 
 
 def test_the_public_loader_reads_the_fixture(tensors):
-    """`load_pretrained` dispatches the `mamba2` model type through the
+    """`Pretrained.load` dispatches the `mamba2` model type through the
     decoder family table and reproduces the reference logits."""
-    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     logits = source.model.apply(source.variables, ids)
     reference = np.load(FIXTURE / "logits.npy")
@@ -168,7 +181,7 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     save_file({name.replace("backbone.embeddings.", "backbone.embedding."): array
                for name, array in tensors.items()}, source / "model.safetensors")
 
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "saved")
 
     logits = loaded.model.apply(loaded.variables, jnp.asarray(np.load(FIXTURE / "input_ids.npy")))
@@ -217,8 +230,8 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     with torch.no_grad():
         reference = port(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
 
-    fp32 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
-    bf16 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M,
+    fp32 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
+    bf16 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M,
                            dtype="bfloat16", param_dtype="bfloat16")
 
     logits = np.asarray(fp32.model.apply(fp32.variables, ids), np.float32)

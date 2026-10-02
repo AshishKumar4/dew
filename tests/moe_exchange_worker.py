@@ -12,7 +12,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.moe import ExpertMLP
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 
 def main() -> None:
@@ -21,7 +21,7 @@ def main() -> None:
                                process_id=rank, local_device_ids=[0], initialization_timeout=30)
     from test_moe_exchange import objective, routing_case
 
-    mesh = build_mesh(MeshSpec(expert=2))
+    mesh = MeshSpec(expert=2).build()
     split = NamedSharding(mesh, P('expert'))
     replicated = NamedSharding(mesh, P())
     errors: dict[str, list[float]] = {}
@@ -45,7 +45,7 @@ def main() -> None:
         x, weights, ids = (distribute(value, split) for value in (x, weights, ids))
         out_specs = ((replicated, split), (parameter_specs, split, split))
         with jax.set_mesh(mesh):
-            def loss(p, x, weights, ids):
+            def loss(p, x, weights, ids, *, model=model):
                 return objective(model.clone(dispatch='exchange'), ids, p, x, weights)
             actual = jax.jit(jax.value_and_grad(loss, (0, 1, 2), has_aux=True),
                              out_shardings=out_specs)(parameters, x, weights, ids)

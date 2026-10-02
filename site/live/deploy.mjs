@@ -19,6 +19,11 @@
 //   node live/deploy.mjs <sha> -- --secrets-file ~/.config/dewml-live-secrets.json
 //   # Restore both files, then deploy again; v3 deletes the empty class.
 //   node live/deploy.mjs <sha> -- --secrets-file ~/.config/dewml-live-secrets.json
+//
+// Each deploy of a new image waits for Cloudflare to prepare it (2 to 14
+// minutes measured). The first container a host starts from it then pulls the
+// image first, which took over 120 s on preview; spares and later starts on
+// that host are not slowed.
 
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, writeFileSync } from 'node:fs';

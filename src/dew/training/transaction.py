@@ -14,17 +14,21 @@ the same arrays step after step.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
-from typing import Generic
+from collections.abc import Callable
+from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
+from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Effects, Loss, Mean, Step, Variables, mean_loss, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge
 from dew.training.state import Accumulation
+
+Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
@@ -32,13 +36,21 @@ def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     return None if ema is None else merge(params, ema)
 
 
-def _project(tree: Variables, like: Variables) -> Variables:
-    """The leaves of tree at the paths like holds, in like's nesting."""
-    return {name: _project(tree[name], child) if isinstance(child, Mapping) else tree[name]
-            for name, child in like.items()}
+def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
+    """The leaves of tree at the key paths like holds, in like's containers."""
+    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
+    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
 
 
-def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables:
+@overload
+def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
+
+
+@overload
+def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
+
+
+def ema_update(ema, params, decay):
     """Update selected EMA leaves in their initialized storage dtypes.
 
     Arithmetic uses at least fp32 and preserves explicit fp64. Unit decay
@@ -81,7 +93,7 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
 
 
 def _all_finite(tree) -> jax.Array:
-    finite = jnp.asarray(True)
+    finite = jnp.asarray(a=True)
     for leaf in jax.tree.leaves(tree):
         finite = finite & jnp.all(jnp.isfinite(leaf))
     return finite
@@ -107,8 +119,11 @@ def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
     decreased = scale.scale * scale.backoff_factor
     if scale.minimum_scale is not None:
         decreased = jnp.maximum(decreased, scale.minimum_scale)
-    return dataclasses.replace(scale, scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
-                               fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1))
+    return dataclasses.replace(
+        scale,
+        scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
+        fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1),
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,14 +171,14 @@ class Transaction:
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `shapes` is the traced result of the objective's loss, statistics and
-        `Aux`. Statistics that are a `Mean` or a bare scalar pool into one
+        `Aux`. Statistics that are a `Ratio` or a bare scalar pool into one
         shared mean, which the window can sum and never has to replay.
         """
         self.objective = objective
         self.optimizer = optimizer
         self.size = accumulation
         stats_shape, self.aux_shape = shapes
-        self.shared = isinstance(stats_shape, (Mean, jax.ShapeDtypeStruct))
+        self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
@@ -201,11 +216,11 @@ class Transaction:
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
         local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
-        local_ok = jnp.asarray(True) if state.scale is None else local_finite
+        local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
         effects = tuple(jax.tree.leaves(aux.effects))
         candidate, pooled = previous, stats
-        replay_required = jnp.asarray(False)
+        replay_required = jnp.asarray(a=False)
         if previous is None:
             _, active = self.objective.reduce_loss(stats)
         else:
@@ -215,12 +230,12 @@ class Transaction:
                 prior_mass, prior_gradient = previous.mass, previous.gradient
                 if prior_mass is None or prior_gradient is None:
                     raise ValueError("checkpoint accumulator does not match shared-mean statistics")
-                if isinstance(stats, Mean):
+                if isinstance(stats, Ratio):
                     mass, total = stats.mass, stats.total
                 elif isinstance(stats, (jax.Array, float, int)):
                     mass, total = jnp.asarray(1.), jnp.asarray(stats)
                 else:
-                    raise TypeError("shared accumulation requires Mean or a scalar")
+                    raise TypeError("shared accumulation requires Ratio or a scalar")
                 mass = jax.lax.stop_gradient(mass)
                 total_mass = prior_mass + mass
                 denominator = jnp.where(total_mass > 0, total_mass, 1)
@@ -228,8 +243,8 @@ class Transaction:
                     lambda old, new: old * jnp.asarray(prior_mass / denominator, old.dtype)
                     + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradient)
                 numerator = previous.statistics[0] + total
-                pooled = Mean(numerator, total_mass)
-                value, active = mean_loss(pooled)
+                pooled = Ratio(numerator, total_mass)
+                value, active = pooled.mean()
                 candidate = dataclasses.replace(previous, gradient=gradient, mass=total_mass,
                                                 statistics=(numerator,), effects=effects, qk_stats=qk)
             else:
@@ -309,7 +324,7 @@ class Transaction:
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
-        accepted = jnp.asarray(True) if scale is None else finite
+        accepted = jnp.asarray(a=True) if scale is None else finite
         numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
                                         microstep=state.microstep + 1)
 
@@ -326,7 +341,9 @@ class Transaction:
                     update, opt_state = self.optimizer.update(
                         native, current.opt_state, current.params["params"], qk_stats=qk)
                 else:
-                    update, opt_state = self.optimizer.update(native, current.opt_state, current.params["params"])
+                    update, opt_state = self.optimizer.update(
+                        native, current.opt_state, current.params["params"]
+                    )
                 params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
                 if self.aux_shape.effects is not None:
                     params = write_back(params, self.objective.apply_effects(
@@ -352,7 +369,7 @@ class Transaction:
             native_finite = native_finite | ~due
         else:
             numerical, native_finite = jax.lax.cond(
-                due, commit, lambda x: (x, jnp.asarray(True)), numerical)
+                due, commit, lambda x: (x, jnp.asarray(a=True)), numerical)
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
@@ -363,8 +380,12 @@ class Transaction:
             def retain(acc):
                 if not self.shared:
                     acc = dataclasses.replace(
-                        acc, batches=jax.tree.map(lambda held, x: held.at[pending.fill].set(x), acc.batches, batch),
-                        attempts=acc.attempts.at[pending.fill].set(state.step))
+                        acc,
+                        batches=jax.tree.map(
+                            lambda held, x: held.at[pending.fill].set(x), acc.batches, batch
+                        ),
+                        attempts=acc.attempts.at[pending.fill].set(state.step),
+                    )
                     if acc.variables is not None:
                         reads = {name: state.params[name] for name in acc.variables}
                         acc = dataclasses.replace(acc, variables=jax.tree.map(

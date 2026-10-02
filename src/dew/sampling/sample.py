@@ -15,20 +15,44 @@ from dew.sampling.solvers import Solver
 
 
 @overload
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: None = None,
-                   final_denoise: bool = True) -> jax.Array: ...
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: int,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: int | jax.Array,
+    times: None = None,
+    final_denoise: bool = True,
+) -> jax.Array: ...
 
 
 @overload
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float],
-                   final_denoise: bool = True) -> jax.Array: ...
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: None = None,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: int | jax.Array,
+    times: ArrayLike | Sequence[float],
+    final_denoise: bool = True,
+) -> jax.Array: ...
 
 
-def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: Solver[StateT],
-                   guidance: Guidance | None = None, key: jax.Array, times: ArrayLike | Sequence[float] | None = None,
-                   final_denoise: bool = True) -> jax.Array:
+def sample[StateT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: int | None = None,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: int | jax.Array,
+    times: ArrayLike | Sequence[float] | None = None,
+    final_denoise: bool = True,
+) -> jax.Array:
     """`steps` points from T to 0: a solver step across each interval, then the
     model's clean prediction at the last point.
 
@@ -36,17 +60,23 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
     reads; `guidance` wraps it. Every step's noise comes from `key` folded
     with the step index, so a trajectory is reproducible from one key.
     An explicit `times` grid is the trajectory when given, descending and
-    concrete, for a source whose sampler pairs its own sigma and model-time
+    concrete, for a source whose solver pairs its own sigma and model-time
     tables; it decides the length, so a grid of `steps + 1` points ending
     on the terminal is legal and a single point walks nothing. Exactly one
     of `steps` and `times` is passed. `final_denoise=False` returns the last
     point's state without the closing clean prediction, the way those
-    samplers end.
+    solvers end.
+
+    The trajectory is one `lax.scan`, traced at each call: under a caller's
+    `jax.jit` it compiles once, as the pipelines and objectives call it,
+    and called eagerly it traces and compiles the scan again every time.
     """
     if (steps is None) == (times is None):
         raise ValueError("pass exactly one of steps and times")
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError("steps must be a positive integer")
+    from dew.nn.inputs import request_key
+    key = request_key(key)
     process = denoise.process
     if guidance is not None and not isinstance(denoise, Denoiser):
         raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")

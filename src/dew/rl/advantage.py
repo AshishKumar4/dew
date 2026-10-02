@@ -51,7 +51,7 @@ value Tunix hardcodes. verl-omni and TRL use 1e-4, so it is an argument."""
 
 
 def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
-    """Mean of `x` over the positions `mask` keeps.
+    """Ratio of `x` over the positions `mask` keeps.
 
     Outside the mask the values are replaced through `jnp.where`, verl's
     `masked_sum` form. A nan in a padded position survives a multiply by a

@@ -23,7 +23,8 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 """
 
 import math
-from typing import Callable, NamedTuple
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -70,40 +71,17 @@ def _operand_dtype(precision: jax.lax.PrecisionLike, work: jnp.dtype):
     return jnp.bfloat16 if precision is BF16 else work
 
 
-def _cotangent_product(subscripts: str, cotangent, operand, precision: jax.lax.PrecisionLike):
-    """`cotangent` times an operand that holds the forward's values, in the
-    cotangent's dtype (fp32, or wider for a float64 run).
+def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
+    """The logits' cotangent as both backward products read it.
 
-    Under the bf16 algorithm the product would round the fp32 cotangent to
-    bf16, and that rounding moved a 4-GPU run's gradients past the layout
-    parity bound: 1.75 of it on a dense model's final norm, 5758 of it on an
-    MoE's expert kernels, against 0.47 and 0.41 with the cotangent kept in
-    fp32. So it enters as a bf16 high half and the bf16 rest, two products
-    whose sum carries it to about 2^-17 of its size; the operand is exact in
-    bf16 already.
-    """
-    def product(left):
-        return jnp.einsum(subscripts, left, operand, precision=precision,
-                          preferred_element_type=cotangent.dtype)
-
-    if precision is not BF16:
-        return product(cotangent)
-    # A cast pair would be folded away under jit (`rounded_to`), and the rest with it.
-    high = rounded_to(cotangent, jnp.bfloat16)
-    # The halves reach the products as bf16: the split writes half the
-    # bytes, and the products read half. The high half and the operand are
-    # bf16 values already; the rest is cast by round-to-nearest-even, the
-    # rounding a GPU's BF16_BF16_F32 applies to an fp32 operand, so on a GPU
-    # the products are unchanged. A CPU runs the algorithm unrounded, so
-    # there the cast is the rounding (2.2e-6 of the state gradient). A caller
-    # in a loop passes the operand already bf16.
-    operand = operand.astype(jnp.bfloat16)
-
-    def half(left):
-        return jnp.einsum(subscripts, left.astype(jnp.bfloat16), operand, precision=precision,
-                          preferred_element_type=jnp.float32)
-
-    return half(high) + half(cotangent - high)
+    Under the bf16 algorithm the logits are bf16 values (`_tile_logits`),
+    and their cotangent is rounded to bf16 once, as the gradient of torch
+    autocast's bf16 logits is: the state product and the head's own read
+    that one copy. Otherwise it stays in its own dtype, fp32 or wider. The
+    cast is round-to-nearest-even, the rounding a GPU's BF16_BF16_F32
+    applies to an fp32 operand; a CPU runs the algorithm unrounded, so there
+    the cast is the rounding."""
+    return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
 
 
 def _capped(logits, softcap, temperature: float = 1.0):
@@ -129,9 +107,45 @@ def head_logits(hidden, head_weight, *, softcap: float | None,
 
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     """Uncapped `[tokens, features] @ [columns, features].T` in at least fp32,
-    over operands already in the dtype the head multiplies in."""
-    return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
-                      precision=precision, preferred_element_type=at_least_fp32(states.dtype))
+    over operands already in the dtype the head multiplies in. Under the
+    bf16 algorithm the logits are rounded to bf16 values, as
+    `dew.nn.precision.head_product` rounds the model's."""
+    logits = jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
+                        precision=precision, preferred_element_type=at_least_fp32(states.dtype))
+    return rounded_to(logits, jnp.bfloat16) if precision is BF16 else logits
+
+
+def _row_terms(logits, predict: bool) -> tuple[jax.Array, tuple[jax.Array, jax.Array] | None]:
+    """Each row's logsumexp, and with `predict` its maximum and the first
+    column that holds it, from one reduction over the row.
+
+    The running maximum, the sum of exponentials scaled to it and the
+    maximum's column ride together through `jax.lax.reduce`, so the row is
+    read once, rather than once for the maximum and again for the sum. On an
+    RTX 4080 (jax 0.11.2), fp32 logits of 4096 x 151936 take 3.9 ms against
+    `jax.nn.logsumexp` and `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against
+    5.0, with the same columns and logsumexps 1.9e-6 apart."""
+    def rescaled(maximum, total, larger):
+        # A sum moved from its own maximum to the larger one; unchanged where they agree.
+        return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
+
+    def combine(first, second):
+        larger = jnp.maximum(first[0], second[0])
+        total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
+        if not predict:
+            return larger, total
+        keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[2] < second[2]))
+        return larger, total, jnp.where(keep, first[2], second[2])
+
+    axis = logits.ndim - 1
+    operands = [logits, jnp.ones_like(logits)]
+    initial = [jnp.array(-jnp.inf, logits.dtype), jnp.array(0, logits.dtype)]
+    if predict:
+        # A vocabulary column is int32 whatever the run's default integer width.
+        operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
+        initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
+    terms = jax.lax.reduce(tuple(operands), tuple(initial), combine, (axis,))
+    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None)
 
 
 class _ChunkTerms(NamedTuple):
@@ -151,14 +165,11 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
-    picked = jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0]
-    lse, picked = jax.nn.logsumexp(logits, axis=-1), jnp.where(inside, picked, 0.0)
-    if not predict:
+    picked = jnp.where(inside, jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0], 0.0)
+    lse, top = _row_terms(logits, predict)
+    if top is None:
         return _ChunkTerms(lse, picked, None, None)
-    # A vocabulary column is int32 whatever the run's default integer width;
-    # argmax widens to int64 under x64.
-    return _ChunkTerms(lse, picked, jnp.max(logits, axis=-1),
-                       jnp.argmax(logits, axis=-1).astype(jnp.int32) + start)
+    return _ChunkTerms(lse, picked, top[0], top[1] + start)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
@@ -246,10 +257,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
     """
     del chunks, predict  # The backward tiles by column, and argmax has no gradient.
     hidden, table, targets, log_z, softcap = residuals
-    # The operands hold the forward's values, widened to the work dtype so
-    # the logits' cotangent is not rounded here: the bf16 algorithm rounds it
-    # inside the product on a backend that has one, as the full pass's
-    # backward does.
+    # The logits are recomputed from operands that hold the forward's
+    # values, so they are the forward's logits.
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     loss_cotangent, _, partition_cotangent = cotangents
@@ -266,8 +275,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
         stored = jax.lax.dynamic_slice_in_dim(table, first, width, axis=0)
         matrix = rounded_operand(stored.astype(work), operands)
         # The state gradient's operand, cast to bf16 once per vocabulary tile
-        # rather than once per token tile inside `_cotangent_product`: the same
-        # values, as `matrix` is exact in bf16 under the bf16 algorithm.
+        # rather than once per token tile: the same values, as `matrix` is
+        # exact in bf16 under the bf16 algorithm.
         product_matrix = stored.astype(jnp.bfloat16) if precision is BF16 else matrix
 
         def tokens(start, carry, size):
@@ -291,12 +300,13 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             d_logits = ((token_loss + token_partition)[:, None] * probabilities
                         - token_loss[:, None] * selected)
             d_raw, cap_tile = pullback(d_logits)
-            states_tile = _cotangent_product('tv,vd->td', d_raw, product_matrix, precision)
-            # The head's own gradient sums over every token in fp32 already
-            # (`d_matrix`), and a split here costs as much again as the
-            # states': Qwen3-0.6B's step 174.0 against 186.6 ms on an A100.
-            matrix_tile = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
+            d_raw = _logits_cotangent(d_raw, precision)
+            states_tile = jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work)
+            matrix_tile = jnp.einsum(
+                'tv,td->vd', d_raw,
+                jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision=precision,
+                preferred_element_type=work)
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size)
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, prior + states_tile, start, axis=0)
@@ -336,15 +346,14 @@ def _whole_head_terms(hidden, table, targets, softcap, precision, predict, tempe
     labels = targets.reshape(-1)
     raw = _tile_logits(flat, table.astype(operands), precision)
     logits = _capped(raw, softcap, temperature)
-    log_z = jax.nn.logsumexp(logits, axis=-1)
+    log_z, top = _row_terms(logits, predict)
     # A target outside the vocabulary picks no column, as in `_chunk_terms`:
     # the vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
     inside = (labels >= 0) & (labels < table.shape[0])
     picked = jnp.where(inside, jnp.take_along_axis(
         logits, jnp.clip(labels, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
-    best = (jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(targets.shape)
-            if predict else None)
+    best = None if top is None else top[1].reshape(targets.shape)
     return raw, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
@@ -365,25 +374,25 @@ def _whole_head_fwd(hidden, table, targets, softcap, chunks, precision, predict,
 
 def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangents):
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
-    logits: the logits' cotangent stays fp32 into the state product
-    (`_cotangent_product`), and the head's accumulates in fp32 once."""
+    logits: the logits' cotangent as `_logits_cotangent` gives it to both
+    products, and the head's gradient accumulated in fp32 once."""
     del chunks, predict
     hidden, table, targets, raw, log_z, softcap = residuals
     loss_cotangent, _, partition_cotangent = cotangents
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    states = rounded_operand(hidden.reshape(-1, features).astype(work), operands)
-    matrix = rounded_operand(table.astype(work), operands)
     d_loss, d_partition = loss_cotangent.reshape(-1), partition_cotangent.reshape(-1)
     logits, pullback = jax.vjp(lambda raw, cap: _capped(raw, cap, temperature), raw, softcap)
     probabilities = jnp.exp(logits - log_z.reshape(-1)[:, None])
     selected = jax.nn.one_hot(targets.reshape(-1), table.shape[0], dtype=work)
     d_raw, d_cap = pullback((d_loss + d_partition)[:, None] * probabilities
                             - d_loss[:, None] * selected)
-    d_states = _cotangent_product('tv,vd->td', d_raw, matrix, precision)
-    d_table = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
-                         preferred_element_type=work)
+    d_raw = _logits_cotangent(d_raw, precision)
+    d_states = jnp.einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
+                          preferred_element_type=work)
+    d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
+                         precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, d_cap)
 
@@ -474,7 +483,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
-    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`). `temperature` divides the capped logits (`head_logits`), which
+    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`).
+    `temperature` divides the capped logits (`head_logits`), which
     scores the draws of a sampler at that temperature.
 
     On a mesh every device scores its own tokens (`_token_spec`): the token
@@ -662,7 +672,10 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
         return _capped(head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], precision),
                        softcap, temperature)
 
-    pieces = (ids.reshape(-1, blocks, block).swapaxes(0, 1), columns.reshape(-1, blocks, block).swapaxes(0, 1))
+    pieces = (
+        ids.reshape(-1, blocks, block).swapaxes(0, 1),
+        columns.reshape(-1, blocks, block).swapaxes(0, 1),
+    )
     logits = jax.lax.map(chunk, pieces).swapaxes(0, 1).reshape(ids.shape)
     labels = jnp.take_along_axis(targets, jnp.maximum(columns, 0), axis=1)
 

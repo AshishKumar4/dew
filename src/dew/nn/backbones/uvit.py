@@ -6,7 +6,7 @@ block's output into its mirror in the second half.
 """
 
 from functools import partial
-from typing import Callable, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +17,6 @@ from dew.registry import models
 
 from ..attention import LayerNorm, TransformerBlock
 from ..blocks import FourierEmbedding, TimeProjection
-from ..conv import Conv
 from ..dit import (
     ROPE_THETA,
     ConditioningEmbed,
@@ -30,11 +29,9 @@ from ..dit import (
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
-from ..sharding import logical_axes
 
 
 @models("uvit")
-@logical_axes({}, heuristic=(("text_proj",), ("up_dense_*",), ("pos_encoding",), ("final_*conv*",)))
 class UViT(nn.Module):
     """Denoise patches as U-ViT does (Bao et al. 2023).
 
@@ -42,28 +39,18 @@ class UViT(nn.Module):
     blocks are plain transformer blocks, and each first-half output skips
     into the second half through a dense layer over the concatenation.
     Position is a learned table over the raster index, sized for a 512
-    pixel image.
-
-    `add_residualblock_output` refines the unpatchified prediction with two
-    convolutions over it and the input image. `use_projection`,
-    `use_self_and_cross`, `norm_inputs` and `explicitly_add_residual` are
-    `TransformerBlock`'s own settings, passed to every block.
+    pixel image. Every block is a `TransformerBlock` without input norm,
+    projection or cross-attention.
     """
     output_channels: int = 3
     patch_size: int = 16
     emb_features: int = 768
     num_layers: int = 12
     num_heads: int = 12
-    use_projection: bool = False
-    use_self_and_cross: bool = False
     force_fp32_for_softmax: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
-    activation: Callable = jax.nn.swish
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    add_residualblock_output: bool = False
-    norm_inputs: bool = False
-    explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"
 
@@ -109,12 +96,12 @@ class UViT(nn.Module):
             TransformerBlock,
             heads=self.num_heads,
             dim_head=self.emb_features // self.num_heads,
-            dtype=self.dtype, precision=self.precision, use_projection=self.use_projection,
-            use_self_and_cross=self.use_self_and_cross,
+            dtype=self.dtype, precision=self.precision, use_projection=False,
+            use_self_and_cross=False,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
-            only_pure_attention=False, norm_inputs=self.norm_inputs,
-            explicitly_add_residual=self.explicitly_add_residual,
+            only_pure_attention=False, norm_inputs=False,
+            explicitly_add_residual=True,
             norm_epsilon=self.norm_epsilon,
         )
         self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
@@ -138,23 +125,12 @@ class UViT(nn.Module):
             name="final_proj"
         )
 
-        if self.add_residualblock_output:
-            self.final_conv1 = Conv(
-                features=64, kernel_size=(3, 3), strides=(1, 1),
-                dtype=self.dtype, precision=self.precision, name="final_conv1"
-            )
-            self.final_norm_conv = norm(name="final_norm_conv")
-            self.final_conv2 = Conv(
-                features=self.output_channels, kernel_size=(3, 3), strides=(1, 1),
-                dtype=at_least_fp32(self.dtype),
-                precision=self.precision, name="final_conv2"
-            )
-
     def __call__(self, x, temb, textcontext=None, train: bool = False):
-        original_img = x
-        _, H, W, _ = original_img.shape
+        _, H, W, _ = x.shape
         num_patches = (H // self.patch_size) * (W // self.patch_size)
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, (
+            "Image dimensions must be divisible by patch size"
+        )
 
         hilbert_inv_idx = None
         if self.scan_order == "hilbert":
@@ -163,8 +139,10 @@ class UViT(nn.Module):
         else:
             x_patches = self.patch_embed(x)
 
-        assert num_patches <= self.pos_encoding.shape[
-            1], f"Number of patches {num_patches} exceeds max_len {self.pos_encoding.shape[1]} in positional encoding"
+        assert num_patches <= self.pos_encoding.shape[1], (
+            f"Number of patches {num_patches} exceeds max_len {self.pos_encoding.shape[1]} "
+            "in positional encoding"
+        )
         x_patches = x_patches + self.pos_encoding[:, :num_patches, :]
 
         time_token = self.time_embed(temb.astype(at_least_fp32(self.dtype)))
@@ -197,21 +175,10 @@ class UViT(nn.Module):
                 x_patches_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
         else:
             x_image = unpatchify(x_patches_out, self.patch_size, H, W, self.output_channels)
-
-        if self.add_residualblock_output:
-            x_image = jnp.concatenate(
-                [original_img.astype(self.dtype), x_image], axis=-1)
-
-            x_image = self.final_conv1(x_image)
-            x_image = self.final_norm_conv(x_image)
-            x_image = self.activation(x_image)
-            x_image = self.final_conv2(x_image)
-
         return x_image
 
 
 @models("simple_udit")
-@logical_axes({}, heuristic=(("up_dense_*",),))
 class SimpleUDiT(nn.Module):
     """A U-shaped DiT: `SimpleDiT`'s adaLN-Zero blocks with the first half's
     outputs skipping into the second half through a dense layer over the
@@ -301,7 +268,9 @@ class SimpleUDiT(nn.Module):
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, (
+            "Image dimensions must be divisible by patch size"
+        )
 
         hilbert_inv_idx = None
         if self.scan_order == "hilbert":

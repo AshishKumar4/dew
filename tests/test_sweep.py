@@ -13,7 +13,7 @@ import pytest
 from test_instrumentation import Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, optuna_search, override, random_search, sweep
+from dew.config.sweep import grid_search, optuna_search, override, random_search
 from dew.data import Dataset
 from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
@@ -42,8 +42,8 @@ def journal(directory, name):
 
 def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_path):
     with LocalTracker(tmp_path / 'sweep') as tracker:
-        trials = sweep(config(tmp_path), SPACE, train=train, trials=4,
-                       ledger=tmp_path / 'ledger.json', tracker=tracker, search=grid_search)
+        trials = config(tmp_path).sweep(SPACE, train=train, trials=4,
+                                        ledger=tmp_path / 'ledger.json', tracker=tracker, search=grid_search)
 
     assert [trial.name for trial in trials] == [f'sweep/trial-{index}' for index in range(4)]
     # Every point of the grid was trained, each under its own run.
@@ -74,16 +74,16 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
             raise KeyboardInterrupt('the operator stopped the sweep')
         return float(len(trained))
 
-    arguments = dict(train=counted, trials=4, ledger=tmp_path / 'ledger.json',
-                     search=grid_search)
+    arguments = {'train': counted, 'trials': 4, 'ledger': tmp_path / 'ledger.json',
+                     'search': grid_search}
     with LocalTracker(tmp_path / 'sweep') as tracker:
         with pytest.raises(KeyboardInterrupt):
-            sweep(config(tmp_path), SPACE, tracker=tracker, **arguments)
+            config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
         assert trained == ['sweep/trial-0', 'sweep/trial-1', 'sweep/trial-2']
         assert len(json.loads((tmp_path / 'ledger.json').read_text())['trials']) == 2
 
         trained.clear()
-        trials = sweep(config(tmp_path), SPACE, tracker=tracker, **arguments)
+        trials = config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
 
     assert trained == ['sweep/trial-2', 'sweep/trial-3']
     assert [trial.index for trial in trials] == [0, 1, 2, 3]
@@ -94,11 +94,11 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
 
 def test_a_ledger_of_another_space_is_refused(tmp_path):
     with LocalTracker(tmp_path / 'sweep') as tracker:
-        arguments = dict(train=lambda run: 1.0, trials=1, ledger=tmp_path / 'ledger.json',
-                         tracker=tracker)
-        sweep(config(tmp_path), SPACE, **arguments)
+        arguments = {'train': lambda run: 1.0, 'trials': 1, 'ledger': tmp_path / 'ledger.json',
+                         'tracker': tracker}
+        config(tmp_path).sweep(SPACE, **arguments)
         with pytest.raises(ValueError, match='not this space'):
-            sweep(config(tmp_path), {'optim.learning_rate': [0.5]}, **arguments)
+            config(tmp_path).sweep({'optim.learning_rate': [0.5]}, **arguments)
 
 
 def test_a_path_the_run_record_does_not_declare_is_refused(tmp_path):
@@ -126,9 +126,9 @@ def test_the_optuna_backend_asks_within_the_space_and_takes_the_ledgers_trials(t
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     with LocalTracker(tmp_path / 'sweep') as tracker:
-        trials = sweep(config(tmp_path), SPACE, train=lambda run: run.optim.learning_rate,
-                       trials=3, ledger=tmp_path / 'ledger.json', tracker=tracker,
-                       search=optuna_search)
+        trials = config(tmp_path).sweep(SPACE, train=lambda run: run.optim.learning_rate,
+                                        trials=3, ledger=tmp_path / 'ledger.json', tracker=tracker,
+                                        search=optuna_search)
     assert [trial.index for trial in trials] == [0, 1, 2]
     assert all(trial.overrides[path] in values
                for trial in trials for path, values in SPACE.items())
@@ -137,9 +137,8 @@ def test_the_optuna_backend_asks_within_the_space_and_takes_the_ledgers_trials(t
 
 
 def test_a_sweep_without_a_run_name_is_refused(tmp_path):
-    with LocalTracker(tmp_path / 'sweep') as tracker:
-        with pytest.raises(ValueError, match='trainer.name'):
-            sweep(config(tmp_path, name=None), SPACE, train=lambda run: 1.0, trials=1,
-                  ledger=tmp_path / 'ledger.json', tracker=tracker)
+    with LocalTracker(tmp_path / 'sweep') as tracker, pytest.raises(ValueError, match=r"trainer.name"):
+        config(tmp_path, name=None).sweep(SPACE, train=lambda run: 1.0, trials=1,
+                                          ledger=tmp_path / 'ledger.json', tracker=tracker)
 
 

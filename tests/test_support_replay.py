@@ -36,7 +36,7 @@ def sampled(softcap=None, temperature=0.7):
     if softcap is not None:
         # Large enough logits that the cap bends them.
         params = jax.tree.map(lambda leaf: leaf * 3.0, params)
-    drawn = obj.policy(params, sampling)([[1, 2, 3], [4, 5, 6]], NEW, seed=7).host()
+    drawn = obj.policy(params, sampling)([[1, 2, 3], [4, 5, 6]], NEW, key=7).host()
     assert (drawn.lengths == NEW).all(), "the fixture wants full-length draws"
     tokens = jnp.asarray(drawn.tokens)
     hidden = obj.token_scores(params, tokens).hidden
@@ -51,8 +51,14 @@ def sampled(softcap=None, temperature=0.7):
         ids = [int(token) for token in np.asarray(tokens[row])]
         support = tuple(tuple(int(token) for token in np.flatnonzero(kept[row, position - 1]))
                         for position in range(PROMPT, PROMPT + NEW))
-        call = Call(tuple(ids[:PROMPT]), tuple(ids[PROMPT:]),
-                    tuple(float(value) for value in drawn.behavior_log_probs[row]), "length", 0, support=support)
+        call = Call(
+            tuple(ids[:PROMPT]),
+            tuple(ids[PROMPT:]),
+            tuple(float(value) for value in drawn.behavior_log_probs[row]),
+            "length",
+            0,
+            support=support,
+        )
         rollouts.append(Session("t", "g", row, 0, (call,), Status.COMPLETED, float(row)))
     return obj, params, drawn, sampling, rollouts
 
@@ -149,20 +155,23 @@ def test_supports_need_a_fixed_capacity_so_every_batch_has_one_shape():
 
     with pytest.raises(ValueError, match="support_capacity"):
         batch((3, 5))
-    assert batch((3, 5), support_capacity=8)[SUPPORT_KEY].shape == batch((3,), support_capacity=8)[SUPPORT_KEY].shape
+    assert (
+        batch((3, 5), support_capacity=8)[SUPPORT_KEY].shape
+        == batch((3,), support_capacity=8)[SUPPORT_KEY].shape
+    )
 
 
 @pytest.mark.mesh(devices=4)
 def test_supports_shard_with_their_rows():
     """The trainer splits axis 0 of every batch leaf over the data axes, so the
     supports have to lead with rows, as every other packed array does."""
-    from dew.training import MeshSpec, build_mesh
+    from dew.training import MeshSpec
     from dew.training.distributed import shard_batch
 
     sessions = [Session("t", "g", index, 0, (Call((1, 2), (3,), (-0.5,), "stop", 0, support=((3, 5, 7),)),),
                         Status.COMPLETED, float(index)) for index in range(7)]
     batch = pack(sessions, 3, rows=8, support_capacity=3)
-    placed = shard_batch(build_mesh(MeshSpec(fsdp=4)), batch)
+    placed = shard_batch(MeshSpec(fsdp=4).build(), batch)
     assert placed[SUPPORT_KEY].shape == (8, 3)
 
 
@@ -174,8 +183,14 @@ def test_padded_support_entries_keep_the_gradient_finite():
     head = jnp.eye(4, 6)
 
     def total(hidden, head):
-        scores, present = support_log_probs(hidden, head, jnp.asarray([[1, 3]]), jnp.asarray([[1, 2, -1, -1]]),
-                                            jnp.asarray([[0, 0, -1, -1]]), temperature=0.5)
+        scores, present = support_log_probs(
+            hidden,
+            head,
+            jnp.asarray([[1, 3]]),
+            jnp.asarray([[1, 2, -1, -1]]),
+            jnp.asarray([[0, 0, -1, -1]]),
+            temperature=0.5,
+        )
         return jnp.sum(jnp.where(present, scores, 0.0))
 
     assert np.isfinite(float(total(hidden, head)))

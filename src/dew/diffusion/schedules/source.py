@@ -38,9 +38,10 @@ The five families are the shapes those `set_timesteps` take:
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, Mapping, Protocol
+from typing import Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -84,14 +85,8 @@ from dew.sampling.solvers import (
     UniPC,
 )
 
-Kind = Literal[
-    "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
-    "HeunDiscrete", "KDPM2Discrete", "KDPM2AncestralDiscrete", "DPMSolverMultistep",
-    "DPMSolverSinglestep", "DPMSolverSDE", "DEISMultistep", "UniPCMultistep",
-    "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
-]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
-Origin = Literal["scheduler", "linspace"]
+Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
@@ -319,6 +314,19 @@ _KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
                   "KDPM2Discrete", "KDPM2AncestralDiscrete")
 
 
+def empirical_mu(tokens: int, steps: int) -> float:
+    """`compute_empirical_mu`, the shift FLUX.2's pipelines fit to the latent
+    token count and the step count and hand the scheduler in place of its
+    own. Past 4300 tokens it is the 200-step line; below, it interpolates
+    linearly in the steps between the 10- and the 200-step lines."""
+    a1, b1 = 8.73809524e-05, 1.89833333
+    a2, b2 = 0.00016927, 0.45666666
+    if tokens > 4300:
+        return float(a2 * tokens + b2)
+    m_200, m_10 = a2 * tokens + b2, a1 * tokens + b1
+    slope = (m_200 - m_10) / 190.0
+    return float(slope * steps + m_200 - 200.0 * slope)
+
 @dataclass(frozen=True)
 class _Flow:
     """Holds a rectified-flow file's shift controls and the shift they name.
@@ -347,8 +355,9 @@ class _Flow:
         slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
         return tokens * slope + self.base_shift - slope * self.base_tokens
 
-    def base(self, tokens: int | None) -> float:
-        """The shift this file names at `tokens` latent tokens.
+    def base(self, tokens: int | None, mu: float | None = None) -> float:
+        """The shift this file names at `tokens` latent tokens, or at the
+        `mu` a pipeline hands the scheduler itself.
 
         The static and the dynamic forms are the same map with a different
         base. shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
@@ -356,15 +365,16 @@ class _Flow:
         """
         if not self.dynamic:
             return self.shift
-        if tokens is None:
-            raise ValueError("Dynamic shifting needs the latent token count; bind the "
-                             "geometry through the task's grid")
-        mu = self.mu(tokens)
+        if mu is None:
+            if tokens is None:
+                raise ValueError("Dynamic shifting needs the latent token count; bind the "
+                                 "geometry through the task's grid")
+            mu = self.mu(tokens)
         return float(np.exp(mu)) if self.kind == "exponential" else mu
 
-    def shifted(self, sigmas: np.ndarray, tokens: int | None) -> np.ndarray:
+    def shifted(self, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
         """The sigmas after this file's shift."""
-        base = self.base(tokens)
+        base = self.base(tokens, mu)
         return base * sigmas / (1 + (base - 1) * sigmas)
 
     def stretched(self, sigmas: np.ndarray) -> np.ndarray:
@@ -476,7 +486,9 @@ class SourceSchedule:
     betas: np.ndarray
     prediction: PredictionTransform
     policy: _Policy
-    sampler: Solver
+    # The native solver this file's class and controls name, resolved once
+    # when the file was read.
+    solver: Solver
     # The grids one schedule has already built, keyed by the call that built
     # them. Held here rather than in an lru_cache over the method, whose keys
     # are the schedules themselves: those outlive every pipeline that asks.
@@ -525,13 +537,9 @@ class SourceSchedule:
             zero_snr=records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
-        policy, sampler = _resolve(kind, source, value, betas)
+        policy, solver = _resolve(kind, source, value, betas)
         return cls(MappingProxyType(dict(config)), betas,
-                   _prediction_transform(policy, prediction), policy, sampler)
-
-    @property
-    def kind(self) -> str:
-        return self.policy.kind
+                   _prediction_transform(policy, prediction), policy, solver)
 
     @property
     def train_steps(self) -> int:
@@ -543,15 +551,10 @@ class SourceSchedule:
         """The process Dew fine-tunes the checkpoint on, at `tokens` latent
         tokens.
 
-        A scheduler file states how its checkpoint samples, not the noise
-        distribution it was trained on, so this is the convention its sampler
-        reads. Every class but the EDM one tabulates a VP beta table, which
-        the process draws from. EDM's convention has no beta table and no VP
-        law; its process is EDM's own log-normal sigma draw, over the
-        preconditioning the sampler reads. A flow file's process takes the
-        shift its sampler walks at the same geometry, so a dynamic file needs
-        `tokens`; the terminal stretch is a sampling grid's alone. A log-SNR
-        class on flow sigmas takes the flow path at its `flow_shift`.
+        A scheduler file states how its checkpoint samples, so this is the
+        convention its sampler reads: the VP beta table, EDM's log-normal
+        sigma draw, or the flow path at the shift its sampler walks (a
+        dynamic file needs `tokens`; the terminal stretch is sampling's alone).
         """
         if self.policy.family == "flow":
             flow = self.policy.flow
@@ -565,11 +568,6 @@ class SourceSchedule:
                                          sigma_data=self.policy.sigma_data)
             return Process(schedule, self.prediction)
         return Process(DiscreteNoiseScheduler(self.betas, p2_loss_weight_gamma=0), self.prediction)
-
-    def solver(self) -> Solver:
-        """The native solver this file's class and controls name, resolved
-        once when the file was read."""
-        return self.sampler
 
     def _training_sigmas(self) -> tuple[np.ndarray, np.ndarray]:
         """The training sigma table sigma/alpha and its logarithm, with the
@@ -703,15 +701,10 @@ class SourceSchedule:
     def _check_unique_start(times: np.ndarray) -> None:
         """Refuse a grid whose first model time appears again in it.
 
-        The source finds the step it starts at by matching that time against
-        the whole list of times it will evaluate. A repeated first time makes
-        it take the second match, which shifts its walk by one and runs off
-        the end of its sigma table, so such a list has no source trajectory
-        to reproduce. The Karras grid of a cosine table at a small step count
-        is the case that reaches it, because the largest sigmas of that table
-        all recover the same index. Repeats after the first entry are left
-        alone: the two-evaluation classes and PNDM's warmup place them on
-        purpose and count from where they started.
+        The source looks its starting step up by that time and takes the
+        second match, which runs its walk off the end of its sigma table (a
+        cosine table's Karras grid at few steps does this). Later repeats are
+        the deliberate ones of the two-evaluation classes and PNDM's warmup.
         """
         if len(times) > 1 and float(np.sum(times == times[0])) > 1:
             raise ValueError(
@@ -725,13 +718,14 @@ class SourceSchedule:
 
         `origin` is where the sigmas start, which is a pipeline fact rather
         than a config one. SD3 lets the scheduler lay them out between its own
-        sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes
+        sigma extremes, Flux hands it `linspace(1, 1/N, N)`, and FLUX.2 hands
+        it the same with its own mu (`empirical_mu`). Then comes
         the file's shift, then whichever sigma conversion it asks for, then
         the appended zero.
         """
         policy = self.policy
         count = policy.train_steps
-        if origin == "linspace":
+        if origin in ("linspace", "empirical"):
             sigmas = np.linspace(1.0, 1.0 / steps, steps, dtype=np.float64)
         else:
             # The class's own sigma extremes, which its constructor already
@@ -743,7 +737,13 @@ class SourceSchedule:
                 trained = flow.shifted(trained, tokens)
             times = np.linspace(float(trained[0]) * count, float(trained[-1]) * count, steps)
             sigmas = np.asarray(times, np.float64) / count
-        sigmas = flow.stretched(flow.shifted(sigmas, tokens))
+        mu = None
+        if origin == "empirical":
+            if not flow.dynamic or tokens is None:
+                raise ValueError("FLUX.2's pipeline hands a dynamically shifting scheduler its own mu, "
+                                 "which reads the latent token count")
+            mu = empirical_mu(tokens, steps)
+        sigmas = flow.stretched(flow.shifted(sigmas, tokens, mu))
         if policy.transform != "none":
             sigmas = _transformed_sigmas(policy.transform, float(sigmas[-1]), float(sigmas[0]),
                                          steps, policy.rho)
@@ -1067,7 +1067,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     """The native solver this class and its controls name, built once.
 
     A solver is a frozen value, so the file's class and controls resolve into
-    one here and `SourceSchedule.solver()` hands that same value out. Nothing
+    one here and `SourceSchedule.solver` holds that same value. Nothing
     downstream re-reads a control to rebuild it.
     """
     if kind == "DDIM":

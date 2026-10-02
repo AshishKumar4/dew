@@ -36,7 +36,8 @@ def oracle_mapping(streams, fn, base, scale, eps, iters, norm_eps):
     mixes = flat @ fn.T
     pre_w, post_w, comb_w = np.split(mixes, [hc, 2 * hc], axis=-1)
     pre_b, post_b, comb_b = np.split(base, [hc, 2 * hc])
-    sigmoid = lambda z: 1 / (1 + np.exp(-z))
+    def sigmoid(z):
+        return 1 / (1 + np.exp(-z))
     pre = sigmoid(pre_w * scale[0] + pre_b) + eps
     post = 2 * sigmoid(post_w * scale[1] + post_b)
     logits = comb_w.reshape(*comb_w.shape[:-1], hc, hc) * scale[2] + comb_b.reshape(hc, hc)
@@ -87,7 +88,9 @@ def site(spec, params, streams, output):
     if not isinstance(outputs, tuple) or len(outputs) != 3:
         raise TypeError("a hyper-connection site returns (post, comb, collapsed)")
     post, comb, collapsed = outputs
-    return collapsed, mix_streams(post, comb, jnp.asarray(output, jnp.float32), jnp.asarray(streams, jnp.float32))
+    return collapsed, mix_streams(
+        post, comb, jnp.asarray(output, jnp.float32), jnp.asarray(streams, jnp.float32)
+    )
 
 
 def test_the_site_mapping_and_mixing_match_the_oracle(case):
@@ -132,8 +135,9 @@ def test_the_gradients_match_central_differences_of_the_oracle(case):
         _, mixed = site(spec, params, streams, output)
         return jnp.sum(mixed * jnp.asarray(cotangent, jnp.float32))
 
-    grads = jax.grad(loss_module, argnums=(0, 1))(jnp.asarray(streams, jnp.float32),
-                                                   jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params))
+    grads = jax.grad(loss_module, argnums=(0, 1))(
+        jnp.asarray(streams, jnp.float32), jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+    )
     ours = {"streams": grads[0], **grads[1]}
     arguments = {"streams": streams, **params}
     for name, value in arguments.items():

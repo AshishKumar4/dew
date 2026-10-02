@@ -1,10 +1,10 @@
 """Name the things a run is made of.
 
 One Registry per kind, including model components such as mixers, towers and
-projectors. A registry is a decorator, a mapping and
-an attribute view over the same table, so `models["simple_dit"]`,
-`models.SimpleDiT` and the class are one object. A name or a field the table
-does not know raises.
+projectors. A registry is the record layer: config files, the CLI and run
+records name a member, and the registry maps that name to its class and back,
+so `models["simple_dit"]` is `SimpleDiT`. Code builds the class itself. A
+name or a field the table does not know raises.
 
 The registries are empty at import. Each member registers itself where it is
 defined, so importing a package fills its table and the registry module
@@ -19,9 +19,9 @@ import operator
 import sys
 import types
 import typing
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, Protocol, TypedDict, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 import jax
 import jax.numpy as jnp
@@ -44,9 +44,7 @@ if TYPE_CHECKING:
     from dew.sampling.solvers import Solver
     from dew.training.optim import ScheduleBase
 
-T = TypeVar("T", bound=Callable[..., Any])
 M = TypeVar("M", bound=Callable[..., Any])
-Built = TypeVar("Built")
 """What calling a member builds: the module a model name builds, the spec a
 dataset name builds. A registry is generic over both, since the table holds
 the callable and `build` hands back what it returned."""
@@ -73,8 +71,8 @@ type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
 NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
-class Registry(Mapping[str, T], Generic[T, Built]):
-    """Names one kind of thing: a decorator, a mapping and an attribute view."""
+class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
+    """Names one kind of thing: a decorator and a mapping from name to member."""
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
@@ -94,7 +92,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
             held = self._members.get(name)
             if held is not None and held is not member:
                 raise ValueError(
-                    f"{self.kind} {name!r} is already {_describe(held)}; "
+                    f"{self.kind} {name!r} is already {held.__name__}; "
                     f"a name maps to one {self.kind}")
             self._members[name] = member
             return member
@@ -108,17 +106,6 @@ class Registry(Mapping[str, T], Generic[T, Built]):
             raise KeyError(
                 f"no {self.kind} named {name!r}; known: {', '.join(sorted(self._members))}"
             ) from None
-
-    def __getattr__(self, attr: str) -> T:
-        """Return the member whose class name is `attr`, as `models.SimpleDiT`."""
-        if attr.startswith("_"):
-            raise AttributeError(attr)
-        for member in self._members.values():
-            if _describe(member) == attr:
-                return member
-        raise AttributeError(
-            f"no {self.kind} is called {attr!r}; known: "
-            f"{', '.join(sorted(_describe(m) for m in self._members.values()))}")
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._members)
@@ -135,7 +122,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         for name, held in self._members.items():
             if held is member:
                 return name
-        raise KeyError(f"{_describe(member)} is not a registered {self.kind}")
+        raise KeyError(f"{member.__name__} is not a registered {self.kind}")
 
     def build(self, name: str, record: Mapping[str, object] = NO_RECORD, /,
               **fields: Configured) -> Built:
@@ -180,7 +167,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         unknown = sorted(set(fields) - declared)
         if unknown:
             raise ValueError(
-                f"{self.kind} {name!r} ({_describe(member)}) has no field for "
+                f"{self.kind} {name!r} ({member.__name__}) has no field for "
                 f"{unknown}; its fields are {sorted(declared)}")
         return {key: resolve_dtype(value) if key == "dtype"
                 else _rebuilt(_declared_type(member, key), value)
@@ -196,18 +183,13 @@ class Named(Protocol):
     """Declares the name a registry member carries of its own.
 
     A member is a class or a function -- the decorator takes both -- and each
-    declares `__name__`, which is what the attribute view matches on and what
-    an error names a member by. The registry's table holds members as the
+    declares `__name__`, which is what an error names a member by. The registry's table holds members as the
     concrete type their decorator handed back, so this is the one thing read
     off them without the caller's own type.
     """
 
     @property
     def __name__(self) -> str: ...
-
-
-def _describe(member: Named) -> str:
-    return member.__name__
 
 
 def _declared_type(member: type, field: str) -> Annotation:
@@ -288,8 +270,8 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
     """
     built = _rebuilt(annotation, value)
     if not isinstance(built, annotation):
-        raise ValueError(f"{value!r} builds {_describe(type(built))}, "
-                         f"not the {_describe(annotation)} the field declares")
+        raise ValueError(f"{value!r} builds {type(built).__name__}, "
+                         f"not the {annotation.__name__} the field declares")
     return built
 
 
@@ -321,7 +303,7 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
-            raise ValueError(f"{_describe(held)} has no field for {unknown}; its "
+            raise ValueError(f"{held.__name__} has no field for {unknown}; its "
                              f"fields are {declared}")
         return held(**{key: resolve_dtype(record) if key == "dtype"
                        else _rebuilt(_declared_type(held, key), record)
@@ -375,8 +357,14 @@ def resolve_dtype(value: object) -> DTypeLike | None:
         f"dtype {value!r} is not a dtype, nor one of {sorted(_DTYPES)}")
 
 
+@overload
+def dtype_name(value: DTypeLike) -> DtypeName: ...
+@overload
+def dtype_name(value: None) -> None: ...
 def dtype_name(value: DTypeLike | None) -> DtypeName | None:
-    """Return the name `resolve_dtype` accepts for a dtype, for a logged config."""
+    """Return the name `resolve_dtype` accepts for a dtype, for a logged config.
+
+    A loader takes a dtype, `jnp.bfloat16`, or its name, and records the name."""
     if value is None:
         return None
     for name, dtype in _DTYPES.items():
@@ -402,7 +390,7 @@ class PrecisionFields(TypedDict, total=False):
     model config carries and what `build` narrows against the field.
     """
 
-    dtype: str
+    dtype: str | None
     attention_impl: str
     param_dtype: str
     precision: str
@@ -410,7 +398,7 @@ class PrecisionFields(TypedDict, total=False):
 
 
 def precision_fields(name: str, config: Mapping[str, object], *,
-                     dtype: str, attention_impl: str, param_dtype: str | None = None,
+                     dtype: str | None, attention_impl: str, param_dtype: str | None = None,
                      matmul_precision: str | None = None) -> PrecisionFields:
     """Return the run's compute dtype and attention kernel as the fields a model takes.
 
@@ -494,7 +482,7 @@ def float64_twin(config: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def with_precision(name: str, config: Mapping[str, object], *,
-                   dtype: str, attention_impl: str, param_dtype: str | None = None,
+                   dtype: str | None, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
     """Return a model config with the run's compute dtype and attention kernel in it."""
     return {**config, **precision_fields(
@@ -504,7 +492,7 @@ def with_precision(name: str, config: Mapping[str, object], *,
 
 models: Registry[type[nn.Module], nn.Module] = Registry("model")
 presets: Registry[type[Preset], Preset] = Registry("preset")
-samplers: Registry[type[Solver[Any]], Solver[Any]] = Registry("sampler")
+solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver")
 datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset")
 encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder")
 metrics: Registry[Callable[..., Metric], Metric] = Registry("metric")
@@ -516,9 +504,22 @@ schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", rec
 
 # Core records nest their fields under a name; model component records inline
 # their fields beside the kind discriminator `Registry.from_record` reads.
-REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
+REGISTRIES = (models, presets, solvers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors, schedules)
 
-__all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "float64_twin", "metrics", "mixers",
-           "models", "objectives", "presets", "projectors", "resolve_dtype", "samplers", "schedules", "towers",
-           "with_precision"]
+__all__ = [
+    "REGISTRIES",
+    "Registry",
+    "datasets",
+    "encoders",
+    "metrics",
+    "mixers",
+    "models",
+    "objectives",
+    "presets",
+    "projectors",
+    "schedules",
+    "solvers",
+    "towers",
+    "with_precision",
+]

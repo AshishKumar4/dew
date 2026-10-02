@@ -8,8 +8,8 @@ only.
 
 Packing is the token pipeline's plan over the whole corpus
 (`PackedWindows`) with `text_roles` as one more per-token field. A window
-carries `text`, `text_roles`, `text_segment_ids`, `text_positions` and the
-identical `text_roles_segment_ids`, `text_roles_positions`, all aligned. The
+carries `text`, `text_roles`, `text_segment_ids` and `text_positions`, all
+aligned. The
 training stream's position is a global window count that resumes on any
 process count.
 
@@ -680,7 +680,7 @@ class ChatMessages(DatasetSpec):
     """Which split `path` is read at, when it names a Hub dataset."""
     val_split: str | None = None
     """Which split `val_path` is read at; None reads `split`."""
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
     """What `datasets.load_dataset` takes beside the id and the split."""
     seq_len: int = 256
     val_batches: int | None = 4
@@ -716,3 +716,15 @@ class ChatMessages(DatasetSpec):
             records=len(train),
             batch=batch,
         )
+
+
+__all__ = [
+    "ChatMessages",
+    "ContentPart",
+    "Conversation",
+    "ConversationSource",
+    "Message",
+    "RenderConversation",
+    "Role",
+    "ToolCall",
+]

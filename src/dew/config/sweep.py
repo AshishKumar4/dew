@@ -1,6 +1,6 @@
 """Search hyperparameters over the ordinary training path.
 
-A sweep overrides a `RunConfig` through its own record, hands each trial to
+`RunConfig.sweep` overrides a config through its own record, hands each trial to
 the recipe's train entry point, and records the score that entry point
 returns. Trials land in a JSON ledger before they are reported, so an
 interrupted sweep resumes at the trial it stopped on instead of retraining
@@ -13,15 +13,16 @@ from __future__ import annotations
 
 import itertools
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
-from dew.config import RunConfig
 from dew.telemetry.records import TrialFinished, json_value
-from dew.training.tracker import Tracker
+
+if TYPE_CHECKING:
+    from dew.config import RunConfig
 
 type Choice = None | bool | int | float | str
 """One candidate value for a swept field: what JSON and Optuna both hold."""
@@ -30,8 +31,6 @@ type Space = Mapping[str, Sequence[Choice]]
 """Dotted paths into a run record, each with the values a trial draws from."""
 
 type Point = dict[str, Choice]
-
-C = TypeVar('C', bound=RunConfig)
 
 
 class Search(Protocol):
@@ -127,31 +126,4 @@ def _write(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:
     partial.replace(path)
 
 
-def sweep(config: C, space: Space, *, train: Callable[[C], float], trials: int,
-          ledger: str | Path, tracker: Tracker, search: Search = random_search,
-          seed: int = 0) -> list[TrialFinished]:
-    """Train `trials` trials of `config` over `space` and return the ledger.
-
-    Each trial draws a point from `space`, trains under the run name
-    `<trainer.name>/trial-<index>` so trials keep their own checkpoints and
-    tracking, and records the score `train` returns for it. `tracker`
-    receives that score as `sweep/value` at the trial's number and the
-    trial's `TrialFinished` record. A trial reaches `ledger` before it is
-    reported, so rerunning the same call continues an interrupted sweep.
-    """
-    path = Path(ledger)
-    if config.trainer.name is None:
-        raise ValueError('a sweep needs trainer.name: every trial trains under '
-                         '<trainer.name>/trial-<index>, and trials sharing one name would '
-                         'resume from each other')
-    finished = _read(path, space)
-    for index in range(len(finished), trials):
-        point = search(space, finished, seed)
-        name = f'{config.trainer.name}/trial-{index}'
-        value = train(override(config, {**point, 'trainer.name': name}))
-        trial = TrialFinished(index, name, point, value)
-        finished.append(trial)
-        _write(path, space, finished)
-        tracker.log({'sweep/value': value}, index)
-        tracker.artifact(trial, index)
-    return finished
+__all__ = ["Choice", "Point", "Search", "Space", "grid_search", "optuna_search", "random_search"]

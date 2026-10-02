@@ -25,11 +25,8 @@ from dew.diffusion import (
     presets,
 )
 from dew.diffusion.schedules import (
-    CosineContinuousNoiseScheduler,
-    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     EDMNoiseScheduler,
-    ExpNoiseScheduler,
     FlowMatchingScheduler,
     KarrasVENoiseScheduler,
     LinearNoiseScheduler,
@@ -46,15 +43,17 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 # identity: 'vp' is variance preserving, 've' keeps alpha=1 and scales the
 # input, 'flow' is the rectified-flow linear path.
 SCHEDULES = [
-    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, 've'),
-    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
+    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (
+        KarrasVENoiseScheduler,
+        partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5),
+        CONTINUOUS_STEPS,
+        "ve",
+    ),
+    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, "ve"),
+    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, "flow"),
 ]
 
 ALL_CASES = SCHEDULES
@@ -77,7 +76,7 @@ def test_snr_decreases_along_the_trajectory(cls, make, steps, family):
 def test_rates_broadcast_against_the_sample(cls, make, steps, family, sample_shape):
     """broadcast_rates is how every caller shapes the rates: the result must
     broadcast against the batch it came from, for images and for video."""
-    x = jnp.zeros((len(steps),) + sample_shape)
+    x = jnp.zeros((len(steps), *sample_shape))
     alpha, sigma = broadcast_rates(make(), steps, x)
     assert alpha.shape == sigma.shape == (len(steps),) + (1,) * (x.ndim - 1)
     assert (alpha * x).shape == x.shape
@@ -91,7 +90,7 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape, rn
     epsilon parameterization on every schedule."""
     schedule = make()
     key0, key1 = jax.random.split(rng)
-    full_shape = (len(steps),) + sample_shape
+    full_shape = (len(steps), *sample_shape)
     x0 = jax.random.normal(key0, full_shape)
     noise = jax.random.normal(key1, full_shape)
     rates = broadcast_rates(schedule, steps, x0)
@@ -193,11 +192,11 @@ def test_karras_weights_at_sigma_min():
     assert jnp.allclose(schedule.weight(jnp.array([0.0])), expected, rtol=1e-2)
 
 
-def test_cosine_general_weights_read_its_sigma_data():
+def test_generalized_weights_read_their_sigma_data():
     """The EDM lambda depends on sigma_data, so two values of it are two
     weightings and not one."""
-    wide = CosineGeneralNoiseScheduler(sigma_data=1.0).weight(CONTINUOUS_STEPS)
-    narrow = CosineGeneralNoiseScheduler(sigma_data=0.5).weight(CONTINUOUS_STEPS)
+    wide = KarrasVENoiseScheduler(sigma_data=1.0).weight(CONTINUOUS_STEPS)
+    narrow = KarrasVENoiseScheduler(sigma_data=0.5).weight(CONTINUOUS_STEPS)
     assert jnp.allclose(narrow - wide, 1 / 0.5**2 - 1 / 1.0**2, rtol=1e-5)
 
 
@@ -218,7 +217,8 @@ def test_cosine_table_is_nichol_and_dhariwals_cumulative_alpha():
     T, s = 1000, 0.008
     schedule = CosineNoiseScheduler(T, beta_start=s)
     index = jnp.array([0, 10, 300, 600, 900])
-    f = lambda u: jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
+    def f(u):
+        return jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
     expected = f(index + 1.0) / f(0.0)
     assert jnp.allclose(schedule.rates(index)[0] ** 2, expected, rtol=1e-4)
 
@@ -375,7 +375,7 @@ def test_presets_rebuild_from_their_fields(rng):
     import dataclasses
 
     from dew.registry import presets as registry
-    preset = registry.Flow(shift=3.0, logit_mean=0.5, logit_std=0.7)
+    preset = presets.Flow(shift=3.0, logit_mean=0.5, logit_std=0.7)
     process = registry.build("flow", **dataclasses.asdict(preset))()
     times = jnp.array([0.05, 0.5, 0.95])
     alpha, sigma = process.schedule.rates(times)

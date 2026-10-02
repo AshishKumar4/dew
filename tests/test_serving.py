@@ -10,14 +10,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.pages import Pages
 from dew.inference.pipeline import place
 from dew.inference.serving import PagedRows, Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.kv_cache import KVCache
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
@@ -36,7 +38,10 @@ class Digits:
         return "".join(str(int(token)) for token in ids)
 
 
-def task(sampling=Sampling(temperature=0, eos_id=EOS), capacity=128):
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
+
+
+def task(sampling=_DEFAULT_TASK_SAMPLING, capacity=128):
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=capacity, dtype="float32")
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
@@ -53,6 +58,108 @@ def assert_same_generation(served, alone):
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
+def test_prepacked_gate_and_up_draw_the_same_gated_projection():
+    """The serving layout is one dot, split before the trained activation."""
+    with jax.enable_x64():
+        model = GatedMLP(hidden_features=6, out_features=4, use_bias=True, dtype=jnp.float64)
+        x = jnp.arange(32, dtype=jnp.float64).reshape(2, 2, 8) / 16
+        kernel = jnp.arange(96, dtype=jnp.float64).reshape(8, 12) / 128
+        bias = jnp.arange(12, dtype=jnp.float64) / 32
+        down = jnp.arange(24, dtype=jnp.float64).reshape(6, 4) / 64
+        down_bias = jnp.arange(4, dtype=jnp.float64) / 16
+        variables = {"params": {"gate_up_proj": {"kernel": kernel, "bias": bias},
+                                "down_proj": {"kernel": down, "bias": down_bias}}}
+        gate, up = jnp.split(x @ kernel + bias, 2, axis=-1)
+        expected = (jax.nn.silu(gate) * up) @ down + down_bias
+        np.testing.assert_array_equal(jax.jit(model.apply)(variables, x), expected)
+
+
+def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
+    """Biases, head norms, RoPE and the cached append still read the same projections."""
+    with jax.enable_x64():
+        model = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=1,
+                                   head_dim=4, max_seq_len=64, attention_bias=True,
+                                   attention_impl="xla", dtype=jnp.float64)
+        x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
+        variables = model.init(jax.random.key(0), x)
+        # Dyadic weights make the projection sums exact, so a different dot
+        # width cannot hide a wrong slice behind a floating-point bound.
+        for index, name in enumerate(("q_proj", "k_proj", "v_proj")):
+            projection = variables["params"][name]
+            projection["kernel"] = jnp.arange(projection["kernel"].size, dtype=jnp.float64).reshape(
+                projection["kernel"].shape) / (128 * 2 ** index)
+            projection["bias"] = jnp.arange(projection["bias"].size, dtype=jnp.float64) / 32
+        packed = {**variables, "params": dict(variables["params"])}
+        packed["params"]["qkv_proj"] = {
+            name: jnp.concatenate([variables["params"][projection][name]
+                                   for projection in ("q_proj", "k_proj", "v_proj")], axis=-1)
+            for name in ("kernel", "bias")}
+        for name in ("q_proj", "k_proj", "v_proj"):
+            del packed["params"][name]
+        applied = jax.jit(lambda weights: model.apply(weights, x, decode=True, mutable=["cache"]))
+        expected, cache = applied(variables)
+        actual, packed_cache = applied(packed)
+        np.testing.assert_array_equal(actual, expected)
+        for before, after in zip(jax.tree.leaves(cache), jax.tree.leaves(packed_cache), strict=True):
+            np.testing.assert_array_equal(after, before)
+
+
+def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
+    """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
+    from flax.core import freeze
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    source = jax.tree.map(np.asarray, bound.variables)
+    packed_task = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(packed_task, slots=2, capacity=128)
+    before = server(["12", "34"], 5, key=3)
+    assert sum(leaf.nbytes for leaf in jax.tree.leaves(server.variables)) == sum(
+        leaf.nbytes for leaf in jax.tree.leaves(bound.variables))
+    for original, saved in zip(jax.tree.leaves(bound.variables), jax.tree.leaves(source), strict=True):
+        np.testing.assert_array_equal(original, saved)
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, bound.variables)
+    server.reload(freeze(trained))
+    served = server(["12", "34"], 5, key=3)
+    assert any(not np.array_equal(old.host().raw_log_probs, new.host().raw_log_probs)
+               for old, new in zip(before, served, strict=True))
+    other = TextGeneration(bound.model, trained, bound.processor, sampling=bound.sampling)
+    for prompt, actual in zip(("12", "34"), served, strict=True):
+        assert_same_generation(actual, other(prompt, 5, key=3))
+    fresh = Server.from_task(other, slots=2, capacity=128)
+    for actual, expected in zip(served, fresh(["12", "34"], 5, key=3), strict=True):
+        assert_same_generation(actual, expected)
+    jax.jit(lambda weights: jax.tree.map(lambda leaf: leaf * 2, weights), donate_argnums=(0,))(trained)
+    for actual, expected in zip(server(["12", "34"], 5, key=3), served, strict=True):
+        assert_same_generation(actual, expected)
+    for original, saved in zip(jax.tree.leaves(bound.variables), jax.tree.leaves(source), strict=True):
+        np.testing.assert_array_equal(original, saved)
+
+
+@pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
+def test_inference_projection_layout_preserves_special_attention_logits(case):
+    from dew.inference.serving import _inference_projections
+
+    with jax.enable_x64():
+        model = CausalTransformer(
+            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1,
+            head_dim=8, mlp_features=32, max_seq_len=64, dtype=jnp.float64,
+            precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
+            kv_shared_layers=(1,) if case == "kv_shared" else None,
+            attention_k_eq_v=case == "k_eq_v", v_norm=case == "k_eq_v",
+            output_gate=case == "output_gate")
+        tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                                 model.init(jax.random.key(13), tokens))
+        packed = _inference_projections(model, variables)
+        expected = jax.jit(model.apply)(variables, tokens)
+        actual = jax.jit(model.apply)(packed, tokens)
+        # Both run in float64; 64 epsilon covers the tiny decoder's few
+        # reassociated dot sums, well inside the existing FP32 parity bound.
+        eps = 64 * np.finfo(np.float64).eps
+        np.testing.assert_allclose(actual, expected, atol=eps, rtol=eps)
+        np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone(decode_steps):
     """Five prompts of different widths and budgets, greedy, one seed per
@@ -60,11 +167,11 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     everything else the generation carries. With four iterations a call,
     rows end inside a call and wait for the next one's admission."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     assert len({generation.text for generation in alone}) == len(alone)
     server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
     served = [ticket.result() for ticket in tickets]
@@ -72,6 +179,44 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     for mine, theirs in zip(served, alone, strict=True):
         assert_same_generation(mine, theirs)
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
+
+
+def test_host_task_and_server_preserve_nonzero_lora_branches():
+    from dew.lora import LoRA
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    adapter, fresh = LoRA.fresh(bound.model, bound.variables, {}, rank=2,
+                                modules=("q_proj", "gate_proj"), key=jax.random.key(17))
+    trained = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + jax.random.normal(jax.random.key(29), leaf.shape) * .25
+        if getattr(path[-1], "key", None) == "lora_B" else leaf, fresh)
+    model = adapter.adapt(bound.model)
+    unplaced = TextGeneration(model, jax.tree.map(np.asarray, trained), bound.processor,
+                             sampling=bound.sampling)
+    placed = TextGeneration(model, trained, bound.processor, sampling=bound.sampling)
+    expected = placed("12", 6, key=3)
+    assert not np.array_equal(expected.host().raw_log_probs, bound("12", 6, key=3).host().raw_log_probs)
+    assert_same_generation(unplaced("12", 6, key=3), expected)
+    served = Server.from_task(unplaced, slots=2, capacity=128)
+    assert_same_generation(served(["12"], 6, key=3)[0], expected)
+
+
+def test_reload_normalizes_source_precision_before_concatenating_projections():
+    """A float64 value just above an FP16 midpoint must not double-round through FP32."""
+    bound = task(Sampling(temperature=0, eos_id=None))
+    source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
+    host = TextGeneration(bound.model, source, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(host, slots=2, capacity=128)
+    incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
+    kernel = incoming["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    kernel[0, 0] = np.nextafter(1.00048828125, np.inf)
+    server.reload(incoming)
+    packed = server.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    assert float(np.asarray(packed)[0, 0]) == 1.0009765625
+    normalized = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), incoming)
+    other = TextGeneration(bound.model, jax.tree.map(jnp.asarray, normalized), bound.processor,
+                           sampling=bound.sampling)
+    assert_same_generation(server(["12"], 5, key=3)[0], other("12", 5, key=3))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -82,8 +227,8 @@ def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
     server = Server.from_task(bound, slots=2, capacity=128)
     prompts = ["12", "567"]
-    served = server(prompts, 4, seed=3)
-    alone = [bound(prompt, 4, seed=3) for prompt in prompts]
+    served = server(prompts, 4, key=3)
+    alone = [bound(prompt, 4, key=3) for prompt in prompts]
     assert [result.text for result in served] == [result.text for result in alone]
     for result, expected in zip(served, alone, strict=True):
         assert_same_generation(result, expected)
@@ -96,13 +241,13 @@ def test_a_sampled_request_keeps_its_own_draws():
     task call does."""
     bound = task(Sampling(temperature=1.0, top_k=5, eos_id=EOS))
     server = Server.from_task(bound, slots=3, capacity=128)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
     for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
-        assert_same_generation(tickets[index].result(), bound(prompt, budget, seed=index))
-    batched = bound(PROMPTS, 6, seed=3)
-    served = server(PROMPTS, 6, seed=3)
+        assert_same_generation(tickets[index].result(), bound(prompt, budget, key=index))
+    batched = bound(PROMPTS, 6, key=3)
+    served = server(PROMPTS, 6, key=3)
     assert tuple(generation.text[0] for generation in served) == batched.text
     rows = batched.host()
     for index, generation in enumerate(served):
@@ -112,17 +257,80 @@ def test_a_sampled_request_keeps_its_own_draws():
         np.testing.assert_array_equal(mine.lengths[0], rows.lengths[index])
 
 
+def test_submission_keeps_device_keys_on_device_until_admission():
+    """A request can queue its key without waiting for a copy to the host.
+
+    The request still draws the same sampled tokens and likelihoods once it
+    is admitted; only the host-side preparation's synchronization changes.
+    """
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    key = jax.random.key(7)
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with guarded(allow=("host_to_device",)):
+        ticket = server.submit(prompt, 5, key=key)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
+
+
+def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
+    """Text requests of one bucket after the first run the program it
+    compiled, and the host waits on nothing but what a request asks for:
+    the device check it raises from and the result. A request's own inputs
+    reach the device as it arrives, so only reads are held (`steady_state`).
+    A prompt that went to the device and came back for validation, or a
+    recompile per request, fails it."""
+    bound = task()
+    keys = [jax.random.key(index) for index in range(4)]
+    bound("12", 6, key=keys[0])
+    with steady_state(allow=("host_to_device",)):
+        drawn = [bound(prompt, 6, key=key) for prompt, key in zip(["34", "56", "78"], keys[1:], strict=True)]
+    assert [generation.tokens.shape for generation in drawn] == [(1, 8)] * 3
+
+
+def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_step():
+    """A second round of the same requests runs the programs the first
+    compiled, and each step's one read is the explicit copy of the drawn
+    tokens the admission works from (`steady_state`). Token rows, which the
+    server keeps on the host until it admits them."""
+    server = Server.from_task(task(), slots=4, capacity=128, admission=2, decode_steps=4)
+    rounds = [[jax.random.key(10 * round + index) for index in range(len(PROMPTS))] for round in range(2)]
+    rows = [np.asarray(Digits().encode(prompt), np.int32) for prompt in PROMPTS]
+
+    def served(keys):
+        tickets = [server.submit(prompt, budget, key=key)
+                   for prompt, budget, key in zip(rows, BUDGETS, keys, strict=True)]
+        server.run()
+        return [ticket.result() for ticket in tickets]
+
+    first = served(rounds[0])
+    with steady_state(allow=("host_to_device",)):
+        second = served(rounds[1])
+    for mine, theirs in zip(second, first, strict=True):
+        np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
+
+
+@pytest.mark.parametrize("ids", [np.asarray([1.5, 2.0]), np.asarray([True, False]),
+                                  np.asarray([2**32], np.int64), np.asarray([-1, 2], np.int32),
+                                  np.asarray([VOCAB], np.int32), np.asarray([], np.int32)])
+def test_host_numeric_submission_still_refuses_invalid_token_rows(ids):
+    server = Server.from_task(task(), slots=1, capacity=128)
+    with pytest.raises(ValueError):
+        server.submit(ids, 2, key=jax.random.key(1))
+    assert server.queued == 0 and server.occupancy == 0
+
+
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
     bound = task()
     server = Server.from_task(bound, slots=4, capacity=128, admission=2)
-    first = server.submit(PROMPTS[0], 12, seed=0)
+    first = server.submit(PROMPTS[0], 12, key=0)
     for _ in range(3):
         server.step()
     assert server.occupancy == 1
-    later = server.submit(PROMPTS[3], 12, seed=3)
+    later = server.submit(PROMPTS[3], 12, key=3)
     server.run()
-    assert later.result().text == bound(PROMPTS[3], 12, seed=3).text
-    assert first.result().text == bound(PROMPTS[0], 12, seed=0).text
+    assert later.result().text == bound(PROMPTS[3], 12, key=3).text
+    assert first.result().text == bound(PROMPTS[0], 12, key=0).text
 
 
 def stored(cache):
@@ -144,8 +352,8 @@ def test_a_slot_is_reused_over_the_same_cache():
     assert len(before) == 2
     shapes = [leaf.shape for leaf in jax.tree.leaves(server.cache)]
     assert all(shape[0] == 2 for shape in shapes)
-    short = server.submit("12", 2, seed=0)
-    long = server.submit("5", 9, seed=1)
+    short = server.submit("12", 2, key=0)
+    long = server.submit("5", 9, key=1)
     peak = 0
     seen_drop = False
     while not long.done():
@@ -156,15 +364,15 @@ def test_a_slot_is_reused_over_the_same_cache():
     server.run()
     assert peak == 2 and seen_drop
     assert server.occupancy == 0
-    third = server.submit("98", 3, seed=2)
+    third = server.submit("98", 3, key=2)
     server.run()
-    assert third.result().text == bound("98", 3, seed=2).text
-    fourth = server.submit("1234567", 40, seed=3)
+    assert third.result().text == bound("98", 3, key=2).text
+    fourth = server.submit("1234567", 40, key=3)
     server.run()
-    assert fourth.result().text == bound("1234567", 40, seed=3).text
-    fifth = server.submit("5", 40, seed=4)
+    assert fourth.result().text == bound("1234567", 40, key=3).text
+    fifth = server.submit("5", 40, key=4)
     server.run()
-    assert fifth.result().text == bound("5", 40, seed=4).text
+    assert fifth.result().text == bound("5", 40, key=4).text
     assert stored(server.cache) == before
     assert [leaf.shape for leaf in jax.tree.leaves(server.cache)] == shapes
 
@@ -174,13 +382,13 @@ def test_more_requests_than_slots_queue_and_all_complete():
     server = Server.from_task(bound, slots=2, capacity=128, admission=2)
     prompts = PROMPTS * 2
     budgets = BUDGETS * 2
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True))]
     assert server.queued == len(tickets)
     server.run()
     assert server.queued == 0 and server.occupancy == 0
     for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
-        assert tickets[index].result().text == bound(prompt, budget, seed=index).text
+        assert tickets[index].result().text == bound(prompt, budget, key=index).text
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
 
 
@@ -188,9 +396,9 @@ def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
     bound = task(capacity=64)
     server = Server.from_task(bound, slots=2, capacity=64)
     with pytest.raises(ValueError, match="exceeds max_seq_len") as refused:
-        bound("1234567", 60, seed=0)
+        bound("1234567", 60, key=0)
     with pytest.raises(ValueError, match="exceeds max_seq_len") as served:
-        server.submit("1234567", 60, seed=0)
+        server.submit("1234567", 60, key=0)
     assert str(served.value) == str(refused.value)
     assert server.queued == 0
     with pytest.raises(ValueError, match="max_seq_len"):
@@ -226,19 +434,19 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     bound = task(capacity=512)
     prompt = "".join(str(1 + index % 9) for index in range(300))
     server = Server.from_task(bound, slots=2, capacity=384)
-    ticket = server.submit(prompt, 50, seed=0)
+    ticket = server.submit(prompt, 50, key=0)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt, 50, seed=0))
+    assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
     server = Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
-    tickets.append(server.submit(PROMPTS[2], BUDGETS[2], seed=2))
+    tickets.append(server.submit(PROMPTS[2], BUDGETS[2], key=2))
     server.run()
     return server, tickets
 
@@ -256,7 +464,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     prompt starts from the page its first run published. None of it
     changes a greedy draw: every row is the lone task call's."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(bound, **options)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
@@ -278,7 +486,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     chunked prompt included, and the repeated prompt starts from the page the
     first one published in its group."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     placed = bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0)))
     server, tickets = served_alongside(placed, slots=8, admission=8, **options)
@@ -308,15 +516,15 @@ def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
     alone once the first returns its pages."""
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=16, pages=3))
-    first = server.submit("1234567", 30, seed=0)
-    second = server.submit("98", 30, seed=1)
+    first = server.submit("1234567", 30, key=0)
+    second = server.submit("98", 30, key=1)
     server.step()
     assert server.occupancy == 1 and server.queued == 1
     server.run()
-    assert first.result().text == bound("1234567", 30, seed=0).text
-    assert second.result().text == bound("98", 30, seed=1).text
+    assert first.result().text == bound("1234567", 30, key=0).text
+    assert second.result().text == bound("98", 30, key=1).text
     with pytest.raises(ValueError, match="pool holds 3"):
-        server.submit("1234567", 60, seed=0)
+        server.submit("1234567", 60, key=0)
 
 
 @pytest.mark.mesh(devices=4)
@@ -334,19 +542,23 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
                                   mlp_features=32, max_seq_len=128, dtype="float32",
                                   mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
         params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
-        return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS))
+        return TextGeneration(
+            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS)
+        )
 
     lone = generation("global", None)
-    alone = [lone(prompt, budget, seed=index)
+    alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    served = generation(dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0)))
+    served = generation(
+        dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    )
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
     if dispatch == "exchange":
         with pytest.raises(ValueError, match="dispatch='global'"):
-            served("12", 3, seed=0)
+            served("12", 3, key=0)
 
 
 def test_chunks_and_prefix_sharing_need_a_paged_cache():
@@ -409,12 +621,12 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=4, pages=40),
                               prefix_cache=True)
-    server.submit("1234567", 8, seed=0)
+    server.submit("1234567", 8, key=0)
     server.run()
     other = bound.variables.copy({"params": jax.tree.map(lambda leaf: leaf * 1.5, bound.variables["params"])})
     server.reload(other)
     hits = server.prefix_hits
-    ticket = server.submit("1234567", 8, seed=0)
+    ticket = server.submit("1234567", 8, key=0)
     server.run()
     assert server.prefix_hits == hits
-    assert ticket.result().text == bound.bind(other)("1234567", 8, seed=0).text
+    assert ticket.result().text == bound.bind(other)("1234567", 8, key=0).text

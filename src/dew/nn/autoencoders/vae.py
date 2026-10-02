@@ -8,9 +8,10 @@ configuration and checkpoint files; no external model implementation runs.
 import json
 import math
 import os
+from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
-from typing import Sequence
+from typing import Literal
 
 import flax.linen as nn
 import jax
@@ -21,21 +22,22 @@ from dew.nn.conv import Conv
 from dew.nn.text_encoders import ParamTree, insert
 
 
+def _conv(features: int, dtype, name: str) -> Conv:
+    """A 3x3 convolution padded to keep the size."""
+    return Conv(features, (3, 3), strides=(1, 1), padding=((1, 1), (1, 1)), dtype=dtype, name=name)
+
+
+def _group_norm(groups: int, dtype, name: str) -> nn.GroupNorm:
+    return nn.GroupNorm(num_groups=groups, epsilon=1e-6, dtype=dtype, name=name)
+
+
 class FlaxUpsample2D(nn.Module):
     """Double each spatial axis by nearest-neighbour resize, then a 3x3 conv."""
 
     in_channels: int
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        self.conv = Conv(
-            self.in_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
+    @nn.compact
     def __call__(self, hidden_states):
         batch, height, width, channels = hidden_states.shape
         hidden_states = jax.image.resize(
@@ -43,7 +45,7 @@ class FlaxUpsample2D(nn.Module):
             shape=(batch, height * 2, width * 2, channels),
             method="nearest",
         )
-        return self.conv(hidden_states)
+        return _conv(self.in_channels, self.dtype, "conv")(hidden_states)
 
 
 class FlaxDownsample2D(nn.Module):
@@ -52,19 +54,11 @@ class FlaxDownsample2D(nn.Module):
     in_channels: int
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        self.conv = Conv(
-            self.in_channels,
-            kernel_size=(3, 3),
-            strides=(2, 2),
-            padding="VALID",
-            dtype=self.dtype,
-        )
-
+    @nn.compact
     def __call__(self, hidden_states):
         pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
-        hidden_states = jnp.pad(hidden_states, pad_width=pad)
-        return self.conv(hidden_states)
+        return Conv(self.in_channels, kernel_size=(3, 3), strides=(2, 2), padding="VALID", dtype=self.dtype,
+                    name="conv")(jnp.pad(hidden_states, pad_width=pad))
 
 
 class FlaxResnetBlock2D(nn.Module):
@@ -76,48 +70,16 @@ class FlaxResnetBlock2D(nn.Module):
     groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        self.norm1 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv1 = Conv(
-            self.out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        self.norm2 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv2 = Conv(
-            self.out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        self.conv_shortcut = None
-        if self.in_channels != self.out_channels:
-            self.conv_shortcut = Conv(
-                self.out_channels,
-                kernel_size=(1, 1),
-                strides=(1, 1),
-                padding="VALID",
-                dtype=self.dtype,
-            )
-
+    @nn.compact
     def __call__(self, hidden_states):
         residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.conv1(hidden_states)
-
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.conv2(hidden_states)
-
-        if self.conv_shortcut is not None:
-            residual = self.conv_shortcut(residual)
-
+        hidden_states = nn.swish(_group_norm(self.groups, self.dtype, "norm1")(hidden_states))
+        hidden_states = _conv(self.out_channels, self.dtype, "conv1")(hidden_states)
+        hidden_states = nn.swish(_group_norm(self.groups, self.dtype, "norm2")(hidden_states))
+        hidden_states = _conv(self.out_channels, self.dtype, "conv2")(hidden_states)
+        if self.in_channels != self.out_channels:
+            residual = Conv(self.out_channels, kernel_size=(1, 1), strides=(1, 1), padding="VALID",
+                            dtype=self.dtype, name="conv_shortcut")(residual)
         return hidden_states + residual
 
 
@@ -134,115 +96,46 @@ class FlaxAttentionBlock(nn.Module):
     num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        dense = partial(nn.Dense, self.channels, dtype=self.dtype)
-
-        self.group_norm = nn.GroupNorm(num_groups=self.num_groups, epsilon=1e-6, dtype=self.dtype)
-        self.query, self.key, self.value = dense(), dense(), dense()
-        self.proj_attn = dense()
-
+    @nn.compact
     def __call__(self, hidden_states):
         residual = hidden_states
         batch, height, width, channels = hidden_states.shape
-
-        hidden_states = self.group_norm(hidden_states)
-
+        hidden_states = _group_norm(self.num_groups, self.dtype, "group_norm")(hidden_states)
         hidden_states = hidden_states.reshape((batch, height * width, channels))
-
-        query = self.query(hidden_states)
-        key = self.key(hidden_states)
-        value = self.value(hidden_states)
+        query, key, value = (nn.Dense(self.channels, dtype=self.dtype, name=name)(hidden_states)
+                             for name in ("query", "key", "value"))
 
         scale = 1 / math.sqrt(math.sqrt(self.channels))
         attn_weights = jnp.einsum("...qc,...kc->...qk", query * scale, key * scale)
         attn_weights = nn.softmax(attn_weights, axis=-1)
-
         hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
 
-        hidden_states = self.proj_attn(hidden_states)
-        hidden_states = hidden_states.reshape((batch, height, width, channels))
-        return hidden_states + residual
+        hidden_states = nn.Dense(self.channels, dtype=self.dtype, name="proj_attn")(hidden_states)
+        return hidden_states.reshape((batch, height, width, channels)) + residual
 
 
-class FlaxDownEncoderBlock2D(nn.Module):
-    """Run `num_layers` resnets to `out_channels`, then halve the spatial axes.
-
-    Only the first resnet changes the channel count. `add_downsample` is
-    False on the last level, which keeps its resolution.
-    """
+class _Level(nn.Module):
+    """One encoder or decoder level: `num_layers` resnets to `out_channels`,
+    only the first changing the channel count, then the level's resampling,
+    `downsamplers_0` or `upsamplers_0`, which the last level does without."""
 
     in_channels: int
     out_channels: int
-    num_layers: int = 1
-    resnet_groups: int = 32
-    add_downsample: bool = True
+    num_layers: int
+    groups: int
+    resample: Literal["down", "up"] | None
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        resnets = []
-        for i in range(self.num_layers):
-            in_channels = self.in_channels if i == 0 else self.out_channels
-
-            res_block = FlaxResnetBlock2D(
-                in_channels=in_channels,
-                out_channels=self.out_channels,
-                groups=self.resnet_groups,
-                dtype=self.dtype,
-            )
-            resnets.append(res_block)
-        self.resnets = resnets
-
-        if self.add_downsample:
-            self.downsamplers_0 = FlaxDownsample2D(self.out_channels, dtype=self.dtype)
-
+    @nn.compact
     def __call__(self, hidden_states):
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-
-        if self.add_downsample:
-            hidden_states = self.downsamplers_0(hidden_states)
-
-        return hidden_states
-
-
-class FlaxUpDecoderBlock2D(nn.Module):
-    """Run `num_layers` resnets to `out_channels`, then double the spatial axes.
-
-    Only the first resnet changes the channel count. `add_upsample` is
-    False on the last level, which keeps its resolution.
-    """
-
-    in_channels: int
-    out_channels: int
-    num_layers: int = 1
-    resnet_groups: int = 32
-    add_upsample: bool = True
-    dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        resnets = []
-        for i in range(self.num_layers):
-            in_channels = self.in_channels if i == 0 else self.out_channels
-            res_block = FlaxResnetBlock2D(
-                in_channels=in_channels,
-                out_channels=self.out_channels,
-                groups=self.resnet_groups,
-                dtype=self.dtype,
-            )
-            resnets.append(res_block)
-
-        self.resnets = resnets
-
-        if self.add_upsample:
-            self.upsamplers_0 = FlaxUpsample2D(self.out_channels, dtype=self.dtype)
-
-    def __call__(self, hidden_states):
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-
-        if self.add_upsample:
-            hidden_states = self.upsamplers_0(hidden_states)
-
+        for index in range(self.num_layers):
+            hidden_states = FlaxResnetBlock2D(self.in_channels if index == 0 else self.out_channels,
+                                              self.out_channels, self.groups, self.dtype,
+                                              name=f"resnets_{index}")(hidden_states)
+        if self.resample == "down":
+            return FlaxDownsample2D(self.out_channels, dtype=self.dtype, name="downsamplers_0")(hidden_states)
+        if self.resample == "up":
+            return FlaxUpsample2D(self.out_channels, dtype=self.dtype, name="upsamplers_0")(hidden_states)
         return hidden_states
 
 
@@ -254,82 +147,41 @@ class FlaxUNetMidBlock2D(nn.Module):
     resnet_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        resnet = partial(FlaxResnetBlock2D, in_channels=self.in_channels, out_channels=self.in_channels,
-                         groups=self.resnet_groups, dtype=self.dtype)
-        # Lists, so the params sit at resnets_0, resnets_1 and attentions_0,
-        # the names diffusers gives them.
-        self.resnets = [resnet(), resnet()]
-        self.attentions = [FlaxAttentionBlock(channels=self.in_channels, num_groups=self.resnet_groups,
-                                              dtype=self.dtype)]
-
+    @nn.compact
     def __call__(self, hidden_states):
-        hidden_states = self.resnets[0](hidden_states)
-        hidden_states = self.attentions[0](hidden_states)
-        return self.resnets[1](hidden_states)
+        resnet = partial(FlaxResnetBlock2D, self.in_channels, self.in_channels, self.resnet_groups,
+                         self.dtype)
+        hidden_states = resnet(name="resnets_0")(hidden_states)
+        hidden_states = FlaxAttentionBlock(self.in_channels, self.resnet_groups, self.dtype,
+                                           name="attentions_0")(hidden_states)
+        return resnet(name="resnets_1")(hidden_states)
 
 
 class FlaxEncoder(nn.Module):
     """Encode images to latent moments with a conv stack that halves each axis.
 
     `block_out_channels` gives one level per entry, each `layers_per_block`
-    resnets; the last level does not downsample. `double_z` doubles the
-    output channels so the caller can split them into mean and log-variance.
+    resnets; the last level does not downsample. The output carries twice
+    `out_channels`, which the caller splits into mean and log-variance.
     """
 
     out_channels: int = 3
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    double_z: bool = False
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        block_out_channels = self.block_out_channels
-        self.conv_in = Conv(
-            block_out_channels[0],
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        levels = len(block_out_channels)
-        self.down_blocks = [
-            FlaxDownEncoderBlock2D(
-                in_channels=block_out_channels[max(i - 1, 0)],
-                out_channels=channels,
-                num_layers=self.layers_per_block,
-                resnet_groups=self.norm_num_groups,
-                add_downsample=i != levels - 1,
-                dtype=self.dtype,
-            )
-            for i, channels in enumerate(block_out_channels)]
-
-        self.mid_block = FlaxUNetMidBlock2D(
-            in_channels=block_out_channels[-1],
-            resnet_groups=self.norm_num_groups,
-            dtype=self.dtype,
-        )
-
-        conv_out_channels = 2 * self.out_channels if self.double_z else self.out_channels
-        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv_out = Conv(
-            conv_out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
+    @nn.compact
     def __call__(self, sample):
-        sample = self.conv_in(sample)
-        for block in self.down_blocks:
-            sample = block(sample)
-        sample = self.mid_block(sample)
-        sample = self.conv_norm_out(sample)
-        sample = nn.swish(sample)
-        return self.conv_out(sample)
+        channels = self.block_out_channels
+        sample = _conv(channels[0], self.dtype, "conv_in")(sample)
+        for index, width in enumerate(channels):
+            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block, self.norm_num_groups,
+                            "down" if index != len(channels) - 1 else None, self.dtype,
+                            name=f"down_blocks_{index}")(sample)
+        sample = FlaxUNetMidBlock2D(channels[-1], self.norm_num_groups, self.dtype, name="mid_block")(sample)
+        sample = nn.swish(_group_norm(self.norm_num_groups, self.dtype, "conv_norm_out")(sample))
+        return _conv(2 * self.out_channels, self.dtype, "conv_out")(sample)
 
 
 class FlaxDecoder(nn.Module):
@@ -345,53 +197,17 @@ class FlaxDecoder(nn.Module):
     norm_num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        block_out_channels = self.block_out_channels
-        self.conv_in = Conv(
-            block_out_channels[-1],
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        self.mid_block = FlaxUNetMidBlock2D(
-            in_channels=block_out_channels[-1],
-            resnet_groups=self.norm_num_groups,
-            dtype=self.dtype,
-        )
-
-        reversed_block_out_channels = list(reversed(block_out_channels))
-        levels = len(block_out_channels)
-        self.up_blocks = [
-            FlaxUpDecoderBlock2D(
-                in_channels=reversed_block_out_channels[max(i - 1, 0)],
-                out_channels=channels,
-                num_layers=self.layers_per_block + 1,
-                resnet_groups=self.norm_num_groups,
-                add_upsample=i != levels - 1,
-                dtype=self.dtype,
-            )
-            for i, channels in enumerate(reversed_block_out_channels)]
-
-        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
-        self.conv_out = Conv(
-            self.out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
+    @nn.compact
     def __call__(self, sample):
-        sample = self.conv_in(sample)
-        sample = self.mid_block(sample)
-        for block in self.up_blocks:
-            sample = block(sample)
-
-        sample = self.conv_norm_out(sample)
-        sample = nn.swish(sample)
-        return self.conv_out(sample)
+        channels = list(reversed(self.block_out_channels))
+        sample = _conv(channels[0], self.dtype, "conv_in")(sample)
+        sample = FlaxUNetMidBlock2D(channels[0], self.norm_num_groups, self.dtype, name="mid_block")(sample)
+        for index, width in enumerate(channels):
+            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block + 1,
+                            self.norm_num_groups, "up" if index != len(channels) - 1 else None, self.dtype,
+                            name=f"up_blocks_{index}")(sample)
+        sample = nn.swish(_group_norm(self.norm_num_groups, self.dtype, "conv_norm_out")(sample))
+        return _conv(self.out_channels, self.dtype, "conv_out")(sample)
 
 
 _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
@@ -475,8 +291,10 @@ def _candidates(revision: str) -> list[Candidate]:
     """
     torch = ([(revision, "vae"), (revision, None)] if revision not in FLAX_REVISIONS
              else [(None, "vae"), (None, None)])
-    return ([(FLAX_WEIGHTS, *place) for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]]
-            + [(TORCH_WEIGHTS, *place) for place in torch])
+    return [
+        (FLAX_WEIGHTS, *place)
+        for place in [(revision, "vae"), ("flax", "vae"), (revision, None), (None, None)]
+    ] + [(TORCH_WEIGHTS, *place) for place in torch]
 
 
 def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> None:
@@ -502,8 +320,11 @@ def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> N
     def cached(name: str, place: Candidate):
         """The cached path (str), the Hub's cached miss (another object) or unknown (None)."""
         _, place_revision, place_subfolder = place
-        return try_to_load_from_cache(modelname, name if place_subfolder is None else f"{place_subfolder}/{name}",
-                                      revision=place_revision)
+        return try_to_load_from_cache(
+            modelname,
+            name if place_subfolder is None else f"{place_subfolder}/{name}",
+            revision=place_revision,
+        )
 
     def recorded_missing(place: Candidate) -> bool:
         found = cached(place[0], place)

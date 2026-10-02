@@ -14,6 +14,7 @@ import { pages, repository, repositoryOnly } from '../src/manifest.mjs';
 
 export const siteRoot = path.resolve(import.meta.dirname, '..');
 export const repoRoot = path.resolve(siteRoot, '..');
+export const checkOnly = process.argv.includes('--check');
 export const contentRoot = path.join(siteRoot, 'src/content/docs');
 export const generatedRoot = path.join(siteRoot, 'src/generated');
 const assetRoot = path.join(siteRoot, 'src/assets/repo');
@@ -67,8 +68,10 @@ export async function rewriteTarget(target, sourcePath, pagePath, { html = false
 		// Markdown images go through Astro's image pipeline; an <img> in raw HTML is
 		// served as a static file, since Astro leaves raw HTML alone.
 		const copy = path.join(html ? publicRepoRoot : assetRoot, resolved);
-		await mkdir(path.dirname(copy), { recursive: true });
-		await copyFile(path.join(repoRoot, resolved), copy);
+		if (!checkOnly) {
+			await mkdir(path.dirname(copy), { recursive: true });
+			await copyFile(path.join(repoRoot, resolved), copy);
+		}
 		return html ? `/repo/${resolved}` : path.relative(path.dirname(pagePath), copy).split(path.sep).join('/');
 	}
 	if (resolved.startsWith('docs/') && resolved.endsWith('.md') && !repositoryOnly.some((prefix) => resolved.startsWith(prefix))) {
@@ -140,9 +143,12 @@ export function describe(markdown) {
 /** Write a page into the collection. `slug` is its URL path without slashes. */
 export async function writePage(slug, frontmatter, body) {
 	const file = pageFile(slug);
-	await mkdir(path.dirname(file), { recursive: true });
 	const data = Object.fromEntries(Object.entries({ ...frontmatter, slug }).filter(([, value]) => value !== undefined));
-	await writeFile(file, `---\n${stringify(data)}---\n\n${body.trimEnd()}\n`);
+	const markdown = `---\n${stringify(data)}---\n\n${body.trimEnd()}\n`;
+	if (!checkOnly) {
+		await mkdir(path.dirname(file), { recursive: true });
+		await writeFile(file, markdown);
+	}
 	return file;
 }
 
@@ -151,6 +157,9 @@ export function pageFile(slug) {
 }
 
 export async function writeGenerated(name, value) {
-	await mkdir(generatedRoot, { recursive: true });
-	await writeFile(path.join(generatedRoot, `${name}.json`), `${JSON.stringify(value, null, '\t')}\n`);
+	const json = `${JSON.stringify(value, null, '\t')}\n`;
+	if (!checkOnly) {
+		await mkdir(generatedRoot, { recursive: true });
+		await writeFile(path.join(generatedRoot, `${name}.json`), json);
+	}
 }

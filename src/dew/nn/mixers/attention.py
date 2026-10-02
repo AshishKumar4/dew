@@ -23,17 +23,19 @@ from dew.nn.attention import (
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
+    cudnn_runs,
     kernel_for_materialized_mask,
     local_attention,
     max_attention_logits,
     open_kv_cache,
+    reference_only,
     scaled_dot_product_attention,
     with_documents,
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
     RopeScaling,
@@ -96,20 +98,15 @@ class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
 
-    decode=True runs the call against the cache: the first call writes the
-    whole prompt and each later call appends one token, so prefill and decode
-    are one code path. Keys are rotated before they enter the cache, so the
-    rotary positions come from the cache index and not from the row index of
-    the token.
-
-    causal=False is full attention over the sequence, which a masked
-    diffusion model reads the whole corrupted sequence with; there is no
-    cache to decode against then, so decode=True raises.
-
-    kv_shared marks a layer that owns no K/V projections (Gemma 3n/4 style
-    cross-layer KV sharing): it reads the keys, values and their positions
-    that the designated earlier layer of the same layer type stashed in
-    `kv_store`, post rope and post norm, and keeps no cache of its own.
+    decode=True runs against the cache: the first call writes the prompt and
+    each later call appends, so prefill and decode are one path. Keys are
+    rotated before they are cached, so rotary positions come from the cache
+    index. causal=False is full attention, which a masked diffusion model reads
+    its corrupted sequence with; decoding then attends a bidirectional canvas
+    over the frozen prefix a causal prefill cached, and writes nothing back.
+    kv_shared marks a layer without K/V projections (Gemma 3n/4 cross-layer
+    sharing): it reads the keys, values and positions its provider stashed in
+    `kv_store`, post rope and norm, and keeps no cache.
     """
     emb_features: int
     num_heads: int
@@ -132,6 +129,7 @@ class CausalSelfAttention(nn.Module):
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
+    attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
@@ -168,12 +166,17 @@ class CausalSelfAttention(nn.Module):
         # The gate doubles the query projection: the reference chunks its
         # output in half, one half the query and the other the gate the
         # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
-        self.q_proj = dense(
-            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
+        query_width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        if self.has_variable('params', 'qkv_proj'):
+            # A Server packs its constant weights once, not on every decode
+            # step. The ordinary parameter tree remains the training layout.
+            self.qkv_proj = dense(query_width + 2 * self.num_kv_heads * self.head_dim, name='qkv_proj')
+        else:
+            self.q_proj = dense(query_width, name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
-        if not self.kv_shared:
+        if not self.kv_shared and not self.has_variable('params', 'qkv_proj'):
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             if not self.k_eq_v:
                 self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
@@ -249,18 +252,24 @@ class CausalSelfAttention(nn.Module):
                 "its layer stack")
         return kv_store[self.kv_store_key]
 
-    def _projected_kv(self, x, whole: bool):
+    def _projected_kv(self, x, whole: bool, projected=None):
         """Project the keys and values, norm them, and split them into heads.
 
         `whole` norms the key projection before the head split, which is
         OLMo 3's scope. Otherwise the key norm runs per head, after it.
         """
         batch, length, _ = x.shape
-        key = checkpoint_name(self.k_proj(x), 'k_proj')
-        # attention_k_eq_v reads the values off the key projection before
-        # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
-        value = (key if self.k_eq_v else checkpoint_name(self.v_proj(x), 'v_proj')).reshape(
-            batch, length, self.num_kv_heads, self.head_dim)
+        if projected is None:
+            key = self.k_proj(x)
+            # Gemma 4's global layers use the raw key projection as the
+            # values before its norm (modeling_gemma4.py).
+            value = key if self.k_eq_v else self.v_proj(x)
+        else:
+            key, value = projected
+        key = checkpoint_name(key, 'k_proj')
+        if not self.k_eq_v:
+            value = checkpoint_name(value, 'v_proj')
+        value = value.reshape(batch, length, self.num_kv_heads, self.head_dim)
         if whole:
             key = self.k_norm(key)
         key = key.reshape(batch, length, self.num_kv_heads, self.head_dim)
@@ -329,21 +338,12 @@ class CausalSelfAttention(nn.Module):
     def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
 
-        Key validity does, and image groups do on a layer that makes images
-        bidirectional. Rotary positions rotate q and k and leave visibility
-        alone, and an explicit pairwise mask builds its own below. Metadata
-        that restricts nothing keeps causality and the window as the flags
-        the fused kernels take, because a materialized [B, 1, S, S] mask
-        sends the call to the xla kernel and costs the fused one's time and
-        memory (the numbers are in docs/performance.md).
-
-        A validity array is opaque at trace time, so its contents decide
-        nothing here. An all-true one restricts as much as any other, and a
-        host that knows a row is unpadded says so by passing none.
-
-        Decoding always builds the mask, which carries the cache's own
-        validity, and a bidirectional-image layer writes its cached groups
-        while building it.
+        Key validity does, and image groups on a bidirectional-image layer; rotary
+        positions and an explicit pairwise mask do not. Otherwise causality and the
+        window stay flags, since a materialized [B, 1, S, S] mask sends the call to
+        the xla kernel (docs/performance.md). A validity array is opaque at trace
+        time, so a host that knows a row is unpadded passes none. Decoding always
+        builds the mask, which carries the cache's validity.
         """
         if decode:
             return metadata is not None or self.bidirectional_images
@@ -354,12 +354,20 @@ class CausalSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
+                 attention_metadata: AttentionMetadata | None = None, train: bool = False):
         B, S, _ = x.shape
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
-        projected = checkpoint_name(self.q_proj(x), 'q_proj')
+        projected_kv = None
+        if self.has_variable('params', 'qkv_proj'):
+            width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+            projected, key, value = jnp.split(
+                self.qkv_proj(x), (width, width + self.num_kv_heads * self.head_dim), axis=-1)
+            projected_kv = (key, value)
+        else:
+            projected = self.q_proj(x)
+        projected = checkpoint_name(projected, 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
         # and the Gemmas norm each head after it, which the reference marks
@@ -379,7 +387,7 @@ class CausalSelfAttention(nn.Module):
         if self.kv_shared:
             key, value, positions = self._shared_kv(kv_store)
         else:
-            key, value = self._projected_kv(x, whole)
+            key, value = self._projected_kv(x, whole, projected_kv)
         if self.qk_norm and not whole:
             query = self.q_norm(query)
         # Column-parallel under a tensor axis, each shard a run of whole
@@ -416,7 +424,7 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.kv_store_key] = (key, value, positions)
         sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
                  if self.attention_sinks else None)
-        if self._runs_local(attention_metadata, decode):
+        if self._runs_local(attention_metadata, decode) and not (self.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
                 positions=None if logical_positions is None else positions,
@@ -429,19 +437,15 @@ class CausalSelfAttention(nn.Module):
             return self._output(attention, gate, B, S, own_value)
         masking = self._masking(query, key, value, positions, rotary_positions, append, prefix, kv_len,
                                 kv_store, segment_ids, attention_metadata, decode)
-        attention = self._attended(masking, positions, append, sinks)
+        attention = self._attended(masking, positions, append, sinks, train)
         return self._output(attention, gate, B, S, own_value)
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
                         decode: bool, S: int):
-        """The positions the rotation and the mask read, the cache append
-        that writes a decode step's keys, and a bidirectional canvas's
-        frozen encoder prefix.
-
-        The cache slot carries position while decoding, so the rotation and
-        the mask both read it and not the row index of the token. A packed
-        batch supplies the position inside its document in place of the
-        row index, and RoPE restarts at every boundary.
+        """The positions the rotation and the mask read, the cache append that
+        writes a decode step's keys, and a bidirectional canvas's frozen encoder
+        prefix. Decoding reads positions off the cache slot; a packed batch supplies
+        each token's position in its document, so RoPE restarts at boundaries.
         """
         append = None
         prefix = None
@@ -477,8 +481,21 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
-    def _masking(self, query, key, value, positions, rotary_positions, append, prefix, kv_len: int,
-                 kv_store, segment_ids, attention_metadata: AttentionMetadata | None, decode: bool) -> _Masking:
+    def _masking(
+        self,
+        query,
+        key,
+        value,
+        positions,
+        rotary_positions,
+        append,
+        prefix,
+        kv_len: int,
+        kv_store,
+        segment_ids,
+        attention_metadata: AttentionMetadata | None,
+        decode: bool,
+    ) -> _Masking:
         """What the kernel reads beside the rotated query and keys: the keys
         and values with the cache's or the prefix's joined, and the causal
         flag, window, mask, document ids and kernel the layer's visibility
@@ -577,7 +594,7 @@ class CausalSelfAttention(nn.Module):
             implementation = masked
         return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
 
-    def _attended(self, masking: _Masking, positions, append, sinks):
+    def _attended(self, masking: _Masking, positions, append, sinks, train: bool):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
@@ -592,10 +609,23 @@ class CausalSelfAttention(nn.Module):
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window,
                 mask=mask if documents is None else with_documents(mask, documents)))
+        if self.attention_dropout_rate and train:
+            return checkpoint_name(scaled_dot_product_attention(
+                query, key, value, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl, causal=causal, sliding_window=window,
+                mask=mask, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
+                dropout_rate=self.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
+                deterministic=False), 'context')
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
-        if (append is not None and plain_step and self.attention_impl in ('auto', 'tpu')
-                and append.store.kernel()):
+        page_kernel_runs = self.attention_impl in ('auto', 'tpu')
+        if jax.default_backend() == 'gpu':
+            page_kernel_runs = (self.attention_impl in ('auto', 'cudnn')
+                                and cudnn_runs(query, self.attn_logit_softcap)
+                                and not reference_only(query, self.dtype, self.precision,
+                                                       self.force_fp32_for_softmax))
+        if append is not None and plain_step and page_kernel_runs and append.store.kernel():
             attention = self._paged(append, query)
         elif plain_step:
             # The cache is compact, so a decode query reads the filled slots
@@ -679,11 +709,9 @@ class AttentionMixer(MixerBase):
     """Grouped-query attention with optional image-block masking and M-RoPE.
 
     Geometry, norms and kernel policy come from the decoder context. Image
-    bidirectionality, spatial rotary sections, NoPE and exclusive self
-    attention configure this mixer only: a hybrid names them on its
-    attention kind, `{"kind": "attention", "nope": true,
-    "exclusive_self_attention": true}`, and a mixer that does not implement
-    them has no field to take them.
+    bidirectionality, spatial rotary sections, NoPE and exclusive self attention
+    are this mixer's own fields, which a hybrid names on its attention kind
+    (`{"kind": "attention", "nope": true}`).
     """
 
     bidirectional_images: bool = False
@@ -704,44 +732,8 @@ class AttentionMixer(MixerBase):
                 raise ValueError("mrope_section must contain three nonnegative section widths")
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        return functools.partial(
-            CausalSelfAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            num_kv_heads=ctx.num_kv_heads,
-            head_dim=ctx.head_dim,
-            max_seq_len=ctx.max_seq_len,
-            causal=ctx.causal,
-            rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rope_scaling,
-            qk_norm=ctx.qk_norm,
-            qk_norm_scope=ctx.qk_norm_scope,
-            v_norm=ctx.v_norm,
-            k_eq_v=ctx.k_eq_v,
-            norm_eps=ctx.norm_eps,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            kv_shared=ctx.kv_shared,
-            kv_store_key=ctx.kv_store_key,
-            sliding_window=ctx.sliding_window,
-            attention_chunk=ctx.attention_chunk,
-            attention_bias=ctx.attention_bias,
-            o_proj_bias=ctx.o_proj_bias,
-            attention_scale=ctx.attention_scale,
-            attention_sinks=ctx.attention_sinks,
-            yarn=ctx.yarn,
-            attn_logit_softcap=ctx.attn_logit_softcap,
-            output_gate=ctx.output_gate,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
-            partial_rotary_factor=ctx.partial_rotary_factor,
-            partial_rotary_type=ctx.partial_rotary_type,
-            kv_cache=ctx.kv_cache,
-            nope=self.nope,
-            exclusive_self_attention=self.exclusive_self_attention,
-            init_std=ctx.init_std,
-            output_init_std=ctx.output_init_std,
-            bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
+        # The context's fields and this kind's are CausalSelfAttention's, by name.
+        context = {field.name: getattr(ctx, field.name) for field in dataclasses.fields(ctx)}
+        kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+        return functools.partial(CausalSelfAttention, **context, **kind)
 

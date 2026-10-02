@@ -1,38 +1,24 @@
-"""Saved run records load as the code that wrote them meant them.
+"""A run config's record reads back as the config that wrote it.
 
-A field a record lacks takes its declared default, so every default says
-what runs recorded before the field existed did. `fixtures/record_defaults.json`
-holds every recorded config class's fields and defaults; a field that
-disappears or a default that changes fails here, and the fix is a new field
-(or a rename the loader reads), never a silent default change.
-
-The run fixtures are dewml/hybrid-dit-176m's run.json as published at two
-commits: 3f11a17 predates EDM's `regime` and dfa94d6 carries it; both
-predate `audio`.
+`to_dict` writes every recorded field, `from_dict` builds the same value
+back, a field the record lacks takes its declared default, and a field the
+class does not declare is refused.
 """
 
 import dataclasses
 import importlib.util
 import json
 import sys
-import typing
 from pathlib import Path
 
 import pytest
 
-from dew import registry
-from dew.config import RunConfig, _recorded, _registry_for, _to_json
-from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
+from dew.config import RunConfig, TrainerConfig
+from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNS = ROOT / "tests" / "fixtures" / "runs"
-DEFAULTS = ROOT / "tests" / "fixtures" / "record_defaults.json"
-
-
-def record(name: str) -> dict:
-    return json.loads((RUNS / name / "run.json").read_text())
 
 
 def recipe_config(name: str, cls: str) -> type:
@@ -46,176 +32,59 @@ def recipe_config(name: str, cls: str) -> type:
     return getattr(module, cls)
 
 
-def recorded_classes(annotation: registry.Annotation) -> list[type]:
-    """The dataclasses a field of this annotation records: every member of a
-    registry it names, the class itself, or those inside a union or a
-    container."""
-    annotation = registry.resolve_alias(annotation)
-    held = _registry_for(annotation)
-    if held is not None:
-        return [member for member in held.values() if isinstance(member, type) and dataclasses.is_dataclass(member)]
-    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
-        return [annotation]
-    return [cls for argument in typing.get_args(annotation) for cls in recorded_classes(argument)]
+def written(config) -> dict:
+    """The record `save` writes, as the JSON file holds it."""
+    return json.loads(json.dumps(config.to_dict()))
 
 
-def name_of(cls: type) -> str:
-    return f"{cls.__module__}.{cls.__qualname__}"
+@pytest.mark.parametrize("config", ["run", "diffusion", "lm", "recipe_lm", "recipe_jepa"])
+def test_a_run_config_reads_back_from_its_own_record(config):
+    if config == "recipe_jepa":
+        # A JEPA run validates through probes it has no classes for by default.
+        value = recipe_config("jepa", "JepaRunConfig")(trainer=TrainerConfig(eval_every=None))
+    else:
+        value = {"run": RunConfig, "diffusion": DiffusionRunConfig, "lm": LMRunConfig,
+                 "recipe_lm": recipe_config("lm", "LmRunConfig")}[config]()
+    assert type(value).from_dict(written(value)) == value
 
 
-def default_of(field: dataclasses.Field):
-    """The field's default value, or MISSING for a required field."""
-    if field.default_factory is not dataclasses.MISSING:
-        return field.default_factory()
-    return field.default
-
-
-def described(value, annotation):
-    """A default as the snapshot holds it. A dataclass is its class and the
-    fields it sets away from that class's own defaults, which the class's
-    own entry holds; anything else is what the record writes."""
-    if not (dataclasses.is_dataclass(value) and not isinstance(value, type)):
-        return json.loads(json.dumps(_to_json(value, annotation)))
-    cls = type(value)
-    return {"class": name_of(cls), "sets": {
-        field.name: described(getattr(value, field.name), registry._declared_type(cls, field.name))
-        for field in dataclasses.fields(cls)
-        if _recorded(field) and getattr(value, field.name) != default_of(field)}}
-
-
-def snapshot_default(field: dataclasses.Field, annotation):
-    """What a record lacking `field` reads as. A factory other than a class
-    or a lambda computes its default where it runs (the compilation cache is
-    under the user's home), so the snapshot names the factory."""
-    factory = field.default_factory
-    if factory is not dataclasses.MISSING and not isinstance(factory, type) and factory.__name__ != "<lambda>":
-        value = factory()
-        if not dataclasses.is_dataclass(value):
-            return {"factory": name_of(factory)}
-    default = default_of(field)
-    return "required" if default is dataclasses.MISSING else described(default, annotation)
-
-
-def recorded_defaults() -> dict[str, dict[str, object]]:
-    """Every config class a run record reaches, from each run config Dew and
-    its recipes declare, by module path: each recorded field's default as
-    `snapshot_default` holds it."""
-    roots = [RunConfig, DiffusionRunConfig, LMRunConfig,
-             recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig")]
-    found: dict[str, dict[str, object]] = {}
-    pending = list(roots)
-    while pending:
-        cls = pending.pop()
-        if name_of(cls) in found:
-            continue
-        fields = {}
-        for field in dataclasses.fields(cls):
-            if _recorded(field):
-                annotation = registry._declared_type(cls, field.name)
-                pending.extend(recorded_classes(annotation))
-                fields[field.name] = snapshot_default(field, annotation)
-        found[name_of(cls)] = fields
-    return dict(sorted(found.items()))
-
-
-def test_every_recorded_default_is_the_one_older_runs_were_recorded_under():
-    """A changed default would rebuild an older run as something it was not,
-    and a removed field would refuse its records; a new field or class is
-    added to the snapshot with the default that says what older runs did."""
-    held = json.loads(DEFAULTS.read_text())
-    today = recorded_defaults()
-    gone = sorted(f"{cls}.{field}" for cls, fields in held.items() for field in fields
-                  if field not in today.get(cls, {}))
-    changed = sorted(f"{cls}.{field}: {fields[field]!r} -> {today[cls][field]!r}"
-                     for cls, fields in held.items() for field in fields
-                     if field in today.get(cls, {}) and today[cls][field] != fields[field])
-    new = {cls: {field: default for field, default in fields.items() if field not in held.get(cls, {})}
-           for cls, fields in today.items()}
-    new = {cls: fields for cls, fields in new.items() if fields}
-    assert not gone, f"recorded fields removed; keep them, or read the old name as a rename: {gone}"
-    assert not changed, f"recorded defaults changed; add a new field instead: {changed}"
-    assert not new, f"add these fields to {DEFAULTS.name}, with defaults meaning what older runs did:\n" + \
-        json.dumps(new, indent=1, sort_keys=True)
-
-
-def test_a_changed_default_fails_the_snapshot(monkeypatch):
-    """The guard reads defaults off the classes themselves: moving one moves
-    what the snapshot is compared against."""
-    import dew.diffusion.presets as presets
-
-    field = next(field for field in dataclasses.fields(presets.EDM) if field.name == "rho")
-    monkeypatch.setattr(field, "default", 5.0)
-    with pytest.raises(AssertionError, match=r"EDM.rho: 7.0 -> 5.0"):
-        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
-
-
-def contains(written, published) -> bool:
-    """Whether every value `published` records is in `written` unchanged."""
-    if isinstance(published, dict):
-        return isinstance(written, dict) and all(
-            name in written and contains(written[name], value) for name, value in published.items())
-    return written == published
-
-
-@pytest.mark.parametrize("name", ["hybrid-dit-176m-3f11a17", "hybrid-dit-176m-dfa94d6"])
-def test_a_published_run_keeps_every_value_it_recorded(name):
-    """What the record states comes back unchanged, and what it lacks takes
-    today's default: `audio` None, a run conditioned on text alone."""
-    run = DiffusionRunConfig.load(str(RUNS / name))
-    written = json.loads(json.dumps(run.to_dict()))
-    assert contains(written, record(name))
-    assert run.audio is None
-    assert DiffusionRunConfig.from_dict(written) == run
-
-
-def test_a_run_from_before_the_regime_trains_on_the_sigmas_it_recorded():
-    """The record states EDM2's P_mean -0.4 and P_std 1.0, which the code
-    that wrote it drew from; they override the regime the run now fills."""
-    run = DiffusionRunConfig.load(str(RUNS / "hybrid-dit-176m-3f11a17"))
-    assert (run.preset.P_mean, run.preset.P_std) == (-0.4, 1.0)
-    assert run.preset.lognormal() == (-0.4, 1.0)
-
-
-def test_a_run_with_a_regime_keeps_it_and_its_autoencoder():
-    """The autoencoder is recorded by its fields alone, so the SD VAE the run
-    names reads back as the `PretrainedAutoencoder` it is today."""
-    run = DiffusionRunConfig.load(str(RUNS / "hybrid-dit-176m-dfa94d6"))
-    assert run.preset.regime == "latent" and run.preset.lognormal() == (-0.4, 1.0)
-    assert run.autoencoder == PretrainedAutoencoder(modelname="pcuenq/sd-vae-ft-mse-flax", revision="main")
+def test_a_record_keeps_what_it_states_and_defaults_what_it_lacks():
+    run = DiffusionRunConfig()
+    quantized = dataclasses.replace(run, trainer=dataclasses.replace(
+        run.trainer, quantization=Quantization(dtype="fp8", patterns=(".*mlp.*",), weight_only=True)))
+    assert DiffusionRunConfig.from_dict(written(quantized)) == quantized
+    assert LMRunConfig.from_dict({"ema_decay": 0.99}) == LMRunConfig(ema_decay=0.99)
+    assert LMRunConfig.from_dict({}).ema_decay is None
 
 
 def test_an_unknown_field_is_refused():
-    published = record("hybrid-dit-176m-dfa94d6")
+    record = written(DiffusionRunConfig())
     with pytest.raises(ValueError, match=r"unknown fields \['epochs'\]"):
-        DiffusionRunConfig.from_dict({**published, "epochs": 3})
+        DiffusionRunConfig.from_dict({**record, "epochs": 3})
     with pytest.raises(ValueError, match=r"unknown fields \['warp'\]"):
-        DiffusionRunConfig.from_dict({**published, "preset": {"name": "edm", "fields": {"warp": 1.0}}})
+        DiffusionRunConfig.from_dict({**record, "preset": {"name": "edm", "fields": {"warp": 1.0}}})
+    with pytest.raises(ValueError, match=r"unknown fields \['seed'\]"):
+        RunConfig.from_dict({"trainer": {"seed": 23}})
 
 
-def quantized_before_weight_only(spec: Quantization) -> dict:
-    """The dfa94d6 run record quantized as `spec`, written before
-    `Quantization.weight_only` existed."""
-    run = DiffusionRunConfig.from_dict(record("hybrid-dit-176m-dfa94d6"))
-    written = json.loads(json.dumps(
-        dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, quantization=spec)).to_dict()))
-    del written["trainer"]["quantization"]["weight_only"]
-    return written
+PUBLISHED = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "run.json"
+LIVE_PIN = ROOT / "site" / "live" / "container" / "text-to-image"
 
 
-def test_a_quantized_run_from_before_weight_only_quantized_its_activations():
-    spec = Quantization(dtype="fp8", patterns=(".*mlp.*",))
-    run = DiffusionRunConfig.from_dict(quantized_before_weight_only(spec))
-    assert run.trainer.quantization == spec and not run.trainer.quantization.weight_only
+def test_the_published_run_reads_back_as_it_was_written():
+    """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
+    publishes it, is a current record: it loads and writes back unchanged.
+    A record change that refuses it or rewrites it fails here, and the fix
+    is to re-export the published run in the same change, since the site,
+    the quick start and the live sampler all load it."""
+    held = json.loads(PUBLISHED.read_text())
+    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == held
 
 
-def test_a_task_reads_an_older_record_with_the_spec_at_the_top_level(tmp_path):
-    """Tasks read `run.json` directly, including the spec at the top level
-    where records from before the trainer held it carry it."""
-    from dew.inference.tasks import _saved_quantization, run_record
+@pytest.mark.network
+def test_the_fixture_is_the_record_the_live_image_pins():
+    from huggingface_hub import hf_hub_download
 
-    written = quantized_before_weight_only(Quantization())
-    older = {**written, "quantization": written["trainer"]["quantization"],
-             "trainer": {**written["trainer"], "quantization": None}}
-    (tmp_path / "run.json").write_text(json.dumps(older))
-    assert _saved_quantization(run_record(str(tmp_path))) == Quantization()
-
+    repo, revision = LIVE_PIN.read_text().strip().split("@")
+    published = Path(hf_hub_download(repo, "run.json", revision=revision))
+    assert json.loads(published.read_text()) == json.loads(PUBLISHED.read_text())

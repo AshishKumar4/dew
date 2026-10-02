@@ -9,7 +9,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _cuda_depthwise_3x3, _depthwise_3x3
+from dew.nn.conv import Conv, _conv_general_dilated, _polyphase_depthwise_3x3, _shifted_depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -20,18 +20,20 @@ def convolve(x, kernel, dilation):
         precision=jax.lax.Precision.HIGHEST)
 
 
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('operation', [_depthwise_3x3, _cuda_depthwise_3x3])
 def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
 
     Nine products contribute to each output and input gradient; B*H*W
     products contribute to each weight gradient. A missing corner moves the
-    output by order one, far outside the bound even under cancellation.
-    At B16/B32 16x16x768 on the RTX 4080 (JAX 0.11.2.post3, highest),
-    forward/dx errors were <=2.86e-6 and dw <=9.01e-4, inside this bound.
-    The 20-step published checkpoint stays within 1.89e-5 on latents and
-    4.0e-5 on fp32-decoded images; the network test reproduces those numbers.
+    output by order one, far outside the bound even under cancellation; so
+    does a grid interleaved back to the wrong pixels. The 7x8 image is not a
+    multiple of either dilation, so the zero padding to a whole grid is
+    checked too. At B16 16x16x768 on the RTX 4080 (JAX 0.11.2.post3) the
+    fp32 output and dx were exact against the dilated convolution at
+    highest precision, and dw was 0.0 of this bound; bf16 dw used 0.019 of
+    it.
     """
     rng = np.random.default_rng(17)
     x = jnp.asarray(rng.normal(size=(2, 7, 8, 5)).astype(np.float32))
@@ -43,9 +45,9 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
         return output, *pullback(cotangent)
 
     reference = partial(convolve, dilation=dilation)
-    shifted = partial(operation, dilation=dilation)
+    candidate = partial(operation, dilation=dilation)
     expected = jax.jit(partial(forward_and_vjp, reference))(x, kernel, cotangent)
-    actual = jax.jit(partial(forward_and_vjp, shifted))(x, kernel, cotangent)
+    actual = jax.jit(partial(forward_and_vjp, candidate))(x, kernel, cotangent)
     magnitudes = jax.jit(partial(forward_and_vjp, reference))(
         jnp.abs(x), jnp.abs(kernel), jnp.abs(cotangent))
     for got, want, magnitude, terms in zip(
@@ -59,8 +61,8 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('operation', [_depthwise_3x3, _cuda_depthwise_3x3])
 def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
     side = 2 * dilation + 1
@@ -77,6 +79,30 @@ def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
         np.testing.assert_array_equal(lhs, rhs)
     assert float(actual[0][0, dilation, dilation, 0]) == 1.03125
     assert float(actual[1][0, dilation, dilation, 0]) == 1.03125
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('dilation', [1, 2, 3])
+@pytest.mark.parametrize('shape', [(2, 16, 16, 768), (1, 7, 8, 17), (1, 7, 8, 16)])
+def test_cpu_depthwise_is_the_library_convolution_bit_for_bit(shape, dilation, dtype):
+    """On the CPU a depthwise convolution of more than 16 features runs as
+    nine shifted products summed in fp32, with no convolution op left, and
+    its bits are the library convolution's (YNNPACK under jax 0.11.2.post3),
+    so a sampled image does not change; 16 features or fewer, which the
+    library sums otherwise, keep the convolution. The hybrid DiT's 2 x 16 x
+    16 x 768 maps took 6.4 ms a call as a convolution and 1.4 ms shifted, on
+    one core of an i9-12900K."""
+    rng = np.random.default_rng(dilation)
+    x = jnp.asarray(rng.normal(size=shape), dtype)
+    kernel = jnp.asarray(rng.normal(size=(3, 3, 1, shape[-1])) * 0.2, dtype)
+    padding = 'SAME' if dilation != 2 else ((2, 2), (2, 2))
+    shared = jax.jit(lambda x, kernel: _conv_general_dilated(
+        x, kernel, (1, 1), padding, rhs_dilation=(dilation, dilation),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=shape[-1]))
+    np.testing.assert_array_equal(np.asarray(shared(x, kernel)), np.asarray(jax.jit(partial(
+        convolve, dilation=dilation))(x, kernel)))
+    assert (' convolution(' in shared.lower(x, kernel).compile().as_text()) == (shape[-1] <= 16)
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
@@ -123,7 +149,9 @@ def test_spatial_fusion_keeps_its_checkpoint_and_residual_add_order():
     magnitude = jnp.abs(x)
     for dilation in (1, 2, 3):
         expected = expected + convolve(x, kernels[f'dwconv_dil{dilation}']['kernel'], dilation)
-        magnitude = magnitude + convolve(jnp.abs(x), jnp.abs(kernels[f'dwconv_dil{dilation}']['kernel']), dilation)
+        magnitude = magnitude + convolve(
+            jnp.abs(x), jnp.abs(kernels[f"dwconv_dil{dilation}"]["kernel"]), dilation
+        )
     actual = jax.jit(SpatialFusionConv(4).apply)({'params': kernels}, x)
     assert_fp32_reduction_bound(actual, expected, magnitude, 28)
 
@@ -142,18 +170,20 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
                 jax.jvp(jax.grad(loss, argnums=(0, 1)), (x, kernel), (dx, dw)))
 
     expected = jax.jit(partial(derivatives, partial(convolve, dilation=2)))(x, kernel, dx, dw)
-    actual = jax.jit(partial(derivatives, partial(_cuda_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
+    actual = jax.jit(partial(derivatives, partial(_polyphase_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
     for lhs, rhs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(lhs, rhs, rtol=4e-6, atol=2e-5)
 
 
-@pytest.mark.skipif(jax.default_backend() == 'gpu',
-                    reason='Grouped int8/fp8 convolution is refused on GPU; test_quantization covers the refusal')
+@pytest.mark.skipif(
+    jax.default_backend() == "gpu",
+    reason="Grouped int8/fp8 convolution is refused on GPU; test_quantization covers the refusal",
+)
 @pytest.mark.parametrize('training', [True, False])
 def test_depthwise_quantization_keeps_the_original_provider_output(training):
     """QT and PTQ still reach the provider, with identical scales and output."""
     pytest.importorskip('qwix')
-    from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving
+    from dew.training.quantization import Quantization, quantize_for_serving
 
     fields = {'features': 8, 'kernel_size': (3, 3), 'feature_group_count': 8,
               'use_bias': False, 'dtype': jnp.bfloat16}
@@ -162,8 +192,8 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
     x = jax.random.normal(jax.random.key(2), (2, 7, 8, 8), jnp.bfloat16)
     variables = original.init(jax.random.key(1), x)
     if training:
-        before = apply_quantization(original, Quantization()).apply(variables, x)
-        after = apply_quantization(optimized, Quantization()).apply(variables, x)
+        before = Quantization().apply(original).apply(variables, x)
+        after = Quantization().apply(optimized).apply(variables, x)
     else:
         old, old_variables = quantize_for_serving(original, variables, Quantization(), x)
         new, new_variables = quantize_for_serving(optimized, variables, Quantization(), x)

@@ -404,17 +404,6 @@ _V4_SCORES = ('softmax', 'sigmoid', 'sqrtsoftplus')
 _V4_PARTIAL = 64 / 512
 
 
-def _string_sequence(value: object, field: str) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
-        _refuse(field, 'expected one string entry per layer')
-    entries: list[str] = []
-    for entry in value:
-        if not isinstance(entry, str):
-            _refuse(field, f'expected a string, got {entry!r}')
-        entries.append(entry)
-    return tuple(entries)
-
-
 def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                     used: set[str]) -> tuple[str, ...]:
     """Return every layer's attention kind.
@@ -442,7 +431,7 @@ def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                  + ['compressed_sparse_attention' if index % 2
                     else 'heavily_compressed_attention'
                     for index in range(max(layers - 2, 0))])
-    resolved = _string_sequence(types, 'layer_types')[:layers]
+    resolved = records.strings(types, 'layer_types')[:layers]
     if len(resolved) != layers:
         _refuse(f"layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one attention kind each")
@@ -467,7 +456,7 @@ def _v4_mlp_kinds(hf_config: Mapping[str, object], layers: int,
     if types is None:
         hashed = _record_int(hf_config, 'num_hash_layers', 3)
         types = ['hash_moe'] * min(layers, hashed) + ['moe'] * max(layers - hashed, 0)
-    resolved = _string_sequence(types, 'mlp_layer_types')[:layers]
+    resolved = records.strings(types, 'mlp_layer_types')[:layers]
     if len(resolved) != layers:
         _refuse(f"mlp_layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one routing kind each")
@@ -814,35 +803,27 @@ def _v4_streams(hf_config: Mapping[str, object]) -> HyperConnectionsFields:
         'head': 'weighted'}
 
 
-# A DeepSeek V4 checkpoint's own names onto the module names transformers
-# renames them to (conversion_mapping.py:483-534), which is the layout
-# `_param_path` reads. The indexer's leaves move before the `attn` and `ffn`
-# prefixes they sit under, and the per-expert and shared `w1`/`w2`/`w3` are
-# the gate, down and up projections of one gated MLP.
+# The layer names V4 and V4.1 releases share, onto the module names
+# transformers renames them to (conversion_mapping.py:483-534), which is the
+# layout `_param_path` reads: the per-expert and shared `w1`/`w2`/`w3` are the
+# gate, down and up projections of one gated MLP. Each release's own renames
+# run first.
+_V4_LAYER_NAMES = (
+    ('.attn_sink', '.sinks'), ('.q_norm.', '.q_a_norm.'), ('.wo_a.', '.o_a_proj.'), ('.wo_b.', '.o_b_proj.'),
+    ('.gate.bias', '.gate.e_score_correction_bias'),
+    ('.w1.', '.gate_proj.'), ('.w2.', '.down_proj.'), ('.w3.', '.up_proj.'),
+    ('.attn.', '.self_attn.'), ('.ffn.', '.mlp.'),
+    ('.attn_norm.', '.input_layernorm.'), ('.ffn_norm.', '.post_attention_layernorm.'),
+    ('.hc_attn_', '.attn_hc.'), ('.hc_ffn_', '.ffn_hc.'),
+)
+# V4's indexer leaves move before the `attn` and `ffn` prefixes they sit under.
 _DEEPSEEK_V4_NAMES = (
     ('.indexer.compressor.', '.compressor.indexer.'),
     ('.indexer.wq_b.', '.compressor.indexer.q_b_proj.'),
     ('.indexer.weights_proj.', '.compressor.indexer.scorer.weights_proj.'),
-    ('.attn_sink', '.sinks'),
-    ('.norm.', '.kv_norm.'),
-    ('.q_norm.', '.q_a_norm.'),
-    ('.ape', '.position_bias'),
-    ('.wq_a.', '.q_a_proj.'),
-    ('.wq_b.', '.q_b_proj.'),
-    ('.wkv.', '.kv_proj.'),
-    ('.wgate.', '.gate_proj.'),
-    ('.wo_a.', '.o_a_proj.'),
-    ('.wo_b.', '.o_b_proj.'),
-    ('.gate.bias', '.gate.e_score_correction_bias'),
-    ('.w1.', '.gate_proj.'),
-    ('.w2.', '.down_proj.'),
-    ('.w3.', '.up_proj.'),
-    ('.attn.', '.self_attn.'),
-    ('.ffn.', '.mlp.'),
-    ('.attn_norm.', '.input_layernorm.'),
-    ('.ffn_norm.', '.post_attention_layernorm.'),
-    ('.hc_attn_', '.attn_hc.'),
-    ('.hc_ffn_', '.ffn_hc.'),
+    ('.norm.', '.kv_norm.'), ('.ape', '.position_bias'),
+    ('.wq_a.', '.q_a_proj.'), ('.wq_b.', '.q_b_proj.'), ('.wkv.', '.kv_proj.'), ('.wgate.', '.gate_proj.'),
+    *_V4_LAYER_NAMES,
 )
 
 
@@ -880,7 +861,11 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     """
     if name.startswith('mtp.'):
         parts = name.split('.')
-        if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= _record_int(config, 'num_nextn_predict_layers', 0):
+        if (
+            len(parts) < 3
+            or not parts[1].isdigit()
+            or int(parts[1]) >= _record_int(config, "num_nextn_predict_layers", 0)
+        ):
             raise ValueError(f"{name} names an undeclared prediction depth")
         depth = f'mtp_{parts[1]}'
         tail = '.'.join(parts[2:])
@@ -908,7 +893,8 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     return _dew_path(f"model.layers.{parts[2]}{tail}", config)
 
 
-def _deepseek_v4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
+                          _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """Reshape the grouped output projection and the hash table as the tree holds them.
 
     `DeepseekV4GroupedLinear` stores one block per head group in a matrix of

@@ -16,7 +16,6 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
-from dew.nn.autoencoders.simple import SimpleDecoder, SimpleEncoder
 from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT
@@ -75,7 +74,7 @@ def _unet_condition():
 
 def _vae_encoder():
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
-                        double_z=True, dtype=jnp.bfloat16)
+                        dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
 
 
@@ -83,16 +82,6 @@ def _vae_decoder():
     model = FlaxDecoder(out_channels=3, block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
                         dtype=jnp.bfloat16)
     return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
-
-
-def _simple_encoder():
-    model = SimpleEncoder(latent_channels=4, feature_depths=(16, 32), dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
-
-
-def _simple_decoder():
-    model = SimpleDecoder(out_channels=3, feature_depths=(16, 32), dtype=jnp.bfloat16)
-    return model, (jnp.ones((2, 4, 4, 4), jnp.bfloat16),), {}
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -105,7 +94,7 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     reference's rounding (the shared reference_error rule).
     """
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
-                        norm_num_groups=8, double_z=True)
+                        norm_num_groups=8)
     host, device = jax.devices("cpu")[0], jax.devices()[0]
     rng = np.random.default_rng(43)
     image = rng.standard_normal((batch, 17, 17, 3)).astype(np.float32)
@@ -136,7 +125,9 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
         # scaling a cancelling bias leaf by its near-zero norm.
         actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
                                     for value in (actual, reference, truth)]
-    assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
+    assert_as_exact_as_the_reference(
+        actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode"
+    )
 
 
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
@@ -166,7 +157,8 @@ def test_strided_convolution_linearizations_keep_host_precision(transform):
                              (variables, image, direction, cotangent))
 
         def run(params, x, tangent, cot):
-            forward = lambda value: model.apply(params, value)
+            def forward(value):
+                return model.apply(params, value)
             if transform == "jvp":
                 return jax.jvp(forward, (x,), (tangent,))[1]
             if transform == "transpose":
@@ -210,9 +202,11 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
     results = []
     for forward, target in ((model.apply, host), (mapped, device)):
-        arguments = jax.tree.map(lambda x: jax.device_put(x, target), (variables, image, cotangent))
+        arguments = jax.tree.map(
+            lambda x, target=target: jax.device_put(x, target), (variables, image, cotangent)
+        )
 
-        def loss(params, x, cot):
+        def loss(params, x, cot, *, forward=forward):
             return jnp.sum(forward(params, x) * cot)
 
         with jax.default_device(target):
@@ -225,9 +219,7 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
 @pytest.mark.parametrize("build", [
     lambda: _unet(8), lambda: _unet(0), _unet_condition, _vae_encoder, _vae_decoder,
-    _simple_encoder, _simple_decoder,
-], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder",
-        "simple_encoder", "simple_decoder"])
+], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder"])
 def test_a_bf16_convolutional_model_keeps_its_activations_in_bf16(rng, build):
     """With fp32 parameters and a bf16 compute dtype, every image-shaped
     activation the convolutional models produce is bf16, the norms' outputs
@@ -437,14 +429,14 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     The checkpoint's Fourier table comes along with its weights."""
     from dew.nn.backbones.unet3d import UNet3D, inflate_unet_variables
 
-    config = dict(
-        emb_features=64,
-        feature_depths=[16, 32],
-        attention_configs=[None, Stage(heads=2, dtype=jnp.float32,
+    config = {
+        "emb_features": 64,
+        "feature_depths": [16, 32],
+        "attention_configs": [None, Stage(heads=2, dtype=jnp.float32,
                                        use_projection=False, use_self_and_cross=False)],
-        num_res_blocks=1,
-        num_middle_res_blocks=1,
-    )
+        "num_res_blocks": 1,
+        "num_middle_res_blocks": 1,
+    }
     model_2d = Unet(**config)
     model_3d = UNet3D(**config, temporal_heads=2)
 
@@ -493,14 +485,14 @@ def test_non_symmetric_attention_configs_place_attention_on_that_stage_alone(rng
     are not, in either the image or the video stack."""
     from dew.nn.backbones.unet3d import UNet3D
 
-    config = dict(
-        emb_features=64,
-        feature_depths=[16, 32],
-        attention_configs=[Stage(heads=2, dtype=jnp.float32,
+    config = {
+        "emb_features": 64,
+        "feature_depths": [16, 32],
+        "attention_configs": [Stage(heads=2, dtype=jnp.float32,
                                  use_projection=False, use_self_and_cross=False), None],
-        num_res_blocks=1,
-        num_middle_res_blocks=1,
-    )
+        "num_res_blocks": 1,
+        "num_middle_res_blocks": 1,
+    }
     temb = jnp.ones((2,))
     textcontext = text()
 
@@ -525,9 +517,9 @@ def test_stages_that_do_not_match_the_feature_depths_are_refused(rng):
     """
     from dew.nn.backbones.unet3d import UNet3D
 
-    config = dict(emb_features=64, feature_depths=[16, 32], num_res_blocks=1,
-                  num_middle_res_blocks=1,
-                  attention_configs=[None, Stage(heads=2), Stage(heads=2)])
+    config = {"emb_features": 64, "feature_depths": [16, 32], "num_res_blocks": 1,
+                  "num_middle_res_blocks": 1,
+                  "attention_configs": [None, Stage(heads=2), Stage(heads=2)]}
     temb, textcontext = jnp.ones((2,)), text()
     with pytest.raises(ValueError, match="3 stages for 2 depths"):
         Unet(**config).init(rng, jax.random.normal(rng, (2, 16, 16, 3)), temb, textcontext)
@@ -615,8 +607,7 @@ def test_a_stage_record_builds_the_value():
 
 def test_a_stage_names_the_dials_the_block_supports(rng):
     """Every `TransformerBlock` dial a stage names reaches the block the unet
-    builds from it: `use_linear_attention` and `norm_epsilon` each change the
-    output when set."""
+    builds from it: `norm_epsilon` changes the output when set."""
     x = jax.random.normal(rng, (2, 16, 16, 3))
     temb = jnp.ones((2,))
     context = text(features=64)
@@ -628,8 +619,6 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
         return model.apply(model.init(rng, x, temb, context), x, temb, context)
 
     projected = output(use_projection=True)
-    assert not jnp.allclose(projected, output(use_projection=True,
-                                              use_linear_attention=False), atol=1e-5)
     assert not jnp.allclose(projected, output(use_projection=True, norm_epsilon=1.0), atol=1e-5)
 
 
@@ -666,7 +655,7 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
                                   block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
     with pytest.raises(ValueError, match="ssm_attention_ratio"):
         model.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    for alone in (dict(block_pattern=("ssm", "attn")), dict(ssm_attention_ratio="1:1")):
+    for alone in ({"block_pattern": ("ssm", "attn")}, {"ssm_attention_ratio": "1:1"}):
         HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                               **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
                                             jnp.ones((1,)))
@@ -675,20 +664,12 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
 def test_a_block_pattern_that_misses_a_layer_is_refused():
     """`block_pattern` names every layer's mixer, so one shorter than
     `num_layers` is refused rather than deciding the depth. The hybrid DiT
-    built one block per named layer and the factorized stack paired its two
-    halves, so a short pattern silently returned a shallower model than the
-    config asked for, with the temporal blocks past the pattern built and
-    never run."""
-    from dew.nn.backbones.jepa import FactorizedTokenStack
-
+    built one block per named layer, so a short pattern silently returned a
+    shallower model than the config asked for."""
     hybrid = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=4,
                                    num_heads=2, block_pattern=("ssm", "attn"))
     with pytest.raises(ValueError, match="2 entries for 4 layers"):
         hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    factorized = FactorizedTokenStack(features=16, num_layers=4, num_heads=2,
-                                      block_pattern=("attn", "attn"))
-    with pytest.raises(ValueError, match="2 entries for 4 layers"):
-        factorized.init(jax.random.PRNGKey(0), jnp.zeros((1, 2, 4, 16)))
 
 
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
@@ -703,7 +684,7 @@ def test_layer_norm_matches_flax_bit_for_bit(rng, use_scale, use_bias, dtype):
     checkpoint's outputs, and this is where that shows."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
-    fields = dict(epsilon=1e-5, use_scale=use_scale, use_bias=use_bias, dtype=dtype)
+    fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}
     ours, reference = LayerNorm(**fields), nn.LayerNorm(**fields)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
 

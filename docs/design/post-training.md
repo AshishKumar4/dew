@@ -45,7 +45,7 @@ Packing reuses the existing machinery. `text_roles` joins as one more per-token 
 
 `loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, together with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, as in pretraining.
 
-Correction (2026-09-22): packing now goes through `PackedWindows`, one plan over the whole corpus (`src/dew/data/tokens.py:250`); `FirstFitPackIterDataset` is gone from `src/`. A window also carries `text_roles_segment_ids` and `text_roles_positions`, identical to the text ones (`src/dew/data/chat.py:9-12`). `ChatMessages` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
+Correction (2026-09-22): packing now goes through `PackedWindows`, one plan over the whole corpus (`src/dew/data/tokens.py:250`); `FirstFitPackIterDataset` is gone from `src/`. A window carries one `text_segment_ids`/`text_positions` pair that serves `text` and `text_roles` alike. `ChatMessages` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
 
 ### 1.2 Preference pairs
 
@@ -158,8 +158,8 @@ A reward is a callable from one finished record to a float: `reward(data_source,
 The language objectives assemble pieces from `dew.rl`, whose estimators and surrogates are built, ported from Tunix and verl, and pinned against their fixtures (`dew/rl/advantage.py`, `dew/rl/surrogate.py`, `tests/fixtures/rl/*.npz`).
 
 - SFT is `LMObjective` with `loss_role` (§2).
-- DPO (`dew/objectives/rl/preference.py`) takes per-sequence log-probabilities as the negated per-token cross entropies the chunked head already returns, summed under the shifted `completion_mask`, for the policy and for `step.ema`. The loss is `preference_logsigmoid` over the pair halves, `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))`, averaged (`dew/rl/surrogate.py:173`). Validation scores the chosen responses' perplexity.
-- GRPO (`dew/objectives/rl/grpo.py`) reads `old_log_probs`, `advantages` and `response_mask` from the rolled-out batch and is one composition: `clipped_surrogate(token_log_ratio(...), advantages, response_mask)` plus `beta * token_mean(k3_kl(...), response_mask)` (`dew/rl/surrogate.py:109, :73, :155, :60`). The current log-probabilities are sliced out of the concatenation one before the prompt width; `beta=0.0` leaves the reference unread. The advantages come from `group_advantage` or `rloo_advantage` inside the rollout (`dew/rl/advantage.py:100, :121`), where the rewards are. Validation scores the prompts' own perplexity off `prompt_length`, since a validation pass never samples.
+- DPO (`dew/objectives/rl/preference.py`) takes per-sequence log-probabilities as the negated per-token cross entropies the chunked head already returns, summed under the shifted `completion_mask`, for the policy and for `step.ema`. The loss is `preference_logsigmoid_terms` over the pair halves, `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))`, averaged over pairs as a `Ratio`. Validation scores the chosen responses' perplexity.
+- GRPO (`dew/objectives/rl/grpo.py`) reads `old_log_probs`, `advantages` and `response_mask` from the rolled-out batch and is one composition: the token mean of `clipped_surrogate_terms(token_log_ratio(...), advantages, response_mask)` plus `beta` times the token mean of `k3_kl(...)`, both over the response mask's token mass as one `Ratio`. The current log-probabilities are sliced out of the concatenation one before the prompt width; `beta=0.0` leaves the reference unread. The advantages come from `group_advantage` or `rloo_advantage` inside the rollout (`dew/rl/advantage.py:100, :121`), where the rewards are. Validation scores the prompts' own perplexity off `prompt_length`, since a validation pass never samples.
 
 Both compute per-token log-probabilities through `LMObjective.per_token_log_probs`, the negated chunked cross entropies, so the policy and the reference share one head path. None of these objectives derives new math, which is why `dew.rl` landed first.
 
@@ -169,7 +169,7 @@ Correction (2026-09-22, packed layout): GRPO no longer slices a concatenation th
 
 ## 7. Diffusion RL
 
-Built in `dew.sampling.flow` and `dew.objectives.rl.flow`. FlowSDE implements the Solver contract; FlowTrajectory records states, times, joint Gaussian log densities, and stochastic support. FlowRollout collects complete reward groups through the existing host capability. FlowGRPOObjective returns additive Mean statistics for clipped per-coordinate policy ratios and conditional Gaussian transition KL. It excludes deterministic intervals. The policy loss has no dual clip. The reference is frozen only when beta is positive; evaluation uses live policy parameters.
+Built in `dew.sampling.flow` and `dew.objectives.rl.flow`. FlowSDE implements the Solver contract; FlowTrajectory records states, times, joint Gaussian log densities, and stochastic support. FlowRollout collects complete reward groups through the existing host capability. FlowGRPOObjective returns additive Ratio statistics for clipped per-coordinate policy ratios and conditional Gaussian transition KL. It excludes deterministic intervals. The policy loss has no dual clip. The reference is frozen only when beta is positive; evaluation uses live policy parameters.
 
 ## 8. Parity plan
 

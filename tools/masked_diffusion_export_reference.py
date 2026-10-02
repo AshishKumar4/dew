@@ -2,10 +2,10 @@
 
 The reproduction command behind the numbers in
 tests/test_masked_diffusion_export.py. Each case loads a committed tiny
-checkpoint through `load_pretrained`, runs one real `Trainer` step of plain
+checkpoint through `Pretrained.load`, runs one real `Trainer` step of plain
 SGD under `MaskedDiffusionObjective` started from those weights, writes the
 trained weights back into the source's own tensor names with
-`Pretrained.save`, and reads the export back twice: with `load_pretrained`
+`Pretrained.save`, and reads the export back twice: with `Pretrained.load`
 for the parameter tree and the logits, and with transformers 5.16.1 for the
 reference logits on the same ids.
 
@@ -47,7 +47,6 @@ import numpy as np
 import optax
 
 from dew.diffusion.discrete import MDLM
-from dew.interop import load_pretrained
 from dew.interop.pretrained import Pretrained
 from dew.objectives.base import Variables
 
@@ -281,11 +280,11 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     """`case` loaded, trained for one step, exported and read back."""
     directory = FIXTURES / case.fixture
     ids = np.load(directory / "input_ids.npy")
-    source = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     state = train(source, ids)
     export = workspace / case.name
     source.save(export, variables=state.params)
-    reloaded = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     theirs, report = reference_logits(case, export, ids, workspace)
     return RoundTrip(case, source, state.params, export, ids,
                      logits(source, state.params, ids), reloaded, theirs, report,

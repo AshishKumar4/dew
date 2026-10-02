@@ -10,7 +10,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.vision import Gemma3nProjectorModule, ProjectorBase, TowerBase
+from dew.nn.vision import Gemma3nProjectorModule, Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
 
 
@@ -30,6 +30,8 @@ class VisionConditioner(nn.Module):
     Pixels have shape [batch, images, channels, height, width]. All images
     in a numeric batch share their processed resolution; the processor keeps
     per-image lengths and does not substitute preprocessing inside the model.
+    `train` reaches the one tower with stochastic layers, Gemma 3n's
+    MobileNet and its drop-path.
     """
 
     vision: TowerBase
@@ -53,10 +55,14 @@ class VisionConditioner(nn.Module):
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
         if grid is not None:
             features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
+        elif isinstance(self.vision, Gemma3nVision):
+            features = self.tower(flat, train=train)
         elif positions is None:
             features = self.tower(flat)
         else:
-            features = self.tower(flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]))
+            features = self.tower(
+                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:])
+            )
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
 
@@ -120,13 +126,19 @@ class AudioConditioner(nn.Module):
         if self.soft_tokens is not None:
             if not isinstance(self.audio_projector, Gemma3nProjectorModule) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
-            padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(projected.dtype)
+            padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
+                projected.dtype
+            )
             projected = jnp.where(encoding.mask[..., None], projected, padding)
             missing = self.soft_tokens - projected.shape[1]
             if missing < 0:
-                raise ValueError(f"{projected.shape[1]} encoded audio frames exceed the {self.soft_tokens} slots per clip")
+                raise ValueError(
+                    f"{projected.shape[1]} encoded audio frames exceed the {self.soft_tokens} slots per clip"
+                )
             projected = jnp.concatenate(
-                [projected, jnp.broadcast_to(padding, (projected.shape[0], missing, projected.shape[-1]))], axis=1)
+                [projected, jnp.broadcast_to(padding, (projected.shape[0], missing, projected.shape[-1]))],
+                axis=1,
+            )
         return projected.reshape(batch, clips * projected.shape[1], projected.shape[-1])
 
     def initialize_parameters(self) -> None:
@@ -234,7 +246,9 @@ class MultimodalTransformer(nn.Module):
             # Placeholder ids feed the per-layer inputs; the hard vocabulary
             # ranges above the per-layer table read the embedders instead, on
             # every call because sampling can emit them.
-            decoder_tokens = jnp.where((tokens >= 0) & (tokens < self.language_model.per_layer_vocab), tokens, 0)
+            decoder_tokens = jnp.where(
+                (tokens >= 0) & (tokens < self.language_model.per_layer_vocab), tokens, 0
+            )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
         embeddings = self.language_model.scaled_embeddings(
@@ -260,21 +274,22 @@ class MultimodalTransformer(nn.Module):
                           segment_ids=None, image_indices=None, conditioning=None,
                           attention_mask=None, image_groups=None, rotary_positions=None):
         """Prediction layers over the same media embeddings as the main decoder."""
-        embeddings = slots = None
+        embeddings = None
         if conditioning is not None:
             fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
             tokens, embeddings = fused.tokens, fused.embeddings
-            slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         elif image_indices is not None:
             raise ValueError("image_indices require conditioning payloads")
         return self.language_model.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            input_embeddings=embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """The shared language head over each media-aware prediction depth."""
-        return [self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
+        return [
+            self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)
+        ]
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
@@ -343,10 +358,9 @@ class MultimodalTransformer(nn.Module):
                 routed_experts=routed_experts, routed=routed)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
-        slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            input_embeddings=fused.embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
             routed_experts=routed_experts, routed=routed)
 

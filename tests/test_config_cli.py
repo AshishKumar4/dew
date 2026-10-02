@@ -14,9 +14,11 @@ import tyro
 from test_diffusion_objective import RES, StubText
 
 from dew.config import RunConfig
-from dew.data import Dataset, OnlineImages, OxfordFlowers, PackedTokens
+from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import tokenized
-from dew.registry import datasets, encoders, presets, samplers
+from dew.diffusion.presets import Flow
+from dew.registry import datasets, encoders
+from dew.sampling import Heun
 from dew.training import MeshSpec
 
 # The manifest names the encoder through the registry.
@@ -28,11 +30,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_recipe(name):
-    path = REPO_ROOT / "recipes" / name / "train.py"
-    spec = importlib.util.spec_from_file_location(f"recipe_{name}", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    """A recipe file, loaded once as `recipe_<name>`: a recipe registers its
+    corpora on import, and a name maps to one class."""
+    module = sys.modules.get(f"recipe_{name}")
+    if module is None:
+        path = REPO_ROOT / "recipes" / name / "train.py"
+        spec = importlib.util.spec_from_file_location(f"recipe_{name}", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
     return module
 
 
@@ -40,23 +46,23 @@ def parse(cls, args):
     return tyro.cli(tyro.conf.CascadeSubcommandArgs[cls], args=args)
 
 
-def test_the_flags_pick_a_dataset_a_preset_and_a_sampler_from_the_registries():
+def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
     recipe = load_recipe("diffusion")
     config = parse(recipe.DiffusionRunConfig, [
         "--data.image-size", "64", "--data.augmentation", "flip_only",
-        "preset:flow", "--preset.shift", "3.0", "sampler:heun",
+        "preset:flow", "--preset.shift", "3.0", "solver:heun",
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model.architecture", "simple_dit", "--model.config", '{"scan_order": "hilbert"}'])
 
-    assert config.data == OxfordFlowers(image_size=64, augmentation="flip_only")
-    assert config.preset == presets.Flow(shift=3.0) and config.sampler == samplers.Heun()
+    assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
+    assert config.preset == Flow(shift=3.0) and config.solver == Heun()
     assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.model.fields()["scan_order"] == "hilbert"
 
 
 def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
     config = parse(RunConfig, ["--data.image-size", "96", "--trainer.epochs", "3"])
-    assert config.data == OxfordFlowers(image_size=96) and config.trainer.epochs == 3
+    assert config.data == TFDSImages(image_size=96) and config.trainer.epochs == 3
 
 
 def test_another_dataset_is_its_subcommand():
@@ -65,7 +71,7 @@ def test_another_dataset_is_its_subcommand():
                                         "--data.seq-len", "64", "--data.packing-bins", "2"])
     assert config.data == PackedTokens(path="d", seq_len=64, packing_bins=2)
     with pytest.raises(ValueError, match="token-windows or data:packed-tokens"):
-        recipe.LmRunConfig(data=OxfordFlowers())
+        recipe.LmRunConfig(data=TFDSImages())
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -90,7 +96,7 @@ def test_a_recipe_config_round_trips_through_its_json_record(name):
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
-    name the sources, so the run and its samplers rebuild from run.json."""
+    name the sources, so the run and its solvers rebuild from run.json."""
     recipe = load_recipe("diffusion")
     config = recipe.DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
 
@@ -106,8 +112,10 @@ def test_steps_and_epochs_are_one_choice():
     config = parse(RunConfig, ["--trainer.epochs", "2"])
     data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
-    with pytest.raises(ValueError, match="--trainer.steps"):
-        config.trainer.total_steps(Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10))
+    with pytest.raises(ValueError, match=r"--trainer.steps"):
+        config.trainer.total_steps(
+            Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10)
+        )
 
 
 class _Batches:
@@ -150,7 +158,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
                                      tokenize),
                        records=4 * batch, batch=batch)
 
-    monkeypatch.setattr(OxfordFlowers, "load", load)
+    monkeypatch.setattr(TFDSImages, "load", load)
     config = parse(recipe.DiffusionRunConfig, [
         "--text.encoder", "stub_text", "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
@@ -193,7 +201,10 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
             if self.remaining is not None:
                 self.remaining -= 1
             rng = np.random.RandomState(self.count)
-            return {"image": rng.randint(0, 256, (batch, size, size, 3)).astype(np.uint8), "label": np.zeros((batch,), np.int32)}
+            return {
+                "image": rng.randint(0, 256, (batch, size, size, 3)).astype(np.uint8),
+                "label": np.zeros((batch,), np.int32),
+            }
 
         def get_state(self):
             return json.dumps({"count": self.count}).encode()
@@ -205,14 +216,36 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
         return Dataset(train=lambda partition: _Images(), val=lambda partition: _Images(count=1),
                        records=4 * batch, batch=batch)
 
-    monkeypatch.setattr(OxfordFlowers, "load", load)
-    config = parse(recipe.JepaRunConfig, [
-        "--data.image-size", str(size), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
-        "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
-        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--trainer.eval-every", "None",  # no probes, so no validation pass
-        "--model.architecture", "jepa_encoder", "--model.dtype", "float32",
-        "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}'])
+    monkeypatch.setattr(TFDSImages, "load", load)
+    config = parse(
+        recipe.JepaRunConfig,
+        [
+            "--data.image-size",
+            str(size),
+            "--trainer.batch-size",
+            str(batch),
+            "--trainer.steps",
+            "2",
+            "--trainer.checkpoint-dir",
+            str(tmp_path),
+            "--trainer.name",
+            "run",
+            "--trainer.compilation-cache-dir",
+            "None",
+            "--trainer.multi-host",
+            "False",
+            "--trainer.log-every",
+            "1",
+            "--trainer.eval-every",
+            "None",  # no probes, so no validation pass
+            "--model.architecture",
+            "jepa_encoder",
+            "--model.dtype",
+            "float32",
+            "--model.config",
+            '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}',
+        ],
+    )
 
     state = recipe.main(config)
 

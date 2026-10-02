@@ -1,48 +1,32 @@
 """The convolution Dew's models build on: `flax.linen.Conv` with its input,
 output and kernel placed so that XLA partitions it correctly.
 
-XLA's SPMD partitioner (jax 0.11.2) scales a convolution's kernel gradient
-by a power of two in some layouts where a mesh axis holds the convolution's
-input or output replicated. In the case we traced, it split the kernel
-gradient's computation over one axis and all-reduced the partial kernels
-over every device, so the devices along the replicated axis added the same
-partial sum again. An input batch split over data with the output's image
-rows split over sequence doubles it, and so does a grouped convolution's
-batch split over one axis beside another. In our checks the gradient came
-out right whenever the input and the output were split over every mesh axis
-or over none, and a 1x1 convolution and every dot_general came out right in
-every layout we tried. The input and bias gradients were right throughout.
+XLA's SPMD partitioner (jax 0.11.2) scales a convolution's kernel gradient by
+a power of two where a mesh axis holds the input or output replicated: it
+splits the gradient over one axis and all-reduces over every device, so the
+replicas add the same partial again (a batch over data with output rows over
+sequence doubles it). The gradient is right when input and output are split
+over every mesh axis or none; 1x1 convolutions, dot_generals and the input
+and bias gradients are right throughout. The same partitioner computes the
+output wrong where one axis splits the image rows or columns (a halo) and
+another the kernel's input features (23.9 off on an 8x8 3x3 over a 2x2 CPU
+mesh), so a kernel is used whole, as FSDP gathers a layer's weights. Both
+are https://github.com/openxla/xla/issues/49382 and
+https://github.com/AshishKumar4/dew/issues/4.
 
-The same partitioner computes a convolution's output wrong where a mesh
-axis splits its image rows or columns, so that each shard needs a halo of
-its neighbours', and another axis splits the kernel's input features: a
-3x3 convolution of an 8x8 image, its rows over one axis of a 2x2 mesh and
-the kernel's input features over the other, came out 23.9 off one
-device's (jax 0.11.2, CPU). A 1x1 kernel, a kernel whole or split on its
-output features, or whole image rows came out right. A layout that splits a kernel over fsdp stores it on
-whichever width its heuristic picks, so the kernel is used whole, as fully
-sharded data parallelism gathers a layer's weights before it computes.
+On TPU, XLA's space-to-batch rewrite corrupts a convolution feeding a strided
+2D convolution at small batches (Dew issue #5), so a barrier sits at the
+strided convolution's input, whatever the global batch, since a shard's may
+be small; its derivative and batching rules are identities.
 
-On TPU, XLA's space-to-batch rewrite also corrupts a convolution feeding
-a strided 2D convolution at small batches (Dew issue #5). A barrier at the
-strided convolution's input fixes both the forward and the VJP. It applies
-regardless of the global batch: partitioning may make a shard's batch small.
-CPU and GPU lower the input unchanged. The barrier's derivative and batching
-rules are identities; JAX's primitive defines neither.
-
-The partitioner bugs are reported at
-https://github.com/openxla/xla/issues/49382 and drafted in
-Dew issue #4 (https://github.com/AshishKumar4/dew/issues/4).
-
-For 3x3 depthwise convolutions, shifted products also avoid cuDNN's slow
-dilated grouped forward and weight-gradient convolutions. The accumulation
-stays fp32, including for bf16 inputs; ordinary JAX differentiation keeps
-forward-mode and higher-order derivatives. CUDA retains cuDNN at dilation
-one, which is faster on the RTX 4080. Other backends retain lax.
-`tools/benchmark_depthwise.py` measures each path's
-forward and backward separately, as well as the hybrid DiT training step.
-Qwix-wrapped models (QT and PTQ, weight-only included) keep its provider's
-lax convolutions and therefore do not get this depthwise speedup.
+A dilated 3x3 depthwise convolution runs on CUDA as an undilated one over
+its interleaved grids (`_polyphase_depthwise_3x3`), since cuDNN's dilated
+grouped kernels are slow: on the RTX 4080 at 16x16x768, batch 16, bf16
+forward and VJP take 0.097 ms (dilation 2) against 1.6 ms dilated, and the
+176M hybrid DiT's bf16 step runs 70.2 ms against 75.3
+(`tools/benchmark_depthwise.py`). Accumulation stays fp32 and ordinary JAX
+differentiation keeps higher-order derivatives; other backends use lax, as
+does a convolution a Qwix rule quantizes (`dew.training.quantization`).
 """
 
 import math
@@ -98,19 +82,12 @@ def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
 
 def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     """`x` `[*batch, *spatial, features]` constrained so that every mesh
-    axis above size one splits it.
-
-    The first batch dimension splits as `activation_batch` splits rows
-    (`logical_spec`). Every other automatic mesh axis above size one then
-    splits the first dimension after it that it divides evenly, the features
-    last. The sequence axis goes first, since a sequence of positions lays
-    its rows out along the first spatial dimension, so a patch embedding's
-    output already sits where its tokens go. If an axis divides no dimension,
-    `x` is replicated over the whole mesh. The stage axis is left out:
-    inside a pipeline the stage vmap holds it, and the trainer refuses a
-    stage axis for a model without one. With no automatic axis above size
-    one (no mesh, one device, or inside a `shard_map` that holds them all)
-    `x` is left as it is."""
+    axis above size one splits it: the first batch dimension as
+    `activation_batch` splits rows, then every other automatic axis the first
+    later dimension it divides, the sequence axis first (a patch embedding's
+    rows already sit where its tokens go) and the features last; an axis that
+    divides nothing replicates. The stage axis is left to the pipeline's vmap,
+    and with no automatic axis above one `x` is left as it is."""
     mesh = jax.sharding.get_abstract_mesh()
     automatic = _automatic_axes(mesh)
     if not automatic:
@@ -133,28 +110,53 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
         x, P(*(tuple(entry) if entry else None for entry in entries)))
 
 
-def _depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """Nine shifted products, with the convolution's fp32 accumulation."""
+def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The dilated depthwise convolution as an undilated one over its
+    `dilation ** 2` interleaved grids.
+
+    A pixel's dilated taps are its neighbours in the grid of pixels that
+    share its row and column residues modulo `dilation`, so the image splits
+    into those grids along the batch, each grid takes the dilation-1
+    convolution with its own zero border, and the grids interleave back.
+    The image is padded with zeros to a multiple of `dilation` first, which
+    are the zeros 'SAME' padding reads there anyway. The convolution runs at
+    full precision, so an fp32 model keeps fp32 accumulation and bf16 rounds
+    once, from fp32."""
+    batch, height, width, features = lhs.shape
+    rows, columns = -(-height // dilation), -(-width // dilation)
+    padded = jnp.pad(lhs, ((0, 0), (0, rows * dilation - height), (0, columns * dilation - width), (0, 0)))
+    grids = padded.reshape(batch, rows, dilation, columns, dilation, features).transpose(0, 2, 4, 1, 3, 5)
+    output = jax.lax.conv_general_dilated(
+        grids.reshape(batch * dilation * dilation, rows, columns, features), rhs, (1, 1), 'SAME',
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features,
+        precision=jax.lax.Precision.HIGHEST)
+    output = output.reshape(batch, dilation, dilation, rows, columns, features).transpose(0, 3, 1, 4, 2, 5)
+    return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
+
+
+def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The depthwise convolution as its nine shifted products, summed in the
+    kernel's row-major order in fp32 and rounded once to the input's dtype.
+
+    The optimization barrier rounds each product to fp32 before it is
+    added, where XLA would otherwise contract it into a fused multiply-add.
+    For more than 16 features that is XLA:CPU's library convolution's
+    arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
+    the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
+    here; it sums 16 features or fewer otherwise, so those keep the
+    convolution. If a jax or YNNPACK release changes that summation,
+    tests/test_depthwise_conv.py's
+    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
     height, width = lhs.shape[1:3]
-    padded = jnp.pad(lhs.astype(jnp.float32),
-                     ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0)))
+    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     kernel = rhs.astype(jnp.float32)
-    output = jnp.zeros(lhs.shape, jnp.float32)
-    for row in range(3):
-        for column in range(3):
-            shifted = padded[:, row * dilation:row * dilation + height,
-                             column * dilation:column * dilation + width, :]
-            output = output + shifted * kernel[row, column, 0, :]
-    return output.astype(lhs.dtype)
-
-
-def _cuda_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    # Otherwise XLA fuses bf16 casts and all nine weight reductions into a
-    # 0.77 ms kernel on sm89. Materializing fp32 gives a 0.31 ms forward/VJP
-    # at B16, against 0.85 ms without boundaries (tools/benchmark_depthwise.py).
-    inputs = _barrier(lhs.astype(jnp.float32))
-    kernel = _barrier(rhs.astype(jnp.float32))
-    return _barrier(_depthwise_3x3(inputs, kernel, dilation)).astype(lhs.dtype)
+    products = jax.lax.optimization_barrier([
+        padded[:, i * dilation:i * dilation + height, j * dilation:j * dilation + width, :] * kernel[i, j, 0]
+        for i in range(3) for j in range(3)])
+    total = products[0]
+    for product in products[1:]:
+        total = total + product
+    return total.astype(lhs.dtype)
 
 
 def _conv_general_dilated(
@@ -186,7 +188,9 @@ def _conv_general_dilated(
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
         return jax.lax.platform_dependent(
             lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: _cuda_depthwise_3x3(x, w, dilation[0]),
+            cuda=convolve if dilation[0] == 1 else lambda x, w: _polyphase_depthwise_3x3(x, w, dilation[0]),
+            cpu=((lambda x, w: _shifted_depthwise_3x3(x, w, dilation[0]))
+                 if feature_group_count > 16 else convolve),
             default=convolve)
     return convolve(lhs, rhs)
 

@@ -6,7 +6,7 @@ documents: token-id prompts, seeds, EOS controls, the field that returns the
 sampled ids (vLLM's `return_tokens_as_token_ids` renders them into the
 logprob tokens, SGLang's `return_token_ids` lists them on the choice) and one
 reported log-probability per sampled token. The safetensors reload writes a
-real Qwen2 export that `load_pretrained` reads back, and posts the reload
+real Qwen2 export that `Pretrained.load` reads back, and posts the reload
 calls to a real local HTTP endpoint in order.
 """
 
@@ -20,6 +20,7 @@ import threading
 import time
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -27,12 +28,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-import httpx2
-
 from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.sampling import Sampling
+
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+httpx2 = import_module("httpx2")
+
 
 FIXTURE = Path(__file__).parent / "fixtures/hf/qwen2-tiny"
 EOS = 7
@@ -72,7 +74,7 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     completion, calls = engine(provider, lambda _: choice(provider, [3, 5, EOS], [-.5, -1., -.25], "stop"))
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, version=4)
     try:
-        draw = server.submit([1, 2, 9], 8, seed=11).result()
+        draw = server.submit([1, 2, 9], 8, key=11).result()
     finally:
         server.close()
     assert draw.prompt == (1, 2, 9) and draw.tokens == (3, 5, EOS) and draw.terminated
@@ -83,7 +85,10 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     assert sent["stop_token_ids"] == [EOS]
     assert sent["logprobs"] == 0 and sent["temperature"] == 1.0 and sent["top_k"] == -1
     returned = {"vllm": "return_tokens_as_token_ids", "sglang": "return_token_ids"}
-    assert sent[returned[provider]] is True and returned[{"vllm": "sglang", "sglang": "vllm"}[provider]] not in sent
+    assert (
+        sent[returned[provider]] is True
+        and returned[{"vllm": "sglang", "sglang": "vllm"}[provider]] not in sent
+    )
 
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
@@ -91,9 +96,9 @@ def test_a_budget_stop_is_unterminated_and_a_disagreeing_reason_is_refused(provi
     completion, _ = engine(provider, lambda _: choice(provider, [3, 5], [-.5, -1.], "length"))
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
     try:
-        assert not server.submit([1], 2, seed=0).result().terminated
+        assert not server.submit([1], 2, key=0).result().terminated
         with pytest.raises(ValueError, match="disagrees"):
-            server.submit([1], 4, seed=0).result()
+            server.submit([1], 4, key=0).result()
     finally:
         server.close()
 
@@ -108,7 +113,7 @@ def test_listed_ids_that_disagree_with_the_likelihoods_are_refused():
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
     try:
         with pytest.raises(ValueError, match="token_ids"):
-            server.submit([1], 2, seed=0).result()
+            server.submit([1], 2, key=0).result()
     finally:
         server.close()
 
@@ -130,7 +135,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
     completion, _ = engine("vllm", answer)
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, routing=True)
     try:
-        draw = server.submit([1, 2], 8, seed=0).result()
+        draw = server.submit([1, 2], 8, key=0).result()
     finally:
         server.close()
     assert draw.routed_experts is not None and draw.routed_experts.dtype == np.uint8
@@ -139,7 +144,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
     server = OpenAIRolloutServer(bare, Sampling(eos_id=EOS), pushed, routing=True)
     try:
         with pytest.raises(ValueError, match="enable-return-routed-experts"):
-            server.submit([1], 8, seed=0).result()
+            server.submit([1], 8, key=0).result()
     finally:
         server.close()
 
@@ -148,7 +153,9 @@ def test_raw_engine_likelihoods_are_not_taken_for_a_transformed_policy():
     completion, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
     with pytest.raises(ValueError, match="processed_logprobs"):
         OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed)
-    OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed, processed_logprobs=True).close()
+    OpenAIRolloutServer(
+        completion, Sampling(temperature=0.7, eos_id=EOS), pushed, processed_logprobs=True
+    ).close()
 
 
 def test_vllms_completions_route_refuses_a_filter_for_want_of_its_support():
@@ -188,7 +195,7 @@ def test_vllms_token_route_draws_carry_the_kept_ids_and_the_routing(monkeypatch)
     sampling = Sampling(temperature=.7, top_k=20, top_p=.9, eos_id=EOS)
     server = VLLMGenerateServer("http://engine:8000/", sampling, pushed, routing=True)
     try:
-        draw = server.submit([1, 2], 4, seed=3).result()
+        draw = server.submit([1, 2], 4, key=3).result()
     finally:
         server.close()
     url, body = seen[0]
@@ -225,12 +232,14 @@ def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
 
     completion, _ = engine("vllm", slow)
     pushes = []
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), lambda *push: pushes.append(push), version=1)
+    server = OpenAIRolloutServer(
+        completion, Sampling(eos_id=EOS), lambda *push: pushes.append(push), version=1
+    )
     try:
-        early = server.submit([1], 4, seed=0)
+        early = server.submit([1], 4, key=0)
         assert arrived.acquire(timeout=10)
         server.load({"params": {}}, 2)
-        late = server.submit([1], 4, seed=1)
+        late = server.submit([1], 4, key=1)
         release.set()
         assert (early.result().version, late.result().version) == (1, 2)
     finally:
@@ -255,7 +264,7 @@ def test_a_failed_push_keeps_the_version():
     try:
         with pytest.raises(RuntimeError, match="400"):
             server.load({"params": {}}, 4)
-        assert server.version == 3 and server.submit([1], 1, seed=0).result().version == 3
+        assert server.version == 3 and server.submit([1], 1, key=0).result().version == 3
     finally:
         server.close()
 
@@ -309,7 +318,10 @@ class Engine(BaseHTTPRequestHandler):
                                {"success": False, "message": "Failed to update weights: shape mismatch",
                                 "num_paused_requests": 0})
         self.server.flushed.append(body.get("flush_cache", True))
-        self.answer(200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0})
+        self.answer(
+            200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0}
+        )
+        return None
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -343,11 +355,13 @@ def replicas():
 
 
 def doubled(source):
-    return jax.tree.map(lambda leaf: leaf * 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, source.variables)
+    return jax.tree.map(
+        lambda leaf: leaf * 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, source.variables
+    )
 
 
 def assert_served(directory, expected):
-    served = load_pretrained(directory, dtype="float32")
+    served = Pretrained.load(directory, dtype="float32")
     for written, pushed in zip(jax.tree.leaves(served.variables), jax.tree.leaves(expected), strict=True):
         # Served in bfloat16: equal to the pushed weights at that precision.
         np.testing.assert_array_equal(np.asarray(written),
@@ -359,10 +373,12 @@ def paths(server):
 
 
 def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_path, replicas):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     changed = doubled(source)
     engines = replicas(3)
-    SafetensorsReload(source, tmp_path / "served", tuple(server.url for server in engines), "vllm")(changed, 5)
+    SafetensorsReload(source, tmp_path / "served", tuple(server.url for server in engines), "vllm")(
+        changed, 5
+    )
     for server in engines:
         assert paths(server) == ["/pause", "/collective_rpc", "/reset_prefix_cache", "/update_weight_version",
                                  "/resume"]
@@ -375,7 +391,7 @@ def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     changed = doubled(source)
     monkeypatch.chdir(tmp_path)
     engines = replicas(2)
@@ -393,11 +409,14 @@ def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_p
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_publication_stamps_only_after_every_replica_serves_the_version(tmp_path, replicas, provider):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     first, second = replicas(2)
     stamps = []
-    publication = Publication(SafetensorsReload(source, tmp_path / "served", (first.url, second.url), provider),
-                              version=3, stamp=stamps.append)
+    publication = Publication(
+        SafetensorsReload(source, tmp_path / "served", (first.url, second.url), provider),
+        version=3,
+        stamp=stamps.append,
+    )
     # The launch version is stamped before anything is submitted, over whatever an earlier run left.
     assert stamps == [3] and publication.version == 3
     publication.load(source.variables, 4)
@@ -418,7 +437,7 @@ def test_a_publication_stamps_only_after_every_replica_serves_the_version(tmp_pa
     ("sglang", "body", "update_weights_from_disk answered 200.*shape mismatch"),
 ])
 def test_a_refused_reload_fails_the_push(tmp_path, replicas, provider, failure, refusal):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     (server,) = replicas(1)
     server.failure = failure
     with pytest.raises(RuntimeError, match=refusal):
@@ -435,8 +454,12 @@ def run_pool(directory, engine, processes=2, devices=2):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         coordinator = f"127.0.0.1:{probe.getsockname()[1]}"
-    environment = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-                   "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
+    environment = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}",
+    }
     outs = [directory / f"process{index}.json" for index in range(processes)]
     running = [subprocess.Popen([sys.executable, str(WORKER), "--out", str(out), "--coordinator", coordinator,
                                  "--processes", str(processes), "--process-id", str(index),
@@ -458,10 +481,18 @@ def run_pool(directory, engine, processes=2, devices=2):
 def test_a_pool_publishes_its_sharded_policy_once_and_every_process_hears_a_failure(tmp_path, replicas):
     (engine,) = replicas(1)
     reports = run_pool(tmp_path, engine.url)
-    assert all(report["processes"] == 2 and report["sharded"] and report["error"] is None for report in reports)
+    assert all(
+        report["processes"] == 2 and report["sharded"] and report["error"] is None for report in reports
+    )
     # Process 0 alone writes and posts: one sequence reaches the engine, not one per process.
-    assert paths(engine) == ["/pause", "/collective_rpc", "/reset_prefix_cache", "/update_weight_version", "/resume"]
-    assert_served(tmp_path / "served", doubled(load_pretrained(FIXTURE, dtype="float32")))
+    assert paths(engine) == [
+        "/pause",
+        "/collective_rpc",
+        "/reset_prefix_cache",
+        "/update_weight_version",
+        "/resume",
+    ]
+    assert_served(tmp_path / "served", doubled(Pretrained.load(FIXTURE, dtype="float32")))
 
     engine.seen.clear()
     engine.failure = "body"
@@ -490,10 +521,33 @@ def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp
     library.touch()
     root = Path(__file__).resolve().parents[1]
     done = subprocess.run(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--processes-per-host", "2", "--devices-per-process", "1",
-         "--", sys.executable, str(WORKER), "--directory", str(tmp_path / "served"), "--engine", engine.url,
-         "--publication", publication, "--library", str(library)],
-        cwd=root, env={**os.environ, "PYTHONPATH": str(root / "src")}, capture_output=True, text=True, timeout=600)
+        [
+            sys.executable,
+            "-m",
+            "dew.cli.main",
+            "launch",
+            "--processes-per-host",
+            "2",
+            "--devices-per-process",
+            "1",
+            "--",
+            sys.executable,
+            str(WORKER),
+            "--directory",
+            str(tmp_path / "served"),
+            "--engine",
+            engine.url,
+            "--publication",
+            publication,
+            "--library",
+            str(library),
+        ],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root / "src")},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
     lines = (done.stdout + done.stderr).splitlines()
     assert done.returncode == 0, "\n".join(lines)
     reports = {line[1]: json.loads(line.split(" report ", 1)[1]) for line in lines if " report {" in line}
@@ -501,8 +555,13 @@ def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp
     assert all(report["error"] is None and report["sharded"] for report in reports.values()), reports
     if publication == "nccl":
         assert reports["0"]["sent"] > 0 and reports["1"]["sent"] is None, reports
-    copies = {rank: sum(line.startswith(f"[{rank}] ") and "device-to-host transfer" in line and "dtype=BF16" in line
-                        for line in lines) for rank in "01"}
+    copies = {
+        rank: sum(
+            line.startswith(f"[{rank}] ") and "device-to-host transfer" in line and "dtype=BF16" in line
+            for line in lines
+        )
+        for rank in "01"
+    }
     assert copies["0"] > 0 and copies["1"] == 0, copies
 
 
@@ -572,7 +631,7 @@ def test_a_failed_nccl_push_opens_its_group_again_and_a_close_does_not_wait_for_
     side of the group, which stays open until the engine exits (a sender on
     4x RTX 3090 waited out jax.distributed's 300 s shutdown barrier)."""
     (engine,) = replicas(1)
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     library = tmp_path / "libnccl.so.2"
     library.touch()
     push = NCCLPush(source, (engine.url,), str(library))
@@ -591,13 +650,15 @@ def test_a_failed_nccl_push_opens_its_group_again_and_a_close_does_not_wait_for_
 
 
 @pytest.mark.mesh(devices=2)
-def test_an_nccl_push_holds_no_copy_of_the_policy_on_the_devices_that_do_not_send(tmp_path, replicas, libraries):
+def test_an_nccl_push_holds_no_copy_of_the_policy_on_the_devices_that_do_not_send(
+    tmp_path, replicas, libraries
+):
     """The pool gathers the policy to host leaf by leaf and sends it from
     one device, so the others hold nothing of it beyond their own shards.
     Replicated over the mesh first, each device held the whole policy:
     gpt-oss-20b is 38.96 GiB in bfloat16, more than a 24 GB GPU."""
     (engine,) = replicas(1)
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     devices = jax.devices()[:2]
     mesh = jax.sharding.Mesh(np.asarray(devices), ("pool",))
 

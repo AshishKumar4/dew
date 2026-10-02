@@ -9,7 +9,7 @@ The dataset is a registered spec and its fields are the command line, so the
 knobs here are the knobs a run has:
 
     python tools/benchmark_data.py --steps 100 data:oxford-flowers --data.image-size 128
-    python tools/benchmark_data.py data:vox-celeb2 --data.path /mnt/data/voxceleb2 --data.frames 16
+    python tools/benchmark_data.py data:local-videos --data.path /mnt/data/voxceleb2/train --data.frames 16
 """
 
 import os
@@ -29,8 +29,8 @@ from absl import flags  # noqa: E402
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-from dew.data import DatasetSpec, OxfordFlowers  # noqa: E402
-from dew import datasets  # noqa: E402  naming a registry fills it
+from dew.data import DatasetSpec, TFDSImages  # noqa: E402
+from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
@@ -42,7 +42,7 @@ else:
 
 @dataclass(frozen=True)
 class Benchmark:
-    data: AnySpec = field(default_factory=OxfordFlowers)
+    data: AnySpec = field(default_factory=TFDSImages)
     """Which dataset, with its own fields as flags."""
     batch: int = 32
     """Global batch size."""
@@ -85,10 +85,11 @@ def main(config: Benchmark) -> None:
     dataset = config.data.load(batch=config.batch)
     print(f"{datasets.name_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
-    from dew.training import build_mesh, data_partition
+    from dew.data import DataPartition
+    from dew.training import MeshSpec
 
     # The share this process reads on the plain data-parallel mesh.
-    source = dataset.train(data_partition(build_mesh()))
+    source = dataset.train(DataPartition.of(MeshSpec().build()))
     try:
         report(measure(source, config.steps, config.warmup), dataset.batch)
     finally:

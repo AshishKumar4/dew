@@ -8,10 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded
 from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import CFG, Heun
 
@@ -22,28 +23,38 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
     objective, state = make_run(tmp_path)
     task = TextToImage.from_objective(objective, state.params)
     key = jax.random.key(23)
-    raw = task(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
+    raw = task(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     prepared = task.prepare(["flower", "tree"], key=key)
     assert isinstance(prepared, DenoisingInputs) and prepared.rows == 2
-    again = task(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
+    again = task(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     np.testing.assert_array_equal(again, raw)
     loaded = TextToImage.from_run(str(tmp_path), ema=False)
-    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images,
-                               raw, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(
+        loaded(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images,
+        raw,
+        atol=2e-6,
+        rtol=2e-6,
+    )
     mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
-    np.testing.assert_array_equal(bound(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images, raw)
-    changed = task.bind(mutable)(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
+    np.testing.assert_array_equal(
+        bound(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images, raw
+    )
+    changed = task.bind(mutable)(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     assert np.max(np.abs(changed - raw)) > 1e-4
-    np.testing.assert_allclose(task("flower", steps=3, sampler=Heun(), key=key).host().images,
-                               task(["flower"], steps=3, sampler=Heun(), key=key).host().images, atol=0, rtol=0)
+    np.testing.assert_allclose(
+        task("flower", steps=3, solver=Heun(), key=key).host().images,
+        task(["flower"], steps=3, solver=Heun(), key=key).host().images,
+        atol=0,
+        rtol=0,
+    )
     with pytest.raises(ValueError, match="initial noise"):
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 
 
 def test_canvas_raw_media_processing_reaches_the_real_conditioner():
-    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as reference:
         prompt = np.asarray(reference["image_prompt"])
         pixels = np.asarray(reference["pixels"])
@@ -78,36 +89,35 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
     from dew.sampling import Euler
 
     objective, state = make_run(tmp_path)
-    task = replace(objective.pipeline(state), final_denoise=False, sampler=Euler())
+    task = replace(objective.pipeline(state), final_denoise=False, solver=Euler())
     shape = (1, *task.latent_shape)
     pixels = np.zeros(shape, np.float32)
     noise = np.full(shape, 0.25, np.float32)
     times = np.asarray(task.process.times(5))
-    prepared = task.prepare(["flower"], image=pixels, noise=noise, times=times, steps=5, seed=3)
+    prepared = task.prepare(["flower"], image=pixels, noise=noise, times=times, steps=5, key=3)
     _, sigma = task.process.sampler_schedule.rates(times[0])
     np.testing.assert_allclose(np.asarray(prepared.noise)[:1], float(sigma) * noise, atol=1e-6, rtol=1e-6)
-    full = task(prepared, seed=3, decode=False).host()
+    full = task(prepared, key=3, decode=False).host()
     assert full.images is None
     # The handoff carries the state at this grid point, not pixels or a newly noised image.
-    prefix = task(replace(prepared, times=tuple(times[:3])), seed=3, decode=False).host()
-    resumed = task.prepare(["flower"], initial=prefix.latents, times=times[2:], steps=5, seed=3)
+    prefix = task(replace(prepared, times=tuple(times[:3])), key=3, decode=False).host()
+    resumed = task.prepare(["flower"], initial=prefix.latents, times=times[2:], steps=5, key=3)
     np.testing.assert_array_equal(np.asarray(resumed.noise)[:1], prefix.latents)
-    tail = task(resumed, seed=3, decode=False).host()
+    tail = task(resumed, key=3, decode=False).host()
     np.testing.assert_allclose(tail.latents, full.latents, atol=1e-6, rtol=1e-6)
-    decoded = task(resumed, seed=3).host()
+    decoded = task(resumed, key=3).host()
     np.testing.assert_array_equal(decoded.images, np.clip(tail.latents, -1, 1))
     with pytest.raises(ValueError, match="already noisy"):
-        task.prepare(["flower"], initial=prefix.latents, noise=noise, seed=3)
+        task.prepare(["flower"], initial=prefix.latents, noise=noise, key=3)
 
 
 
 @pytest.mark.parametrize("family", ["diffusion-gemma-workflow", "gemma3-native-tiny"])
 def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     directory = FIXTURE.parent / family
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
     if family == "diffusion-gemma-workflow":
         with np.load(directory / "reference.npz") as reference:
             tokens = reference["image_prompt"]
@@ -121,20 +131,15 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
         task = loaded.text_generation()
     host_inputs = jax.tree.map(np.asarray, inputs)
     resident = replace(host_inputs, conditioning=jax.tree.map(jnp.asarray, host_inputs.conditioning))
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     variables = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
     task = task.bind(variables)
     key = jax.random.key(7)
     expected = task(host_inputs, 4, key=key).host()
     jax.block_until_ready(resident.conditioning)
-    if family == "diffusion-gemma-workflow":
-        with jax.transfer_guard_device_to_host("disallow"):
-            generated = task(resident, 4, key=key)
-            jax.block_until_ready(generated.tokens)
-    else:
-        # Autoregressive checkify reports scalar error status on the host;
-        # public result equivalence does not forbid that control-plane transfer.
+    with guarded(allow=("host_to_device", "device_to_device")):
         generated = task(resident, 4, key=key)
+        jax.block_until_ready(generated.tokens)
     actual = generated.host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(left, right)

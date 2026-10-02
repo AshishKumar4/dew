@@ -45,6 +45,7 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Protocol
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -383,14 +384,18 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
             values = rloo_advantage(rewards, size)
         else:
             values = group_advantage(rewards, size, normalise_by_std=estimator == "group")
-        per_session[order] = np.asarray(values, np.float32)
+        per_session[order] = np.asarray(jax.device_get(values), np.float32)
     return per_session
 
 
 def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Chain]:
     """The chains of every session that trains under `truncation`, in session order."""
-    return [chain for index, session in enumerate(sessions) if _trained_reward(session, truncation) is not None
-            for chain in _chains(session, index, width)]
+    return [
+        chain
+        for index, session in enumerate(sessions)
+        if _trained_reward(session, truncation) is not None
+        for chain in _chains(session, index, width)
+    ]
 
 
 def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
@@ -534,8 +539,10 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     if any(kept):
         totals = [sum(len(group) for group in groups) for groups in kept]
         if support_capacity is None:
-            raise ValueError("recorded supports pack to [rows, support_capacity]; pass a support_capacity "
-                             "(at least top_k times the sampled ids a row holds) so every batch has one shape")
+            raise ValueError(
+                "recorded supports pack to [rows, support_capacity]; pass a support_capacity "
+                "(at least top_k times the sampled ids a row holds) so every batch has one shape"
+            )
         if max(totals) > support_capacity:
             raise ValueError(f"a row's recorded supports keep {max(totals)} ids, "
                              f"more than support_capacity {support_capacity}")
@@ -543,7 +550,9 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
         columns = np.full((shape[0], support_capacity), -1, np.int32)
         for row, (groups, total) in enumerate(zip(kept, totals, strict=True)):
             ids[row, :total] = np.fromiter((token for group in groups for token in group), np.int32, total)
-            columns[row, :total] = np.repeat(np.asarray(owners[row], np.int32), [len(group) for group in groups])
+            columns[row, :total] = np.repeat(
+                np.asarray(owners[row], np.int32), [len(group) for group in groups]
+            )
         out[SUPPORT_KEY] = ids
         out[SUPPORT_COLUMNS_KEY] = columns
     return out
@@ -623,7 +632,9 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
         for session, _ in scored:
             for name, value in session.components.items():
                 components.setdefault(name, []).append(float(value))
-        metrics.update({f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()})
+        metrics.update(
+            {f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()}
+        )
     if latencies:
         seconds = np.asarray(latencies, np.float64)
         for label, quantile in (("p50", 50), ("p90", 90), ("p99", 99)):

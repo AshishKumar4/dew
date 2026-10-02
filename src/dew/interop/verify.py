@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 CONVENTION = "llama"
 """The registered family a verified unregistered type loads as."""
 
-_CONVENTION = replace(decoders._FAMILIES[CONVENTION], translate_config=decoders._base_config)
+_CONVENTION = replace(decoders.families()[CONVENTION], translate_config=decoders._base_config)
 """The convention reads every field `_base_config` shares, windows included,
 where the registered Llama family reads only what LlamaConfig declares; the
 probe, not the reference's declarations, is what admits a type's reading."""
@@ -64,7 +64,7 @@ _WINDOW = 4
 # plain floats.
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders._CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
-_FALLBACK = 'load_pretrained(..., fallback="torchax")'
+_FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # fp32 rounding between Dew and transformers on a registered family, in eps
 # per layer per unit of the largest reference logit. The thirteen dense and
 # routed tier-1 tiny fixtures (tests/fixtures/hf, written by
@@ -297,7 +297,9 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
             try:
                 decoders._check_tree(variables, model)
             except ValueError as error:
-                raise _refuse(model_type, f"its tensors do not fill the convention's model ({error})") from error
+                raise _refuse(
+                    model_type, f"its tensors do not fill the convention's model ({error})"
+                ) from error
             # `_ROUNDING` was measured at fp32 matmul precision; a GPU's
             # default runs fp32 matmuls in TF32, which alone misses it.
             with jax.default_matmul_precision("highest"):

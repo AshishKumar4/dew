@@ -29,8 +29,9 @@ its PIL image processor.
 import functools
 import json
 import math
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping, NamedTuple, TypedDict
+from typing import NamedTuple, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -64,7 +65,14 @@ def quick_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 
-@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed")})
+@logical_axes(
+    {
+        ("q_proj",): ("embed", "heads"),
+        ("k_proj",): ("embed", "kv"),
+        ("v_proj",): ("embed", "kv"),
+        ("out_proj",): ("attention", "embed"),
+    }
+)
 class CLIPAttention(nn.Module):
     """Self-attention with a bias on all four projections.
 
@@ -396,7 +404,9 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
         "intermediate_size": records.integer(text["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(text["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": records.integer(text["num_attention_heads"], "num_attention_heads"),
-        "max_position_embeddings": records.integer(text["max_position_embeddings"], "max_position_embeddings"),
+        "max_position_embeddings": records.integer(
+            text["max_position_embeddings"], "max_position_embeddings"
+        ),
         "layer_norm_eps": records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         "eos_token_id": eos_token_id,
         "activation": activation,
@@ -772,22 +782,17 @@ class CLIPModel:
 DEFAULT_T5_MODEL = "google-t5/t5-v1_1-xxl"
 
 
-def _t5_relative_position_bucket(relative_position, bidirectional, num_buckets, max_distance):
+def _t5_relative_position_bucket(relative_position, num_buckets, max_distance):
     """A relative distance into a bias-table row, modeling_t5.py
-    `T5Attention._relative_position_bucket`.
+    `T5Attention._relative_position_bucket` with the encoder's
+    `bidirectional=True`.
 
-    relative_position is memory_position - query_position. The encoder runs
-    bidirectional bucketing (`bidirectional=(not self.is_decoder)` with
-    is_decoder False upstream), so attended-to future positions take the
-    upper buckets; the flag stays for the reference's shape.
+    relative_position is memory_position - query_position, and attended-to
+    future positions take the upper half of the buckets.
     """
-    relative_buckets = 0
-    if bidirectional:
-        num_buckets //= 2
-        relative_buckets += (relative_position > 0).astype(jnp.int32) * num_buckets
-        relative_position = jnp.abs(relative_position)
-    else:
-        relative_position = -jnp.minimum(relative_position, 0)
+    num_buckets //= 2
+    relative_buckets = (relative_position > 0).astype(jnp.int32) * num_buckets
+    relative_position = jnp.abs(relative_position)
     max_exact = num_buckets // 2
     is_small = relative_position < max_exact
     large = max_exact + (
@@ -798,7 +803,15 @@ def _t5_relative_position_bucket(relative_position, bidirectional, num_buckets, 
     return relative_buckets + jnp.where(is_small, relative_position, large)
 
 
-@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed"), ("rel_bias",): (None, "heads")})
+@logical_axes(
+    {
+        ("q_proj",): ("embed", "heads"),
+        ("k_proj",): ("embed", "kv"),
+        ("v_proj",): ("embed", "kv"),
+        ("out_proj",): ("attention", "embed"),
+        ("rel_bias",): (None, "heads"),
+    }
+)
 class T5SelfAttention(nn.Module):
     """Multi-head self-attention with the relative position bias, no causal
     mask and no 1/sqrt(d) scale, modeling_t5.py `T5Attention` as the encoder
@@ -841,16 +854,9 @@ class T5SelfAttention(nn.Module):
         key = self.k_proj(hidden_states).reshape(heads)
         value = self.v_proj(hidden_states).reshape(heads)
         if position_bias is None:
-            if self.has_relative_attention_bias:
-                relative = (jnp.arange(length)[None, :] - jnp.arange(length)[:, None])
-                buckets = _t5_relative_position_bucket(
-                    relative, bidirectional=True, num_buckets=self.num_buckets,
-                    max_distance=self.max_distance)
-                position_bias = jnp.transpose(
-                    self.rel_bias(buckets), (2, 0, 1))[None]
-            else:
-                position_bias = jnp.zeros((1, self.num_heads, length, length),
-                                          jnp.float32)
+            relative = (jnp.arange(length)[None, :] - jnp.arange(length)[:, None])
+            buckets = _t5_relative_position_bucket(relative, self.num_buckets, self.max_distance)
+            position_bias = jnp.transpose(self.rel_bias(buckets), (2, 0, 1))[None]
         mask = None
         if attention_mask is not None:
             mask = jnp.asarray(attention_mask)[:, None, None, :] != 0
@@ -881,17 +887,6 @@ class T5DenseReluDense(nn.Module):
         hidden_states = self.dropout(hidden_states, deterministic=not train)
         return self.wo(hidden_states)
 
-def _gelu_new(x):
-    """transformers' `NewGELUActivation`, which T5 v1.1 gates with: 0.5 x (1 +
-    tanh(sqrt(2/pi) (x + 0.044715 x^3))).
-
-    `jax.nn.gelu` with `approximate=True` is that formula; the erf one,
-    `approximate=False`, rounds differently once |x| passes 5 (4.7e-4 apart
-    at |x| = 11 in fp32, measured against `ACT2FN["gelu_new"]`).
-    """
-    return jax.nn.gelu(x, approximate=True)
-
-
 @logical_axes({("wi_0",): ("embed", "mlp"), ("wi_1",): ("embed", "mlp"), ("wo",): ("mlp", "embed")})
 class T5DenseGatedGeluDense(nn.Module):
     """wi_0 through gelu times wi_1, then wo, modeling_t5.py
@@ -910,7 +905,10 @@ class T5DenseGatedGeluDense(nn.Module):
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, hidden_states, train: bool = False):
-        hidden_states = _gelu_new(self.wi_0(hidden_states)) * self.wi_1(hidden_states)
+        # transformers' `NewGELUActivation`, 0.5 x (1 + tanh(sqrt(2/pi) (x +
+        # 0.044715 x^3))). The erf GELU rounds differently once |x| passes 5
+        # (4.7e-4 apart at |x| = 11 in fp32, against `ACT2FN["gelu_new"]`).
+        hidden_states = jax.nn.gelu(self.wi_0(hidden_states), approximate=True) * self.wi_1(hidden_states)
         hidden_states = self.dropout(hidden_states, deterministic=not train)
         return self.wo(hidden_states)
 

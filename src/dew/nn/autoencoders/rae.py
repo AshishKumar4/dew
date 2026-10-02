@@ -1,29 +1,21 @@
 """Representation autoencoders, diffusers' `AutoencoderRAE`.
 
-An independent linen port of diffusers 0.40.0
-src/diffusers/models/autoencoders/autoencoder_rae.py (Apache-2.0) and of the
-frozen encoders it builds from transformers 4.57.1 (DINOv2 with registers,
-SigLIP, ViT-MAE), channels last. An RAE encodes an image with a pretrained
-representation encoder, frozen, and reads its patch tokens as the latent: a
-`[grid, grid, width]` map whatever the image's size, since the image is
-resized (bicubic, as torch computes it) to the encoder's input first. A ViT
-decoder paints one patch per token.
+An independent linen port of diffusers 0.40.0 autoencoder_rae.py
+(Apache-2.0) and the frozen encoders it builds from transformers 4.57.1
+(DINOv2 with registers, SigLIP, ViT-MAE), channels last. The latent is the
+frozen encoder's patch tokens, a `[grid, grid, width]` map whatever the image
+size, since the image is first resized (bicubic, as torch computes it) to
+the encoder's input; a ViT decoder paints one patch per token.
 
-The three encoders are one pre-norm ViT and differ in their tables:
-
-- DINOv2 prepends a class token and four registers, scales each residual
-  branch by a learned layer scale, and resizes its 37x37 position table
-  (its 518-pixel pretraining) with antialiasing;
-- SigLIP has neither extra token and a tanh GELU;
-- ViT-MAE prepends a class token; its table is the 224-pixel one. The source
-  runs it with masking off, which keeps every patch in order.
-
-Each ends in a layer norm without scale or bias, as the source strips them,
-and the latent is the patch tokens alone. transformers' plain `Dinov2Model`,
-which REPA aligns to, is the same encoder as `dinov2_plain`: one class token,
-no registers, its table resized without antialiasing, its final norm kept
-(`load_dinov2`). The decoder's position table is the
-2-D sine-cosine one diffusers computes, a zero row for its class token first.
+The encoders are one pre-norm ViT with different tables: DINOv2 prepends a
+class token and four registers, scales each residual branch by a layer
+scale, and resizes its 37x37 position table with antialiasing; SigLIP has
+neither token and a tanh GELU; ViT-MAE prepends a class token at its
+224-pixel table, run with masking off. Each ends in an affine-free layer
+norm. `dinov2_plain` is transformers' `Dinov2Model`, which REPA aligns to:
+one class token, no registers, no antialiasing, its final norm kept
+(`load_dinov2`). The decoder's table is diffusers' 2-D sine-cosine one with a
+zero class row first.
 """
 from __future__ import annotations
 
@@ -46,10 +38,10 @@ from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import AutoEncoder
+from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 HEAD_WIDTH = 64
 """Every encoder's attention head width; the source sets the heads from it."""
@@ -120,7 +112,9 @@ class _Block(nn.Module):
             return branch * self.param(name, nn.initializers.ones, (self.width,))
 
         norm = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm1")
-        x = x + scaled(_Attention(self.width, self.heads, self.dtype, name="attention")(norm(x)), "layer_scale1")
+        x = x + scaled(
+            _Attention(self.width, self.heads, self.dtype, name="attention")(norm(x)), "layer_scale1"
+        )
         hidden = nn.Dense(self.intermediate, dtype=self.dtype, name="fc1")(
             LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm2")(x))
         hidden = jax.nn.gelu(hidden, approximate=self.activation == "gelu_pytorch_tanh")
@@ -146,8 +140,11 @@ class RepresentationEncoder(nn.Module):
                       dtype=self.dtype, name="patch")(pixels)
         batch = tokens.shape[0]
         classes = int(spec.leading > 0)
-        positions = self.param("position_embeddings", nn.initializers.zeros,
-                               (1, classes + table * table, self.width) if classes else (table * table, self.width))
+        positions = self.param(
+            "position_embeddings",
+            nn.initializers.zeros,
+            (1, classes + table * table, self.width) if classes else (table * table, self.width),
+        )
         positions = positions.reshape(classes + table * table, self.width)
         patches = positions[classes:].reshape(1, table, table, self.width)
         if table != grid:
@@ -157,7 +154,9 @@ class RepresentationEncoder(nn.Module):
             cls_token = self.param("cls_token", nn.initializers.zeros, (1, 1, self.width)) + positions[:1]
             leading = [jnp.broadcast_to(cls_token, (batch, 1, self.width))]
             if spec.leading > 1:
-                registers = self.param("register_tokens", nn.initializers.zeros, (1, spec.leading - 1, self.width))
+                registers = self.param(
+                    "register_tokens", nn.initializers.zeros, (1, spec.leading - 1, self.width)
+                )
                 leading.append(jnp.broadcast_to(registers, (batch, spec.leading - 1, self.width)))
             tokens = jnp.concatenate([*leading, tokens], axis=1)
         intermediate = spec.intermediate or 4 * self.width
@@ -188,17 +187,22 @@ class _Decoder(nn.Module):
         if latents.shape[1:3] != (self.grid, self.grid):
             raise ValueError(f"an RAE decodes a {self.grid}x{self.grid} latent, not "
                              f"{latents.shape[1]}x{latents.shape[2]}")
-        tokens = nn.Dense(self.width, dtype=self.dtype, name="embed")(latents.reshape(batch, -1, latents.shape[-1]))
+        tokens = nn.Dense(self.width, dtype=self.dtype, name="embed")(
+            latents.reshape(batch, -1, latents.shape[-1])
+        )
         cls_token = self.param("cls_token", nn.initializers.zeros, (1, 1, self.width))
-        tokens = jnp.concatenate([jnp.broadcast_to(cls_token, (batch, 1, self.width)).astype(tokens.dtype), tokens],
-                                 axis=1)
+        tokens = jnp.concatenate(
+            [jnp.broadcast_to(cls_token, (batch, 1, self.width)).astype(tokens.dtype), tokens], axis=1
+        )
         positions = sincos_position(self.width, self.grid, base_size=16)
         tokens = tokens + jnp.concatenate([jnp.zeros((1, 1, self.width)), positions], axis=1)
         for index in range(self.layers):
             tokens = _Block(self.width, self.heads, self.intermediate, 1e-12, "gelu", dtype=self.dtype,
                             name=f"layers_{index}")(tokens)
         tokens = LayerNorm(epsilon=1e-12, dtype=self.dtype, name="norm")(tokens)
-        patches = nn.Dense(self.patch * self.patch * self.channels, dtype=self.dtype, name="pred")(tokens[:, 1:])
+        patches = nn.Dense(self.patch * self.patch * self.channels, dtype=self.dtype, name="pred")(
+            tokens[:, 1:]
+        )
         patches = patches.reshape(batch, self.grid, self.grid, self.patch, self.patch, self.channels)
         return patches.transpose(0, 1, 3, 2, 4, 5).reshape(
             batch, self.grid * self.patch, self.grid * self.patch, self.channels)
@@ -244,8 +248,14 @@ class RAE(nn.Module):
         return self.input_size // self.encoder_patch
 
     def setup(self):
-        self.encoder = RepresentationEncoder(self.kind, self.encoder_width, self.encoder_layers, self.encoder_patch,
-                                              self.input_size, self.dtype)
+        self.encoder = RepresentationEncoder(
+            self.kind,
+            self.encoder_width,
+            self.encoder_layers,
+            self.encoder_patch,
+            self.input_size,
+            self.dtype,
+        )
         self.decoder = _Decoder(self.decoder_width, self.decoder_layers, self.decoder_heads,
                                 self.decoder_intermediate, self.grid, self.patch, dtype=self.dtype)
 
@@ -288,13 +298,19 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
         return tuple(records.number(entry, name) for entry in value)
 
     fields = RAEFields(
-        kind=kind, encoder_width=integer("encoder_hidden_size", 768),
-        encoder_layers=integer("encoder_num_hidden_layers", 12), encoder_patch=integer("encoder_patch_size", 14),
-        input_size=integer("encoder_input_size", 224), decoder_width=integer("decoder_hidden_size", 512),
-        decoder_layers=integer("decoder_num_hidden_layers", 8), decoder_heads=integer("decoder_num_attention_heads", 16),
-        decoder_intermediate=integer("decoder_intermediate_size", 2048), patch=integer("patch_size", 16),
+        kind=kind,
+        encoder_width=integer("encoder_hidden_size", 768),
+        encoder_layers=integer("encoder_num_hidden_layers", 12),
+        encoder_patch=integer("encoder_patch_size", 14),
+        input_size=integer("encoder_input_size", 224),
+        decoder_width=integer("decoder_hidden_size", 512),
+        decoder_layers=integer("decoder_num_hidden_layers", 8),
+        decoder_heads=integer("decoder_num_attention_heads", 16),
+        decoder_intermediate=integer("decoder_intermediate_size", 2048),
+        patch=integer("patch_size", 16),
         pixel_mean=per_channel("encoder_norm_mean", (0.485, 0.456, 0.406)),
-        pixel_std=per_channel("encoder_norm_std", (0.229, 0.224, 0.225)))
+        pixel_std=per_channel("encoder_norm_std", (0.229, 0.224, 0.225)),
+    )
     if fields["input_size"] % fields["encoder_patch"]:
         raise ValueError(f"encoder_input_size {fields['input_size']} is not a multiple of "
                          f"encoder_patch_size {fields['encoder_patch']}")
@@ -304,16 +320,30 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
     return fields
 
 _LAYER = {
-    "norm1": "norm1", "layernorm_before": "norm1", "layer_norm1": "norm1",
-    "norm2": "norm2", "layernorm_after": "norm2", "layer_norm2": "norm2",
-    "attention.attention.query": "attention.query", "attention.attention.key": "attention.key",
-    "attention.attention.value": "attention.value", "attention.output.dense": "attention.out",
-    "self_attn.q_proj": "attention.query", "self_attn.k_proj": "attention.key", "self_attn.v_proj": "attention.value",
+    "norm1": "norm1",
+    "layernorm_before": "norm1",
+    "layer_norm1": "norm1",
+    "norm2": "norm2",
+    "layernorm_after": "norm2",
+    "layer_norm2": "norm2",
+    "attention.attention.query": "attention.query",
+    "attention.attention.key": "attention.key",
+    "attention.attention.value": "attention.value",
+    "attention.output.dense": "attention.out",
+    "self_attn.q_proj": "attention.query",
+    "self_attn.k_proj": "attention.key",
+    "self_attn.v_proj": "attention.value",
     "self_attn.out_proj": "attention.out",
-    "attention.to_q": "attention.query", "attention.to_k": "attention.key", "attention.to_v": "attention.value",
+    "attention.to_q": "attention.query",
+    "attention.to_k": "attention.key",
+    "attention.to_v": "attention.value",
     "attention.to_out.0": "attention.out",
-    "mlp.fc1": "fc1", "intermediate.dense": "fc1", "mlp.fc2": "fc2", "output.dense": "fc2",
-    "layer_scale1": "layer_scale1", "layer_scale2": "layer_scale2",
+    "mlp.fc1": "fc1",
+    "intermediate.dense": "fc1",
+    "mlp.fc2": "fc2",
+    "output.dense": "fc2",
+    "layer_scale1": "layer_scale1",
+    "layer_scale2": "layer_scale2",
 }
 """A layer's module, after its index, in each source's naming, and the port's."""
 
@@ -381,7 +411,7 @@ def _statistic(values, grid: int, width: int, default: float) -> np.ndarray | fl
     return array.transpose(1, 2, 0)
 
 
-class RAEAutoencoder(AutoEncoder):
+class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     """Native RAE weights and the source's latent normalization,
     `(z - latents_mean) / (latents_std + 1e-5) * scaling_factor` on the way
     out and its inverse on the way in, per latent position where the
@@ -389,12 +419,11 @@ class RAEAutoencoder(AutoEncoder):
 
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):
-        self.model = model
-        self.params = params
+        super().__init__(model, params)
         self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
-        self.latent_scale = scaling_factor / (_statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5)
-        self._encode = jax.jit(lambda params, images: model.apply({"params": params}, images, method=model.encode))
-        self._decode = jax.jit(lambda params, latents: model.apply({"params": params}, latents, method=model.decode))
+        self.latent_scale = scaling_factor / (
+            _statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5
+        )
 
     @property
     def downscale_factor(self) -> int:
@@ -408,16 +437,16 @@ class RAEAutoencoder(AutoEncoder):
         *lead, _, _, _ = shape
         return (*lead, self.model.grid, self.model.grid, self.latent_channels)
 
-    def encode_batch(self, params, x, key=None):
-        return self._encode(params, x)
 
-    def decode_batch(self, params, z):
-        return self._decode(params, z)
-
-
-def load_rae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None, subfolder: str = "",
-             param_dtype: str = "float32", params: Variables | None = None
-             ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
+def load_rae(
+    name_or_dir: str | Path,
+    compute=jnp.float32,
+    *,
+    revision: str | None = None,
+    subfolder: str = "",
+    param_dtype: str = "float32",
+    params: Variables | None = None,
+) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
     `nyu-visionx/RAE-dinov2-wReg-base-ViTXL-n08`. Every tensor the module
@@ -427,10 +456,14 @@ def load_rae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | No
     source layouts are returned."""
     from dew.interop import diffusion, sources
 
-    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,) if params is None else False)
+    directory = sources.snapshot(
+        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
+    )
     config = json.loads((directory / subfolder / "config.json").read_text())
     if config.get("_class_name") != "AutoencoderRAE":
-        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderRAE")
+        raise ValueError(
+            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderRAE"
+        )
     model = RAE(**rae_fields(config), dtype=compute)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
@@ -450,30 +483,30 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
                 param_dtype: str = "float32", params: Variables | None = None
                 ) -> tuple[RepresentationEncoder, Variables, tuple[WeightLayout, ...]]:
     """Build a transformers `Dinov2Model` checkpoint, such as
-    `facebook/dinov2-base`, as a `RepresentationEncoder` of kind
-    `dinov2_plain` at the checkpoint's 518-pixel input, its parameters, and
-    their source layouts under `representation`. Its tensors are named as an
-    RAE's DINOv2 encoder's are, without the `encoder.` in front.
-
-    The encoder reads ImageNet-normalized `[B, S, S, 3]` pixels at its
-    `input_size`; `module.clone(input_size=224)` reads 224-pixel ones with
-    the position table resized to the 16x16 grid, as `Dinov2Model` resizes
-    it for a 224-pixel image.
-
-    Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    `facebook/dinov2-base`, as a `dinov2_plain` `RepresentationEncoder` at its
+    518-pixel input, with its parameters and their source layouts under
+    `representation`. It reads ImageNet-normalized `[B, S, S, 3]` pixels;
+    `module.clone(input_size=224)` resizes the table to the 16x16 grid as
+    `Dinov2Model` does. Supplied `params` are bound unchanged, only the config
+    is read, and no layouts are returned."""
     from dew.interop import diffusion, sources
 
     directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)
     config = json.loads((directory / "config.json").read_text())
-    if config.get("model_type") != "dinov2" or config.get("use_swiglu_ffn") or config.get("hidden_act") != "gelu":
+    if (
+        config.get("model_type") != "dinov2"
+        or config.get("use_swiglu_ffn")
+        or config.get("hidden_act") != "gelu"
+    ):
         raise ValueError(f"{directory} is not a GELU Dinov2Model; the port computes that one")
     geometry = (config.get("image_size"), config.get("mlp_ratio"), config.get("layer_norm_eps"),
                 config["hidden_size"] // config["num_attention_heads"])
     if geometry != (ENCODERS["dinov2_plain"].table_size, 4, ENCODERS["dinov2_plain"].epsilon, HEAD_WIDTH):
-        raise ValueError(f"the port reads a DINOv2 with a 518-pixel position table, a 4x feed-forward, norms at "
-                         f"1e-6 and {HEAD_WIDTH}-wide heads, not (image_size, mlp_ratio, layer_norm_eps, head "
-                         f"width) {geometry}")
+        raise ValueError(
+            f"the port reads a DINOv2 with a 518-pixel position table, a 4x feed-forward, norms at "
+            f"1e-6 and {HEAD_WIDTH}-wide heads, not (image_size, mlp_ratio, layer_norm_eps, head "
+            f"width) {geometry}"
+        )
     module = RepresentationEncoder("dinov2_plain", config["hidden_size"], config["num_hidden_layers"],
                                    config["patch_size"], config["image_size"], compute)
     layouts: tuple[WeightLayout, ...] = ()

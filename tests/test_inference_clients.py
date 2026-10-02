@@ -2,16 +2,18 @@
 
 import asyncio
 import json
+from importlib import import_module
 
 import pytest
 
-ollama = pytest.importorskip("ollama", reason="optional inference-clients extra")
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-import httpx
-import httpx2
-
 from dew.inference import OllamaCompletion, OpenAICompletion, Usage
 from dew.sampling import Sampling
+
+ollama = pytest.importorskip("ollama", reason="optional inference-clients extra")
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+httpx = import_module("httpx")
+httpx2 = import_module("httpx2")
+
 
 
 def response(choices, **fields):
@@ -66,7 +68,9 @@ def test_requested_sampling_overrides_hidden_ollama_penalties(clients):
 
 
 def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(clients):
-    task, calls = clients("openai", lambda http, request, body: http.Response(200, json=response([choice(0, "ok")])))
+    task, calls = clients(
+        "openai", lambda http, request, body: http.Response(200, json=response([choice(0, "ok")]))
+    )
     from dataclasses import replace
     sampling = Sampling(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1, eos_id=2)
     with pytest.raises(ValueError, match="vllm"):
@@ -79,7 +83,12 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
     # The SDK writes extra_body over the named parameters, so a policy field
     # hidden there would reach the backend after the named checks passed.
     policy = Sampling(temperature=0, top_p=0.5)
-    for hidden in ({"temperature": 1.5}, {"top_p": 1.0}, {"presence_penalty": 2}, {"repetition_penalty": 1.3}):
+    for hidden in (
+        {"temperature": 1.5},
+        {"top_p": 1.0},
+        {"presence_penalty": 2},
+        {"repetition_penalty": 1.3},
+    ):
         with pytest.raises(ValueError, match="conflict"):
             vllm("prompt", 5, sampling=policy, extra_body=hidden)
         with pytest.raises(ValueError, match="conflict"):
@@ -92,12 +101,56 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
     assert calls[1]["presence_penalty"] == 0.0 and calls[1]["guided_regex"] == "[a-z]+"
 
 
+def test_a_policys_penalties_reach_the_wire_where_they_mean_the_same_and_refuse_elsewhere(clients):
+    """Presence and frequency penalties are OpenAI's, which Dew's follow, and
+    vLLM's repetition penalty is Transformers'; controls a remote engine
+    applies differently (Ollama's windowed penalties, stripped stop strings)
+    are refused rather than dropped."""
+    from dataclasses import replace
+
+    task, calls = clients(
+        "openai", lambda http, request, body: http.Response(200, json=response([choice(0, "ok")]))
+    )
+    penalized = Sampling(temperature=0.7, presence_penalty=0.5, frequency_penalty=0.25)
+    task("prompt", 5, sampling=penalized)
+    assert (calls[0]["presence_penalty"], calls[0]["frequency_penalty"]) == (0.5, 0.25)
+    with pytest.raises(ValueError, match="repetition-penalty"):
+        task("prompt", 5, sampling=Sampling(repetition_penalty=1.1))
+    replace(task, provider="vllm")("prompt", 5, sampling=Sampling(repetition_penalty=1.1))
+    assert calls[1]["repetition_penalty"] == 1.1
+    for unmatched in ({"stop": ("\n",)}, {"no_repeat_ngram_size": 3}, {"typical_p": 0.9}):
+        with pytest.raises(ValueError, match=next(iter(unmatched))):
+            replace(task, provider="vllm")("prompt", 5, sampling=Sampling(**unmatched))
+    ollama, sent = clients("ollama", lambda http, request, body: http.Response(200, json={"response": "ok"}))
+    with pytest.raises(ValueError, match="presence_penalty"):
+        ollama("prompt", 5, sampling=penalized)
+    assert len(calls) == 2 and not sent
+
+
+@pytest.mark.parametrize("kind", ["ollama", "openai"])
+def test_integer_and_jax_keys_reach_the_same_native_wire_seed(clients, kind):
+    import jax
+
+    def network(http, request, body):
+        answer = {"response": "ok"} if kind == "ollama" else response([choice(0, "ok")])
+        return http.Response(200, json=answer)
+
+    task, calls = clients(kind, network)
+    task("prompt", 3, key=17)
+    task("prompt", 3, key=jax.random.key(17))
+    fields = [call["options"] if kind == "ollama" else call for call in calls]
+    assert fields[0]["seed"] == fields[1]["seed"] == 17
+    with pytest.raises(ValueError, match="key="):
+        task("prompt", 3, seed=17)
+    assert len(calls) == 2
+
+
 def test_ollama_retains_sdk_metadata_and_full_options(clients):
     def network(http, request, body):
         return http.Response(200, json={"response": body["prompt"].upper(), "done_reason": "length",
                                         "context": [4, 5], "logprobs": [{"token": "A", "logprob": -0.7}]})
     task, calls = clients("ollama", network)
-    result = task(["a", "b"], 7, seed=3,
+    result = task(["a", "b"], 7, key=3,
                   options={"top_p": 0.6, "min_p": 0.1, "repeat_penalty": 1.5},
                   raw=True, system="system", format={"type": "object"},
                   images=[b"image bytes"], logprobs=True, think=True)
@@ -126,7 +179,9 @@ def test_ollama_malformed_or_negative_wire_values_fail(clients, answer):
 
 
 def test_genuine_empty_text_zero_usage_and_absent_reason_remain_distinct(clients):
-    task, _ = clients("ollama", lambda http, request, body: http.Response(200, json={"response": "", "eval_count": 0}))
+    task, _ = clients(
+        "ollama", lambda http, request, body: http.Response(200, json={"response": "", "eval_count": 0})
+    )
     result = task("a", 0)
     assert result.texts == ("",) and result.token_counts == (0,) and result.finish_reasons == (None,)
 
@@ -137,7 +192,7 @@ def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
             choice(1, "second", "length", token_ids=[2]), choice(0, "first", "stop", token_ids=[1])],
             usage={"prompt_tokens": 3, "completion_tokens": 7, "total_tokens": 10}))
     task, calls = clients("openai", network)
-    result = task(["a", "b"], 8, seed=9, top_p=0.7, logprobs=2,
+    result = task(["a", "b"], 8, key=9, top_p=0.7, logprobs=2,
                   extra_body={"top_k": 3, "min_p": 0.1, "return_tokens_as_token_ids": True})
     assert result.texts == ("first", "second") and result.finish_reasons == ("stop", "length")
     assert result.token_counts == (None, None)
@@ -149,7 +204,7 @@ def test_openai_keeps_aggregate_usage_separate_and_associates_choices(clients):
 
 @pytest.mark.parametrize("choices", [
     [choice(0, "a"), choice(0, "b")], [choice(0.9, "a"), choice(0.1, "b")],
-    [choice(True, "a"), choice(0, "b")], [choice(2, "a"), choice(0, "b")],
+    [choice(index=True, text="a"), choice(0, "b")], [choice(2, "a"), choice(0, "b")],
     [{"text": "a"}, choice(1, "b")], [choice(0, None), choice(1, "b")], [{}, {}],
 ])
 def test_openai_refuses_ambiguous_or_malformed_prompt_associations(clients, choices):
@@ -178,7 +233,9 @@ def test_multiple_choices_and_absent_usage_are_preserved(clients):
 
 @pytest.mark.parametrize("kind", ["ollama", "openai"])
 def test_bad_budgets_fail_before_network_and_sdk_errors_propagate(clients, kind):
-    task, calls = clients(kind, lambda http, request, body: http.Response(404, json={"error": "missing model"}))
+    task, calls = clients(
+        kind, lambda http, request, body: http.Response(404, json={"error": "missing model"})
+    )
     for budget in (-1, True, 1.5):
         with pytest.raises(ValueError):
             task("prompt", budget)
@@ -205,20 +262,34 @@ def test_native_streams_and_chat_keep_tools_structured_outputs_and_media(clients
                                             "created": 1, "choices": [{"index": 0, "message": message,
                                                                        "finish_reason": "tool_calls"}]})
         if kind == "ollama":
-            return http.Response(200, content='{"response":"part","done":false}\n{"response":"","done":true,"eval_count":1}\n')
+            return http.Response(
+                200, content='{"response":"part","done":false}\n{"response":"","done":true,"eval_count":1}\n'
+            )
         records = [response([choice(0, "part")]), response([choice(0, "", "stop")])]
-        return http.Response(200, headers={"Content-Type": "text/event-stream"},
-                             content="".join(f"data: {json.dumps(item)}\n\n" for item in records) + "data: [DONE]\n\n")
+        return http.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content="".join(f"data: {json.dumps(item)}\n\n" for item in records) + "data: [DONE]\n\n",
+        )
+
     task, calls = clients(kind, network)
-    streamed = list(task.stream("prompt", 5, seed=7))
+    streamed = list(task.stream("prompt", 5, key=7))
     if kind == "ollama":
         assert [chunk.response for chunk in streamed] == ["part", ""]
         options = {"format": {"type": "object"}}
         messages = [{"role": "tool", "content": "verified", "tool_name": "verify", "images": ["aW1hZ2U="]}]
     else:
         assert [chunk.choices[0].text for chunk in streamed] == ["part", ""]
-        options = {"response_format": {"type": "json_object"}, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-        messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}}]}]
+        options = {
+            "response_format": {"type": "json_object"},
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}}],
+            }
+        ]
     tool = {"type": "function", "function": {"name": "verify", "parameters": {"type": "object"}}}
     chat = task.chat(messages, 9, tools=[tool], **options)
     message = chat.message if kind == "ollama" else chat.choices[0].message

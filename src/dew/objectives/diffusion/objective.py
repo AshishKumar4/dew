@@ -6,16 +6,18 @@ conditions are the `InputSpec`; every draw comes from the step's key. The
 frozen encoders' weights live in the tree's `encoders` collection, so they
 reach the compiled step as arguments and the optimizer never sees them. The
 unconditional branch is a pure function of those frozen weights and a fixed
-prompt, so the objective encodes it once, when it is built, and the step
-reads that: the tower runs over the batch and nothing else, once a step.
+prompt, so the objective encodes it once, on first use, and the step reads
+that: the tower runs over the batch and nothing else, once a step.
 
-Evaluation samples a few images from the validation batch's conditions with
-the averaged weights, through the same `sample` inference uses.
+Evaluation samples one image per validation row from its conditions, with the
+averaged weights when the run keeps them, through the same `sample` inference
+uses; the preview hook limits itself to the display count.
 """
 
 from __future__ import annotations
 
 import copy
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -23,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from jax.core import eval_context
 
 from dew.artifacts import ImageGrid, VideoGrid, agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
@@ -34,7 +37,18 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.mp import Uncertainty
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
+from dew.objectives.base import (
+    Aux,
+    EMASpec,
+    Objective,
+    PathFilter,
+    Ratio,
+    Step,
+    Variables,
+    freeze,
+    thaw,
+    under,
+)
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, EndToEnd
 from dew.registry import objectives
@@ -70,6 +84,14 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 """What trains beside the model under `params` and the model never reads."""
 
 
+def _own_loss(name: str, kwargs: dict) -> None:
+    """Refuse the denoising loss's extras, which an objective with its own
+    loss would leave unused."""
+    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+    if unused:
+        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+
+
 def _without_loss_heads(variables: Variables) -> Variables:
     """`variables` without what the model never reads: the uncertainty head,
     the alignment projector, the frozen representation encoder, and an
@@ -80,18 +102,20 @@ def _without_loss_heads(variables: Variables) -> Variables:
             for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER, SPECTRAL)}
 
 
-def check_solver(process, sampler, steps: int) -> None:
+def check_solver(process, solver, steps: int) -> None:
     """Trace a solver step on the objective's actual sampling grid."""
+    if isinstance(solver, str):
+        raise TypeError(f"solver={solver!r} names a solver; pass the solver itself, as Euler()")
     x = jnp.zeros((1, 1), jnp.float32)
     with jax.ensure_compile_time_eval():
         times = process.times(steps)
-    state = sampler.init(x, times, process, key=jax.random.PRNGKey(0))
+    state = solver.init(x, times, process, key=jax.random.PRNGKey(0))
     if times.shape[0] < 2:
         return
     t, t_next = times[:1], times[1:2]
     key = jax.ShapeDtypeStruct((2,), jnp.uint32)
     jax.eval_shape(
-        lambda x, key: sampler.step(x, t, t_next, x, x, state, key, process,
+        lambda x, key: solver.step(x, t, t_next, x, x, state, key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
 
@@ -108,8 +132,12 @@ class TunedLatents(NamedTuple):
     terms: dict[str, jax.Array]
 
 
+_DEFAULT_SOLVER = DDIM()
+_DEFAULT_GUIDANCE = CFG(3.0)
+
+
 @objectives("diffusion")
-class DiffusionObjective(Objective[Mean]):
+class DiffusionObjective(Objective[Ratio]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
     def __init__(
@@ -121,18 +149,19 @@ class DiffusionObjective(Objective[Mean]):
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
-        sampler: Solver = DDIM(),
-        guidance: Guidance | None = CFG(3.0),
+        solver: Solver = _DEFAULT_SOLVER,
+        guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int = 200,
         pretrained: Variables | None = None,
         uncertainty: int | None = None,
         alignment: Alignment | None = None,
         end_to_end: EndToEnd | None = None,
+        trainable: PathFilter | None = None,
     ):
         """Build a denoising objective over `model` for the `inputs` field.
 
         `process` is a preset or a custom `Process`; presets build once here.
-        `sampler`, `guidance` and `steps` are how evaluation samples;
+        `solver`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction.
 
         `uncertainty` learns EDM2's loss weighting (Karras et al. 2024,
@@ -156,15 +185,25 @@ class DiffusionObjective(Objective[Mean]):
         latents a batch norm normalizes, its running statistics held in
         the `LATENT_STATS` collection. A published task carries the tuned
         autoencoder with those statistics as its latent normalization.
+
+        `trainable` selects the model leaves the optimizer moves, by their
+        full path; the rest of the model rides under `FROZEN`, as
+        `LMObjective` keeps it. An adapted pipeline's filter
+        (`dew.lora.LoRA.trainable`) goes here. It chooses among the model's
+        own leaves, so it takes the denoising loss alone, without the heads
+        `uncertainty`, `alignment` and `end_to_end` train beside the model.
+        None trains every leaf.
         """
         self.model = model
         self.process = build_process(process)
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.pretrained = pretrained
+        self._condition_precision = jax.config.jax_default_matmul_precision
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         self.alignment = alignment
         self.end_to_end = end_to_end
+        self.trainable = trainable
         if end_to_end is not None and (
                 alignment is None or not isinstance(autoencoder, ModuleAutoEncoder)
                 or not isinstance(autoencoder.model, AutoencoderKL) or inputs.mask is not None):
@@ -172,29 +211,36 @@ class DiffusionObjective(Objective[Mean]):
                              "needs `alignment`, a KL autoencoder and no masked-image input")
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
-        # The unconditional branch is a pure function of the frozen towers
-        # and each condition's fixed datum, so it is encoded here, once, and
-        # not inside every step and every sample. A few hundred kilobytes of
-        # host arrays, which a compiled step takes as a constant; the towers
-        # themselves stay in the state, for the reason `held_variables` gives.
-        self.unconditional_conditions = jax.tree.map(
-            np.asarray, self.encode(self.encoder_params()))
         self.unconditional_prob = unconditional_prob
-        self.sampler = sampler
+        self.solver = solver
         self.guidance = guidance
         self.steps = steps
         self.ema = (None if ema_decay is None else
                     EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, sampler, steps)
+        check_solver(self.process, solver, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:
+    def inference_record(self):
+        """Declare the model, input encoders and sampling convention of this step."""
+        from dew.config import ModelConfig, _to_json
+        from dew.registry import models, objectives
+        if (not any(member is type(self.model) for member in models.values())
+                or not any(member is type(self) for member in objectives.values())):
+            return None
+        model = ModelConfig.from_model(self.model)
+        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
+                'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
+                'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
+                'solver': _to_json(self.solver, type(self.solver)),
+                'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps}
+
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`
         task, sampling the way this objective's evaluation does."""
         from dew.sampling.pipelines import TextToImage
 
-        return TextToImage.from_objective(self, self._pipeline_weights(state, ema))
+        return TextToImage.from_objective(self, thaw(self._pipeline_weights(state, ema)))
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
@@ -218,11 +264,27 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
+    @cached_property
+    def unconditional_conditions(self) -> dict:
+        """The fixed prompts encoded once, on first use, over the bound towers.
+
+        Building or shape-checking a restored model does not run its towers.
+        The encode keeps the original eager operations and construction-time
+        matmul precision, so moving its first use does not fuse or change the
+        arithmetic. The small host result remains a constant in each training
+        step and sampling call.
+        """
+        # Leave a caller's trace without enabling eager constant folding:
+        # Flax checks parameter shapes with eval_shape(initializer), and
+        # constant folding would compute those discarded random weights.
+        with eval_context(), jax.default_matmul_precision(self._condition_precision):
+            return jax.tree.map(np.asarray, self.encode(self.encoder_params()))
+
     def blank_conditions(self, like: dict) -> dict:
         """Cast the stored unconditional conditions to the conditional branch's dtypes.
 
         `like` is the conditional branch. The values themselves were
-        encoded once at construction, so this only changes dtype.
+        cached on first use, so subsequent calls only change dtype.
         """
         return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype),
                             self.unconditional_conditions, like)
@@ -249,7 +311,7 @@ class DiffusionObjective(Objective[Mean]):
         held = self.held_variables() if variables is None else variables
         head_key = jax.random.fold_in(key, 1)
         if "params" in held:
-            state: dict[str, Any] = dict(held)
+            state: dict[str, Any] = dict(thaw(held))
         else:
             conditions = self.encode(held["encoders"])
             if self.inputs.mask is not None:
@@ -272,13 +334,24 @@ class DiffusionObjective(Objective[Mean]):
                 state[collection] = {**state.get(collection, {}), UNCERTAINTY: value}
         if self.end_to_end is not None and AUTOENCODER not in state["params"]:
             assert self.autoencoder is not None
-            state["params"] = {**state["params"], AUTOENCODER: state.pop("autoencoder", self.autoencoder.params)}
+            state["params"] = {
+                **state["params"],
+                AUTOENCODER: state.pop("autoencoder", self.autoencoder.params),
+            }
             state[LATENT_STATS] = self.end_to_end.initial_statistics(
-                self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels)
+                self.autoencoder.latent_shift, self.autoencoder.latent_scale, self.autoencoder.latent_channels
+            )
         if self.alignment is not None and ALIGNMENT not in state["params"]:
             state["params"] = {**state["params"], ALIGNMENT: self._projector_init(
                 jax.random.fold_in(key, 2), state)}
-        return state
+        if self.trainable is None:
+            return state
+        if type(self).loss is not DiffusionObjective.loss or any(
+                head in state["params"] for head in LOSS_HEADS):
+            raise ValueError(
+                f"{type(self).__name__} trains a loss or heads of its own beside the model, and "
+                "`trainable` selects among the model's leaves alone; train a plain DiffusionObjective")
+        return freeze(state, self.trainable)
 
     def _projector_init(self, key, state) -> Variables:
         """The projector's parameters, shaped by the model's hidden tokens at
@@ -293,7 +366,7 @@ class DiffusionObjective(Objective[Mean]):
                 capture_intermediates=alignment.captures, mutable=["intermediates"])
             return self._captured(captured)
 
-        tokens = jax.eval_shape(hidden, self.trainable(state))
+        tokens = jax.eval_shape(hidden, self.model_variables(state))
         features = jax.eval_shape(alignment.targets, state[REPRESENTATION],
                                   jnp.zeros((1, *self.inputs.sample.shape)))
         return alignment.init(key, tokens.shape[-1], tokens.shape[1], features.shape[-1])["params"]
@@ -305,10 +378,10 @@ class DiffusionObjective(Objective[Mean]):
             raise ValueError(f"the model has no submodule {self.alignment.layer!r} to align")
         return kept["__call__"][0]
 
-    def trainable(self, params) -> Variables:
-        """Return the model's own collections, without the frozen towers or
-        the loss's own heads."""
-        return _without_loss_heads({name: value for name, value in params.items()
+    def model_variables(self, params) -> Variables:
+        """Return the model's own collections, a frozen split merged back,
+        without the frozen towers or the loss's own heads."""
+        return _without_loss_heads({name: value for name, value in thaw(params).items()
                                     if name not in ("encoders", "autoencoder")})
 
     def encoded_conditions(self, params, batch) -> dict:
@@ -321,12 +394,15 @@ class DiffusionObjective(Objective[Mean]):
         """Build the process's denoiser over the model's own collections.
 
         The unconditional branch is passed only when this objective is
-        guided; without guidance the sampler never evaluates it.
+        guided; without guidance the solver never evaluates it.
         """
-        return self.process.denoiser(self.model, self.trainable(params), given,
+        return self.process.denoiser(self.model, self.model_variables(params), given,
                                      None if self.guidance is None else unconditional)
 
     def _conditions(self, params, batch, key, *, dropout):
+        """The batch's conditions and the blank ones, the blank aligned to and
+        broadcast over the batch's rows. `dropout` blanks a drawn share of
+        the batch's own rows, classifier-free guidance's training dropout."""
         given = self.encoded_conditions(params, batch)
         # The unconditional prompt is fixed, so its encoding is a constant
         # and the text tower runs over the batch alone, once per step.
@@ -338,10 +414,18 @@ class DiffusionObjective(Objective[Mean]):
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
                 given, aligned_conditions(given, unconditional))
+        else:
+            unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
+                                         given, aligned_conditions(given, unconditional))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],
-                unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key], jax.random.fold_in(key, 1))
+            spatial = latent_image_conditions(
+                self.autoencoder,
+                params["autoencoder"],
+                unit_range(batch[self.inputs.sample.key]),
+                batch[self.inputs.mask.key],
+                jax.random.fold_in(key, 1),
+            )
             return {**given, **spatial}, {**unconditional, **spatial}
         return given, unconditional
 
@@ -369,7 +453,8 @@ class DiffusionObjective(Objective[Mean]):
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
 
         call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
-        losses, aligned = self._denoised(params, self.trainable(params), samples, t, noise, call, images)
+        losses, aligned = self._denoised(params, self.model_variables(params), samples, t, noise, call,
+                                         images)
         weighted = losses * expand(self.process.weight(t), losses)
         if self.uncertainty is not None:
             head = {collection: params[collection][UNCERTAINTY] for collection in ("params", "constants")}
@@ -384,7 +469,7 @@ class DiffusionObjective(Objective[Mean]):
             metrics["alignment"] = aligned
             total = total + self.alignment.weight / 2 * aligned * mass
         if self.end_to_end is None or end_to_end is None:
-            return Mean(total, mass), Aux(metrics=metrics)
+            return Ratio(total, mass), Aux(metrics=metrics)
         # The autoencoder's update: its regularizer and the alignment of its
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
@@ -393,12 +478,12 @@ class DiffusionObjective(Objective[Mean]):
         latents = self.end_to_end.normalized(end_to_end.raw, params[LATENT_STATS])
         frozen = jax.lax.stop_gradient(params)
         given, _ = self._conditions(params, batch, drop_key, dropout=False)
-        _, through = self._denoised(frozen, self.trainable(frozen), latents, t, noise,
+        _, through = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
                                     {**given, "train": False}, images)
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
         total = total + (end_to_end.regularizer + self.end_to_end.align_weight * through) * mass
-        return Mean(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
+        return Ratio(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
 
     def _denoised(self, params, variables, samples, t, noise, call, images):
         """The per-element denoising loss at `(t, noise)` and, under
@@ -449,7 +534,7 @@ class DiffusionObjective(Objective[Mean]):
         denoise = self.denoiser(params, given, unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
-        samples = sample(denoise, x_T, self.steps, solver=self.sampler,
+        samples = sample(denoise, x_T, self.steps, solver=self.solver,
                          guidance=self.guidance, key=sample_key)
         autoencoder, params = self.published_autoencoder(params)
         if autoencoder is not None:

@@ -30,15 +30,13 @@ Wrote corpus.txt with 53640 bytes
 Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 IDs:
 
 ```bash
-python "$DEW_REPO/tools/tokenize_text.py" \
+dew tokenize \
     --input corpus.txt --out tokens --tokenizer byte --val-fraction 0.1
 ```
 
 ```text
-1 file(s), 0.1 MB of text
-wrote tokens/train.bin (48276 tokens)
-wrote tokens/val.bin (5364 tokens)
-wrote tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
+wrote 48276 tokens to tokens/train.bin and 5364 to tokens/val.bin
+tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
 ```
 
 `tokens/meta.json` records the tokenizer, the vocabulary size, the storage dtype and the token counts, so keep the three files together. The validation split is the first 10% of the token stream, not a random sample. This corpus repeats itself, so it checks the workflow and measures nothing about generalization.
@@ -129,9 +127,9 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, a validation `sampler`, guidance, the number of sampling steps, a text condition and an optional autoencoder. Registered choices are picked with subcommands such as `preset:edm` and `sampler:heun`. Guidance is a configuration object, set with `--guidance.scale`; there is no bare numeric `--guidance` flag. By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Oxford Flowers must be prepared first and passed as `--data.path` ([Installation](installation.md)). The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
+A diffusion configuration adds a training `preset`, a validation `solver`, guidance, the number of sampling steps, a text condition and an optional autoencoder. Registered choices are picked with subcommands such as `preset:edm` and `sampler:heun`. Guidance is a configuration object, set with `--guidance.scale`; there is no bare numeric `--guidance` flag. By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Oxford Flowers must be prepared first and passed as `--data.path` ([Installation](installation.md)). The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
 
-`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout: a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux or Qwen-Image. The pipeline decides the model, its text conditioning (all of its text encoders, passed to the model as `conditioning`) and its autoencoder, so `--model` then carries only `dtype`, `param_dtype` and `attention_impl`, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images are in the autoencoder's own channels: Qwen-Image 2.1's are RGBA. `preset:none` trains on the convention the pipeline's scheduler reads, with the flow shift its sampler walks at that resolution (3.0 for SD3; for Flux, exp(mu) of its packed latent's token count). A scheduler file states how its checkpoint samples, not how it was trained, so this is Dew's fine-tuning choice; a preset of the same kind, such as `preset:flow --preset.shift 1.0`, replaces it. `run.json` records a Hub source as `repo@commit`. The same published architectures train from scratch by naming them in `--model.architecture` with their fields in `--model.config`, conditioned by a pipeline's text towers through `--text.encoder diffusion_text --text.checkpoint REPO`. `rl:flow-grpo` trains the model with Flow-GRPO instead of the denoising loss: it samples `--rl.groups` images per prompt through the flow SDE, scores them with the image metric `--rl.reward` names (higher must be better, as `clip_score`), and needs a flow preset.
+`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout: a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its text conditioning (all of its text encoders, passed to the model as `conditioning`) and its autoencoder, so `--model` then carries only `dtype`, `param_dtype` and `attention_impl`, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images are in the autoencoder's own channels: Qwen-Image 2.1's are RGBA. `preset:none` trains on the convention the pipeline's scheduler reads, with the flow shift its sampler walks at that resolution (3.0 for SD3; for Flux, exp(mu) of its packed latent's token count). A scheduler file states how its checkpoint samples, not how it was trained, so this is Dew's fine-tuning choice; a preset of the same kind, such as `preset:flow --preset.shift 1.0`, replaces it. `run.json` records a Hub source as `repo@commit`. The same published architectures train from scratch by naming them in `--model.architecture` with their fields in `--model.config`, conditioned by a pipeline's text towers through `--text.encoder diffusion_text --text.checkpoint REPO`. `rl:flow-grpo` trains the model with Flow-GRPO instead of the denoising loss: it samples `--rl.groups` images per prompt through the flow SDE, scores them with the image metric `--rl.reward` names (higher must be better, as `clip_score`), and needs a flow preset.
 
 A JEPA configuration adds predictor fields, target-mask settings, an EMA momentum schedule for the target encoder, and optional representation probes. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 

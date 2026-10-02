@@ -656,3 +656,35 @@ header.header {
 .turnstile-holder:empty {
 	display: none;
 }
+
+.curated-gallery {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 1.5rem 0.75rem;
+}
+
+.curated-gallery figure {
+	margin: 0;
+	min-width: 0;
+}
+
+.curated-gallery img {
+	display: block;
+	width: 100%;
+	height: auto;
+	margin: 0;
+	border-radius: 0.35rem;
+}
+
+.curated-gallery figcaption {
+	margin-top: 0.5rem;
+	font-size: 0.75rem;
+	line-height: 1.5;
+	color: var(--dew-muted);
+}
+
+@media (max-width: 40rem) {
+	.curated-gallery {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}

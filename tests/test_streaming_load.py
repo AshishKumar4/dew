@@ -1,6 +1,6 @@
 """A load onto a mesh builds each leaf from the mapped checkpoint, one device shard at a time.
 
-`load_pretrained(..., mesh=...)` translates the checkpoint into `SourceLeaf`
+`Pretrained.load(..., mesh=...)` translates the checkpoint into `SourceLeaf`
 recipes and lands each straight on its sharding through
 `jax.make_array_from_callback`. What a consumer can observe is that the
 placed values are the host load's values under the layout's sharding, and
@@ -14,7 +14,7 @@ import jax
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.streaming import SourceLeaf
 from dew.training import Layout, MeshSpec
 
@@ -34,7 +34,7 @@ def test_a_mesh_load_lands_the_host_values_and_reads_at_most_one_shard(fixture, 
     Qwen 3.5 wrapper streams its language model beside its host-built tower.
     Every placed leaf equals the host load's, carries the layout's sharding,
     and every read is one device's shard of it."""
-    host = load_pretrained(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype, attention_impl="xla")
+    host = Pretrained.load(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype, attention_impl="xla")
     reads: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
     read = SourceLeaf.read
 
@@ -44,7 +44,7 @@ def test_a_mesh_load_lands_the_host_values_and_reads_at_most_one_shard(fixture, 
         return value
 
     monkeypatch.setattr(SourceLeaf, "read", recorded)
-    placed = load_pretrained(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype,
+    placed = Pretrained.load(FIXTURES / fixture, dtype="float32", param_dtype=param_dtype,
                              attention_impl="xla", mesh=MeshSpec(fsdp=jax.device_count()), layout=LAYOUT)
 
     placed_leaves = jax.tree_util.tree_leaves_with_path(placed.variables)
@@ -73,6 +73,25 @@ def test_a_stacked_transposed_leaf_reads_any_block_as_the_whole_leaf_holds_it():
     for index in [(slice(1, 3), slice(None), slice(2, 4)), (slice(0, 1), slice(1, 3), slice(None)),
                   (slice(None), slice(3, 4), slice(0, 6))]:
         np.testing.assert_array_equal(leaf.read(index), whole[index])
+
+
+def test_concatenated_projections_read_only_the_requested_columns_in_storage_precision():
+    """A shard can start inside Q and cross K/V, with no concatenated host model."""
+    import ml_dtypes
+
+    rng = np.random.default_rng(9)
+    members = tuple(rng.standard_normal((width, 6)).astype(np.float32) for width in (8, 4, 4))
+    dtype = np.dtype(ml_dtypes.bfloat16)
+    leaf = SourceLeaf.concatenate([SourceLeaf((member,), dtype, transposed=True) for member in members])
+    whole = np.concatenate([member.T.astype(dtype) for member in members], axis=-1)
+    assert leaf.shape == (6, 16)
+    for index in ((slice(1, 4), slice(6, 14)), (slice(None), slice(8, 12)),
+                  (slice(2, 5), slice(14, 3, -2)), (slice(None), slice(2, 15, 3)),
+                  (slice(0, 0), slice(6, 14)), (slice(None), slice(7, 7))):
+        read = leaf.read(index)
+        np.testing.assert_array_equal(read, whole[index])
+        assert read.dtype == dtype and read.flags.c_contiguous
+        assert read.nbytes == whole[index].nbytes
 
 
 @pytest.mark.mesh

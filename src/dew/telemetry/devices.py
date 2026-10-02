@@ -1,10 +1,17 @@
-"""The extra XLA flags a run hands to the backend.
+"""The extra XLA flags a run hands to the backend, and what the CUDA driver
+says of a GPU.
 
 XLA reads XLA_FLAGS once, when it opens a backend, so a run's flags have to
 reach the environment before the first JAX call of the process.
 """
 
+import ctypes
+import logging
 import os
+import sys
+
+_log = logging.getLogger(__name__)
+_late_policy_warned = False
 
 
 def apply_xla_flags(flags: str | None) -> None:
@@ -37,31 +44,89 @@ def xla_flag(name: str) -> str | None:
     return value
 
 
+def keep_roundings() -> None:
+    """Keep declared narrow-dtype roundings unless the caller names XLA's policy.
+
+    Fusion must not normalize an unrounded FP32 value where the program
+    produces a BF16 sum. `import dew` applies it before the process's first
+    JAX computation: XLA reads these flags when its backend opens. In an
+    already-used notebook, restart with
+    `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
+    """
+    global _late_policy_warned
+    # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
+    # test covers this path without opening a backend just to inspect it.
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge is not None and bridge.backends_are_initialized():
+        if not _late_policy_warned:
+            _late_policy_warned = True
+            _log.warning(
+                "Dew was imported after the JAX backend opened; its numerical policy cannot take effect. "
+                "Restart with XLA_FLAGS=--xla_allow_excess_precision=false set before importing JAX.")
+        return
+    if xla_flag("xla_allow_excess_precision") is None:
+        apply_xla_flags("--xla_allow_excess_precision=false")
+
+
 def deterministic_ops_requested() -> bool:
     """Whether the run asked XLA for deterministic ops.
 
-    `--xla_gpu_deterministic_ops` orders the reductions that make a GPU step
-    bitwise reproducible. Kernel selection reads it: `dew.nn.attention` keeps
+    `--xla_gpu_deterministic_ops` orders the reductions of a GPU step.
+    Autotuning, which `--xla_gpu_autotune_level=0` turns off, can pick
+    different kernels in another compilation (docs/guides/checkpoints.md).
+    Kernel selection reads this flag: `dew.nn.attention` keeps
     cudnn's fused attention away from a run that set it.
     """
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')
 
 
 # The generations whose training steps compile with XLA's Triton GEMM fusions
-# off, so every dot goes to cuBLAS. Through the trainer on one A100 (sm80,
-# jax 0.11.2, bf16), Qwen3-0.6B at 4 x 512 tokens: compile 47.5 -> 27.1 s,
-# the Triton GEMM autotuning it no longer runs, step 161.5 -> 161.4 ms.
-# Standalone runs on another A100 VM (main 775e68d9 and 8eabe55c) measured
-# Qwen3-0.6B at 4 x 1024 tokens 162.1 -> 153.1 ms, a 99M MoE 74.6 -> 69.4 ms
-# and a DiT 5.8% faster. A Mamba-2 step lost 7.7% (127.9 -> 138.6 ms): its
-# SSD scan's small batched dots gain from the fusions, so its mixer keeps
-# them (`MixerBase.keeps_triton_gemm`). On an RTX 4080 (sm89, same jax,
-# bf16), Qwen3-0.6B's widths at 2 layers: at exactly 4096 tokens the
-# fusions take the whole-logits head's backward from 69 to 261 ms (4088 and
-# 4104 run 75), a 286.0 ms step against 93.4 without them; at 2048, 4080
-# and 16384 tokens the steps run 56.7 -> 53.5, 103.8 -> 94.0 and
-# 420.5 -> 406.3 ms, and tiled heads 3-6% faster. They can hold fewer
-# temporaries, so a step that fits only with them keeps them
-# (`dew.training.trainer.fitting_default`). Unmeasured generations, sm86
-# among them, keep XLA's default.
+# off, so every dot goes to cuBLAS: on the A100 (sm80) compiles take half as
+# long and decoder, MoE and DiT steps run 0-6% faster, and on the RTX 4080
+# (sm89) decoder steps run 3-10% faster, and 3x faster where the fusions hit
+# a whole-logits head at 4096 tokens (docs/performance.md). A Mamba-2 mixer
+# loses 7.7% without them and keeps them (`MixerBase.keeps_triton_gemm`), and
+# a step that fits only with them keeps them (`fitting_default`). Unmeasured
+# generations, sm86 among them, keep XLA's default.
 TRITON_GEMM_OFF_GENERATIONS = frozenset({'sm80', 'sm89'})
+
+
+
+def primary_context(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_void_p, ctypes.c_int]:
+    """Retain the primary context of the visible CUDA device `ordinal`, the
+    one JAX's runtime runs in: the driver library, the context and the
+    device, which the caller releases with `cuDevicePrimaryCtxRelease_v2`
+    once it is done. Raises OSError where no driver is installed and
+    RuntimeError on a driver error."""
+    cuda = ctypes.CDLL("libcuda.so.1")
+    device, context = ctypes.c_int(), ctypes.c_void_p()
+    for call in (lambda: cuda.cuInit(0), lambda: cuda.cuDeviceGet(ctypes.byref(device), ordinal),
+                 lambda: cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device)):
+        if status := call():
+            raise RuntimeError(f"CUDA driver error {status}")
+    return cuda, context, device
+
+
+def gpu_free_bytes(ordinal: int) -> int | None:
+    """The bytes the CUDA driver reports free on the visible GPU `ordinal`,
+    every process's allocations counted, or None where no driver answers.
+
+    An allocator's limit is a share of the GPU's memory, not memory it holds:
+    a pool that grows takes each new region from what is free when it asks,
+    and another process on the same GPU may hold the rest. The read makes the
+    device's primary context current on this thread for the call."""
+    try:
+        cuda, context, device = primary_context(ordinal)
+    except (OSError, RuntimeError) as error:
+        _log.debug("no free memory read for GPU %d: %s", ordinal, error)
+        return None
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    try:
+        if cuda.cuCtxPushCurrent_v2(context):
+            return None
+        try:
+            return None if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) else free.value
+        finally:
+            cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
+    finally:
+        cuda.cuDevicePrimaryCtxRelease_v2(device)

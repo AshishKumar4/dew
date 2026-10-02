@@ -1,0 +1,648 @@
+"""Run untrusted programs and tool sessions in bounded Linux subprocesses.
+
+`SubprocessEnvironment` is an episode environment whose worker runs under
+the caller's OS permissions with bounded CPU, memory, time and IO. It has no
+filesystem or network isolation, so hostile code needs an outer boundary.
+Dew never selects or executes it by default.
+
+A `Program` is files written into a fresh temporary directory, an argv run
+there without a shell, and the text fed to its stdin. A runner executes one
+program under `SandboxLimits` and reports an `Outcome`: how it ended, its
+exit code, its capped output and the seconds it took. `SandboxFleet` runs
+programs on `workers` threads at once, each program in its own process,
+which is what a verifiable reward scores completions with.
+
+Two runners exist. `ProcessRunner` starts the program through the same
+launcher as `SubprocessEnvironment`: RLIMIT_CPU and RLIMIT_AS, no core
+dumps, its own session, SIGKILL on parent death, a minimal environment, and
+a process-group kill at the wall deadline. It keeps the caller's user,
+filesystem and network, so a program can read and reach whatever you can. `ContainerRunner` runs the
+program in a fresh Docker or Podman container with no network, a read-only
+root, the job directory mounted read-only, no capabilities, an unprivileged
+user and memory, CPU, process and CPU-time limits; that is the boundary for
+hostile code.
+
+A program that fails returns an `Outcome`, and the reward decides what a
+timeout or a crash is worth. A runner raises only when it cannot start a
+program at all.
+
+`MathReward` is the verifiable reward that needs no program: it reads the
+completion's final answer and compares it with the reference as an exact
+rational number.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import json
+import math
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from fractions import Fraction
+from pathlib import Path
+from types import MappingProxyType
+from typing import Protocol
+
+from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
+from dew.records import JSON
+
+
+@dataclass(frozen=True)
+class SandboxLimits:
+    """Bound one worker by RLIMIT_CPU and RLIMIT_AS, plus parent-enforced session and IO limits.
+
+    Forked children inherit the resource limits. Process-group cleanup handles
+    descendants that stay in that group; this is not a cgroup aggregate limit.
+    """
+
+    wall_seconds: float = 30.
+    cpu_seconds: int = 10
+    memory_bytes: int = 256 * 1024 ** 2
+    message_bytes: int = 1024 ** 2
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.wall_seconds) or self.wall_seconds <= 0:
+            raise ValueError("sandbox wall_seconds must be finite and positive")
+        for name in ("cpu_seconds", "memory_bytes", "message_bytes"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"sandbox {name} must be a positive integer")
+
+
+def _observation(value: object) -> Observation:
+    """Read one decoded JSON response as an `Observation`."""
+    if not isinstance(value, Mapping):
+        raise ValueError("sandbox response must be an observation object")
+    context, status, detail = value.get("context"), value.get("status"), value.get("detail", "")
+    if not isinstance(context, list) or not isinstance(status, str) or not isinstance(detail, str):
+        raise ValueError("sandbox observation needs context ids, a status name and string detail")
+    try:
+        state = EpisodeStatus[status.upper()]
+    except KeyError:
+        raise ValueError(f"unknown sandbox observation status {status!r}") from None
+    return Observation(tuple(context), state, detail)
+
+
+def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
+    """Start `command` in `directory` under `limits`, in its own session, with piped streams.
+
+    The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
+    parent-death signal, then execs the command with a minimal environment.
+    """
+    launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
+    return subprocess.Popen(
+        [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
+         str(os.getpid()), *command], cwd=directory,
+        env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+
+
+class _ProcessEnvironment:
+    """Drive one sandboxed worker process over a line-delimited JSON protocol."""
+
+    def __init__(self, command: tuple[str, ...], limits: SandboxLimits,
+                 identity: EpisodeId, directory: str):
+        self.identity, self.limits = identity, limits
+        self.deadline = time.monotonic() + limits.wall_seconds
+        self.output = bytearray()
+        self.process = launch(command, limits, directory)
+        assert (
+            self.process.stdin is not None
+            and self.process.stdout is not None
+            and self.process.stderr is not None
+        )
+        self.stdin, self.stdout, self.stderr = self.process.stdin, self.process.stdout, self.process.stderr
+        for stream in (self.stdin, self.stdout, self.stderr):
+            os.set_blocking(stream.fileno(), False)
+
+    def _decoded(self) -> JSON:
+        """Take the first complete line out of the read buffer as JSON."""
+        line, _, rest = self.output.partition(b"\n")
+        self.output = rest
+        try:
+            return json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("sandbox returned malformed JSON") from error
+
+    def _pump(self, ready: selectors.BaseSelector, event: selectors.SelectorKey, request: bytes,
+              sent: int, diagnostic: bytearray) -> int:
+        """Write the pending request to one ready stream, or read a chunk from it.
+
+        Returns how much of the request has been written. A stream with
+        nothing left is unregistered, so the selector itself reports when
+        the worker can no longer answer.
+        """
+        descriptor = event.fd
+        if event.data == "stdin":
+            try:
+                sent += os.write(descriptor, request[sent:])
+            except BrokenPipeError:
+                ready.unregister(self.stdin)
+            else:
+                if sent == len(request):
+                    ready.unregister(self.stdin)
+            return sent
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            ready.unregister(event.fileobj)
+        elif event.data == "stdout":
+            self.output.extend(chunk)
+        else:
+            diagnostic.extend(chunk)
+        if len(self.output) + len(diagnostic) > self.limits.message_bytes:
+            raise ValueError("sandbox response exceeds message_bytes")
+        return sent
+
+    def _request(self, operation: str, payload: Mapping[str, object]) -> JSON:
+        """Send one request and return the worker's decoded reply.
+
+        The loop selects over all three streams at once, because a worker
+        that never reads its input can still fill the pipe with output,
+        and a deadlock there would outlive the wall clock. It carries how
+        much of the request is `sent`, the undecoded `self.output`, and the
+        stderr `diagnostic` an exit reports.
+        """
+        request = json.dumps({"operation": operation, **payload}, allow_nan=False).encode() + b"\n"
+        if len(request) > self.limits.message_bytes:
+            raise ValueError("sandbox request exceeds message_bytes")
+        sent = 0
+        diagnostic = bytearray()
+        with selectors.DefaultSelector() as ready:
+            ready.register(self.stdin, selectors.EVENT_WRITE, "stdin")
+            ready.register(self.stdout, selectors.EVENT_READ, "stdout")
+            ready.register(self.stderr, selectors.EVENT_READ, "stderr")
+            while True:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox exceeded wall_seconds")
+                if sent == len(request) and b"\n" in self.output:
+                    return self._decoded()
+                for event, _ in ready.select(min(remaining, .1)):
+                    sent = self._pump(ready, event, request, sent, diagnostic)
+                if self.process.poll() is not None and not ready.get_map():
+                    raise ChildProcessError(
+                        f"sandbox exited with code {self.process.returncode}: "
+                        f"{diagnostic.decode('utf-8', errors='replace')}")
+
+    def reset(self) -> Observation:
+        return _observation(self._request("reset", {"episode": asdict(self.identity)}))
+
+    def step(self, action: Action) -> Observation:
+        record = {"context": list(action.context), "tokens": list(action.tokens),
+                  "terminated": action.terminated, "policy_step": action.policy_step}
+        return _observation(self._request("step", {"action": record}))
+
+    def get_state(self) -> bytes:
+        reply = self._request("get_state", {})
+        state = reply.get("state") if isinstance(reply, Mapping) else None
+        if not isinstance(state, str):
+            raise ValueError("sandbox get_state must return a base64 state string")
+        return base64.b64decode(state, validate=True)
+
+    def set_state(self, state: bytes) -> None:
+        reply = self._request("set_state", {"state": base64.b64encode(state).decode("ascii")})
+        if not isinstance(reply, Mapping) or reply.get("restored") is not True:
+            raise ValueError("sandbox set_state must acknowledge restored state")
+
+    def close(self) -> None:
+        # The group is already gone when the sandbox exited on its own.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        try:
+            self.process.wait(timeout=5)
+        finally:
+            for stream in (self.stdin, self.stdout, self.stderr):
+                stream.close()
+
+
+@dataclass(frozen=True)
+class SubprocessEnvironment:
+    """A user-selected JSON-lines worker implementing reset and step.
+
+    command is an argv tuple, executed without a shell in a temporary working
+    directory. Each request has an operation and either an episode identity
+    or an action record. Replies contain context (integer ids), status
+    (running/completed/truncated/cancelled/error) and optional string detail.
+
+    Session exit kills the process group on success, error or cancellation.
+    The direct worker also receives SIGKILL if its parent dies. Neither
+    mechanism replaces filesystem/network isolation or controls descendants
+    that deliberately leave the group.
+    """
+
+    command: tuple[str, ...]
+    limits: SandboxLimits = SandboxLimits()
+
+    def __post_init__(self) -> None:
+        if sys.platform != "linux":
+            raise NotImplementedError(
+                "SubprocessEnvironment currently requires Linux resource and parent-death limits"
+            )
+        if not self.command or any(not isinstance(part, str) or not part for part in self.command):
+            raise ValueError("sandbox command must be a nonempty argv tuple")
+
+    @contextmanager
+    def __call__(self, identity: EpisodeId) -> Iterator[Environment]:
+        with tempfile.TemporaryDirectory(prefix="dew-episode-") as directory:
+            worker = _ProcessEnvironment(self.command, self.limits, identity, directory)
+            try:
+                yield worker
+            finally:
+                worker.close()
+
+class Verdict(Enum):
+    """How a program ended."""
+
+    COMPLETED = "completed"
+    """Exited with status zero."""
+    FAILED = "failed"
+    """Exited with a nonzero status, an uncaught exception or MemoryError included."""
+    TIMEOUT = "timeout"
+    """Ran past the wall deadline or its CPU-time limit and was killed."""
+    CRASHED = "crashed"
+    """Killed by a signal it did not ask for."""
+    OUTPUT_LIMIT = "output_limit"
+    """Wrote more than `message_bytes` to stdout and stderr together and was killed."""
+
+
+@dataclass(frozen=True)
+class Program:
+    """Files to write, the argv to run beside them, and its stdin."""
+
+    files: Mapping[str, str]
+    command: tuple[str, ...]
+    stdin: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.command or any(not isinstance(part, str) or not part for part in self.command):
+            raise ValueError("a program command is a nonempty argv tuple")
+        for name in self.files:
+            path = Path(name)
+            if path.is_absolute() or ".." in path.parts or not path.parts:
+                raise ValueError(f"program file {name!r} must be a relative path inside the job directory")
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
+
+
+@dataclass(frozen=True)
+class Outcome:
+    verdict: Verdict
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    seconds: float
+
+
+class Runner(Protocol):
+    """Run one program to its end under `limits`; raise only when it cannot start.
+
+    `python` is the argv that runs a Python file where this runner runs programs.
+    """
+
+    @property
+    def python(self) -> tuple[str, ...]: ...
+
+    def __call__(self, program: Program, limits: SandboxLimits) -> Outcome: ...
+
+
+def _written(program: Program, directory: str) -> None:
+    for name, text in program.files.items():
+        path = Path(directory, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+@dataclass
+class _Streams:
+    stdout: bytearray = field(default_factory=bytearray)
+    stderr: bytearray = field(default_factory=bytearray)
+
+
+def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
+               limit: int) -> tuple[_Streams, Verdict | None]:
+    """Feed stdin, read both output streams until they close, and wait for the exit.
+
+    Returns what was read, and TIMEOUT or OUTPUT_LIMIT when the process had
+    to be stopped for it, else None. The caller kills and reaps.
+    """
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    streams = _Streams()
+    sent = 0
+    with selectors.DefaultSelector() as ready:
+        if stdin:
+            os.set_blocking(process.stdin.fileno(), False)
+            ready.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+        ready.register(process.stdout, selectors.EVENT_READ, streams.stdout)
+        ready.register(process.stderr, selectors.EVENT_READ, streams.stderr)
+        while any(key.data != "stdin" for key in ready.get_map().values()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return streams, Verdict.TIMEOUT
+            for key, _ in ready.select(min(remaining, .1)):
+                if key.data == "stdin":
+                    try:
+                        sent += os.write(key.fd, stdin[sent:])
+                    except BrokenPipeError:
+                        sent = len(stdin)
+                    if sent == len(stdin):
+                        ready.unregister(key.fileobj)
+                        process.stdin.close()
+                    continue
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    ready.unregister(key.fileobj)
+                    continue
+                key.data.extend(chunk)
+                if len(streams.stdout) + len(streams.stderr) > limit:
+                    return streams, Verdict.OUTPUT_LIMIT
+    try:
+        # Closed streams are not an exit: wait for it, so a kill that follows
+        # never lands between a program's last write and its exit status.
+        process.wait(timeout=max(deadline - time.monotonic(), 0))
+    except subprocess.TimeoutExpired:
+        return streams, Verdict.TIMEOUT
+    return streams, None
+
+
+def _outcome(process: subprocess.Popen[bytes], streams: _Streams, stopped: Verdict | None,
+             started: float, deadline: float) -> Outcome:
+    """Reap the process and name how it ended."""
+    code = process.wait(timeout=max(deadline - time.monotonic(), 0) + 5)
+    seconds = time.monotonic() - started
+    if stopped is not None:
+        verdict = stopped
+    elif code == 0:
+        verdict = Verdict.COMPLETED
+    elif code in (-signal.SIGXCPU, -signal.SIGKILL):
+        # The fleet kills only after an exit or a stop it reports itself, so
+        # a SIGKILL here is the kernel's: the launcher sets RLIMIT_CPU's soft
+        # and hard limits equal, and the hard limit kills with SIGKILL.
+        verdict = Verdict.TIMEOUT
+    elif code < 0:
+        verdict = Verdict.CRASHED
+    else:
+        verdict = Verdict.FAILED
+    return Outcome(verdict, None if stopped is not None else code,
+                   streams.stdout.decode("utf-8", errors="replace"),
+                   streams.stderr.decode("utf-8", errors="replace"), seconds)
+
+
+def _closed(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+@dataclass(frozen=True)
+class ProcessRunner:
+    """Run each program as a resource-limited Linux process in a temporary directory.
+
+    The whole process group is killed at the wall deadline, on excess
+    output, and after a normal exit, so no child it forked outlives it
+    unless it left the group on purpose. `python` is this interpreter,
+    isolated from the environment, site-packages and user site.
+    """
+
+    python: tuple[str, ...] = (sys.executable, "-I", "-S")
+
+    def __call__(self, program: Program, limits: SandboxLimits) -> Outcome:
+        with tempfile.TemporaryDirectory(prefix="dew-fleet-") as directory:
+            _written(program, directory)
+            started = time.monotonic()
+            deadline = started + limits.wall_seconds
+            process = launch(program.command, limits, directory)
+            try:
+                streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            try:
+                return _outcome(process, streams, stopped, started, deadline)
+            finally:
+                _closed(process)
+
+
+@dataclass(frozen=True)
+class ContainerRunner:
+    """Run each program in a fresh, network-less container of `image`.
+
+    `runtime` is the Docker-compatible CLI (`docker` or `podman`). The job
+    directory is mounted read-only at `/work`, the working directory; `/tmp`
+    is a small writable tmpfs. Memory is capped at `memory_bytes` with no
+    swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later),
+    the processor share at `cpus` and the
+    process count at `pids`. At the wall deadline the client that runs
+    it is killed, then the container is force-removed by name. A runtime that exits without
+    creating the container (no daemon, no permission, no image) raises.
+    """
+
+    image: str
+    runtime: str = "docker"
+    cpus: float = 1.0
+    pids: int = 64
+    user: str = "65534:65534"
+    python: tuple[str, ...] = ("python", "-I", "-S")
+    """The image's own interpreter; the host's path does not exist inside it."""
+
+    def command(
+        self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str
+    ) -> list[str]:
+        """The runtime argv that runs `program` from `directory` in a container called `name`.
+
+        The runtime writes the container's id to `cidfile` once it creates one.
+        """
+        return [self.runtime, "run", "--rm", "-i", "--name", name, "--cidfile", cidfile, "--network", "none",
+                "--memory", str(limits.memory_bytes), "--memory-swap", str(limits.memory_bytes),
+                "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
+                "--ulimit", f"cpu={limits.cpu_seconds}:{limits.cpu_seconds + 1}", "--ulimit", "core=0",
+                "--read-only", "--tmpfs", "/tmp:size=64m", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--user", self.user,
+                "--volume", f"{directory}:/work:ro", "--workdir", "/work",
+                "--env", "PYTHONDONTWRITEBYTECODE=1", self.image, *program.command]
+
+    def __call__(self, program: Program, limits: SandboxLimits) -> Outcome:
+        with tempfile.TemporaryDirectory(prefix="dew-fleet-") as scratch:
+            # The job is mounted; the id file beside it is not.
+            directory, cidfile = os.path.join(scratch, "job"), os.path.join(scratch, "cid")
+            os.mkdir(directory)
+            _written(program, directory)
+            # The container user is not the caller, so it needs to read the files.
+            os.chmod(directory, 0o755)
+            for path in Path(directory).rglob("*"):
+                os.chmod(path, 0o755 if path.is_dir() else 0o644)
+            name = f"dew-fleet-{uuid.uuid4().hex}"
+            started = time.monotonic()
+            # The pull and the container start count against the deadline, so
+            # a cold image is a timeout, not an unbounded wait.
+            deadline = started + limits.wall_seconds
+            process = subprocess.Popen(self.command(program, limits, directory, name, cidfile),
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
+            finally:
+                if process.poll() is None:
+                    # The client dies first so it makes no further API call;
+                    # `rm --force` then removes the container whether it is
+                    # still being created, created or running.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    subprocess.run(
+                        [self.runtime, "rm", "--force", name], capture_output=True, timeout=60, check=False
+                    )
+            try:
+                outcome = _outcome(process, streams, stopped, started, deadline)
+            finally:
+                _closed(process)
+            if stopped is None and not (os.path.exists(cidfile) and Path(cidfile).read_text().strip()):
+                # The client ended without creating a container: the runtime
+                # failed, and the program never ran to be scored.
+                raise RuntimeError(f"{self.runtime} created no container (exit {outcome.exit_code}): "
+                                   f"{outcome.stderr.strip()}")
+            # `docker run` exits with 128 plus the signal that ended the
+            # container's process. The CPU soft limit sits one second under
+            # the hard one, so running out of CPU time is SIGXCPU; SIGKILL is
+            # the memory cgroup's OOM killer.
+            code = outcome.exit_code
+            if code is not None and code > 128 and outcome.verdict is Verdict.FAILED:
+                verdict = Verdict.TIMEOUT if code == 128 + signal.SIGXCPU else Verdict.CRASHED
+                return Outcome(verdict, code, outcome.stdout, outcome.stderr, outcome.seconds)
+            return outcome
+
+
+_DEFAULT_RUNNER = ProcessRunner()
+_DEFAULT_LIMITS = SandboxLimits()
+
+
+class SandboxFleet:
+    """Run programs on `workers` concurrent sandboxed workers.
+
+    Use it as a context manager, or call `close`. Programs queue when every
+    worker is busy; `submit` returns at once.
+    """
+
+    def __init__(self, runner: Runner = _DEFAULT_RUNNER, *, limits: SandboxLimits = _DEFAULT_LIMITS,
+                 workers: int = os.cpu_count() or 1):
+        if type(workers) is not int or workers < 1:
+            raise ValueError("a fleet needs at least one worker")
+        self.runner, self.limits = runner, limits
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-fleet")
+
+    def submit(self, program: Program) -> Future[Outcome]:
+        return self._pool.submit(self.runner, program, self.limits)
+
+    def run(self, programs: Iterable[Program]) -> list[Outcome]:
+        """Run every program, concurrently, and return their outcomes in order."""
+        futures = [self.submit(program) for program in programs]
+        return [future.result() for future in futures]
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> SandboxFleet:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def outputs_match(outcome: Outcome, expected: str) -> bool:
+    """A completed program whose stdout equals `expected`, up to surrounding whitespace per line."""
+    def lines(text: str) -> list[str]:
+        return [line.rstrip() for line in text.strip().splitlines()]
+
+    return outcome.verdict is Verdict.COMPLETED and lines(outcome.stdout) == lines(expected)
+
+
+_BOXED = re.compile(r"\\boxed\{")
+_GROUPED = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+"""A number written with thousands-group commas, the only commas read as part of one."""
+_NUMBER = re.compile(rf"{_GROUPED}|-?\d+(?:\.\d+)?(?:/\d+)?|-?\.\d+")
+
+
+def _boxed(text: str) -> str | None:
+    """The contents of the last `\\boxed{...}`, braces balanced."""
+    starts = [match.end() for match in _BOXED.finditer(text)]
+    if not starts:
+        return None
+    depth, start = 1, starts[-1]
+    for index in range(start, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[index], 0)
+        if depth == 0:
+            return text[start:index]
+    return None
+
+
+def _rational(text: str) -> Fraction | None:
+    """Read a decimal, integer or `a/b` answer, allowing thousands separators and `\\frac{a}{b}`.
+
+    Any other comma or inner space leaves the text unreadable as one number,
+    so a list such as `1,2` or `2 3` never collapses into `12` or `23`.
+    """
+    cleaned = text.replace("$", "").strip()
+    if re.fullmatch(_GROUPED, cleaned):
+        cleaned = cleaned.replace(",", "")
+    fraction = re.fullmatch(r"-?\\[dt]?frac\{(-?\d+)\}\{(-?\d+)\}", cleaned)
+    if fraction is not None:
+        numerator, denominator = int(fraction[1]), int(fraction[2])
+        sign = -1 if cleaned.startswith("-") else 1
+        return None if denominator == 0 else sign * Fraction(numerator, denominator)
+    number = re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:/(\d+))?", cleaned)
+    if number is None or (number[1] is not None and int(number[1]) == 0):
+        return None
+    return Fraction(cleaned)
+
+
+@dataclass(frozen=True)
+class MathReward:
+    """Score one when the final answer equals the reference as a rational number.
+
+    The answer is the last `\\boxed{}` in the completion; with
+    `require_boxed=False` a completion without one falls back to its last
+    number. Integers, decimals, `a/b` and `\\frac{a}{b}` compare exactly, so
+    `0.5`, `1/2` and `\\frac{1}{2}` agree. A reference that is not a number
+    compares as trimmed text.
+    """
+
+    require_boxed: bool = True
+
+    def __call__(self, data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
+        answer = _boxed(completion)
+        if answer is None and not self.require_boxed:
+            numbers = _NUMBER.findall(completion)
+            answer = numbers[-1] if numbers else None
+        if answer is None:
+            return 0.0
+        expected = _rational(ground_truth)
+        if expected is None:
+            return float(answer.strip() == ground_truth.strip())
+        return float(_rational(answer) == expected)
+
+
+__all__ = [
+    "ContainerRunner",
+    "MathReward",
+    "Outcome",
+    "ProcessRunner",
+    "Program",
+    "Runner",
+    "SandboxFleet",
+    "SandboxLimits",
+    "SubprocessEnvironment",
+    "Verdict",
+    "outputs_match",
+]

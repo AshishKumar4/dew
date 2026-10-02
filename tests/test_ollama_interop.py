@@ -6,7 +6,7 @@ tokenizer is the committed byte-level BPE fixture the token files were
 written with.
 
 What is held to account is the artifact contract. `ollama create` reads the
-HF layout `save_pretrained_decoder` writes, so the GGUF its converter emits
+HF layout `PretrainedDecoder.from_model(...).save` writes, so the GGUF its converter emits
 carries the exported config's own numbers and serves the computation the
 export describes: asked for the model's own argmax, the daemon reproduces
 Dew's greedy draw token for token. That is what catches a conversion which
@@ -26,7 +26,7 @@ the GGUF records the pre-tokenizer as `default`, whose regex cuts digit runs
 into groups of three, where the exported ByteLevel tokenizer keeps a run
 whole. One test pins that too, so nobody reads the length check as identity.
 
-`save_pretrained_decoder` writes the tokenizer's own files beside the
+`PretrainedDecoder.save` writes the tokenizer's own files beside the
 weights: handed the tokenizer the run trained with, it asks that tokenizer
 to save itself, so the directory it leaves is already complete and this file
 copies nothing into it. `Pretrained.save` delegates a decoder to the same
@@ -55,8 +55,7 @@ from test_lm_recipe import load_recipe
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
-from dew.interop import load_pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
@@ -103,7 +102,7 @@ def draw(client: OllamaCompletion, prompt: str, count: int,
     request fields such as `raw` and `logprobs`; `options` is the lower-level
     escape hatch, and mixing a request field into it raises.
     """
-    return client(prompt, count, seed=0, raw=True, **fields)
+    return client(prompt, count, key=0, raw=True, **fields)
 
 
 def prompt_tokens(client: OllamaCompletion, prompt: str) -> int | None:
@@ -157,7 +156,7 @@ def train_and_export(root: Path) -> Path:
         config.model.architecture, {**FIELDS, "vocab_size": meta["vocab_size"]},
         dtype="float32", attention_impl="xla"))
     export = root / "export"
-    save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+    PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(str(export))
     return export
 
 
@@ -218,7 +217,7 @@ def test_the_converted_model_carries_the_exported_config(imported):
     """Ollama's converter reads the export's own config, so the GGUF it
     writes reports Dew's widths, its rope base and its parameter count.
     A field the export spelled wrong lands here as a different number."""
-    name, export, shown = imported
+    _name, export, shown = imported
     config = json.loads((export / "config.json").read_text())
     info = shown["model_info"]
 
@@ -285,7 +284,7 @@ def test_the_client_completes_prompts_against_the_daemon(client):
     """`OllamaCompletion` over the imported model: one answer per prompt in
     prompt order, the token budget spent, the backend's own finish reason,
     and the SDK responses retained. Ollama reports no aggregate usage."""
-    answer = client(list(PROMPTS), DRAWN, seed=1234,
+    answer = client(list(PROMPTS), DRAWN, key=1234,
                     sampling=Sampling(temperature=0.8, top_k=40))
 
     assert len(answer.texts) == len(PROMPTS)
@@ -299,8 +298,8 @@ def test_the_client_completes_prompts_against_the_daemon(client):
 def test_zero_temperature_repeats_itself(client):
     """The seed rides on every call, so the same greedy request twice is the
     same text: a completion is reproducible against a fixed model."""
-    first = client(PROMPTS[0], DRAWN, seed=7, options={"temperature": 0.0})
-    again = client(PROMPTS[0], DRAWN, seed=7, options={"temperature": 0.0})
+    first = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
+    again = client(PROMPTS[0], DRAWN, key=7, options={"temperature": 0.0})
 
     assert first.texts == again.texts
 
@@ -308,7 +307,7 @@ def test_zero_temperature_repeats_itself(client):
 def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     """The conversion repacked the computation, it did not change it.
 
-    The export is read back through `load_pretrained`, drawn from at
+    The export is read back through `Pretrained.load`, drawn from at
     temperature zero, and compared with the daemon handed the same policy as
     a `Sampling` value, which is what stops its penalties from standing
     between the checkpoint and the answer. The two agree token for token.
@@ -321,7 +320,7 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
 
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
@@ -352,7 +351,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
 
     worst = 0.0
     for prompt in PROMPTS:
@@ -365,7 +364,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
 
         logits = np.asarray(loaded.model.apply(
             loaded.variables, jnp.asarray([head + theirs], jnp.int32)))[0]
-        for offset, (token, entry) in enumerate(zip(theirs, reported)):
+        for offset, (token, entry) in enumerate(zip(theirs, reported, strict=True)):
             row = logits[len(head) + offset - 1].astype(np.float64)
             ours = float(row[token] - (np.log(np.exp(row - row.max()).sum()) + row.max()))
             worst = max(worst, abs(ours - float(entry.logprob)))
@@ -391,7 +390,7 @@ def test_backend_options_alone_are_not_the_models_policy(client):
 
 
 def test_what_the_export_writes_is_enough_to_import(imported, tmp_path):
-    """The gap `save_pretrained_decoder` used to leave, closed.
+    """The gap the decoder export used to leave, closed.
 
     It wrote config.json, model.safetensors and a generation_config naming a
     tokenizer it did not copy, and that directory did not convert: the

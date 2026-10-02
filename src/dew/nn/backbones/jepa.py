@@ -13,7 +13,7 @@ position is carried entirely by the 2D sincos embedding that travels with
 each token.
 """
 
-from typing import ClassVar, Literal, Sequence
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -26,12 +26,8 @@ from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
-from ..sharding import constrain, down_projection, logical_axes
-
-
-def gather_tokens(tokens, indices):
-    """Select tokens per sample: [B, S, F] and [B, N] -> [B, N, F]."""
-    return jnp.take_along_axis(tokens, indices[..., None], axis=-2)
+from ..sharding import constrain, down_projection
+from .dit import gather_tokens
 
 
 class TokenStack(nn.Module):
@@ -41,7 +37,6 @@ class TokenStack(nn.Module):
     num_heads: int
     mlp_ratio: int = 4
     ssm_attention_ratio: str = "all-attn"
-    block_pattern: Sequence[str] | None = None
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
@@ -53,8 +48,7 @@ class TokenStack(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
-        pattern = build_block_pattern(
-            self.num_layers, self.ssm_attention_ratio, self.block_pattern)
+        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
         self.blocks = [
             ModulatedBlock(
                 features=self.features,
@@ -92,7 +86,6 @@ class FactorizedTokenStack(nn.Module):
     num_heads: int
     mlp_ratio: int = 4
     ssm_attention_ratio: str = "all-attn"
-    block_pattern: Sequence[str] | None = None
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
@@ -116,8 +109,7 @@ class FactorizedTokenStack(nn.Module):
 
         # one spatial and one temporal block per layer, built as single-block
         # stacks so the two halves can be interleaved
-        pattern = build_block_pattern(
-            self.num_layers, self.ssm_attention_ratio, self.block_pattern)
+        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
         self.spatial = [stack(f"spatial_{i}", 1, "all-ssm" if kind == 'ssm' else "all-attn")
                         for i, kind in enumerate(pattern)]
         self.temporal = [stack(f"temporal_{i}", 1, "all-attn") for i in range(self.num_layers)]
@@ -207,7 +199,6 @@ class JepaVideoEncoder(JepaEncoder):
 
 
 @models("jepa_predictor")
-@logical_axes({}, heuristic=(("proj_in",), ("proj_out",), ("mask_token",)))
 class JepaPredictor(nn.Module):
     """Narrow transformer from context embeddings to target embeddings.
 

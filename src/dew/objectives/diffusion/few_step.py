@@ -1,6 +1,6 @@
 """Few-step generators trained from scratch: MeanFlow and shortcut models.
 
-MeanFlow (Geng et al. 2025, "Mean Flows for One-step Generative Modeling")
+MeanFlow (Geng et al. 2025, "Ratio Flows for One-step Generative Modeling")
 trains a model of the average velocity u(z_t, r, t) over [r, t] through the
 MeanFlow identity u = v - (t - r) du/dt, the total derivative taken along
 the flow with one JVP. One step of the average velocity then crosses the
@@ -24,23 +24,15 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.diffusion.process import Process, aligned_conditions
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
-from dew.objectives.base import Aux, Mean, Step
+from dew.objectives.base import Aux, Ratio, Step
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
 
-from .objective import DiffusionObjective
-
-
-def _own_loss(name: str, kwargs: dict) -> None:
-    """Refuse the denoising loss's extras, which an objective with its own
-    loss would leave unused."""
-    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
-    if unused:
-        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+from .objective import DiffusionObjective, _own_loss
 
 Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
@@ -130,7 +122,7 @@ class MeanFlowObjective(DiffusionObjective):
                              "path; build the process with presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.instantaneous = instantaneous
@@ -147,15 +139,15 @@ class MeanFlowObjective(DiffusionObjective):
             samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
-        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                             given, aligned_conditions(given, unconditional))
+        given, blank = self._conditions(params, batch, drop_key, dropout=False)
         later, earlier = jax.random.split(time_key)
         t, r = intervals(schedule.sample_t(later, count), schedule.sample_t(earlier, count),
                          self.instantaneous)
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
-        z, _, v = self.process.prediction.forward_diffusion(samples, noise, broadcast_rates(schedule, t, samples))
-        variables = self.trainable(params)
+        z, _, v = self.process.prediction.forward_diffusion(
+            samples, noise, broadcast_rates(schedule, t, samples)
+        )
+        variables = self.model_variables(params)
 
         def velocity(conditions, *, train: bool) -> Velocity:
             def average(z, t, r) -> jax.Array:
@@ -171,8 +163,15 @@ class MeanFlowObjective(DiffusionObjective):
             inside = (t >= start) & (t <= stop)
             omega = expand(jnp.where(inside, self.omega, 1.0), v)
             kappa = expand(jnp.where(inside, self.kappa, 0.0), v)
-            guided = jax.lax.stop_gradient(guided_velocity(
-                v, velocity(blank, train=False)(z, t, t), velocity(given, train=False)(z, t, t), omega, kappa))
+            guided = jax.lax.stop_gradient(
+                guided_velocity(
+                    v,
+                    velocity(blank, train=False)(z, t, t),
+                    velocity(given, train=False)(z, t, t),
+                    omega,
+                    kappa,
+                )
+            )
         else:
             guided = v
         dropped = jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
@@ -181,7 +180,7 @@ class MeanFlowObjective(DiffusionObjective):
         guided = jnp.where(expand(dropped, v), v, guided)
         u, target = mean_flow_target(velocity(conditions, train=True), z, t, r, guided)
         losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
-        return Mean(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
 
 
 @objectives("shortcut")
@@ -210,7 +209,7 @@ class ShortcutObjective(DiffusionObjective):
         if sections < 2 or sections & (sections - 1):
             raise ValueError(f"sections is a power of two, not {sections}")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Euler())
+        kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.sections = sections
@@ -224,9 +223,7 @@ class ShortcutObjective(DiffusionObjective):
         count = samples.shape[0]
         rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
-        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                             given, aligned_conditions(given, unconditional))
+        given, blank = self._conditions(params, batch, drop_key, dropout=False)
 
         levels = shortcut_levels(rows, self.sections)
         grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
@@ -234,7 +231,9 @@ class ShortcutObjective(DiffusionObjective):
         sigma = 1 - jax.random.randint(time_key, (count,), 0, grid.astype(jnp.int32)) / grid
         step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
-        x, _, v = self.process.prediction.forward_diffusion(samples, noise, broadcast_rates(schedule, sigma, samples))
+        x, _, v = self.process.prediction.forward_diffusion(
+            samples, noise, broadcast_rates(schedule, sigma, samples)
+        )
         dropped = jnp.arange(count) >= rows
         dropped &= jax.random.bernoulli(jax.random.fold_in(drop_key, 1), self.unconditional_prob, (count,))
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
@@ -242,21 +241,27 @@ class ShortcutObjective(DiffusionObjective):
 
         def velocity(variables, conditions, *, train: bool) -> Velocity:
             def over(x, sigma, following) -> jax.Array:
-                output = self.model.apply(variables, x, schedule.model_time(sigma), **conditions,
-                                          duration=schedule.model_time(sigma) - schedule.model_time(following),
-                                          train=train, rngs={"dropout": dropout_key})
+                output = self.model.apply(
+                    variables,
+                    x,
+                    schedule.model_time(sigma),
+                    **conditions,
+                    duration=schedule.model_time(sigma) - schedule.model_time(following),
+                    train=train,
+                    rngs={"dropout": dropout_key},
+                )
                 assert isinstance(output, jax.Array)
                 return output
             return over
 
-        teacher = self.trainable(jax.lax.stop_gradient(params if step.ema is None else step.ema))
+        teacher = self.model_variables(jax.lax.stop_gradient(params if step.ema is None else step.ema))
         leading = jax.tree.map(lambda value: value[:rows], given)
         bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
                                        step_size[:rows])
         target = jnp.concatenate([bootstrapped, v[rows:]])
-        u = velocity(self.trainable(params), conditions, train=True)(x, sigma, sigma - step_size)
+        u = velocity(self.model_variables(params), conditions, train=True)(x, sigma, sigma - step_size)
         losses = optax.l2_loss(u, target)
-        return Mean(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
 __all__ = ["MeanFlowObjective", "ShortcutObjective", "adaptive_loss", "guided_velocity", "intervals",

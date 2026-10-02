@@ -4,10 +4,10 @@ Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
 paths and applies them without editing the model. One call wraps the module,
 and the matmuls in the wrapped methods' extent run quantized.
 
-Dew's version of that call is `apply_quantization`. A caller builds its model
-from the registry as always, then wraps it before the objective ever sees it.
+Dew's version of that call is `Quantization.apply`. A caller builds its model
+as always, then wraps it before the objective ever sees it.
 A run that names `--trainer.quantization` instead hands `RunConfig.train` the
-objective, and `quantize` wraps the model it holds before anything
+objective, and `_quantize` wraps the model it holds before anything
 initialises it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
@@ -144,6 +144,19 @@ class Quantization:
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
+    def apply(self, model: nn.Module) -> nn.Module:
+        """Wrap `model` so its trunk matmuls train in this spec's dtype.
+
+        The returned module is a copy of the same class with the entry methods
+        it defines of `METHODS` wrapped, so everything the registry, the
+        objective and the checkpoint code read off the model still answers.
+        Construction already refused what the value cannot ask for; without the
+        package the call raises naming it.
+        """
+        rules = _rules(self, training=True)
+        methods = tuple(method for method in METHODS if hasattr(model, method))
+        return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
+
 
 def _qwix(module: str = "qwix") -> ModuleType:
     """Qwix's `module`, imported when a call needs it; without Qwix, an error
@@ -153,8 +166,9 @@ def _qwix(module: str = "qwix") -> ModuleType:
     except ModuleNotFoundError as error:
         if error.name != "qwix":
             raise
-        raise ModuleNotFoundError('quantization runs on Qwix; install it with pip install "dewml[quantization]"',
-                                  name="qwix") from error
+        raise ModuleNotFoundError(
+            'quantization runs on Qwix; install it with pip install "dewml[quantization]"', name="qwix"
+        ) from error
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -190,21 +204,11 @@ def _real(*dtypes: jax.typing.DTypeLike) -> bool:
 
 
 def _refuse_grouped_on_gpu() -> None:
-    """Refuse a grouped convolution with quantized activations on a GPU.
-
-    Measured with jax 0.11.2. In int8, with one or two input channels per
-    group and the int32 result scaled in float, plain JAX returns wrong
-    values without an error on the RTX 4080 (75% and 50% of the outputs),
-    and on the A100 quantizing the 176M text-to-image model's depthwise
-    convolutions dropped its CLIP score from 0.247 to 0.137. With four or
-    more per group, plain JAX computed it correctly on the RTX 4080, compiled
-    with its scaling; an int8 convolution run without its scaling fused in,
-    as it runs eagerly, fails to compile there at every group width. In fp8,
-    one or two input channels per group fail to compile on sm_89 (the RTX
-    4080), and four came out 3.5% from float; the A100, with no fp8 units,
-    computes it emulated, so nothing is gained there; sm_90 is untested. The
-    refusal covers every GPU, dtype and group width, and is revisited once an
-    H100 is measured."""
+    """Refuse a grouped convolution with quantized activations on a GPU,
+    where jax 0.11.2 computed it wrong or failed to compile it (the error
+    says where; in int8 on the A100 the 176M text-to-image model's CLIP score
+    fell from 0.247 to 0.137). The refusal covers every GPU, dtype and group
+    width until an H100 is measured."""
     if jax.default_backend() == "gpu":
         raise ValueError(
             "Dew refuses to quantize a grouped convolution's activations on a GPU. Measured with jax "
@@ -243,8 +247,11 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
         if len(operands) < 2:
             return op(*args, **kwargs)
         _, dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)
-        rescaled = jax.tree.map(lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
-                                args, is_leaf=lambda arg: isinstance(arg, qarray.QArray))
+        rescaled = jax.tree.map(
+            lambda arg: arg.astype(jnp.float32) if isinstance(arg, qarray.QArray) else arg,
+            args,
+            is_leaf=lambda arg: isinstance(arg, qarray.QArray),
+        )
         return op(*rescaled, **kwargs).astype(dtype)
 
     return scaled
@@ -314,7 +321,11 @@ def _grouped_convolution_gradient() -> type:
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            if rule is None or rule.weight_qtype is None or (feature_group_count == 1 and rule.act_qtype is None):
+            if (
+                rule is None
+                or rule.weight_qtype is None
+                or (feature_group_count == 1 and rule.act_qtype is None)
+            ):
                 return super().conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
@@ -340,29 +351,11 @@ def _grouped_convolution_gradient() -> type:
 
 
 @functools.cache
-def _providers() -> tuple[type, type]:
-    """Qwix's quantized-training and serving providers with Dew's grouped
-    convolution; importing Qwix here keeps it optional.
-
-    Both pass a matmul with a complex operand through unquantized, as the
-    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
-    quantized training quantized the real operand of the scan's
-    real-by-complex input projection, after which `jax.grad` failed on the
-    complex gradient Qwix returned for it. The training provider
-    differentiates a grouped convolution (`_grouped_convolution_gradient`).
-
-    The serving provider casts a quantized kernel's scales to the dtype a
-    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
-    through: a bf16 module then multiplied bf16 activations by fp32
-    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
-    scales two quantized operands' product in float32
-    (`_scaled_in_float32`)."""
+def _group_scaled_convolution() -> type:
+    """Qwix's provider base with Dew's grouped convolution, the base of both
+    of Dew's providers; importing Qwix here keeps it optional."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    dot_general = _qwix("qwix._src.core.dot_general")
-    einsum = _qwix("qwix._src.core.einsum")
-    quantized = _qwix("qwix._src.providers.ptq").WithAux
+    dew_conv = importlib.import_module("dew.nn.conv")
 
     class GroupScaledConvolution(qwix.QuantizationProvider):
         """Quantizes a grouped convolution's input with one scale per feature
@@ -389,9 +382,26 @@ def _providers() -> tuple[type, type]:
         """
 
         def get_intercept_map(self):
-            # Conv's CUDA implementation must keep Qwix's scales and GPU refusal.
+            # Dew's Conv convolves through dew.nn.conv._conv_general_dilated,
+            # which on CUDA computes a dilated depthwise convolution as shifted
+            # products and so reaches no lax convolution Qwix intercepts.
             return {**super().get_intercept_map(),
-                    "dew.nn.conv._conv_general_dilated": self.conv_general_dilated}
+                    "dew.nn.conv._conv_general_dilated": self.dew_conv_general_dilated}
+
+        def dew_conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, *args, **kwargs) -> jax.Array:
+            """Dew's convolution, through this provider when a rule
+            quantizes it, so that it keeps the per-group scales and the GPU
+            refusal, and otherwise Dew's own, as the unwrapped model computes
+            it (inside this handler Qwix calls the original). Sent through
+            the provider unquantized, an excluded or weight-only dilated
+            depthwise convolution took lax's path on CUDA, and quantized
+            training of the hybrid DiT parted from Qwix's own and from the
+            unwrapped model after its zero-initialized fusion kernels'
+            first update (ColabPlan-2, the RTX 4080)."""
+            rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
+            if rule is None or rule.weight_qtype is None:
+                return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
+            return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
         def conv_general_dilated(self, lhs: jax.Array, rhs: jax.Array, window_strides: Sequence[int],
                                  padding: str | Sequence[tuple[int, int]],
@@ -418,7 +428,38 @@ def _providers() -> tuple[type, type]:
             out = convolve(lhs=lhs.astype(jnp.float32)
                            / _per_feature(scales, lhs.ndim, batch, feature, lhs.shape[feature]))
             batch, feature = numbers.out_spec[:2]
-            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(lhs.dtype)
+            return (out * _per_feature(scales, out.ndim, batch, feature, out.shape[feature])).astype(
+                lhs.dtype
+            )
+
+    return GroupScaledConvolution
+
+
+@functools.cache
+def _providers() -> tuple[type, type]:
+    """Qwix's quantized-training and serving providers with Dew's grouped
+    convolution; importing Qwix here keeps it optional.
+
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it. The training provider
+    differentiates a grouped convolution (`_grouped_convolution_gradient`).
+
+    The serving provider casts a quantized kernel's scales to the dtype a
+    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
+    through: a bf16 module then multiplied bf16 activations by fp32
+    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
+    qwix = _qwix()
+    conv_general = _qwix("qwix._src.core.conv_general")
+    dot_general = _qwix("qwix._src.core.dot_general")
+    einsum = _qwix("qwix._src.core.einsum")
+    quantized = _qwix("qwix._src.providers.ptq").WithAux
+    group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
         """Passes a matmul with a complex operand through unquantized."""
@@ -437,10 +478,10 @@ def _providers() -> tuple[type, type]:
                 return super().einsum(einsum_str, *operands, **kwargs)
             return jnp.einsum(einsum_str, *operands, **kwargs)
 
-    class QtProvider(GroupScaledConvolution, ComplexInFloat, _grouped_convolution_gradient()):
+    class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
         pass
 
-    class PtqProvider(GroupScaledConvolution, ComplexInFloat, qwix.PtqProvider):
+    class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
         def __init__(self, rules: Sequence[object]) -> None:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(dot_general.dot_general),
@@ -478,20 +519,6 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
-    """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
-
-    The returned module is a copy of the same class with the entry methods
-    it defines of `METHODS` wrapped, so everything the registry, the
-    objective and the checkpoint code read off the model still answers.
-    Construction already refused what the value cannot ask for; without the
-    package the call raises naming it.
-    """
-    rules = _rules(spec, training=True)
-    methods = tuple(method for method in METHODS if hasattr(model, method))
-    return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
-
-
 def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
@@ -517,7 +544,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     the float kernel, so the weights take about a quarter of fp32's memory, and the
     returned module computes with them. Unless `spec.weight_only`, its
     activations quantize at each matmul from their own range, as training
-    under `apply_quantization` does, and a matmul of two quantized operands
+    under `Quantization.apply` does, and a matmul of two quantized operands
     runs in the quantized dtype. `args` and `kwargs` are one example call of
     the model, which Qwix traces abstractly to find the kernels its
     matmuls read. `spec`'s backward fields have nothing to do here.
@@ -551,11 +578,12 @@ class ModelObjective(Protocol):
     model: nn.Module
 
 
-def quantize(objective: object, spec: Quantization) -> None:
-    """Quantize the trunk matmuls of the module `objective` trains.
+def _quantize(objective: object, spec: Quantization) -> None:
+    """Quantize the trunk matmuls of the module `objective` trains, in place.
 
-    `apply_quantization` wraps a module before an objective is built, which
-    is what a recipe that builds its own model does. A run that names
+    This is `RunConfig.train`'s step, not a user's. `Quantization.apply`
+    wraps a module before an objective is built, which is what a recipe or
+    a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
     already, so the wrap lands on the objective's own model instead, before
     anything has initialised or traced it; the wrapped module is a copy of
@@ -570,4 +598,7 @@ def quantize(objective: object, spec: Quantization) -> None:
             f"--trainer.quantization quantizes the module an objective trains, and "
             f"{type(objective).__name__} keeps no `model`; train an objective that "
             f"holds one, or leave the quantization unset")
-    objective.model = apply_quantization(objective.model, spec)
+    objective.model = spec.apply(objective.model)
+
+
+__all__ = ["ModelObjective", "Quantization"]

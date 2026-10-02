@@ -2,7 +2,8 @@
 
 On eight CPU devices simulated in one process, as a mesh of data 2, expert 2 and fsdp 2:
 
-    XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu python examples/moe_mesh.py --out runs/moe-mesh
+    XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
+        python examples/moe_mesh.py --out runs/moe-mesh
 
 On one accelerator, where the experts cannot be split, each device computes every expert:
 
@@ -33,19 +34,21 @@ from pathlib import Path
 
 import flax.linen as nn
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
 from jax.sharding import NamedSharding
 
-from dew import Layout, MeshSpec, Trainer, models
-from dew.data import ByteTokenizer, Loading, TokenWindows
+from dew import Layout, MeshSpec, Trainer
+from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
+from dew.nn.backbones import CausalTransformer, Mixture
 from dew.nn.sharding import RESIDUAL, logical_spec
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
-from dew.training.distributed import DevicePrefetchIterator, batch_shardings, data_partition
+from dew.training.distributed import DevicePrefetchIterator, batch_shardings
 
 
 @dataclass
@@ -169,9 +172,15 @@ def routing_record(selections, tokens: np.ndarray, where: Placement, experts: in
             np.add.at(sent[device], where.owner[device, indices[rows].ravel()], 1)
         by_class = np.zeros((len(CLASSES), experts), np.int64)
         np.add.at(by_class, (np.repeat(classes.ravel(), indices.shape[-1]), indices.ravel()), 1)
-        layers.append({"layer": name, "sent": sent.tolist(), "rounds": exchange_rounds(sent, shards, dispatch),
-                       "per_expert": np.bincount(indices.ravel(), minlength=experts).tolist(),
-                       "by_class": by_class.tolist()})
+        layers.append(
+            {
+                "layer": name,
+                "sent": sent.tolist(),
+                "rounds": exchange_rounds(sent, shards, dispatch),
+                "per_expert": np.bincount(indices.ravel(), minlength=experts).tolist(),
+                "by_class": by_class.tolist(),
+            }
+        )
     return layers
 
 
@@ -209,10 +218,10 @@ def main(config: Config) -> None:
     write_tokens(config.out / "tokens", config.seed)
     data = TokenWindows(path=str(config.out / "tokens"), seq_len=config.sequence_length, val_batches=1,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=config.batch_size)
-    model = models.build(
-        "causal_transformer", vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
-        mlp_features=128, max_seq_len=64, dtype="float32", attention_impl="xla",
-        mixture={"experts": config.experts, "top_k": config.top_k, "every": 1, "dispatch": config.dispatch})
+    model = CausalTransformer(
+        vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
+        mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
+        mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
     objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
     trainer = Trainer(objective, optax.adam(config.learning_rate), key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))
@@ -230,7 +239,7 @@ def main(config: Config) -> None:
     selections = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"])[1]["router"])
 
     steps, frames = [], []
-    with DevicePrefetchIterator(data.train(data_partition(mesh)), mesh) as source:
+    with DevicePrefetchIterator(data.train(DataPartition.of(mesh)), mesh) as source:
         batch = next(source)
         step = trainer.compile(state, batch)
         operations, groups = all_to_all_ops(trainer.executable.as_text())
@@ -265,7 +274,7 @@ def main(config: Config) -> None:
     task = TextGeneration(model, state.params, RunProcessor(tokenizer), sampling=Sampling(temperature=0.0))
     server = Server.from_task(task, slots=len(starts), capacity=64)
     generations = [generation.host() for generation in
-                   server(starts, config.sequence_length - width, seed=config.seed)]
+                   server(starts, config.sequence_length - width, key=config.seed)]
     for start, generation in zip(starts, generations, strict=True):
         print(f"{start.lstrip()!r} -> {generation.text[0].split(chr(10))[0]!r}")
     sequences = np.concatenate([np.asarray(generation.tokens) for generation in generations])
@@ -311,7 +320,9 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
     mesh = where.mesh
     shape = {axis: mesh.shape[axis] for axis in ("data", "expert", "fsdp")}
     if any(size > 1 for axis, size in mesh.shape.items() if axis not in shape):
-        raise ValueError(f"the drawing lays out the data, expert and fsdp axes; this mesh is {dict(mesh.shape)}")
+        raise ValueError(
+            f"the drawing lays out the data, expert and fsdp axes; this mesh is {dict(mesh.shape)}"
+        )
     layers = len(record["frames"][0]["layers"])
     # One panel per data index, wrapped to rows about four devices wide;
     # inside a panel the expert axis runs down and fsdp across.
@@ -362,22 +373,47 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
     kind = ("simulated CPU devices" if where.devices[0].platform == "cpu" and len(where.devices) > 1
             else f"{record['device_kind']} device(s)")
     static += [
-        text(0, 20, f"MoE decoder on mesh {shape} of {len(where.devices)} {kind}, "
-                    f"{config.experts} experts, top-{config.top_k}, dispatch={config.dispatch}", 15, weight="bold"),
+        text(
+            0,
+            20,
+            f"MoE decoder on mesh {shape} of {len(where.devices)} {kind}, "
+            f"{config.experts} experts, top-{config.top_k}, dispatch={config.dispatch}",
+            15,
+            weight="bold",
+        ),
         text(0, 62, ops, 11, fill="#555"),
-        text(0, grid_top + grid_h + 24, "Arrows: routed slots a device sends to another in this step's forward, "
-             "summed over the MoE layers (d, e, f = data, expert, fsdp coordinate).", 11, fill="#555"),
-        text(0, grid_top + grid_h + 40, "Each training frame routes that step's own batch through the "
-             "step's parameters; the last frame routes the generated text.", 11, fill="#555"),
+        text(
+            0,
+            grid_top + grid_h + 24,
+            "Arrows: routed slots a device sends to another in this step's forward, "
+            "summed over the MoE layers (d, e, f = data, expert, fsdp coordinate).",
+            11,
+            fill="#555",
+        ),
+        text(
+            0,
+            grid_top + grid_h + 40,
+            "Each training frame routes that step's own batch through the "
+            "step's parameters; the last frame routes the generated text.",
+            11,
+            fill="#555",
+        ),
     ]
     if config.dispatch == "global":
         static.append(text(0, 80, "dispatch=global: each device computes every expert for its own rows, "
                                   "so no token leaves its device", 11, fill="#555"))
     charts = [
-        series([step["loss"] for step in record["steps"]], "training loss", 0, grid_top + grid_h + 80,
-               grid_w, 80),
-        series([int(np.sum(step["sent"]) - np.trace(np.sum(step["sent"], axis=0))) for step in record["steps"]],
-               "slots sent to another device per step, all MoE layers", 0, grid_top + grid_h + 200, grid_w, 80),
+        series(
+            [step["loss"] for step in record["steps"]], "training loss", 0, grid_top + grid_h + 80, grid_w, 80
+        ),
+        series(
+            [int(np.sum(step["sent"]) - np.trace(np.sum(step["sent"], axis=0))) for step in record["steps"]],
+            "slots sent to another device per step, all MoE layers",
+            0,
+            grid_top + grid_h + 200,
+            grid_w,
+            80,
+        ),
     ]
     static += [chart.static for chart in charts]
     frames = [frame_group(frame, centre, config, chart_x, grid_top)
@@ -391,12 +427,14 @@ def drawing(record: dict, where: Placement, config: Config) -> str:
              f".frame {{ visibility: hidden; animation: show {total:.1f}s step-end infinite }}\n"
              + "".join(f".f{i} {{ animation-delay: {i * SECONDS_PER_FRAME:.1f}s }}\n" for i in range(count)))
     body = "\n".join(static + [f'<g class="frame f{i}">{group}</g>' for i, group in enumerate(frames)])
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" '
-            f'height="{height}" font-family="ui-sans-serif, system-ui, sans-serif">\n'
-            f'<style>{style}</style>\n<rect width="100%" height="100%" fill="#fff"/>\n'
-            f'<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" '
-            f'markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#333"/>'
-            f'</marker></defs>\n{body}\n</svg>\n')
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" '
+        f'height="{height}" font-family="ui-sans-serif, system-ui, sans-serif">\n'
+        f'<style>{style}</style>\n<rect width="100%" height="100%" fill="#fff"/>\n'
+        f'<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" '
+        f'markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#333"/>'
+        f"</marker></defs>\n{body}\n</svg>\n"
+    )
 
 
 @dataclass
@@ -415,8 +453,13 @@ class Series:
 def series(values: list[float], label: str, x: float, y: float, width: float, height: float) -> Series:
     """One value per training step as a line, with its range labelled."""
     low, high = min(values), max(values)
-    points = [(x + 40 + (width - 40) * index / max(1, len(values) - 1),
-               y + height - height * (value - low) / max(high - low, 1e-9)) for index, value in enumerate(values)]
+    points = [
+        (
+            x + 40 + (width - 40) * index / max(1, len(values) - 1),
+            y + height - height * (value - low) / max(high - low, 1e-9),
+        )
+        for index, value in enumerate(values)
+    ]
     line = " ".join(f"{px:.1f},{py:.1f}" for px, py in points)
     static = "".join([
         text(x, y - 6, label, 11, fill="#555"),
@@ -439,9 +482,15 @@ def frame_group(frame: dict, centre: dict, config: Config, chart_x: float, top: 
     peak = max(1, int(away.max()))
     for device, (cx, cy) in centre.items():
         start, stop = frame["rows"][device]
-        parts += [text(cx - BOX_W / 2 + 8, cy - BOX_H / 2 + 68, f"batch rows {start}:{stop}", 11, fill="#555"),
-                  text(cx - BOX_W / 2 + 8, cy + BOX_H / 2 - 8,
-                       f"keeps {sent[device, device]} slots, sends {away[device].sum()}", 11)]
+        parts += [
+            text(cx - BOX_W / 2 + 8, cy - BOX_H / 2 + 68, f"batch rows {start}:{stop}", 11, fill="#555"),
+            text(
+                cx - BOX_W / 2 + 8,
+                cy + BOX_H / 2 - 8,
+                f"keeps {sent[device, device]} slots, sends {away[device].sum()}",
+                11,
+            ),
+        ]
     for source, target in zip(*np.nonzero(away), strict=True):
         (x0, y0), (x1, y1) = centre[source], centre[target]
         # Each direction bends to its own side, so a pair's two arrows stay apart.
@@ -450,11 +499,19 @@ def frame_group(frame: dict, centre: dict, config: Config, chart_x: float, top: 
         direction = np.sign(y1 - y0)
         y0, y1 = y0 + direction * BOX_H / 2, y1 - direction * BOX_H / 2
         stroke = 1 + 7 * away[source, target] / peak
-        parts += [f'<path d="M{x0 + bend / 2:.1f} {y0:.1f} Q{mid_x:.1f} {mid_y:.1f} {x1 + bend / 2:.1f} {y1:.1f}" '
-                  f'fill="none" stroke="#333" stroke-opacity="0.55" stroke-width="{stroke:.1f}" '
-                  f'marker-end="url(#head)"/>',
-                  text(mid_x + (6 if bend > 0 else -6), mid_y + 4, int(away[source, target]), 11,
-                       "start" if bend > 0 else "end", "bold")]
+        parts += [
+            f'<path d="M{x0 + bend / 2:.1f} {y0:.1f} Q{mid_x:.1f} {mid_y:.1f} {x1 + bend / 2:.1f} {y1:.1f}" '
+            f'fill="none" stroke="#333" stroke-opacity="0.55" stroke-width="{stroke:.1f}" '
+            f'marker-end="url(#head)"/>',
+            text(
+                mid_x + (6 if bend > 0 else -6),
+                mid_y + 4,
+                int(away[source, target]),
+                11,
+                "start" if bend > 0 else "end",
+                "bold",
+            ),
+        ]
     for index, layer in enumerate(frame["layers"]):
         parts.append(layer_chart(layer, config, chart_x, top + index * 250))
     return "".join(parts)

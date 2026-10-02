@@ -4,7 +4,7 @@
 
 Without --pickle the pinned upstream checkpoint is downloaded and verified
 first. The conversion itself is `dew.interop.inception_fid`, the one place
-that opens a pickle; `fid(weights=...)` reads what this writes.
+that opens a pickle; `FID(weights=...)` reads what this writes.
 """
 
 import argparse

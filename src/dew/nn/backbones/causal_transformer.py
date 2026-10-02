@@ -1,7 +1,7 @@
 """The autoregressive transformer decoder every language model here trains.
 
-Token embedding, rotary positions, pre-norm blocks of grouped-query causal
-attention and a gated MLP, a final RMSNorm, and an fp32 head. Attention goes
+By default, token embedding, rotary positions, pre-norm blocks of grouped-query
+causal attention and a gated MLP, a final RMSNorm, and an fp32 head. Attention goes
 through the one shared kernel path in dew.nn.attention, so a run picks
 reference/xla/cudnn/tpu the same way a diffusion run does, and decoding reuses
 the same fixed-size KV cache helpers.
@@ -24,7 +24,8 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal
 
 import flax.core
 import jax
@@ -56,7 +57,7 @@ from ..hyper_connections import (
     first_stream,
 )
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
-from ..kv_cache import KVCache, is_paged
+from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
@@ -73,7 +74,16 @@ from ..sharding import (
     pipeline_stages,
     row_axes,
 )
-from .decoder_block import BlockWiring, DecoderBlock, GatedMLP, Mixture, MTPBlock, RematPolicy, remat_policy
+from .decoder_block import (
+    BlockWiring,
+    DecoderBlock,
+    GatedMLP,
+    Mixture,
+    MTPBlock,
+    RematPolicy,
+    decoder_norm,
+    remat_policy,
+)
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 
@@ -175,7 +185,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
 
-        def step(layer, carry, per_layer_input):
+        def step(layer, carry, per_layer_input, *, store=store):
             return layer(carry, train=train, decode=decode, positions=positions,
                          segment_ids=segment_ids, kv_store=store,
                          per_layer_input=per_layer_input,
@@ -188,7 +198,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # host operand and refetches only this layer in backward
             # (MaxText layers/decoders.py:544-565).
             step = nn.remat(nn.map_variables(
-                step, True, trans_in_fn=_fetched, init=False, mutable=True))
+                step, mapped_collections=True, trans_in_fn=_fetched, init=False, mutable=True))
         if count == 1:
             x, _ = step(run, x, None if inputs is None else inputs.layer(0))
         else:
@@ -203,40 +213,29 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
               banked: bool = False):
     """Run the layers over `x`, one run at a time as `groups` says.
 
-    A run of one layer is `layers[first]`, called as the plain loop calls
-    it. A longer run is one block, named for its range, under flax's scan.
-    Its variables carry a leading layer axis that the view outside stacks
-    and unstacks, and each iteration reads its own slice of the per-layer
-    inputs.
+    A run of one is `layers[first]`; a longer run is one block named for its
+    range under flax's scan, its variables on a leading layer axis the view
+    stacks and unstacks, each iteration reading its slice of the per-layer
+    inputs. A run's layers all share or all own their keys and values: sharing
+    layers read the store their providers filled (a closed-over constant), and
+    owning layers get no store, since a Python dict cannot follow writes from
+    inside the loop and a provider is always a run of one.
 
-    A run's layers all share or all own their keys and values. Sharing
-    layers read the store their providers filled before the run, a constant
-    the loop closes over. Owning layers would write into it from inside the
-    loop, where a Python dict cannot follow, so they get no store. Nothing
-    reads what they would have written, because a provider is always a run
-    of one.
-
-    `banked` says the store already holds each run's parameters as one array
-    (`dew.inference.banks`) rather than as the layers the view stacked.
-    Those runs, and any run the layout left in host memory, are read one
-    layer at a time in `_prefetched_run`. At most two layers of one run are
-    in device memory then, whatever the depth, and nothing is fetched that
-    nothing computes with. Staging crosses the runs' boundaries, so a stack
-    of single layers, of unequal runs, or of both is pipelined the same way.
-    No run's fetch can be hoisted above the layer before it, because it is
-    issued inside that layer's scan iteration or ordered after it by the
-    carry it lands in. A resident bank and a host-resident one are read by
-    the same loop and give the same values.
-
-    Training uses the native Linen scan instead. map_variables stages one
-    row under remat, so the backward pass refetches the original pinned bank
-    rather than retaining a device copy of every layer. That leaves training
-    no duplicate weight bank and no prefetch carry; inference keeps its
-    prefetch.
+    `banked` says the store holds each run's parameters as one array
+    (`dew.inference.banks`). Those runs, and runs the layout left in host
+    memory, are read one layer at a time in `_prefetched_run`: at most two of a
+    run's layers are on the device, staging crosses run boundaries, and no fetch
+    can be hoisted above the layer before it (it is issued inside that layer's
+    iteration or ordered by the carry). Training uses the native Linen scan
+    instead, with map_variables staging one row under remat, so the backward
+    refetches the pinned bank rather than keeping a device copy.
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
-    fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
+    streaming = any('streaming' in run.variables for run in runs)
+    if streaming and train:
+        raise ValueError("disk streaming is inference-only")
+    fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              positions=positions, segment_ids=segment_ids, kv_store=kv_store,
@@ -249,9 +248,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         which a bank holds per layer.
         """
         return [name for name in run.variables
-                if not run.is_mutable_collection(name) or name not in WRITTEN]
+                if name != 'streaming' and (not run.is_mutable_collection(name) or name not in WRITTEN)]
 
-    def first_of(index: int):
+    def first_of(index: int, dependency):
         """Fetch run `index`'s first layer's read-only variables.
 
         Returns None past the last run: the copy nothing computes with is
@@ -259,16 +258,19 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         """
         if index >= len(runs):
             return None
+        reader = runs[index].variables.get('streaming', {}).get('bank')
+        if reader is not None:
+            return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
         return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
 
-    staged = first_of(0)
+    staged = first_of(0, x)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
         mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
 
-        def layer(read, cache, hidden, per_layer_slice):
+        def layer(read, cache, hidden, per_layer_slice, *, run=run, mutable=mutable, store=store):
             variables = dict(read) if cache is None else {**read, 'cache': cache}
             hidden, changed = run.apply(
                 variables, hidden, mutable=mutable, train=train, decode=decode,
@@ -278,13 +280,14 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
         cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
-            following = first_of(index + 1)
+            following = first_of(index + 1, x)
             x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
                 banks, staged, cached, x, inputs, layer, count,
-                following=functools.partial(first_of, index + 1))
+                following=functools.partial(first_of, index + 1),
+                reader=run.variables.get('streaming', {}).get('bank'))
         staged = following
         for collection, tree in changed.items():
             for name, value in tree.items():
@@ -292,26 +295,20 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
-def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following):
+def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following, reader=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
-    `primed` is layer 0's read-only variables, already in device memory.
-    Iteration `i` issues the copy of layer `i + 1` and then computes layer
-    `i`, so the copy has that layer's compute to overlap. The loop runs
-    `count - 1` iterations and the last layer is computed after it, out of
-    what the carry brought out. `following` stages the next run's first
-    layer in place of the copy the last layer does not need, and its result
-    goes back to the caller.
-
-    The carry is the hidden state, the staged variables and the cache. The
-    cache is written in place, one layer's slice per iteration, so a decode
-    step holds one banked cache and not two. A cache the layers create
-    instead comes out per iteration, stacked on a leading layer axis the way
-    flax's own scan hands them out.
+    `primed` is layer 0's read-only variables, already on the device. Iteration
+    `i` issues layer `i + 1`'s copy, then computes layer `i`; the last layer is
+    computed after the loop and `following` stages the next run's first layer in
+    place of its copy. The carry is the hidden state, the staged variables and
+    the cache, written in place one layer's slice per iteration so a decode step
+    holds one banked cache; a cache the layers create comes out stacked per
+    iteration, as flax's scan hands them out.
     """
     def body(carry, index):
         hidden, current, held = carry
-        staged = _fetched_layer(banks, index + 1)
+        staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
@@ -321,7 +318,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
 
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
-    staged = following()
+    staged = following(x)
     x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
@@ -367,28 +364,19 @@ def _stack_leaves(*trees):
 class StackView:
     """The layer stack's variables as its loops read them.
 
-    Outside, every collection holds one subtree per layer, `layers_N`, which
-    is the tree a checkpoint stores and a Hugging Face loader fills. Inside
-    a scanned run the same leaves are stacked along a leading layer axis
-    under the run's name (`layers_3_7`), and inside a pipeline every stage's
-    copy of a position is stacked along a leading stage axis under `stages`.
-    `stack` builds the inside from the outside and `unstack` the outside
-    from the inside, so what a run reads, sows and caches lands leaf for
-    leaf where the plain loop puts it.
+    Outside, every collection holds one subtree per layer, `layers_N`, the tree
+    a checkpoint stores and a Hugging Face loader fills. Inside a scanned run
+    the leaves stack on a leading layer axis under the run's name
+    (`layers_3_7`), and inside a pipeline on a leading stage axis under
+    `stages`; `stack` and `unstack` convert, so what a run reads, sows and
+    caches lands where the plain loop puts it.
 
-    `banked` names the collections a store already holds the inside way, one
-    array per run with the layer axis in it. Those the view leaves alone in
-    both directions: the bank a run scans is the one array the store holds,
-    with no copy of it under either name and no per-layer mirror beside it.
-    The stored identity is still `layers_N`: `bank_names` says which bank a
-    run's layers are in, and `unstack` on a banked store outside a scope is
-    what a save or an export reads, one layer's slice of one bank at a time.
-
-    `groups` are the runs of one stage (of the whole stack without a
-    pipeline). A collection that entered the pipeline's loop keeps `[stage,
-    ...]` leaves; one the loop created (what the routers sow) keeps
-    `[iteration, stage, microbatch, ...]` leaves, of which the real
-    iterations of each stage are its microbatches in order.
+    `banked` collections are already held the inside way, one array per run,
+    and are left alone both ways; `bank_names` says which bank a run's layers
+    are in, and `unstack` outside a scope reads one layer's slice at a time for
+    a save or export. A collection that entered the pipeline keeps `[stage,
+    ...]` leaves; one the loop created keeps `[iteration, stage, microbatch,
+    ...]`, each stage's real iterations being its microbatches in order.
     """
     groups: tuple[tuple[int, int], ...]
     stages: int = 1
@@ -475,13 +463,9 @@ class StackView:
         return outside
 
     def _leaf(self, stage: int, offset: int | None, broadcast: bool, leaf):
-        """One layer's leaf out of a run's stacked one.
-
-        The row is taken with `index_in_dim`, a slice of a known position, so
-        the read is expressible wherever the bank sits: an index array would
-        be a gather, and a gather over a host-resident operand needs its
-        indices in host memory too, which is not what a save or an export
-        holds.
+        """One layer's leaf out of a run's stacked one, taken with `index_in_dim`:
+        an index array would be a gather, which over a host-resident bank needs
+        host-memory indices a save or export does not hold.
         """
         if self.stages == 1:
             assert offset is not None, "a run of one is not stacked, so the view keeps it"
@@ -548,6 +532,7 @@ def _whole(value, axis: int):
 @models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
+    ("embed_positions",): (None, "embed"),
     ("lm_head",): ("embed", "vocab"),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
@@ -555,106 +540,64 @@ def _whole(value, axis: int):
     # per copy past the first, named by their index like the layers; a
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
-}, heuristic=(("altup_projections_*",), ("altup_unembed_projections_*",)))
+})
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
     The defaults train a model from scratch: multi-head attention, swiglu,
     tied embeddings, no softcap. Every field an open decoder varies is a
     field here, so loading Qwen3 or Gemma3 is a field mapping and not a
-    subclass. The field comments below name which family sets each one.
+    subclass; the field comments name the family that sets each one. Classic
+    GPT blocks are `norm_type='layer'`, `norm_bias`, an ungated `mlp`,
+    `mlp_bias` and learned positions, which advance from each decode row's
+    cache cursor.
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
-    a kind does: its window, and its own rope base or head dim. Deriving the
-    pattern from a checkpoint's config belongs to that translation, not
-    here; this takes the tuple.
+    a kind does. `kv_shared_layers` names the layers that share by index (a
+    trailing run for Gemma 3n/4, one after every indexer layer for GLM's
+    IndexShare). A sharing layer reads what the last earlier non-sharing
+    layer of its kind stashed: keys and values for attention, the indexer's
+    selection for MLA.
 
-    `mixture` turns the feed-forward of some layers into `moe.SparseMLP`,
-    routing each token to a few of its experts. None is a dense model. The
-    LM objective's balance_rate is what moves a mixture's balancing bias.
+    Active attention dropout runs the reference kernel, and an explicit
+    fused kernel that cannot drop probabilities is refused.
 
-    `causal=False` turns every layer into full attention with no cache,
-    which is the encoder a masked diffusion language model denoises with.
-    The parameter tree is the same either way.
+    Interleaved mRoPE (Qwen3.5's mrope_section) is `partial_rotary_factor`
+    for text: with one position per token the three grids' angles are equal,
+    so text-only input reduces to the partial rope exactly; image-grid
+    positions are not modelled. A `mixer` kind other than attention reads its
+    own record; the GQA geometry fields stay validated, so a translation
+    fills them consistently.
 
-    `per_layer_input_dim` turns on Gemma 3n/4 per-layer input embeddings: an
-    extra table, read per layer and added to that layer's input through its
-    own gate. None leaves the tree unchanged.
+    MTP depth d pairs the previous depth's state at position p with the
+    embedding of the token at p + d and scores what follows p + d (arXiv
+    2412.19437, section 2.2), so each depth is one position shorter.
 
-    `num_kv_shared_layers` makes that many trailing layers reuse an earlier
-    layer's keys and values instead of projecting their own, which is Gemma
-    3n/4 cross-layer KV sharing. `use_double_wide_mlp`, which widens the
-    sharing layers' MLP, needs it. `kv_shared_layers` names the sharing
-    layers one by one instead, for a pattern that is not a trailing run:
-    GLM's IndexShare puts one after every indexer layer but the first three.
-    Either spelling resolves to the same plan. A sharing layer reads what
-    the last earlier non-sharing layer of its own kind stashed, and what a
-    layer stashes is its mixer's own: keys and values for attention, the
-    indexer's selection for MLA.
-
-    `altup` carries Gemma 3n's copies of the residual stream
-    (`dew.nn.gemma3n`). The embeddings enter the layers as a stack, each
-    block predicts the copies, runs on the active one and corrects them all,
-    and the copies come back through their own projections to a mean the
-    final norm reads. `laurel_rank` adds the LAuReL block to every layer and
-    `activation_sparsity_pattern` the gaussian top-k on each layer's gate. A
-    tuple `mlp_features` gives each layer its own width; a width of 0 is a
-    layer without a feed-forward, which is Mamba-2's block of the mixer
-    alone.
-
-    `attention_residuals` replaces the running residual with Kimi K3's
-    softmax over finished blocks of layers (`dew.nn.attention_residuals`):
-    the embeddings enter as the first partial sum, every sublayer reads a
-    mixture over depth, and a model-level site mixes the blocks once more
-    before the final norm. `mlp` may be a `Situ` in place of an activation
-    name: Kimi K3's SiTU, which every feed-forward then shares
-    (`dew.nn.moe.Situ`).
-
-    `partial_rotary_factor` rotates that fraction of an unwindowed kind's
-    head dims and passes the rest through; a windowed kind rotates whole.
-    `partial_rotary_type` names which published convention the fraction
-    follows, because the two rotate different angles:
-    `dew.nn.rope.rotary_freqs` documents both. Interleaved mRoPE
-    (Qwen3.5's mrope_section) is this same rotation for text. With one
-    position per token the three grids' angles are equal and the interleave
-    reads the same value from each, so text-only input reduces to this
-    partial rope exactly; image-grid positions are not modelled.
-
-    `mixer` names the per-layer token mixer as a value from the `mixers`
-    registry, one frozen dataclass per kind under the reference's own field
-    names. None is grouped-query causal attention. A non-standard kind reads
-    its own record and ignores the GQA projection geometry the context still
-    carries; those fields stay validated, so a translation fills them with
-    consistent values.
-
-    `num_nextn_predict_layers` stacks that many multi-token-prediction
-    depths after the final norm, each an `MTPBlock`. Depth d pairs the
-    previous depth's state at position p with the embedding of the token at
-    p + d and scores what follows p + d (arXiv 2412.19437, section 2.2), so
-    each depth is one position shorter than the last.
-
-    `scan_layers` runs each run of consecutive like layers as iterations of
-    one body under flax's scan, and the layers between such runs unrolled.
-    Layers are alike when they share a parameter shape and a computation,
-    which is read off the resolved layers and never configured. A body
-    compiles once however many layers it runs, so compile time stops growing
-    with depth. The variables tree is the unscanned one leaf for leaf: the
-    scan reads and writes a stacked view of the same leaves (`StackView`).
-    `init` builds every run of like layers under the scan whatever
-    `scan_layers` says, so its program draws each run's parameters once
-    rather than once per layer, and unstacks them into that tree. A stage axis above one on
-    the mesh runs the stack as a pipeline over that axis (`_pipeline`),
-    whether or not the layers scan.
+    `scan_layers` runs each run of like layers (same parameter shapes and
+    computation, read off the resolved layers) as one scanned body, so
+    compile time stops growing with depth; the variables tree stays the
+    unscanned one (`StackView`). `init` always draws like runs under the
+    scan, once per run. A stage axis above one on the mesh runs the stack as
+    a pipeline (`_pipeline`).
     """
     vocab_size: int
     emb_features: int = 512
     num_layers: int = 8
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
-    head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: GatedActivation = 'swiglu'          # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
-    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
+    head_dim: int | None = None  # None: emb_features // num_heads
+    mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
+    mlp_bias: bool = False
+    """Bias both feed-forward projections; gelu, gelu_exact and relu are ungated."""
+    mlp_features: int | tuple[int, ...] | None = None
+    """None: four times emb_features; a tuple: one width per layer (Gemma 3n);
+    0: no feed-forward (Mamba-2)."""
     max_seq_len: int = 2048
+    position_embedding: Literal['rotary', 'learned'] = 'rotary'
+    position_embedding_size: int | None = None
+    """Learned table size, None for max_seq_len, independent of the decode capacity."""
+    position_embedding_offset: int = 0
+    """Reserved rows before learned position zero, two in OPT checkpoints."""
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: float | None = None  # None: every dim rotates
@@ -662,10 +605,14 @@ class CausalTransformer(nn.Module):
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
+    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_bias: bool = False
     scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
+    parallel_residual: bool = False
+    """Attention and feed-forward read the same residual, as GPT-NeoX does."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -708,6 +655,8 @@ class CausalTransformer(nn.Module):
     """Placeholder ids looked up as token zero, without changing labels
     (modeling_kimi_k25.py:686-690, the text-only wrapper path)."""
     dropout_rate: float = 0.0
+    embedding_dropout_rate: float = 0.0
+    attention_dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
@@ -715,13 +664,16 @@ class CausalTransformer(nn.Module):
     kv_cache: KVCache = KVCache()
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
-    mixture: Mixture | None = None        # None: every layer is dense
-    use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
-    causal: bool = True                      # False: full attention, no cache
-    per_layer_input_dim: int | None = None  # Gemma 3n/4 per-layer inputs
+    mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
+    use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width; needs sharing
+    causal: bool = True
+    """False is full attention, the encoder a masked diffusion language model
+    denoises with; the parameter tree is the same either way."""
+    per_layer_input_dim: int | None = None
+    """Gemma 3n/4 per-layer inputs: an extra table read per layer and added
+    to its input through its own gate."""
     per_layer_input_vocab: int | None = None  # None: vocab_size
-    num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    kv_shared_layers: tuple[int, ...] | None = None  # the sharing layers named one by one
+    kv_shared_layers: tuple[int, ...] | None = None  # layers reusing a provider's K/V; None disables
     mixer: MixerBase | None = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
@@ -730,10 +682,12 @@ class CausalTransformer(nn.Module):
     mtp_hyper_connections: HyperConnections | None = None
     """None gives prediction depths plain residuals and normalized trunk inputs.
     A stream depth explicitly opts in, independently of the trunk's residuals."""
-    altup: AltUp | None = None             # Gemma 3n's stack of residual copies; None disables
+    altup: AltUp | None = None             # Gemma 3n's residual copies (`dew.nn.gemma3n`); None disables
     laurel_rank: int | None = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams; None disables
-    attention_residuals: AttentionResiduals | None = None  # Kimi K3's block depth mixture; None disables
+    attention_residuals: AttentionResiduals | None = None
+    """Kimi K3's softmax over finished blocks of layers in place of the
+    running residual (`dew.nn.attention_residuals`); None disables."""
     engram: Engram | None = None
     """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`): the layers it names
     gate their table rows into the residual streams before their attention.
@@ -746,9 +700,12 @@ class CausalTransformer(nn.Module):
     decoder blocks attending with its `layer_type` kind's V4 attention as a
     `DSparkAttention`, and its target layers sow the stream means it reads
     (`draft_context`). None is a model without one."""
-    swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
-    activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
-    mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
+    swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
+    activation_sparsity_pattern: tuple[float, ...] | None = None
+    """Gemma 3n's gaussian top-k, one fraction per layer."""
+    mask_token_id: int | None = None
+    """The vocabulary id a masked-diffusion objective corrupts to;
+    None is plain training."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is how many its parameter
@@ -885,38 +842,20 @@ class CausalTransformer(nn.Module):
         mixture = self.mixture
         if mixture is None:
             return ()
-        if mixture.layers is not None:
-            return tuple(mixture.layers)
-        if mixture.every is not None:
-            return tuple(index for index in range(self.num_layers)
-                         if (index + 1) % mixture.every == 0)
-        return tuple(range(self.num_layers))
+        return tuple(range(self.num_layers)) if mixture.layers is None else mixture.layers
 
     @property
     def sharing_layers(self) -> tuple[int, ...]:
-        """The layers that read another layer's stash, in order: the trailing
-        num_kv_shared_layers or the ones kv_shared_layers names."""
-        if self.num_kv_shared_layers and self.kv_shared_layers is not None:
-            raise ValueError(
-                "num_kv_shared_layers and kv_shared_layers both name the sharing "
-                "layers; a model spells them one way")
-        if self.kv_shared_layers is not None:
-            outside = sorted(index for index in self.kv_shared_layers
-                             if not 0 <= index < self.num_layers)
-            if outside:
-                raise ValueError(
-                    f"kv_shared_layers {outside} name no layer of a "
-                    f"{self.num_layers}-layer model")
-            return tuple(sorted(set(self.kv_shared_layers)))
-        if not self.num_kv_shared_layers:
+        """The layers that read another layer's stash, in order."""
+        if self.kv_shared_layers is None:
             return ()
-        first = self.num_layers - self.num_kv_shared_layers
-        if first <= 0:
+        outside = sorted(index for index in self.kv_shared_layers
+                         if not 0 <= index < self.num_layers)
+        if outside:
             raise ValueError(
-                f"num_kv_shared_layers ({self.num_kv_shared_layers}) has to leave "
-                f"a provider: it must be between 1 and num_layers - 1 "
-                f"({self.num_layers - 1})")
-        return tuple(range(first, self.num_layers))
+                f"kv_shared_layers {outside} name no layer of a "
+                f"{self.num_layers}-layer model")
+        return tuple(sorted(set(self.kv_shared_layers)))
 
     @property
     def kv_sharing(self) -> dict:
@@ -948,50 +887,24 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """One layer's mixer geometry: the kind's resolved values as a context.
 
-        `head_dim`, `rope_theta`, `window` and the two rotary ramps already
-        carry the layer kind's overrides; a windowed kind rotates every
-        dimension, so the partial rotary belongs to the kinds that attend the
-        whole sequence, where Gemma 4 puts it. A kind builds its
-        `DecoderBlock` factory from this and its own record; `setup` chooses
-        the mixer there and nowhere else.
+        `head_dim`, `rope_theta`, `window` and the two rotary ramps carry the
+        layer kind's overrides; a windowed kind rotates every dimension, so the
+        partial rotary belongs to the kinds that attend the whole sequence,
+        where Gemma 4 puts it. Every other field is the model's own of the same
+        name. A kind builds its `DecoderBlock` factory from this and its own
+        record; `setup` chooses the mixer there and nowhere else.
         """
-        return MixerContext(
-            emb_features=self.emb_features,
-            num_heads=self.num_heads,
-            num_kv_heads=kind.num_kv_heads,
-            head_dim=kind.head_dim,
-            max_seq_len=self.max_seq_len,
-            causal=self.causal,
-            rope_theta=kind.rope_theta,
-            rope_scaling=kind.rope_scaling,
-            qk_norm=self.qk_norm,
-            qk_norm_scope=self.qk_norm_scope,
-            v_norm=self.v_norm,
-            k_eq_v=self.attention_k_eq_v and kind.window is None,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            kv_shared=kv_shared,
-            kv_store_key=layer_type,
-            sliding_window=kind.window,
-            attention_chunk=kind.chunk,
-            attention_bias=self.attention_bias,
-            o_proj_bias=self.o_proj_bias,
-            attention_scale=self.attention_scale,
-            attention_sinks=self.attention_sinks,
-            yarn=kind.yarn,
-            attn_logit_softcap=self.attn_logit_softcap,
-            output_gate=self.output_gate,
-            dtype=self.dtype,
-            precision=self.precision,
-            attention_impl=self.attention_impl,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            kv_cache=self.kv_cache,
-            partial_rotary_factor=(None if kind.window is not None
-                                   else self.partial_rotary_factor),
-            partial_rotary_type=self.partial_rotary_type,
-            init_std=self.init_stds[0],
-            output_init_std=self.init_stds[1])
+        resolved = {
+            "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "sliding_window": kind.window, "attention_chunk": kind.chunk,
+            "k_eq_v": self.attention_k_eq_v and kind.window is None,
+            "kv_shared": kv_shared, "kv_store_key": layer_type,
+            "partial_rotary_factor": None if kind.window is not None else self.partial_rotary_factor,
+            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
+        return MixerContext(**resolved, **{field.name: getattr(self, field.name)
+                                           for field in dataclasses.fields(MixerContext)
+                                           if field.name not in resolved})
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -1014,7 +927,9 @@ class CausalTransformer(nn.Module):
         if len(types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
-        prediction_kinds = {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        prediction_kinds = (
+            {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        )
         if self.dspark is not None:
             prediction_kinds.add(self.dspark.layer_type)
         unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
@@ -1051,23 +966,51 @@ class CausalTransformer(nn.Module):
         elif self.depth_scaled_init:
             raise ValueError("depth_scaled_init scales initializer_range's std; set it")
 
-    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise for a field, or a pair of fields, this model cannot build.
+    def refuse_unbuildable_dropout(self, kinds: Mapping[str, "ResolvedKind"]) -> None:
+        """Refuse invalid rates and a mixer that cannot drop probabilities."""
+        for field in ("embedding_dropout_rate", "attention_dropout_rate"):
+            rate = getattr(self, field)
+            if not 0 <= rate < 1:
+                raise ValueError(f"{field} must be within [0, 1), got {rate}")
+        if self.attention_dropout_rate:
+            for kind in kinds.values():
+                if not isinstance(kind.mixer or self.mixer or AttentionMixer(), AttentionMixer):
+                    raise ValueError("attention_dropout_rate requires ordinary attention mixers")
 
-        Each check names the field the caller set and what a model without
-        it looks like, so a translated config says which entry to fix.
-        """
-        self.refuse_unbuildable_mup(kinds)
-        mtp_hc = self.mtp_hyper_connections
-        if mtp_hc is not None:
-            if self.num_nextn_predict_layers != 1:
-                raise ValueError("mtp_hyper_connections requires a single prediction depth")
-            if mtp_hc.head != 'weighted':
-                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
-            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
-                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
+    def refuse_unbuildable_classic_fields(self):
+        """Refuse norm, position and feed-forward combinations with no counterpart."""
+        if self.norm_type not in ('rms', 'layer'):
+            raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
+        if self.norm_type == 'rms' and self.norm_bias:
+            raise ValueError('norm_bias requires LayerNorm')
+        if self.norm_type == 'layer' and self.scale_offset:
+            raise ValueError('scale_offset describes RMSNorm weights')
+        if self.position_embedding not in ('rotary', 'learned'):
+            raise ValueError('position_embedding must be rotary or learned')
+        if self.position_embedding == "learned" and (
+            self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
+        ):
+            raise ValueError('learned positions require the default unrotated attention mixer')
+        if self.position_embedding_size is not None and (
+                self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
+            raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
+        if self.position_embedding_offset < 0 or (self.position_embedding_offset and (
+                self.position_embedding != 'learned' or self.position_embedding_size is None
+                or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
+            raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
+        if self.position_embedding != "rotary" and (
+            self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None
+        ):
+            raise ValueError('rotary scaling requires rotary positions')
+        if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
+            raise ValueError('the routed experts require a bias-free gated MLP')
+        if self.num_nextn_predict_layers and (self.norm_type != 'rms' or self.position_embedding != 'rotary'):
+            raise ValueError('prediction depths require RMSNorm and rotary positions')
+
+    def refuse_unbuildable_kinds(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Validate each kind's rotary, local-mask and grouped-head geometry."""
         for layer_type, kind in sorted(kinds.items()):
-            if kind.head_dim % 2:
+            if self.position_embedding == 'rotary' and kind.head_dim % 2:
                 raise ValueError(
                     "rotary positions rotate pairs, so the head dim of "
                     f"{layer_type!r} must be even, got {kind.head_dim}")
@@ -1089,6 +1032,25 @@ class CausalTransformer(nn.Module):
                 raise ValueError(
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "
                     f"heads of {layer_type!r} ({kind.num_kv_heads})")
+
+    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise for a field, or a pair of fields, this model cannot build.
+
+        Each check names the field the caller set and what a model without
+        it looks like, so a translated config says which entry to fix.
+        """
+        self.refuse_unbuildable_mup(kinds)
+        self.refuse_unbuildable_dropout(kinds)
+        self.refuse_unbuildable_classic_fields()
+        mtp_hc = self.mtp_hyper_connections
+        if mtp_hc is not None:
+            if self.num_nextn_predict_layers != 1:
+                raise ValueError("mtp_hyper_connections requires a single prediction depth")
+            if mtp_hc.head != 'weighted':
+                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
+            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
+                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
+        self.refuse_unbuildable_kinds(kinds)
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -1117,7 +1079,7 @@ class CausalTransformer(nn.Module):
         if self.use_double_wide_mlp and not sharing:
             raise ValueError(
                 "use_double_wide_mlp widens the MLP of the layers that share "
-                "their keys and values, so it needs num_kv_shared_layers set")
+                "their keys and values, so it needs kv_shared_layers set")
         ple = self.per_layer_input_dim
         if ple is not None and ple < 1:
             raise ValueError(
@@ -1194,7 +1156,8 @@ class CausalTransformer(nn.Module):
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
-                                      activation=self.mlp, swiglu_limit=self.swiglu_limit,
+                                      activation=self.mlp, use_bias=self.mlp_bias,
+                                      swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         mixture = self.mixture
@@ -1269,13 +1232,9 @@ class CausalTransformer(nn.Module):
         return gated_mlp, routed, parallel
 
     def setup(self):
-        """Build the embeddings, the layers, the prediction depths and the head.
-
-        `specs` is one `LayerSpec` per layer, `block` builds a layer from
-        its index and name, `layers` holds them all, and `groups` says which
-        consecutive runs of them scan together. `mtp` holds the prediction
-        depths and `norm` the final norm, with `lm_head` beside it when the
-        embeddings are not tied.
+        """Build the embeddings, the layers (one `LayerSpec` each, built by
+        `block`, scanned in `groups`), the prediction depths `mtp`, the final
+        `norm`, and `lm_head` when the embeddings are not tied.
         """
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
@@ -1287,6 +1246,14 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype, name='embed_tokens',
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
+        if self.embedding_dropout_rate:
+            self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.position_embedding == 'learned':
+            self.embed_positions = TokenEmbedding(
+                num_embeddings=self.position_embedding_size or self.max_seq_len,
+                features=self.emb_features, dtype=self.dtype, name='embed_positions',
+                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                                else nn.initializers.normal(self.initializer_range)))
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1306,10 +1273,11 @@ class CausalTransformer(nn.Module):
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
-        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
+        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1344,9 +1312,10 @@ class CausalTransformer(nn.Module):
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
-        self.norm = RMSNorm(
-            epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
+        self.norm = decoder_norm(
+            self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+            scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype)(name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1415,8 +1384,7 @@ class CausalTransformer(nn.Module):
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
-                EngramLayer, rows=self.engram.num_embeddings[spec.engram],
-                columns=self.engram.columns, head_dim=self.engram.head_dim,
+                EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
@@ -1424,6 +1392,8 @@ class CausalTransformer(nn.Module):
             prediction_slot=spec.prediction_slot,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
+            norm_type=self.norm_type,
+            norm_bias=self.norm_bias,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             wiring=wiring,
@@ -1502,8 +1472,8 @@ class CausalTransformer(nn.Module):
                     scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
                     wiring=wiring, hyper_connections=self.hyper_connections,
                     dtype=self.dtype, precision=self.precision),
-                emb_features=self.emb_features, targets=len(self.dspark.target_layers),
-                vocab_size=self.vocab_size, markov_rank=self.dspark.markov_rank,
+                emb_features=self.emb_features, vocab_size=self.vocab_size,
+                markov_rank=self.dspark.markov_rank,
                 first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
             for stage in range(stages)]
@@ -1556,13 +1526,12 @@ class CausalTransformer(nn.Module):
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
-                 input_embeddings=None, embedding_positions=None,
+                 input_embeddings=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups,
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             rotary_positions=rotary_positions, attention_pairwise_mask=attention_pairwise_mask,
             attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
@@ -1574,7 +1543,7 @@ class CausalTransformer(nn.Module):
             # business: a plain init holds every depth.
             self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   embedding_positions=embedding_positions, attention_mask=attention_mask,
+                                   attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
@@ -1602,10 +1571,7 @@ class CausalTransformer(nn.Module):
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
-        # The logits are fp32 and the loss is computed in fp32. The product
-        # follows the compute dtype, as torch autocast and MaxText's
-        # `logits_dot_in_fp32=False` do: bf16 states multiply the head as
-        # bf16 with fp32 accumulation, fp32 states the head as stored
+        # fp32 logits whose product follows the compute dtype
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
             logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding,
@@ -1620,7 +1586,7 @@ class CausalTransformer(nn.Module):
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
                           positions=None, segment_ids=None, input_embeddings=None,
-                          embedding_positions=None, attention_mask=None,
+                          attention_mask=None,
                           image_groups=None, rotary_positions=None):
         """One final-normed state array per shifted prediction depth.
 
@@ -1631,8 +1597,7 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        embeds = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                      input_embeddings, embedding_positions)
+        embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
@@ -1660,27 +1625,25 @@ class CausalTransformer(nn.Module):
         return states
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
-                   segment_ids=None, input_embeddings=None, embedding_positions=None,
+                   segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, rotary_positions=None):
         """The shared language head over each prediction depth's hidden states."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
-            attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)]
+            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            rotary_positions=rotary_positions)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
                  decode: bool = False, prediction_phase: PredictionPhase = "ordinary"):
         """One unshifted prediction step, optionally appending its own KV cache.
 
-        Call init_mtp_cache before cached steps. The hidden input is the
-        target model's preceding state; tokens or input_embeddings supply
-        the candidate next token, as in vLLM's Qwen3_5MultiTokenPredictor.
-        Returns the step's logits and its own hidden state, which the next
-        step of a chained draft consumes in place of the target's. With
-        index_share_for_mtp_iteration, cached extend publishes index selections
-        and draft reuses them; ordinary always recomputes. Uncached training
-        never carries a selection between queries.
+        Call init_mtp_cache before cached steps. `hidden` is the target model's
+        preceding state and tokens or input_embeddings the candidate next token, as
+        in vLLM's Qwen3_5MultiTokenPredictor. Returns the step's logits and hidden
+        state, which a chained draft's next step reads in place of the target's.
+        With index_share_for_mtp_iteration, cached extend publishes index
+        selections and draft reuses them; ordinary always recomputes.
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
@@ -1707,19 +1670,15 @@ class CausalTransformer(nn.Module):
 
     def scaled_embeddings(self, x):
         """Token embeddings `x` as the first layer reads them: times
-        sqrt(emb_features) when `embedding_scale` is set, as Gemma scales
-        them, then times `embedding_multiplier`, as lm-engine and
-        GraniteMoeHybrid scale them. The decoder's forward, the multimodal
-        wrapper and the Qwen-Image conditioner all scale here.
+        sqrt(emb_features) under `embedding_scale` (Gemma), then times
+        `embedding_multiplier` (lm-engine, GraniteMoeHybrid). The decoder, the
+        multimodal wrapper and the Qwen-Image conditioner all scale here.
 
         Gemma casts embed_scale to the embedding weight dtype
-        (modeling_gemma3.py:117). The token lookup holds that table in fp32
-        and returns the compute dtype, so the factor keeps its fp32 value and
-        only the product rounds with the activations. A factor rounded to
-        bf16 would be 34.0 at hidden 1152, where sqrt(1152) is
-        33.94112549695428. lm-engine multiplies the looked-up states
-        (`hidden_states * m_emb`, mixins/dense/base.py at 45b6b57b) in fp32
-        opmath, which `scaled` keeps.
+        (modeling_gemma3.py:117); the lookup holds that table in fp32, so the
+        factor stays fp32 and only the product rounds (a bf16 factor would be 34.0
+        at hidden 1152, not 33.941...). lm-engine multiplies in fp32 opmath
+        (mixins/dense/base.py at 45b6b57b), which `scaled` keeps.
         """
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
@@ -1729,15 +1688,13 @@ class CausalTransformer(nn.Module):
     def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
         """DSpark's draft after each row's last context position.
 
-        `context` `[B, M, targets * D]` is what `draft_context` assembles
-        from a forward's sown `prediction_inputs` (the target layers' stream
-        means), `valid` `[B, M]` which of its positions are real, `tokens`
-        `[B]` the tokens drawn after it. Returns `(ids [B, block + 1],
-        logits [B, block, vocab], confidence [B, block])`, each drafted
-        token drawn by `choose(index, logits)`, greedily when None
-        (`dew.nn.dspark.draft`). Cached, call `init_draft_cache` first; a
-        call with `tokens` None only appends its context to the windows and
-        one with `context` None drafts after what they hold.
+        `context` `[B, M, targets * D]` comes from `draft_context` (the target
+        layers' sown stream means), `valid` `[B, M]` marks its real positions and
+        `tokens` `[B]` are drawn after it. Returns `(ids [B, block + 1], logits
+        [B, block, vocab], confidence [B, block])`, drafting by `choose(index,
+        logits)`, greedily when None (`dew.nn.dspark.draft`). Cached, call
+        `init_draft_cache` first; `tokens` None only appends context and `context`
+        None drafts after what the windows hold.
         """
         if self.dspark is None:
             raise ValueError("this model has no DSpark drafter")
@@ -1784,41 +1741,28 @@ class CausalTransformer(nn.Module):
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
-                              input_embeddings=None, embedding_positions=None,
+                              input_embeddings=None,
                               attention_mask=None, image_groups=None, rotary_positions=None,
                               attention_pairwise_mask=None, attention_key_positions=None,
                               routed_experts=None, routed=None, media_mask=None):
         """The final normalized states and the prediction depth's input.
 
-        V4's depth reads the raw residual streams before the collapse head
-        and final norm (official inference/model.py MTPBlock.forward at
-        b5968e9); ordinary depths read the final normalized states.
+        V4's depth reads the raw residual streams before the collapse head and final
+        norm (inference/model.py MTPBlock.forward at b5968e9); other depths read the
+        final normalized states. Packed `positions` and `segment_ids` reach the
+        layers.
 
-        A packed batch passes per-document `positions` and `segment_ids`
-        through to the layers, where RoPE and the mask read them.
-
-        A caller that fuses another encoder's outputs passes them as
-        `input_embeddings` with their token positions in
-        `embedding_positions`: both or neither, and the values replace the
-        scaled token embeddings before the layers read them.
-
-        `attention_pairwise_mask` is an explicit boolean [B, queries, keys]
-        visibility mask for ordinary attention mixers. Optional
-        `attention_key_positions` supplies logical [B, keys] coordinates;
-        local layers apply their configured window to those coordinates.
-        These are call-local cached-read metadata, not sliceable token fields.
-
-        `routed_experts` replays a rollout engine's routing: `[B, S, layers,
-        top_k]` expert ids indexed by decoder layer, dense layers included (the
-        layout vLLM's `routed_experts` and SGLang's `meta_info.routed_experts`
-        return), with `routed`, `[B, S]`, marking the tokens the record covers
-        (None for all). Every sparse layer's router selects its slice
-        (`dew.nn.moe.Routes`).
-
-        `media_mask` [B, S] marks the positions `input_embeddings` fill from
-        a media encoder. A model with engram keeps them out of every n-gram
-        and a router with a media bias selects for them by it; the rest
-        ignore it.
+        `input_embeddings` `[B, S, D]` replace the scaled token embeddings, for
+        a caller fusing another encoder; the token ids still feed per-layer
+        inputs and routing.
+        `attention_pairwise_mask` is an explicit [B, queries, keys] visibility mask
+        for ordinary attention, with optional `attention_key_positions` [B, keys]
+        for local windows; both are call-local cached-read metadata.
+        `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's routing
+        (vLLM's `routed_experts`, SGLang's `meta_info.routed_experts`) with `routed`
+        `[B, S]` marking covered tokens (`dew.nn.moe.Routes`). `media_mask` [B, S]
+        marks positions a media encoder fills, which engram keeps out of n-grams
+        and a media-biased router selects for.
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, attention_mask, image_groups, rotary_positions,
@@ -1826,23 +1770,37 @@ class CausalTransformer(nn.Module):
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
-        x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
-                                           input_embeddings, embedding_positions), RESIDUAL)
-        # A prediction depth reads the embeddings `mtp_hidden_states` pairs
-        # with, which are the unscaled ones with any media replacement already
-        # in place. A decoder that fused another encoder's outputs cannot
-        # rebuild those from token ids, and rebuilding them would run that
-        # encoder again. Sowing costs nothing unless a caller asks for the
-        # collection, and init leaves it out so the variables tree a caller
-        # keeps holds parameters and nothing else.
+        x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
+                                     input_embeddings), RESIDUAL)
+        if self.position_embedding == 'learned':
+            places = positions
+            if places is None:
+                start = (self.layers[0].self_attn.get_variable('cache', 'cache_index')
+                         if decode else None)
+                valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask)
+                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+                if start is not None:
+                    places = places + start[:, None]
+            x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
+        if self.embedding_dropout_rate:
+            x = self.embedding_dropout(x, deterministic=not train)
+        # A prediction depth reads these unscaled embeddings, media
+        # replacements in place, which token ids cannot rebuild. Sowing costs
+        # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            prepared = self._scatter_inputs(self.token_embeddings(tokens), tokens,
-                                            input_embeddings, embedding_positions)
+            prepared = self._prepared(self.token_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
-        residual = self.stack(self._expand(x), train=train, decode=decode, positions=positions,
-                              segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
+        residual = self.stack(
+            self._expand(x),
+            train=train,
+            decode=decode,
+            positions=positions,
+            segment_ids=segment_ids,
+            per_layer_input=ple,
+            attention_metadata=attention_metadata,
+        )
         streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
         if self.logits_scaling != 1.0:
@@ -1889,26 +1847,20 @@ class CausalTransformer(nn.Module):
         """The layer stack over `x`: the plain loop, the scanned runs, or the
         pipeline over the mesh's stages.
 
-        `init` draws each run of like layers under the scan and unstacks it,
-        so the variables tree is the plain loop's whatever the model is asked
-        to do afterwards; under a stage mesh or with `decode` it runs the
-        plain loop. With `scan_layers`, or a stage axis above one on the mesh in context,
-        the stack runs under `StackView`: the same leaves, stacked along the
-        loops' axes while the loops run and unstacked on the way out. The
-        loops carry the residual stream in one dtype, so it enters them in
-        the dtype it settles in (`residual_dtype`).
-
-        A store built bank by bank (`dew.inference.banks`) already holds the
-        parameters the way the runs read them, one array per run, so the view
-        leaves that collection alone in both directions and the run scans the
-        one array the store holds.
+        `init` draws like runs under the scan and unstacks them, so the tree is the
+        plain loop's; a stage mesh or `decode` runs the plain loop. `scan_layers`
+        or a stage axis runs under `StackView`, stacking the leaves while the loops
+        run. The loops carry one residual dtype, so the stream enters in the dtype
+        it settles in (`residual_dtype`). A store built bank by bank
+        (`dew.inference.banks`) already holds one array per run, which the view
+        leaves alone.
         """
         stages = pipeline_stages()
         if self.is_initializing() and stages == 1 and not decode:
             groups = scan_groups(self.specs, self.bank_layers)
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)
-                run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+                run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                        trans_out_fn=view.unstack, init=True, mutable=True)
                 return run(self, view, x, train, decode, positions, segment_ids,
                            per_layer_input, attention_metadata)
@@ -1945,14 +1897,11 @@ class CausalTransformer(nn.Module):
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`_microbatched`), a share
-            # of every device's block of rows only where the count divides a
-            # block. Where it does not, a microbatch misses some devices, and
-            # the devices that hold none of its rows compute another's again:
-            # 1.43 times one device's FLOPs for a stage x fsdp step of 8 rows in
-            # 4 microbatches over 4 row shards, where the bubble accounts for 1.25.
-            # No axis splits the rows where the mesh leaves none for them
-            # (four stages on four devices): every device holds every row.
+            # Microbatch m takes rows m, m + count, ... (`_microbatched`), a
+            # share of every device's rows only where the count divides a
+            # block; otherwise devices holding none of a microbatch recompute
+            # another's (1.43 times one device's FLOPs for 8 rows in 4
+            # microbatches over 4 row shards, against the bubble's 1.25).
             splitting = row_axes(rows)
             shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
             if (rows // shards) % count_microbatches:
@@ -1975,25 +1924,19 @@ class CausalTransformer(nn.Module):
             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         # A carried collapse stays fp32, as the reference keeps it.
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
-        run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+        run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
 
     def banked_collections(self) -> tuple[str, ...]:
         """The collections whose layer subtrees the store holds as banks.
 
-        A store built per layer holds `layers_0`; one built bank by bank
-        holds the name of each run of more than one layer, `layers_0_15`. A
-        run of one is the same tree either way, so it says nothing about
-        which of the two a store is and neither form has to be converted for
-        it. A collection may hold a run's bank beside that run's layers when
-        the two hold different leaves: a host layout keeps the leaves every
-        row froze as the bank and the rest per layer, and `StackView.stack`
-        stacks the rows into the bank. Such a collection is not banked, since
-        its rows still stack. A bank and a row holding the same leaf, or some
-        of the banks and not the others with no rows, is refused: which of
-        the two the run would read is not a question this answers by
-        guessing.
+        A store built per layer holds `layers_0`, one built bank by bank each
+        multi-layer run's name, `layers_0_15`; a run of one is the same either way.
+        A collection holding a run's bank beside its layers with different leaves
+        (a host layout's frozen leaves) is not banked, since its rows still stack
+        (`StackView.stack`). A bank and a row holding the same leaf, or some banks
+        and not others with no rows, is refused rather than guessed.
         """
         runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
                 for first, count in self.groups if count > 1}
@@ -2034,19 +1977,11 @@ class CausalTransformer(nn.Module):
         """The dtype the residual stream settles in: `x`'s promoted with what
         the first layer returns for it.
 
-        A scan carries one dtype from its first iteration to its last, and
-        every pipeline stage takes the dtype the stage before it returns.
-        Under a bf16 policy the dense feed-forward returns fp32, so the
-        plain loop's stream is fp32 from the first layer on and the loops
-        take it in fp32 from the start; at fp32 nothing changes. The layer
-        runs abstractly, in a scope of its own, so it writes no cache and
-        sows nothing here, and its RNG streams take placeholder keys, since
-        a shape needs a key of each name and no value.
-
-        Only the shapes and dtypes matter, so a banked store answers this
-        from the first row of its first bank, without fetching it: the layer
-        the plain loop would read is not in that store under a name of its
-        own.
+        A scan carries one dtype through, and each pipeline stage takes the one the
+        stage before returns; under a bf16 policy the dense feed-forward returns
+        fp32, so the loops take fp32 from the start. The layer runs abstractly in
+        its own scope (no cache, nothing sown, placeholder RNG keys), and a banked
+        store answers from its first bank's first row without fetching it.
         """
         layer, scope = self.layers[0], self.layers[0].scope
         assert scope is not None
@@ -2062,17 +1997,15 @@ class CausalTransformer(nn.Module):
         return jnp.result_type(streams.dtype, output.dtype)
 
     def first_layer_shapes(self) -> dict:
-        """The stack's first layer's variables as shape/dtype structs.
-
-        A store holding one subtree per layer answers with layer 0's; one
-        holding banks answers with the first row of the first bank's, the
-        layer axis dropped; one holding both (`banked_collections`) answers
-        with layer 0's leaves completed by the bank's. Nothing is read,
-        fetched or sliced: this is what an abstract run of one layer needs
-        and no more, and a bank's first row is a shape, not a copy.
+        """The stack's first layer's variables as shape/dtype structs: layer 0's,
+        a bank's first row with the layer axis dropped, or layer 0's completed by
+        the bank's (`banked_collections`). Nothing is read, fetched or sliced.
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
+        reader = self.variables.get('streaming', {}).get(first, {}).get('bank')
+        if reader is not None:
+            return reader.shapes()
         stacked = self.groups[0][1] > 1
 
         def shapes(leaf, drop: bool):
@@ -2096,12 +2029,10 @@ class CausalTransformer(nn.Module):
     def stage_layers(self, stages: int) -> int:
         """Layers per stage when the stack splits into `stages`, or why it cannot.
 
-        Every stage runs one program over its own layers, so the stages have
-        to be the same length and layer `j` of every stage the same kind of
-        layer as layer `j` of the first: same kind, same feed-forward, same
-        width, the same say in keys and values. A pattern that does not
-        repeat every `num_layers / stages` layers is refused with the first
-        pair of layers that differ and what differs between them.
+        Every stage runs one program, so layer `j` of every stage must match layer
+        `j` of the first (kind, feed-forward, width, KV role); a pattern that does
+        not repeat every `num_layers / stages` layers is refused with the first
+        differing pair.
         """
         if self.num_layers % stages:
             raise LayoutRefused(
@@ -2133,30 +2064,29 @@ class CausalTransformer(nn.Module):
                 kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
-        return self._pipeline(view, x, train=train, positions=positions,
-                              segment_ids=segment_ids, per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+        return self._pipeline(
+            view,
+            x,
+            train=train,
+            positions=positions,
+            segment_ids=segment_ids,
+            per_layer_input=per_layer_input,
+            attention_metadata=attention_metadata,
+        )
 
     def _pipeline(self, view: StackView, x, *, train: bool, positions, segment_ids,
                   per_layer_input, attention_metadata=None):
         """GPipe over the stage axis, as MaxText's `layers/pipeline.py` runs it.
 
-        The batch splits into `view.microbatches` microbatches. Iteration t
-        runs every stage at once on one microbatch each, stage s on
-        microbatch t - s, with the whole stack's layers stacked over the
-        stages under `jax.vmap` so GSPMD keeps each stage's computation on
-        its own devices; the outputs shift one stage down for the next
-        iteration through a `ppermute`. The microbatches sit in `state_io`,
-        `[stages, microbatches / stages, ...]`, stage-sharded like the rest:
-        stage 0 reads its slot t % (microbatches / stages) and the slot
-        rotates up a stage each iteration, so every microbatch reaches stage
-        0 in turn and every finished one lands in the last stage's slot,
-        without a gather. The first stages - 1 iterations compute on nothing
-        and the last stages - 1 finish the pipeline; both are the bubble.
-
-        Only the layers pipeline. The embeddings before them and the norm,
-        the head and the loss after them run on the whole batch on every
-        stage's devices, so the loss is the plain loop's mean over the same
-        rows.
+        Iteration t runs stage s on microbatch t - s, the layers stacked over the
+        stages under `jax.vmap` so GSPMD keeps each stage on its devices, and
+        outputs shift a stage down by `ppermute`. The microbatches sit in
+        `state_io`, `[stages, microbatches / stages, ...]`, stage-sharded: stage 0
+        reads slot t % (microbatches / stages) and the slots rotate up a stage per
+        iteration, so every microbatch reaches stage 0 and finishes in the last
+        stage's slot without a gather. The first and last stages - 1 iterations are
+        the bubble. Only the layers pipeline; embeddings, norm, head and loss run on
+        the whole batch, so the loss is the plain loop's mean.
         """
         stages, count = view.stages, view.microbatches
         per_stage = view.per_stage
@@ -2165,7 +2095,9 @@ class CausalTransformer(nn.Module):
         x = micro(x, batch_axis)
         per_row = [None if value is None else micro(jnp.asarray(value), 0)
                    for value in (positions, segment_ids)]
-        inputs = None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
+        inputs = (
+            None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
+        )
         metadata = jax.tree.map(lambda value: micro(value, 0), attention_metadata)
         slots = count // stages
         state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
@@ -2272,62 +2204,32 @@ class CausalTransformer(nn.Module):
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
-    def _scatter_inputs(self, x, tokens, input_embeddings, embedding_positions):
-        """`x` with the fused encoder outputs written at their token positions.
-
-        Both arguments or neither; the shapes are `[B, N, D]` and `[B, N]`
-        against the `[B, S, D]` embeddings, the positions are integers within
-        the sequence, and the values are already in the decoder's scaled
-        space, so they land as they arrive, cast to the stream dtype.
-        """
-        if (input_embeddings is None) != (embedding_positions is None):
-            raise ValueError(
-                "input_embeddings and embedding_positions arrive together: one "
-                "without the other names no replacement")
+    @staticmethod
+    def _prepared(x, input_embeddings):
+        """`x`, or in its place a caller's prepared `[B, S, D]` embeddings
+        (another encoder's outputs fused in), cast to the stream dtype."""
         if input_embeddings is None:
             return x
-        replacements = jnp.asarray(input_embeddings)
-        where = jnp.asarray(embedding_positions)
-        batch, length = tokens.shape
-        if (replacements.ndim != 3 or where.ndim != 2
-                or replacements.shape[0] != batch
-                or where.shape != (batch, replacements.shape[1])
-                or replacements.shape[2] != self.emb_features):
-            raise ValueError(
-                f"input_embeddings is [B, N, D] and embedding_positions [B, N] "
-                f"for [{batch}, {length}, {self.emb_features}] embeddings, got "
-                f"{replacements.shape} and {where.shape}")
-        if not jnp.issubdtype(where.dtype, jnp.integer):
-            raise ValueError(
-                "embedding_positions holds token positions, so an integer "
-                f"dtype, got {where.dtype}")
-        rows = jnp.arange(batch)[:, None]
-        return x.at[rows, where].set(replacements.astype(x.dtype))
+        prepared = jnp.asarray(input_embeddings)
+        if prepared.shape != x.shape:
+            raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
+        return prepared.astype(x.dtype)
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in its stored dtype, as the forward
-        contracts it (`_logits`: fp32 accumulation over the stored operand).
-
-        `params` is the parameter tree the forward runs under, so this is a
-        plain read: a tied head is the embedding table transposed, an untied
-        one is `lm_head`'s kernel, which is `[D, vocab]` already. The Gemma
-        embedding scale multiplies the input embeddings only, so it has no
-        place here. A vocabulary-sized fp32 copy is what a loss over this
-        head would hold for its backward, so none is made here.
+        contracts it (`_logits`): the tied embedding table transposed or
+        `lm_head`'s kernel, read from `params` without an fp32 copy. The Gemma
+        embedding scale applies to input embeddings only.
         """
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
 
     def head_table(self, params):
         """The head matrix as the tree stores it, and whether its rows are
-        the vocabulary: the `[vocab, D]` embedding table and True for a tied
-        head, `lm_head`'s `[D, vocab]` kernel and False otherwise.
-
-        No operation sits between the parameter and this value, so a loss
-        that keeps the head for its backward (`chunked_cross_entropy` with
-        `vocab_major`) keeps the parameter itself rather than a transposed
-        copy of it, which for a tied head is a vocabulary-sized array.
-        `head_weight` is this value as `[D, vocab]`.
+        the vocabulary: the `[vocab, D]` embedding table and True for a tied head,
+        `lm_head`'s `[D, vocab]` kernel and False otherwise. With no operation in
+        between, a loss keeping the head for its backward (`chunked_cross_entropy`
+        with `vocab_major`) keeps the parameter, not a transposed copy.
         """
         if self.tie_embeddings:
             return params['embed_tokens']['embedding'], True
@@ -2346,29 +2248,4 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
 
-def gather_cache_rows(cache, rows):
-    """A decode cache reindexed on its batch axis, one gather per leaf.
-
-    Outside the layer stack a cache holds one subtree per layer, and every
-    leaf a decode step writes carries its batch on axis zero: dense keys and
-    values with their cached validity and cursor, a gated delta net's
-    convolution and recurrent state, latent attention's compressed cache,
-    cached image groups, and a multimodal model's next position. The scanned
-    stack's layer axis exists only inside `run_stack`; `StackView` removes it
-    before the cache crosses `apply`, so axis zero is the row here whatever
-    the stack did.
-
-    `rows` is any index array: repeats duplicate a row's whole decode state,
-    a permutation reparents rows, and a shorter or longer array changes the
-    row count. Beam branching and speculative rollback are both this
-    operation. Nothing else in the tree depends on the row order, so the
-    gathered cache decodes exactly as the rows it came from.
-
-    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
-    share through their page tables, so gathered rows would write into each
-    other's pages; it is refused.
-    """
-    if is_paged(cache):
-        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
-                         "paged cache's shared pool cannot do; decode them with a dense cache")
-    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)
+__all__ = ["CausalTransformer", "DecoderBank", "PipelineStage", "StackView"]

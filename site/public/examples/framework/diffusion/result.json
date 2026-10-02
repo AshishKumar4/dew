@@ -1,0 +1,11 @@
+{
+  "steps": 3,
+  "processes": [
+    "Flow",
+    "EDM"
+  ],
+  "solvers": [
+    "Euler",
+    "Heun"
+  ]
+}

@@ -1,7 +1,7 @@
 """Forward processes, noise schedules and the parameterizations over them.
 
 `Process` pairs a schedule with a prediction transform, which is what a
-run's objective and every sampler read. `presets` holds the named
+run's objective and every solver read. `presets` holds the named
 combinations, and `discrete` is the masked-token process.
 """
 
@@ -9,12 +9,9 @@ from . import discrete, presets
 from .process import Denoiser, Process
 from .schedules import (
     ContinuousNoiseScheduler,
-    CosineContinuousNoiseScheduler,
-    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     DiscreteNoiseScheduler,
     EDMNoiseScheduler,
-    ExpNoiseScheduler,
     FlowMatchingScheduler,
     GeneralizedNoiseScheduler,
     KarrasVENoiseScheduler,
@@ -22,7 +19,6 @@ from .schedules import (
     NoiseScheduler,
     SqrtContinuousNoiseScheduler,
     cosine_beta_schedule,
-    exp_beta_schedule,
     expand,
     linear_beta_schedule,
 )
@@ -42,12 +38,35 @@ from .transforms import (
     broadcast_rates,
 )
 
-__all__ = ["ConsistencyBoundary", "ContinuousNoiseScheduler", "CosineContinuousNoiseScheduler",
-           "CosineGeneralNoiseScheduler", "CosineNoiseScheduler", "Denoiser", "DirectPredictionTransform",
-           "DiscreteNoiseScheduler", "EDMNoiseScheduler", "EpsilonPredictionTransform", "ExpNoiseScheduler",
-           "FlowMatchPredictionTransform", "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
-           "KarrasPredictionTransform", "KarrasVENoiseScheduler", "LinearNoiseScheduler", "MinSNR",
-           "NoiseScheduler", "PredictionTransform", "Process", "ScheduleWeighting", "SourceLimitedPrediction",
-           "SqrtContinuousNoiseScheduler", "VPredictionTransform", "VelocityLoss", "Weighting", "broadcast_rates",
-           "cosine_beta_schedule", "discrete", "exp_beta_schedule", "expand", "linear_beta_schedule",
-           "presets"]
+__all__ = [
+    "ConsistencyBoundary",
+    "ContinuousNoiseScheduler",
+    "CosineNoiseScheduler",
+    "Denoiser",
+    "DirectPredictionTransform",
+    "DiscreteNoiseScheduler",
+    "EDMNoiseScheduler",
+    "EpsilonPredictionTransform",
+    "FlowMatchPredictionTransform",
+    "FlowMatchingScheduler",
+    "GeneralizedNoiseScheduler",
+    "KarrasPredictionTransform",
+    "KarrasVENoiseScheduler",
+    "LinearNoiseScheduler",
+    "MinSNR",
+    "NoiseScheduler",
+    "PredictionTransform",
+    "Process",
+    "ScheduleWeighting",
+    "SourceLimitedPrediction",
+    "SqrtContinuousNoiseScheduler",
+    "VPredictionTransform",
+    "VelocityLoss",
+    "Weighting",
+    "broadcast_rates",
+    "cosine_beta_schedule",
+    "discrete",
+    "expand",
+    "linear_beta_schedule",
+    "presets",
+]

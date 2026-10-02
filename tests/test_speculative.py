@@ -8,6 +8,8 @@ emit exactly the greedy walk, which it can only do if the state it replays
 after a rejection is the state the accepted prefix would have left.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -58,13 +60,13 @@ def scripted(target, drafts, rows):
                      depths=1)
 
 
-def run(target, drafts, rows, budget, block, seed=0, stopping=(), transforms=()):
+def run(target, drafts, rows, budget, block, key=0, stopping=(), transforms=()):
     """One speculative run over fixed distributions."""
-    return run_with(Speculative(block=block), target, drafts, rows, budget, seed, stopping,
+    return run_with(Speculative(block=block), target, drafts, rows, budget, key, stopping,
                     transforms)
 
 
-def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms=()):
+def run_with(plan, target, drafts, rows, budget, key=0, stopping=(), transforms=()):
     """One run of a given speculative plan over fixed distributions."""
     state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
                          positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32))
@@ -72,7 +74,7 @@ def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms
                       valid=jnp.concatenate([jnp.ones((rows, 1), bool),
                                              jnp.zeros((rows, budget), bool)], axis=1),
                       step=jnp.zeros(rows, jnp.int32), active=jnp.ones(rows, bool),
-                      keys=jax.random.split(jax.random.key(seed), rows), prompt_width=1)
+                      keys=jax.random.split(jax.random.key(key), rows), prompt_width=1)
     ops = scripted(target, drafts, rows)
 
     def body(carried, opening):
@@ -160,7 +162,7 @@ def test_a_criterion_inside_a_block_truncates_it():
     assert int(np.asarray(drawn.valid).sum(axis=1)[0]) == 8
     stopped = run(point(5), [point(5)] * 3, 2, 8, 4, stopping=(stop,))
     np.testing.assert_array_equal(np.asarray(stopped.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(stopped.terminated), True)
+    np.testing.assert_array_equal(np.asarray(stopped.terminated), desired=True)
 
 
 def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
@@ -174,7 +176,7 @@ def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
         lambda state, logits: jnp.where((state.step < 2)[:, None], logits, -jnp.inf))
     drawn = run(point(1), [point(1)] * 3, 2, 4, 2, stopping=(stop,), transforms=(nothing_after,))
     np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), 2)
-    np.testing.assert_array_equal(np.asarray(drawn.terminated), True)
+    np.testing.assert_array_equal(np.asarray(drawn.terminated), desired=True)
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, :2], 1)
 
 
@@ -184,7 +186,7 @@ def test_the_budget_bounds_the_last_block():
     for budget in (3, 5, 7):
         drawn = run(point(5), [point(5)] * 3, 2, budget, 4)
         np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), budget)
-        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], True)
+        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], desired=True)
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
@@ -267,7 +269,7 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
                             method=model.mtp_step)[0]
 
     state, _ = _prefill(model, params, ModelInputs(prompt), ops)
-    state, _, _ = reseed(
+    state, _ = reseed(
         ops, state, (state.hidden,), ahead[:, prompt.shape[1]:width],
         model.apply(params, emitted, method=model.token_embeddings),
         jnp.ones((2, 2), bool),
@@ -291,6 +293,16 @@ def params_of(model, prompt):
     return model.init(jax.random.key(0), prompt)
 
 
+def recording(ops, produced):
+    """`ops` whose prediction depths append each hidden state they produce to `produced`."""
+    def propose(*arguments):
+        state, logits, out = ops.propose(*arguments)
+        produced.append(out)
+        return state, logits, out
+
+    return dataclasses.replace(ops, propose=propose)
+
+
 def test_a_model_without_a_drafter_is_refused():
     model = decoder()
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
@@ -305,12 +317,12 @@ def test_a_draft_that_loses_confidence_ends_the_block_on_a_target_draw():
     would ask for the positive part of `p - q` where the two are equal, which
     is nothing at all."""
     target = spread({3: 0.5, 4: 0.5})
-    open_ = run(target, [target] * 3, 512, 5, 4, seed=2)
+    open_ = run(target, [target] * 3, 512, 5, 4, key=2)
     np.testing.assert_array_equal(np.asarray(open_.valid).sum(axis=1), 5)
     assert set(np.unique(np.asarray(open_.tokens)[np.asarray(open_.valid)]).tolist()) == {3, 4}
     # A threshold no draft of this distribution can meet truncates every block
     # after its free target draw, and the emitted law is unchanged.
-    guarded = run_with(Speculative(block=4, confidence=0.9), target, [target] * 3, 512, 5, seed=2)
+    guarded = run_with(Speculative(block=4, confidence=0.9), target, [target] * 3, 512, 5, key=2)
     np.testing.assert_array_equal(np.asarray(guarded.valid).sum(axis=1), 5)
     share = float(np.mean(np.asarray(guarded.tokens)[np.asarray(guarded.valid)] == 3))
     assert abs(share - 0.5) < 0.03, f"share {share:g}"
@@ -383,15 +395,16 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
 
     ops = _operations(model, params, 0, 2)
     empty, _ = _prefill(model, params, ModelInputs(prompt[:, :1]), ops)
-    _, produced, _ = reseed(
-        ops, empty, (states[:, 0], None), states[:, 1:],
+    produced = []
+    reseed(
+        recording(ops, produced), empty, (states[:, 0], None), states[:, 1:],
         model.apply(params, prompt[:, 1:], method=model.token_embeddings),
         jnp.ones((2, width - 1), bool),
         jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
         jnp.full(2, width - 2, jnp.int32), prior_tokens=jnp.ones(2, jnp.int32))
 
     assert len(produced) == 2 == len(trained)
-    for depth, (cached, reference) in enumerate(zip(produced, trained)):
+    for depth, (cached, reference) in enumerate(zip(produced, trained, strict=True)):
         # Depth d starts d positions in, as the training pass shifts it.
         kept = np.asarray(cached)[:, depth:]
         assert kept.shape == np.asarray(reference).shape
@@ -452,11 +465,11 @@ def test_a_draft_after_an_advance_is_proposed_at_the_advanced_coordinate():
     step = step.commit(grown[:, 3], jnp.ones(1, bool))
     base = _coordinates(advanced, step, jnp.arange(2)[None, :])
     # The block that emitted token four writes its own entry behind the draft.
-    advanced, _, _ = reseed(ops, advanced, (prompted.hidden,), states[:, 3:4],
-                            jnp.asarray(model.apply(params, grown[:, 3:4],
-                                                    method=model.token_embeddings)),
-                            jnp.ones((1, 1), bool), coordinates[:, 3:4], jnp.zeros(1, jnp.int32),
-                            prior_tokens=jnp.full(1, 3, jnp.int32))
+    advanced, _ = reseed(ops, advanced, (prompted.hidden,), states[:, 3:4],
+                         jnp.asarray(model.apply(params, grown[:, 3:4],
+                                                 method=model.token_embeddings)),
+                         jnp.ones((1, 1), bool), coordinates[:, 3:4], jnp.zeros(1, jnp.int32),
+                         prior_tokens=jnp.full(1, 3, jnp.int32))
     assert ops.propose is not None
     _, proposed, _ = ops.propose(advanced, states[:, 3:4], grown[:, 4:5], None,
                                  jnp.ones((1, 1), bool), base[:, :1], 0, "ordinary")
@@ -497,7 +510,7 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
     model = MultimodalTransformer(
         language, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
                                image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1)
     prompt = jnp.asarray([[2, 1, 3, 4]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
@@ -631,11 +644,11 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
 
     ops = _operations(model, params, 0, 2)
     state, _ = _prefill(model, params, ModelInputs(cold), ops)
-    _, produced, _ = reseed(ops, state, (state.hidden,) + state.drafts,
-                            states[:, 1:], model.apply(params, emitted,
-                                                       method=model.token_embeddings),
-                            jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
-                            jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
+    produced = []
+    reseed(recording(ops, produced), state, (state.hidden, *state.drafts),
+           states[:, 1:], model.apply(params, emitted, method=model.token_embeddings),
+           jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
+           jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
     # Depth two's only entry is at coordinate two, and it is the trained one.
     largest = float(np.max(np.abs(np.asarray(produced[1])[:, 1] - np.asarray(trained[1])[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
@@ -665,8 +678,8 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
     state, _ = _prefill(model, params,
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
-    state, _, carried = reseed(
-        ops, state, (state.hidden,) + state.drafts, hidden[:, prefix:-1],
+    state, carried = reseed(
+        ops, state, (state.hidden, *state.drafts), hidden[:, prefix:-1],
         ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
         prior_tokens=jnp.asarray([prefix], jnp.int32))
@@ -709,7 +722,7 @@ def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
     replayed, _, seen = ops.verify(replace(drafted, cache=saved), emitted, keep)
     assert seen is not None
     positions = jnp.asarray([[4, 5], [2, 3]])
-    corrected, _, _ = reseed(
+    corrected, _ = reseed(
         ops, replayed, (seeded.hidden,), seen, ops.embed(emitted), keep, positions,
         jnp.asarray([1, 0]), prior_tokens=jnp.asarray([4, 2]))
     whole = jnp.concatenate([prompt, emitted], axis=1)

@@ -1,39 +1,48 @@
 """Load native models and their host processors from a Hugging Face source.
 
-`load_pretrained` is the front door: it reads a source directory or repo,
+`Pretrained.load` is the front door: it reads a source directory or repo,
 translates its config and weights through `dew.interop.hf_decoders`, and
-returns a `Pretrained` holding the model, its variables and its processor.
+returns the kind of `Pretrained` the source is, holding the model, its
+variables and its processor.
 `Pretrained` also carries the source's own decoding controls and the layouts
 that write every tensor back, so `Pretrained.save` restores what it read.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
-import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, TypedDict, TypeGuard, Unpack
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from flax import linen as nn
+from jax.typing import DTypeLike
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
 from dew.inputs import Condition, Field, InputSpec
-from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
+from dew.inputs.diffusion import (
+    Composition,
+    DiffusionConditioner,
+    HiddenStatesConditioner,
+    QwenImageConditioner,
+    T5Segment,
+)
 from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.generation_config import (
@@ -44,20 +53,24 @@ from dew.interop.generation_config import (
     return_sequences,
     source_decoding,
 )
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
-from dew.interop.streaming import SourceLeaf
+from dew.interop.processors import (
+    HostProcessor as HostProcessor,
+    Processor as Processor,
+    ProcessorCall as ProcessorCall,
+    _hosts,
+)
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.streaming import SourceLeaf, WeightLayout
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.text_encoders import ParamTree
 from dew.objectives.base import Variables
-from dew.records import JSON
 from dew.registry import (
     dtype_name,
-    models,
+    from_record,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -69,659 +82,17 @@ from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
 
+    from dew.lora import LoRA
+    from dew.objectives.diffusion import DiffusionObjective
     from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
 
 
-class ProcessorCall(TypedDict, total=False):
-    """Names every keyword dew hands a host processor beside `images`.
-
-    A source processor takes far more than these; these are the ones dew
-    passes, so the bag names them rather than standing for any keyword at
-    all. `tests/test_interop.py` reads a real processor through this call.
-    """
-
-    text: str | list[str]
-    padding: bool
-    truncation: bool
-    return_tensors: str | None
-    audio: Media
-    videos: Media
-    video_metadata: Sequence[Mapping[str, object]]
-
-
-class HostProcessor(Protocol):
-    """Declares the HF processor operations kept outside compiled model computation."""
-
-    def __call__(self, *, images: Media | None = None,
-                 **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]: ...
-    # The files it wrote are its own bookkeeping; dew calls this for the effect.
-    def save_pretrained(self, save_directory: str) -> None: ...
-    def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
-                            **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]: ...
-    def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
-
-
-def _hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
-    """Whether `reference` offers every HostProcessor operation, checked by
-    name because a tokenizer's own annotations are narrower than what dew
-    passes (see `data.chat._token_ids`)."""
-    return all(callable(getattr(reference, name, None))
-               for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
-
-
-def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
-                   kernel: int, table_size: int, patch_size: int
-                   ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Return each modality's patch frames, their coordinates and their pooled
-    lengths, by the placeholder id that stands in the prompt for them.
-
-    The source flattens its video and frame axes, not its prompt rows
-    (modeling_gemma4.py:2476-2488), so the two streams stay separate here and
-    the caller's placeholder runs establish row order over them. A stream
-    arrives whole: its pixels with its positions, its coordinates inside the
-    position table, and its patches in complete pooling blocks.
-    """
-    streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    for pixel_name, position_name, token_id, ndim in (
-        ("pixel_values", "image_position_ids", image_id, 3),
-        ("pixel_values_videos", "video_position_ids", video_id, 4),
-    ):
-        if pixel_name not in values and position_name not in values:
-            continue
-        if pixel_name not in values or position_name not in values:
-            raise ValueError(f"{pixel_name} and {position_name} arrive together")
-        if token_id is None:
-            raise ValueError(f"{pixel_name} requires an integer placeholder id")
-        if token_id in streams:
-            raise ValueError("image_token_id and video_token_id must identify separate payload streams")
-        frames, coordinates = np.asarray(values[pixel_name]), np.asarray(values[position_name])
-        if (frames.ndim != ndim or not np.issubdtype(frames.dtype, np.floating)
-                or min(frames.shape[1:]) < 1):
-            raise ValueError(f"{pixel_name} must contain floating patch frames of rank {ndim}")
-        if (coordinates.shape != (*frames.shape[:-1], 2)
-                or not np.issubdtype(coordinates.dtype, np.integer)):
-            raise ValueError(f"{position_name} must contain aligned integer patch coordinates")
-        if frames.shape[-1] != 3 * patch_size ** 2:
-            raise ValueError(f"{pixel_name} patch width disagrees with vision_config.patch_size")
-        frames = frames.reshape(-1, *frames.shape[-2:])
-        coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
-        valid_patches = (coordinates >= 0).all(axis=-1)
-        padding = (coordinates == -1).all(axis=-1)
-        if not np.all(valid_patches | padding):
-            raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
-        if np.any(coordinates >= table_size):
-            raise ValueError(f"{position_name} exceeds position_embedding_size")
-        counts = valid_patches.sum(axis=1)
-        if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
-            raise ValueError("patch counts must divide into complete pooling blocks")
-        streams[token_id] = (frames, coordinates, counts // kernel ** 2)
-    return streams
-
-
-def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
-    """Return the id and the side to pad text rows with, at the boundary a host
-    processor draws: it delegates text to the tokenizer it wraps, a tokenizer
-    is its own, and either may state neither field, so both names are read off
-    the object here and narrowed once for the rows.
-    """
-    tokenizer = getattr(reference, "tokenizer", reference)
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    side = getattr(tokenizer, "padding_side", "right")
-    if side not in ("left", "right"):
-        raise ValueError("the tokenizer padding_side must be left or right")
-    return (0 if pad_id is None else records.integer(pad_id, "pad_token_id"),
-            "left" if side == "left" else "right")
-
-
-def _row_start(reference: HostProcessor) -> int | None:
-    """Return the id the tokenizer starts a sequence with, or None, read at the
-    boundary `_row_padding` reads its padding at: off the tokenizer a
-    processor wraps, or the tokenizer itself."""
-    tokenizer = getattr(reference, "tokenizer", reference)
-    bos = getattr(tokenizer, "bos_token_id", None)
-    return None if bos is None else records.integer(bos, "bos_token_id")
-
-
-@dataclass(frozen=True)
-class Processor:
-    """Runs host text and image preprocessing, then normalizes the numeric layout.
-
-    The checkpoint processor owns resizing, normalization and special-token
-    expansion. Dew organizes its outputs into row-aligned arrays; it does
-    not reproduce the checkpoint's image preprocessing algorithms.
-    """
-
-    reference: HostProcessor
-    config: Mapping[str, object]
-    record: Mapping[str, object]
-    vocab_size: int
-
-    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
-                 audio: Media | None = None, videos: Media | None = None,
-                 video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
-        if video_metadata is not None and videos is None:
-            raise ValueError("video_metadata requires videos")
-        if images is None and audio is None and videos is None:
-            rows = [text] if isinstance(text, str) else list(text)
-            values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
-            pad_id, side = _row_padding(self.reference)
-            ids = values["input_ids"]
-            ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
-            fields = {name: value if isinstance(value, Sequence) else np.asarray(value)
-                      for name, value in values.items() if name != "input_ids"}
-            tokens, fields = pad_token_rows(ids, pad_id=pad_id, padding_side=side, fields=fields)
-            return self.from_hf({"input_ids": tokens, **fields})
-        # truncation is off for text anyway; reloaded Gemma processors forward
-        # the tokenizer's unset max_length into audio kwargs otherwise.
-        arguments: ProcessorCall = {
-            "text": text if isinstance(text, str) else list(text),
-            "padding": not isinstance(text, str) and len(text) > 1, "truncation": False, "return_tensors": "pt"}
-        if audio is not None:
-            arguments["audio"] = audio
-        if videos is not None:
-            arguments["videos"] = videos
-        if video_metadata is not None:
-            arguments["video_metadata"] = video_metadata
-        # An audio-only processor takes no images keyword at all, so the
-        # absent one is left out of the call rather than passed as None.
-        if images is None:
-            return self._from_tensors(self.reference(**arguments))
-        return self._from_tensors(self.reference(images=images, **arguments))
-
-    def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
-             **template_options: JSON) -> ModelInputs:
-        """Run the source's actual chat template and processor into numeric inputs.
-
-        Template controls such as reasoning_effort and preserve_thinking are
-        interpreted by the checkpoint template. Media-bearing content uses
-        the same reference processor and numeric normalization as plain text.
-        """
-        values = self.reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="pt",
-            add_generation_prompt=add_generation_prompt, **template_options)
-        if not isinstance(values, Mapping):
-            raise TypeError("the source chat processor must return named numeric inputs")
-        return self._from_tensors(values)
-
-    def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
-        import torch
-
-        arrays: dict[str, np.ndarray] = {}
-        for name, value in values.items():
-            if not isinstance(value, torch.Tensor):
-                raise TypeError(f"processor field {name!r} is not a tensor")
-            # Llama 4's processor emits bf16; float32 widening is exact.
-            arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-        return self.from_hf(arrays)
-
-    def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
-        """Validate and normalize actual processor outputs before device use."""
-        known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
-                 "image_position_ids", "image_grid_thw", "input_features", "input_features_mask",
-                 "pixel_values_videos", "video_grid_thw", "video_position_ids"}
-        unknown = set(values) - known
-        if unknown:
-            raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
-        tokens = np.asarray(values["input_ids"])
-        if tokens.ndim != 2 or not np.issubdtype(tokens.dtype, np.integer) or min(tokens.shape) < 1:
-            raise ValueError("input_ids must be nonempty integer [B, S] rows")
-        valid = np.asarray(values.get("attention_mask", np.ones(tokens.shape, bool)), dtype=bool)
-        if valid.shape != tokens.shape:
-            raise ValueError("attention_mask must align with input_ids")
-        positions = np.maximum(np.cumsum(valid, axis=1) - 1, 0).astype(np.int32)
-        # An unpadded batch carries no validity field. The host knows the rows
-        # are whole here; the model would have to take an all-true mask on
-        # trust and build one anyway.
-        token_fields = {"positions": jnp.asarray(positions)}
-        if not valid.all():
-            token_fields["attention_mask"] = jnp.asarray(valid)
-        gemma = self.config.get("model_type") == "gemma4"
-        if gemma:
-            for pixels, coordinates in (("pixel_values", "image_position_ids"),
-                                         ("pixel_values_videos", "video_position_ids")):
-                if (pixels in values) != (coordinates in values):
-                    raise ValueError(f"{pixels} and {coordinates} arrive together")
-            if "mm_token_type_ids" in values:
-                types = np.asarray(values["mm_token_type_ids"])
-                if types.shape != tokens.shape or not np.issubdtype(types.dtype, np.integer):
-                    raise ValueError("mm_token_type_ids must be integer values aligned with input_ids")
-                # Image-to-video adjacency stays one vision run; hard text
-                # breaks it (modeling_gemma4.py:2148-2157).
-                vision = (types == 1) | (types == 2)
-                previous = np.concatenate([np.zeros((tokens.shape[0], 1), bool), vision[:, :-1]], axis=1)
-                groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
-                token_fields["image_groups"] = jnp.asarray(np.where(vision, groups, -1))
-        elif "video_position_ids" in values:
-            raise ValueError("video_position_ids require the Gemma4 visual tower")
-        conditioning: dict[str, jax.Array] = {}
-        if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") not in ("qwen3_5", "gemma4"):
-                raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
-            image_fields, conditioning = self._images(values, tokens)
-            token_fields.update(image_fields)
-            if self.config.get("model_type") == "qwen3_5":
-                token_fields["rotary_positions"] = self._image_rotary_positions(
-                    tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
-        if ("input_features" in values) != ("input_features_mask" in values):
-            raise ValueError("input_features and input_features_mask arrive together")
-        if "input_features" in values:
-            audio_fields, audio_conditioning = self._audio(values, tokens)
-            token_fields.update(audio_fields)
-            conditioning = {**conditioning, **audio_conditioning}
-        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
-            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
-        prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
-        prepared.validate()
-        return prepared
-
-    def _images(self, values: Mapping[str, object], tokens: np.ndarray
-                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-        """Row-align the processor's image and video features to their placeholders.
-
-        It runs in two halves. The first reads the processor's output into
-        `chunks`, one feature block per image, with `lengths` its placeholder
-        count, `shape` the padded block shape and `capacity` the slots one
-        image occupies; `grid` and `patch_positions` carry the per-family
-        extras. The second copies each chunk into `padded` at its row and image
-        slot and writes `indices`, the slot each placeholder token reads.
-
-        The three branches are the three source layouts: Qwen's packed patch
-        runs, a per-patch position stream, and a fixed tokens-per-image grid.
-        """
-        image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
-        if type(image_id) is not int:
-            raise ValueError("image_token_id must be an integer")
-        qwen = self.config.get("model_type") == "qwen3_5"
-        gemma = self.config.get("model_type") == "gemma4"
-        video_id = (self.config.get("video_token_id", 258884) if gemma else
-                    self.config.get("video_token_id") if qwen else None)
-        if video_id is not None and type(video_id) is not int:
-            raise ValueError("video_token_id must be an integer")
-        pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
-        if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
-            raise ValueError("pixel_values must contain floating image tensors or patch vectors")
-        pixel_dtype = pixels.dtype
-        runs = []
-        for row in tokens:
-            locations = np.flatnonzero((row == image_id) | (row == video_id if video_id is not None else False))
-            boundaries = np.flatnonzero((np.diff(locations) != 1) | (row[locations[1:]] != row[locations[:-1]])) + 1
-            runs.append([] if not len(locations) else np.split(locations, boundaries))
-        image_counts = np.array([len(row) for row in runs], np.int32)
-        patch_positions = None
-        grid = None
-        merge = 1
-        if qwen:
-            expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
-            supplied_types = np.asarray(values.get("mm_token_type_ids"))
-            if not np.array_equal(supplied_types, expected_types):
-                raise ValueError("mm_token_type_ids must identify each image and video placeholder")
-            chunks, grid, merge = self._qwen_frames(values, tokens, runs)
-            shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            lengths = np.prod(grid, axis=1) // merge ** 2
-            capacity = shape[0] // merge ** 2
-        elif "image_position_ids" in values or "video_position_ids" in values:
-            chunks, patch_positions, lengths, kernel = self._positioned_chunks(values, tokens, runs,
-                                                                               image_id, video_id)
-            shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            pixel_dtype = np.result_type(*(chunk.dtype for chunk in chunks))
-            capacity = shape[0] // kernel ** 2
-        else:
-            count = self.record.get("tokens_per_image")
-            if type(count) is not int or count < 1 or pixels.ndim != 4:
-                raise ValueError("fixed-resolution pixel_values require a positive tokens_per_image")
-            lengths = np.full(pixels.shape[0], count, np.int32)
-            capacity = count
-            chunks, shape = list(pixels), pixels.shape[1:]
-        if len(chunks) != int(image_counts.sum()):
-            raise ValueError("pixel_values and image placeholder counts disagree")
-        width = int(image_counts.max())
-        if width < 1:
-            raise ValueError("pixels require image placeholders")
-        padded = np.zeros((tokens.shape[0], width, *shape), pixel_dtype)
-        padded_grid = None if grid is None else np.zeros((tokens.shape[0], width, 3), np.int32)
-        if padded_grid is not None:
-            padded_grid[..., 1:] = merge
-        padded_positions = (None if patch_positions is None else np.full(
-            (tokens.shape[0], width, shape[0], 2), -1, np.int32))
-        indices = np.full(tokens.shape, -1, np.int32)
-        groups = None if gemma else np.full(tokens.shape, -1, np.int32)
-        token_lengths = np.zeros((tokens.shape[0], width), np.int32)
-        offset = 0
-        for row, blocks in enumerate(runs):
-            for image, slots in enumerate(blocks):
-                length = int(lengths[offset])
-                if len(slots) != length:
-                    raise ValueError("image placeholder counts do not match the projector's feature count")
-                chunk = chunks[offset]
-                padded[row, image, :chunk.shape[0]] = chunk
-                if padded_grid is not None and grid is not None:
-                    padded_grid[row, image] = grid[offset]
-                if padded_positions is not None and patch_positions is not None:
-                    positions = patch_positions[offset]
-                    padded_positions[row, image, :positions.shape[0]] = positions
-                token_lengths[row, image] = length
-                indices[row, slots] = image * capacity + np.arange(length)
-                if groups is not None:
-                    groups[row, slots] = image
-                offset += 1
-        conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
-                        "image_token_lengths": jnp.asarray(token_lengths)}
-        if padded_positions is not None:
-            conditioning["image_position_ids"] = jnp.asarray(padded_positions)
-        if padded_grid is not None:
-            conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
-        fields = {"image_indices": jnp.asarray(indices)}
-        if groups is not None:
-            fields["image_groups"] = jnp.asarray(groups)
-        return fields, conditioning
-
-    def _positioned_chunks(self, values: Mapping[str, object], tokens: np.ndarray, runs: list[list[np.ndarray]],
-                           image_id: int, video_id: int | None
-                           ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], int]:
-        """The per-patch position layout's feature blocks, in placeholder order:
-        each image or video's patches, their positions and placeholder count,
-        and the vision pooling kernel that sets how many slots one fills."""
-        vision = self.config.get("vision_config")
-        if not isinstance(vision, Mapping):
-            raise ValueError("patch position ids require a vision config")
-        kernel = vision.get("pooling_kernel_size")
-        if type(kernel) is not int or kernel < 1:
-            raise ValueError("pooling_kernel_size must be a positive integer")
-        table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
-        if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
-            raise ValueError("position_embedding_size and patch_size must be positive integers")
-        streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=table_size, patch_size=patch_size)
-        offsets = dict.fromkeys(streams, 0)
-        chunks, patch_positions, lengths = [], [], []
-        for row, blocks in enumerate(runs):
-            for slots in blocks:
-                token_id = int(tokens[row, slots[0]])
-                stream = streams.get(token_id)
-                offset = offsets.get(token_id, 0)
-                if stream is None or offset >= len(stream[0]):
-                    raise ValueError("pixel_values and image/video placeholder counts disagree")
-                chunks.append(stream[0][offset])
-                patch_positions.append(stream[1][offset])
-                lengths.append(int(stream[2][offset]))
-                offsets[token_id] += 1
-        if any(offsets[token_id] != len(stream[0]) for token_id, stream in streams.items()):
-            raise ValueError("pixel_values and image/video placeholder counts disagree")
-        if not chunks:
-            raise ValueError("pixels require image or video placeholders")
-        return chunks, patch_positions, lengths, kernel
-
-    def _audio(self, values: Mapping[str, object], tokens: np.ndarray
-               ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-        """Row-align the processor's clip features and index their placeholders.
-
-        Each contiguous run of the audio placeholder is one clip, in the
-        processor's clip order. Gemma 4 inserts one placeholder per encoded
-        valid frame; Gemma 3n inserts its fixed slot count. Both are checked
-        against the encoder's frame stride here, before any device work.
-        """
-        audio_id = self.record.get("audio_token_id")
-        audio = self.record.get("audio")
-        if type(audio_id) is not int or not isinstance(audio, Mapping):
-            raise ValueError("this source has no audio tower")
-        encoder = towers.from_record(audio)
-        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError("audio conditioning requires a Gemma audio encoder")
-        features = np.asarray(values["input_features"])
-        mask = np.asarray(values["input_features_mask"])
-        if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
-            raise ValueError("input_features must be floating [clips, frames, mel]")
-        if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
-            raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
-        encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
-        slots = self.record.get("audio_soft_tokens")
-        if slots is None:
-            expected = encoded.sum(axis=1)
-            capacity = encoded.shape[1]
-        else:
-            if type(slots) is not int or encoded.shape[1] > slots:
-                raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
-            expected = np.full(features.shape[0], slots)
-            capacity = slots
-        runs = []
-        for row in tokens:
-            locations = np.flatnonzero(row == audio_id)
-            runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
-        counts = np.array([len(row) for row in runs], np.int32)
-        if int(counts.sum()) != features.shape[0]:
-            raise ValueError("input_features and audio placeholder runs disagree")
-        width = int(counts.max())
-        padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
-        padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
-        indices = np.full(tokens.shape, -1, np.int32)
-        offset = 0
-        for row, clips in enumerate(runs):
-            for clip, run in enumerate(clips):
-                if len(run) != int(expected[offset]):
-                    raise ValueError("audio placeholder counts do not match the encoded frame counts")
-                padded[row, clip] = features[offset]
-                padded_mask[row, clip] = mask[offset]
-                indices[row, run] = clip * capacity + np.arange(len(run))
-                offset += 1
-        conditioning = {"input_features": jnp.asarray(padded), "input_features_mask": jnp.asarray(padded_mask),
-                        "audio_lengths": jnp.asarray(counts)}
-        return {"audio_indices": jnp.asarray(indices)}, conditioning
-
-    def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Return views of packed image/video patches in text order, one item per frame.
-
-        Qwen3.5 get_rope_index repeats video grids by their temporal count and
-        resets each frame's temporal coordinate to zero. The processor places
-        timestamps between frames. Attention never crosses a frame, so these
-        views share the existing visual tower and merger without new weights.
-        """
-        vision = self.config.get("vision_config")
-        if not isinstance(vision, Mapping):
-            raise ValueError("packed visual inputs require a vision config")
-        merge = vision.get("spatial_merge_size")
-        if type(merge) is not int or merge < 1:
-            raise ValueError("spatial_merge_size must be a positive integer")
-        streams = {}
-        for pixel_name, grid_name, token_name, split in (
-                ("pixel_values", "image_grid_thw", "image_token_id", False),
-                ("pixel_values_videos", "video_grid_thw", "video_token_id", True)):
-            if (pixel_name in values) != (grid_name in values):
-                raise ValueError(f"{pixel_name} and {grid_name} arrive together")
-            if pixel_name not in values:
-                continue
-            pixels, grid = np.asarray(values[pixel_name]), np.asarray(values[grid_name])
-            if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
-                    or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
-                raise ValueError(f"{grid_name} requires positive integer grids tiled by spatial_merge_size")
-            if pixels.ndim != 2 or not np.issubdtype(pixels.dtype, np.floating):
-                raise ValueError(f"{pixel_name} must be floating packed patch vectors")
-            if int(np.prod(grid, axis=1).sum()) != pixels.shape[0]:
-                raise ValueError(f"{pixel_name} does not match {grid_name}")
-            pieces = []
-            offset = 0
-            for time, height, width in grid:
-                count = int(height * width)
-                for _ in range(int(time) if split else 1):
-                    frames = 1 if split else int(time)
-                    pieces.append((pixels[offset:offset + frames * count],
-                                   (frames, int(height), int(width))))
-                    offset += frames * count
-            token_id = self.config[token_name]
-            if type(token_id) is not int:
-                raise ValueError(f"{token_name} must be an integer")
-            streams[token_id] = pieces
-        offsets = dict.fromkeys(streams, 0)
-        ordered = []
-        for row, spans in enumerate(runs):
-            for span in spans:
-                token = int(tokens[row, span[0]])
-                if token not in streams or offsets[token] == len(streams[token]):
-                    raise ValueError("visual placeholders exceed their image/video frame payloads")
-                ordered.append(streams[token][offsets[token]])
-                offsets[token] += 1
-        if not ordered or any(offsets[token] != len(stream) for token, stream in streams.items()):
-            raise ValueError("visual payloads and placeholder frame counts disagree")
-        chunks, grids = zip(*ordered, strict=True)
-        widths = {chunk.shape[-1] for chunk in chunks}
-        if len(widths) != 1:
-            raise ValueError("image and video patch widths must agree")
-        return list(chunks), np.asarray(grids, np.int32), merge
-
-    def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
-                                groups: jax.Array, grids: jax.Array) -> jax.Array:
-        """Compute Qwen3.5's get_rope_index on host-normalized image grids.
-
-        Text advances one coordinate per token. An image occupies its merged
-        temporal/height/width grid, and following text starts after its longest
-        spatial side. Padding keeps coordinate zero, as in the reference.
-        """
-        vision = records.record(self.config["vision_config"], "vision_config")
-        merge = records.integer(vision["spatial_merge_size"], "spatial_merge_size")
-        image_groups, grid_values = np.asarray(groups), np.asarray(grids)
-        prepared = np.zeros((*tokens.shape, 3), np.int32)
-        for row in range(tokens.shape[0]):
-            slots = np.flatnonzero(valid[row])
-            start = cursor = 0
-            while start < len(slots):
-                group = int(image_groups[row, slots[start]])
-                stop = start + 1
-                while stop < len(slots) and image_groups[row, slots[stop]] == group:
-                    stop += 1
-                span = slots[start:stop]
-                if group < 0:
-                    prepared[row, span] = (cursor + np.arange(len(span)))[:, None]
-                    cursor += len(span)
-                else:
-                    time, height, width = (int(value) for value in grid_values[row, group])
-                    coordinates = np.indices((time, height // merge, width // merge)).reshape(3, -1).T
-                    if len(span) != len(coordinates):
-                        raise ValueError("image tokens do not match their multimodal rotary grid")
-                    prepared[row, span] = coordinates + cursor
-                    cursor += max(height, width) // merge
-                start = stop
-        return jnp.asarray(prepared)
-
-    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
-        """Decode token rows with the tokenizer retained by the source processor."""
-        array = np.asarray(tokens)
-        if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
-            raise ValueError("decode expects integer [B, S] token rows")
-        return self.reference.batch_decode(array.tolist(), skip_special_tokens=True)
-
-    @property
-    def bos_id(self) -> int | None:
-        """The id the source's tokenizer starts a sequence with, or None."""
-        return _row_start(self.reference)
-
-    def save_pretrained(self, directory: str | Path) -> None:
-        """Save the same processor and tokenizer used by this source."""
-        self.reference.save_pretrained(str(directory))
-
-
-@dataclass(frozen=True)
-class WeightLayout:
-    """Holds an existing source tensor's location and reversible storage layout.
-
-    `expert_index` is the expert a per-expert source tensor holds. The
-    loader stacks those tensors onto an expert dimension
-    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
-    expert of a layer and the index says which slice this tensor is.
-
-    `dtype` is the width the source stores this tensor in where that is
-    not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
-    and int32 in the collection, and the export writes back what the
-    checkpoint held.
-
-    `padded` is the length a 1-D source tensor stores past its leaf's, as
-    zeros, for the names its family declares (`DecoderFamily.zero_padded`):
-    Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
-    entries. The family's prepare step checks and trims the tail, and export
-    writes the zeros back.
-    """
-
-    name: str
-    paths: tuple[tuple[str, ...], ...]
-    shape: tuple[int, ...]
-    transpose: tuple[int, ...] | None = None
-    concatenate: int | None = None
-    expert_index: int | None = None
-    dtype: np.dtype | None = None
-    padded: int | None = None
-
-    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
-        if path[-1] == "layer_scalar":
-            if scalar_mode not in ("frozen", "trainable"):
-                raise ValueError("layer_scalar export requires an explicit model mode")
-            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
-        node: object = variables
-        for part in path:
-            if not isinstance(node, Mapping):
-                raise ValueError(f"parameter path {path} does not traverse a mapping")
-            node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
-            raise ValueError(f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array")
-        return node
-
-    def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
-        """The dtype `export` writes, read from the leaf without copying it."""
-        if self.dtype is not None:
-            return np.dtype(self.dtype)
-        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
-
-    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
-        leaves = []
-        for path in self.paths:
-            node = self._leaf(variables, path, scalar_mode)
-            if self.expert_index is not None:
-                # Slice the expert where the leaf lives. One stacked leaf
-                # answers for E source tensors, so copying it to the host
-                # per tensor would move the whole stack E times.
-                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
-                    raise ValueError(
-                        f"{self.name} is expert {self.expert_index} of {path}, which "
-                        f"holds {node.shape}")
-                node = node[self.expert_index]
-            leaves.append(np.asarray(node))
-        value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
-        if self.transpose is not None:
-            value = value.transpose(self.transpose)
-        if self.padded is not None:
-            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
-        if value.size != math.prod(self.shape):
-            raise ValueError(
-                f"{self.name} assembles {value.shape} from {self.paths}, which does not "
-                f"fill the source's {self.shape}")
-        value = np.ascontiguousarray(value).reshape(self.shape)
-        return value if self.dtype is None else value.astype(self.dtype)
-
-    def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-        """Return the leaf of `shape` whose export is `tensor`.
-
-        The inverse of `export` for a layout that binds one whole leaf; a
-        tensor assembled from several leaves has no single leaf to restore.
-        """
-        if len(self.paths) != 1 or self.concatenate is not None or self.expert_index is not None:
-            raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
-        if tensor.shape != self.shape:
-            raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
-        transpose = self.transpose or tuple(range(len(shape)))
-        stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
-        return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
-
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Map a per-expert leaf path to the stacked leaf the loaded tree holds.
-
-    A checkpoint that names one tensor per expert maps through the family
-    to `experts/K/projection/kernel`, a path `hf_decoders._stack_experts`
-    consumed on the way in: the tree keeps one `experts/projection/kernel`
-    stacked in expert order, so that leaf and K are where the tensor's
-    values live.
-    """
+    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
+    `experts/K/projection/kernel` path into, and K."""
     if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
             and path[-1] == "kernel"):
         return (*path[:-3], path[-2], path[-1]), int(path[-3])
@@ -754,18 +125,26 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
-    """Return the text family's leaf map plus its inverse storage operations."""
-    family = decoders._FAMILIES[model_type]
-    # A family whose checkpoint packs its experts as `[E, out, in]`
-    # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
-    # back swapped.
-    packed = family.prepare_weights is decoders._gemma4_prepare
+    """Return the leaves the text family maps a source tensor to and the
+    storage operations that rebuild it from them; a `packed` tensor is built
+    from the layouts of its parts."""
+    family = decoders.families()[model_type]
+    packing = family.packing(text_name)
+    if packing is None:
+        return _leaf_layout(name, text_name, tensor, family, config, variables, component)
+    parts = [_leaf_layout(part, part, value, family, config, variables, component)
+             for part, value in packing.split(text_name, tensor).items()]
+    if any(part is None for part in parts):
+        raise ValueError(f"packed tensor {name!r} has no parameter path")
+    return packing.layout(name, [part for part in parts if part is not None])
 
+
+def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoders.DecoderFamily,
+                 config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    concatenate = None
     expert_index = None
     head_name, embedding_name = family.tied_head_names
     if text_name == head_name and config["tie_embeddings"]:
@@ -775,18 +154,6 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if embedding is None:
             raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
         paths = (nested(embedding),)
-    elif text_name.endswith(".experts.gate_up_proj") and (packed or model_type == "llama4_text"):
-        names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
-        paths_list = []
-        for key in names:
-            path = family.weight_path(key, config)
-            if path is None:
-                raise ValueError(f"fused expert tensor {name!r} has no parameter path")
-            paths_list.append(nested(path))
-        paths = tuple(paths_list)
-        concatenate = -1
-        if packed:
-            transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
         if path is None:
@@ -796,14 +163,11 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if path[-1] == "kernel" and tensor.ndim == 2:
             lead = _leading_axes(variables, paths[0], expert_index)
             transpose = (*range(lead), lead + 1, lead)
-        elif text_name.endswith(".experts.down_proj") and packed:
-            transpose = (0, 2, 1)
-    # A weight is fp32 in the tree whatever the checkpoint stored it as, so
-    # only an index table's own width has to be carried back.
+    # A floating weight is written in its leaf's dtype; an index table
+    # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
     padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
-    return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored, padded)
+    return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 
 
 def _wrapper_layouts(tensors, record, variables):
@@ -838,7 +202,11 @@ def _wrapper_layouts(tensors, record, variables):
         elif group == "tower":
             path = vision.TOWER_PATHS[tower_kind](local)
             if path is not None:
-                paths = ((path[0], "tower", *path[1:]),) if tower_kind == "gemma4" else (("params", "tower", *path),)
+                paths = (
+                    ((path[0], "tower", *path[1:]),)
+                    if tower_kind == "gemma4"
+                    else (("params", "tower", *path),)
+                )
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
@@ -897,6 +265,13 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
 class Pretrained:
     """Holds a native model, explicit variables and its checkpoint's host processor.
 
+    `Pretrained.load` returns the kind of source it read, each a subclass
+    with the methods that work for it: `PretrainedDecoder` for an
+    autoregressive decoder, `PretrainedMaskedDecoder` for a masked-diffusion
+    one, `PretrainedBlockDecoder` for DiffusionGemma, `PretrainedPipeline` for
+    a latent diffusion pipeline and `PretrainedFallback` for transformers'
+    forward through torchax. Every kind saves back to the source's format.
+
     `model_config` is the record the model was built from, in Dew's own
     vocabulary with the run's compute dtype and attention kernel, so a caller
     logs the model it ran.
@@ -906,18 +281,16 @@ class Pretrained:
     variables: Variables
     processor: Processor | None
     config: Mapping[str, object]
-    source: Path
+    source: Path | None
+    """The directory the source was read from; None for a model trained in
+    Dew (`PretrainedDecoder.from_model`)."""
     model_config: Mapping[str, object]
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
-    process: Process | None = None
-    inputs: InputSpec | None = None
-    autoencoder: AutoEncoder | None = None
-    schedule: SourceSchedule | None = None
-    task: SourceTask | None = None
-    finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
+    export_adapter: (
+        Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None
+    ) = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
     quantized_scale_dtype: str | None = None
     """The dtype a quantized source stored its scales in, where its format
@@ -929,6 +302,151 @@ class Pretrained:
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
+    adapter: LoRA | None = None
+    """The low-rank adapter `lora` put on the model, whose factors the
+    variables hold; None for the source as published."""
+    tokenizer: str | decoders.ExportTokenizer | None = None
+    """The vocabulary `save` writes beside the weights, by name or by object,
+    for a bundle with no source processor to write (`from_model`)."""
+
+    @classmethod
+    def from_run(cls, directory: str | Path, *, step: int | str | None = None,
+                 ema: bool | None = None) -> Self:
+        """A trained run's selected checkpoint, rebuilt from its own inference record."""
+        from dew.checkpoints import Checkpoints
+        from dew.config import ModelConfig
+        from dew.inference.tasks import run_record
+        from dew.records import record, text
+        from dew.registry import objectives
+        declaration = run_record(str(directory), step)
+        model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        model = model_config.build()
+        kind = text(declaration['objective'], 'objective')
+        averaged = False if objectives[kind]._ema_is_reference else ema
+        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
+        sampling = declaration.get('sampling')
+        generation = None if sampling is None else record(sampling, 'sampling')
+        tokenizer = declaration.get('tokenizer')
+        tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        if isinstance(model, CausalTransformer):
+            bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
+                                                   generation_config=generation)
+            if kind == 'masked_diffusion':
+                bundle = PretrainedMaskedDecoder(
+                    model, bundle.variables, bundle.processor, bundle.config, bundle.source,
+                    bundle.model_config, bundle.generation_config,
+                    export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
+        elif isinstance(model, DiffusionGemma):
+            from dew.interop import diffusion_gemma
+            settings = record(declaration['diffusion_gemma'], 'diffusion_gemma')
+            config = record(settings['config'], 'diffusion_gemma config')
+            generation = record(settings['generation_config'], 'generation_config')
+            bundle = PretrainedBlockDecoder(model, variables, None, config, None, model_config.fields(),
+                                             generation, export_adapter=diffusion_gemma.export_weights,
+                                             tokenizer=tokenizer)
+        else:
+            raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
+                            "load diffusion runs with TextToImage.from_run")
+        if not isinstance(bundle, cls):
+            raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
+                            f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
+        return bundle
+
+    @classmethod
+    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
+             param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
+             attention_impl: str = "auto", max_seq_len: int | None = None,
+             revision: str | None = None, gguf_file: str | None = None,
+             single_file: str | None = None,
+             mesh: MeshSpec | None = None, layout: Layout | None = None,
+             fallback: str | None = None) -> Self:
+        """Load a source into a native Flax model with explicit parameter trees, as
+        the kind of source it is.
+
+        ``name_or_dir`` is a local HF directory or a Hub model identifier. The
+        decoder/tower/projector maps preserve their established internal paths;
+        wrapper variables join under their existing component names. Processor
+        artifacts are loaded only when the source contains them.
+        dtype selects computation; param_dtype independently selects floating
+        parameter storage and defaults to FP32 masters, or 'auto' stores the
+        checkpoint's own dtype (`_checkpoint_dtype`). Each is a dtype
+        (`jnp.bfloat16`) or its name, and the model's record keeps the name. Frozen component weights
+        (text encoders and VAE) follow it too; router, clipping, positional and
+        safety state retain their own FP32/integer contracts.
+
+        Without `mesh` or `layout` the variables are host arrays. With either,
+        they are placed on that mesh (the default `MeshSpec()` when only
+        `layout` is given) under that layout, one leaf at a time: a decoder's
+        leaves are read from the mapped checkpoint one device shard at a time
+        and cast and transposed there (`dew.interop.streaming`), so the host
+        never holds the translated model. Towers, projectors and a quantized
+        source's dequantized tensors are still built whole on the host first.
+
+        ``gguf_file`` names a GGUF file in the repo or directory: its metadata is
+        the config, its block-quantized tensors are dequantized to float32
+        (`dew.interop.gguf`), and its tokenizer is the processor where the repo
+        ships no tokenizer.
+
+        ``single_file`` names an original-format diffusion checkpoint in the
+        repo or directory: diffusers' own key maps convert it once into Dew's
+        cache as the diffusers pipeline it describes (`dew.interop.single_file`),
+        which then loads; the cache entry is published only once that load
+        succeeds. The configs are the repo or directory's own when it has a
+        model_index.json, and otherwise the diffusers repo diffusers infers from
+        the checkpoint, at the commit fetched. A component the file lacks gets
+        its weights from the same place, or is refused by name.
+
+        `fallback="torchax"` opts into tier 3 for any causal LM transformers
+        can build, registered or not: transformers' PyTorch forward lowered to
+        JAX by torchax (`dew.interop.torchax_fallback`), with no Dew kernels,
+        sharding rules or cached generation.
+
+        Called on a kind (`PretrainedDecoder.load`), a source of another kind
+        is refused naming the kind it is.
+        """
+        return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+                         max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
+                         single_file=single_file, mesh=mesh, layout=layout, fallback=fallback)
+
+    @classmethod
+    def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
+              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
+              attention_impl: str = "auto", max_seq_len: int | None = None,
+              revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
+              mesh: MeshSpec | None = None, layout: Layout | None = None, fallback: str | None = None,
+              prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Self:
+        """Share the source reader with inference's pre-placement projection packing."""
+        if fallback not in (None, "torchax"):
+            raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
+                             "tier 3 through transformers' PyTorch forward")
+        streaming = mesh is not None or layout is not None
+
+        def placed(variables: Variables) -> Variables:
+            return place(variables, mesh, layout) if streaming else variables
+
+        dtype = dtype_name(dtype)
+        param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
+        directory = sources.snapshot(str(name_or_dir), revision, weights=False)
+        # A Hub snapshot directory is named by its commit.
+        commit = None if os.path.isdir(name_or_dir) else directory.name
+        if fallback is not None:
+            from dew.interop import torchax_fallback
+            loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
+                                           param_dtype=param_dtype, attention_impl=attention_impl,
+                                           max_seq_len=max_seq_len)
+            loaded = replace(loaded, variables=placed(loaded.variables))
+        else:
+            loaded = _pipeline_source(name_or_dir, directory, commit, single_file, placed, dtype=dtype,
+                                      attention_impl=attention_impl, param_dtype=param_dtype)
+        if loaded is None:
+            loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
+                                         streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+                                         attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                         prepare=prepare)
+        if not isinstance(loaded, cls):
+            raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
+                            f"load it with {type(loaded).__name__}.load or Pretrained.load")
+        return loaded
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -941,101 +459,30 @@ class Pretrained:
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
 
-    def lm_objective(self, seq_len: int, **options) -> LMObjective:
-        """Build next-token training from this source's model and variables.
-
-        `options` are `LMObjective`'s training and evaluation controls;
-        this bundle supplies `pretrained` itself.
-        """
-        from dew.objectives.lm import LMObjective
-
-        if "pretrained" in options:
-            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        return LMObjective(self.model, seq_len, pretrained=self.variables, **options)
-
-    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
-        """Build the text generation task this source describes.
-
-        Masked generation refines a full response with Unmask, not the source
-        family's custom generation recipe. AR sampling overrides are refused.
-
-        Without an override the task runs the source's whole chain, its
-        criteria and the strategy its config names. An explicit `sampling`
-        replaces the basic policy and clears that chain with it, because the
-        chain was built around the policy the caller just replaced; the
-        criteria and `num_return_sequences` still come from the source.
-        """
-        if self.process is not None:
-            raise TypeError("a latent diffusion source generates through text_to_image")
-        if isinstance(self.model, DiffusionGemma):
-            raise TypeError("a DiffusionGemma source generates through block_generation")
-        if not isinstance(self.model, CausalTransformer | MultimodalTransformer):
-            raise TypeError(
-                f"text_generation decodes through a native Dew decoder's KV cache, and this "
-                f"source loaded as {type(self.model).__name__}; generate with transformers' "
-                f"AutoModelForCausalLM.from_pretrained({str(self.source)!r}).generate, or load a "
-                f"registered family without fallback")
-        decoder = self.model if isinstance(self.model, CausalTransformer) else None
-        mask_id = None if decoder is None else decoder.mask_token_id
-        if decoder is not None and not decoder.causal and mask_id is not None:
-            from dew.diffusion.discrete import MDLM
-            if sampling is not None:
-                raise TypeError("native MDLM accepts denoising steps, not autoregressive sampling controls")
-            audit_masked(self.config, self.generation_config)
-            return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(), self.processor,
-                eos_token_ids=eos_ids(self.config, self.generation_config),
-                pad_token_id=pad_id(self.config, self.generation_config),
-                max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                max_length=generation_limit(self.config, self.generation_config, "max_length"),
-                n=return_sequences(self.config, self.generation_config))
-        rows = return_sequences(self.config, self.generation_config)
-        policy, logits, stopping, strategy = source_decoding(
-            self.config, self.generation_config, self.model, self.processor, rows,
-            sampling)
-        return TextGeneration(self.model, self.variables, self.processor, policy,
-                              max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                              max_length=generation_limit(self.config, self.generation_config, "max_length"),
-                              n=rows, logits=logits, stopping=stopping, strategy=strategy)
-
-    def block_generation(self) -> BlockGeneration:
-        """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
-        from dew.interop import diffusion_gemma
-        if not isinstance(self.model, DiffusionGemma):
-            raise TypeError("block generation needs a DiffusionGemma source")
-        return BlockGeneration(self.model, self.variables,
-                               diffusion_gemma.generation_process(self.config, self.generation_config),
-                               self.processor, eos_ids(self.config, self.generation_config),
-                               pad_id(self.config, self.generation_config),
-                               max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                               max_length=generation_limit(self.config, self.generation_config, "max_length"),
-                               n=return_sequences(self.config, self.generation_config))
-
-    def text_to_image(self) -> TextToImage:
-        """Build the latent diffusion source as an image task with its published policy."""
-        if self.process is None or self.inputs is None or self.schedule is None:
-            raise TypeError("text_to_image needs a latent diffusion source")
-        if self.task is None:
-            raise TypeError("text_to_image needs the source's own call policy")
-        return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
-                           grid=self.task.grid, final_denoise=False, sampler=self.schedule.solver(),
-                           steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
-
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
 
-        A diffusion source writes one set per component, so it has none.
+        An adapted bundle (`lora`) writes the source's own tensors with the
+        factors merged into their kernels, PEFT's `merge_and_unload`, from
+        its variables or a trainer's split of them; `adapter.save` writes
+        the factors alone.
         """
         values = self.variables if variables is None else variables
+        if self.adapter is not None:
+            values = self.adapter.merge(values)
         quantization = self._quantization()
-        if self.schedule is not None:
-            raise ValueError("a diffusion source writes one tensor set per component; save it instead")
         family = self.config.get("model_type")
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
-        elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
-              and not decoders._FAMILIES.get(family, decoders._FAMILIES[verify.CONVENTION]).preserve_source_layout
-              and quantization is None):
-            # The decoder export's own encoder, so this and `save_pretrained_decoder`
+        elif (
+            isinstance(self.model, CausalTransformer)
+            and isinstance(family, str)
+            and not decoders.families().get(
+                family, decoders.families()[verify.CONVENTION]
+            ).preserve_source_layout
+            and quantization is None
+        ):
+            # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
             # leave the same weights. A quantized source keeps its packed format
             # by going back over its source names, below.
             return decoders.export_decoder_weights(self.model, values, decoders._export_config(self.model))
@@ -1045,13 +492,7 @@ class Pretrained:
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                # Each tensor is assembled when its shard is written (`save_sharded`).
-                specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                            for name, value in self.retained_tensors.items()},
-                         **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(values, scalar_mode))
-                            for name, layout in layouts.items()}}
-                return LazyTensors(specs, lambda name: (layouts[name].export(values, scalar_mode) if name in layouts
-                                                        else self.retained_tensors[name]))
+                return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -1061,7 +502,8 @@ class Pretrained:
         return tensors
 
     def _quantization(self) -> SourceQuantization | None:
-        """The config's quantization format, refused when the loader recorded no tensors to write back in it."""
+        """The config's quantization format, refused when the loader
+        recorded no tensors to write back in it."""
         quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype,
                                            grid=self.quantization_grid)
         if quantization is not None and not self.quantized_tensors:
@@ -1077,14 +519,286 @@ class Pretrained:
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
-        if self.schedule is not None:
-            from dew.interop import diffusion
-            self._quantization()
-            diffusion.save_source(self, values, destination)
-            return
         save_hf_layout(self.export(values), dict(self.config), destination, max_shard_size)
-        decoders.save_export_assets(destination, tokenizer=self.processor,
+        decoders.save_export_assets(destination,
+                                    tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config))
+
+    def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
+                    private: bool = False, commit_message: str = "Upload dew export",
+                    max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Upload what `save` writes to the Hub repo `repo_id`, created when
+        it is missing: `save` into a staging directory, then
+        `huggingface_hub.HfApi`'s `create_repo` and `upload_folder`. Retries,
+        progress and authentication are the hub client's."""
+        import tempfile
+
+        from huggingface_hub import HfApi
+
+        with tempfile.TemporaryDirectory() as staged:
+            self.save(staged, variables=variables, max_shard_size=max_shard_size)
+            api = HfApi()
+            api.create_repo(repo_id, private=private, exist_ok=True)
+            api.upload_folder(repo_id=repo_id, folder_path=staged, commit_message=commit_message)
+
+
+@dataclass(frozen=True)
+class PretrainedDecoder(Pretrained):
+    """An autoregressive decoder, alone or inside a multimodal wrapper: it
+    generates through its KV cache, fine-tunes next-token and takes a
+    low-rank adapter."""
+
+    model: CausalTransformer | MultimodalTransformer
+
+    @classmethod
+    def from_model(cls, model: CausalTransformer, variables: Variables, *,
+                   tokenizer: str | decoders.ExportTokenizer | None = None,
+                   generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
+        """A decoder trained in Dew, as the bundle `save` writes in its family's
+        Hugging Face layout.
+
+        The config is derived from the native computation and every variable
+        collection is encoded through the matching family, which is the
+        encoder a loaded source of a derived family exports through, so the
+        two leave the same weights behind. Gemma 4 writes frozen or trainable
+        layer-scalar values into HF buffers; reloading that layout preserves
+        computation, not the native scalar training policy.
+
+        `tokenizer` is the vocabulary the weights were trained against, by
+        object or by name; `save` writes its files beside them, so the
+        directory `Pretrained.load` reads back carries its processor.
+        `generation_config` is what generation_config.json records,
+        `GENERATION_DEFAULTS` when None.
+        """
+        config = decoders._export_config(model)
+        decoders._refuse_lossy_export(model, config)
+        built = {entry.name: getattr(model, entry.name) for entry in dataclasses.fields(model)
+                 if entry.init and entry.name not in ("parent", "name")}
+        return cls(model, variables, None, config, None, built,
+                   decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
+
+    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
+             rslora: bool = False, dropout: float = 0.0) -> PretrainedDecoder:
+        """Return this source with a fresh low-rank adapter on the projections `modules` name.
+
+        The bundle that comes back holds the adapted model, the variables
+        with the factors in them (B zero, so it computes what the source
+        does) and the adapter, and nothing of a run: `lm_objective` trains
+        the factors alone, `adapter.save` writes PEFT's directory and `save`
+        the source's layout with the factors merged in. `dew.lora.LoRA.fresh`
+        describes the arguments.
+        """
+        from dew.lora import LoRA
+
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        adapter, variables = LoRA.fresh(self.model, self.variables, self.layouts, rank=rank, modules=modules,
+                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
+        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
+
+    def lm_objective(self, seq_len: int, **options) -> LMObjective:
+        """Build next-token training from this source's model and variables.
+
+        `options` are `LMObjective`'s training and evaluation controls. This
+        bundle supplies `pretrained` itself and its processor unless one is
+        passed, and an adapted bundle its adapter's filter as `trainable`,
+        so the run moves the factors alone.
+        """
+        from dew.objectives.lm import LMObjective
+
+        if "pretrained" in options:
+            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        if self.adapter is not None:
+            if "trainable" in options:
+                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
+            options["trainable"] = self.adapter.trainable
+        return LMObjective(self.model, seq_len, pretrained=self.variables,
+                           **{"processor": self.processor, **options})
+
+    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
+        """Build the text generation task this source describes.
+
+        Without an override the task runs the source's policy (`task.sampling`
+        holds every common control its config sets), any chain the rarer
+        controls need, and the strategy its config names. An explicit
+        `sampling` replaces the policy and clears that chain with it, because
+        the chain was built around the policy the caller just replaced; the
+        source's EOS and pad ids fill the ones it leaves None, and
+        `num_return_sequences` still comes from the source.
+        Host weights pack before placement; an already placed bundle shares its canonical weights unchanged.
+        Unmerged LoRA models retain their projection paths and are not packed.
+        """
+        rows = return_sequences(self.config, self.generation_config)
+        policy, logits, strategy = source_decoding(
+            self.config, self.generation_config, self.model, rows, sampling)
+        return TextGeneration(
+            self.model,
+            self.variables,
+            self.processor,
+            policy,
+            max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
+            max_length=generation_limit(self.config, self.generation_config, "max_length"),
+            n=rows,
+            logits=logits,
+            strategy=strategy,
+        )
+
+
+
+@dataclass(frozen=True)
+class PretrainedMaskedDecoder(Pretrained):
+    """A masked-diffusion decoder (LLaDA, Dream): a non-causal decoder with a
+    mask id, which generates by unmasking a full response."""
+
+    model: CausalTransformer
+
+    def text_generation(self) -> MaskedGeneration:
+        """Build the masked generation task this source describes: native MDLM
+        refining a full response with Unmask, not the source family's custom
+        generation recipe."""
+        from dew.diffusion.discrete import MDLM
+
+        config, generation = self.config, self.generation_config
+        mask_id = self.model.mask_token_id
+        if mask_id is None:
+            raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
+        audit_masked(config, generation)
+        return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
+                                self.processor,
+                                eos_token_ids=eos_ids(config, generation),
+                                pad_token_id=pad_id(config, generation),
+                                max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
+                                max_length=generation_limit(config, generation, "max_length"),
+                                n=return_sequences(config, generation))
+
+
+@dataclass(frozen=True)
+class PretrainedBlockDecoder(Pretrained):
+    """DiffusionGemma, which decodes whole canvases."""
+
+    model: DiffusionGemma
+
+    def block_generation(self) -> BlockGeneration:
+        """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
+        from dew.interop import diffusion_gemma
+
+        return BlockGeneration(
+            self.model,
+            self.variables,
+            diffusion_gemma.generation_process(self.config, self.generation_config),
+            self.processor,
+            eos_ids(self.config, self.generation_config),
+            pad_id(self.config, self.generation_config),
+            max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
+            max_length=generation_limit(self.config, self.generation_config, "max_length"),
+            n=return_sequences(self.config, self.generation_config),
+        )
+
+
+
+@dataclass(frozen=True, kw_only=True)
+class PretrainedPipeline(Pretrained):
+    """A latent diffusion pipeline: the denoiser as `model`, its processes,
+    conditions and autoencoder, and the policy the source calls it with. It
+    samples, fine-tunes by denoising and takes a low-rank adapter on its
+    denoiser; `save` writes one tensor set per component, in the diffusers
+    layout."""
+
+    process: Process
+    inputs: InputSpec
+    autoencoder: AutoEncoder | None
+    schedule: SourceSchedule
+    task: SourceTask
+    finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
+
+    def text_to_image(self) -> TextToImage:
+        """Build the latent diffusion source as an image task with its published policy."""
+        return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
+                           grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
+                           steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
+
+    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
+             rslora: bool = False, dropout: float = 0.0) -> PretrainedPipeline:
+        """Return this pipeline with a fresh low-rank adapter on the denoiser projections `modules` name.
+
+        `modules` match the denoiser's projections alone, by their names
+        relative to its component (`to_q`, `attn.to_out.0`), so the text
+        towers and the VAE stay as published. The bundle that comes back
+        holds the adapted denoiser, the variables with the factors in them
+        (B zero, so it samples what the source does) and the adapter:
+        `diffusion_objective` trains the factors alone, `adapter.save` writes
+        the Diffusers file the family's `load_lora_weights` reads, and `save`
+        writes the pipeline with the factors merged in. `dew.lora.LoRA.fresh`
+        describes the arguments.
+        """
+        from dew.lora import LoRA
+
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        denoiser = {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
+        adapter, variables = LoRA.fresh(self.model, self.variables, denoiser, rank=rank, modules=modules,
+                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
+        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
+
+    def diffusion_objective(self, **options) -> DiffusionObjective:
+        """Build denoising training from this pipeline's denoiser, process, conditions and autoencoder.
+
+        `options` are `DiffusionObjective`'s training and evaluation
+        controls. This bundle supplies `pretrained` itself, evaluation
+        samples the way the source does (its solver, step count and
+        guidance) unless they are passed, and an adapted bundle supplies its
+        adapter's filter as `trainable`, so the run moves the factors alone.
+        The text towers and the VAE never train. Batches carry the source's
+        input fields, an inpainting source's mask among them.
+        """
+        from dew.objectives.diffusion import DiffusionObjective
+
+        if "pretrained" in options:
+            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        if self.adapter is not None:
+            if "trainable" in options:
+                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
+            options["trainable"] = self.adapter.trainable
+        policy = {"solver": self.schedule.solver, "steps": self.task.steps, "guidance": self.task.guidance}
+        return DiffusionObjective(self.model, self.process, self.inputs, autoencoder=self.autoencoder,
+                                  pretrained=self.variables, **{**policy, **options})
+
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        raise ValueError("a diffusion source writes one tensor set per component; save it instead")
+
+    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
+             max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write each component's tensors and config in the diffusers layout,
+        an adapted bundle's factors merged into the denoiser's kernels
+        (PEFT's `merge_and_unload`) from its variables or a trainer's split
+        of them; `adapter.save` writes the factors alone."""
+        from dew.interop import diffusion
+
+        self._quantization()
+        values = self.variables if variables is None else variables
+        if self.adapter is not None:
+            values = self.adapter.merge(values)
+        diffusion.save_source(self, values, Path(directory))
+
+
+@dataclass(frozen=True)
+class PretrainedFallback(Pretrained):
+    """transformers' PyTorch forward lowered to JAX by torchax (tier 3): it
+    fine-tunes next-token, with no Dew kernels, sharding rules or cached
+    generation; generate with transformers' own
+    `AutoModelForCausalLM.from_pretrained(source).generate`."""
+
+    def lm_objective(self, seq_len: int, **options) -> LMObjective:
+        """Build next-token training from this source's forward and variables;
+        `options` are `LMObjective`'s controls, and the processor is this
+        source's unless one is passed."""
+        from dew.objectives.lm import LMObjective
+
+        if "pretrained" in options:
+            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        return LMObjective(self.model, seq_len, pretrained=self.variables,
+                           **{"processor": self.processor, **options})
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -1103,7 +817,7 @@ class _Call(NamedTuple):
     it pads its T5 tower to. Qwen-Image's pipeline pads to the longest prompt
     of a call, so its budget is the prompt window Dew pads each row to."""
 
-    family: Literal["sd", "sdxl", "sd3", "flux", "qwen_image"]
+    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image", "z_image"]
     steps: int
     guidance: float
     guided: bool
@@ -1126,6 +840,13 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
     "FluxPipeline": _Call("flux", 28, 3.5, guided=False, sequence=512),
     # `true_cfg_scale` defaults to 1.0: the release samples unguided.
     "QwenImage21Pipeline": _Call("qwen_image", 40, 1.0, guided=True, sequence=512),
+    # FLUX.2 [dev] embeds its 4.0; [klein] guides two branches at 4.0 unless
+    # its index marks it step-distilled, which `_call_policy` reads.
+    "Flux2Pipeline": _Call("flux2", 50, 4.0, guided=False, sequence=512),
+    "Flux2KleinPipeline": _Call("flux2", 50, 4.0, guided=True, sequence=512),
+    # Z-Image guides as `pos + 5.0 (pos - neg)`, which is Dew's
+    # `neg + 6.0 (pos - neg)`.
+    "ZImagePipeline": _Call("z_image", 50, 6.0, guided=True, sequence=512),
     "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
@@ -1153,6 +874,11 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
     if found.family != expected.family:
         raise ValueError(f"The declared pipeline {published!r} is a {found.family} pipeline, and "
                          f"this directory's denoiser belongs to {denoiser.pipeline!r}")
+    if published == "Flux2KleinPipeline" and records.boolean(
+        index.get("is_distilled", False), "is_distilled"
+    ):
+        # A step-distilled [klein] ignores its guidance scale.
+        return found._replace(guided=False)
     return found
 
 
@@ -1183,6 +909,7 @@ class _TextTowers:
     towers: tuple[str, ...]
     t5_tower: str | None = None
     embeds_guidance: bool = False
+    conditioner: ClassVar[type[DiffusionConditioner]] = DiffusionConditioner
 
     def components(self, index: Mapping[str, object]) -> tuple[str, ...]:
         """The text components this directory holds, which a conditioner load fetches."""
@@ -1209,9 +936,7 @@ class _TextTowers:
             if params is None:
                 text_params = {**text_params, self.t5_tower: t5_params}
             layouts += t5_layouts
-        height, width = index.get("dew_height", size), index.get("dew_width", size)
-        if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-            raise ValueError("Image geometry must contain positive integer dimensions")
+        height, width = _geometry(index, size)
         encoder = DiffusionConditioner(
             towers, tokenizers, names, text_params, str(directory), height, width,
             denoiser.context_width, composition=self.composition, t5=t5,
@@ -1232,6 +957,8 @@ class _QwenImageText:
     """Qwen-Image's Qwen3-VL text encoder, which `QwenImageConditioner` runs
     over its pipeline's chat template, padded to the call's token budget."""
 
+    conditioner: ClassVar[type[QwenImageConditioner]] = QwenImageConditioner
+
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: int, *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
@@ -1247,15 +974,37 @@ class _QwenImageText:
 
 
 @dataclass(frozen=True)
-class _Denoiser:
-    """Holds what one architecture contributes to a diffusion source.
+class _HiddenStatesText:
+    """The text encoder FLUX.2 (`pipeline="flux2"`: Mistral-3 for [dev],
+    Qwen3 for [klein]) or Z-Image (`"z_image"`: Qwen3) reads hidden states
+    from, which `HiddenStatesConditioner` runs, padded to the call's token
+    budget. `embeds_guidance` marks FLUX.2 [dev]'s transformer, which reads
+    the guidance scale as an input."""
 
-    Model construction and conditioning conventions use metadata only.
-    The weight reader is invoked only by a complete source load; a restored
-    conditioner can reuse the same architecture metadata without reading
-    denoiser or autoencoder weights. `text` is the family's text
-    conditioning: which components it reads, how it builds its encoder and
-    the unconditional row its pipeline guides against.
+    pipeline: Literal["flux2", "z_image"]
+    embeds_guidance: bool = False
+    conditioner: ClassVar[type[HiddenStatesConditioner]] = HiddenStatesConditioner
+
+    def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
+              policy: _Call, compute, size: int, *, param_dtype: str,
+              attention_impl: str = "auto", params: Variables | None = None
+              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+        """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
+        return _hidden_states_conditioning(
+            directory, index, compute, size, pipeline=self.pipeline, tokens=policy.sequence,
+            guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
+            attention_impl=attention_impl, params=params)
+
+    def unconditional(self, index: Mapping[str, object]) -> dict:
+        """The empty prompt a guided call encodes as its negative."""
+        return {"text": ""}
+
+
+@dataclass(frozen=True)
+class _Denoiser:
+    """Holds what one architecture contributes to a diffusion source, from
+    metadata alone: only a complete source load calls `weights`, and `text`
+    is how the family conditions on its prompt.
     """
 
     component: str
@@ -1263,7 +1012,7 @@ class _Denoiser:
     weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    text: _TextTowers | _QwenImageText
+    text: _TextTowers | _QwenImageText | _HiddenStatesText
     patch: int
     latent_input: int
     sample_size: int
@@ -1274,15 +1023,13 @@ class _Denoiser:
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
                            attention_impl: str, param_dtype: str = "float32",
-                           variables: Variables | None = None) -> Pretrained:
+                           variables: Variables | None = None) -> PretrainedPipeline:
     """Read a published latent diffusion directory into native modules and variables.
 
-    Two denoiser families ship this layout: a UNet reading one or two CLIP
-    towers through cross attention, and an MM-DiT transformer reading them
-    jointly beside a T5 tower. The directory's own denoiser component selects
-    the family, and everything the families share - the autoencoder, the text
-    towers, the geometry, the conditioning, the safety head a file declares,
-    the schedule and the call policy - is read once here.
+    The directory's own denoiser component selects the family (`_denoiser`),
+    and everything the families share - the autoencoder, the text towers,
+    the geometry, the conditioning, the safety head a file declares, the
+    schedule and the call policy - is read once here.
 
     Supplied `variables` are a saved tree in this layout, bound as they are:
     every module is built from the directory's metadata and no weight file is
@@ -1308,9 +1055,11 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = encoder.height, encoder.width
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
-    inputs = InputSpec(Field("image", (height, width, records.integer(vae_config["in_channels"], "in_channels"))),
-                       {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
-                       mask=Field("mask", (height, width, 1)) if inpaint else None)
+    inputs = InputSpec(
+        Field("image", (height, width, records.integer(vae_config["in_channels"], "in_channels"))),
+        {encoder.keyword: Condition(encoder, unconditional=denoiser.text.unconditional(index))},
+        mask=Field("mask", (height, width, 1)) if inpaint else None,
+    )
     encoders: dict[str, object] = {encoder.keyword: encoder.params}
     finish, safety_layouts = None, ()
     if _present(index, "safety_checker"):
@@ -1326,16 +1075,17 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                       functools.partial(schedule.sampling, origin=denoiser.origin, tokens=tokens))
     variables = {**denoiser_variables, "encoders": encoders, "autoencoder": vae_params}
     config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
-    return Pretrained(denoiser.model, variables, None, config, directory, denoiser.built,
-                      weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
-                      process=schedule.training_process(tokens), inputs=inputs, autoencoder=autoencoder,
-                      schedule=schedule, finish=finish, task=task)
+    return PretrainedPipeline(model=denoiser.model, variables=variables, processor=None, config=config,
+                              source=directory, model_config=denoiser.built,
+                              weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
+                              process=schedule.training_process(tokens), inputs=inputs,
+                              autoencoder=autoencoder, schedule=schedule, finish=finish, task=task)
 
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
                           size: tuple[int, int] | None = None,
-                          variables: Variables | None = None) -> Pretrained:
+                          variables: Variables | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -1361,11 +1111,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
 
 
-def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
-                               param_dtype: str = "float32", revision: str | None = None,
-                               attention_impl: str = "auto", params: Variables | None = None
-                               ) -> DiffusionConditioner:
-    """Load conditioning weights, or bind supplied parameters using metadata only."""
+def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, HiddenStatesConditioner)](
+        checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
+        revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
+        params: Variables | None = None) -> C:
+    """Load the text conditioning a pipeline's denoiser reads, which must be a
+    `kind`, or bind supplied parameters using metadata only. `tokens` replaces
+    the pipeline's own prompt budget."""
     from dew.nn.autoencoders import AutoencoderKL
 
     compute = resolve_dtype(dtype)
@@ -1374,18 +1126,26 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
     denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    if not isinstance(denoiser.text, _TextTowers):
-        raise ValueError(f"{checkpoint} conditions through its Qwen3-VL encoder; "
-                         "build it with QwenImageConditioner.from_pretrained")
+    text = denoiser.text
+    if text.conditioner is not kind:
+        raise ValueError(f"{checkpoint} conditions through a {text.conditioner.__name__}; "
+                         f"build it with {text.conditioner.__name__}.from_pretrained")
+    towers = isinstance(text, _TextTowers)
     if params is None:
         # snapshot_download returns a commit directory. Keep both fetches on
         # that commit even when the requested Hub branch moves between them.
         directory = sources.snapshot(checkpoint, directory.name,
-                                       weights=denoiser.text.components(index))
-    vae = AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
-    encoder, _, _ = denoiser.text.build(
-        directory, index, denoiser, _call_policy(index, denoiser), compute,
-        denoiser.sample_size * vae.downscale_factor, param_dtype=param_dtype, params=params)
+                                     weights=text.components(index) if towers else ("text_encoder",))
+    policy = _call_policy(index, denoiser)
+    # The CLIP families' geometry is their VAE's; the language-model encoders
+    # are bound at 16 pixels per latent position.
+    scale = (AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
+             .downscale_factor if towers else 16)
+    encoder, _, _ = text.build(
+        directory, index, denoiser, policy if tokens is None else policy._replace(sequence=tokens), compute,
+        denoiser.sample_size * scale, param_dtype=param_dtype, attention_impl=attention_impl, params=params)
+    if not isinstance(encoder, kind):
+        raise TypeError(f"{type(text).__name__} built a {type(encoder).__name__}, not a {kind.__name__}")
     return encoder
 
 
@@ -1409,12 +1169,18 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
              "fields": {**fields, "dtype": dtype,
                         "stages": [asdict(stage) for stage in model.stages]}}
     return _Denoiser(
-        component="unet", model=model, weights=weights,
-        built=built, config=config,
-        text=_TextTowers("clip_pooled" if pooled else "clip", ("text_encoder", "text_encoder_2")), patch=1, latent_input=model.in_channels,
+        component="unet",
+        model=model,
+        weights=weights,
+        built=built,
+        config=config,
+        text=_TextTowers("clip_pooled" if pooled else "clip", ("text_encoder", "text_encoder_2")),
+        patch=1,
+        latent_input=model.in_channels,
         sample_size=records.integer(config["sample_size"], "sample_size"),
         context_width=records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
-        pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
+        pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline",
+    )
 
 
 def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1430,8 +1196,30 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "QwenImage21Transformer2DModel":
         return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "Flux2Transformer2DModel":
+        return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "ZImageTransformer2DModel":
+        return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
+
+
+def _transformer_weights(directory: Path, translate: Callable[..., tuple[ParamTree, tuple[WeightLayout, ...]]]
+                         ) -> Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]:
+    """Read a transformer denoiser's parameters, and their layouts, from its component."""
+    from dew.interop import diffusion
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = translate(diffusion.component_tensors(directory, "transformer"),
+                                    param_dtype=param_dtype)
+        return {"params": params}, layouts
+    return weights
+
+
+def _built(name: str, fields: Mapping[str, object], dtype: str | None) -> dict:
+    """The registry record a denoiser was built from, its tuples as JSON lists."""
+    return {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
+                                        for key, value in fields.items()}, "dtype": dtype}}
 
 
 def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1441,19 +1229,15 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     from dew.nn.backbones.sd3 import SD3Transformer
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = SD3Transformer(**fields)
 
     def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, buffers, layouts = diffusion.translate_sd3_weights(
             diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
         return {"params": params, "buffers": buffers}, layouts
 
-    built = {"name": "sd3_transformer",
-             "fields": {**fields, "dtype": dtype,
-                        "dual_attention_layers": list(fields["dual_attention_layers"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights,
-        built=built, config=config,
+        component="transformer", model=SD3Transformer(**fields), weights=weights,
+        built=_built("sd3_transformer", fields, dtype), config=config,
         text=_TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
         patch=fields["patch_size"],
         latent_input=fields["in_channels"], sample_size=records.integer(config["sample_size"], "sample_size"),
@@ -1472,19 +1256,10 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
     from dew.nn.backbones.flux import FluxTransformer
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = FluxTransformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_flux_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "flux_transformer",
-             "fields": {**fields, "dtype": dtype,
-                        "axes_dims_rope": list(fields["axes_dims_rope"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights,
-        built=built, config=config,
+        component="transformer", model=FluxTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_flux_weights),
+        built=_built("flux_transformer", fields, dtype), config=config,
         text=_TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
                          embeds_guidance=fields["guidance_embeds"]), patch=2,
         latent_input=fields["in_channels"] // 4,
@@ -1507,20 +1282,56 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     from dew.nn.backbones.qwen_image import QwenImageTransformer
 
     fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = QwenImageTransformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_qwen_image_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "qwen_image_transformer",
-             "fields": {**fields, "dtype": dtype, "axes_dims_rope": list(fields["axes_dims_rope"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights, built=built, config=config,
+        component="transformer", model=QwenImageTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_qwen_image_weights),
+        built=_built("qwen_image_transformer", fields, dtype), config=config,
         text=_QwenImageText(), patch=1,
         latent_input=fields["in_channels"], sample_size=64,
         context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
+
+
+def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build FLUX.2's transformer over its VAE's folded latent, one token per
+    position, conditioned by stacked text-encoder states.
+
+    Its pipelines render at `default_sample_size` 128 through the VAE's 8x,
+    which is 64 folded positions, and hand the scheduler `linspace(1, 1/N,
+    N)` with their own empirical mu.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.flux2 import Flux2Transformer
+
+    fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
+    guided = fields["guidance_embeds"]
+    return _Denoiser(
+        component="transformer", model=Flux2Transformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_flux2_weights),
+        built=_built("flux2_transformer", fields, dtype), config=config,
+        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1,
+        latent_input=fields["in_channels"], sample_size=64, context_width=fields["joint_attention_dim"],
+        pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
+
+
+def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build Z-Image's single-stream transformer over the Flux VAE's latent,
+    cut into 2x2 patches, conditioned by its Qwen3 encoder's second-to-last
+    layer.
+
+    Its pipeline renders at 1024 pixels by default, 128 latent positions
+    through the VAE's 8x, and hands its statically shifting scheduler
+    `linspace(1, 1/N, N)`.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.z_image import ZImageTransformer
+
+    fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    return _Denoiser(
+        component="transformer", model=ZImageTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_z_image_weights),
+        built=_built("z_image_transformer", fields, dtype), config=config,
+        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=128,
+        context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
 
 
 def _component_config(directory: Path, name: str) -> dict:
@@ -1528,6 +1339,14 @@ def _component_config(directory: Path, name: str) -> dict:
     file = "scheduler_config.json" if name == "scheduler" else "config.json"
     with open(directory / name / file) as handle:
         return json.load(handle)
+
+
+def _geometry(index: Mapping[str, object], size: int) -> tuple[int, int]:
+    """The (height, width) a pipeline is bound to: the index's own, or `size` square."""
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    return height, width
 
 
 def _present(index: Mapping[str, object], name: str) -> bool:
@@ -1549,11 +1368,19 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
     if config.get("_class_name") == "AutoencoderKLQwenImage21":
         from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
         return load_qwen_image_vae(directory, compute, param_dtype=param_dtype, params=params)
+    if config.get("_class_name") == "AutoencoderKLFlux2":
+        from dew.nn.autoencoders.flux2 import load_flux2_vae
+        return load_flux2_vae(directory, compute, param_dtype=param_dtype, params=params)
     model = AutoencoderKL(
-        channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
-        image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
-        norm_groups=config["norm_num_groups"], quantize=diffusion.flag(config, "use_quant_conv", default=True),
-        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True), dtype=compute)
+        channels=tuple(config["block_out_channels"]),
+        latent_channels=config["latent_channels"],
+        image_channels=config["in_channels"],
+        blocks_per_level=config["layers_per_block"],
+        norm_groups=config["norm_num_groups"],
+        quantize=diffusion.flag(config, "use_quant_conv", default=True),
+        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
+        dtype=compute,
+    )
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tensors = diffusion.component_tensors(directory, "vae")
@@ -1650,7 +1477,7 @@ def _qwen_text_path(record: decoders.DecoderFields):
     """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
     decoder's, its head too, and its vision tower held as stored, which the
     text-to-image prompt never reads and an export writes back."""
-    family = decoders._FAMILIES["qwen3"]
+    family = decoders.families()["qwen3"]
 
     def path(name: str) -> tuple[str, ...] | None:
         if name.startswith("model.language_model."):
@@ -1681,9 +1508,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     built = with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl)
-    decoder = models.build("causal_transformer", built)
-    if not isinstance(decoder, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    decoder = from_record(CausalTransformer, built)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = diffusion.record_layouts(
@@ -1691,34 +1516,92 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
             _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
             param_dtype=param_dtype)
         params = {"text_encoder": tower}
-    height, width = index.get("dew_height", size), index.get("dew_width", size)
-    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-        raise ValueError("Image geometry must contain positive integer dimensions")
+    height, width = _geometry(index, size)
     encoder = QwenImageConditioner(
         decoder, load_tokenizer(str(directory / "processor")), params, str(directory),
         height, width, tokens=tokens, param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
 
 
-def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
-                                param_dtype: str = "float32", revision: str | None = None,
-                                attention_impl: str = "auto", tokens: int = 512,
-                                params: Variables | None = None):
-    """Load Qwen-Image's text conditioning, or bind supplied parameters using metadata only."""
-    compute = resolve_dtype(dtype)
-    resolve_dtype(param_dtype)
-    directory = sources.snapshot(checkpoint, revision, weights=False)
-    with open(directory / "model_index.json") as handle:
-        index = json.load(handle)
-    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    if not isinstance(denoiser.text, _QwenImageText):
-        raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
+_FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] = MappingProxyType({
+    "qwen3": ("qwen3", (9, 18, 27)), "mistral3": ("mistral3", (10, 20, 30))})
+"""Each FLUX.2 text encoder's `model_type`, the template its pipeline
+formats a prompt with, and the `hidden_states` it stacks."""
+
+
+def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal: bool):
+    """Map a hidden-states text encoder's tensors: a Qwen3 language model's
+    own names, or a Mistral-3's language model as the Mistral decoder's with
+    its vision tower and projector held as stored, which a text prompt never
+    reads and an export writes back. A Mistral-3 checkpoint names its
+    language model `language_model.model.` and its head
+    `language_model.lm_head` (transformers 4.50 and 5 write these), or
+    `model.language_model.` and `lm_head` (4.52 to 4.57)."""
+    decoder = decoders.families()[family]
+
+    def path(name: str) -> tuple[str, ...] | None:
+        if not multimodal or name == "lm_head.weight":
+            return decoder.weight_path(name, record)
+        if name == "language_model.lm_head.weight":
+            return decoder.weight_path("lm_head.weight", record)
+        for prefix in ("model.language_model.", "language_model.model."):
+            if name.startswith(prefix):
+                return decoder.weight_path("model." + name.removeprefix(prefix), record)
+        if name.removeprefix("model.").startswith(("vision_tower.", "multi_modal_projector.")):
+            return ("visual", name)
+        raise ValueError(f"unknown tensor name {name!r}")
+    return path
+
+
+def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+                                pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
+                                param_dtype: str, attention_impl: str, params: Variables | None = None
+                                ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],
+                                           dict[str, Mapping[str, object]]]:
+    """Build FLUX.2's or Z-Image's conditioner: the text encoder's language
+    model, the tokenizer and chat template, the parameters and their layouts.
+    Z-Image reads the output of the encoder's second-to-last layer with the
+    template's thinking on."""
+    from dew.data.text import load_tokenizer
+    from dew.interop import diffusion
+
+    config = _component_config(directory, "text_encoder")
+    kind = records.text(config.get("model_type"), "model_type")
+    known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
+    if kind not in known:
+        raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
+    template, layers = known[kind]
+    multimodal = kind == "mistral3"
+    text = dict(records.record(config["text_config"], "text_config")) if multimodal else config
+    if multimodal:
+        text["tie_word_embeddings"] = records.boolean(config.get("tie_word_embeddings", False),
+                                                      "tie_word_embeddings")
+    record = decoders.translate_config(text)
+    named = dtype_name(compute)
+    if named is None:
+        raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
+    decoder = from_record(CausalTransformer, with_precision("causal_transformer", record, dtype=named,
+                                                            attention_impl=attention_impl))
+    if pipeline == "z_image":
+        layers = (decoder.num_layers - 1,)
+    if max(layers) >= decoder.num_layers:
+        # transformers' last hidden state is the final norm's output, which
+        # none of these pipelines reads of its released encoder.
+        raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
+                         "encoder does not have before its final norm")
+    layouts: tuple[WeightLayout, ...] = ()
     if params is None:
-        directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
-    encoder, _, _ = _qwen_image_conditioning(
-        directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
-        param_dtype=param_dtype, attention_impl=attention_impl, params=params)
-    return encoder
+        tower, layouts = diffusion.record_layouts(
+            "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
+            _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
+            ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype)
+        params = {"text_encoder": tower}
+    height, width = _geometry(index, size)
+    encoder = HiddenStatesConditioner(
+        decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory), height, width,
+        template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
+        param_dtype=param_dtype)
+    return encoder, layouts, {"text_encoder": config}
 
 
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
@@ -1793,7 +1676,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"kind": "attention", "bidirectional_images": True}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family == "qwen3_5":
+    if family in _QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -1907,7 +1790,7 @@ def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nda
 
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
                      placed: Callable[[Variables], Variables], *, dtype: str, attention_impl: str,
-                     param_dtype: str) -> Pretrained | None:
+                     param_dtype: str) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
 
     A single file converts into the pipeline it describes; a directory with
@@ -1917,7 +1800,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     the mesh; a single file's conversion is kept only once that succeeds too.
     """
 
-    def pipeline(directory: Path) -> Pretrained:
+    def pipeline(directory: Path) -> PretrainedPipeline:
         with open(directory / "model_index.json") as handle:
             index = json.load(handle)
         storage = param_dtype
@@ -2046,12 +1929,17 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    # The Transformers conditional classes ignore auxiliary prediction
+    # layers. A released config advertises a depth even when its checkpoint
+    # contains only the trunk; a source with mtp.* retains its actual depth.
+    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
+        text_fields['num_nextn_predict_layers'] = 0
+        record['text']['num_nextn_predict_layers'] = 0
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
-    language_model = models.build("causal_transformer", wrapper["text"])
-    if not isinstance(language_model, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
     variables = _native_variables({**parts, "language_model": decoders.with_constants(
@@ -2074,7 +1962,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
     built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
-    model = models.build("causal_transformer", built)
+    model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
     decoders._check_tree(variables, model)
@@ -2083,84 +1971,24 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # derived-export family binds too; `save` picks its writer by
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
-    # (Gemma 4's prepare) has no raw-name bindings.
-    entry = decoders._FAMILIES[family]
+    # (GPT-2's and GPT-NeoX's prepare) has no raw-name bindings.
+    entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare is decoders.DecoderFamily.prepare:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
 
-def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
-                    attention_impl: str = "auto", max_seq_len: int | None = None,
-                    revision: str | None = None, gguf_file: str | None = None,
-                    single_file: str | None = None,
-                    mesh: MeshSpec | None = None, layout: Layout | None = None,
-                    fallback: str | None = None) -> Pretrained:
-    """Load a source into a native Flax model with explicit parameter trees.
+def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
+                        gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                        dtype: str, param_dtype: str, attention_impl: str,
+                        max_seq_len: int | None,
+                        prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Pretrained:
+    """Decode native source weights and bind their processors and export layout.
 
-    ``name_or_dir`` is a local HF directory or a Hub model identifier. The
-    decoder/tower/projector maps preserve their established internal paths;
-    wrapper variables join under their existing component names. Processor
-    artifacts are loaded only when the source contains them.
-    dtype selects computation; param_dtype independently selects floating
-    parameter storage and defaults to FP32 masters, or 'auto' stores the
-    checkpoint's own dtype (`_checkpoint_dtype`). Frozen component weights
-    (text encoders and VAE) follow it too; router, clipping, positional and
-    safety state retain their own FP32/integer contracts.
-
-    Without `mesh` or `layout` the variables are host arrays. With either,
-    they are placed on that mesh (the default `MeshSpec()` when only
-    `layout` is given) under that layout, one leaf at a time: a decoder's
-    leaves are read from the mapped checkpoint one device shard at a time
-    and cast and transposed there (`dew.interop.streaming`), so the host
-    never holds the translated model. Towers, projectors and a quantized
-    source's dequantized tensors are still built whole on the host first.
-
-    ``gguf_file`` names a GGUF file in the repo or directory: its metadata is
-    the config, its block-quantized tensors are dequantized to float32
-    (`dew.interop.gguf`), and its tokenizer is the processor where the repo
-    ships no tokenizer.
-
-    ``single_file`` names an original-format diffusion checkpoint in the
-    repo or directory: diffusers' own key maps convert it once into Dew's
-    cache as the diffusers pipeline it describes (`dew.interop.single_file`),
-    which then loads; the cache entry is published only once that load
-    succeeds. The configs are the repo or directory's own when it has a
-    model_index.json, and otherwise the diffusers repo diffusers infers from
-    the checkpoint, at the commit fetched. A component the file lacks gets
-    its weights from the same place, or is refused by name.
-
-    `fallback="torchax"` opts into tier 3 for any causal LM transformers
-    can build, registered or not: transformers' PyTorch forward lowered to
-    JAX by torchax (`dew.interop.torchax_fallback`), with no Dew kernels,
-    sharding rules or cached generation.
+    Diffusers pipelines and the explicit torchax fallback have already taken
+    their own routes; this boundary handles native decoders and media wrappers.
     """
-    if fallback not in (None, "torchax"):
-        raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
-                         "tier 3 through transformers' PyTorch forward")
-    streaming = mesh is not None or layout is not None
-
-    def placed(variables: Variables) -> Variables:
-        return place(variables, mesh, layout) if streaming else variables
-
-    if param_dtype != AUTO:
-        storage = dtype_name(resolve_dtype(param_dtype))
-        if storage is None:
-            raise ValueError("param_dtype must select floating parameter storage")
-        param_dtype = storage
-    directory = sources.snapshot(str(name_or_dir), revision, weights=False)
-    # A Hub snapshot directory is named by its commit.
-    commit = None if os.path.isdir(name_or_dir) else directory.name
-    if fallback is not None:
-        from dew.interop import torchax_fallback
-        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
-                                       attention_impl=attention_impl, max_seq_len=max_seq_len)
-        return replace(loaded, variables=placed(loaded.variables))
-    pipeline = _pipeline_source(name_or_dir, directory, commit, single_file, placed, dtype=dtype,
-                                attention_impl=attention_impl, param_dtype=param_dtype)
-    if pipeline is not None:
-        return pipeline
     gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
     config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     mamba_ssm = mamba2.is_mamba_ssm(config)
@@ -2172,7 +2000,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     source_quantization(config)
     # An unregistered decoder is checked against transformers on the config
     # alone, before its weights download (tier 2, dew.interop.verify).
-    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders._FAMILIES
+    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders.families()
                 and family != "diffusion_gemma" and "text_config" not in config else None)
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
@@ -2185,12 +2013,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
-        model = diffusion_gemma.build(config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
+
+        model = diffusion_gemma.build(
+            config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
+        )
         variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype)
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and (family not in decoders._FAMILIES or decoders._bundles(config)):
+    elif "text_config" in config and (family not in decoders.families() or decoders._bundles(config)):
         # A wrapper repo carries its decoder under text_config. Where its
         # model_type is a registered decoder family, its towers have no
         # counterpart and the text half, read from the nested config, is the
@@ -2205,8 +2036,17 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
     processor = _source_processor(directory, config, record, model, gguf_path)
     generation_config = _generation_config(directory)
-    return Pretrained(model, placed(variables), processor, config, directory, built, generation_config,
-                      layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                      quantized_scale_dtype=scale_dtype, quantization_grid=grid,
-                      # The weights' commit: a pickle repo's may be its conversion's.
-                      revision=None if commit is None else directory.name)
+
+    def bundle[K: Pretrained](kind: type[K]) -> K:
+        prepared = variables if prepare is None else prepare(model, variables)
+        return kind(model, placed(prepared), processor, config, directory, built, generation_config,
+                    layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
+                    quantized_scale_dtype=scale_dtype, quantization_grid=grid,
+                    # The weights' commit: a pickle repo's may be its conversion's.
+                    revision=None if commit is None else directory.name)
+
+    if isinstance(model, DiffusionGemma):
+        return bundle(PretrainedBlockDecoder)
+    if isinstance(model, CausalTransformer) and not model.causal and model.mask_token_id is not None:
+        return bundle(PretrainedMaskedDecoder)
+    return bundle(PretrainedDecoder)

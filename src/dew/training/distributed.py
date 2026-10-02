@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
-import functools
 import json
 import logging
 import math
@@ -13,8 +12,7 @@ import queue
 import statistics
 import threading
 import time
-from collections.abc import Callable, Mapping
-from typing import Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import numpy as np
@@ -113,6 +111,62 @@ class MeshSpec:
                 f"microbatches must be a positive multiple of stage "
                 f"({self.stage}), got {self.microbatches}")
 
+    def build(self, devices: list | None = None) -> Mesh:
+        """Build the six-axis device mesh this spec describes.
+
+        Parameters shard over 'fsdp', 'expert' and 'tensor', batches over the
+        first four with their sequence dimension on 'sequence', and the layer
+        stack over 'stage'.
+
+        An MoE layer's expert dimension is the one dimension no dense model has,
+        and splitting it is what expert parallelism is. So it gets its own axis
+        and leaves 'fsdp' to the model's widths. The tensor axis is where the
+        mlp, head and vocabulary widths split beside fsdp, as `DEFAULT_RULES`
+        places them. The sequence axis is where long sequences split. The stage
+        axis is where a decoder's layers split into pipeline stages, each stage
+        on its own devices.
+
+        Sizes of 1 degenerate to plain data parallelism, so the same code path
+        serves every topology without a flag. Axes are Auto so GSPMD infers the
+        collectives.
+
+        `devices` names the devices and their order on one slice: the mesh
+        takes them row-major over `MESH_AXES`, so the last axes hold
+        neighbouring entries. Unset is every device, in the order
+        `jax.make_mesh` gives the platform's topology.
+
+        `replicas` above 1 builds the mesh the way MaxText builds a
+        multislice one, through `mesh_utils.create_hybrid_device_mesh`: the
+        data axis takes `replicas` groups of granules as its outer factor, and
+        each group lays out the rest of the mesh over its own devices. A group
+        of more than one granule splits fsdp across them, the one axis whose
+        traffic, a gather and a reduce-scatter per layer, tolerates it.
+        """
+        named = devices is not None
+        devices = list(devices) if devices is not None else jax.devices()
+        sizes = {"expert": self.expert, "fsdp": self.fsdp, "tensor": self.tensor,
+                 "sequence": self.sequence, "stage": self.stage}
+        sharded = math.prod(sizes.values())
+        if any(size < 1 for size in sizes.values()):
+            raise LayoutRefused(f"every axis of a mesh is at least 1, and {sizes} is not")
+        if len(devices) % sharded:
+            split = " x ".join(f"{axis} {size}" for axis, size in sizes.items() if size > 1)
+            raise LayoutRefused(f"{split} is {sharded} devices a data replica, which does not divide "
+                                f"the {len(devices)} devices")
+        shape = (len(devices) // sharded, self.expert, self.fsdp, self.tensor, self.sequence,
+                 self.stage)
+        # `jax.make_mesh` lays one slice out by the platform's topology, which on
+        # GPU is the devices sorted by id whatever order they came in; a list the
+        # caller names is the layout itself, filled in its own order. Devices on
+        # several slices, every GPU host its own, take the hybrid layout even as
+        # one replica.
+        if self.replicas == 1 and len({_slice(device) for device in devices}) == 1:
+            if named:
+                return Mesh(np.asarray(devices).reshape(shape), MESH_AXES,
+                            axis_types=(AxisType.Auto,) * 6)
+            return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
+        return Mesh(hybrid_devices(self, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
+
 
 def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxisRules:
     """Return `rules` as the tuple of pairs flax reads, in precedence order.
@@ -123,61 +177,6 @@ def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxis
     return tuple((name, axes if axes is None or isinstance(axes, str) else tuple(axes))
                  for name, axes in pairs)
 
-
-
-def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh:
-    """Build the six-axis device mesh `spec` describes.
-
-    Parameters shard over 'fsdp', 'expert' and 'tensor', batches over the
-    first four with their sequence dimension on 'sequence', and the layer
-    stack over 'stage'.
-
-    An MoE layer's expert dimension is the one dimension no dense model has,
-    and splitting it is what expert parallelism is. So it gets its own axis
-    and leaves 'fsdp' to the model's widths. The tensor axis is where the
-    mlp, head and vocabulary widths split beside fsdp, as `DEFAULT_RULES`
-    places them. The sequence axis is where long sequences split. The stage
-    axis is where a decoder's layers split into pipeline stages, each stage
-    on its own devices.
-
-    Sizes of 1 degenerate to plain data parallelism, so the same code path
-    serves every topology without a flag. Axes are Auto so GSPMD infers the
-    collectives.
-
-    `devices` names the devices and their order on one slice: the mesh
-    takes them row-major over `MESH_AXES`, so the last axes hold
-    neighbouring entries. Unset is every device, in the order
-    `jax.make_mesh` gives the platform's topology.
-
-    `spec.replicas` above 1 builds the mesh the way MaxText builds a
-    multislice one, through `mesh_utils.create_hybrid_device_mesh`: the
-    data axis takes `replicas` groups of granules as its outer factor, and
-    each group lays out the rest of the mesh over its own devices. A group
-    of more than one granule splits fsdp across them, the one axis whose
-    traffic, a gather and a reduce-scatter per layer, tolerates it.
-    """
-    named = devices is not None
-    devices = list(devices) if devices is not None else jax.devices()
-    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
-    if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
-            or spec.sequence < 1 or len(devices) % sharded):
-        raise LayoutRefused(
-            f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
-            f"{spec.tensor} times sequence {spec.sequence} times stage "
-            f"{spec.stage} must be a positive divisor of device count {len(devices)}")
-    shape = (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
-             spec.stage)
-    # `jax.make_mesh` lays one slice out by the platform's topology, which on
-    # GPU is the devices sorted by id whatever order they came in; a list the
-    # caller names is the layout itself, filled in its own order. Devices on
-    # several slices, every GPU host its own, take the hybrid layout even as
-    # one replica.
-    if spec.replicas == 1 and len({_slice(device) for device in devices}) == 1:
-        if named:
-            return Mesh(np.asarray(devices).reshape(shape), MESH_AXES,
-                        axis_types=(AxisType.Auto,) * 6)
-        return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
-    return Mesh(hybrid_devices(spec, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
 
 
 def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
@@ -482,8 +481,8 @@ class Layout:
                 f"host_parameters {list(self.host_parameters)} keeps those weights "
                 f"in pinned host memory, which only a stack that fetches a layer's "
                 f"parameters as it reaches it reads; this placement keeps every "
-                f"parameter on the device. Place the weights for generation with "
-                f"dew.inference.host_banked, or use host=('params',) for a "
+                f"parameter on the device. Place the weights for generation with a "
+                f"dew.inference.LayerBanks source's place, or use host=('params',) for a "
                 f"CPU-owned training transaction and drop the inference-only patterns")
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
@@ -546,46 +545,10 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
     return jax.tree.map(leaf_sharding, batch)
 
 
-@functools.cache
-def data_partition(mesh: Mesh) -> DataPartition:
-    """The share of every global batch this process reads on `mesh`.
-
-    A batch's rows split over the batch axes and no others (`BATCH_SPEC`):
-    the sequence axis splits positions, the tensor axis widths, and the stage
-    axis holds a pipeline's stages. So the processes whose devices hold the
-    same row shards need the same rows, and the processes fall into groups by
-    the rows they hold.
-    Each group reads one share, numbered by the first row shard it holds,
-    and every process of the group reads it (`readers`); `reader` is this
-    process's place among them, in process order.
-
-    Groups whose rows overlap without being the same rows, which a device
-    order built by hand can produce, leave no share each could read whole,
-    so they are refused.
-    """
-    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
-    held: dict[int, set[int]] = {}
-    placement = NamedSharding(mesh, P(BATCH_AXES)).devices_indices_map((shards,))
-    for device, index in placement.items():
-        held.setdefault(device.process_index, set()).add(index[0].start or 0)
-    groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
-    if (sum(len(group) for group in groups) != shards
-            or len({len(group) for group in groups}) != 1):
-        raise LayoutRefused(
-            f"the processes of this mesh hold the row shards "
-            f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
-            f"which overlap without being the same; each group of processes has to "
-            f"hold rows no other group holds, so it can read them as its own share")
-    mine = frozenset(held[jax.process_index()])
-    readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
-    return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
-                         reader=readers.index(jax.process_index()))
-
-
 def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
-    The share is the one `data_partition(mesh)` names: that share's rows, each
+    The share is the one `DataPartition.of(mesh)` names: that share's rows, each
     whole in every other dimension. A pool assembles one leaf per process,
     so every process has to hand this
     the same tree. Validity is the one optional token field, and whether a
@@ -604,7 +567,14 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     request, belongs where the caller's own collectives are issued.
     """
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
-    count = data_partition(mesh).count
+    count = DataPartition.of(mesh).count
+    shardings = batch_shardings(mesh, batch)
+    if jax.process_count() == 1:
+        # The whole batch is this process's share, placed by one device_put
+        # for the tree: 74 us of host time a batch on an RTX 4080, and 174 on
+        # 8 CPU devices, where a call per leaf took 105 and 222.
+        return jax.device_put(jax.tree.map(
+            lambda leaf: leaf if isinstance(leaf, jax.Array) else np.asarray(leaf), batch), shardings)
 
     def place(leaf, sharding: NamedSharding) -> jax.Array:
         # The share holds whole rows: `count` shares make the rows, and every
@@ -615,13 +585,13 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
         return jax.make_array_from_process_local_data(
             sharding, local, (shape[0] * count, *shape[1:]) if shape else ())
 
-    return jax.tree.map(place, batch, batch_shardings(mesh, batch))
+    return jax.tree.map(place, batch, shardings)
 
 
 def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     """The batch the first reader of this process's share read, on every reader of it.
 
-    The processes that read one share (`data_partition(mesh).readers`) hand
+    The processes that read one share (`DataPartition.of(mesh).readers`) hand
     `shard_batch` rows the same devices hold, so their batches must be the
     same. A source whose reads differ between them, as independent draws
     from an engine do, reads on the share's first reader alone
@@ -631,7 +601,7 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
     process, and each takes its share's. A later reader's `batch` is not
     read. On a mesh whose shares have one reader each this is `batch`.
     """
-    partition = data_partition(mesh)
+    partition = DataPartition.of(mesh)
     if partition.readers == 1:
         return dict(batch)
     layout = broadcast_from_process_zero(
@@ -654,6 +624,10 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
     return {name: np.asarray(gathered[name][source]) for name in layout}
 
 
+# The batches a `DevicePrefetchIterator` queues ahead of the step by default.
+PREFETCH_DEPTH = 2
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -672,7 +646,7 @@ class DevicePrefetchIterator:
     when arbitrary source code cannot be stopped.
     """
 
-    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
+    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
                  source_state: bytes | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
@@ -877,3 +851,6 @@ class DevicePrefetchIterator:
             self.source_state = position
             return batch
         raise StopIteration
+
+
+__all__ = ["DevicePrefetchIterator", "Layout", "MeshSpec", "batch_shardings"]
