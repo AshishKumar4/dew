@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import outside_any_cluster
+from lane_environment import outside_any_cluster
 
 from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec

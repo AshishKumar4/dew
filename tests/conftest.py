@@ -1,15 +1,10 @@
 import logging
 import os
 
-import lane_environment as lane_environment  # configures the backend before JAX reads the environment
+import lane_environment  # configures the backend before JAX reads the environment
 import jax
 import jax.numpy as jnp
 import pytest
-from lane_environment import (
-    MESH_DEVICES,
-    configure_lane as configure_lane,
-    outside_any_cluster as outside_any_cluster,
-)
 
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
@@ -33,7 +28,7 @@ jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 def pytest_runtest_setup(item):
     marker = item.get_closest_marker("mesh")
-    needed = marker.kwargs.get("devices", MESH_DEVICES) if marker else 0
+    needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
