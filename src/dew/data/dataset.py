@@ -496,7 +496,9 @@ class Dataset:
     global batch and `records` the training records behind it, so
     `steps_per_epoch` is one pass over them. `ramped` sets `ramp` when the
     run grows its batch over its first records, and `batch` is then the batch
-    the ramp ends at.
+    the ramp ends at. `held_out` is how many records of the training split
+    a spec kept back as the validation pass, which `fit` reports when the run
+    starts; 0 when validation is a split of its own or there is none.
 
     Each factory call returns a fresh iterator owned by its caller. Close it
     after use when it exposes close; never close the shared dataset or
@@ -523,6 +525,7 @@ class Dataset:
     records: int | None
     batch: int
     ramp: Ramp | None = None
+    held_out: int = 0
 
     @classmethod
     def from_grain(cls, train: GrainPipeline, *, batch: int,
