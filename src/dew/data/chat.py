@@ -716,3 +716,15 @@ class ChatMessages(DatasetSpec):
             records=len(train),
             batch=batch,
         )
+
+
+__all__ = [
+    "ChatMessages",
+    "ContentPart",
+    "Conversation",
+    "ConversationSource",
+    "Message",
+    "RenderConversation",
+    "Role",
+    "ToolCall",
+]

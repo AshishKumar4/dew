@@ -124,3 +124,6 @@ def _write(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:
     partial.write_text(json.dumps({'space': _recorded(space),
                                    'trials': [json_value(trial) for trial in trials]}, indent=2))
     partial.replace(path)
+
+
+__all__ = ["Choice", "Point", "Search", "Space", "grid_search", "optuna_search", "random_search"]
