@@ -41,14 +41,24 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
-        flags.append(f"--xla_force_host_platform_device_count={MESH_DEVICES}")
+        cpu_devices = MESH_DEVICES
     else:
         if accelerator == "cuda":
             flags.extend(REPEATABLE_GPU_FLAGS)
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
-        flags.append(f"--xla_force_host_platform_device_count={local[accelerator](environ)}")
+        cpu_devices = local[accelerator](environ)
+    flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
     environ["XLA_FLAGS"] = " ".join(flags).strip()
+    # XLA:CPU runs every device of a launch on one pool of max(cores,
+    # devices) threads (PJRT_NPROC overrides the cores), each held until the
+    # launch's collectives meet, and dispatches the next launch on the same
+    # pool, where a device with 32 computations in flight blocks its thread.
+    # With a thread per device, a 4-core runner's 8, a loop that ran ahead
+    # left the launch it waited on one device short, and the rendezvous
+    # aborted the process (tests/test_discrete.py's toy run on CI, three
+    # times). Two threads per device hold both launches.
+    environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:

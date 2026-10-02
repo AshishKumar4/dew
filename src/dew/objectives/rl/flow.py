@@ -28,7 +28,7 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Batch, Mean, Shown, Step, Variables
+from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
@@ -154,7 +154,7 @@ class FlowGRPOObjective(DiffusionObjective):
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)))
         return values.T
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Mean, Aux]:
+    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """Score the clipped policy gradient over the recorded transitions.
 
         The scan carries nothing between transitions; each one contributes
@@ -208,7 +208,7 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Mean(pg + self.beta * kl, mass), Aux(metrics)
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
 
     def _draw(self, params: Variables, batch: Batch, key: jax.Array,
               limit: int | None = None) -> tuple[jax.Array, Batch]:

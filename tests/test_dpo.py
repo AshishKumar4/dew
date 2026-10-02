@@ -243,6 +243,9 @@ def test_evaluation_scores_chosen_perplexity():
     expected = np.asarray(objective.per_token_log_probs(params, chosen_ids))
     np.testing.assert_allclose(np.asarray(scores.losses), -expected, rtol=1e-5)
     np.testing.assert_array_equal(np.asarray(scores.weights), chosen_mask)
+    logits = objective.model.apply(params, chosen_ids[:, :-1], train=False)
+    np.testing.assert_array_equal(np.asarray(scores.correct),
+                                  np.asarray(jnp.argmax(logits, axis=-1) == chosen_ids[:, 1:]))
 
 
 def test_a_misbuilt_objective_is_refused():
