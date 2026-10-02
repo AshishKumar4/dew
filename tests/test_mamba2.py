@@ -60,8 +60,14 @@ def operands(reference):
     """The scan's operands as the module hands them to it: the step already
     through softplus with its bias (the reference does that inside)."""
     step = jax.nn.softplus(jnp.asarray(reference["scan.dt"]) + jnp.asarray(reference["scan.dt_bias"]))
-    return (jnp.asarray(reference["scan.x"]), step, jnp.asarray(reference["scan.A"]),
-            jnp.asarray(reference["scan.B"]), jnp.asarray(reference["scan.C"]), jnp.asarray(reference["scan.D"]))
+    return (
+        jnp.asarray(reference["scan.x"]),
+        step,
+        jnp.asarray(reference["scan.A"]),
+        jnp.asarray(reference["scan.B"]),
+        jnp.asarray(reference["scan.C"]),
+        jnp.asarray(reference["scan.D"]),
+    )
 
 
 def test_segment_sum_is_the_masked_cumulative_sum():
@@ -134,15 +140,25 @@ def layer(geometry, **overrides) -> Mamba2:
 def layer_params(reference):
     """The reference layer's state dict under the module's names: kernels
     transposed from torch's [out, in], everything else as stored."""
-    weights = {name[len("layer."):]: value for name, value in reference.items()
-               if name.startswith("layer.") and name not in ("layer.hidden", "layer.output", "layer.output_bf16")}
-    return {"params": {
-        "in_proj": {"kernel": jnp.asarray(weights["in_proj.weight"].T)},
-        "conv1d": {"weight": jnp.asarray(weights["conv1d.weight"]), "bias": jnp.asarray(weights["conv1d.bias"])},
-        "A_log": jnp.asarray(weights["A_log"]), "dt_bias": jnp.asarray(weights["dt_bias"]),
-        "D": jnp.asarray(weights["D"]),
-        "norm": {"weight": jnp.asarray(weights["norm.weight"])},
-        "out_proj": {"kernel": jnp.asarray(weights["out_proj.weight"].T)}}}
+    weights = {
+        name[len("layer.") :]: value
+        for name, value in reference.items()
+        if name.startswith("layer.") and name not in ("layer.hidden", "layer.output", "layer.output_bf16")
+    }
+    return {
+        "params": {
+            "in_proj": {"kernel": jnp.asarray(weights["in_proj.weight"].T)},
+            "conv1d": {
+                "weight": jnp.asarray(weights["conv1d.weight"]),
+                "bias": jnp.asarray(weights["conv1d.bias"]),
+            },
+            "A_log": jnp.asarray(weights["A_log"]),
+            "dt_bias": jnp.asarray(weights["dt_bias"]),
+            "D": jnp.asarray(weights["D"]),
+            "norm": {"weight": jnp.asarray(weights["norm.weight"])},
+            "out_proj": {"kernel": jnp.asarray(weights["out_proj.weight"].T)},
+        }
+    }
 
 
 def test_the_layer_matches_mamba2_mixer(reference, geometry):
@@ -168,7 +184,9 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geom
     each sits further from the fp32 output than they do from each other
     (8.2e-02 for the reference, 5.1e-02 for dew)."""
     module = layer(geometry, dtype=jnp.bfloat16)
-    out = jnp.asarray(module.apply(layer_params(reference), jnp.asarray(reference["layer.hidden"], jnp.bfloat16)))
+    out = jnp.asarray(
+        module.apply(layer_params(reference), jnp.asarray(reference["layer.hidden"], jnp.bfloat16))
+    )
     assert out.dtype == jnp.bfloat16
     assert largest(out, reference["layer.output_bf16"]) < 1e-1
 
@@ -206,7 +224,9 @@ def test_the_decode_state_is_a_fixed_size(reference, geometry):
     hidden = jnp.asarray(reference["layer.hidden"])
     cache = module.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
     _, mutated = module.apply({**variables, "cache": cache}, hidden, decode=True, mutable=["cache"])
-    conv_dim = geometry["num_heads"] * geometry["head_dim"] + 2 * geometry["n_groups"] * geometry["state_size"]
+    conv_dim = (
+        geometry["num_heads"] * geometry["head_dim"] + 2 * geometry["n_groups"] * geometry["state_size"]
+    )
     assert jax.tree.map(jnp.shape, mutated["cache"]) == {
         "conv_state": (2, conv_dim, geometry["conv_kernel"] - 1),
         "ssm_state": (2, geometry["num_heads"], geometry["head_dim"], geometry["state_size"])}

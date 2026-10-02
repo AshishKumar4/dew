@@ -204,7 +204,9 @@ def test_a_pair_of_equal_widths_needs_no_projection():
     with_feature, aux = scalar_loss(objective, params, batch, step_at())
     without, _ = scalar_loss(DistillationObjective(student, teacher), params, batch, step_at())
     assert float(aux.metrics["distill/feature"]) > 0
-    assert float(with_feature) == pytest.approx(float(without) + float(aux.metrics["distill/feature"]), rel=1e-6)
+    assert float(with_feature) == pytest.approx(
+        float(without) + float(aux.metrics["distill/feature"]), rel=1e-6
+    )
 
 
 def test_a_layer_the_model_does_not_have_is_named_at_init():
@@ -298,7 +300,9 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
         assert np.array_equal(np.asarray(leaf), np.asarray(dict(
             jax.tree_util.tree_leaves_with_path(initial.params[TEACHER]))[path])), path
     for name, kernel in state.params["params"][PROJECTIONS].items():
-        assert not np.array_equal(np.asarray(kernel), np.asarray(initial.params["params"][PROJECTIONS][name])), name
+        assert not np.array_equal(
+            np.asarray(kernel), np.asarray(initial.params["params"][PROJECTIONS][name])
+        ), name
     after = float(scalar_loss(trainer.objective, state.params, batch, step_at())[0])
     assert after < before, (before, after)
 

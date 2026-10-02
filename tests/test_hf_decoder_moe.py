@@ -1075,8 +1075,11 @@ def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
     ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
     reference = np.load(DEEPSEEK_V4 / "logits.npy")
     moe = variables["moe"]
-    assert [layer for layer in sorted(moe)
-            if layer.startswith('layers_') and "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
+    assert [
+        layer
+        for layer in sorted(moe)
+        if layer.startswith("layers_") and "tid2eid" in moe[layer]["mlp"]["gate"]
+    ] == ["layers_0", "layers_1", "layers_2"]
 
     rolled = jax.tree.map(lambda value: value, moe)
     for layer in ("layers_0", "layers_1", "layers_2"):

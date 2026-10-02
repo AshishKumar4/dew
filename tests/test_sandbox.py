@@ -77,7 +77,10 @@ def test_memory_limit_ends_the_worker_with_its_diagnostic():
 
 
 def test_worker_exit_reports_its_code_and_stderr():
-    with environment("crash")(IDENTITY) as session, pytest.raises(ChildProcessError, match=r"code 3.*worker boom"):
+    with (
+        environment("crash")(IDENTITY) as session,
+        pytest.raises(ChildProcessError, match=r"code 3.*worker boom"),
+    ):
         session.reset()
 
 
@@ -91,11 +94,11 @@ def test_parent_death_kills_the_worker(tmp_path):
     script = tmp_path / "parent.py"
     script.write_text(
         "import json, os, sys, time\n"
-        "sys.path.insert(0, {!r})\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
         "from test_sandbox import environment, IDENTITY\n"
         "with environment()(IDENTITY) as session:\n"
         "    print(json.loads(session.reset().detail)[0], flush=True)\n"
-        "    time.sleep(3600)\n".format(str(Path(__file__).parent)))
+        "    time.sleep(3600)\n")
     root = Path(__file__).resolve().parents[1]
     parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
                               env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
@@ -133,7 +136,10 @@ def test_episodes_collect_through_subprocess_workers():
 
 
 def test_cpu_limit_kills_a_busy_worker():
-    with environment("cpu", cpu_seconds=1, wall_seconds=10.)(IDENTITY) as session, pytest.raises(ChildProcessError, match="code -9"):
+    with (
+        environment("cpu", cpu_seconds=1, wall_seconds=10.0)(IDENTITY) as session,
+        pytest.raises(ChildProcessError, match="code -9"),
+    ):
         session.reset()
 
 

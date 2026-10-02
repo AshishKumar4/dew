@@ -55,7 +55,9 @@ def fit(layout, directory, steps):
     # features stands in for the plain regression and a metric reads them.
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                       checkpoints=checkpoints)
-    data = Dataset(train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH)
+    data = Dataset(
+        train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH
+    )
     state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2,
                         metrics=(Spread([]),))
     checkpoints.wait()
@@ -444,7 +446,10 @@ def test_a_pipeline_over_stages_refuses_a_banked_store():
 
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
-    with jax.set_mesh(build_mesh(MeshSpec(stage=2))), pytest.raises(ValueError, match="already banked by run"):
+    with (
+        jax.set_mesh(build_mesh(MeshSpec(stage=2))),
+        pytest.raises(ValueError, match="already banked by run"),
+    ):
         scanned.apply(on_host, tokens)
 
 

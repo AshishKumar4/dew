@@ -430,7 +430,9 @@ def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp
         theirs = reference(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
     np.testing.assert_allclose(theirs, expected, atol=LOGITS, rtol=0)
     again = load_pretrained(str(export), dtype="float32", attention_impl="reference")
-    np.testing.assert_allclose(np.asarray(again.model.apply(again.variables, ids)), expected, atol=LOGITS, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(again.model.apply(again.variables, ids)), expected, atol=LOGITS, rtol=0
+    )
 
     source.save(export)
     assert sorted(path.name for path in export.glob("model*")) == ["model.safetensors"]
@@ -753,7 +755,9 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
 
 
-@pytest.mark.parametrize("same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"])
+@pytest.mark.parametrize(
+    "same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"]
+)
 def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_values):
     from dew.interop.codecs import E4M3
 
@@ -908,8 +912,12 @@ def glm5_native_export_case(variant):
             kinds["full_attention"], mixer=dataclasses.replace(
                 sparse, index_kpool=3, index_topk=6, index_kpool_always_select_tail=False))
         assert model.mixture is not None
-        model = model.clone(kinds=kinds, tie_embeddings=True, index_share_for_mtp_iteration=False,
-                            mixture=dataclasses.replace(model.mixture, layers=(1, 3, 4), norm_topk_prob=False))
+        model = model.clone(
+            kinds=kinds,
+            tie_embeddings=True,
+            index_share_for_mtp_iteration=False,
+            mixture=dataclasses.replace(model.mixture, layers=(1, 3, 4), norm_topk_prob=False),
+        )
         del params["lm_head"]
         params["layers_1"]["mlp"] = jax.tree.map(lambda leaf: leaf, params["layers_4"]["mlp"])
         variables["moe"]["layers_1"] = jax.tree.map(lambda leaf: leaf, variables["moe"]["layers_4"])
@@ -949,7 +957,9 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
     cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     if model.num_nextn_predict_layers:
-        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[1]
+        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[
+            1
+        ]
     save_pretrained_decoder(model, {**variables, **cache}, tmp_path)
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))

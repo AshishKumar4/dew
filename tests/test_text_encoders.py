@@ -505,7 +505,9 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
         assert isinstance(native, (CLIPTextModel, T5EncoderModel))
         assert native.transformer.dtype == jnp.float32
     assert jax.tree.structure(masters.variables) == jax.tree.structure(native.variables)
-    for before, after in zip(jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True):
+    for before, after in zip(
+        jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True
+    ):
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))

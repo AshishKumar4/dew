@@ -88,7 +88,13 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     full = reference_variables(loaded, "gradient.safetensors")
-    assert max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full), strict=True)) > 1e-3
+    assert (
+        max(
+            float(jnp.max(jnp.abs(a - b)))
+            for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full), strict=True)
+        )
+        > 1e-3
+    )
 
 
 @pytest.mark.parametrize("probability,reference_key", [(0., "sc_off_loss"), (1., "sc_on_loss")])
@@ -227,7 +233,9 @@ def test_image_sft_uses_media_validity_groups_and_positions(image_source):
     np.testing.assert_array_equal(media_gradient[0, 1], 0)
     assert any(float(jnp.linalg.norm(leaf)) > 0
                for leaf in jax.tree.leaves(gradient["params"]["conditioner"]))
-    changed = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]})
+    changed = inputs.replace(
+        conditioning={**inputs.conditioning, "pixel_values": -inputs.conditioning["pixel_values"]}
+    )
     changed_loss = evaluate(variables, changed)[0]
     assert abs(float(changed_loss - loss)) > 1e-5
     for name, replacement in (("attention_mask", inputs.tokens != 0),

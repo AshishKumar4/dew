@@ -70,7 +70,9 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     assert isinstance(bundle.model, DiffusionGemma)
     source = dew.pipeline(str(FIXTURE), dtype="float32", param_dtype="bfloat16")
     assert isinstance(source, BlockGeneration)
-    for expected, actual in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(source.variables), strict=True):
+    for expected, actual in zip(
+        jax.tree.leaves(bundle.variables), jax.tree.leaves(source.variables), strict=True
+    ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
     wanted = bundle.block_generation()([[1, 5, 7]], 3, key=4).host()
@@ -98,7 +100,9 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     expected_task = BlockGeneration(expected_model, place(expected_vars, None, None),
                                     BlockProcess(expected_model.canvas_length, expected_model.vocab_size))
     assert jnp.dtype(restored.model.text.dtype) == jnp.dtype(jnp.bfloat16)
-    for expected, actual in zip(jax.tree.leaves(expected_vars), jax.tree.leaves(restored.variables), strict=True):
+    for expected, actual in zip(
+        jax.tree.leaves(expected_vars), jax.tree.leaves(restored.variables), strict=True
+    ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
     result = restored([[1, 5, 7]], 3, key=8).host()
@@ -117,7 +121,9 @@ def test_a_published_checkpoint_with_a_sampler_index_loads_as_the_decoder(tmp_pa
         {"_class_name": "DiffusionGemmaPipeline", "_diffusers_version": "0.39.0.dev0",
          "scheduler": ["diffusers", "BlockRefinementScheduler"]}))
     reference = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
-    bundle = load_pretrained(str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = load_pretrained(
+        str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32
+    )
     assert type(bundle.model) is type(reference.model)
     assert jax.tree.structure(bundle.variables) == jax.tree.structure(reference.variables)
 
@@ -127,8 +133,16 @@ def test_a_text_decoder_takes_its_tokenizer_whatever_processor_files_ship(tmp_pa
     audio feature extractors) beside a text-only model; the loader reads the
     tokenizer, not a processor that needs towers the model does not have."""
     shutil.copytree(FIXTURE, tmp_path / "published")
-    (tmp_path / "published" / "processor_config.json").write_text(json.dumps(
-        {"processor_class": "Gemma4Processor", "image_processor": {"image_processor_type": "Gemma4ImageProcessor"}}))
-    bundle = load_pretrained(str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32)
+    (tmp_path / "published" / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Gemma4Processor",
+                "image_processor": {"image_processor_type": "Gemma4ImageProcessor"},
+            }
+        )
+    )
+    bundle = load_pretrained(
+        str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32
+    )
     reference = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
     assert type(bundle.processor.reference) is type(reference.processor.reference)

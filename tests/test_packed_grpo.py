@@ -71,7 +71,11 @@ def _per_call(rollouts):
     calls = [(call, values[index]) for index, rollout in enumerate(rollouts) for call in rollout.calls]
     shape = (len(calls), WIDTH)
     ids, segments, positions = np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, np.int32)
-    mask, behavior, advantage = np.zeros(shape, np.float32), np.zeros(shape, np.float32), np.zeros(shape, np.float32)
+    mask, behavior, advantage = (
+        np.zeros(shape, np.float32),
+        np.zeros(shape, np.float32),
+        np.zeros(shape, np.float32),
+    )
     for row, (call, value) in enumerate(calls):
         size, count = len(call.prompt_ids), len(call.sampled_ids)
         ids[row, :size + count] = (*call.prompt_ids, *call.sampled_ids)
@@ -230,7 +234,9 @@ def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
     scored = np.asarray(objective.packed_log_probs(params, packed))
     alone = np.asarray(objective.packed_log_probs(params, unmerged))
     expected = alone[unmerged[RESPONSE_MASK_KEY] != 0]
-    order = [(index, number) for index, rollout in enumerate(rollouts) for number in range(len(rollout.calls))]
+    order = [
+        (index, number) for index, rollout in enumerate(rollouts) for number in range(len(rollout.calls))
+    ]
     placed = np.concatenate([scored[(packed[SESSION_INDEX_KEY] == index) & (packed[CALL_INDEX_KEY] == number)]
                              for index, number in order])
     np.testing.assert_allclose(placed, expected, atol=1e-5)

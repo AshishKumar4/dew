@@ -1053,7 +1053,9 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
                        table.astype(jnp.bfloat16).astype(jnp.float32),
                        precision=jax.lax.Precision.HIGHEST)
-    np.testing.assert_array_equal(np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32)))
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+    )
     assert np.all(np.abs(np.asarray(logits - exact)) <= 2 ** -8 * np.abs(np.asarray(exact)) + 1e-6)
     assert not np.allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
 
@@ -1089,8 +1091,14 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu"}
     assert translate_config(base)["scale_after_cast"] is True
     assert translate_config({**base, "model_type": "qwen3", "head_dim": 8})["scale_after_cast"] is True
-    gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
-                    "query_pre_attn_scalar": 8, "sliding_window": 4}
+    gemma_config = {
+        **base,
+        "model_type": "gemma3_text",
+        "head_dim": 8,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 4,
+    }
     assert translate_config(gemma_config)["scale_after_cast"] is False
 
 
@@ -1269,7 +1277,9 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
             v = np.repeat(np.asarray(v), 2, axis=-2)
             norm = np.sum(v * v, -1, keepdims=True)
             safe = np.where(norm > 0, norm, 1)
-            return np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            return (
+                np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+            )
 
         out = exclusive_self_attention(y, v)
         np.testing.assert_allclose(out, oracle(y, v), rtol=1e-13, atol=1e-13)

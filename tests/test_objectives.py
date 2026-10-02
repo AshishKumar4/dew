@@ -136,7 +136,9 @@ def test_an_objective_that_holds_nothing_binds_no_initializer_arguments():
     # The tiny model's tables are 16 bytes; a baseline past a few KiB would
     # be an array the model itself bakes in.
     assert model_constants(objective) < 4096
-    assert captured_bytes(lambda key: objective.initializer(key), jax.random.key(0)) == model_constants(objective)
+    assert captured_bytes(lambda key: objective.initializer(key), jax.random.key(0)) == model_constants(
+        objective
+    )
 
 
 def test_a_held_tree_crosses_into_a_jit_as_data_rather_than_as_a_constant():

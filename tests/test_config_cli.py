@@ -107,7 +107,9 @@ def test_steps_and_epochs_are_one_choice():
     data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError, match=r"--trainer.steps"):
-        config.trainer.total_steps(Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10))
+        config.trainer.total_steps(
+            Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10)
+        )
 
 
 class _Batches:
@@ -193,7 +195,10 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
             if self.remaining is not None:
                 self.remaining -= 1
             rng = np.random.RandomState(self.count)
-            return {"image": rng.randint(0, 256, (batch, size, size, 3)).astype(np.uint8), "label": np.zeros((batch,), np.int32)}
+            return {
+                "image": rng.randint(0, 256, (batch, size, size, 3)).astype(np.uint8),
+                "label": np.zeros((batch,), np.int32),
+            }
 
         def get_state(self):
             return json.dumps({"count": self.count}).encode()
@@ -206,13 +211,35 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
                        records=4 * batch, batch=batch)
 
     monkeypatch.setattr(OxfordFlowers, "load", load)
-    config = parse(recipe.JepaRunConfig, [
-        "--data.image-size", str(size), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
-        "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
-        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--trainer.eval-every", "None",  # no probes, so no validation pass
-        "--model.architecture", "jepa_encoder", "--model.dtype", "float32",
-        "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}'])
+    config = parse(
+        recipe.JepaRunConfig,
+        [
+            "--data.image-size",
+            str(size),
+            "--trainer.batch-size",
+            str(batch),
+            "--trainer.steps",
+            "2",
+            "--trainer.checkpoint-dir",
+            str(tmp_path),
+            "--trainer.name",
+            "run",
+            "--trainer.compilation-cache-dir",
+            "None",
+            "--trainer.multi-host",
+            "False",
+            "--trainer.log-every",
+            "1",
+            "--trainer.eval-every",
+            "None",  # no probes, so no validation pass
+            "--model.architecture",
+            "jepa_encoder",
+            "--model.dtype",
+            "float32",
+            "--model.config",
+            '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}',
+        ],
+    )
 
     state = recipe.main(config)
 

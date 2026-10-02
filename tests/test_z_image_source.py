@@ -103,7 +103,9 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     probe = nhwc(arrays[f"{name}.probe"])
 
     def objective(params, latents, context):
-        return jnp.sum(model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe)
+        return jnp.sum(
+            model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe
+        )
 
     flow = model.apply({"params": params}, latents, time, DenoisingCondition(jnp.asarray(context), mask=mask))
     gaps = {"forward": relative_gap(-flow, nhwc(arrays[f"{name}.output"]))}
@@ -111,7 +113,9 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
                                                                                      jnp.asarray(context))
     gaps["latents"] = relative_gap(-grad_latents, nhwc(arrays[f"{name}.grad_latents"]))
     for row, length in enumerate(record["cases"][name]["lengths"]):
-        gaps[f"prompt {row}"] = relative_gap(-grad_context[row, :length], arrays[f"{name}.grad_caption.{row}"])
+        gaps[f"prompt {row}"] = relative_gap(
+            -grad_context[row, :length], arrays[f"{name}.grad_caption.{row}"]
+        )
         assert not np.asarray(grad_context[row, length:]).any()
     for layout in layouts:
         key = f"{name}.grad_param.{layout.name.removeprefix('transformer/')}"

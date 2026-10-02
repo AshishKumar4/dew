@@ -212,7 +212,9 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
 def test_soft_initialization_also_creates_the_hard_vision_path():
     projector = V.Gemma3nProjectorModule(8, 4, vocab_size=3, vocab_offset=16)
     variables = projector.init(jax.random.key(51), jnp.arange(16, dtype=jnp.float32).reshape(1, 2, 8))
-    hard = jnp.asarray(projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard))
+    hard = jnp.asarray(
+        projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard)
+    )
     np.testing.assert_allclose(jnp.mean(jnp.square(hard), axis=-1), 1.0, atol=1e-4)
 
 

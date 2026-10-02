@@ -27,16 +27,24 @@ WIDTH = 24
 def engine_batch():
     rollouts = []
     for number, call in enumerate(RECORD["calls"]):
-        record = Call(tuple(call["prompt_ids"]), tuple(call["sampled_ids"]), tuple(call["behavior_log_probs"]),
-                      "length", 0, routed_experts=np.asarray(call["routed_experts"]),
-                      support=tuple(tuple(kept) for kept in call["support"]))
+        record = Call(
+            tuple(call["prompt_ids"]),
+            tuple(call["sampled_ids"]),
+            tuple(call["behavior_log_probs"]),
+            "length",
+            0,
+            routed_experts=np.asarray(call["routed_experts"]),
+            support=tuple(tuple(kept) for kept in call["support"]),
+        )
         rollouts.append(Session("t", "g", number, 0, (record,), Status.COMPLETED, float(number)))
     return rollouts, pack(rollouts, WIDTH, rows=len(rollouts), support_capacity=6 * WIDTH)
 
 
 @pytest.fixture(scope="module")
 def objective():
-    pretrained = load_pretrained(str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference")
+    pretrained = load_pretrained(
+        str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference"
+    )
     grpo = GRPOObjective(pretrained.model, WIDTH - 1, sampling_temperature=RECORD["sampling"]["temperature"])
     return grpo, pretrained.variables
 

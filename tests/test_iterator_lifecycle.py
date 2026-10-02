@@ -198,7 +198,10 @@ def test_source_close_failure_preserves_primary_and_is_reported_once(body_fails)
     cleanup = OSError("source close failed")
     primary = RuntimeError("body failed")
     source = Source(close_failure=cleanup)
-    with pytest.raises((RuntimeError, OSError)) as raised, DevicePrefetchIterator(source, build_mesh()) as stream:
+    with (
+        pytest.raises((RuntimeError, OSError)) as raised,
+        DevicePrefetchIterator(source, build_mesh()) as stream,
+    ):
         next(stream)
         if body_fails:
             raise primary
@@ -513,6 +516,12 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         "for _ in range(20):\n"
         "    next(prefetch)\n")
     root = Path(__file__).resolve().parents[1]
-    done = subprocess.run([sys.executable, "-c", program], cwd=root, capture_output=True, text=True, timeout=300,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    done = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")},
+    )
     assert done.returncode == 0, done.stdout + done.stderr

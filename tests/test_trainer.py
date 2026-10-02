@@ -523,13 +523,21 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert jax.tree.structure(restored) == jax.tree.structure(prefix)
     for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     resumed = fresh.fit(dataset(resumed_seen), steps=4, checkpoint_every=1)
     assert resumed_seen[0].tobytes() == whole_seen[2].tobytes(), "the first batch after resume"
     assert jax.tree.structure(resumed) == jax.tree.structure(whole)
     for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(whole), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
@@ -1744,7 +1752,12 @@ def alternating(gen, disc):
                 return params, {**state.opt_state, "disc": disc_state}, loss
 
             params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
-            new_state = state.replace(microstep=state.microstep + 1, updates=state.updates + 1, opt_state=opt_state, params={**state.params, "params": params})
+            new_state = state.replace(
+                microstep=state.microstep + 1,
+                updates=state.updates + 1,
+                opt_state=opt_state,
+                params={**state.params, "params": params},
+            )
             return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step
     return make_step
@@ -1979,7 +1992,9 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
         objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
-        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        options = (
+            f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        )
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",

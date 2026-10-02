@@ -580,14 +580,24 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     with jax.set_mesh(trainer.state_mesh):
         first, second = execution.snapshot(state.params), execution.snapshot(state.params)
     bank = next(name for name in first["params"] if name.startswith("layers_0_"))
-    assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
-    assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    assert (
+        first["params"][bank]["mlp"]["gate_proj"]["kernel"]
+        is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
+    )
+    assert (
+        first["params"][bank]["self_attn"]["q_proj"]["kernel"]
+        is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    )
     before = _pointers(frozen)
     step = trainer.compile(state, tokens())
     for _ in range(2):
         state, *_ = step(state, tokens())
     assert _pointers(state.params[FROZEN]) == before
-    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {"layers_0", "layers_1"}
+    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {
+        "layers_0",
+        "layers_1",
+    }
+
 
 def test_place_streams_the_held_tree_and_releases_each_source():
     """The objective's held leaves become the placed arrays as they land, so
@@ -606,13 +616,36 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     bank = state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
     assert held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
     assert held["params"]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
-    assert state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    assert (
+        state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+        is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    )
     fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=fresh,
-                                   trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), DEVICE)
-    close(updated(LMObjective(model, 8, head_chunks=1, pretrained=jax.tree.map(np.asarray, fresh),
-                              trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), HOST).params,
-          resident.params)
+    resident = updated(
+        LMObjective(
+            model,
+            8,
+            head_chunks=1,
+            pretrained=fresh,
+            trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
+        ),
+        tokens(),
+        DEVICE,
+    )
+    close(
+        updated(
+            LMObjective(
+                model,
+                8,
+                head_chunks=1,
+                pretrained=jax.tree.map(np.asarray, fresh),
+                trainable=lambda path: path[-2:] == ("q_proj", "kernel"),
+            ),
+            tokens(),
+            HOST,
+        ).params,
+        resident.params,
+    )
 
 
 def _resident_pages(view: np.ndarray) -> int:
@@ -675,7 +708,9 @@ def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_pat
     assert _resident_pages(banked_row) < pages // 10
     assert _resident_pages(single) < single.nbytes // 4096
     np.testing.assert_array_equal(
-        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))
+        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1],
+        np.asarray(banked_row),
+    )
 
 
 def test_stream_refuses_a_node_it_cannot_update_in_place_by_its_path():

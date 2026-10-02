@@ -161,7 +161,9 @@ def test_the_autoencoder_scales_as_the_pipeline_does(variant):
     video = np.asarray(autoencoder.encode(params, image[None]))
     np.testing.assert_array_equal(video[0], normalized)
     decoded = np.asarray(autoencoder.decode(params, normalized))
-    np.testing.assert_allclose(decoded, np.asarray(autoencoder.decode_batch(params, raw)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        decoded, np.asarray(autoencoder.decode_batch(params, raw)), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_a_missing_tensor_is_refused(source, tmp_path):
@@ -230,22 +232,40 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
-                          dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=16), trainer=TrainerConfig(batch_size=8, steps=2),
-        sampler=samplers.Euler(), sampling_steps=2, text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"))
+        model=ModelConfig(
+            "simple_dit",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
+            dtype="float32",
+            attention_impl="reference",
+        ),
+        data=OxfordFlowers(image_size=16),
+        trainer=TrainerConfig(batch_size=8, steps=2),
+        sampler=samplers.Euler(),
+        sampling_steps=2,
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
+    )
     objective = config.build()
     images = (np.random.default_rng(0).random((8, 16, 16, 3)) * 255).astype(np.uint8)
-    batch = {"image": images, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    batch = {
+        "image": images,
+        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
+    }
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
-    state = trainer.fit(Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
-                        steps=2, log_every=100)
+    state = trainer.fit(
+        Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
+        steps=2,
+        log_every=100,
+    )
 
     for before, after in zip(jax.tree.leaves(initial.params["autoencoder"]),
                              jax.tree.leaves(state.params["autoencoder"]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
-             zip(jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True)]
+    moved = [
+        not np.array_equal(np.asarray(before), np.asarray(after))
+        for before, after in zip(
+            jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True
+        )
+    ]
     assert any(moved)

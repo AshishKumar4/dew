@@ -260,8 +260,15 @@ def build_model(architecture, dtype="bfloat16"):
     if architecture in DECODERS:
         return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
     if architecture not in COMPOSITES:
-        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer", "edm2_unet",
-               "flux2_transformer", "z_image_transformer")
+        own = (
+            "unet_2d_condition",
+            "sd3_transformer",
+            "flux_transformer",
+            "qwen_image_transformer",
+            "edm2_unet",
+            "flux2_transformer",
+            "z_image_transformer",
+        )
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **resolved(architecture, fields))
     text = models.build("causal_transformer", **resolved(

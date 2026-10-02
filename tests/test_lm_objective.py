@@ -419,7 +419,11 @@ def test_preview_generates_reproducible_text_from_ema():
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
                               dtype="float32", attention_impl="xla")
-    objective = LMObjective(model, seq_len=SEQ, samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)))
+    objective = LMObjective(
+        model,
+        seq_len=SEQ,
+        samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)),
+    )
     params = objective.init(jax.random.key(0))
     ema = jax.tree.map(lambda leaf: leaf + 0.1, params)
     averaged = objective.preview(params, token_batch(), step_at(key=5, ema=ema))
@@ -445,8 +449,16 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     gets wrong the moment counts differ."""
     metric = metrics.perplexity()
     assert metric.reads is TokenScores
-    heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 1.0), dtype=bool))
-    light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]), correct=jnp.zeros_like(jnp.full((1, 4), 3.0), dtype=bool))
+    heavy = TokenScores(
+        losses=jnp.full((1, 4), 1.0),
+        weights=jnp.ones((1, 4)),
+        correct=jnp.zeros_like(jnp.full((1, 4), 1.0), dtype=bool),
+    )
+    light = TokenScores(
+        losses=jnp.full((1, 4), 3.0),
+        weights=jnp.array([[1.0, 0, 0, 0]]),
+        correct=jnp.zeros_like(jnp.full((1, 4), 3.0), dtype=bool),
+    )
 
     score = metric.finalize(metric.merge(metric(heavy, None), metric(light, None)))
 
@@ -456,18 +468,37 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
 def test_a_batch_with_no_counted_target_weighs_nothing():
     metric = metrics.perplexity()
-    scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)), correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool))
-    empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)), correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool))
+    scored = TokenScores(
+        losses=jnp.full((1, 4), 2.0),
+        weights=jnp.ones((1, 4)),
+        correct=jnp.zeros_like(jnp.full((1, 4), 2.0), dtype=bool),
+    )
+    empty = TokenScores(
+        losses=jnp.zeros((1, 4)),
+        weights=jnp.zeros((1, 4)),
+        correct=jnp.zeros_like(jnp.zeros((1, 4)), dtype=bool),
+    )
 
-    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(np.exp(2.0))
+    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(
+        np.exp(2.0)
+    )
     with pytest.raises(ValueError, match="no counted target"):
         metric.finalize(metric(empty, None))
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
     metric = metrics.perplexity()
-    values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2)), correct=jnp.zeros_like(jnp.full((1, 2), ce), dtype=bool)), None)
-              for ce in (0.0, 2.0)]
+    values = [
+        metric(
+            TokenScores(
+                losses=jnp.full((1, 2), ce),
+                weights=jnp.ones((1, 2)),
+                correct=jnp.zeros_like(jnp.full((1, 2), ce), dtype=bool),
+            ),
+            None,
+        )
+        for ce in (0.0, 2.0)
+    ]
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)

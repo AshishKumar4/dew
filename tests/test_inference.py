@@ -55,7 +55,9 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder="stub_text"
 _DEFAULT_MAKE_RUN_PRESET = presets.EDM()
 
 
-def make_run(directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder="stub_text", checkpoint="stub-clip", steps=2):
+def make_run(
+    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder="stub_text", checkpoint="stub-clip", steps=2
+):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build. A directory that already holds the run resumes
@@ -167,7 +169,9 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     checkpoints.wait()
     dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
 
-    expected = TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, key=0).host().images
+    expected = (
+        TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, key=0).host().images
+    )
     np.testing.assert_array_equal(TextToImage.from_run(str(single))(["a lily"], steps=3, key=0).host().images,
                                   expected)
     with pytest.raises(ValueError, match="keeps no EMA"):
@@ -267,7 +271,9 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
     key = jax.random.PRNGKey(1)
     plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images
-    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key).host().images
+    guided = (
+        pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key).host().images
+    )
     assert plain.shape == guided.shape == (1, RES, RES, 3)
     assert not np.allclose(plain, guided)
     assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images, plain)
@@ -461,7 +467,11 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     objective, state = make_run(tmp_path)
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
-    assert (pipe.steps, pipe.guidance, pipe.sampler) == (objective.steps, objective.guidance, objective.sampler)
+    assert (pipe.steps, pipe.guidance, pipe.sampler) == (
+        objective.steps,
+        objective.guidance,
+        objective.sampler,
+    )
     for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
@@ -532,7 +542,9 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     run.mkdir()
     objective, state = make_lm_run(run, ema_decay=None)
     published = objective.pipeline(state)
-    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True):
+    for expected, bound in zip(
+        jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True
+    ):
         assert bound is expected
     export_run(str(run), tmp_path / "export")
     reloaded = load_pretrained(tmp_path / "export", dtype="float32", attention_impl="reference")
@@ -831,10 +843,16 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         parameter = (keys[0] in ("params", FROZEN, "autoencoder") or
                      keys[:3] in (("encoders", "textcontext", "params"),
                                   ("encoders", "textcontext", FROZEN)))
-        return leaf.astype(storage) if storage and parameter and jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+        return (
+            leaf.astype(storage)
+            if storage and parameter and jnp.issubdtype(leaf.dtype, jnp.floating)
+            else leaf
+        )
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
-    for expected, actual in zip(jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True):
+    for expected, actual in zip(
+        jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True
+    ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
     # Equal storage is insufficient for bitwise comparison: the unplaced
@@ -868,8 +886,9 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     np.testing.assert_array_equal(restored(["a red bird"], steps=2, key=5).host().images,
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
-    for owner_leaf, bound_leaf in zip(jax.tree.leaves(owned),
-                                      jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True):
+    for owner_leaf, bound_leaf in zip(
+        jax.tree.leaves(owned), jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True
+    ):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
@@ -880,7 +899,9 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 
 
 @pytest.mark.parametrize("compute,storage", [("bfloat16", None), (None, "bfloat16")])
-def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights(tmp_path, compute, storage):
+def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights(
+    tmp_path, compute, storage
+):
     import jax.numpy as jnp
 
     from dew.inference import TextGeneration

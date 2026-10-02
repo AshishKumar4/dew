@@ -136,7 +136,9 @@ def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
         # scaling a cancelling bias leaf by its near-zero norm.
         actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
                                     for value in (actual, reference, truth)]
-    assert_as_exact_as_the_reference(actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode")
+    assert_as_exact_as_the_reference(
+        actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode"
+    )
 
 
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
@@ -211,7 +213,9 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
     results = []
     for forward, target in ((model.apply, host), (mapped, device)):
-        arguments = jax.tree.map(lambda x, target=target: jax.device_put(x, target), (variables, image, cotangent))
+        arguments = jax.tree.map(
+            lambda x, target=target: jax.device_put(x, target), (variables, image, cotangent)
+        )
 
         def loss(params, x, cot, *, forward=forward):
             return jnp.sum(forward(params, x) * cot)

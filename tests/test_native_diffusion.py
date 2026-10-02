@@ -26,22 +26,40 @@ def saved_pipelines(tmp_path_factory):
 
 
 def run_check(*arguments):
-    result = subprocess.run([sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
-                            cwd=ROOT, capture_output=True, text=True, timeout=240,
-                            env={**os.environ, "JAX_PLATFORMS": "cpu", "USE_TF": "0",
-                                 "PYTHONPATH": str(ROOT / "src"), "OMP_NUM_THREADS": "2",
-                                 "OPENBLAS_NUM_THREADS": "1"})
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=240,
+        env={
+            **os.environ,
+            "JAX_PLATFORMS": "cpu",
+            "USE_TF": "0",
+            "PYTHONPATH": str(ROOT / "src"),
+            "OMP_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "1",
+        },
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"])
+@pytest.mark.parametrize(
+    "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
+)
 def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
     run_check(saved_pipelines / task)
 
 
 @pytest.mark.parametrize("solver", ["pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm"])
 def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
-    run_check(saved_pipelines / "sd", "--grids", ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz", "--case", solver)
+    run_check(
+        saved_pipelines / "sd",
+        "--grids",
+        ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz",
+        "--case",
+        solver,
+    )
 
 
 @pytest.mark.parametrize("task", ["sd", "xl"])
@@ -136,7 +154,9 @@ def test_a_matching_image_task_variant_loads(saved_pipelines, tmp_path, case, de
 
 
 @pytest.mark.parametrize("family", ["sd", "xl", "safety", "sd3", "flux"])
-def test_public_source_precision_covers_denoiser_and_frozen_component_weights(saved_pipelines, tmp_path, family):
+def test_public_source_precision_covers_denoiser_and_frozen_component_weights(
+    saved_pipelines, tmp_path, family
+):
     import jax.numpy as jnp
     from test_interop import assert_parameter_storage
 
@@ -202,7 +222,9 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
         np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
     latest = load_pretrained(destination, dtype="float32", attention_impl="xla")
     for layout in latest.weight_layouts:
-        expected = original[layout.name] + np.float32(1.) if layout.name == changed.name else original[layout.name]
+        expected = (
+            original[layout.name] + np.float32(1.0) if layout.name == changed.name else original[layout.name]
+        )
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
 
 

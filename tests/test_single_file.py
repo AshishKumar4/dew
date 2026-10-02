@@ -96,7 +96,9 @@ def test_a_cached_load_reads_nothing_from_the_file(tmp_path: Path, cache: Path,
     assert len(_entries(cache)) == 1
 
 
-def test_another_diffusers_converts_again(tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_another_diffusers_converts_again(
+    tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import diffusers
 
     repo = _repo(tmp_path, "sd")
@@ -122,7 +124,9 @@ def test_a_failed_load_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: 
     assert [entry.name.startswith(".") for entry in cache.iterdir()] == [False]
 
 
-def test_a_failed_placement_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_placement_caches_nothing(
+    tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Placing the pipeline on the mesh is part of the load: a placement that
     fails (a device out of memory, a layout refusal) keeps no conversion."""
     from dew.training.distributed import MeshSpec
@@ -134,7 +138,9 @@ def test_a_failed_placement_caches_nothing(tmp_path: Path, cache: Path, monkeypa
 
     monkeypatch.setattr(pretrained, "place", refused)
     with pytest.raises(MemoryError):
-        load_pretrained(repo, single_file="sd.safetensors", dtype="float32", param_dtype="auto", mesh=MeshSpec())
+        load_pretrained(
+            repo, single_file="sd.safetensors", dtype="float32", param_dtype="auto", mesh=MeshSpec()
+        )
     assert list(cache.iterdir()) == []
 
 
@@ -196,7 +202,9 @@ def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit
     assert asked == [("org/sd-tiny", None, False), ("org/sd-tiny", metadata.name, ("vae",))]
     assert loaded.revision == metadata.name
     assert sorted(path.name for path in (loaded.source / "vae").iterdir()) == ["config.json", WEIGHTS["vae"]]
-    assert (loaded.source / "vae" / WEIGHTS["vae"]).read_bytes() == (hub / "vae" / WEIGHTS["vae"]).read_bytes()
+    assert (loaded.source / "vae" / WEIGHTS["vae"]).read_bytes() == (
+        hub / "vae" / WEIGHTS["vae"]
+    ).read_bytes()
 
 
 def test_only_the_configs_metadata_is_copied(tmp_path: Path, cache: Path) -> None:
@@ -207,7 +215,9 @@ def test_only_the_configs_metadata_is_copied(tmp_path: Path, cache: Path) -> Non
                   "unet/diffusion_pytorch_model.safetensors.index.json", "README.md"):
         (repo / extra).write_bytes(b"{}")
     loaded = _load(repo, "sd")
-    copied = {path.relative_to(loaded.source).as_posix() for path in loaded.source.rglob("*") if path.is_file()}
+    copied = {
+        path.relative_to(loaded.source).as_posix() for path in loaded.source.rglob("*") if path.is_file()
+    }
     configs = {path.relative_to(FIXTURE / "sd" / "configs").as_posix()
                for path in (FIXTURE / "sd" / "configs").rglob("*") if path.is_file()}
     assert copied == configs | {f"{name}/{WEIGHTS[name]}" for name in ("unet", "vae", "text_encoder")}
@@ -273,15 +283,21 @@ FLUX = {"attention_head_dim": 128, "num_attention_heads": 24, "axes_dims_rope": 
 def _bfl_names(width: int, config: dict[str, object]) -> dict[str, tuple[int, ...]]:
     """BFL's Flux tensor names and shapes (black-forest-labs/flux, model.py)."""
     mlp, head = 4 * width, int(config["attention_head_dim"])
-    linear = {"time_in.in_layer": (width, 256), "time_in.out_layer": (width, width),
-              "vector_in.in_layer": (width, int(config["pooled_projection_dim"])),
-              "vector_in.out_layer": (width, width), "guidance_in.in_layer": (width, 256),
-              "guidance_in.out_layer": (width, width), "txt_in": (width, int(config["joint_attention_dim"])),
-              "img_in": (width, int(config["in_channels"])),
-              "single_blocks.0.modulation.lin": (3 * width, width),
-              "single_blocks.0.linear1": (3 * width + mlp, width), "single_blocks.0.linear2": (width, width + mlp),
-              "final_layer.linear": (int(config["in_channels"]), width),
-              "final_layer.adaLN_modulation.1": (2 * width, width)}
+    linear = {
+        "time_in.in_layer": (width, 256),
+        "time_in.out_layer": (width, width),
+        "vector_in.in_layer": (width, int(config["pooled_projection_dim"])),
+        "vector_in.out_layer": (width, width),
+        "guidance_in.in_layer": (width, 256),
+        "guidance_in.out_layer": (width, width),
+        "txt_in": (width, int(config["joint_attention_dim"])),
+        "img_in": (width, int(config["in_channels"])),
+        "single_blocks.0.modulation.lin": (3 * width, width),
+        "single_blocks.0.linear1": (3 * width + mlp, width),
+        "single_blocks.0.linear2": (width, width + mlp),
+        "final_layer.linear": (int(config["in_channels"]), width),
+        "final_layer.adaLN_modulation.1": (2 * width, width),
+    }
     norms = ["single_blocks.0.norm.query_norm.scale", "single_blocks.0.norm.key_norm.scale"]
     for stream in ("img", "txt"):
         block = f"double_blocks.0.{stream}"
@@ -375,7 +391,9 @@ def test_the_released_sdxl_header_converts_to_the_repo_s_own_diffusers_layout() 
     seen = []
     for name, _, tensors in single_file.converted(checkpoint, configs, index):
         assert tensors is not None, name
-        published = HfApi().parse_safetensors_file_metadata(repo, f"{name}/{WEIGHTS[name]}", revision=revision)
+        published = HfApi().parse_safetensors_file_metadata(
+            repo, f"{name}/{WEIGHTS[name]}", revision=revision
+        )
         assert _shapes(tensors) == {key.removeprefix("text_model."): tuple(info.shape)
                                     for key, info in published.tensors.items()
                                     if not key.endswith("position_ids")}, name

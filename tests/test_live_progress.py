@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def progress():
-    spec = importlib.util.spec_from_file_location("live_progress", ROOT / "site" / "live" / "container" / "progress.py")
+    spec = importlib.util.spec_from_file_location(
+        "live_progress", ROOT / "site" / "live" / "container" / "progress.py"
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # its dataclass resolves annotations through it
     spec.loader.exec_module(module)

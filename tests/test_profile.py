@@ -169,7 +169,10 @@ def test_explicit_options_control_native_host_events(tmp_path, native_reports):
     options = jax.profiler.ProfileOptions()
     options.host_tracer_level = 0
     options.python_tracer_level = 0
-    with dew.profile(tmp_path / "disabled-host", options=options), jax.profiler.TraceAnnotation("host_option_marker"):
+    with (
+        dew.profile(tmp_path / "disabled-host", options=options),
+        jax.profiler.TraceAnnotation("host_option_marker"),
+    ):
         work()
     with dew.profile(tmp_path / "default"), jax.profiler.TraceAnnotation("host_option_marker"):
         work()
@@ -328,7 +331,9 @@ def test_blocked_lifecycle_drain_refuses_conflicts_without_holding_mutex(
     assert record["capture_status"] == "completed"
 
 
-def test_interrupted_publication_closes_only_its_successfully_started_trace(tmp_path, native_reports, monkeypatch):
+def test_interrupted_publication_closes_only_its_successfully_started_trace(
+    tmp_path, native_reports, monkeypatch
+):
     module = importlib.import_module("dew.telemetry.profile")
     native_lock = module._lifecycle
     failure = KeyboardInterrupt("publication interrupted")

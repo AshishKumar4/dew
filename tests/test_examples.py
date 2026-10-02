@@ -65,7 +65,10 @@ def load_example(name):
     return module
 
 
-@pytest.mark.parametrize("section", ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"])
+@pytest.mark.parametrize(
+    "section",
+    ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"],
+)
 def test_landing_snippet_runs(section, tmp_path):
     smoke("landing", tmp_path, "--section", section,
           script=REPO_ROOT / "site/snippets/framework.py")
@@ -264,7 +267,9 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
 
 
 @pytest.mark.parametrize("new_tokens", [1, 128])
-def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_full_budget(tmp_path, new_tokens):
+def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_full_budget(
+    tmp_path, new_tokens
+):
     """SGLang 0.5.20 refuses an input of `context - 6` ids or more
     (`max_req_input_len`) and caps a budget at `context - 2 - input`
     (`max_req_len - input - 1`). A prompt truncated to `--prompt-tokens`
@@ -329,7 +334,9 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
         def submit(self, prompt, max_new_tokens, *, key):
             program = failing if not runs else passing
             future = Future()
-            future.set_result(Draw(tuple(prompt), (*program, eos), (-.5,) * 3, None, terminated=True, version=0))
+            future.set_result(
+                Draw(tuple(prompt), (*program, eos), (-0.5,) * 3, None, terminated=True, version=0)
+            )
             return future
 
     def reward(source, completion, cases, info):
@@ -339,7 +346,9 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
     config = example.Config(prompt_tokens=8, new_tokens=4, turns=2, prompts=1, groups=1)
     source = example.attempts_source(Server(), reward, lambda ids: " ".join(map(str, ids)),
                                      lambda text: [7, 7], config)
-    session = source.submit(Task("t", {"prompt": (1, 2), "truth": "cases"}), 1, version=0)[0].result(timeout=10)
+    session = source.submit(Task("t", {"prompt": (1, 2), "truth": "cases"}), 1, version=0)[0].result(
+        timeout=10
+    )
     source.close()
     assert session.status == Status.COMPLETED and session.reward == 1.0
     first, second = session.calls
@@ -364,7 +373,10 @@ def test_train_rlvr_scorer_forgets_old_programs_in_a_long_run():
 
     score = example.attempt_scorer(reward, lambda ids: " ".join(map(str, ids)))
     sampling = Sampling(temperature=1.0, eos_id=0)
-    programs = [Action((1,), (token,), (-.5,), (-.5,), terminated=False, policy_step=0, sampling=sampling) for token in range(1, 65_538)]
+    programs = [
+        Action((1,), (token,), (-0.5,), (-0.5,), terminated=False, policy_step=0, sampling=sampling)
+        for token in range(1, 65_538)
+    ]
     for action in (*programs, programs[0]):
         score("cases", action)
     assert runs.count("1") == 2
@@ -378,9 +390,15 @@ def test_train_harbor_waits_for_the_gateway_it_is_told_to_launch(tmp_path):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    config = example.Config(model=str(REPO_ROOT / "tests/fixtures/hf/qwen2-tiny"), tasks=(tmp_path,), width=64,
-                            gateway=f"http://127.0.0.1:{port}", served=tmp_path / "served", out=tmp_path / "out",
-                            ready_timeout=1.0)
+    config = example.Config(
+        model=str(REPO_ROOT / "tests/fixtures/hf/qwen2-tiny"),
+        tasks=(tmp_path,),
+        width=64,
+        gateway=f"http://127.0.0.1:{port}",
+        served=tmp_path / "served",
+        out=tmp_path / "out",
+        ready_timeout=1.0,
+    )
     with pytest.raises(RuntimeError, match="no healthy worker"):
         example.main(config)
     assert (tmp_path / "served" / "config.json").is_file()
@@ -453,27 +471,35 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
     the loaded checkpoint stays on the host, where a device copy would be
     2.2 GiB more. The run is a smoke run's, on one device in its own process,
     which counts the live arrays after each push."""
-    program = ("import collections, importlib.util, json, sys\n"
-               "from pathlib import Path\n"
-               "import jax\n"
-               "from dew.objectives.rl import RolloutScheduler\n"
-               "spec = importlib.util.spec_from_file_location('train_rlvr', 'examples/train_rlvr.py')\n"
-               "example = importlib.util.module_from_spec(spec)\n"
-               "sys.modules[spec.name] = example\n"
-               "spec.loader.exec_module(example)\n"
-               "counts = []\n"
-               "schedule = RolloutScheduler.__call__\n"
-               "def counted(self, state, batch, key):\n"
-               "    packed = schedule(self, state, batch, key)\n"
-               "    counts.append(collections.Counter(f'{array.shape} {array.dtype}' for array in jax.live_arrays()))\n"
-               "    return packed\n"
-               "RolloutScheduler.__call__ = counted\n"
-               "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
-               "source = example.load_pretrained(str(example.SMOKE_MODEL), dtype='float32')\n"
-               "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
-               "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n")
-    finished = subprocess.run([sys.executable, "-c", program, str(tmp_path)], cwd=REPO_ROOT, env=single_device(),
-                              capture_output=True, text=True, timeout=900)
+    program = (
+        "import collections, importlib.util, json, sys\n"
+        "from pathlib import Path\n"
+        "import jax\n"
+        "from dew.objectives.rl import RolloutScheduler\n"
+        "spec = importlib.util.spec_from_file_location('train_rlvr', 'examples/train_rlvr.py')\n"
+        "example = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = example\n"
+        "spec.loader.exec_module(example)\n"
+        "counts = []\n"
+        "schedule = RolloutScheduler.__call__\n"
+        "def counted(self, state, batch, key):\n"
+        "    packed = schedule(self, state, batch, key)\n"
+        "    counts.append(collections.Counter(f'{array.shape} {array.dtype}' for array in jax.live_arrays()))\n"
+        "    return packed\n"
+        "RolloutScheduler.__call__ = counted\n"
+        "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
+        "source = example.load_pretrained(str(example.SMOKE_MODEL), dtype='float32')\n"
+        "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
+        "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path)],
+        cwd=REPO_ROOT,
+        env=single_device(),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
     assert finished.returncode == 0, finished.stdout + finished.stderr
     counted = json.loads(finished.stdout.rsplit("counts ", 1)[1])
     expected = {f"{shape} {dtype}": copies * number for shape, number in counted["shapes"].items()
@@ -496,8 +522,15 @@ def test_no_trivial_program_passes_a_tenth_of_a_train_rlvr_task():
     import json
 
     example = load_example("train_rlvr")
-    trivial = {"a": lambda a, b: a, "b": lambda a, b: b, "min(a, b)": min, "max(a, b)": max,
-               "a + b": lambda a, b: a + b, "a * b": lambda a, b: a * b, "abs(a - b)": lambda a, b: abs(a - b)}
+    trivial = {
+        "a": lambda a, b: a,
+        "b": lambda a, b: b,
+        "min(a, b)": min,
+        "max(a, b)": max,
+        "a + b": lambda a, b: a + b,
+        "a * b": lambda a, b: a * b,
+        "abs(a - b)": lambda a, b: abs(a - b),
+    }
     cases = collections.Counter()
     passed = collections.defaultdict(collections.Counter)
     for row in map(json.loads, example.records(16_000, seed=0)):

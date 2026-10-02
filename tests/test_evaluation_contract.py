@@ -53,9 +53,26 @@ def test_image_mean_weights_each_image_once_across_unequal_batches():
 
 def test_perplexity_streams_weighted_targets_and_empty_contributions():
     metric = perplexity()
-    first = metric(TokenScores(np.array([[1., 4.]]), np.array([[1., .5]]), correct=np.zeros_like(np.array([[1., 4.]]), dtype=bool)), {})
-    empty = metric(TokenScores(np.array([[9.]]), np.array([[0.]]), correct=np.zeros_like(np.array([[9.]]), dtype=bool)), {})
-    last = metric(TokenScores(np.array([[2.]]), np.array([[3.]]), correct=np.zeros_like(np.array([[2.]]), dtype=bool)), {})
+    first = metric(
+        TokenScores(
+            np.array([[1.0, 4.0]]),
+            np.array([[1.0, 0.5]]),
+            correct=np.zeros_like(np.array([[1.0, 4.0]]), dtype=bool),
+        ),
+        {},
+    )
+    empty = metric(
+        TokenScores(
+            np.array([[9.0]]), np.array([[0.0]]), correct=np.zeros_like(np.array([[9.0]]), dtype=bool)
+        ),
+        {},
+    )
+    last = metric(
+        TokenScores(
+            np.array([[2.0]]), np.array([[3.0]]), correct=np.zeros_like(np.array([[2.0]]), dtype=bool)
+        ),
+        {},
+    )
     pooled = metric.merge(metric.merge(first, empty), last)
     assert metric.finalize(pooled) == pytest.approx(np.exp(9 / 4.5))
     with pytest.raises(ValueError, match="no counted target"):
@@ -75,15 +92,20 @@ def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objectiv
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=16, tie_embeddings=False,
                               dtype="float32", attention_impl="xla")
-    objective = objective_type(model, seq_len=8,
-                               samples=Samples(prompt=[1, 2], max_new_tokens=3, sampling=Sampling(temperature=0)))
+    objective = objective_type(
+        model, seq_len=8, samples=Samples(prompt=[1, 2], max_new_tokens=3, sampling=Sampling(temperature=0))
+    )
     policy = objective.init(jax.random.key(0))
     reference = objective.init(jax.random.key(1))
     key = jax.random.key(9)
     step = Step(step=jnp.asarray(0), key=key, ema=reference)
     preview = objective.preview(policy, {}, step)
-    expected = generate(model, policy, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)).tokens
-    frozen = generate(model, reference, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)).tokens
+    expected = generate(
+        model, policy, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)
+    ).tokens
+    frozen = generate(
+        model, reference, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)
+    ).tokens
     assert not np.array_equal(expected, frozen)
     np.testing.assert_array_equal(preview.tokens, expected)
 

@@ -457,7 +457,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
         trajectories.append(trajectory)
     for first, second in zip(*trajectories, strict=True):
         for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
-            np.testing.assert_allclose(np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE)
+            np.testing.assert_allclose(
+                np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE
+            )
 
 
 @pytest.mark.mesh
@@ -593,8 +595,10 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
     kernel = jnp.ones((8, 16, 16), jnp.float32)
     sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
     projections = {
-        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
-        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False),
+        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, "xla", None),
+        "pallas-fallback": lambda x, kernel: grouped_projection(
+            x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False
+        ),
     }
     for name, project in projections.items():
         def loss(x, kernel, project=project):

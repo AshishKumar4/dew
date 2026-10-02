@@ -23,9 +23,16 @@ from dew.objectives.rl.sessions import Call, Status, Task
 
 
 def trace(prompt, sampled, logprobs, reason="stop", *, started=0.0, version=None, **extra):
-    return {"prompt_token_ids": prompt, "completion_token_ids": sampled, "logprobs": logprobs,
-            "finish_reason": reason, "weight_version": version, "timestamp": started + 1.0, "latency_ms": 1000.0,
-            **extra}
+    return {
+        "prompt_token_ids": prompt,
+        "completion_token_ids": sampled,
+        "logprobs": logprobs,
+        "finish_reason": reason,
+        "weight_version": version,
+        "timestamp": started + 1.0,
+        "latency_ms": 1000.0,
+        **extra,
+    }
 
 
 def test_calls_follow_submission_order_and_carry_the_gateway_stamp():
@@ -35,7 +42,9 @@ def test_calls_follow_submission_order_and_carry_the_gateway_stamp():
     early["latency_ms"] = 5000.0
     early["timestamp"] = 5.0
     assert calls([late, early], unstamped=2).calls == (
-        Call((1, 2), (3, 4), (-1., -2.), "tool_calls", 2), Call((1, 2, 3, 4, 5), (6, 7), (-.5, -.25), "stop", 3))
+        Call((1, 2), (3, 4), (-1.0, -2.0), "tool_calls", 2),
+        Call((1, 2, 3, 4, 5), (6, 7), (-0.5, -0.25), "stop", 3),
+    )
 
 
 def test_a_trace_carries_vllms_routed_experts_into_its_call():
@@ -110,19 +119,34 @@ def refusal(message, code=400):
     return {**trace([], [], None, None), "raw_response": {"error": {"message": message, "code": code}}}
 
 
-@pytest.mark.parametrize(("refused", "status"), [
-    # Live refusals of a prompt past the context length, in each engine's own shape.
-    (overflow("sglang"), Status.TRUNCATED),
-    (overflow("vllm"), Status.TRUNCATED),
-    # vLLM 0.30.0's input processor (_validate_prompt_len), reached by token-id prompts.
-    (refusal("The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
-             "`max_model_len` is no smaller than the number of text tokens."), Status.TRUNCATED),
-    (refusal("The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer "
-             "than the maximum model length of 4096."), Status.TRUNCATED),
-    (refusal("EngineCore died", 500), Status.INFRA_ERROR),
-])
+@pytest.mark.parametrize(
+    ("refused", "status"),
+    [
+        # Live refusals of a prompt past the context length, in each engine's own shape.
+        (overflow("sglang"), Status.TRUNCATED),
+        (overflow("vllm"), Status.TRUNCATED),
+        # vLLM 0.30.0's input processor (_validate_prompt_len), reached by token-id prompts.
+        (
+            refusal(
+                "The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
+                "`max_model_len` is no smaller than the number of text tokens."
+            ),
+            Status.TRUNCATED,
+        ),
+        (
+            refusal(
+                "The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer "
+                "than the maximum model length of 4096."
+            ),
+            Status.TRUNCATED,
+        ),
+        (refusal("EngineCore died", 500), Status.INFRA_ERROR),
+    ],
+)
 def test_an_engine_error_is_an_event_that_decides_the_session(refused, status):
-    recorded = calls([trace([1, 2], [3], [-.5]), {**refused, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0)
+    recorded = calls(
+        [trace([1, 2], [3], [-0.5]), {**refused, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0
+    )
     assert recorded.calls == (Call((1, 2), (3,), (-.5,), "stop", 0),) and len(recorded.errors) == 1
     assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is status
 
@@ -133,31 +157,53 @@ ABORTED = Call((1,), (2,), (-.5,), "abort", 0)
 
 
 def result(exception=None, rewards=None):
-    return {"exception_info": {"exception_type": exception, "exception_message": "boom"} if exception else None,
-            "verifier_result": {"rewards": rewards} if rewards is not None else None}
+    return {
+        "exception_info": {"exception_type": exception, "exception_message": "boom"} if exception else None,
+        "verifier_result": {"rewards": rewards} if rewards is not None else None,
+    }
 
 
-@pytest.mark.parametrize(("trial", "records", "exit", "status", "reward"), [
-    (result(rewards={"reward": 1}), (STOP,), None, Status.COMPLETED, 1.0),
-    (result(rewards={"reward": 0}), (STOP,), None, Status.COMPLETED, 0.0),
-    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), None, Status.AGENT_ERROR, 0.0),
-    (result("AgentTimeoutError", {"reward": 1}), (STOP,), None, Status.TRUNCATED, 1.0),
-    (result("ContextWindowExceededError"), (STOP,), None, Status.TRUNCATED, None),
-    (result(rewards={"reward": 0}), (STOP, CUT), None, Status.TRUNCATED, 0.0),
-    (result(rewards={"reward": 0}), (STOP,), "LimitsExceeded", Status.TRUNCATED, 0.0),
-    (result(rewards={"reward": 1}), (STOP, ABORTED), None, Status.INFRA_ERROR, 1.0),
-    (result(rewards={"reward": 1}), (), None, Status.INFRA_ERROR, 1.0),
-    (result("EnvironmentStartTimeoutError"), (), None, Status.INFRA_ERROR, None),
-    (result("ApiConnectionClosedError", {"reward": 0}), (STOP,), None, Status.INFRA_ERROR, 0.0),
-    (result("RewardFileNotFoundError"), (STOP,), None, Status.INFRA_ERROR, None),
-    (result(rewards={"tests": 1, "style": 0}), (STOP,), None, Status.INFRA_ERROR, None),
-    # The harness's model client gave up (litellm exception names, recorded by mini-swe-agent as its
-    # exit status) and Harbor saw only a nonzero exit: an infrastructure fault, not a scored failure.
-    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "APIConnectionError", Status.INFRA_ERROR, 0.0),
-    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "ContextWindowExceededError",
-     Status.TRUNCATED, 0.0),
-    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "RepeatedFormatError", Status.AGENT_ERROR, 0.0),
-])
+@pytest.mark.parametrize(
+    ("trial", "records", "exit", "status", "reward"),
+    [
+        (result(rewards={"reward": 1}), (STOP,), None, Status.COMPLETED, 1.0),
+        (result(rewards={"reward": 0}), (STOP,), None, Status.COMPLETED, 0.0),
+        (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), None, Status.AGENT_ERROR, 0.0),
+        (result("AgentTimeoutError", {"reward": 1}), (STOP,), None, Status.TRUNCATED, 1.0),
+        (result("ContextWindowExceededError"), (STOP,), None, Status.TRUNCATED, None),
+        (result(rewards={"reward": 0}), (STOP, CUT), None, Status.TRUNCATED, 0.0),
+        (result(rewards={"reward": 0}), (STOP,), "LimitsExceeded", Status.TRUNCATED, 0.0),
+        (result(rewards={"reward": 1}), (STOP, ABORTED), None, Status.INFRA_ERROR, 1.0),
+        (result(rewards={"reward": 1}), (), None, Status.INFRA_ERROR, 1.0),
+        (result("EnvironmentStartTimeoutError"), (), None, Status.INFRA_ERROR, None),
+        (result("ApiConnectionClosedError", {"reward": 0}), (STOP,), None, Status.INFRA_ERROR, 0.0),
+        (result("RewardFileNotFoundError"), (STOP,), None, Status.INFRA_ERROR, None),
+        (result(rewards={"tests": 1, "style": 0}), (STOP,), None, Status.INFRA_ERROR, None),
+        # The harness's model client gave up (litellm exception names, recorded by mini-swe-agent as its
+        # exit status) and Harbor saw only a nonzero exit: an infrastructure fault, not a scored failure.
+        (
+            result("NonZeroAgentExitCodeError", {"reward": 0}),
+            (STOP,),
+            "APIConnectionError",
+            Status.INFRA_ERROR,
+            0.0,
+        ),
+        (
+            result("NonZeroAgentExitCodeError", {"reward": 0}),
+            (STOP,),
+            "ContextWindowExceededError",
+            Status.TRUNCATED,
+            0.0,
+        ),
+        (
+            result("NonZeroAgentExitCodeError", {"reward": 0}),
+            (STOP,),
+            "RepeatedFormatError",
+            Status.AGENT_ERROR,
+            0.0,
+        ),
+    ],
+)
 def test_a_trial_is_scored_masked_or_retried_by_how_it_ended(trial, records, exit, status, reward):
     classified = outcome(trial, records, harness_exit=exit)
     assert classified[:2] == (status, reward)
@@ -257,13 +303,22 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
         assert rollout.status is Status.COMPLETED and rollout.reward == 1.0 and rollout.task == "hello"
         # The session's own call, stamped by the gateway, came back to its own sample.
         assert rollout.calls == (Call((1, 2), (10 + rollout.sample,), (-.5,), "stop", 7),)
-        seen = json.loads((tmp_path / "trials" / f"dew-{rollout.group}-{rollout.sample}" / "seen.json").read_text())
+        seen = json.loads(
+            (tmp_path / "trials" / f"dew-{rollout.group}-{rollout.sample}" / "seen.json").read_text()
+        )
         url = seen["agent"]["OPENAI_BASE_URL"]
         session = url.removeprefix("http://172.17.0.1:9090/sessions/").removesuffix("/v1")
         # A sample's session carries a secret token, so a sandbox cannot address its siblings' sessions.
         assert re.fullmatch(rf"hello:{rollout.group}:{rollout.sample}:[0-9a-f]{{32}}", session)
         assert seen["agent"] == {"MSWEA_API_KEY": "none", "OPENAI_BASE_URL": url}
-        assert seen["arguments"][:6] == ["trials", "start", "-a", "mini-swe-agent", "-m", "hosted_vllm/policy"]
+        assert seen["arguments"][:6] == [
+            "trials",
+            "start",
+            "-a",
+            "mini-swe-agent",
+            "-m",
+            "hosted_vllm/policy",
+        ]
         assert ("DELETE", f"/sessions/{session}") in asked
 
 
@@ -290,7 +345,9 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
 def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_path, harbor):
     (tmp_path / "stubborn").mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", grace=1.0)
+    source = HarborSource(
+        gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", grace=1.0
+    )
     try:
         (future,) = source.submit(Task("stubborn", {HARBOR_KEY: str(tmp_path / "stubborn")}), 1, version=0)
         deadline = time.monotonic() + 30
@@ -307,7 +364,9 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
     gateway, _ = fake_gateway()
-    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", workers=1)
+    source = HarborSource(
+        gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", workers=1
+    )
     futures = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 2, version=0)
     deadline = time.monotonic() + 30
     while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
@@ -353,9 +412,11 @@ def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor
     gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
     source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials",
                           ready_timeout=3.0, ready_poll=0.01)
-    waiting = threading.Thread(target=lambda: pytest.raises(RuntimeError, source.submit,
-                                                            Task("hello", {HARBOR_KEY: str(tmp_path / "task")}),
-                                                            1, version=0))
+    waiting = threading.Thread(
+        target=lambda: pytest.raises(
+            RuntimeError, source.submit, Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0
+        )
+    )
     waiting.start()
     time.sleep(0.3)
     began = time.monotonic()

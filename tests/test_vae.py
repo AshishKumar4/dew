@@ -100,7 +100,10 @@ OFFLINE_CACHES = {
     "a recorded miss": ("bf16", [("bf16", "vae", 99.0, "missing"), ("flax", "vae", 0.25, "cached")]),
     "ambiguous": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("flax", "vae", 0.25, "unknown")]),
     # The flax layout's bf16/vae against the torch layout's default-branch vae.
-    "ambiguous across layouts": ("bf16", [("bf16", "vae", 99.0, "unknown"), ("main", "vae", 0.25, "unknown")]),
+    "ambiguous across layouts": (
+        "bf16",
+        [("bf16", "vae", 99.0, "unknown"), ("main", "vae", 0.25, "unknown")],
+    ),
 }
 
 

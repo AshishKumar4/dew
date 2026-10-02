@@ -33,7 +33,12 @@ def network(name: str, label=LABEL):
 
     def velocity(x, rf):
         time = rf.reshape(-1, 1, 1, 1, 1)
-        return jnp.tanh(x) * strength + jnp.sin(2 * time) * x * 0.3 + (0.1 + time) * label.reshape(-1, 1, 1, 1, 1)
+        return (
+            jnp.tanh(x) * strength
+            + jnp.sin(2 * time) * x * 0.3
+            + (0.1 + time) * label.reshape(-1, 1, 1, 1, 1)
+        )
+
     return velocity
 
 
@@ -182,8 +187,13 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     fast = tmp_path / "fast"
     fast.mkdir()
-    dataclasses.replace(teacher_run, model=dataclasses.replace(teacher_run.model, config={
-        key: value for key, value in teacher_run.model.config.items() if key != "time_scale"})).save(str(fast))
+    dataclasses.replace(
+        teacher_run,
+        model=dataclasses.replace(
+            teacher_run.model,
+            config={key: value for key, value in teacher_run.model.config.items() if key != "time_scale"},
+        ),
+    ).save(str(fast))
     with pytest.raises(ValueError, match="time_scale=16"):
         dataclasses.replace(teacher_run, distill=ConsistencyDistillation(teacher=str(fast))).build()
 

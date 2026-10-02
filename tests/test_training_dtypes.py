@@ -134,7 +134,9 @@ def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=Fa
 ON_TPU = jax.default_backend() == "tpu"
 
 
-def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None):
+def exercise_updates_and_resume(
+    tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None
+):
     objective = DenseObjective(parameter_kind, loss_kind)
     if ON_TPU and "64" in parameter_kind:
         with pytest.raises(ValueError, match="a TPU has no float64"):
@@ -171,7 +173,9 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
             def average(old, new):
                 work = np.float64 if old.dtype == jnp.float64 or new.dtype == jnp.float64 else np.float32
                 weight = np.asarray(ema_decay, work)
-                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(new, work)
+                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(
+                    new, work
+                )
                 return value.astype(old.dtype)
             expected_ema = jax.tree.map(average, expected_ema, {"params": expected_params})
         for micro in range(k):
@@ -244,7 +248,8 @@ def test_router_reductions_preserve_float64_scores(seq_aux):
         expected_gradient = np.broadcast_to(coefficients, values.shape)
         expected = np.sum(values * expected_gradient)
         loss, gradient = jax.value_and_grad(
-            lambda scores: deepseek_v2_aux_loss(scores, jnp.asarray(indices), .2, seq_aux))(jnp.asarray(values))
+            lambda scores: deepseek_v2_aux_loss(scores, jnp.asarray(indices), 0.2, seq_aux)
+        )(jnp.asarray(values))
         np.testing.assert_allclose(loss, expected, rtol=0, atol=1e-15)
         np.testing.assert_allclose(gradient, expected_gradient, rtol=0, atol=1e-15)
 

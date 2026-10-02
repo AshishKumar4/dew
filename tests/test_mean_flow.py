@@ -47,14 +47,21 @@ def test_the_loss_is_the_references(power):
     classes = jnp.asarray(case["classes"])
     inside = ((t >= settings["t_start"]) & (t <= settings["t_end"])).reshape(-1, 1, 1, 1)
     null = jnp.full_like(classes, settings["num_classes"])
-    guided = guided_velocity(v, tiny(z, t, 0 * t, null), tiny(z, t, 0 * t, classes),
-                             jnp.where(inside, settings["omega"], 1.0), jnp.where(inside, settings["kappa"], 0.0))
+    guided = guided_velocity(
+        v,
+        tiny(z, t, 0 * t, null),
+        tiny(z, t, 0 * t, classes),
+        jnp.where(inside, settings["omega"], 1.0),
+        jnp.where(inside, settings["kappa"], 0.0),
+    )
     # Both sides run the same float32 JAX operations in the same order, up
     # to the association of the three-term sum: a few ulps.
     np.testing.assert_allclose(np.asarray(guided), case["guided"], rtol=1e-5, atol=1e-6)
 
     labels = jnp.asarray(case["labels"])
-    u, target = mean_flow_target(lambda z, t, r: tiny(z, t, t - r, labels), z, t, r, jnp.asarray(case["dropped"]))
+    u, target = mean_flow_target(
+        lambda z, t, r: tiny(z, t, t - r, labels), z, t, r, jnp.asarray(case["dropped"])
+    )
     loss = jnp.mean(adaptive_loss(u, target, settings["norm_p"], settings["norm_eps"]))
     np.testing.assert_allclose(float(loss), float(case["loss"]), rtol=1e-5)
 
@@ -66,8 +73,12 @@ def test_the_first_fraction_of_rows_is_instantaneous():
 
 
 def objective(**fields):
-    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
-    inputs = InputSpec(Field("image", (4, 4, 3)), {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    model = models.SimpleDiT(
+        patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True
+    )
+    inputs = InputSpec(
+        Field("image", (4, 4, 3)), {"textcontext": Condition(CharTable.from_pretrained("char_table"))}
+    )
     return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None, **fields)
 
 
@@ -85,7 +96,9 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 4, 4, 3), 0, 256), np.uint8),
              **task.inputs.tokenize(["a", "b", "c", "d"])}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    grads = jax.grad(lambda tree: scalar_loss(task, {**params, "params": tree}, batch, step)[0])(params["params"])
+    grads = jax.grad(lambda tree: scalar_loss(task, {**params, "params": tree}, batch, step)[0])(
+        params["params"]
+    )
     duration = grads["conditioning"]["duration_embed"]
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(duration))) > 0
 
@@ -117,12 +130,23 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
-                          dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=presets.MeanFlow(), sampler=Euler(), guidance=None,
-        sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        model=ModelConfig(
+            "simple_dit",
+            {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
+            dtype="float32",
+            attention_impl="xla",
+        ),
+        data=OxfordFlowers(image_size=4),
+        preset=presets.MeanFlow(),
+        sampler=Euler(),
+        guidance=None,
+        sampling_steps=2,
+        ema_decay=None,
+        val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        mean_flow=MeanFlowTraining(omega=2.0, kappa=0.5))
+        mean_flow=MeanFlowTraining(omega=2.0, kappa=0.5),
+    )
     task = config.build()
     assert isinstance(task, MeanFlowObjective) and task.model.interval
     trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
@@ -135,7 +159,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     checkpoints.wait()
     config.save(str(run))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
-    np.testing.assert_array_equal(TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected)
+    np.testing.assert_array_equal(
+        TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected
+    )
 
 
 def test_a_meanflow_run_samples_unguided():
@@ -147,7 +173,9 @@ def test_a_meanflow_run_samples_unguided():
 
 @pytest.mark.parametrize("extra", [{"uncertainty": 8}])
 def test_meanflow_refuses_the_denoising_losss_extras(extra):
-    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
+    model = models.SimpleDiT(
+        patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True
+    )
     with pytest.raises(ValueError, match="own loss"):
         MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))), **extra)
 
@@ -155,8 +183,9 @@ def test_meanflow_refuses_the_denoising_losss_extras(extra):
 def test_the_time_embeddings_take_the_models_time_scale():
     """`time_scale` sets the Fourier frequencies of the time and the duration
     embeddings, the smoothness a loss differentiating in time needs."""
-    model = models.SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True,
-                             time_scale=0.002)
+    model = models.SimpleDiT(
+        patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True, time_scale=0.002
+    )
     variables = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
     table = np.random.RandomState(42).normal(size=(8,)).astype(np.float32) * np.float32(0.002)
     for name in ("time_embed", "duration_embed"):

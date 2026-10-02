@@ -318,8 +318,13 @@ def test_token_loader_stride_changes_training_windows_only(tmp_path):
     seq_len, batch = 4, 4
     _token_dir(tmp_path, train_tokens=17, val_tokens=17, body=np.arange(34))
     default = _windows(tmp_path, seq_len=seq_len, seed=17).load(batch=batch)
-    positional = TokenWindows(str(tmp_path), seq_len, None, seed=17,
-                              loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).load(batch=batch)
+    positional = TokenWindows(
+        str(tmp_path),
+        seq_len,
+        None,
+        seed=17,
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+    ).load(batch=batch)
     explicit = _windows(tmp_path, seq_len=seq_len, stride=seq_len, seed=17).load(batch=batch)
     overlap = _windows(tmp_path, seq_len=seq_len, stride=1, seed=17).load(batch=batch)
     assert overlap.records == 13 and overlap.steps_per_epoch == 3
@@ -439,7 +444,9 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def by_record(worker_count):
-        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(batch=4)
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(
+            batch=4
+        )
         out = {}
         for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
             for row in b["text"]:

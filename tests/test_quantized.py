@@ -777,8 +777,10 @@ def test_deepseek_v3_kv_a_proj_dequantizes_like_the_reference():
 @pytest.mark.network
 @pytest.mark.parametrize("repo, scale_fmt", SOURCES,
                          ids=["deepseek-v3", "deepseek-v32-exp"])
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="reads two tensors of a DeepSeek checkpoint from the hub; DEW_NETWORK_TESTS=1 runs it")
+@pytest.mark.skipif(
+    os.environ.get("DEW_NETWORK_TESTS") != "1",
+    reason="reads two tensors of a DeepSeek checkpoint from the hub; DEW_NETWORK_TESTS=1 runs it",
+)
 def test_the_encoder_reproduces_the_bytes_deepseek_shipped(repo, scale_fmt):
     """The oracle no synthetic weight can stand in for. DeepSeek's own
     quantizer wrote the shipped pair, so dequantizing it and running this

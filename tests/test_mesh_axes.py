@@ -328,8 +328,11 @@ def test_an_image_batch_never_takes_the_sequence_axis():
 def test_build_mesh_rejects_sizes_the_devices_cannot_hold():
     """The refusal names the axes the spec splits and their product against
     the devices, not the axes it leaves at one."""
-    with pytest.raises(ValueError, match=rf"^fsdp 4 x tensor 2 x sequence 3 is 24 devices a data "
-                                         rf"replica, which does not divide the {jax.device_count()} devices$"):
+    with pytest.raises(
+        ValueError,
+        match=rf"^fsdp 4 x tensor 2 x sequence 3 is 24 devices a data "
+        rf"replica, which does not divide the {jax.device_count()} devices$",
+    ):
         build_mesh(MeshSpec(fsdp=4, tensor=2, sequence=3))
 
 
@@ -485,7 +488,18 @@ COLLECTIVE = re.compile(
     r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
 ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
 TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
-ITEMSIZE = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8, "s64": 8}
+ITEMSIZE = {
+    "pred": 1,
+    "s8": 1,
+    "u8": 1,
+    "bf16": 2,
+    "f16": 2,
+    "f32": 4,
+    "s32": 4,
+    "u32": 4,
+    "f64": 8,
+    "s64": 8,
+}
 
 
 def collectives(spec, model):
@@ -521,15 +535,21 @@ def step_text(spec, model):
     objective = LMObjective(model, SEQ_LEN)
     initial = jax.eval_shape(objective.init, jax.random.key(0))
     shardings = Layout(min_shard=TINY_SHARD).shardings(mesh, initial)
-    tokens = jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32,
-                                  sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"])
+    tokens = jax.ShapeDtypeStruct(
+        (BATCH, SEQ_LEN + 1),
+        jnp.int32,
+        sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"],
+    )
 
     def loss(params, rest, text):
         return scalar_loss(objective, {**rest, "params": params}, {"text": text},
                            Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))[0]
 
-    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-                          initial, shardings)
+    placed = jax.tree.map(
+        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+        initial,
+        shardings,
+    )
     rest = {name: value for name, value in placed.items() if name != "params"}
     with jax.set_mesh(mesh):
         # The gradient lands where its parameter is, as the optimizer reads it.

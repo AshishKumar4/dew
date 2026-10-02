@@ -39,9 +39,17 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     import orbax.checkpoint as ocp
 
     def state(width, step):
-        return TrainState(step=jnp.asarray(step), microstep=jnp.asarray(step), updates=jnp.asarray(step),
-                          params={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
-                          opt_state=(), ema=None, key=jax.random.key(0), scale=None, window_size=jnp.asarray(1))
+        return TrainState(
+            step=jnp.asarray(step),
+            microstep=jnp.asarray(step),
+            updates=jnp.asarray(step),
+            params={"params": {"weight": jnp.arange(width, dtype=jnp.float32)}},
+            opt_state=(),
+            ema=None,
+            key=jax.random.key(0),
+            scale=None,
+            window_size=jnp.asarray(1),
+        )
 
     checkpoints = Checkpoints(str(tmp_path))
     first = state(3, 3)
@@ -117,7 +125,9 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
         frozen_state, frozen_loss, *_ = frozen_step(frozen_state, batch)
         assert bool(accepted) and state.ema is None
         np.testing.assert_allclose(loss, frozen_loss, rtol=1e-6)
-        for got, want in zip(jax.tree.leaves(state.params), jax.tree.leaves(frozen_state.params), strict=True):
+        for got, want in zip(
+            jax.tree.leaves(state.params), jax.tree.leaves(frozen_state.params), strict=True
+        ):
             np.testing.assert_array_equal(got, want)
     for got, want in zip(jax.tree.leaves(frozen_state.ema), jax.tree.leaves(reference), strict=True):
         np.testing.assert_array_equal(got, want)

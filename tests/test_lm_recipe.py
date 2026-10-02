@@ -619,7 +619,9 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
     task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
-    trained = recipe.build_block_objective(config, original.model, original.variables).pipeline(state, ema=False)
+    trained = recipe.build_block_objective(config, original.model, original.variables).pipeline(
+        state, ema=False
+    )
     prompt = [[4, 5, 6, 7]]
     np.testing.assert_array_equal(task(prompt, 4, key=9).host().tokens,
                                   trained(prompt, 4, key=9).host().tokens)

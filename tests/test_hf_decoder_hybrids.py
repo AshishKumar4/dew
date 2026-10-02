@@ -824,11 +824,15 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
     ba_kernel = np.asarray(params.pop("in_proj_ba")["kernel"])
     q, k, v, z = np.split(qkvz_kernel.reshape(16, 2, 2 * 4 + 2 * 2 * 6), [4, 8, 8 + 12], axis=-1)
     ba = ba_kernel.reshape(16, 2, 4)
-    regrouped = {**params,
-                 "in_proj_qkv": {"kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)},
-                 "in_proj_z": {"kernel": z.reshape(16, -1)},
-                 "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
-                 "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)}}
+    regrouped = {
+        **params,
+        "in_proj_qkv": {
+            "kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)
+        },
+        "in_proj_z": {"kernel": z.reshape(16, -1)},
+        "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
+        "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)},
+    }
     whole = {**regrouped,
              "in_proj_qkv": {"kernel": qkvz_kernel[:, :2 * 8 + 24]},
              "in_proj_z": {"kernel": qkvz_kernel[:, 2 * 8 + 24:]}}

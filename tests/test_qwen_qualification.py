@@ -89,7 +89,9 @@ def test_source_processor_and_forward_match_reference(source):
     loaded, inputs, reference = source
     np.testing.assert_array_equal(inputs.tokens, reference["input_ids"])
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    result = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    result = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
+        loaded.variables
+    )
     np.testing.assert_allclose(np.asarray(result)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
     np.testing.assert_array_equal(np.asarray(result)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
 
@@ -121,7 +123,9 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
         np.testing.assert_array_equal(before, after)
     output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    np.testing.assert_allclose(np.asarray(output)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(output)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0
+    )
     generated = generate(loaded.model, loaded.variables, inputs, 3, key=jax.random.key(1),
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
@@ -131,7 +135,9 @@ def test_moe_shared_gate_cannot_be_replaced_by_an_ungated_branch():
     loaded = load_pretrained(ROOT / "qwen38-moe-tiny", dtype="float32", attention_impl="reference")
     reference = np.load(ROOT / "qwen38-moe-tiny/reference.npz")
     wrong = loaded.model.clone(mixture=dataclasses.replace(loaded.model.mixture, shared_gate=False))
-    output = wrong.apply(loaded.variables, reference["input_ids"], attention_mask=reference["attention_mask"].astype(bool))
+    output = wrong.apply(
+        loaded.variables, reference["input_ids"], attention_mask=reference["attention_mask"].astype(bool)
+    )
     valid = reference["attention_mask"].astype(bool)
     with pytest.raises(AssertionError):
         np.testing.assert_allclose(np.asarray(output)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
@@ -152,7 +158,9 @@ def test_shipped_prediction_weights_match_published_composition(source):
                                       method=loaded.model.mtp_logits, **inputs.kwargs())[0]
     valid = reference["valid"]
     np.testing.assert_allclose(np.asarray(predictions)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
-    np.testing.assert_array_equal(np.asarray(predictions)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
+    np.testing.assert_array_equal(
+        np.asarray(predictions)[valid].argmax(-1), reference["logits"][valid].argmax(-1)
+    )
     changed = jax.tree.map(lambda value: value, loaded.variables)
     text = changed["params"].get("language_model", changed["params"])
     depth = text["mtp_0"]
@@ -218,7 +226,9 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
     predictions = restored.model.apply(restored.variables, hidden, inputs.tokens,
                                         method=restored.model.mtp_logits, **inputs.kwargs())[0]
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    np.testing.assert_allclose(np.asarray(logits)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(logits)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0
+    )
     np.testing.assert_allclose(np.asarray(predictions)[reference["valid"]],
                                reference["updated_mtp_logits"][reference["valid"]], atol=1e-4, rtol=0)
 
@@ -253,7 +263,9 @@ def test_timestamped_videos_and_images_share_the_reference_frame_order(video_sou
                               method=loaded.model.mtp_logits, **inputs.kwargs())[0]
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
     admitted = valid[:, :-1] & valid[:, 1:]
-    np.testing.assert_allclose(np.asarray(mtp)[admitted], reference["mtp_logits"][admitted], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(mtp)[admitted], reference["mtp_logits"][admitted], atol=1e-4, rtol=0
+    )
     wrong = dataclasses.replace(inputs, conditioning={
         **inputs.conditioning, "pixel_values": inputs.conditioning["pixel_values"][:, ::-1]})
     moved = loaded.model.apply(loaded.variables, wrong.tokens, **wrong.kwargs())
@@ -288,13 +300,25 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
     logits = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    np.testing.assert_allclose(np.asarray(logits)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(logits)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0
+    )
 
 
 def test_video_grid_and_modality_labels_are_checked_before_execution(video_source):
     loaded, _, reference = video_source
-    values = {key: reference[key] for key in ("input_ids", "attention_mask", "mm_token_type_ids",
-                                              "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")}
+    values = {
+        key: reference[key]
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "pixel_values",
+            "image_grid_thw",
+            "pixel_values_videos",
+            "video_grid_thw",
+        )
+    }
     with pytest.raises(ValueError, match="mm_token_type_ids"):
         loaded.processor.from_hf({**values, "mm_token_type_ids": np.zeros_like(values["input_ids"])})
     with pytest.raises(ValueError, match="video_grid_thw"):
@@ -351,7 +375,9 @@ def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source
 
 
 
-@pytest.mark.parametrize("field,value", [("mtp_num_hidden_layers", 2), ("mtp_use_dedicated_embeddings", True)])
+@pytest.mark.parametrize(
+    "field,value", [("mtp_num_hidden_layers", 2), ("mtp_use_dedicated_embeddings", True)]
+)
 def test_prediction_layouts_outside_the_released_contract_are_refused(field, value):
     config = json.loads((ROOT / "qwen38-source/moe/config.json").read_text())
     with pytest.raises(ValueError, match=field):

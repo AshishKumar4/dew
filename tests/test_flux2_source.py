@@ -119,7 +119,9 @@ def test_a_guided_checkpoint_refuses_a_call_without_guidance(source, arrays, rec
         model.apply({"params": params}, latent, times, DenoisingCondition(condition.context))
 
 
-@pytest.mark.parametrize("change", [{"patch_size": 2}, {"axes_dims_rope": [8, 8]}, {"axes_dims_rope": [4, 4, 4, 3]}])
+@pytest.mark.parametrize(
+    "change", [{"patch_size": 2}, {"axes_dims_rope": [8, 8]}, {"axes_dims_rope": [4, 4, 4, 3]}]
+)
 def test_an_unsupported_config_is_refused(source, change):
     config = json.loads((source / "dev" / "transformer" / "config.json").read_text())
     flux2_fields(config)
@@ -135,7 +137,9 @@ def nhwc(array):
 def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, arrays, name):
     autoencoder, params, layouts, _ = load_flux2_vae(source / name)
     tensors = component_tensors(source / name, "vae")
-    assert {layout.name for layout in layouts} == {f"vae/{key}" for key in tensors if not key.startswith("bn.")}
+    assert {layout.name for layout in layouts} == {
+        f"vae/{key}" for key in tensors if not key.startswith("bn.")
+    }
     image = nhwc(arrays[f"{name}.image"])
     latent = autoencoder.encode(params, image)
     assert latent.shape == (2, *autoencoder.latent_shape(image.shape[1:])) == (2, 4, 6, 16)
@@ -163,7 +167,9 @@ def test_the_published_autoencoder_matches_the_source():
     float32 distance from that result, or 1e-5."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py")
+    spec = importlib.util.spec_from_file_location(
+        "diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py"
+    )
     tool = importlib.util.module_from_spec(spec)
     # Its dataclasses resolve their module through sys.modules.
     sys.modules[spec.name] = tool
