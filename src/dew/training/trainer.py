@@ -1361,8 +1361,7 @@ class Trainer(Generic[Loss, Effects]):
         receives them; scalar reporting never triggers preview work.
         """
         selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
-        if stop is None or not isinstance(stop.metric, TrainingScalar):
-            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        self._preflight(dataset, stop, eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1782,6 +1781,18 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(evaluations[0], scores={name: value for report in evaluations for name, value in report.scores.items()},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
+    def _preflight(self, dataset: Dataset, stop, eval_every: int | None, metrics: Sequence[Metric], *,
+                   preview: bool) -> None:
+        """The refusals `fit` makes before it places anything: validation
+        nothing reads, and a pipeline's batch, whose placement could take
+        minutes or run out of memory before the error. Every other mesh's
+        batch is checked with its stream (`_check_stream`), a ramp's at each
+        of its stages."""
+        if stop is None or not isinstance(stop.metric, TrainingScalar):
+            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        if self.mesh.stage > 1:
+            self._check_batch(dataset.batch, self.device_mesh)
+
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
         """Refuse a validation cadence whose batches nothing would read.
@@ -1827,8 +1838,8 @@ class Trainer(Generic[Loss, Effects]):
         return agreed("profiling window setup", own_window)
 
     def _check_batch(self, batch: int, mesh: Mesh) -> None:
-        """Refuse, before a batch is placed or the step compiles, a global
-        batch the mesh cannot split (`batch_divisor`): its rows shard over the batch axes as whole
+        """Refuse, before anything is placed, a global batch the mesh cannot
+        split (`batch_divisor`): its rows shard over the batch axes as whole
         rows, and a pipeline cuts each device's rows again into M
         microbatches, where a device that holds none of a microbatch's rows
         computes another's again. The message names the row shards, and the
