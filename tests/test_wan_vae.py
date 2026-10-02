@@ -260,7 +260,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.registry import samplers
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
@@ -272,7 +272,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
         ),
         data=VideoDataset(frame_size=32, frames=9),
         trainer=TrainerConfig(batch_size=8, steps=1),
-        sampler=samplers.Euler(),
+        sampler=Euler(),
         sampling_steps=2,
         val_metrics=(),
         text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),

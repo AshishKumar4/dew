@@ -36,7 +36,6 @@ from dew.data.tokens import PackedWindows
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
-from dew.objectives.base import scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
@@ -1092,6 +1091,44 @@ def test_documents_packed_online_by_grain_keep_attention_inside_each_document(mo
                     f"row {row} position {query} attending to {key}")
 
 
+def test_the_packing_bins_are_part_of_the_order_a_position_counts_into():
+    """Which chunks share a window depends on how many bins the plan keeps
+    open. Two plans with as many windows were described alike, so a run
+    resumed under another bin count read other windows at the same count."""
+    lengths = np.asarray([3, 2, 1, 1])
+    documents = pygrain.MapDataset.source(
+        [{"text": np.full(length, index + 1, np.int32)} for index, length in enumerate(lengths)])
+    one, two = (PackedWindows(documents, lengths, 4, bins, "corpus") for bins in (1, 2))
+
+    assert len(one) == len(two) == 2
+    assert not np.array_equal(one[0]["text"], two[0]["text"]), "the plans differ"
+    assert describe(one) != describe(two)
+
+
+def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypatch):
+    """Each chunk of a document longer than the window read the whole
+    document and kept a slice: a D-token document cost D tokens per chunk,
+    D * ceil(D / window) a pass."""
+    documents = [list(range(1, 40)), [2, 3], list(range(5, 30))]
+    stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
+    _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
+    (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
+    data = _packed_tokens(tmp_path, seq_len=7, packing_bins=2).load(batch=2)
+
+    spans = []
+    read = TokenBytes.__getitem__
+
+    def recording(self, span):
+        spans.append(span.stop - span.start)
+        return read(self, span)
+
+    monkeypatch.setattr(TokenBytes, "__getitem__", recording)
+    windows = list(itertools.islice(data.train(DataPartition()), 10))
+
+    assert spans and max(spans) <= 8
+    assert all(batch["text"].shape == (2, 8) for batch in windows)
+
+
 def _counted_cross_entropy(batch, seq_len):
     """The objective's ce, and the same number computed by hand.
 
@@ -1105,7 +1142,7 @@ def _counted_cross_entropy(batch, seq_len):
     segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
     positions = jnp.asarray(batch["text_positions"], jnp.int32)
 
-    ce, _ = scalar_loss(objective, params, batch, Step(step=jnp.zeros((), jnp.int32),
+    ce, _ = objective.scalar_loss(params, batch, Step(step=jnp.zeros((), jnp.int32),
                                                 key=jax.random.key(1), ema=None))
 
     logits = model.apply(params, tokens[:, :-1], positions=positions[:, :-1],

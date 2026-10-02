@@ -101,6 +101,32 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
     assert calls[1]["presence_penalty"] == 0.0 and calls[1]["guided_regex"] == "[a-z]+"
 
 
+def test_a_policys_penalties_reach_the_wire_where_they_mean_the_same_and_refuse_elsewhere(clients):
+    """Presence and frequency penalties are OpenAI's, which Dew's follow, and
+    vLLM's repetition penalty is Transformers'; controls a remote engine
+    applies differently (Ollama's windowed penalties, stripped stop strings)
+    are refused rather than dropped."""
+    from dataclasses import replace
+
+    task, calls = clients(
+        "openai", lambda http, request, body: http.Response(200, json=response([choice(0, "ok")]))
+    )
+    penalized = Sampling(temperature=0.7, presence_penalty=0.5, frequency_penalty=0.25)
+    task("prompt", 5, sampling=penalized)
+    assert (calls[0]["presence_penalty"], calls[0]["frequency_penalty"]) == (0.5, 0.25)
+    with pytest.raises(ValueError, match="repetition-penalty"):
+        task("prompt", 5, sampling=Sampling(repetition_penalty=1.1))
+    replace(task, provider="vllm")("prompt", 5, sampling=Sampling(repetition_penalty=1.1))
+    assert calls[1]["repetition_penalty"] == 1.1
+    for unmatched in ({"stop": ("\n",)}, {"no_repeat_ngram_size": 3}, {"typical_p": 0.9}):
+        with pytest.raises(ValueError, match=next(iter(unmatched))):
+            replace(task, provider="vllm")("prompt", 5, sampling=Sampling(**unmatched))
+    ollama, sent = clients("ollama", lambda http, request, body: http.Response(200, json={"response": "ok"}))
+    with pytest.raises(ValueError, match="presence_penalty"):
+        ollama("prompt", 5, sampling=penalized)
+    assert len(calls) == 2 and not sent
+
+
 @pytest.mark.parametrize("kind", ["ollama", "openai"])
 def test_integer_and_jax_keys_reach_the_same_native_wire_seed(clients, kind):
     import jax

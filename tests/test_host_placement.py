@@ -442,14 +442,10 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
 def test_a_pipeline_over_stages_refuses_a_banked_store():
     """A pipeline stacks every stage's copy of a layer, which a store already
     banked by run cannot be reshaped into."""
-    from dew.training.distributed import build_mesh
 
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
-    with (
-        jax.set_mesh(build_mesh(MeshSpec(stage=2))),
-        pytest.raises(ValueError, match="already banked by run"),
-    ):
+    with jax.set_mesh(MeshSpec(stage=2).build()), pytest.raises(ValueError, match="already banked by run"):
         scanned.apply(on_host, tokens)
 
 

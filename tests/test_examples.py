@@ -414,7 +414,7 @@ def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
-    `evaluate` scores over the held-out split, a greedy continuation, and a
+    `Evaluation.run` scores over the held-out split, a greedy continuation, and a
     served comparison that neither SDK can reach. An installed SDK reports
     the endpoint unreachable, an absent one is skipped, and neither needs an
     OpenAI key, which the smoke's environment does not carry."""

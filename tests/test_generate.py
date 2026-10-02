@@ -306,10 +306,10 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     compiler's choice."""
     from dew.nn.inputs import BATCH_AXES
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import batch_shardings, build_mesh
+    from dew.training.distributed import batch_shardings
 
     model = tiny(max_seq_len=8)
-    mesh = build_mesh(MeshSpec(fsdp=2))
+    mesh = MeshSpec(fsdp=2).build()
     params = model.init(rng, jnp.ones((2, 4), jnp.int32))
     placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
     prompt = jax.random.randint(rng, (8, 3), 0, VOCAB)
@@ -336,10 +336,9 @@ def test_row_padding_pads_prompts_and_hands_back_only_their_continuations(rng):
     global array, which is why `rows` counts real prompts times `n`."""
     from dew.nn.inputs import BATCH_AXES, local_rows
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     model = tiny(max_seq_len=8)
-    mesh = build_mesh(MeshSpec(fsdp=2))
+    mesh = MeshSpec(fsdp=2).build()
     params = model.init(rng, jnp.ones((2, 4), jnp.int32))
     placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
     prompt = jax.random.randint(rng, (5, 3), 0, VOCAB)

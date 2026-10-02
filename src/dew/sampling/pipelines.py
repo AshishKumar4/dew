@@ -127,7 +127,7 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)`.
+    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=Heun(), key=key)`.
 
     `params` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
@@ -612,7 +612,7 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | str | Non
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
     target = resolve_dtype(param_dtype)
     checkpoints = Checkpoints(directory)
@@ -623,7 +623,7 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | str | Non
     averaged = stored.get("ema") is not None if ema is None else ema
     if averaged:
         template["ema"] = stored["ema"]
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
     chosen_layout = DefaultLayout() if layout is None else layout
     placement = chosen_layout.shardings(device_mesh, template)
     chosen_layout.check(template["params"], placement["params"], device_mesh)

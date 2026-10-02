@@ -258,7 +258,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, OxfordFlowers
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.registry import samplers
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
@@ -270,7 +270,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
         ),
         data=OxfordFlowers(image_size=64),
         trainer=TrainerConfig(batch_size=8, steps=2),
-        sampler=samplers.Euler(),
+        sampler=Euler(),
         sampling_steps=2,
         text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(

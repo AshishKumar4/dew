@@ -13,9 +13,10 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
@@ -25,9 +26,9 @@ ids = np.array(tokenizer.encode("One day, Lily saw a big dog in the park. "
 rows = np.stack([ids[i:i + 65] for i in range(0, 16 * 64, 64)])
 data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
                records=16, batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=128)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
@@ -142,10 +143,9 @@ Results hold global arrays sharded by row, including any filler rows added so th
 ```python
 import jax
 
-from dew import models
 from dew.inference import SafetensorsBanks, stream_banked
 from dew.interop.hf_decoders import translate_config
-from dew.registry import with_precision
+from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
@@ -199,9 +199,20 @@ A call takes `key`, either an integer seed or a JAX key; `key=n` means `jax.rand
 |---|---|
 | `max_new_tokens` | Continuation budget. A checkpoint can set a default in `generation_config.json`; if it declares only `max_length`, the budget is that total length minus the padded prompt width. A budget in the call wins. Without any, the call must pass one. |
 | `n` | Continuations per prompt, a positive integer. The checkpoint's `num_return_sequences` becomes the default, whatever sampling policy you pass; otherwise 1. `n` in the call wins in both directions. |
-| `sampling` | `Sampling`: temperature (default 1.0; 0 is argmax), top-k, top-p, min-p, EOS IDs and the output padding ID. |
+| `sampling` | `Sampling`: temperature (default 1.0; 0 is argmax), top-k, top-p, min-p, typical-p, the repetition, presence and frequency penalties, `no_repeat_ngram_size`, `min_new_tokens`, `stop` strings, EOS IDs and the output padding ID. |
 
-Building a task from source defaults raises if an unsupported control is active, such as a repetition penalty or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` holds a default solver, guidance and step count; a call can override any of them, and `guidance=None` turns off classifier-free guidance.
+`task.sampling` holds the policy a loaded checkpoint's `generation_config.json` declares. To change one control, replace it on that value; the others, the source's EOS IDs included, still apply:
+
+```python
+from dataclasses import replace
+
+policy = replace(task.sampling, repetition_penalty=1.1, stop=("\n\n",))
+result = task("The capital of France is", 64, sampling=policy, key=0)
+```
+
+A fresh `Sampling(...)` in a call replaces the whole policy, except that the EOS and padding IDs it leaves `None` are the task's, because they belong to the model and its tokenizer. `stop` strings compile once against the task's processor, which a task needs for them. The controls run in Transformers' order whatever order you name them in. `logits=` stays the full override: `logits=policy.transforms() + (my_transform,)` adds a transform of your own to the chain the policy compiles to.
+
+Building a task from source defaults raises if an unsupported control is active, such as DoLa or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` holds a default solver, guidance and step count; a call can override any of them, and `guidance=None` turns off classifier-free guidance.
 
 Every result array has `n` rows per prompt, in prompt order. `result.rows` is this process's real prompts times `n`. `Generation.text` returns one string per row in the same order, and each row has its own length, termination flag and likelihoods (`behavior_log_probs`, and `raw_log_probs` for the raw policy). `Generation.text` and `CanvasGeneration.text` decode the first time they are read and cache the strings; a result with no processor raises when asked for text. A tokenizer without a pad token needs no change: Dew tokenizes without padding, then pads the numeric rows and masks at the boundary `RunProcessor` uses.
 

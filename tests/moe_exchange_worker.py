@@ -12,7 +12,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.moe import ExpertMLP
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 
 def main() -> None:
@@ -21,7 +21,7 @@ def main() -> None:
                                process_id=rank, local_device_ids=[0], initialization_timeout=30)
     from test_moe_exchange import objective, routing_case
 
-    mesh = build_mesh(MeshSpec(expert=2))
+    mesh = MeshSpec(expert=2).build()
     split = NamedSharding(mesh, P('expert'))
     replicated = NamedSharding(mesh, P())
     errors: dict[str, list[float]] = {}

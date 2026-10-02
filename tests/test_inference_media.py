@@ -114,7 +114,6 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
 @pytest.mark.parametrize("family", ["diffusion-gemma-workflow", "gemma3-native-tiny"])
 def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     directory = FIXTURE.parent / family
     loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
@@ -131,7 +130,7 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
         task = loaded.text_generation()
     host_inputs = jax.tree.map(np.asarray, inputs)
     resident = replace(host_inputs, conditioning=jax.tree.map(jnp.asarray, host_inputs.conditioning))
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     variables = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
     task = task.bind(variables)
     key = jax.random.key(7)

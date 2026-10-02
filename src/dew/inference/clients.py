@@ -177,8 +177,14 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     if sampling is not None:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.eos_id is not None or sampling.pad_id != 0:
+        if sampling.eos_id is not None or sampling.pad != 0:
             raise ValueError("Ollama text completion cannot implement native EOS-token or padding IDs")
+        unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"Ollama text completion cannot implement {unmatched} as Dew does: its "
+                             "penalties read a window of recent tokens, and it strips stop strings "
+                             "from the text")
         native: dict[str, object] = {"temperature": sampling.temperature,
                                      "top_k": 0 if sampling.top_k is None else sampling.top_k,
                                      "top_p": sampling.top_p, "min_p": sampling.min_p,
@@ -468,16 +474,25 @@ class OpenAICompletion:
             return fields
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.pad_id != 0:
+        if sampling.pad != 0:
             raise ValueError("remote text completion does not implement padded token rows")
+        unmatched = sampling.active(("no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "
+                             "an OpenAI-compatible server strips stop strings from the text")
         if self.provider == "openai" and (
             sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None
+            or sampling.repetition_penalty != 1.0
         ):
-            raise ValueError("top-k, min-p and EOS-token controls require provider='vllm' or 'sglang'")
+            raise ValueError("top-k, min-p, repetition-penalty and EOS-token controls require "
+                             "provider='vllm' or 'sglang'")
+        # Presence and frequency penalties are OpenAI's own, which Dew's follow.
         native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
-                                     "frequency_penalty": 0.0, "presence_penalty": 0.0}
+                                     "frequency_penalty": sampling.frequency_penalty,
+                                     "presence_penalty": sampling.presence_penalty}
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
-                                      "min_p": sampling.min_p, "repetition_penalty": 1.0}
+                                      "min_p": sampling.min_p,
+                                      "repetition_penalty": sampling.repetition_penalty}
         if sampling.eos_id is not None:
             controls["stop_token_ids"] = (
                 list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]

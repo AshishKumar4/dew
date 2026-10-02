@@ -25,7 +25,7 @@ from flax.traverse_util import unflatten_dict
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -96,7 +96,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
 
-    loss, aux = scalar_loss(objective, params, fixture_batch(arrays), step_at())
+    loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
 
     scaled_close(loss, arrays[f"{kind}/loss"], 1e-4)
     for metric, name in (("ce", "hard_loss"), ("distill/soft_loss", "soft_loss"),
@@ -126,8 +126,8 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     scaled_close(logits, arrays["student_logits"], 1e-5)
     expected, = pullback((jnp.asarray(arrays[f"{kind}/d_student_logits"], jnp.float32),
                           jnp.asarray(arrays[f"{kind}/d_student_features"], jnp.float32)))
-    actual = jax.grad(lambda trainable: scalar_loss(
-        objective, {**params, "params": trainable}, batch, step_at())[0])(params["params"])
+    actual = jax.grad(lambda trainable: objective.scalar_loss(
+        {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
     expected_leaves = dict(jax.tree_util.tree_leaves_with_path(expected))
     actual_leaves = dict(jax.tree_util.tree_leaves_with_path(actual))
@@ -162,14 +162,14 @@ def test_a_scheduled_weight_reads_the_step():
     arrays = fixture()
     batch = fixture_batch(arrays)
     scheduled, params = fixture_objective(arrays, alpha=optax.linear_schedule(0.6, 0.1, 100))
-    at_start = float(scalar_loss(scheduled, params, batch, step_at(0))[0])
-    at_end = float(scalar_loss(scheduled, params, batch, step_at(100))[0])
-    between = float(scalar_loss(scheduled, params, batch, step_at(50))[0])
+    at_start = float(scheduled.scalar_loss(params, batch, step_at(0))[0])
+    at_end = float(scheduled.scalar_loss(params, batch, step_at(100))[0])
+    between = float(scheduled.scalar_loss(params, batch, step_at(50))[0])
 
     first, _ = fixture_objective(arrays, alpha=0.6)
     last, _ = fixture_objective(arrays, alpha=0.1)
-    assert at_start == pytest.approx(float(scalar_loss(first, params, batch, step_at(0))[0]), rel=1e-6)
-    assert at_end == pytest.approx(float(scalar_loss(last, params, batch, step_at(0))[0]), rel=1e-6)
+    assert at_start == pytest.approx(float(first.scalar_loss(params, batch, step_at(0))[0]), rel=1e-6)
+    assert at_end == pytest.approx(float(last.scalar_loss(params, batch, step_at(0))[0]), rel=1e-6)
     assert min(at_start, at_end) < between < max(at_start, at_end)
 
 
@@ -180,12 +180,12 @@ def test_alpha_zero_without_features_is_the_students_own_loss():
     batch = fixture_batch(arrays)
     hard, params = fixture_objective(arrays, alpha=0.0, beta=0.0, features=())
     assert PROJECTIONS not in params["params"]
-    own, _ = scalar_loss(hard.student, hard.student_variables(params), batch, step_at())
-    mixed, _ = scalar_loss(hard, params, batch, step_at())
+    own, _ = hard.student.scalar_loss(hard.student_variables(params), batch, step_at())
+    mixed, _ = hard.scalar_loss(params, batch, step_at())
     assert float(mixed) == float(own)
 
     soft, _ = fixture_objective(arrays, alpha=1.0, beta=0.0, features=())
-    loss, aux = scalar_loss(soft, params, batch, step_at())
+    loss, aux = soft.scalar_loss(params, batch, step_at())
     assert float(loss) == pytest.approx(float(aux.metrics["distill/soft_loss"]), rel=1e-6)
     assert float(loss) == pytest.approx(META["temperature"] ** 2 * float(aux.metrics["distill/kl"]), rel=1e-6)
 
@@ -201,8 +201,8 @@ def test_a_pair_of_equal_widths_needs_no_projection():
     assert PROJECTIONS not in params["params"]
 
     batch = fixture_batch(fixture())
-    with_feature, aux = scalar_loss(objective, params, batch, step_at())
-    without, _ = scalar_loss(DistillationObjective(student, teacher), params, batch, step_at())
+    with_feature, aux = objective.scalar_loss(params, batch, step_at())
+    without, _ = DistillationObjective(student, teacher).scalar_loss(params, batch, step_at())
     assert float(aux.metrics["distill/feature"]) > 0
     assert float(with_feature) == pytest.approx(
         float(without) + float(aux.metrics["distill/feature"]), rel=1e-6
@@ -240,7 +240,7 @@ def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher
     params = objective.init(jax.random.key(0))
     tokens = jnp.zeros_like(fixture_batch(fixture())[TEXT_KEY])
     with pytest.raises(ValueError, match="share a tokenizer and a vocabulary"):
-        scalar_loss(objective, params, {TEXT_KEY: tokens}, step_at())
+        objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
 
 
 def test_a_student_with_the_router_balance_loss_is_refused():
@@ -251,7 +251,7 @@ def test_a_student_with_the_router_balance_loss_is_refused():
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
     objective = DistillationObjective(student, teacher)
     with pytest.raises(ValueError, match="balance_rate"):
-        scalar_loss(objective, objective.init(jax.random.key(0)), fixture_batch(arrays), step_at())
+        objective.scalar_loss(objective.init(jax.random.key(0)), fixture_batch(arrays), step_at())
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +292,7 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     batch = {TEXT_KEY: jnp.tile(fixture_batch(arrays)[TEXT_KEY], (4, 1))}
     trainer = make_trainer(arrays)
     initial = trainer.initial_state()
-    before = float(scalar_loss(trainer.objective, initial.params, batch, step_at())[0])
+    before = float(trainer.objective.scalar_loss(initial.params, batch, step_at())[0])
 
     state = trainer.fit(Data(batch), steps=5, log_every=1)
 
@@ -303,7 +303,7 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
         assert not np.array_equal(
             np.asarray(kernel), np.asarray(initial.params["params"][PROJECTIONS][name])
         ), name
-    after = float(scalar_loss(trainer.objective, state.params, batch, step_at())[0])
+    after = float(trainer.objective.scalar_loss(state.params, batch, step_at())[0])
     assert after < before, (before, after)
 
     make_trainer(arrays, tmp_path).fit(Data(batch), steps=3, log_every=1)
@@ -321,7 +321,7 @@ def test_the_student_tree_is_what_a_plain_student_run_reads():
     own = objective.student_variables(params)
     assert TEACHER not in own and PROJECTIONS not in own["params"]
     batch = fixture_batch(arrays)
-    _, aux = scalar_loss(objective, params, batch, step_at())
-    loss, _ = scalar_loss(objective.student, own, batch, step_at())
+    _, aux = objective.scalar_loss(params, batch, step_at())
+    loss, _ = objective.student.scalar_loss(own, batch, step_at())
     assert float(loss) == pytest.approx(float(aux.metrics["ce"]), rel=1e-6)
     assert objective.ema is None

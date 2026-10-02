@@ -28,17 +28,18 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer, Loading, PreferencePairs
 from dew.data.chat import Role
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
 from dew.sampling import Sampling
 
 tokenizer = ByteTokenizer()
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=64)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=64)
 base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 ```
 
@@ -199,8 +200,9 @@ import jax
 import numpy as np
 import optax
 
-from dew import Trainer, models
+from dew import Trainer
 from dew.data import Loading, PreferencePairs
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
 
 rows = [
@@ -214,8 +216,8 @@ spec = PreferencePairs(records=tuple(json.dumps(row) for row in rows * 4),
                        seq_len=row_width, pad_id=0,
                        loading=Loading(workers=0, threads=1, read_buffer=2))
 data = spec.load(batch=8)
-model = models.build("causal_transformer", vocab_size=8, emb_features=16, num_layers=1,
-                     num_heads=2, mlp_features=32, max_seq_len=row_width)
+model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                          num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 initial = trainer.initial_state()
@@ -506,14 +508,16 @@ import itertools
 import jax
 import numpy as np
 import optax
-from dew import Field, InputSpec, Trainer, models, presets
+from dew import Field, InputSpec, Trainer
 from dew.data import Dataset
+from dew.diffusion.presets import Flow
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.rl import FlowGRPOObjective, FlowRollout
 
 inputs = InputSpec(Field("image", (4, 4, 1)))
-model = models.SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
-                         num_layers=1, num_heads=2, mlp_ratio=2)
-objective = FlowGRPOObjective(model, presets.Flow(), inputs,
+model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
+                  num_layers=1, num_heads=2, mlp_ratio=2)
+objective = FlowGRPOObjective(model, Flow(), inputs,
                               guidance=None, beta=0.01, steps=5)
 
 def brightness(images, batch):

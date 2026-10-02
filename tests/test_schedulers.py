@@ -381,7 +381,7 @@ def test_presets_rebuild_from_their_fields(rng):
     import dataclasses
 
     from dew.registry import presets as registry
-    preset = registry.Flow(shift=3.0, logit_mean=0.5, logit_std=0.7)
+    preset = presets.Flow(shift=3.0, logit_mean=0.5, logit_std=0.7)
     process = registry.build("flow", **dataclasses.asdict(preset))()
     times = jnp.array([0.05, 0.5, 0.95])
     alpha, sigma = process.schedule.rates(times)

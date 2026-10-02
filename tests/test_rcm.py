@@ -154,6 +154,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import OxfordFlowers
+    from dew.diffusion.presets import Flow
     from dew.objectives.base import Step
     from dew.objectives.diffusion import (
         ConsistencyDistillation,
@@ -162,15 +163,14 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
         TextCondition,
     )
     from dew.objectives.diffusion.objective import FAKE_SCORE, TEACHER
-    from dew.registry import presets, samplers
-    from dew.sampling import TextToImage
+    from dew.sampling import Consistency, Euler, TextToImage
     from dew.training import Trainer
 
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002},
                           dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
+        data=OxfordFlowers(image_size=4), preset=Flow(), sampler=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))
     teacher = teacher_run.build()
@@ -199,7 +199,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     config = dataclasses.replace(teacher_run, distill=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
-        max_simulation_steps=2), sampler=samplers.Consistency(), sampling_steps=3)
+        max_simulation_steps=2), sampler=Consistency(), sampling_steps=3)
     task = config.build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))

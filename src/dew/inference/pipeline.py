@@ -148,11 +148,11 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
     a frozen node can't be updated, so frozen nodes are first rebuilt as
     dicts over the same leaves.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
     from dew.training.host import stream
 
     variables = _updatable(variables)
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(device_mesh, variables)
     chosen_layout.check(variables, shardings, device_mesh)

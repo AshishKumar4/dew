@@ -1,19 +1,20 @@
 # Mixture of experts
 
-A mixture-of-experts (MoE) layer holds several feed-forward networks, called experts, in place of one. For each token, a router scores the experts, picks the `top_k` best and sums their outputs weighted by the router's scores. In Dew a `causal_transformer` becomes sparse through its `mixture` field, a `Mixture` value (`dew.nn.backbones.causal_transformer`) or a mapping of its fields.
+A mixture-of-experts (MoE) layer holds several feed-forward networks, called experts, in place of one. For each token, a router scores the experts, picks the `top_k` best and sums their outputs weighted by the router's scores. In Dew a `CausalTransformer` becomes sparse through its `mixture` field, a `Mixture` value from `dew.nn.backbones`.
 
 ## Example
 
 ```python
 import jax
 import jax.numpy as jnp
-from dew import models
 
-model = models.build(
-    "causal_transformer", vocab_size=32, emb_features=16,
+from dew.nn.backbones import CausalTransformer, Mixture
+
+model = CausalTransformer(
+    vocab_size=32, emb_features=16,
     num_layers=2, num_heads=2, mlp_features=32, max_seq_len=8,
-    mixture={"experts": 4, "top_k": 2, "every": 1},
-    dtype="float32", attention_impl="xla",
+    mixture=Mixture(experts=4, top_k=2, every=1),
+    dtype=jnp.float32, attention_impl="xla",
 )
 tokens = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
 variables = model.init(jax.random.key(0), tokens)
@@ -78,7 +79,7 @@ On an L4 the Pallas kernels take the lm-moe training step from 601.6 ms to 213.1
 
 A mesh does not change the choice: the experts run inside the dispatch's `shard_map` on each device's rows, with the weights they need gathered there. On 2x RTX 3090 one fsdp-sharded expert layer took 26.2 ms on the Pallas kernels against 271.9 ms on `'xla'`. Every routed expert module the decoder builds follows `implementation`, GPT OSS's included.
 
-tokamax's own default picks its v1 TPU kernel, 13 times slower than XLA on a v6e, so Dew names the kernel. If a model names `'tokamax'` and the package cannot be imported, initialization fails; there is no fallback to XLA under that name. tokamax is not a Dew dependency, and its releases cannot be installed cleanly beside Dew: tokamax 0.0.13 (and 0.0.14) pins `typeguard==2.13.3`, while tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. Installing tokamax downgrades typeguard, `uv pip check` reports the conflict, and every recipe fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Use the tokamax kernel from a separate environment that drives Dew from Python, as `tools/benchmark_attention.py` does.
+tokamax's own default picks its v1 TPU kernel, 13 times slower than XLA on a v6e, so Dew names the kernel. If a model names `'tokamax'` and the package cannot be imported, initialization fails; there is no fallback to XLA under that name. tokamax's releases cannot be installed cleanly beside Dew: tokamax 0.0.13 (and 0.0.14) pins `typeguard==2.13.3`, while tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. Installing such a release downgrades typeguard, `uv pip check` reports the conflict, and every recipe fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Installing tokamax with `-c constraints.txt` takes its main at a commit that dropped typeguard ([Installation](../installation.md)); the grouped-matmul numbers here were measured on 0.0.14.
 
 ## Dispatch and expert parallelism
 
