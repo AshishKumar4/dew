@@ -906,51 +906,24 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """One layer's mixer geometry: the kind's resolved values as a context.
 
-        `head_dim`, `rope_theta`, `window` and the two rotary ramps already
-        carry the layer kind's overrides; a windowed kind rotates every
-        dimension, so the partial rotary belongs to the kinds that attend the
-        whole sequence, where Gemma 4 puts it. A kind builds its
-        `DecoderBlock` factory from this and its own record; `setup` chooses
-        the mixer there and nowhere else.
+        `head_dim`, `rope_theta`, `window` and the two rotary ramps carry the
+        layer kind's overrides; a windowed kind rotates every dimension, so the
+        partial rotary belongs to the kinds that attend the whole sequence,
+        where Gemma 4 puts it. Every other field is the model's own of the same
+        name. A kind builds its `DecoderBlock` factory from this and its own
+        record; `setup` chooses the mixer there and nowhere else.
         """
-        return MixerContext(
-            emb_features=self.emb_features,
-            num_heads=self.num_heads,
-            num_kv_heads=kind.num_kv_heads,
-            head_dim=kind.head_dim,
-            max_seq_len=self.max_seq_len,
-            causal=self.causal,
-            rope_theta=kind.rope_theta,
-            rope_scaling=kind.rope_scaling,
-            qk_norm=self.qk_norm,
-            qk_norm_scope=self.qk_norm_scope,
-            v_norm=self.v_norm,
-            k_eq_v=self.attention_k_eq_v and kind.window is None,
-            norm_eps=self.norm_eps,
-            scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast,
-            kv_shared=kv_shared,
-            kv_store_key=layer_type,
-            sliding_window=kind.window,
-            attention_chunk=kind.chunk,
-            attention_bias=self.attention_bias,
-            o_proj_bias=self.o_proj_bias,
-            attention_scale=self.attention_scale,
-            attention_dropout_rate=self.attention_dropout_rate,
-            attention_sinks=self.attention_sinks,
-            yarn=kind.yarn,
-            attn_logit_softcap=self.attn_logit_softcap,
-            output_gate=self.output_gate,
-            dtype=self.dtype,
-            precision=self.precision,
-            attention_impl=self.attention_impl,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            kv_cache=self.kv_cache,
-            partial_rotary_factor=(None if kind.window is not None
-                                   else self.partial_rotary_factor),
-            partial_rotary_type=self.partial_rotary_type,
-            init_std=self.init_stds[0],
-            output_init_std=self.init_stds[1])
+        resolved = {
+            "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "sliding_window": kind.window, "attention_chunk": kind.chunk,
+            "k_eq_v": self.attention_k_eq_v and kind.window is None,
+            "kv_shared": kv_shared, "kv_store_key": layer_type,
+            "partial_rotary_factor": None if kind.window is not None else self.partial_rotary_factor,
+            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
+        return MixerContext(**resolved, **{field.name: getattr(self, field.name)
+                                           for field in dataclasses.fields(MixerContext)
+                                           if field.name not in resolved})
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
