@@ -75,10 +75,10 @@ class ResolvedKind:
     """One kind of layer with the model's defaults filled in.
 
     `LayerKind` is what a config states, so a field it leaves to the model is
-    None there. This is what the model resolved it to, so `rope_theta` and
-    `head_dim` are numbers; only the window stays optional, because attending
-    the whole sequence is what a kind without one does. `mixer` passes
-    through: it needs no resolution, only the model's default when unset.
+    None there. This is what the model resolved it to, so `num_kv_heads`,
+    `rope_theta` and `head_dim` are numbers; the window, the chunk and the
+    rotary ramps stay optional, as a kind may have none. `mixer` passes
+    through, the model's default applying when unset.
     """
 
     window: int | None

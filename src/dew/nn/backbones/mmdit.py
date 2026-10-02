@@ -124,7 +124,7 @@ class MMDiTBlock(nn.Module):
             q_i, k_i = self.img_q_norm(q_i), self.img_k_norm(k_i)
             q_t, k_t = self.txt_q_norm(q_t), self.txt_k_norm(k_t)
 
-        # RoPE carries 2D position for image tokens only
+        # RoPE rotates the image tokens by their raster index (`rope_for_scan`)
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
             q_i = apply_rotary(q_i, freqs_cos, freqs_sin)
