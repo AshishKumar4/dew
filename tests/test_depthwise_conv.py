@@ -9,7 +9,7 @@ import pytest
 from flax import linen as nn
 from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import Conv, _cuda_depthwise_3x3, _depthwise_3x3
+from dew.nn.conv import Conv, _polyphase_depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -21,18 +21,20 @@ def convolve(x, kernel, dilation):
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('operation', [_depthwise_3x3, _cuda_depthwise_3x3])
-def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
+def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
 
     Nine products contribute to each output and input gradient; B*H*W
     products contribute to each weight gradient. A missing corner moves the
-    output by order one, far outside the bound even under cancellation.
-    At B16/B32 16x16x768 on the RTX 4080 (JAX 0.11.2.post3, highest),
-    forward/dx errors were <=2.86e-6 and dw <=9.01e-4, inside this bound.
-    The 20-step published checkpoint stays within 1.89e-5 on latents and
-    4.0e-5 on fp32-decoded images; the network test reproduces those numbers.
+    output by order one, far outside the bound even under cancellation; so
+    does a grid interleaved back to the wrong pixels. The 7x8 image is not a
+    multiple of either dilation, so the zero padding to a whole grid is
+    checked too. At B16 16x16x768 on the RTX 4080 (JAX 0.11.2.post3) the
+    fp32 output and dx were exact against the dilated convolution at
+    highest precision, and dw was 0.0 of this bound; bf16 dw used 0.019 of
+    it.
     """
+    operation = _polyphase_depthwise_3x3
     rng = np.random.default_rng(17)
     x = jnp.asarray(rng.normal(size=(2, 7, 8, 5)).astype(np.float32))
     kernel = jnp.asarray(rng.normal(size=(3, 3, 1, 5)).astype(np.float32))
@@ -43,9 +45,9 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
         return output, *pullback(cotangent)
 
     reference = partial(convolve, dilation=dilation)
-    shifted = partial(operation, dilation=dilation)
+    candidate = partial(operation, dilation=dilation)
     expected = jax.jit(partial(forward_and_vjp, reference))(x, kernel, cotangent)
-    actual = jax.jit(partial(forward_and_vjp, shifted))(x, kernel, cotangent)
+    actual = jax.jit(partial(forward_and_vjp, candidate))(x, kernel, cotangent)
     magnitudes = jax.jit(partial(forward_and_vjp, reference))(
         jnp.abs(x), jnp.abs(kernel), jnp.abs(cotangent))
     for got, want, magnitude, terms in zip(
@@ -60,9 +62,9 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('operation', [_depthwise_3x3, _cuda_depthwise_3x3])
-def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
+def test_bf16_depthwise_accumulates_before_rounding(dilation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
+    operation = _polyphase_depthwise_3x3
     side = 2 * dilation + 1
     x = jnp.ones((1, side, side, 2), jnp.bfloat16)
     kernel = jnp.full((3, 3, 1, 2), 1 / 256, jnp.bfloat16).at[1, 1].set(1)
@@ -142,7 +144,7 @@ def test_depthwise_boundaries_preserve_forward_and_higher_order_derivatives():
                 jax.jvp(jax.grad(loss, argnums=(0, 1)), (x, kernel), (dx, dw)))
 
     expected = jax.jit(partial(derivatives, partial(convolve, dilation=2)))(x, kernel, dx, dw)
-    actual = jax.jit(partial(derivatives, partial(_cuda_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
+    actual = jax.jit(partial(derivatives, partial(_polyphase_depthwise_3x3, dilation=2)))(x, kernel, dx, dw)
     for lhs, rhs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(lhs, rhs, rtol=4e-6, atol=2e-5)
 

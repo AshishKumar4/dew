@@ -1,0 +1,35 @@
+{
+  "checkpoint": "trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6",
+  "revision": "57faabc3b49ec3ae69b8d6158130ce19496bc2d3",
+  "dtype": "float32",
+  "precision": "highest",
+  "tf32": false,
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cu130",
+  "jax": "0.11.2.post3",
+  "device": "NVIDIA GeForce RTX 4080",
+  "bound": "2 * eps * layers * max_logit * (6.46 + (28 - 6.46) * S/12 * gamma_K/gamma_12). The Qwen3.5 fixture calibrated 28 at S=12 and K=12. Normalized keys, beta in [0,1] and decay in [0,1] make the recurrence update nonexpansive.",
+  "observations": [
+    {
+      "modality": "text",
+      "sequence_length": 5,
+      "key_dim": 128,
+      "max_reference_logit": 0.3785378038883209,
+      "max_abs_error": 0.0000034421682357788086,
+      "bound": 0.000018446107787895016,
+      "argmax_agreement": true,
+      "generation_agreement": true
+    },
+    {
+      "modality": "image",
+      "sequence_length": 71,
+      "key_dim": 128,
+      "max_reference_logit": 0.4486950933933258,
+      "max_abs_error": 0.000008806586265563965,
+      "bound": 0.0002922367420978844,
+      "argmax_agreement": true,
+      "generation_agreement": true
+    }
+  ],
+  "command": "PYTHONPATH=src python tools/wrapper_checkpoint_parity.py trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6 --revision 57faabc3b49ec3ae69b8d6158130ce19496bc2d3 --output qwen35-moe-parity.json"
+}

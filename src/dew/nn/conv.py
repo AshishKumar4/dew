@@ -34,13 +34,20 @@ The partitioner bugs are reported at
 https://github.com/openxla/xla/issues/49382 and drafted in
 Dew issue #4 (https://github.com/AshishKumar4/dew/issues/4).
 
-For 3x3 depthwise convolutions, shifted products also avoid cuDNN's slow
-dilated grouped forward and weight-gradient convolutions. The accumulation
-stays fp32, including for bf16 inputs; ordinary JAX differentiation keeps
-forward-mode and higher-order derivatives. CUDA retains cuDNN at dilation
-one, which is faster on the RTX 4080. Other backends retain lax.
-`tools/benchmark_depthwise.py` measures each path's
-forward and backward separately, as well as the hybrid DiT training step.
+A dilated 3x3 depthwise convolution runs on CUDA as an undilated one over
+its interleaved grids (`_polyphase_depthwise_3x3`): cuDNN's dilated grouped
+forward and weight-gradient kernels are slow, its dilation-one depthwise
+kernels are not. On the RTX 4080 at 16x16x768 and batch 16 the bf16
+forward and VJP take 0.097 ms at dilation 2 and 0.089 at dilation 3,
+against 1.6 ms through the dilated convolution and 0.31-0.33 through the
+fp32 shifted products this replaced; the 176M hybrid DiT's bf16 step at
+that batch runs 70.2 ms against 75.3. cuDNN's fp32 depthwise kernels are
+slower, and the same step in fp32 runs 113.7 ms against 109.7 with the
+shifted products. The accumulation stays fp32,
+including for bf16 inputs; ordinary JAX differentiation keeps forward-mode
+and higher-order derivatives. Other backends retain lax.
+`tools/benchmark_depthwise.py` measures each path's forward and backward
+separately, as well as the hybrid DiT training step.
 Under Qwix quantization (`dew.training.quantization`) a convolution that a
 rule quantizes goes through Qwix's provider, which computes it with lax, and
 so does not get this depthwise speedup; one that no rule quantizes, such as
@@ -135,28 +142,28 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
         x, P(*(tuple(entry) if entry else None for entry in entries)))
 
 
-def _depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """Nine shifted products, with the convolution's fp32 accumulation."""
-    height, width = lhs.shape[1:3]
-    padded = jnp.pad(lhs.astype(jnp.float32),
-                     ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0)))
-    kernel = rhs.astype(jnp.float32)
-    output = jnp.zeros(lhs.shape, jnp.float32)
-    for row in range(3):
-        for column in range(3):
-            shifted = padded[:, row * dilation:row * dilation + height,
-                             column * dilation:column * dilation + width, :]
-            output = output + shifted * kernel[row, column, 0, :]
-    return output.astype(lhs.dtype)
+def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The dilated depthwise convolution as an undilated one over its
+    `dilation ** 2` interleaved grids.
 
-
-def _cuda_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    # Otherwise XLA fuses bf16 casts and all nine weight reductions into a
-    # 0.77 ms kernel on sm89. Materializing fp32 gives a 0.31 ms forward/VJP
-    # at B16, against 0.85 ms without boundaries (tools/benchmark_depthwise.py).
-    inputs = _barrier(lhs.astype(jnp.float32))
-    kernel = _barrier(rhs.astype(jnp.float32))
-    return _barrier(_depthwise_3x3(inputs, kernel, dilation)).astype(lhs.dtype)
+    A pixel's dilated taps are its neighbours in the grid of pixels that
+    share its row and column residues modulo `dilation`, so the image splits
+    into those grids along the batch, each grid takes the dilation-1
+    convolution with its own zero border, and the grids interleave back.
+    The image is padded with zeros to a multiple of `dilation` first, which
+    are the zeros 'SAME' padding reads there anyway. The convolution runs at
+    full precision, so an fp32 model keeps fp32 accumulation and bf16 rounds
+    once, from fp32."""
+    batch, height, width, features = lhs.shape
+    rows, columns = -(-height // dilation), -(-width // dilation)
+    padded = jnp.pad(lhs, ((0, 0), (0, rows * dilation - height), (0, columns * dilation - width), (0, 0)))
+    grids = padded.reshape(batch, rows, dilation, columns, dilation, features).transpose(0, 2, 4, 1, 3, 5)
+    output = jax.lax.conv_general_dilated(
+        grids.reshape(batch * dilation * dilation, rows, columns, features), rhs, (1, 1), 'SAME',
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features,
+        precision=jax.lax.Precision.HIGHEST)
+    output = output.reshape(batch, dilation, dilation, rows, columns, features).transpose(0, 3, 1, 4, 2, 5)
+    return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 
 
 def _conv_general_dilated(
@@ -188,7 +195,7 @@ def _conv_general_dilated(
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
         return jax.lax.platform_dependent(
             lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: _cuda_depthwise_3x3(x, w, dilation[0]),
+            cuda=convolve if dilation[0] == 1 else lambda x, w: _polyphase_depthwise_3x3(x, w, dilation[0]),
             default=convolve)
     return convolve(lhs, rhs)
 
