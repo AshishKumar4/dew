@@ -1269,9 +1269,11 @@ class PhasedStream:
                 records=self._records - self._start(phase), order=stream.order)))
             self._current = phase
         stream = self._streams[phase]
-        before = stream.get_state()
+        # The stream's own count, which it advances only for a batch it
+        # delivered; its checkpoint envelope is for checkpoints.
+        before = stream._records
         batch = next(stream)
-        read = position.read(stream.get_state()).records - position.read(before).records
+        read = stream._records - before
         self._records += read
         if phase < len(self._ends) and self._records > self._ends[phase]:
             raise ValueError(
