@@ -27,6 +27,9 @@ What lands in tests/fixtures/t5:
   gated-gelu, the T5 v1.1 feed-forward SD3.5 and Flux run, which the t5-small
   network test cannot cover (v1.0 is plain relu). Small enough to live in
   git, so the parity tests need no network.
+- tiny-umt5/: the same for a random-weight UMT5 encoder (`UMT5EncoderModel`,
+  three layers), whose every layer holds its own relative bias table, as
+  Wan 2.1's umt5-xxl text encoder does.
 """
 
 import argparse
@@ -36,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import T5Config, T5EncoderModel, T5Tokenizer
+from transformers import T5Config, T5EncoderModel, T5Tokenizer, UMT5Config, UMT5EncoderModel
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "t5"
 
@@ -78,10 +81,23 @@ def tiny_model(vocab_size: int) -> T5EncoderModel:
     return T5EncoderModel(config)
 
 
-def write_tiny(tiny: Path) -> None:
+def tiny_umt5(vocab_size: int) -> UMT5EncoderModel:
+    """A random UMT5 encoder: the tiny T5's widths, three layers, so two
+    later layers each read a table of their own."""
+    config = UMT5Config(
+        vocab_size=vocab_size, d_model=64, d_kv=16, d_ff=128,
+        num_layers=3, num_heads=4, relative_attention_num_buckets=16,
+        relative_attention_max_distance=64, dropout_rate=0.0,
+        layer_norm_epsilon=1e-6, feed_forward_proj="gated-gelu",
+        pad_token_id=0, eos_token_id=1, decoder_start_token_id=0)
+    torch.manual_seed(1)
+    return UMT5EncoderModel(config)
+
+
+def write_tiny(tiny: Path, build=tiny_model) -> None:
     tiny.mkdir(parents=True, exist_ok=True)
     tokenizer = tiny_tokenizer()
-    model = tiny_model(tokenizer.vocab_size)
+    model = build(tokenizer.vocab_size)
     model.config.save_pretrained(tiny)
     # The tokenizer files the loader reads back.
     tokenizer.save_pretrained(tiny)
@@ -116,7 +132,9 @@ def write_tiny(tiny: Path) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=FIXTURES)
-    write_tiny(parser.parse_args(argv).out / "tiny")
+    out = parser.parse_args(argv).out
+    write_tiny(out / "tiny")
+    write_tiny(out / "tiny-umt5", tiny_umt5)
 
 
 if __name__ == "__main__":
