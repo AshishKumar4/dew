@@ -178,6 +178,13 @@ def test_fit_lets_go_of_each_state_its_step_consumed():
     assert alive == [False, False]
 
 
+def test_train_state_exposes_the_whole_variables_tree():
+    trainer = Trainer(Regression(), optax.sgd(.1), key=0)
+    state = trainer.initial_state()
+    assert "params" in state.variables
+    assert not hasattr(state, "params")
+
+
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
@@ -1783,7 +1790,7 @@ def alternating(gen, disc):
                 microstep=state.microstep + 1,
                 updates=state.updates + 1,
                 opt_state=opt_state,
-                params={**state.variables, "params": params},
+                variables={**state.variables, "params": params},
             )
             return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step

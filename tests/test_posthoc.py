@@ -208,7 +208,7 @@ def test_reconstruction_accumulates_bfloat16_weights_in_float32(tmp_path):
     state = trainer.fit(Data(), steps=2, log_every=2)
     averages = tuple(jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), average)
                      for average in state.opt_state.averages)
-    state = state.replace(params=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), state.variables),
+    state = state.replace(variables=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), state.variables),
                           opt_state=state.opt_state._replace(averages=averages))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     checkpoints.save(2, state, None)
