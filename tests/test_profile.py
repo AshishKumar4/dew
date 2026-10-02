@@ -304,11 +304,18 @@ def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_repor
 @pytest.mark.parametrize("drain_fails", [False, True])
 def test_blocked_lifecycle_drain_refuses_conflicts_without_holding_mutex(
         tmp_path, native_reports, monkeypatch, phase, drain_fails):
+    """The bounded waits time the lifecycle, so the captures leave out HLO
+    protos: XLA writes one for every executable alive in the process, not
+    the captured work's alone, and the export of them takes as long as the
+    process's history makes it (400 unrelated live programs: 15 s a capture
+    on CPU, against 0.05 s without them)."""
     module = importlib.import_module("dew.telemetry.profile")
     original = module._drain
     entered, release = Event(), Event()
-    profiler = dew.Profiler(tmp_path / "owner")
-    competitor = dew.Profiler(tmp_path / "competitor")
+    options = module.capture_options()
+    options.enable_hlo_proto = False
+    profiler = dew.Profiler(tmp_path / "owner", options=options)
+    competitor = dew.Profiler(tmp_path / "competitor", options=options)
     if phase == "stop":
         profiler.start()
         work()
