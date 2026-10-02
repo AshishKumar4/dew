@@ -127,6 +127,31 @@ class ModelConfig:
         """Read back the record `RunConfig.to_dict` writes for this field."""
         return _built(cls, values)
 
+    @classmethod
+    def from_model(cls, model) -> Self:
+        """The registered module's constructor fields, with its actual compute settings."""
+        architecture = models.name_of(type(model))
+        fields = {}
+        compute, storage, precision, attention = None, None, None, 'auto'
+        for field in dataclasses.fields(model):
+            if not field.init or field.name in ('parent', 'name'):
+                continue
+            value = getattr(model, field.name)
+            if field.name == 'dtype':
+                compute = registry.dtype_name(value)
+            elif field.name == 'param_dtype':
+                storage = registry.dtype_name(value)
+            elif field.name == 'precision':
+                precision = None if value is None else str(value).lower()
+            elif field.name == 'attention_impl':
+                attention = value
+            elif callable(value) and value is field.default:
+                continue
+            else:
+                fields[field.name] = _to_json(value, _declared_type(type(model), field.name))
+        return cls(architecture, fields, dtype=compute, param_dtype=storage,
+                   matmul_precision=precision, attention_impl=attention)
+
     def build(self):
         return models.build(self.architecture, self.fields())
 
