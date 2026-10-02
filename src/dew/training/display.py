@@ -26,6 +26,7 @@ import math
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 
 import jax
 from rich import box
@@ -38,6 +39,8 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.logging import display_console
+from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
@@ -146,10 +149,7 @@ def change(first: float, last: float, shown: Shown = PLAIN) -> Text:
         size = ""
     else:
         size = f" {relative:.1%}" if relative < 0.1 else f" {relative:.0%}"
-    if shown.better is None:
-        style = LABEL
-    else:
-        style = BETTER if rising == (shown.better == "higher") else WORSE
+    style = LABEL if shown.better is None else BETTER if rising == (shown.better == "higher") else WORSE
     return Text(arrow + size, style)
 
 
@@ -209,6 +209,7 @@ class TrainingDisplay:
     # How the phase is drawn, not what the display holds: left out of equality.
     spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT), compare=False)
     live: Live | None = None
+    _logs: AbstractContextManager[None] | None = dataclasses.field(default=None, compare=False)
 
     @property
     def shown_here(self) -> bool:
@@ -235,6 +236,9 @@ class TrainingDisplay:
         self.title = model
         self.header = [("", f"{count(started.parameters)} parameters"), ("on", where)]
         if mesh:
+            splits = any(started.mesh.get(axis, 1) > 1 for axis in (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS))
+            if splits:
+                mesh += f", {started.sharded:.0%} of the parameters' bytes split"
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
@@ -245,6 +249,8 @@ class TrainingDisplay:
         self.phase = "compiling"
         self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
+        self._logs = display_console(console)
+        self._logs.__enter__()
 
     # --------------------------------------------------------------
     # What the trainer tells it
@@ -280,7 +286,7 @@ class TrainingDisplay:
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
             if (rate := self.rate()) and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
-            print(line, flush=True)
+            self.note(line)
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
@@ -300,14 +306,19 @@ class TrainingDisplay:
         if self.live is not None:
             self.live.console.print(Text(text, style=style or ""))
         else:
-            print(text, flush=True)
+            Console().print(Text(text), soft_wrap=True)
 
     def close(self) -> None:
         """Stop the live panel, leaving its last frame on the screen."""
-        if self.live is not None:
-            self.ended = True
-            self.live.stop()
-        self.live = None
+        try:
+            if self.live is not None:
+                self.ended = True
+                self.live.stop()
+        finally:
+            self.live = None
+            if self._logs is not None:
+                self._logs.__exit__(None, None, None)
+                self._logs = None
 
     def summary(self, step: int, seconds: float, goodput: Mapping[str, float],
                 loss: float | None) -> None:
@@ -447,7 +458,9 @@ class TrainingDisplay:
 
         if evaluations := self.evaluation_rows():
             parts.append(Text())
-            used = len(console.render_lines(Group(*parts), options.update(width=inner, height=None), pad=False))
+            used = len(
+                console.render_lines(Group(*parts), options.update(width=inner, height=None), pad=False)
+            )
             parts.append(self.metrics(evaluations, inner, options.size.height - used - 4, evaluation=True))
 
         title = Text.assemble(" ", ("dew", Style(color=Color.from_triplet(END), bold=True)),
@@ -466,7 +479,9 @@ class TrainingDisplay:
         assert isinstance(frame, Text)
         return Text.assemble(" ", frame, " ", (self.phase or "training", LABEL), " ")
 
-    def metrics(self, rows: list[tuple[str, Row]], inner: int, lines: int, *, evaluation: bool = False) -> Table:
+    def metrics(
+        self, rows: list[tuple[str, Row]], inner: int, lines: int, *, evaluation: bool = False
+    ) -> Table:
         """The metrics under their groups' headings, each as its name, its
         value, a sparkline and its change across the sparkline; those that
         have held one value share a line per group. Groups stay whole, and

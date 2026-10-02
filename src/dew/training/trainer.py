@@ -16,6 +16,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import logging
 import math
 import sys
 import time
@@ -32,11 +33,11 @@ from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from termcolor import colored
+from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints, Ranking
-from dew.data.dataset import Checkpointable, Closeable, RampedStream, Reader, rows_of
+from dew.data.dataset import Checkpointable, Closeable, Dataset, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
@@ -49,15 +50,14 @@ from dew.nn.sharding import (
     Link,
     Schedule,
     measured_links,
+    mesh_axes,
     pipeline_microbatches,
 )
 from dew.objectives.base import (
     FROZEN,
     Aux,
     Batch,
-    Effects,
     Initializer,
-    Loss,
     Metric,
     Objective,
     Ratio,
@@ -83,6 +83,7 @@ from dew.telemetry.records import (
 )
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
+    PARAMETER_AXES,
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
@@ -102,9 +103,10 @@ from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.training.transaction import Transaction, compact_qk, with_ema
 
+_log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from dew.config import TrainerConfig
-    from dew.data import Dataset
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -120,6 +122,9 @@ CompiledStep = Callable[
 """A call returns the stepped state, the scalar loss, the objective's whole
 report (`Aux.metrics`), whether that loss was finite, and whether the
 microbatch was accepted."""
+
+Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
+Effects = DefaultTypeVar("Effects", default=None)
 
 ObjectiveLoss = TypeVar("ObjectiveLoss")
 ObjectiveEffects = TypeVar("ObjectiveEffects")
@@ -269,9 +274,25 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
-    print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
-                  "compiling it with them", "yellow"), file=sys.stderr)
+    _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
     return default, True
+
+
+def _split_share(params: Variables) -> float:
+    """The share of the bytes of `params`, placed arrays, every collection a
+    frozen split keeps among them, that a parameter axis splits
+    (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
+    split nothing of a model whose parameters all sit below `Layout`'s
+    `min_shard`, and the run's banner says how much it does."""
+    total = split = 0
+    for leaf in jax.tree.leaves(params):
+        total += leaf.nbytes
+        sharding = leaf.sharding
+        if isinstance(sharding, NamedSharding) and any(
+                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES):
+            split += leaf.nbytes
+    return split / total if total else 0.0
 
 
 def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
@@ -293,8 +314,10 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
     """How the display shows what the rollout and the validation metrics
     report. Both may declare `shown`, which their protocols leave optional,
     so the trainer reads it at this boundary."""
-    return {**getattr(rollout, 'shown', {}),
-            **{metric.name: shown for metric in metrics if (shown := getattr(metric, 'shown', None)) is not None}}
+    return {
+        **getattr(rollout, "shown", {}),
+        **{metric.name: shown for metric in metrics if (shown := getattr(metric, "shown", None)) is not None},
+    }
 
 
 def _keeps_triton_gemm(model: nn.Module) -> bool:
@@ -320,8 +343,16 @@ def climb_to(objective, rung: Mapping[str, object]) -> None:
     ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
               else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
     records = [remat_record(remat) for remat in ladder]
-    here, there = remat_record('dots' if current is True else current), json_value(rung.get('remat'), 'rung remat')
-    if model is not None and here in records and there in records and records.index(there) > records.index(here):
+    here, there = (
+        remat_record("dots" if current is True else current),
+        json_value(rung.get("remat"), "rung remat"),
+    )
+    if (
+        model is not None
+        and here in records
+        and there in records
+        and records.index(there) > records.index(here)
+    ):
         objective.model = model.clone(remat=ladder[records.index(there)])
 
 
@@ -498,8 +529,9 @@ def recompute_more(objective) -> bool:
     model's remat climbs."""
     moved = objective.tile_head()
     if moved is not None:
-        print(colored(f"the step does not fit the devices with the whole logits kept; "
-                      f"compiling it again with {moved}", "yellow"), file=sys.stderr)
+        _log.warning(
+            "the step does not fit the devices with the whole logits kept; compiling it again with %s", moved
+        )
         return True
     model = _model_of(objective)
     if model is None:
@@ -513,8 +545,9 @@ def recompute_more(objective) -> bool:
     if current not in ladder[:-1]:
         return False
     stronger = ladder[ladder.index(current) + 1]
-    print(colored(f"the step does not fit the devices under remat {current!r}; "
-                  f"compiling it again under {stronger!r}", "yellow"), file=sys.stderr)
+    _log.warning(
+        "the step does not fit the devices under remat %r; compiling it again under %r", current, stronger
+    )
     objective.model = model.clone(remat=stronger)
     return True
 
@@ -534,7 +567,12 @@ class Plateau:
 
 
 class _MetricValues[Statistics, Additions](Mapping):
-    def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float], objective: Objective[Statistics, Additions]):
+    def __init__(
+        self,
+        metrics: Sequence[Metric],
+        scores: Mapping[str, float],
+        objective: Objective[Statistics, Additions],
+    ):
         self.objective = objective
         self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
                                               if name == 'loss' or f'train/{name}' in scores)
@@ -548,7 +586,11 @@ class _MetricValues[Statistics, Additions](Mapping):
             if metric.owner is not self.objective:
                 raise KeyError("training score belongs to another objective")
             return self.scores[f'train/{metric.name}']
-        if isinstance(metric, types.MethodType) and metric.__name__ == 'loss' and metric.__self__ is self.objective:
+        if (
+            isinstance(metric, types.MethodType)
+            and metric.__name__ == "loss"
+            and metric.__self__ is self.objective
+        ):
             return self.scores['train/loss']
         if isinstance(metric, str):
             if any(metric == f'{name}/{declared.name}' for name in {key.split('/')[0] for key in self.scores}
@@ -564,7 +606,13 @@ class _MetricValues[Statistics, Additions](Mapping):
         for name in self.scores:
             split, _, label = name.partition('/')
             metric = next((metric for metric in self.metrics if metric.name == label), None)
-            yield name if metric is None else metric if split == 'val' or isinstance(metric, TrainingScalar) else (split, metric)
+            yield (
+                name
+                if metric is None
+                else metric
+                if split == "val" or isinstance(metric, TrainingScalar)
+                else (split, metric)
+            )
 
     def __len__(self):
         return len(self.scores)
@@ -671,6 +719,10 @@ class _Interval:
         self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
 
 
+_DEFAULT_MESH = MeshSpec()
+_DEFAULT_LAYOUT = Layout()
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
 
@@ -680,8 +732,8 @@ class Trainer(Generic[Loss, Effects]):
         optimizer: optax.GradientTransformation,
         *,
         key: int | jax.Array,
-        mesh: MeshSpec = MeshSpec(),
-        layout: Layout = Layout(),
+        mesh: MeshSpec = _DEFAULT_MESH,
+        layout: Layout = _DEFAULT_LAYOUT,
         accumulation: int = 1,
         dynamic_scale: bool = False,
         checkpoints: Checkpoints | None = None,
@@ -705,7 +757,10 @@ class Trainer(Generic[Loss, Effects]):
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
         if step is not None and "params" in layout.host:
-            raise ValueError("Parameter-streamed training requires the trainer objective transaction; custom steps own their execution")
+            raise ValueError(
+                "Parameter-streamed training requires the trainer objective transaction; "
+                "custom steps own their execution"
+            )
         self.objective = objective
         self.optimizer = optimizer
         from dew.nn.inputs import request_key
@@ -866,7 +921,9 @@ class Trainer(Generic[Loss, Effects]):
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
         if frozen is not None:
-            placed = dataclasses.replace(placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)})
+            placed = dataclasses.replace(
+                placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)}
+            )
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -967,7 +1024,9 @@ class Trainer(Generic[Loss, Effects]):
             return
         fields = record(rung, 'rung')
         climb_to(self.objective, fields)
-        self._xla_defaults = self._xla_defaults or boolean(fields.get('xla_defaults', False), 'rung xla_defaults')
+        self._xla_defaults = self._xla_defaults or boolean(
+            fields.get("xla_defaults", False), "rung xla_defaults"
+        )
         self._resumed_rung = self._rung()
 
     def _placed_held(self, initializer: Initializer, abstract: TrainState,
@@ -1157,7 +1216,11 @@ class Trainer(Generic[Loss, Effects]):
                    jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
 
         def zeros(leaf):
-            dtype = jnp.promote_types(leaf.dtype, jnp.float32) if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
+            dtype = (
+                jnp.promote_types(leaf.dtype, jnp.float32)
+                if jnp.issubdtype(leaf.dtype, jnp.inexact)
+                else leaf.dtype
+            )
             return jnp.zeros(leaf.shape, dtype)
 
         def buffer(tree):
@@ -1280,9 +1343,11 @@ class Trainer(Generic[Loss, Effects]):
                     self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
                     self._xla_defaults = fits
                 if not fits and resumed is not None:
-                    print(colored(f"the step does not fit the devices at the rung its checkpoint trained on "
-                                  f"({resumed}); from here the resumed run computes otherwise than the "
-                                  f"run it continues", "yellow"), file=sys.stderr)
+                    _log.warning(
+                        "the step does not fit the devices at the rung its checkpoint trained on "
+                        "(%s); from here the resumed run computes otherwise than the run it continues",
+                        resumed,
+                    )
                     resumed = None
                 if fits or not recompute_more(self.objective):
                     break
@@ -1332,11 +1397,21 @@ class Trainer(Generic[Loss, Effects]):
     # The loop
     # ------------------------------------------------------------------
 
-    def fit(self, dataset: Dataset, *, steps: int, log_every: int = 100,
-            eval_every: int | None = None, checkpoint_every: int | datetime.timedelta | None = None,
-            metrics: Sequence[Metric] = (), preview: bool = False,
-            best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
-            validation: Mapping[str, Reader] | None = None, restore_best: bool = False) -> TrainState:
+    def fit(
+        self,
+        dataset: Dataset,
+        *,
+        steps: int,
+        log_every: int = 100,
+        eval_every: int | None = None,
+        checkpoint_every: int | datetime.timedelta | None = None,
+        metrics: Sequence[Metric] = (),
+        preview: bool = False,
+        best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
+        stop: Plateau | None = None,
+        validation: Mapping[str, Reader] | None = None,
+        restore_best: bool = False,
+    ) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
 
@@ -1361,8 +1436,7 @@ class Trainer(Generic[Loss, Effects]):
         receives them; scalar reporting never triggers preview work.
         """
         selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
-        if stop is None or not isinstance(stop.metric, TrainingScalar):
-            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        self._preflight(dataset, stop, eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1373,76 +1447,30 @@ class Trainer(Generic[Loss, Effects]):
         # scopes share whichever profiler owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            if self.mesh.stage > 1:
-                # Before the state is placed; every other mesh's batch is
-                # checked with its stream (`_check_stream`), a ramp's at each
-                # of its stages.
-                self._check_batch(dataset.batch, self.device_mesh)
-            plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
-                            None if checkpoints is None else checkpoints.local_every, metrics, preview,
-                            best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
-                            validation=validation is not None or (bool(eval_every or metrics) and dataset.val is not None))
+            plan = _FitPlan(
+                dataset,
+                steps,
+                log_every,
+                eval_every,
+                checkpoint_every,
+                None if checkpoints is None else checkpoints.local_every,
+                metrics,
+                preview,
+                best=selection,
+                stop=stop,
+                validation_splits=validation,
+                restore_best=restore_best,
+                validation=validation is not None
+                or (bool(eval_every or metrics) and dataset.val is not None),
+            )
             state, shardings, position = self.place()
             run.last_checkpoint = time.perf_counter()
             if checkpoints is not None and checkpoints.latest is not None:
                 run.stop_control = checkpoints.control(checkpoints.latest)
             if self._opened(plan, run, state, position):
                 return state
-            compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            interval = _Interval(fresh_book(), time.time(), last_saved=(
-                run.current if checkpoints is not None and checkpoints.latest is not None else None))
-            seen = 0
-            run.notice = PreemptionNotice()
-            while run.current < steps:
-                # Read through `run` each time: a local alias would keep the
-                # closed iterator reachable from a failed run's traceback.
-                assert run.train is not None
-                # The window's capture opens before this iteration's first
-                # read, so the step row records the read it waits on rather
-                # than a compile that ran before capture began.
-                if (profiler is not None and profile is not None
-                        and not run.tracing and run.traced == 0
-                        and seen >= profile.warmup):
-                    self._start_window(profiler)
-                    run.tracing = True
-                capturing = tracer is not None and tracer.running
-                step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
-                              if capturing else contextlib.nullcontext())
-                with step_scope:
-                    with region("input.wait"):
-                        batch = next(run.train)
-                    if self.rollout is not None:
-                        batch, sampled = self._rolled_out(state, batch)
-                        interval.rollout_seconds += sampled
-                    first_compile = not compiled
-                    train_step, measured_flops = self._compiled_for(compiled, state, batch)
-                    if first_compile:
-                        # Rebound once the step is compiled, so the first tick
-                        # measures steps, not the compile.
-                        interval.last_log_time = time.time()
-                    with region("train.step"):
-                        state, loss, aux, finite, accepted = train_step(state, batch)
-                    run.loss = loss
-                    position = run.train.source_state
-                    run.current += 1
-                    self._display.step(run.current)
-                    seen += 1
-                    interval.count(batch, measured_flops, loss, finite)
-                    if run.first_step is None:
-                        loss.block_until_ready()
-                        run.first_step = time.perf_counter() - run.started
-                    if self._between_steps(plan, run, interval, state, shardings, position,
-                                           loss, aux, accepted):
-                        break
-                # The step row is complete once its scope exits; closing the
-                # window here keeps the last iteration inside the capture.
-                if run.tracing and profile is not None:
-                    run.traced += 1
-                    if run.traced == profile.steps:
-                        run.tracing = False
-                        assert profiler is not None
-                        self._stop_trace(run, profile, profiler)
-            self._wind_down(plan, run, interval, state, shardings, position, profiler)
+            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer,
+                                        profile, checkpoints)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
@@ -1451,8 +1479,73 @@ class Trainer(Generic[Loss, Effects]):
         if run.preempted is not None:
             raise Preempted(run.preempted)
         if restore_best and checkpoints is not None:
-            state, _ = checkpoints.restore(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state), step='best')
+            state, _ = checkpoints.restore(
+                jax.tree.map(
+                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state
+                ),
+                step="best",
+            )
+        return state
+
+    def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
+                       shardings, position, profiler: Profiler | None, tracer: Profiler | None,
+                       profile: ProfileWindow | None, checkpoints: Checkpoints | None) -> TrainState:
+        """Dispatch the numerical steps and finish their loop before resource cleanup."""
+        compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+        interval = _Interval(fresh_book(), time.time(), last_saved=(
+            run.current if checkpoints is not None and checkpoints.latest is not None else None))
+        seen = 0
+        run.notice = PreemptionNotice()
+        while run.current < plan.steps:
+            # Read through `run` each time: a local alias would keep the
+            # closed iterator reachable from a failed run's traceback.
+            assert run.train is not None
+            # The window's capture opens before this iteration's first
+            # read, so the step row records the read it waits on rather
+            # than a compile that ran before capture began.
+            if (profiler is not None and profile is not None
+                    and not run.tracing and run.traced == 0
+                    and seen >= profile.warmup):
+                self._start_window(profiler)
+                run.tracing = True
+            capturing = tracer is not None and tracer.running
+            step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
+                          if capturing else contextlib.nullcontext())
+            with step_scope:
+                with region("input.wait"):
+                    batch = next(run.train)
+                if self.rollout is not None:
+                    batch, sampled = self._rolled_out(state, batch)
+                    interval.rollout_seconds += sampled
+                first_compile = not compiled
+                train_step, measured_flops = self._compiled_for(compiled, state, batch)
+                if first_compile:
+                    # Rebound once the step is compiled, so the first tick
+                    # measures steps, not the compile.
+                    interval.last_log_time = time.time()
+                with region("train.step"):
+                    state, loss, aux, finite, accepted = train_step(state, batch)
+                run.loss = loss
+                position = run.train.source_state
+                run.current += 1
+                self._display.step(run.current)
+                seen += 1
+                interval.count(batch, measured_flops, loss, finite)
+                if run.first_step is None:
+                    loss.block_until_ready()
+                    run.first_step = time.perf_counter() - run.started
+                if self._between_steps(plan, run, interval, state, shardings, position,
+                                       loss, aux, accepted):
+                    break
+            # The step row is complete once its scope exits; closing the
+            # window here keeps the last iteration inside the capture.
+            if run.tracing and profile is not None:
+                run.traced += 1
+                if run.traced == profile.steps:
+                    run.tracing = False
+                    assert profiler is not None
+                    self._stop_trace(run, profile, profiler)
+        self._wind_down(plan, run, interval, state, shardings, position, profiler)
         return state
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
@@ -1510,8 +1603,13 @@ class Trainer(Generic[Loss, Effects]):
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed)
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), _split_share(state.params),
+            seed=self.seed)
         self._report(started, current)
+        # Read through the type that declares it: fit takes any object with a
+        # Dataset's readers, and a held-out count is not one of them.
+        if isinstance(plan.dataset, Dataset) and plan.dataset.held_out:
+            self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
@@ -1563,11 +1661,15 @@ class Trainer(Generic[Loss, Effects]):
         else:
             checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         evaluation_due = bool(plan.eval_every and current % plan.eval_every == 0)
-        if current < steps and (evaluation_due or ((plan.validation or plan.best or plan.stop) and checkpoint_due)):
+        if current < steps and (
+            evaluation_due or ((plan.validation or plan.best or plan.stop) and checkpoint_due)
+        ):
             with region("evaluate"):
                 run.evaluation = self._evaluation(plan, state, shardings, run.training)
                 run.other += run.evaluation.elapsed_seconds
-        scores = {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
+        scores = (
+            {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
+        )
         ranking = self._ranking(plan, scores)
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
@@ -1583,9 +1685,21 @@ class Trainer(Generic[Loss, Effects]):
         if (plan.checkpoint_every and checkpoints is not None
                 and checkpoint_due and current < steps) or (candidate and current < steps):
             assert checkpoints is not None
-            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
-                                                 training_best=not plan.validation and not plan.best, control=run.stop_control,
-                                                 weights_only=not checkpoint_due and not run.stopped and bool(winners) and all(rank.weights_only for rank in winners))
+            run.other += self._saved_checkpoint(
+                checkpoints,
+                current,
+                state,
+                position,
+                interval,
+                scores=scores,
+                ranking=ranking,
+                training_best=not plan.validation and not plan.best,
+                control=run.stop_control,
+                weights_only=not checkpoint_due
+                and not run.stopped
+                and bool(winners)
+                and all(rank.weights_only for rank in winners),
+            )
             run.last_checkpoint = time.perf_counter()
         if (plan.local_every and checkpoints is not None
                 and current % plan.local_every == 0 and current < steps):
@@ -1598,7 +1712,15 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         if current < steps and run.notice.reached(current):
             if checkpoints is not None and interval.last_saved != current:
-                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, training_best=not plan.validation and not plan.best, control=run.stop_control)
+                run.other += self._saved_checkpoint(
+                    checkpoints,
+                    current,
+                    state,
+                    position,
+                    interval,
+                    training_best=not plan.validation and not plan.best,
+                    control=run.stop_control,
+                )
             run.preempted = current
             return True
         return False
@@ -1636,7 +1758,11 @@ class Trainer(Generic[Loss, Effects]):
         if loss is not None:
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
-        if (plan.validation or plan.eval_every or plan.best or plan.stop) and run.preempted is None and not run.stopped:
+        if (
+            (plan.validation or plan.eval_every or plan.best or plan.stop)
+            and run.preempted is None
+            and not run.stopped
+        ):
             run.evaluation = self._evaluation(plan, state, shardings, run.training)
             run.other += run.evaluation.elapsed_seconds
             if self._plateau(plan, run, run.evaluation.scores):
@@ -1649,9 +1775,17 @@ class Trainer(Generic[Loss, Effects]):
             # step: a step-0 checkpoint holding the final weights would
             # make a resume restart the schedule from the beginning.
             scores = {} if run.evaluation is None or run.evaluation.step != current else run.evaluation.scores
-            run.other += self._saved_checkpoint(checkpoints, current, state, position, interval, scores=scores,
-                                                 ranking=self._ranking(plan, scores), training_best=not plan.validation and not plan.best,
-                                                 control=run.stop_control)
+            run.other += self._saved_checkpoint(
+                checkpoints,
+                current,
+                state,
+                position,
+                interval,
+                scores=scores,
+                ranking=self._ranking(plan, scores),
+                training_best=not plan.validation and not plan.best,
+                control=run.stop_control,
+            )
         if checkpoints is not None:
             checkpoints.wait()
 
@@ -1661,7 +1795,14 @@ class Trainer(Generic[Loss, Effects]):
         splits = ('val',) if validation is None else tuple(validation)
         if not splits:
             raise ValueError("validation must contain a split")
-        raw = () if best is None else tuple(best) if isinstance(best, Sequence) and not isinstance(best, str) else (best,)
+        raw = (
+            ()
+            if best is None
+            else tuple(best)
+            if isinstance(best, Sequence) and not isinstance(best, str)
+            else (best,)
+        )
+
         def owned(choice):
             if isinstance(choice, types.MethodType):
                 if choice.__name__ == 'loss' and choice.__self__ is self.objective:
@@ -1675,8 +1816,11 @@ class Trainer(Generic[Loss, Effects]):
                     source = self.objective.scalars[choice.metric.removeprefix('train/')]
                 return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
-        selection = tuple(self._best_selection(owned(Best(choice) if isinstance(choice, str) else choice), metrics, splits)
-                          for choice in raw)
+
+        selection = tuple(
+            self._best_selection(owned(Best(choice) if isinstance(choice, str) else choice), metrics, splits)
+            for choice in raw
+        )
         labels = [(choice.split, choice.metric) for choice in selection
                   if isinstance(choice._source, (Metric, TrainingScalar))]
         if len(labels) != len(set(labels)):
@@ -1684,7 +1828,9 @@ class Trainer(Generic[Loss, Effects]):
         if stop is not None:
             metric = owned(stop.metric)
             if not isinstance(metric, (Metric, TrainingScalar)):
-                raise TypeError("Plateau selects a declared metric object, not a Best policy or score function")
+                raise TypeError(
+                    "Plateau selects a declared metric object, not a Best policy or score function"
+                )
             stopping = self._best_selection(Best(metric, mode=stop.mode, split=stop.split), metrics, splits)
             stop = dataclasses.replace(stop, metric=metric, mode=stopping.mode, split=stopping.split)
         if restore_best and any(choice.weights_only for choice in selection):
@@ -1692,7 +1838,11 @@ class Trainer(Generic[Loss, Effects]):
         return selection, stop
 
     @staticmethod
-    def _best_selection(best: str | Metric | TrainingScalar | Best, metrics: Sequence[Metric], splits: Sequence[str] = ('val',)) -> Best:
+    def _best_selection(
+        best: str | Metric | TrainingScalar | Best,
+        metrics: Sequence[Metric],
+        splits: Sequence[str] = ("val",),
+    ) -> Best:
         selection = best if isinstance(best, Best) else Best(best)
         metric = selection._source
         if metric is None:
@@ -1705,7 +1855,9 @@ class Trainer(Generic[Loss, Effects]):
             if selection.mode is None:
                 if metric.shown.better is None:
                     raise ValueError("training scalar has no declared direction; use Best(scalar, mode=...)")
-                selection = dataclasses.replace(selection, mode='max' if metric.shown.better == 'higher' else 'min')
+                selection = dataclasses.replace(
+                    selection, mode="max" if metric.shown.better == "higher" else "min"
+                )
             return dataclasses.replace(selection, split='train')
         if isinstance(metric, (Metric, TrainingScalar)):
             if not any(metric is declared for declared in metrics):
@@ -1714,7 +1866,9 @@ class Trainer(Generic[Loss, Effects]):
             better = declaration.better if isinstance(declaration, Shown) else None
             if selection.mode is None:
                 if better not in ('higher', 'lower'):
-                    raise ValueError("best metric has no declared direction; use Best(metric, mode='min' or 'max')")
+                    raise ValueError(
+                        "best metric has no declared direction; use Best(metric, mode='min' or 'max')"
+                    )
                 selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
         if selection.split is None:
             if len(splits) != 1 and isinstance(metric, Metric):
@@ -1726,7 +1880,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _ranking(self, plan: _FitPlan, scores: Mapping[str, float]) -> tuple[Ranking, ...]:
         if not plan.best:
-            name = ('val' if plan.validation_splits is None else next(iter(plan.validation_splits))) + '/loss' if plan.validation else 'train/loss'
+            name = (
+                ("val" if plan.validation_splits is None else next(iter(plan.validation_splits))) + "/loss"
+                if plan.validation
+                else "train/loss"
+            )
             return (Ranking(name, scores[name]),) if name in scores else ()
         ranks = []
         for index, selection in enumerate(plan.best):
@@ -1753,7 +1911,9 @@ class Trainer(Generic[Loss, Effects]):
         stop = plan.stop
         if stop is None:
             return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar)), "fit binds the stopping selector before stepping"
+        assert isinstance(stop.metric, (Metric, TrainingScalar)), (
+            "fit binds the stopping selector before stepping"
+        )
         name = f'{stop.split}/{stop.metric.name}'
         if name not in scores:
             return False
@@ -1764,7 +1924,9 @@ class Trainer(Generic[Loss, Effects]):
         held = run.stop_control.get(key)
         rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}
         if held is not None and held.get('rule') != rule:
-            raise ValueError("Plateau policy differs from the resumed checkpoint; resume with the same stopping rule")
+            raise ValueError(
+                "Plateau policy differs from the resumed checkpoint; resume with the same stopping rule"
+            )
         if held is not None and held.get('step') == run.current:
             return held['bad'] >= stop.evals
         if held is None or value < held['best'] - stop.min_delta:
@@ -1779,13 +1941,36 @@ class Trainer(Generic[Loss, Effects]):
         reports = training if self.checkpoints is not None or plan.best or plan.stop else None
         loss = plan.validation and not plan.best and not any(metric.name == 'loss' for metric in plan.metrics)
         if plan.validation_splits is None:
-            return self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview, loss=loss and self.checkpoints is not None, training=reports)
+            return self._evaluate(
+                state,
+                shardings,
+                plan.dataset,
+                plan.metrics,
+                plan.preview,
+                loss=loss and self.checkpoints is not None,
+                training=reports,
+            )
         evaluations = []
         for split, reader in plan.validation_splits.items():
             evaluations.append(self._evaluate(state, shardings, plan.dataset, plan.metrics, plan.preview,
                                           loss=loss, reader=reader, split=split, training=reports))
-        return dataclasses.replace(evaluations[0], scores={name: value for report in evaluations for name, value in report.scores.items()},
-                                   elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
+        return dataclasses.replace(
+            evaluations[0],
+            scores={name: value for report in evaluations for name, value in report.scores.items()},
+            elapsed_seconds=sum(report.elapsed_seconds for report in evaluations),
+        )
+
+    def _preflight(self, dataset: Dataset, stop, eval_every: int | None, metrics: Sequence[Metric], *,
+                   preview: bool) -> None:
+        """The refusals `fit` makes before it places anything: validation
+        nothing reads, and a pipeline's batch, whose placement could take
+        minutes or run out of memory before the error. Every other mesh's
+        batch is checked with its stream (`_check_stream`), a ramp's at each
+        of its stages."""
+        if stop is None or not isinstance(stop.metric, TrainingScalar):
+            self._check_validation_is_read(eval_every, metrics, preview=preview)
+        if self.mesh.stage > 1:
+            self._check_batch(dataset.batch, self.device_mesh)
 
     def _check_validation_is_read(self, eval_every: int | None,
                                   metrics: Sequence[Metric], *, preview: bool) -> None:
@@ -1795,7 +1980,12 @@ class Trainer(Generic[Loss, Effects]):
         Scheduled with neither, it would open nothing and report nothing, so
         the contradiction is refused before the run does any work.
         """
-        if eval_every and not metrics and self.checkpoints is None and not (preview and self.tracker is not None):
+        if (
+            eval_every
+            and not metrics
+            and self.checkpoints is None
+            and not (preview and self.tracker is not None)
+        ):
             raise ValueError(
                 f"eval_every={eval_every} schedules a validation pass that nothing consumes: "
                 + ("preview=True needs a tracker to receive the samples; "
@@ -1954,10 +2144,20 @@ class Trainer(Generic[Loss, Effects]):
             self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
         return compiled[shapes]
 
-    def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
-                          position: bytes | None, interval: _Interval, *, scores: Mapping[str, float] | None = None,
-                          ranking: Sequence[Ranking] = (), training_best: bool = True,
-                          control: dict | None = None, weights_only: bool = False) -> float:
+    def _saved_checkpoint(
+        self,
+        checkpoints: Checkpoints,
+        step: int,
+        state: TrainState,
+        position: bytes | None,
+        interval: _Interval,
+        *,
+        scores: Mapping[str, float] | None = None,
+        ranking: Sequence[Ranking] = (),
+        training_best: bool = True,
+        control: dict | None = None,
+        weights_only: bool = False,
+    ) -> float:
         """Write one checkpoint with the interval's mean loss, report it and
         start the next interval.
 
@@ -1978,8 +2178,15 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("")
         return time.perf_counter() - paused
 
-    def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int,
-                                state: TrainState, position: bytes | None, *, control: dict | None = None) -> float:
+    def _saved_local_checkpoint(
+        self,
+        checkpoints: Checkpoints,
+        step: int,
+        state: TrainState,
+        position: bytes | None,
+        *,
+        control: dict | None = None,
+    ) -> float:
         """Write one checkpoint to the local directory, and report it.
 
         Returns the seconds it took. The local copy carries no metadata; it
@@ -1987,9 +2194,20 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         if control:
-            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), control=control, rung=self._rung(), artifact=self.objective.inference_record())
+            checkpoints.save_local(
+                step,
+                state,
+                position,
+                share=data_partition(self.device_mesh),
+                control=control,
+                rung=self._rung(),
+                artifact=self.objective.inference_record(),
+            )
         else:
-            checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh), rung=self._rung(), artifact=self.objective.inference_record())
+            checkpoints.save_local(
+                step, state, position, share=data_partition(self.device_mesh), rung=self._rung(),
+                artifact=self.objective.inference_record(),
+            )
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2083,9 +2301,19 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
-                  metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
-                  reader: Reader | None = None, split: str = 'val', training: Mapping[str, jax.Array] | None = None) -> Evaluation:
+    def _evaluate(
+        self,
+        state: TrainState,
+        shardings: Placement[TrainState],
+        dataset: Dataset,
+        metrics: Sequence[Metric],
+        preview: bool,
+        *,
+        loss: bool = False,
+        reader: Reader | None = None,
+        split: str = "val",
+        training: Mapping[str, jax.Array] | None = None,
+    ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
         which is what the goodput fraction is measured against.

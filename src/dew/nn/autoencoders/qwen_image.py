@@ -282,8 +282,14 @@ class QwenImageVAE(nn.Module):
                                 self.temporal_downsample, self.dtype)
         self.quant_conv = _conv(2 * self.latent_channels, 1, self.dtype, None)
         self.post_quant_conv = _conv(self.latent_channels, 1, self.dtype, None)
-        self.decoder = _Decoder(self.decoder_base_dim, self.image_channels, self.dim_mult, self.num_res_blocks,
-                                self.temporal_downsample[::-1], self.dtype)
+        self.decoder = _Decoder(
+            self.decoder_base_dim,
+            self.image_channels,
+            self.dim_mult,
+            self.num_res_blocks,
+            self.temporal_downsample[::-1],
+            self.dtype,
+        )
 
     def encode(self, x, key=None):
         """The posterior mean, or a draw from it when `key` is given."""
@@ -410,8 +416,10 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
         self.latents_std = np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
         if self.latents_mean.shape != expected or self.latents_std.shape != expected:
-            raise ValueError(f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
-                             f"must both hold one value per latent channel {expected}")
+            raise ValueError(
+                f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
+                f"must both hold one value per latent channel {expected}"
+            )
     @property
     def downscale_factor(self) -> int:
         return self.model.downscale_factor
@@ -427,7 +435,9 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
         return (latent - self.latents_mean.astype(latent.dtype)) / self.latents_std.astype(latent.dtype)
 
     def decode(self, params, z):
-        return super().decode(params, z * self.latents_std.astype(z.dtype) + self.latents_mean.astype(z.dtype))
+        return super().decode(
+            params, z * self.latents_std.astype(z.dtype) + self.latents_mean.astype(z.dtype)
+        )
 
 
 def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32",

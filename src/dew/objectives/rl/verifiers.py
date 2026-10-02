@@ -70,7 +70,9 @@ class CodeReward:
         interpreter = self.fleet.runner.python if self.interpreter is None else self.interpreter
         outcomes = self.fleet.run(Program({self.filename: source}, (*interpreter, self.filename), stdin)
                                   for stdin, _ in cases)
-        passed = sum(outputs_match(outcome, expected) for outcome, (_, expected) in zip(outcomes, cases, strict=True))
+        passed = sum(
+            outputs_match(outcome, expected) for outcome, (_, expected) in zip(outcomes, cases, strict=True)
+        )
         if self.all_or_nothing:
             return float(passed == len(cases))
         return passed / len(cases)

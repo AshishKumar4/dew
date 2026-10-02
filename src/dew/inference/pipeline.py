@@ -33,10 +33,17 @@ if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
 
 
-def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None = None,
-             dtype: str | None = None, param_dtype: str | None = None,
-             ema: bool | None = None, step: int | str | None = None,
-             revision: str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+def pipeline(
+    source: str,
+    *,
+    mesh: MeshSpec | None = None,
+    layout: Layout | None = None,
+    dtype: str | None = None,
+    param_dtype: str | None = None,
+    ema: bool | None = None,
+    step: int | str | None = None,
+    revision: str | None = None,
+) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     """Load the inference task for `source`, its weights placed once.
 
     `source` is a run directory, or a source checkpoint directory or Hub

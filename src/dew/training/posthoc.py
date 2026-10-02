@@ -120,7 +120,10 @@ def reconstruct(directory: str, std: float, step: int | None = None) -> Variable
             if total is None:
                 dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
                 total = jax.tree.map(
-                    lambda leaf: weight * leaf.astype(np.promote_types(leaf.dtype, np.float32)), average)
+                    lambda leaf, weight=weight: weight
+                    * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
+                    average,
+                )
             else:
-                total = jax.tree.map(lambda sum_, leaf: sum_ + weight * leaf, total, average)
+                total = jax.tree.map(lambda sum_, leaf, weight=weight: sum_ + weight * leaf, total, average)
     return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)

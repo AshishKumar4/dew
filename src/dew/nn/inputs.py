@@ -60,21 +60,27 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     if type(pad_id) is not int or not 0 <= pad_id <= limits.max:
         raise ValueError("pad_id must be a nonnegative int32 token id")
     arrays = [np.asarray(row) for row in rows]
-    if not arrays or any(row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays):
+    if not arrays or any(
+        row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays
+    ):
         raise ValueError("each prompt must contain a nonempty integer token row")
     if any(np.any((row < 0) | (row > limits.max)) for row in arrays):
         raise ValueError("token IDs must be nonnegative int32 values")
     width = max(row.size for row in arrays)
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
-    slots = [slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays]
+    slots = [
+        slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays
+    ]
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
     padded = {"attention_mask": valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
-        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)):
+        if len(aligned) != len(arrays) or any(
+            value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
+        ):
             raise ValueError(f"token field {name!r} must align with the token rows")
         if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
             raise ValueError("attention_mask must contain only zero or one")
@@ -142,10 +148,14 @@ class ModelInputs:
                     "mutable", "capture_intermediates", "attention_pairwise_mask",
                     "attention_key_positions"}
         if reserved.intersection(self.token_fields):
-            raise ValueError(f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}")
+            raise ValueError(
+                f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
+            )
         for name, value in self.token_fields.items():
             if value.ndim < 2 or value.shape[:2] != self.tokens.shape:
-                raise ValueError(f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}")
+                raise ValueError(
+                    f"token field {name!r} must start with {self.tokens.shape}, got {value.shape}"
+                )
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")

@@ -42,11 +42,19 @@ def draw_device(key: jax.Array, shape: tuple[int, ...], *, flip: bool, jitter: b
     sides = jnp.asarray(shape[:2], jnp.int32)
     extent = jnp.maximum(1, jnp.rint(sides * fraction).astype(jnp.int32))
     start = jax.random.randint(origin, (2,), 0, sides - extent + 1, dtype=jnp.int32)
-    factors = (jax.random.uniform(colour, (3,), dtype=jnp.float32,
-                                 minval=jnp.asarray(_LOW, jnp.float32), maxval=jnp.asarray(_HIGH, jnp.float32))
-               if jitter else jnp.ones(3, jnp.float32))
+    factors = (
+        jax.random.uniform(
+            colour,
+            (3,),
+            dtype=jnp.float32,
+            minval=jnp.asarray(_LOW, jnp.float32),
+            maxval=jnp.asarray(_HIGH, jnp.float32),
+        )
+        if jitter
+        else jnp.ones(3, jnp.float32)
+    )
     return ImageParameters(jnp.concatenate([start, extent]),
-                           jax.random.bernoulli(mirror, p=jnp.float32(0.5)) if flip else jnp.asarray(False),
+                           jax.random.bernoulli(mirror, p=jnp.float32(0.5)) if flip else jnp.asarray(a=False),
                            factors, jax.random.permutation(order, jnp.arange(3, dtype=jnp.int32))
                            if jitter else jnp.arange(3, dtype=jnp.int32))
 

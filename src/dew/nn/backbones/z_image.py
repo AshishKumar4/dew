@@ -26,7 +26,8 @@ and returns the flow Dew's process reads, so the conversion lives here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -92,8 +93,9 @@ class _Attention(nn.Module):
         split = (x.shape[0], x.shape[1], self.heads, self.head_dim)
 
         def projection(name):
-            return nn.Dense(inner, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)(x).reshape(
-                split)
+            return nn.Dense(inner, use_bias=False, dtype=self.dtype, precision=self.precision, name=name)(
+                x
+            ).reshape(split)
 
         query = RMSNorm(epsilon=1e-5, dtype=self.dtype, name="norm_q")(projection("to_q"))
         key = RMSNorm(epsilon=1e-5, dtype=self.dtype, name="norm_k")(projection("to_k"))
@@ -101,8 +103,13 @@ class _Attention(nn.Module):
         attended = scaled_dot_product_attention(
             apply_rotary(query, *rotation), apply_rotary(key, *rotation), projection("to_v"),
             implementation=self.attention_impl, precision=self.precision, key_value_seq_lengths=lengths)
-        return nn.Dense(self.heads * self.head_dim, use_bias=False, dtype=self.dtype, precision=self.precision,
-                        name="to_out_0")(attended.reshape(x.shape[0], x.shape[1], inner))
+        return nn.Dense(
+            self.heads * self.head_dim,
+            use_bias=False,
+            dtype=self.dtype,
+            precision=self.precision,
+            name="to_out_0",
+        )(attended.reshape(x.shape[0], x.shape[1], inner))
 
 
 @logical_axes({("w1",): ("embed", "mlp"), ("w3",): ("embed", "mlp"), ("w2",): ("mlp", "embed")})
@@ -117,7 +124,9 @@ class _FeedForward(nn.Module):
     @nn.compact
     def __call__(self, x):
         dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
-        gated = nn.silu(nn.Dense(self.hidden, name="w1", **dense)(x)) * nn.Dense(self.hidden, name="w3", **dense)(x)
+        gated = nn.silu(nn.Dense(self.hidden, name="w1", **dense)(x)) * nn.Dense(
+            self.hidden, name="w3", **dense
+        )(x)
         return nn.Dense(self.features, name="w2", **dense)(gated)
 
 
@@ -139,8 +148,14 @@ class ZImageBlock(nn.Module):
         def norm(name):
             return RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name=name)
 
-        attention = _Attention(self.heads, self.features // self.heads, dtype=self.dtype, precision=self.precision,
-                               attention_impl=self.attention_impl, name="attention")
+        attention = _Attention(
+            self.heads,
+            self.features // self.heads,
+            dtype=self.dtype,
+            precision=self.precision,
+            attention_impl=self.attention_impl,
+            name="attention",
+        )
         feed_forward = _FeedForward(self.features, int(self.features / 3 * 8), dtype=self.dtype,
                                     precision=self.precision, name="feed_forward")
         if not self.modulation:
@@ -151,7 +166,9 @@ class ZImageBlock(nn.Module):
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale), cos, sin, lengths)
         x = x + jnp.tanh(gate) * norm("attention_norm2")(attended)
-        return x + jnp.tanh(gate_mlp) * norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x) * (1 + scale_mlp)))
+        return x + jnp.tanh(gate_mlp) * norm("ffn_norm2")(
+            feed_forward(norm("ffn_norm1")(x) * (1 + scale_mlp))
+        )
 
 
 @models("z_image_transformer")
@@ -221,7 +238,9 @@ class ZImageTransformer(nn.Module):
             batch, count, 4 * channels)
         image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(patches)
         image = jnp.concatenate(
-            [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))], axis=1)
+            [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
+            axis=1,
+        )
         caption = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="cap_embedder")(
             RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
         caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
@@ -245,8 +264,9 @@ class ZImageTransformer(nn.Module):
             image = ZImageBlock(self.dim, self.n_heads, name=f"noise_refiner_{index}", **block)(
                 image, image_cos, image_sin, whole_image, embedded)
         for index in range(self.n_refiner_layers):
-            caption = ZImageBlock(self.dim, self.n_heads, modulation=False, name=f"context_refiner_{index}", **block)(
-                caption, caption_cos, caption_sin, spans)
+            caption = ZImageBlock(
+                self.dim, self.n_heads, modulation=False, name=f"context_refiner_{index}", **block
+            )(caption, caption_cos, caption_sin, spans)
         joined = jnp.concatenate([image, caption], axis=1)
         cos = jnp.concatenate([image_cos, caption_cos], axis=1)
         sin = jnp.concatenate([image_sin, caption_sin], axis=1)

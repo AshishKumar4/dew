@@ -62,7 +62,9 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 or type(teacher.process.prediction) is not type(process.prediction)):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+        unused = sorted(
+            key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None
+        )
         if unused:
             raise ValueError(f"guidance distillation trains on its own loss, which reads none of {unused}")
         kwargs.setdefault("guidance", None)

@@ -2,7 +2,7 @@
 
     curl -o data/shakespeare.txt --create-dirs \\
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
+    dew tokenize --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """
@@ -49,9 +49,16 @@ def main(config: Config):
     model = models.build("causal_transformer", **config.model, vocab_size=int(meta["vocab_size"]),
                          max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
                          dtype="bfloat16")
-    objective = LMObjective(model, config.sequence_length,
-                            samples=Samples(prompt, config.sample_tokens, sampling=Sampling(temperature=0.8, top_k=40),
-                                            decode=tokenizer.decode))
+    objective = LMObjective(
+        model,
+        config.sequence_length,
+        samples=Samples(
+            prompt,
+            config.sample_tokens,
+            sampling=Sampling(temperature=0.8, top_k=40),
+            decode=tokenizer.decode,
+        ),
+    )
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))

@@ -30,15 +30,13 @@ Wrote corpus.txt with 53640 bytes
 Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 IDs:
 
 ```bash
-python "$DEW_REPO/tools/tokenize_text.py" \
+dew tokenize \
     --input corpus.txt --out tokens --tokenizer byte --val-fraction 0.1
 ```
 
 ```text
-1 file(s), 0.1 MB of text
-wrote tokens/train.bin (48276 tokens)
-wrote tokens/val.bin (5364 tokens)
-wrote tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
+wrote 48276 tokens to tokens/train.bin and 5364 to tokens/val.bin
+tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
 ```
 
 `tokens/meta.json` records the tokenizer, the vocabulary size, the storage dtype and the token counts, so keep the three files together. The validation split is the first 10% of the token stream, not a random sample. This corpus repeats itself, so it checks the workflow and measures nothing about generalization.

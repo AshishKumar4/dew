@@ -69,7 +69,9 @@ class _TimeMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj")(x)
-        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(nn.silu(x))
+        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(
+            nn.silu(x)
+        )
 
 
 @logical_axes({(sublayer, projection): ("embed", "heads", "head_dim")
@@ -135,7 +137,10 @@ class _Transformer(nn.Module):
         def attention(name):
             return _Attention(self.stage.features, self.stage.heads, self.dropout, self.dtype,
                               self.precision, self.attention_impl, name=name)
-        x = x + attention("self_attention")(norm("self_norm")(x), context if self.stage.cross_only else None, train=train)
+
+        x = x + attention("self_attention")(
+            norm("self_norm")(x), context if self.stage.cross_only else None, train=train
+        )
         x = x + attention("cross_attention")(norm("cross_norm")(x), context, train=train)
         x = x + FlaxFeedForward(self.stage.features, dtype=self.dtype, precision=self.precision,
                                dropout=self.dropout, approximate_gelu=self.approximate_gelu,
@@ -217,14 +222,28 @@ class _Level(nn.Module):
         for index in range(self.blocks):
             if self.direction == "up":
                 x = jnp.concatenate([x, skips[-(index + 1)]], axis=-1)
-            x = ResidualBlock(self.stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
-                              dropout=self.dropout, dtype=self.dtype, precision=self.precision,
-                              name=f"residual_{index}")(x, nn.silu(time), train=train)
+            x = ResidualBlock(
+                self.stage.features,
+                norm_groups=self.norm_groups,
+                norm_epsilon=self.norm_epsilon,
+                dropout=self.dropout,
+                dtype=self.dtype,
+                precision=self.precision,
+                name=f"residual_{index}",
+            )(x, nn.silu(time), train=train)
             if self.stage.cross_attention:
-                x = _SpatialAttention(self.stage, self.linear_projection, self.dropout, self.dtype,
-                                      self.precision, self.attention_impl, norm_groups=self.norm_groups,
-                                      norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
-                                      name=f"attention_{index}")(x, context, train=train)
+                x = _SpatialAttention(
+                    self.stage,
+                    self.linear_projection,
+                    self.dropout,
+                    self.dtype,
+                    self.precision,
+                    self.attention_impl,
+                    norm_groups=self.norm_groups,
+                    norm_epsilon=self.attention_norm_epsilon,
+                    approximate_gelu=self.approximate_gelu,
+                    name=f"attention_{index}",
+                )(x, context, train=train)
             outputs.append(x)
         if self.resize:
             if self.direction == "up":
@@ -267,7 +286,9 @@ class UNet2DCondition(nn.Module):
     approximate_gelu: bool = True
 
     @nn.compact
-    def __call__(self, x, time, *, conditioning: DenoisingCondition, mask=None, masked_image=None, train=False):
+    def __call__(
+        self, x, time, *, conditioning: DenoisingCondition, mask=None, masked_image=None, train=False
+    ):
         if mask is not None:
             if masked_image is None:
                 raise ValueError("An inpaint mask needs its masked-image latents")
@@ -298,23 +319,56 @@ class UNet2DCondition(nn.Module):
         if self.middle_attention:
             last = self.stages[-1]
             stage = UNetStage(last.features, last.heads, last.depth)
-            x = ResidualBlock(stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon, dropout=self.dropout,
-                              dtype=self.dtype, precision=self.precision, name="middle_in")(x, nn.silu(time), train=train)
-            x = _SpatialAttention(stage, self.linear_projection, self.dropout, self.dtype, self.precision,
-                                  self.attention_impl, norm_groups=self.norm_groups,
-                                  norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
-                                  name="middle_attention")(x, conditioning.context, train=train)
-            x = ResidualBlock(stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon, dropout=self.dropout,
-                              dtype=self.dtype, precision=self.precision, name="middle_out")(x, nn.silu(time), train=train)
+            x = ResidualBlock(
+                stage.features,
+                norm_groups=self.norm_groups,
+                norm_epsilon=self.norm_epsilon,
+                dropout=self.dropout,
+                dtype=self.dtype,
+                precision=self.precision,
+                name="middle_in",
+            )(x, nn.silu(time), train=train)
+            x = _SpatialAttention(
+                stage,
+                self.linear_projection,
+                self.dropout,
+                self.dtype,
+                self.precision,
+                self.attention_impl,
+                norm_groups=self.norm_groups,
+                norm_epsilon=self.attention_norm_epsilon,
+                approximate_gelu=self.approximate_gelu,
+                name="middle_attention",
+            )(x, conditioning.context, train=train)
+            x = ResidualBlock(
+                stage.features,
+                norm_groups=self.norm_groups,
+                norm_epsilon=self.norm_epsilon,
+                dropout=self.dropout,
+                dtype=self.dtype,
+                precision=self.precision,
+                name="middle_out",
+            )(x, nn.silu(time), train=train)
         for index, stage in enumerate(reversed(self.stages)):
             count = self.blocks_per_level + 1
             inputs, skips = tuple(skips[-count:]), skips[:-count]
             target = skips[-1].shape[1:3] if skips else None
-            x, _ = _Level(stage, count, "up", index + 1 < len(self.stages), self.linear_projection,
-                          self.dropout, self.dtype, self.precision, self.attention_impl,
-                          norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
-                          attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
-                          name=f"up_{index}")(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
+            x, _ = _Level(
+                stage,
+                count,
+                "up",
+                index + 1 < len(self.stages),
+                self.linear_projection,
+                self.dropout,
+                self.dtype,
+                self.precision,
+                self.attention_impl,
+                norm_groups=self.norm_groups,
+                norm_epsilon=self.norm_epsilon,
+                attention_norm_epsilon=self.attention_norm_epsilon,
+                approximate_gelu=self.approximate_gelu,
+                name=f"up_{index}",
+            )(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
         x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype,
                                   name="output_norm")(x))
         return Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)

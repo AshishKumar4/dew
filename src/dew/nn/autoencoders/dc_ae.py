@@ -151,9 +151,18 @@ class _LinearAttention(nn.Module):
         inner = heads * self.head_dim
         qkv = jnp.concatenate([nn.Dense(inner, use_bias=False, dtype=self.dtype, name=name)(x)
                                for name in ("to_q", "to_k", "to_v")], axis=-1)
-        qkv = jnp.concatenate([qkv, *(
-            _MultiscaleProjection(3 * inner, heads, kernel, self.dtype, name=f"to_qkv_multiscale_{index}")(qkv)
-            for index, kernel in enumerate(self.scales))], axis=-1)
+        qkv = jnp.concatenate(
+            [
+                qkv,
+                *(
+                    _MultiscaleProjection(
+                        3 * inner, heads, kernel, self.dtype, name=f"to_qkv_multiscale_{index}"
+                    )(qkv)
+                    for index, kernel in enumerate(self.scales)
+                ),
+            ],
+            axis=-1,
+        )
         positions = height * width
         quadratic = positions <= self.head_dim
         if not quadratic:
@@ -273,12 +282,22 @@ class _Encoder(nn.Module):
                       name="conv_in")(image)
         for level, (features, count) in enumerate(zip(channels, layers, strict=True)):
             for index in range(count):
-                x = _block(self.blocks[level], features, self.head_dim, self.scales[level], "rms_norm", "silu",
-                           self.dtype, f"down_blocks_{level}_{index}")(x)
+                x = _block(
+                    self.blocks[level],
+                    features,
+                    self.head_dim,
+                    self.scales[level],
+                    "rms_norm",
+                    "silu",
+                    self.dtype,
+                    f"down_blocks_{level}_{index}",
+                )(x)
             if level < len(channels) - 1 and count > 0:
                 x = _Down(features, channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
-        return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(x, self.latent_channels)
+        return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(
+            x, self.latent_channels
+        )
 
 
 class _Decoder(nn.Module):
@@ -303,8 +322,14 @@ class _Decoder(nn.Module):
             count = layers[level]
             upsampled = level < len(channels) - 1 and count > 0
             if upsampled:
-                x = _Up(channels[level + 1], channels[level], self.interpolate, shortcut=True, dtype=self.dtype,
-                        name=f"up_blocks_{level}_0")(x)
+                x = _Up(
+                    channels[level + 1],
+                    channels[level],
+                    self.interpolate,
+                    shortcut=True,
+                    dtype=self.dtype,
+                    name=f"up_blocks_{level}_0",
+                )(x)
             for index in range(count):
                 x = _block(self.blocks[level], channels[level], self.head_dim, self.scales[level],
                            self.norms[level], self.activations[level], self.dtype,
@@ -360,9 +385,17 @@ class DCAE(nn.Module):
         return 2 ** (len(self.encoder_channels) - 1)
 
     def setup(self):
-        self.encoder = _Encoder(self.image_channels, self.latent_channels, self.head_dim, self.encoder_blocks,
-                                self.encoder_channels, self.encoder_layers, self.encoder_scales, self.unshuffle,
-                                self.dtype)
+        self.encoder = _Encoder(
+            self.image_channels,
+            self.latent_channels,
+            self.head_dim,
+            self.encoder_blocks,
+            self.encoder_channels,
+            self.encoder_layers,
+            self.encoder_scales,
+            self.unshuffle,
+            self.dtype,
+        )
         self.decoder = _Decoder(self.image_channels, self.latent_channels, self.head_dim, self.decoder_blocks,
                                 self.decoder_channels, self.decoder_layers, self.decoder_scales,
                                 self.decoder_norms, self.decoder_activations, self.interpolate, self.dtype)
@@ -416,7 +449,11 @@ def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
         unshuffle=config["downsample_block_type"] == "pixel_unshuffle",
         interpolate=config["upsample_block_type"] == "interpolate")
     checks = [
-        ("block types", {*fields["encoder_blocks"], *fields["decoder_blocks"]}, {"ResBlock", "EfficientViTBlock"}),
+        (
+            "block types",
+            {*fields["encoder_blocks"], *fields["decoder_blocks"]},
+            {"ResBlock", "EfficientViTBlock"},
+        ),
         ("decoder norm types", set(fields["decoder_norms"]), {"rms_norm", "batch_norm"}),
         ("decoder activations", set(fields["decoder_activations"]), set(_ACTIVATIONS)),
         ("downsample_block_type", {config["downsample_block_type"]}, {"pixel_unshuffle", "Conv"}),
@@ -424,7 +461,9 @@ def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
     ]
     for what, found, known in checks:
         if not found <= known:
-            raise ValueError(f"{what} {sorted(found - known)} are not ones AutoencoderDC builds: {sorted(known)}")
+            raise ValueError(
+                f"{what} {sorted(found - known)} are not ones AutoencoderDC builds: {sorted(known)}"
+            )
     return fields
 
 
@@ -492,7 +531,9 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
 
     from dew.interop import diffusion, sources
 
-    directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,) if params is None else False)
+    directory = sources.snapshot(
+        str(name_or_dir), revision, weights=(subfolder,) if params is None else False
+    )
     config = json.loads((directory / subfolder / "config.json").read_text())
     if config.get("_class_name") != "AutoencoderDC":
         raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderDC")

@@ -23,7 +23,8 @@ temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 """
 
 import math
-from typing import Callable, NamedTuple
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -482,7 +483,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
-    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`). `temperature` divides the capped logits (`head_logits`), which
+    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`).
+    `temperature` divides the capped logits (`head_logits`), which
     scores the draws of a sampler at that temperature.
 
     On a mesh every device scores its own tokens (`_token_spec`): the token
@@ -670,7 +672,10 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
         return _capped(head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], precision),
                        softcap, temperature)
 
-    pieces = (ids.reshape(-1, blocks, block).swapaxes(0, 1), columns.reshape(-1, blocks, block).swapaxes(0, 1))
+    pieces = (
+        ids.reshape(-1, blocks, block).swapaxes(0, 1),
+        columns.reshape(-1, blocks, block).swapaxes(0, 1),
+    )
     logits = jax.lax.map(chunk, pieces).swapaxes(0, 1).reshape(ids.shape)
     labels = jnp.take_along_axis(targets, jnp.maximum(columns, 0), axis=1)
 

@@ -44,7 +44,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +71,7 @@ _SUM = 0
 
 
 class _UniqueId(ctypes.Structure):
-    _fields_ = [("internal", ctypes.c_byte * 128)]
+    _fields_: ClassVar = [("internal", ctypes.c_byte * 128)]
 
 
 class _Library:
@@ -229,9 +229,13 @@ class NCCLPush:
         for root in self.engines:
             _post(root, "/pause?mode=wait", None, self.timeout)
             _post(root, "/start_weight_update", None, self.timeout)
-        listing: JSON = {"update_info": {"names": list(names),
-                                         "dtype_names": [str(tensor.dtype) for tensor in tensors],
-                                         "shapes": [[int(size) for size in tensor.shape] for tensor in tensors]}}
+        listing: JSON = {
+            "update_info": {
+                "names": list(names),
+                "dtype_names": [str(tensor.dtype) for tensor in tensors],
+                "shapes": [[int(size) for size in tensor.shape] for tensor in tensors],
+            }
+        }
         failures: list[BaseException] = []
 
         def receive(root: str) -> None:
@@ -274,7 +278,7 @@ class NCCLPush:
                                         "rank_offset": 1, "world_size": 1 + workers, "packed": False}}
             failures: list[BaseException] = []
 
-            def join(root: str = root, body: JSON = body) -> None:
+            def join(root: str = root, body: JSON = body, failures=failures) -> None:
                 try:
                     _post(root, "/init_weight_transfer_engine", body, self.timeout)
                 except BaseException as failure:
@@ -294,7 +298,9 @@ class NCCLPush:
             self._groups[root] = comm
         return library
 
-    def _broadcast(self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]) -> None:
+    def _broadcast(
+        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]
+    ) -> None:
         """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
 
         The next chunk's copies are issued before the current chunk broadcasts,

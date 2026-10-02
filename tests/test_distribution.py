@@ -339,6 +339,23 @@ def test_eight_cpu_devices_on_four_cores_run_collectives_ahead_of_the_host():
 
 
 @pytest.mark.mesh(devices=0)
+@pytest.mark.parametrize("flags, kept", [("", "false"), ("--xla_allow_excess_precision=true", "true")])
+def test_a_process_keeps_every_rounding_its_program_states(flags, kept):
+    """XLA's default lets a fusion skip a rounding to bf16, and which
+    roundings it skips depends on what fuses, so on the layout. The process
+    keeps them all, unless the run named the flag."""
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.prepare_process(multi_host=False)\n"
+               "from dew.telemetry.devices import xla_flag\n"
+               "print('excess', xla_flag('xla_allow_excess_precision'))\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"excess {kept}" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
 def test_one_slurm_task_joins_no_pool():
     """srun with one task sets SLURM_JOB_ID, and JAX's Slurm detection then
     starts a one-process pool whose coordinator is the node's name. A

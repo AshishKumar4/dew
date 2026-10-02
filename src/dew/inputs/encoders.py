@@ -13,9 +13,10 @@ An encoder is rebuilt from a run's record by `rebuild(name, fields)`, where
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, ClassVar, Generic, Mapping, Self, Sequence
+from typing import TYPE_CHECKING, ClassVar, Generic, Self
 
 import jax.numpy as jnp
 import numpy as np
@@ -378,7 +379,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             from torchax.interop import JittableModule, extract_all_buffers
             from transformers import AutoConfig, AutoModel
         except ImportError as error:
-            raise ImportError(f"hf_audio runs transformers' audio model through torchax: {INSTALL}") from error
+            raise ImportError(
+                f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
+            ) from error
         if params is None:
             model = AutoModel.from_pretrained(checkpoint, dtype=getattr(torch, param_dtype))
         else:

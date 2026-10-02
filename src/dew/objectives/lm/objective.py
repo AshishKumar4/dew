@@ -275,7 +275,11 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     for name in columns:
         if name in prepared.token_fields:
             raise ValueError(f"{name} must come from either ModelInputs or the packing column")
-    return dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns}) if columns else prepared
+    return (
+        dataclasses.replace(prepared, token_fields={**prepared.token_fields, **columns})
+        if columns
+        else prepared
+    )
 
 
 def prompt_batch(prompt) -> jax.Array:
@@ -300,7 +304,7 @@ class Samples:
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     decode: Callable[[list[int]], str] = lambda ids: str(ids)
 
 
@@ -466,6 +470,9 @@ def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable
     return _is_indexer if indexer.phase == "warmup" else None
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 @objectives("lm")
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews.
@@ -569,7 +576,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """
 
     artifact = TokenScores
-    shown = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
+    shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
     keeps_whole_logits: ClassVar[bool] = True
@@ -693,7 +700,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return merge(variables, pretrained)
 
 
-    def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
+    def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
         """Expose the model over this training tree as a generation task.
 
         A rollout binds one snapshot of the policy and draws every completion
