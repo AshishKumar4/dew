@@ -143,7 +143,7 @@ def test_a_matrix_of_rank_above_two_with_undeclared_axes_is_rejected():
     # rank-2 axes would refuse this for another reason.
     params['params']['layers_0']['mixer'] = {'mixing': jnp.zeros((4, 8, 16))}
 
-    with pytest.raises(ValueError, match="mixer.*rank 3.*declared logical axes"):
+    with pytest.raises(ValueError, match=r"mixer.*rank 3.*declared logical axes"):
         muon_weight_dimension_numbers(params)
 
 

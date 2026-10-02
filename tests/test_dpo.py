@@ -277,7 +277,7 @@ def test_a_misshapen_batch_is_refused():
         scalar_loss(objective, params, wide, step)
 
     no_ref = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError, match="step.ema"):
+    with pytest.raises(ValueError, match=r"step.ema"):
         scalar_loss(objective, params, batch, no_ref)
 
 

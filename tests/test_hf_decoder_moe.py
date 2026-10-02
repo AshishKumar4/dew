@@ -512,7 +512,7 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     write_file({**tensors, "language_model.lm_head.weight": embedding + 1.0},
                source / "model.safetensors", {"format": "pt"})
     with pytest.raises(ValueError,
-                       match="language_model.lm_head.weight is not the embedding"):
+                       match=r"language_model.lm_head.weight is not the embedding"):
         load_pretrained(str(source), dtype="float32", attention_impl="reference")
 
 
@@ -617,7 +617,7 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
     directory.mkdir()
     save_file(tensors, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(fixture_config("glm4-moe-tiny")))
-    with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
+    with pytest.raises(ValueError, match=r"shared_head.head.weight differs from lm_head.weight"):
         fp32_decoder(directory)
 
 
@@ -1024,7 +1024,7 @@ def test_both_spellings_of_one_deepseek_v4_tensor_are_refused():
     tensors = dict(load_shards(DEEPSEEK_V4))
     tensors["model.embed_tokens.weight"] = tensors["embed.weight"] + 1
 
-    with pytest.raises(ValueError, match="model.embed_tokens.weight lands on params/embed_tokens"):
+    with pytest.raises(ValueError, match=r"model.embed_tokens.weight lands on params/embed_tokens"):
         translate_weights(tensors, config)
 
 
@@ -1584,7 +1584,7 @@ def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
     (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gemma4-moe-tiny"), "attention_k_eq_v": False}))
-    with pytest.raises(ValueError, match="layers_2.self_attn.v_proj.kernel"):
+    with pytest.raises(ValueError, match=r"layers_2.self_attn.v_proj.kernel"):
         fp32_decoder(directory)
 
 

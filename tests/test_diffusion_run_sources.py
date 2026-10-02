@@ -135,7 +135,7 @@ def test_a_scratch_flow_run_shifts_by_the_datas_resolution(size):
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():
-    with pytest.raises(ValueError, match="leave model.architecture, model.config, text unset"):
+    with pytest.raises(ValueError, match=r"leave model.architecture, model.config, text unset"):
         DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
                            text=TextCondition(encoder="t5"))
 

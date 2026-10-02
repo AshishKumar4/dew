@@ -314,7 +314,7 @@ def test_inference_parameter_patterns_are_not_a_training_layout():
     trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0,
                                     host_parameters=("params/*",)))
-    with pytest.raises(ValueError, match="dew.inference.host_banked"):
+    with pytest.raises(ValueError, match=r"dew.inference.host_banked"):
         trainer.place()
 
 
@@ -444,9 +444,8 @@ def test_a_pipeline_over_stages_refuses_a_banked_store():
 
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
-    with jax.set_mesh(build_mesh(MeshSpec(stage=2))):
-        with pytest.raises(ValueError, match="already banked by run"):
-            scanned.apply(on_host, tokens)
+    with jax.set_mesh(build_mesh(MeshSpec(stage=2))), pytest.raises(ValueError, match="already banked by run"):
+        scanned.apply(on_host, tokens)
 
 
 # --------------------------------------------------------------------------

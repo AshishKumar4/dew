@@ -1360,7 +1360,7 @@ def test_a_failing_validation_loader_fails_the_pass():
         def __next__(self):
             raise OSError("val.bin: Input/output error")
 
-    with pytest.raises(OSError, match="val.bin"):
+    with pytest.raises(OSError, match=r"val.bin"):
         make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
                                                log_every=1, eval_every=1, metrics=(Spread([]),))
 

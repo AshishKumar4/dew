@@ -99,9 +99,8 @@ def test_nested_and_concurrent_refusals_do_not_stop_owner(tmp_path, native_repor
         with pytest.raises(RuntimeError, match="already running"), dew.profile(tmp_path / "nested"):
             pytest.fail("nested capture must not run its body")
         other = dew.profile(tmp_path / "concurrent")
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            with pytest.raises(RuntimeError, match="already running"):
-                pool.submit(other.start).result()
+        with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="already running"):
+            pool.submit(other.start).result()
         with pytest.raises(RuntimeError, match="does not own"):
             other.stop()
         assert outer.running
@@ -170,9 +169,8 @@ def test_explicit_options_control_native_host_events(tmp_path, native_reports):
     options = jax.profiler.ProfileOptions()
     options.host_tracer_level = 0
     options.python_tracer_level = 0
-    with dew.profile(tmp_path / "disabled-host", options=options):
-        with jax.profiler.TraceAnnotation("host_option_marker"):
-            work()
+    with dew.profile(tmp_path / "disabled-host", options=options), jax.profiler.TraceAnnotation("host_option_marker"):
+        work()
     with dew.profile(tmp_path / "default"), jax.profiler.TraceAnnotation("host_option_marker"):
         work()
     assert options.host_tracer_level == 0
@@ -229,9 +227,8 @@ def test_native_export_failure_keeps_body_exception_and_trace(tmp_path, native_r
     assert raised.value is failure and failure.__notes__
     assert list((tmp_path / "body-failed").glob("capture-*/plugins/profile/*/*.xplane.pb"))
     assert manifest(captures(tmp_path / "body-failed")[0])["export_status"] == "failed"
-    with pytest.raises(ExceptionGroup, match="cleanup or export"):
-        with dew.profile(tmp_path / "export-failed"):
-            work()
+    with pytest.raises(ExceptionGroup, match="cleanup or export"), dew.profile(tmp_path / "export-failed"):
+        work()
     assert active_profile() is None
     monkeypatch.setattr(native_reports, "xspace_to_tool_data", original)
     with dew.profile(tmp_path / "recovered"):

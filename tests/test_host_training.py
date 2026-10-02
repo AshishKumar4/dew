@@ -308,7 +308,7 @@ def test_companion_coordinates_preserve_shards_under_device_permutation():
 def test_missing_companion_devices_names_the_launch_fix():
     devices = jax.devices("cpu")
     mesh = Mesh(np.asarray(devices, dtype=object), ("fsdp",), axis_types=(AxisType.Auto,))
-    with pytest.raises(ValueError, match="JAX_NUM_CPU_DEVICES=.*restart"):
+    with pytest.raises(ValueError, match=r"JAX_NUM_CPU_DEVICES=.*restart"):
         companion_mesh(mesh, devices[:1])
 
 

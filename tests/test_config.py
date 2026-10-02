@@ -183,14 +183,14 @@ def test_a_model_config_that_carries_a_precision_setting_the_run_names_is_refuse
     """The run owns these fields, so a --model.config that carries one names
     it twice and is refused with the flag that sets it."""
     fields = {"vocab_size": 64, "precision": "highest"}
-    with pytest.raises(ValueError, match="--model.matmul-precision"):
+    with pytest.raises(ValueError, match=r"--model.matmul-precision"):
         ModelConfig("causal_transformer", fields, matmul_precision="high").fields()
     # Unset, the run claims nothing and the config keeps its own precision.
     assert ModelConfig("causal_transformer", fields).fields()["precision"] == "highest"
 
 
 def test_a_model_config_that_names_the_precision_twice_is_refused():
-    with pytest.raises(ValueError, match="--model.dtype"):
+    with pytest.raises(ValueError, match=r"--model.dtype"):
         ModelConfig("simple_dit", {"dtype": "float32"}).fields()
 
 
@@ -213,7 +213,7 @@ def test_the_run_length_is_steps_or_epochs():
     assert TrainerConfig(epochs=4).total_steps(Sized()) == 100
     with pytest.raises(ValueError, match="record count"):
         TrainerConfig(epochs=4).total_steps(Streamed())
-    with pytest.raises(ValueError, match="--trainer.steps or --trainer.epochs"):
+    with pytest.raises(ValueError, match=r"--trainer.steps or --trainer.epochs"):
         TrainerConfig().total_steps(Sized())
 
 

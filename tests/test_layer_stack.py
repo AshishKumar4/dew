@@ -533,9 +533,8 @@ def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
 def test_decoding_under_a_stage_axis_is_refused():
     model = tiny()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, stage=2))):
-        with pytest.raises(ValueError, match="decode outside jax.set_mesh"):
-            model.apply(variables, jnp.ones((1, 1), jnp.int32), decode=True, mutable=["cache"])
+    with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, stage=2))), pytest.raises(ValueError, match=r"decode outside jax.set_mesh"):
+        model.apply(variables, jnp.ones((1, 1), jnp.int32), decode=True, mutable=["cache"])
 
 
 @mesh_lane

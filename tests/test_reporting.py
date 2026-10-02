@@ -215,11 +215,10 @@ def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch
 
     local = FailedLocal(tmp_path / 'local')
     later_local = LocalTracker(tmp_path / 'later-local')
-    with pytest.raises((ValueError, OSError)) as caught:
-        with Trackers(local, WandbTracker('dew-close-proof', offline=True), later_local) as sinks:
-            sinks.log({'train/loss': 1.}, 1)
-            if body_failure:
-                raise original
+    with pytest.raises((ValueError, OSError)) as caught, Trackers(local, WandbTracker('dew-close-proof', offline=True), later_local) as sinks:
+        sinks.log({'train/loss': 1.}, 1)
+        if body_failure:
+            raise original
     assert caught.value is (original if body_failure else cleanup)
     if body_failure:
         assert any('local journal flush failed' in note for note in original.__notes__)

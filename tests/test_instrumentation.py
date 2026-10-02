@@ -632,10 +632,9 @@ def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
 def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch):
     """Both must refuse before training: neither trace is dropped silently."""
     _capture_env(monkeypatch)
-    with dew.profile(tmp_path / "outer"):
-        with pytest.raises(ValueError, match="dew.profile capture is active"):
-            make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
-                Data(batches), steps=2)
+    with dew.profile(tmp_path / "outer"), pytest.raises(ValueError, match=r"dew.profile capture is active"):
+        make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
+            Data(batches), steps=2)
 
 
 def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):

@@ -584,7 +584,7 @@ def test_documents_in_memory_are_written_one_eos_terminated_document_each(tmp_pa
 
 
 def test_a_path_that_holds_no_text_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="holds no \\*.txt file"):
+    with pytest.raises(ValueError, match=r"holds no \*.txt file"):
         write_tokens(tmp_path, tmp_path / "out")
     with pytest.raises(FileNotFoundError, match="neither a text file nor a directory"):
         write_tokens(tmp_path / "missing", tmp_path / "out")

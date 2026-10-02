@@ -170,7 +170,7 @@ def test_a_missing_tensor_is_refused(source, tmp_path):
     tensors = load_file(weights)
     del tensors["encoder.down_blocks.2.1.attn.to_qkv_multiscale.0.proj_out.weight"]
     save_file(tensors, weights)
-    with pytest.raises(ValueError, match="down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
+    with pytest.raises(ValueError, match=r"down_blocks_2_1.attn.to_qkv_multiscale_0.per_head"):
         load_dc_ae(tmp_path / "vae")
 
 
