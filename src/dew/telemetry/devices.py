@@ -11,6 +11,7 @@ import os
 import sys
 
 _log = logging.getLogger(__name__)
+_late_policy_warned = False
 
 
 def apply_xla_flags(flags: str | None) -> None:
@@ -52,10 +53,13 @@ def keep_roundings() -> None:
     already-used notebook, restart with
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """
+    global _late_policy_warned
     bridge = sys.modules.get("jax._src.xla_bridge")
     if bridge is not None and bridge.backends_are_initialized():
-        _log.warning("Dew was imported after the JAX backend opened; its numerical policy cannot take effect. "
-                     "Restart with XLA_FLAGS=--xla_allow_excess_precision=false set before importing JAX.")
+        if not _late_policy_warned:
+            _late_policy_warned = True
+            _log.warning("Dew was imported after the JAX backend opened; its numerical policy cannot take effect. "
+                         "Restart with XLA_FLAGS=--xla_allow_excess_precision=false set before importing JAX.")
         return
     if xla_flag("xla_allow_excess_precision") is None:
         apply_xla_flags("--xla_allow_excess_precision=false")
