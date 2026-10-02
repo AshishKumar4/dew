@@ -345,20 +345,13 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
 
 
 def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
-    """Read the run's quantization spec, wherever its `run.json` carries it.
-
-    The spec is read from `trainer.quantization`, or from the top level, which
-    is where some run records carry it. It comes back through the config layer
-    that wrote it, the one place a saved dataclass record becomes its class
-    again.
-    """
+    """Read the run's `trainer.quantization` spec back through the config layer
+    that wrote it, the one place a saved dataclass record becomes its class again."""
     from dew.config import _built
     from dew.training.quantization import Quantization
 
     trainer = record.get("trainer")
     section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
-    if section is None:
-        section = record.get("quantization")
     return None if section is None else _built(Quantization, named_fields(section, "quantization"))
 
 
