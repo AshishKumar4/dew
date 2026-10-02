@@ -22,6 +22,7 @@ import numpy as np
 from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
+from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 from .kl import AutoencoderKL
 
@@ -33,31 +34,17 @@ STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
 and it computes nothing else."""
 
 
-def fold(latents):
-    """`Flux2Pipeline._patchify_latents` channels last: `[B, H, W, C]` to
-    `[B, H/2, W/2, 4C]`, a channel's four pixels adjacent, row-major."""
-    batch, height, width, channels = latents.shape
-    grouped = latents.reshape(batch, height // 2, 2, width // 2, 2, channels)
-    return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height // 2, width // 2, 4 * channels)
-
-
-def unfold(latents):
-    """`Flux2Pipeline._unpatchify_latents` channels last."""
-    batch, height, width, channels = latents.shape
-    grouped = latents.reshape(batch, height, width, channels // 4, 2, 2)
-    return grouped.transpose(0, 1, 4, 2, 5, 3).reshape(batch, 2 * height, 2 * width, channels // 4)
-
-
 class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
 
     def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
         super().__init__(model, params)
-        self.encode_single_frame = jax.jit(lambda params, image, key=None: fold(model.apply(
+        # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last.
+        self.encode_single_frame = jax.jit(lambda params, image, key=None: pixel_unshuffle(model.apply(
             {"params": params}, image, key, method=model.encode)))
         self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
-            {"params": params}, unfold(latent), method=model.decode))
+            {"params": params}, pixel_shuffle(latent), method=model.decode))
         self.latent_shift = np.asarray(mean, np.float32)
         self.latent_scale = 1.0 / np.sqrt(np.asarray(variance, np.float32) + np.float32(epsilon))
         if (

@@ -27,6 +27,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -61,21 +62,6 @@ def flux_positions(rows: int, columns: int, text: int) -> np.ndarray:
     grid = np.indices((rows, columns), dtype=np.float32).reshape(2, -1)
     positions[text:, 1], positions[text:, 2] = grid[0], grid[1]
     return positions
-
-
-def pack(x: jax.Array) -> jax.Array:
-    """`_prepare_latents`' packing: one position per 2x2 patch, whose channels
-    run channel-major over the patch's own two rows and columns."""
-    rows, columns, channels = x.shape[1] // 2, x.shape[2] // 2, x.shape[3]
-    grouped = x.reshape(x.shape[0], rows, 2, columns, 2, channels)
-    return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(x.shape[0], rows * columns, channels * 4)
-
-
-def unpack(x: jax.Array, rows: int, columns: int) -> jax.Array:
-    """`_unpack_latents`, back to NHWC."""
-    channels = x.shape[-1] // 4
-    grouped = x.reshape(x.shape[0], rows, columns, channels, 2, 2)
-    return grouped.transpose(0, 1, 4, 2, 5, 3).reshape(x.shape[0], rows * 2, columns * 2, channels)
 
 
 def apply_rotary(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
@@ -299,8 +285,10 @@ class FluxTransformer(nn.Module):
             raise ValueError(f"A {x.shape[1]}x{x.shape[2]} latent does not pack into 2x2 patches")
         if conditioning.pooled is None:
             raise ValueError("Flux conditioning needs the pooled text vector")
+        # `_prepare_latents`' packing: one position per 2x2 patch, channel-major.
+        packed = pixel_unshuffle(x).reshape(x.shape[0], rows * columns, 4 * x.shape[3])
         image = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
-                         name="x_embedder")(pack(x))
+                         name="x_embedder")(packed)
         conditioned = self._conditioning(time, conditioning.guidance, conditioning.pooled)
         context = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
                            name="context_embedder")(conditioning.context)
@@ -324,7 +312,7 @@ class FluxTransformer(nn.Module):
         image = _modulate(_layer_norm(self.dtype)(image), shift, scale)
         packed = nn.Dense(self.patch_size ** 2 * self.out_channels, dtype=self.dtype,
                           precision=self.precision, name="proj_out")(image)
-        return unpack(packed, rows, columns)
+        return pixel_shuffle(packed.reshape(packed.shape[0], rows, columns, -1))
 
 
 __all__ = [
@@ -333,7 +321,5 @@ __all__ = [
     "FluxTransformer",
     "apply_rotary",
     "flux_positions",
-    "pack",
     "rotary_table",
-    "unpack",
 ]
