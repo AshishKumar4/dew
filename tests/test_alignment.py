@@ -110,3 +110,31 @@ def test_a_layer_the_model_lacks_is_refused():
     with pytest.raises(ValueError, match="no submodule 'dit_block_9'"):
         DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
                            solver=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))
+
+
+def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
+    """An inference record restores the denoiser, not the frozen encoder or
+    projector that only its training loss reads, as the objective's own
+    pipeline does."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Trainer
+
+    objective = aligned()
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+    state = trainer.initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+
+    restored = TextToImage.from_run(str(tmp_path), ema=False)
+    published = objective.pipeline(state, ema=False)
+    assert REPRESENTATION not in restored.params
+    assert ALIGNMENT not in restored.params["params"]
+    assert jax.tree.structure(restored.params) == jax.tree.structure(published.params)
+    for actual, expected in zip(jax.tree.leaves(restored.params), jax.tree.leaves(published.params),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored([{}, {}], key=9).host().images,
+                                  published([{}, {}], key=9).host().images)
