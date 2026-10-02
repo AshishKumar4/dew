@@ -156,7 +156,7 @@ def main(config: Config):
         raise ValueError("image SFT must update the vision tower and depend on the conditioning pixels")
     task = replace(objective.pipeline(state, ema=False), eos_token_ids=(256,))
     generated = task(probe["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
-                     seed=3).host()
+                     key=3).host()
     tokenizer = ByteTokenizer()
     captions = [tokenizer.decode([int(token) for token in row[config.prompt_tokens:config.prompt_tokens+length]
                                   if token < 256])

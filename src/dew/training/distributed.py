@@ -158,13 +158,15 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     """
     named = devices is not None
     devices = list(devices) if devices is not None else jax.devices()
-    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
-    if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
-            or spec.sequence < 1 or len(devices) % sharded):
-        raise LayoutRefused(
-            f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
-            f"{spec.tensor} times sequence {spec.sequence} times stage "
-            f"{spec.stage} must be a positive divisor of device count {len(devices)}")
+    sizes = {"expert": spec.expert, "fsdp": spec.fsdp, "tensor": spec.tensor,
+             "sequence": spec.sequence, "stage": spec.stage}
+    sharded = math.prod(sizes.values())
+    if any(size < 1 for size in sizes.values()):
+        raise LayoutRefused(f"every axis of a mesh is at least 1, and {sizes} is not")
+    if len(devices) % sharded:
+        split = " x ".join(f"{axis} {size}" for axis, size in sizes.items() if size > 1)
+        raise LayoutRefused(f"{split} is {sharded} devices a data replica, which does not divide "
+                            f"the {len(devices)} devices")
     shape = (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
              spec.stage)
     # `jax.make_mesh` lays one slice out by the platform's topology, which on

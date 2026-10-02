@@ -34,6 +34,25 @@ def test_caption_rows_keep_image_and_caption_targets_in_separate_spans():
                                pixels.transpose(0, 3, 1, 2).astype(np.float32) / 127.5 - 1, atol=0, rtol=0)
 
 
+def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkeypatch):
+    from dew.data import Dataset
+
+    script = example("sft_diffusion_gemma_images")
+    config = script.Config(flowers="unused", image_size=16, prompt_tokens=24,
+                           batch_size=8, steps=2, features=16, vision_features=8,
+                           out=tmp_path / "caption")
+    pixels = np.arange(8 * 16 * 16 * 3, dtype=np.uint8).reshape(8, 16, 16, 3)
+    batch = script.caption_batch({"image": pixels, "label": np.arange(8) % 2}, config,
+                                 ["pink rose", "yellow tulip"])
+    data = Dataset(train=lambda partition: iter([batch] * config.steps), val=None,
+                   records=8 * config.steps, batch=8)
+    monkeypatch.setattr(script, "flowers_data", lambda selected: data)
+    state = script.main(config)
+    assert int(state.step) == 2
+    assert (config.out / "result.json").exists()
+    assert (config.out / "samples.txt").read_text().strip()
+
+
 def test_masked_lm_example_trains_real_byte_windows_and_writes_a_sample(tmp_path):
     script = example("train_masked_lm")
     import json

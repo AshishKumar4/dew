@@ -26,7 +26,7 @@ from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import _FAMILIES, translate_config
+from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 
@@ -70,7 +70,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     released config builds, each at the leaf's shape (A_log read from its
     stored [1, 1, 32, 1] as the 32 heads), and cover all 603 of its leaves,
     before any weight would be read."""
-    fields, family = translate_config(released_config()), _FAMILIES["kimi_linear"]
+    fields, family = translate_config(released_config()), families()["kimi_linear"]
     model = models.build("causal_transformer", fields)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     tree = {path: leaf.shape for path, leaf in flatten_dict(dict(shapes)).items()}

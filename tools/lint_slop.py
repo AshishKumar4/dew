@@ -73,7 +73,7 @@ VAGUE = {"tmp", "temp", "obj", "thing", "info", "item", "items", "val", "helper"
          "util", "utils", "manager", "handler", "res", "ret", "arr", "lst", "dct", "num",
          "cnt", "idx", "flag", "foo", "bar", "data", "result", "results"}
 VAGUE_SUFFIXES = ("_impl", "_v2", "_new", "_old", "_copy")
-# Three words the tree earns. `value` is the attention V, `Mean.value` and the
+# Three words the tree earns. `value` is the attention V, `Ratio.value` and the
 # partner of `key` in 296 more places; `values` is the same plural, the critic
 # values of GAE among them; `out` is the output array a numeric function
 # returns, which is what numpy calls its own out= parameter. Counted at 405,
