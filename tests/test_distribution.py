@@ -238,10 +238,8 @@ def test_a_named_device_list_is_laid_out_in_its_own_order():
     mesh for every order."""
     import jax
 
-    from dew.training import build_mesh
-
     order = jax.devices()[:2][::-1]
-    mesh = build_mesh(MeshSpec(fsdp=2), order)
+    mesh = MeshSpec(fsdp=2).build(order)
     assert list(mesh.devices.flat) == order
 
 
@@ -249,10 +247,8 @@ def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
     """A process that never joined a pool has CPU devices without a
     `slice_index`; it is one granule, so replicas are refused by the same
     rule, not by the missing attribute."""
-    from dew.training import build_mesh
-
     with pytest.raises(ValueError, match="replicas 2 must divide both the 1 granules"):
-        build_mesh(MeshSpec(fsdp=4, replicas=2))
+        MeshSpec(fsdp=4, replicas=2).build()
 
 
 def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str:
@@ -267,8 +263,8 @@ def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str
             "prepare_process()\n"
             "import jax, numpy as np\n"
             "from jax.sharding import NamedSharding, PartitionSpec\n"
-            "from dew.training import MeshSpec, build_mesh\n"
-            "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+            "from dew.training import MeshSpec\n"
+            "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
             "rows = NamedSharding(mesh, PartitionSpec('fsdp'))\n"
             "whole = np.ones((jax.device_count() * 256, 256), np.float32)\n"
             "x = jax.make_array_from_callback(whole.shape, rows, lambda index: whole[index])\n"
@@ -749,8 +745,8 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
         "import jax, jax.numpy as jnp, numpy as np\n"
         "from jax.sharding import NamedSharding, PartitionSpec\n"
         "from dew import artifacts\n"
-        "from dew.training import MeshSpec, build_mesh\n"
-        "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
         "rows, rng = jax.device_count(), np.random.default_rng(0)\n"
         "values = {'replicated': rng.standard_normal((3, 5)).astype(np.float32)}\n"
         "for i in range(8):\n"
@@ -806,9 +802,9 @@ def test_every_process_of_a_pool_takes_the_same_link_bandwidth():
     program = ("import dew.training.runtime as runtime\n"
                "runtime.prepare_process()\n"
                "import jax\n"
-               "from dew.training import MeshSpec, build_mesh\n"
+               "from dew.training import MeshSpec\n"
                "from dew.training.distributed import link_bandwidth\n"
-               "mesh = build_mesh(MeshSpec(tensor=jax.device_count()))\n"
+               "mesh = MeshSpec(tensor=jax.device_count()).build()\n"
                "print('measured', jax.process_index(), repr(link_bandwidth(mesh, 'tensor')), flush=True)\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=2, timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -829,8 +825,8 @@ def test_a_rank_that_fails_in_a_gather_group_ends_the_gather_at_that_groups_agre
                "import jax, numpy as np\n"
                "from jax.sharding import NamedSharding, PartitionSpec\n"
                "from dew import artifacts\n"
-               "from dew.training import MeshSpec, build_mesh\n"
-               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "from dew.training import MeshSpec\n"
+               "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
                "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
                "tree = [jax.make_array_from_callback(value.shape, NamedSharding(mesh, PartitionSpec('fsdp')),"
                " lambda index: value[index]) for _ in range(4)]\n"
@@ -866,8 +862,8 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "import jax, numpy as np\n"
                "from jax.sharding import NamedSharding, PartitionSpec\n"
                "from dew import artifacts\n"
-               "from dew.training import MeshSpec, build_mesh\n"
-               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "from dew.training import MeshSpec\n"
+               "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
                "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
                "tree = [jax.make_array_from_callback(value.shape, NamedSharding(mesh, PartitionSpec('fsdp')),"
                " lambda index: value[index]) for _ in range(2)]\n"
@@ -899,8 +895,8 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
         "import jax, jax.numpy as jnp, numpy as np\n"
         "from jax.sharding import NamedSharding, PartitionSpec\n"
         "from dew import artifacts\n"
-        "from dew.training import MeshSpec, build_mesh\n"
-        "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
         "def placed(value, spec):\n"
         "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
         " lambda index: value[index])\n"
@@ -984,8 +980,8 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         "prepare_process(compilation_cache_dir=sys.argv[1])\n"
         "import jax.numpy as jnp, numpy as np\n"
         "from jax.sharding import NamedSharding, PartitionSpec\n"
-        "from dew.training import MeshSpec, build_mesh\n"
-        "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+        "from dew.training import MeshSpec\n"
+        "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
         "def placed(value, spec):\n"
         "    return jax.make_array_from_callback(value.shape, NamedSharding(mesh, spec),"
         " lambda index: value[index])\n"

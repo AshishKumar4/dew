@@ -246,7 +246,7 @@ def two_processes(tmp_path_factory):
 def test_the_mesh_covers_every_process_in_the_pool(two_processes):
     """A mesh that stopped at the local devices would train two models.
 
-    build_mesh takes jax.devices(), which inside a pool is every device of
+    MeshSpec.build takes jax.devices(), which inside a pool is every device of
     every process, so its axes have to multiply out to the global count and
     its devices have to come from every process. Nothing in a simulated
     single-process run can tell the two apart.

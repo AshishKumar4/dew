@@ -7,7 +7,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.objectives.base import Aux, EMASpec, Objective, Step, everything, merge, scalar_loss, select, under
+from dew.objectives.base import Aux, EMASpec, Objective, Step, everything, merge, select, under
 
 
 def tree():
@@ -88,8 +88,8 @@ def test_registered_lm_objective_computes_next_token_loss():
     variables = direct.init(jax.random.key(0))
     batch = {"text": jnp.array([[0, 1, 2, 3, 4]], dtype=jnp.int32)}
     step = Step(step=jnp.array(0), key=jax.random.key(1), ema=None)
-    actual, _ = scalar_loss(registered, variables, batch, step)
-    expected, _ = scalar_loss(direct, variables, batch, step)
+    actual, _ = registered.scalar_loss(variables, batch, step)
+    expected, _ = direct.scalar_loss(variables, batch, step)
     np.testing.assert_allclose(actual, expected)
 
 

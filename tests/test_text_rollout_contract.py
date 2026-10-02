@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_rl_surrogate import clipped_surrogate
 
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -16,7 +17,6 @@ from dew.nn.mla import MLAMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
-from dew.rl import clipped_surrogate
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
 

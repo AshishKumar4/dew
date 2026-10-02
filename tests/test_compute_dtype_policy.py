@@ -65,12 +65,16 @@ import optax
 import pytest
 from test_precision_policy import build_model, tiny_inputs
 
-from dew import models  # the attribute import is what registers every family
+import dew.nn.backbones
+import dew.nn.backbones.jepa
+import dew.nn.diffusion_gemma
+import dew.nn.multimodal  # noqa: F401  (registers the kind)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import TEXT_KEY
+from dew.registry import models
 from dew.telemetry.instrumentation import (
     _COMPUTATION,
     _INSTRUCTION,
@@ -351,7 +355,7 @@ def lm_loss_and_grad(rng):
     step = Step(step=jnp.asarray(0), key=rng, ema=None)
 
     def loss(params):
-        return scalar_loss(objective, params, batch, step)[0]
+        return objective.scalar_loss(params, batch, step)[0]
 
     return jax.value_and_grad(loss), variables
 

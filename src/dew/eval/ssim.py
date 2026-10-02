@@ -112,12 +112,14 @@ def structural_similarity(
 
 
 @metrics("ssim")
-def ssim(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid) -> ImageMetric:
+class SSIM(ImageMetric):
     """Mean SSIM between the sampled frames and the batch's, higher is
-    better, on the same [-1, 1] scale as `psnr`. `reads` names the artifact
+    better, on the same [-1, 1] scale as `PSNR`. `reads` names the artifact
     type the trainer hands this metric; a video run passes `VideoGrid`."""
-    def measure(artifact, batch):
-        samples, targets = paired(artifact, batch, field)
-        return structural_similarity(samples, targets, data_range, per_example=True)
 
-    return ImageMetric(name="ssim", measure=measure, reads=reads)
+    def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
+        def measure(artifact, batch):
+            samples, targets = paired(artifact, batch, field)
+            return structural_similarity(samples, targets, data_range, per_example=True)
+
+        super().__init__(name="ssim", measure=measure, reads=reads)

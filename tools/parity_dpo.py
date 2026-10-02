@@ -8,7 +8,7 @@ rejected]` chunking, and `mean(-logsigmoid(beta * delta))`
 (`trl/trainer/dpo_trainer.py`, the forward branch and `dpo_loss`). The
 tensors are fixed random log-probabilities, so the fixture pins the math
 without a model; the gradients come from autograd over the same four
-tensors. Dew's `preference_logsigmoid` must match both. Runs in an
+tensors. Dew's `preference_logsigmoid_terms`, averaged over pairs, must match both. Runs in an
 environment with torch and TRL installed; Dew never imports either.
 """
 

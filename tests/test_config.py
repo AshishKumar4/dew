@@ -533,11 +533,11 @@ class Spec(Base):
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     """A run's record reads back the schedule it names, its tail and the muP
     groups included."""
-    from dew.training.optim import Power, PowerTail, mup_param_groups
+    from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
         data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
-                          param_groups=mup_param_groups(4.0)))
+                          param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config

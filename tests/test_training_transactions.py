@@ -12,7 +12,7 @@ from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
-from dew.objectives import Aux, EMASpec, Objective, Ratio, mean_loss, scalar_loss
+from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.objectives.base import under
 from dew.training import Trainer
 
@@ -58,9 +58,9 @@ class Tiny(Objective[Ratio | Terms, None]):
 
     def reduce_loss(self, stats):
         if isinstance(stats, Ratio):
-            return mean_loss(stats)
-        main, a = mean_loss(stats.prediction)
-        row, b = mean_loss(stats.rows)
+            return stats.mean()
+        main, a = stats.prediction.mean()
+        row, b = stats.rows.mean()
         positions = jnp.where(stats.positions > 0, stats.positions, 1)
         auxiliary = .2 * 3 * jnp.vdot(jax.lax.stop_gradient(stats.counts), stats.scores) / positions ** 2
         return main + .1 * row + auxiliary, a | b | (stats.positions > 0)
@@ -236,7 +236,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
     info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)
     (expected_loss, aux), gradient = jax.value_and_grad(
-        lambda p: scalar_loss(objective, {**start, "params": p}, combined, info),
+        lambda p: objective.scalar_loss({**start, "params": p}, combined, info),
         has_aux=True)(start["params"])
     updates, _ = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
     expected = optax.apply_updates(start["params"], updates)

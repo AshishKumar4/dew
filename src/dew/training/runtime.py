@@ -87,9 +87,9 @@ def prepare_process(wandb: Wandb | None = None,
     _raise_limits()
     _join_process_pool(multi_host)
     if layout is not None and "params" in layout.host:
-        from dew.training.distributed import build_mesh
+        from dew.training.distributed import MeshSpec
         from dew.training.host import companion_mesh
-        companion_mesh(build_mesh())
+        companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
 
 

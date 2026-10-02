@@ -108,7 +108,7 @@ jobs:
         import jax.numpy as jnp
 
         import dew
-        from dew import models
+        from dew.nn.backbones import CausalTransformer
         from dew.training.runtime import _pool_keys_alike
 
         assert "site-packages" in dew.__file__, dew.__file__
@@ -117,8 +117,8 @@ jobs:
         # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
         assert not _pool_keys_alike()
         import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
-        model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2,
-                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
+        model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
+                                  num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
         tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))

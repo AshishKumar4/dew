@@ -17,8 +17,7 @@ import pytest
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.base import scalar_loss
-from dew.training.optim import Cosine, build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip
+from dew.training.optim import Cosine, ParamGroup, muon_weight_dimension_numbers, scale_by_qk_clip
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
@@ -38,8 +37,7 @@ def dit_params():
 
 
 def muon_solver(**kwargs):
-    return build_optimizer(OptimConfig(optimizer='muon', learning_rate=LR, **kwargs),
-                           steps=10)
+    return OptimConfig(optimizer='muon', learning_rate=LR, **kwargs).build(10)
 
 
 def fixed_gradients(params):
@@ -244,10 +242,8 @@ def test_both_groups_step_with_the_one_schedule():
     params = decoder_params()
     grads = fixed_gradients(params)
     cosine = Cosine(init=1e-4, peak=4e-3, end=1e-3, warmup_steps=1, decay_steps=4)
-    scheduled = build_optimizer(OptimConfig(optimizer='muon', schedule=cosine),
-                                steps=4)
-    unscaled = build_optimizer(OptimConfig(optimizer='muon', learning_rate=1.0),
-                               steps=4)
+    scheduled = OptimConfig(optimizer='muon', schedule=cosine).build(4)
+    unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=cosine.init, peak_value=cosine.peak,
         warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end)
@@ -318,8 +314,7 @@ QK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muonclip" / "maxtex
 
 
 def muonclip_solver(**kwargs):
-    return build_optimizer(
-        OptimConfig(optimizer='muonclip', learning_rate=LR, **kwargs), steps=10)
+    return OptimConfig(optimizer='muonclip', learning_rate=LR, **kwargs).build(10)
 
 
 def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
@@ -490,9 +485,9 @@ def test_the_threshold_rides_optimizer_opts():
     updates, _ = default.update(grads, default.init(params), params,
                                 qk_stats=stats)
     assert largest_update_difference(updates, plain) == 0.0
-    low = build_optimizer(OptimConfig(
+    low = OptimConfig(
         optimizer='muonclip', learning_rate=LR,
-        optimizer_opts={'qk_clip_threshold': 5.0}), steps=10)
+        optimizer_opts={'qk_clip_threshold': 5.0}).build(10)
     clipped, _ = low.update(grads, low.init(params), params, qk_stats=stats)
     factor = float(np.sqrt(5.0 / 50.0))
     stepped = (np.asarray(params['layers_0']['self_attn']['q_proj']['kernel'])
@@ -572,7 +567,7 @@ def test_muonclip_moves_a_real_step():
         losses = []
         for _ in range(3):
             (loss, _), grads = jax.value_and_grad(
-                lambda p: scalar_loss(objective, {**variables, "params": p}, batch, info),
+                lambda p: objective.scalar_loss({**variables, "params": p}, batch, info),
                 has_aux=True)(params)
             updates, opt_state = solver.update(
                 grads, opt_state, params, **stats)
@@ -581,9 +576,9 @@ def test_muonclip_moves_a_real_step():
         return params, losses
 
     muon = muon_solver()
-    clipped = build_optimizer(OptimConfig(
+    clipped = OptimConfig(
         optimizer='muonclip', learning_rate=LR,
-        optimizer_opts={'qk_clip_threshold': 1.0}), steps=10)
+        optimizer_opts={'qk_clip_threshold': 1.0}).build(10)
     muon_params, plain_losses = run(muon, {})
     _, sown = model.apply(variables, inputs, mutable=["qk"])
     stats = {"qk_stats": sown.get("qk")}
@@ -599,11 +594,10 @@ def test_mup_groups_decay_and_scale_the_parameters_lm_engine_does():
     AdamW step on a zero gradient is then pure decay, and it moves exactly
     the embeddings and projections, by rate * decay and rate / m_width *
     decay of themselves."""
-    from dew.training.optim import mup_param_groups
     params = decoder_params()["params"]
     config = OptimConfig(optimizer="adamw", learning_rate=0.1, weight_decay=0.5,
-                         param_groups=mup_param_groups(4.0))
-    solver = build_optimizer(config, steps=1)
+                         param_groups=ParamGroup.mup(4.0))
+    solver = config.build(1)
     updates, _ = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)
     np.testing.assert_allclose(updates["layers_0"]["input_layernorm"]["scale"], 0.0)
     np.testing.assert_allclose(updates["norm"]["scale"], 0.0)
@@ -619,7 +613,7 @@ def test_a_parameter_no_group_claims_is_refused():
     config = OptimConfig(optimizer="adamw", param_groups=(ParamGroup("norms", ("*/scale",)),))
     params = decoder_params()["params"]
     with pytest.raises(ValueError, match="matches no param group"):
-        build_optimizer(config, steps=1).init(params)
+        config.build(1).init(params)
 
 
 def test_a_power_schedules_tail_is_one_record_that_ends_where_it_says():
@@ -636,8 +630,8 @@ def test_a_power_schedules_tail_is_one_record_that_ends_where_it_says():
 # --- bf16 optimizer state ---------------------------------------------------
 
 def bf16_state_adamw(**kwargs):
-    return build_optimizer(OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.1,
-                                       state_dtype='bfloat16', **kwargs), steps=10)
+    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.1,
+                                       state_dtype='bfloat16', **kwargs).build(10)
 
 
 def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
@@ -680,7 +674,7 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
 
 def test_bf16_state_is_refused_where_there_is_no_adam_moment():
     with pytest.raises(ValueError, match="state_dtype"):
-        build_optimizer(OptimConfig(optimizer='lamb', state_dtype='bfloat16'), steps=10)
+        OptimConfig(optimizer='lamb', state_dtype='bfloat16').build(10)
 
 
 def test_bf16_state_steps_optax_own_update_first():

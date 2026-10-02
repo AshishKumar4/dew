@@ -8,10 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew import models
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import models
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 

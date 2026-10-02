@@ -9,7 +9,7 @@ from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
-from dew.objectives import Aux, EMASpec, Objective, Ratio, mean_loss
+from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.training import Trainer
 
 
@@ -19,7 +19,7 @@ def test_ratio_keeps_numerator_and_denominator_until_the_reduction():
     first = objectives.Ratio(jnp.asarray(4.), jnp.asarray(2.))
     last = objectives.Ratio(jnp.asarray(9.), jnp.asarray(1.))
     whole = jax.tree.map(jnp.add, first, last)
-    value, supported = objectives.mean_loss(whole)
+    value, supported = whole.mean()
     assert float(value) == pytest.approx(13 / 3) and bool(supported)
     assert not hasattr(objectives, "Mean")
 
@@ -103,7 +103,7 @@ class DenseObjective(Objective):
 
     def reduce_loss(self, stats):
         if isinstance(stats, Moments):
-            value, active = mean_loss(stats.errors)
+            value, active = stats.errors.mean()
             return value + .125 * (stats.predictions / stats.rows) ** 2, active
         return super().reduce_loss(stats)
 
@@ -222,7 +222,7 @@ def test_adam_native_parameter_dtypes_survive_updates_and_checkpoints(tmp_path, 
 def test_float64_statistics_and_updates_preserve_requested_precision(tmp_path, parameter_kind, loss_kind, k):
     with jax.enable_x64():
         total, mass = 1 + 2. ** -40, 3 + 2. ** -35
-        reduced, _ = mean_loss(Ratio(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)))
+        reduced, _ = Ratio(jnp.array(total, jnp.float64), jnp.array(mass, jnp.float64)).mean()
         np.testing.assert_allclose(reduced, total / mass, rtol=0, atol=1e-15)
         exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k)
 
@@ -269,8 +269,8 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
             right = Ratio(value * jnp.where(first, -50000., 60000.) * right_mass, right_mass)
             return (left, right), Aux({})
         def reduce_loss(self, stats):
-            left, active_left = mean_loss(stats[0])
-            right, active_right = mean_loss(stats[1])
+            left, active_left = stats[0].mean()
+            right, active_right = stats[1].mean()
             return left + right, active_left | active_right
 
     trainer = Trainer(Cancellation(), optax.sgd(.01), key=jax.random.PRNGKey(2),

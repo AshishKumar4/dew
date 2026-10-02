@@ -18,7 +18,7 @@ import optax
 
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
 
@@ -75,7 +75,7 @@ def main():
                               precision=jax.lax.Precision.HIGHEST)
     objective = LMObjective(model, seq_len=256, ema_decay=None)
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-    score = jax.jit(jax.value_and_grad(lambda params, batch: scalar_loss(objective, params, batch, step)[0]))
+    score = jax.jit(jax.value_and_grad(lambda params, batch: objective.scalar_loss(params, batch, step)[0]))
     forward = jax.jit(model.apply)
     observations = []
     for index in (() if args.train_smoke else (0, 40, 92)):

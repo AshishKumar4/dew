@@ -200,14 +200,19 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     error = None
     try:
         paths, tree = jax.tree_util.tree_flatten_with_path(value)
+        local = []
         for path, leaf in paths:
             if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
                 global_indices.append(len(leaves))
                 plan.append([jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype),
                              str(leaf.sharding)])
-                leaves.append(leaf)
             else:
-                leaves.append(np.asarray(leaf) if held else leaf)
+                local.append(len(leaves))
+            leaves.append(leaf)
+        if held:
+            # One read for every local leaf: their copies run together.
+            for index, home in zip(local, jax.device_get([leaves[index] for index in local]), strict=True):
+                leaves[index] = np.asarray(home)
         jax.block_until_ready(leaves)
     except BaseException as failure:
         error = failure

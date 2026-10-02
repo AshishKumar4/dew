@@ -1,30 +1,29 @@
-"""Score image metrics behind `dew.registry.metrics`: `metrics["fid"]()`,
-`metrics["clip_score"]()`, `metrics.psnr()`, `metrics.ssim()`, `metrics.clip()`,
-each a factory returning a `Metric` the trainer scores an `ImageGrid` with.
+"""Score image metrics: `FID`, `CLIPScore`, `PSNR`, `SSIM` and `CLIPDistance`,
+each a `Metric` the trainer scores an `ImageGrid` with, and each registered
+in `dew.registry.metrics` under the name a run record gives it.
 
 `fid(generated, reference)` and `clip_score(images, prompts)` are the same
 numbers over image sets already in hand, with no trainer and no batch."""
 
 from .common import ImageMetric, Mean, frames
 from .fid import FID, fid, frechet_distance
-from .images import CLIPScore, clip, clip_image_text_cosine, clip_score, clip_score_metric
-from .psnr import peak_signal_noise_ratio, psnr
-from .ssim import ssim, structural_similarity
+from .images import CLIPDistance, CLIPScore, clip_image_text_cosine, clip_score
+from .psnr import PSNR, peak_signal_noise_ratio
+from .ssim import SSIM, structural_similarity
 
 __all__ = [
     "FID",
+    "PSNR",
+    "SSIM",
+    "CLIPDistance",
     "CLIPScore",
     "ImageMetric",
     "Mean",
-    "clip",
     "clip_image_text_cosine",
     "clip_score",
-    "clip_score_metric",
     "fid",
     "frames",
     "frechet_distance",
     "peak_signal_noise_ratio",
-    "psnr",
-    "ssim",
     "structural_similarity",
 ]

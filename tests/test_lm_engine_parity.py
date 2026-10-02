@@ -29,14 +29,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss, router_moments
 from dew.objectives.lm.objective import _router_scores, router_z_terms
-from dew.training.optim import (
-    Power,
-    build_optimizer,
-    linear_schedule,
-    mup_param_groups,
-    param_labels,
-    power_schedule,
-)
+from dew.training.optim import ParamGroup, Power, linear_schedule, param_labels, power_schedule
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lm_engine"
 COEF = 0.01  # the fixture's router_aux_loss_coef
@@ -167,7 +160,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
     same gradients: the group of every parameter and the parameters after
     each of three steps agree."""
     membership = json.loads(str(reference["groups"]))
-    groups = mup_param_groups(4.0)
+    groups = ParamGroup.mup(4.0)
     params0 = leaves(reference, "param:")
     labels = param_labels(groups)(tree(params0))
     for source, path, _ in params0:
@@ -181,7 +174,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
         schedule=Power(peak=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
         weight_decay=0.1, param_groups=groups)
     with float64():
-        solver = build_optimizer(config, steps=3)
+        solver = config.build(3)
         params = tree(params0)
         state = solver.init(params)
         for step in range(3):

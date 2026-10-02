@@ -21,7 +21,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
 
 VOCAB = 37
@@ -161,11 +161,10 @@ def test_a_depth_places_on_a_sharded_mesh():
     and a declaration with it failed every MTP model on a mesh with fsdp above
     one once the kernel crossed min_shard."""
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import build_mesh
 
     model = tiny(num_nextn_predict_layers=1)
     params = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=8))
+    mesh = MeshSpec(fsdp=8).build()
     placement = Layout(min_shard=1).shardings(mesh, params)
 
     assert placement["params"]["mtp_0"]["eh_proj"]["kernel"].spec == jax.sharding.PartitionSpec(None, "fsdp")
@@ -213,13 +212,13 @@ def test_the_term_is_off_by_default():
     batch = token_batch()
 
     (loss, aux), grads = jax.value_and_grad(
-        lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True)(params)
+        lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
 
     assert float(loss) == float(aux.metrics["ce"])
     assert "mtp_ce" not in aux.metrics
     plain = {"params": {key: value for key, value in params["params"].items()
                         if key != "mtp_0"}}
-    plain_loss, _ = scalar_loss(LMObjective(tiny(), SEQ), plain, batch, step_at())
+    plain_loss, _ = LMObjective(tiny(), SEQ).scalar_loss(plain, batch, step_at())
     assert float(loss) == pytest.approx(float(plain_loss), rel=1e-6)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"]["mtp_0"]))
 
@@ -239,7 +238,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
     tokens = np.asarray(batch[TEXT_KEY])
 
     (loss, aux), grads = jax.value_and_grad(
-        lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True)(params)
+        lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
 
     ce = float(aux.metrics["ce"])
     expected = depth_cross_entropies(model, params, tokens)
@@ -292,8 +291,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same():
     columns = {TEXT_KEY: ids, "text_segment_ids": segments, "text_positions": positions}
     carried = {TEXT_KEY: ModelInputs(ids, {"segment_ids": segments, "positions": positions})}
 
-    _, by_columns = scalar_loss(objective, params, columns, step_at())
-    _, by_inputs = scalar_loss(objective, params, carried, step_at())
+    _, by_columns = objective.scalar_loss(params, columns, step_at())
+    _, by_inputs = objective.scalar_loss(params, carried, step_at())
 
     assert float(by_inputs.metrics["ce"]) == float(by_columns.metrics["ce"])
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
@@ -336,7 +335,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     batch = token_batch()
     still = LMObjective(model, SEQ, balance_rate=0.1)
     params = still.init(jax.random.key(0))
-    _, aux = scalar_loss(still, params, batch, step_at())
+    _, aux = still.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
     moved = still.apply_effects(params, aux.effects)["moe"]
     assert jnp.array_equal(moved["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
@@ -345,7 +344,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
                                params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
 
     running = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3)
-    _, aux = scalar_loss(running, params, batch, step_at())
+    _, aux = running.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
     moved = running.apply_effects(params, aux.effects)["moe"]
     assert not jnp.array_equal(

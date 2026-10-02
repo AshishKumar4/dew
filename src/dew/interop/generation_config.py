@@ -4,9 +4,12 @@ transformers reads decoding policy from generation_config.json, falling back to
 config.json and its text_config: EOS and pad ids, the length limit, returned
 rows, the sampling policy, the logits processors (`_CONTROLS`), stopping
 criteria and the search strategy (beams, the model's own prediction depths).
-`source_decoding` turns them into Dew's `Sampling`, transform chain, criteria
-and `Strategy`; a field Dew has no counterpart for is refused by name. The
-masked-diffusion families' fields are audited apart (`audit_masked`).
+`source_decoding` turns them into Dew's `Sampling`, which holds the common
+controls, a transform chain only where the source names a control `Sampling`
+does not carry, and a `Strategy`; both chains come from one compiler,
+`dew.sampling.text.ordered_transforms`. A field Dew has no counterpart for is
+refused by name. The masked-diffusion families' fields are audited apart
+(`audit_masked`).
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -25,10 +28,7 @@ from dew.nn.multimodal import MultimodalTransformer
 from dew.records import JSON
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
-from dew.sampling.text import Sampling
-
-if TYPE_CHECKING:
-    from dew.interop.pretrained import Processor
+from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
 
 
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -169,9 +169,9 @@ _CONTROLS = {
     "max_new_tokens": _Control("task"),
     "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
     "min_length": _Control("transform", neutral=(0,)),
-    "min_new_tokens": _Control("transform", neutral=(0,)),
+    "min_new_tokens": _Control("policy", neutral=(0,)),
     "min_p": _Control("policy", mode="sampling", masked_neutral=(0.0,)),
-    "no_repeat_ngram_size": _Control("transform", neutral=(0,)),
+    "no_repeat_ngram_size": _Control("policy", neutral=(0,)),
     "num_assistant_tokens": _Control("strategy"),
     "num_assistant_tokens_schedule": _Control(
         "unsupported",
@@ -207,11 +207,11 @@ _CONTROLS = {
     "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
     "remove_invalid_values": _Control("transform", neutral=(False,)),
     "renormalize_logits": _Control("transform", neutral=(False,)),
-    "repetition_penalty": _Control("transform", neutral=(1.0,)),
+    "repetition_penalty": _Control("policy", neutral=(1.0,)),
     "return_dict_in_generate": _Control("inapplicable"),
     "sequence_bias": _Control("transform"),
     "speculation_type": _Control("strategy"),
-    "stop_strings": _Control("criterion"),
+    "stop_strings": _Control("policy"),
     "suppress_tokens": _Control("transform"),
     "target_lookbehind": _Control(
         "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
@@ -227,7 +227,7 @@ _CONTROLS = {
     "top_k": _Control("policy", masked_neutral=(0,)),
     "top_p": _Control("policy", mode="sampling", masked_neutral=(1.0,)),
     "transformers_version": _Control("metadata"),
-    "typical_p": _Control("transform", neutral=(1.0,), mode="sampling"),
+    "typical_p": _Control("policy", neutral=(1.0,), mode="sampling"),
     "use_cache": _Control(
         "unsupported",
         neutral=(True,),
@@ -336,20 +336,34 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
 
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
-    """Return the policy tail a source declares, whatever else it also declares."""
+    """Return the policy a source declares, every common control in it."""
+    read = functools.partial(_active, config, generation_config)
     temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
     if temperature is None:
         temperature = Sampling.temperature
     top_k = _generation_value(config, generation_config, "top_k")
+    eos = eos_ids(config, generation_config) or None
+    penalty = read("repetition_penalty")
+    ngram = read("no_repeat_ngram_size")
+    # Without an EOS id there is nothing for min_new_tokens to hold back.
+    floor = read("min_new_tokens") if eos is not None else None
+    typical = read("typical_p") if do_sample else None
+    stop = read("stop_strings")
     return Sampling(
         temperature=records.number(temperature, "temperature") if do_sample else 0.0,
         top_k=(records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
-        eos_id=(eos_ids(config, generation_config) or None),
+        eos_id=eos,
         pad_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
         if do_sample else Sampling.top_p,
         min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
-        if do_sample else Sampling.min_p)
+        if do_sample else Sampling.min_p,
+        repetition_penalty=Sampling.repetition_penalty if penalty is None
+        else records.number(penalty, "repetition_penalty"),
+        no_repeat_ngram_size=0 if ngram is None else records.integer(ngram, "no_repeat_ngram_size"),
+        min_new_tokens=0 if floor is None else records.integer(floor, "min_new_tokens"),
+        typical_p=Sampling.typical_p if typical is None else records.number(typical, "typical_p"),
+        stop=() if stop is None else _as_strings(stop))
 
 
 def _token_list(value: object, name: str) -> list[int]:
@@ -400,109 +414,61 @@ def _as_strings(value: object) -> tuple[str, ...]:
 
 
 def _source_transforms(config: Mapping[str, object], generation_config: Mapping[str, object],
-                       sampling: Sampling, do_sample: bool,
-                       searching: bool) -> tuple[decoding.LogitsTransform, ...]:
-    """Build the source's whole transform chain, in `_get_logits_processor`'s order.
+                       sampling: Sampling, searching: bool) -> tuple[decoding.LogitsTransform, ...] | None:
+    """Build the chain a source needs beyond its `Sampling`, or None when the policy is all of it.
 
-    This is the complete chain the task runs, so the policy's own tail is
-    built here rather than appended afterwards and every warper lands where
-    the reference puts it: temperature, top-h, top-k, top-p, min-p, typical,
-    epsilon, eta, and `renormalize_logits` last of all. Without sampling the
-    reference adds no warper at all and picks the argmax, which is the
-    trailing `Greedy`. Beam search picks its own continuations, so it ends
-    the chain after the processors.
+    The controls `Sampling` does not carry are built here and placed by the
+    one compiler, `ordered_transforms`, in `_get_logits_processor`'s order,
+    with the policy's own transforms between them. A beam search picks its
+    own continuations, so it always binds its chain, which ends after the
+    processors.
     """
     eos = jnp.asarray(eos_ids(config, generation_config) or (), jnp.int32)
     read = functools.partial(_active, config, generation_config)
-    transforms: list[decoding.LogitsTransform] = []
+    extra: dict[str, decoding.LogitsTransform] = {}
     if (value := read("sequence_bias")) is not None:
-        transforms.append(decoding.sequence_bias(_as_bias(value)))
+        extra["sequence_bias"] = decoding.sequence_bias(_as_bias(value))
     if (value := read("encoder_repetition_penalty")) is not None:
-        transforms.append(
-            decoding.PromptRepetitionPenalty(records.number(value, "encoder_repetition_penalty"))
-        )
-    if (value := read("repetition_penalty")) is not None:
-        transforms.append(decoding.RepetitionPenalty(records.number(value, "repetition_penalty")))
-    if (value := read("no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.NoRepeatNGram(records.integer(value, "no_repeat_ngram_size")))
+        extra["encoder_repetition_penalty"] = decoding.PromptRepetitionPenalty(
+            records.number(value, "encoder_repetition_penalty"))
     if (value := read("encoder_no_repeat_ngram_size")) is not None:
-        transforms.append(
-            decoding.PromptNoRepeatNGram(records.integer(value, "encoder_no_repeat_ngram_size"))
-        )
+        extra["encoder_no_repeat_ngram_size"] = decoding.PromptNoRepeatNGram(
+            records.integer(value, "encoder_no_repeat_ngram_size"))
     if (value := read("bad_words_ids")) is not None:
-        transforms.append(decoding.bad_words(_as_words(value), sampling.eos_id))
+        extra["bad_words_ids"] = decoding.bad_words(_as_words(value), sampling.eos_id)
     if (value := read("min_length")) is not None and eos.size:
-        transforms.append(decoding.MinLength(records.integer(value, "min_length"), eos))
-    if (value := read("min_new_tokens")) is not None and eos.size:
-        transforms.append(decoding.MinNewTokens(records.integer(value, "min_new_tokens"), eos))
+        extra["min_length"] = decoding.MinLength(records.integer(value, "min_length"), eos)
     if (value := read("forced_bos_token_id")) is not None:
-        transforms.append(decoding.ForcedBOS(records.integer(value, "forced_bos_token_id")))
+        extra["forced_bos_token_id"] = decoding.ForcedBOS(records.integer(value, "forced_bos_token_id"))
     if (value := read("forced_eos_token_id")) is not None:
         # The reference forces at the effective end of the request, and a call
         # may set its own budget, so the control stays request relative.
-        transforms.append(decoding.ForcedEOS(
-            jnp.asarray(_token_list(value, "forced_eos_token_id"), jnp.int32)))
+        extra["forced_eos_token_id"] = decoding.ForcedEOS(
+            jnp.asarray(_token_list(value, "forced_eos_token_id"), jnp.int32))
     if read("remove_invalid_values") is not None:
-        transforms.append(decoding.RemoveInvalidValues())
+        extra["remove_invalid_values"] = decoding.RemoveInvalidValues()
     if (value := read("exponential_decay_length_penalty")) is not None:
         start, factor = _as_decay(value)
-        transforms.append(decoding.ExponentialDecayLengthPenalty(start, factor, eos))
+        extra["exponential_decay_length_penalty"] = decoding.ExponentialDecayLengthPenalty(start, factor, eos)
     if (value := read("suppress_tokens")) is not None:
-        transforms.append(decoding.SuppressTokens(
-            jnp.asarray(_token_list(value, "suppress_tokens"), jnp.int32)))
+        extra["suppress_tokens"] = decoding.SuppressTokens(
+            jnp.asarray(_token_list(value, "suppress_tokens"), jnp.int32))
     if (value := read("begin_suppress_tokens")) is not None:
-        transforms.append(decoding.BeginSuppressTokens(
+        extra["begin_suppress_tokens"] = decoding.BeginSuppressTokens(
             jnp.asarray(_token_list(value, "begin_suppress_tokens"), jnp.int32),
-            read("forced_bos_token_id") is not None))
-    if searching:
-        if read("renormalize_logits") is not None:
-            transforms.append(decoding.Renormalize())
-        return tuple(transforms)
-    if not do_sample:
-        transforms.append(decoding.Greedy())
-    else:
-        transforms.extend(_source_warpers(config, generation_config, sampling))
+            read("forced_bos_token_id") is not None)
+    if sampling.temperature > 0 and not searching:
+        if (value := read("top_h")) is not None:
+            extra["top_h"] = decoding.TopH(records.number(value, "top_h"))
+        if (value := read("epsilon_cutoff")) is not None:
+            extra["epsilon_cutoff"] = decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff"))
+        if (value := read("eta_cutoff")) is not None:
+            extra["eta_cutoff"] = decoding.EtaCutoff(records.number(value, "eta_cutoff"))
     if read("renormalize_logits") is not None:
-        transforms.append(decoding.Renormalize())
-    return tuple(transforms)
-
-
-def _source_warpers(config: Mapping[str, object], generation_config: Mapping[str, object],
-                    sampling: Sampling) -> tuple[decoding.LogitsTransform, ...]:
-    """The sampling-only tail, in the reference's warper order."""
-    read = functools.partial(_active, config, generation_config)
-    transforms: list[decoding.LogitsTransform] = []
-    if sampling.temperature != 1.0:
-        transforms.append(decoding.Temperature(sampling.temperature))
-    if (value := read("top_h")) is not None:
-        transforms.append(decoding.TopH(records.number(value, "top_h")))
-    if sampling.top_k is not None:
-        transforms.append(decoding.TopK(sampling.top_k))
-    if sampling.top_p < 1.0:
-        transforms.append(decoding.TopP(sampling.top_p))
-    if sampling.min_p > 0.0:
-        transforms.append(decoding.MinP(sampling.min_p))
-    if (value := read("typical_p")) is not None:
-        transforms.append(decoding.Typical(records.number(value, "typical_p")))
-    if (value := read("epsilon_cutoff")) is not None:
-        transforms.append(decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff")))
-    if (value := read("eta_cutoff")) is not None:
-        transforms.append(decoding.EtaCutoff(records.number(value, "eta_cutoff")))
-    return tuple(transforms)
-
-
-def _source_stopping(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     processor: Processor | None, vocab_size: int | None
-                     ) -> tuple[decoding.Stopping, ...]:
-    """Return the source's active criteria beyond the policy's EOS ids."""
-    value = _active(config, generation_config, "stop_strings")
-    if value is None:
-        return ()
-    if processor is None:
-        raise ValueError("stop_strings need the source's processor to compile its vocabulary")
-    if vocab_size is None:
-        raise ValueError("stop_strings need the model's vocab_size to compile its vocabulary")
-    return (decoding.stop_strings(processor, _as_strings(value), vocab_size),)
+        extra["renormalize_logits"] = decoding.Renormalize()
+    if not extra and not searching:
+        return None
+    return ordered_transforms(sampling, extra, searching=searching)
 
 
 def _source_strategy(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -560,15 +526,14 @@ def _mtp_mode(value: object) -> bool:
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None, rows: int,
-                     override: Sampling | None
-                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None,
-                                tuple[decoding.Stopping, ...], Strategy | None]:
-    """Return the policy, chain, criteria and strategy a loaded source decodes with.
+                     model: nn.Module, rows: int, override: Sampling | None
+                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None, Strategy | None]:
+    """Return the policy, chain and strategy a loaded source decodes with.
 
     An explicit policy replaces the first two, so they are not built and the
     controls behind them are not judged: a watermark the caller just replaced
-    cannot block the call.
+    cannot block the call. The source's EOS and pad ids fill the ones it
+    leaves None, since they belong to the model and its tokenizer.
     """
     requested_mode = _generation_value(config, generation_config, "do_sample")
     if override is None and requested_mode is not None and type(requested_mode) is not bool:
@@ -577,13 +542,9 @@ def source_decoding(config: Mapping[str, object], generation_config: Mapping[str
     _audit(config, generation_config, model, do_sample,
            _generation_value(config, generation_config, "num_beams"), override is not None)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)
-    decoder = _decoder(model)
-    criteria = _source_stopping(config, generation_config, processor,
-                                None if decoder is None else decoder.vocab_size)
-    policy = override if override is not None else _source_sampling(config, generation_config, do_sample)
-    transforms = (
-        None
-        if override is not None
-        else _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam))
-    )
-    return policy, transforms, criteria, strategy
+    if override is not None:
+        ids = Sampling(eos_id=eos_ids(config, generation_config) or None,
+                       pad_id=pad_id(config, generation_config))
+        return with_ids_of(override, ids), None, strategy
+    policy = _source_sampling(config, generation_config, do_sample)
+    return policy, _source_transforms(config, generation_config, policy, isinstance(strategy, Beam)), strategy

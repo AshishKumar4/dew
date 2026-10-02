@@ -280,7 +280,7 @@ class PackedWindows(_WrappingDataset):
     def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
                  bins: int, described: str):
         super().__init__(DocumentChunks(documents, lengths, window))
-        self._window = window
+        self._window, self._bins = window, bins
         self._described = described
         self._order, self._starts = first_fit(chunk_lengths(lengths, window), window, bins)
 
@@ -288,7 +288,7 @@ class PackedWindows(_WrappingDataset):
         # A saved position names the order it counts into (`dew.position`),
         # and which chunks share a window is part of that order.
         return (f"PackedWindows({self._described}, window={self._window}, "
-                f"windows={len(self)})")
+                f"bins={self._bins}, windows={len(self)})")
 
     def __len__(self) -> int:
         return len(self._starts) - 1
@@ -399,7 +399,9 @@ class PackedTokens(DatasetSpec):
         # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
         def packed(tokens) -> PackedWindows:
-            source = TokenDocumentSource(tokens)
+            # Cut where the packer would, so a chunk of a long document reads
+            # its own span instead of the whole document.
+            source = TokenDocumentSource(tokens, chunk_len=window)
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 

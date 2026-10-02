@@ -33,6 +33,7 @@ from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMap
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
+import optax
 import tyro
 from etils import epath
 
@@ -53,7 +54,15 @@ from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cac
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
+from dew.training.optim import (
+    BF16_STATE_OPTIMIZERS,
+    OPTIMIZER_MAP,
+    ParamGroup,
+    ScheduleBase,
+    learning_rate_schedule,
+    param_labels,
+    power_profiles,
+)
 from dew.training.quantization import Quantization, _quantize
 from dew.training.selection import Best
 from dew.training.state import TrainState
@@ -147,8 +156,8 @@ class OptimConfig:
     weight_decay: float | None = None
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
     """Per-group learning-rate multipliers and weight decay, first match wins;
-    empty moves every parameter alike. `dew.training.optim.mup_param_groups`
-    is lm-engine's muP split."""
+    empty moves every parameter alike. `ParamGroup.mup` is lm-engine's muP
+    split."""
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
@@ -162,8 +171,67 @@ class OptimConfig:
     """Relative standard deviations of the power-function EMAs a run keeps
     for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
     et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
-    `dew.training.posthoc.reconstruct` builds an average of any other
+    `Checkpoints.posthoc_ema` builds an average of any other
     relative standard deviation from the snapshots. Empty keeps none."""
+
+    def build(self, steps: int) -> optax.GradientTransformation:
+        """Build the solver this config describes, with its schedule, parameter
+        groups and clipping.
+
+        `steps` is the run's length, which a schedule decays over unless the
+        config names its own end. `param_groups` runs one solver per group under
+        `optax.multi_transform`, each on the schedule times its multiplier and
+        with its own weight decay; the global-norm clip still reads every
+        gradient together, before the groups split them."""
+        learning_rate = learning_rate_schedule(self, steps)
+        opts = dict(self.optimizer_opts)
+        if self.weight_decay is not None:
+            opts['weight_decay'] = self.weight_decay
+            if self.optimizer in ('muon', 'muonclip'):
+                # Muon's weight_decay does not cover the AdamW group's norm scales.
+                opts.setdefault('adam_weight_decay', self.weight_decay)
+        make = OPTIMIZER_MAP[self.optimizer]
+        if self.state_dtype == 'bfloat16':
+            if self.optimizer not in BF16_STATE_OPTIMIZERS:
+                raise ValueError(
+                    f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
+                    f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
+            make = BF16_STATE_OPTIMIZERS[self.optimizer]
+        if self.param_groups:
+            names = [group.name for group in self.param_groups]
+            if len(set(names)) != len(names):
+                raise ValueError(f"param group names repeat: {names}")
+            solvers = {}
+            for group in self.param_groups:
+                group_opts = dict(opts)
+                if group.weight_decay is not None:
+                    group_opts['weight_decay'] = group.weight_decay
+                    if self.optimizer in ('muon', 'muonclip'):
+                        group_opts['adam_weight_decay'] = group.weight_decay
+                solvers[group.name] = make(
+                    _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
+            solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+        else:
+            solver = make(learning_rate, **opts)
+
+        if self.clip_grads > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
+        if self.forced_weight_normalization:
+            from dew.nn.mp import forced_weight_normalization
+
+            solver = optax.chain(solver, forced_weight_normalization())
+        if self.ema_profiles:
+            solver = power_profiles(solver, self.ema_profiles)
+        return solver
+
+
+def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
+    if multiplier == 1.0:
+        return learning_rate
+    if callable(learning_rate):
+        schedule = learning_rate
+        return lambda count: multiplier * schedule(count)
+    return multiplier * learning_rate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -730,7 +798,7 @@ class RunConfig:
 
             agreed("run metadata", record_run)
             state = Trainer.from_config(
-                trainer, objective, build_optimizer(self.optim, steps),
+                trainer, objective, self.optim.build(steps),
                 key=trainer.key,
                 checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout,

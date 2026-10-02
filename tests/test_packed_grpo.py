@@ -14,7 +14,7 @@ from test_layer_stack import widened
 from test_tools import load
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Step, mean_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
@@ -90,7 +90,7 @@ def _per_call(rollouts):
 
 def _loss(objective, params, batch, reference):
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=reference)
-    return mean_loss(objective.loss(params, batch, step)[0])[0]
+    return objective.loss(params, batch, step)[0].mean()[0]
 
 
 FLOOR_FACTOR = load("layout_parity").FLOOR_FACTOR
@@ -260,7 +260,7 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
     assert float(aux.metrics["masked/band"]) == pytest.approx(outside)
     plain, _ = GRPOObjective(_model(), WIDTH - 1).loss(params, packed, step)
     banded, _ = objective.loss(params, packed, step)
-    assert abs(float(mean_loss(plain)[0]) - float(mean_loss(banded)[0])) > 1e-4
+    assert abs(float(plain.mean()[0]) - float(banded.mean()[0])) > 1e-4
     geometric = GRPOObjective(_model(), WIDTH - 1, geometric_mask=(0.99, 1.01))
     _, aux = geometric.loss(params, packed, step)
     assert float(aux.metrics["masked/geometric"]) == 1.0
@@ -308,7 +308,7 @@ def test_the_loss_never_holds_the_logits_of_the_whole_batch():
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
 
     def loss(params, batch):
-        return mean_loss(objective.loss(params, batch, step)[0])[0]
+        return objective.loss(params, batch, step)[0].mean()[0]
 
     compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
     logits = rows * width * vocab * 4

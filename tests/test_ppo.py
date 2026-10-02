@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from test_rl_surrogate import clipped_surrogate, token_mean
 from test_tool_episodes import (
     EOS,
     GROUPS,
@@ -25,10 +26,10 @@ from test_tool_episodes import (
 )
 
 from dew.data import Dataset
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
-from dew.rl import clipped_surrogate, clipped_value_loss_terms, gae, token_log_ratio, token_mean
+from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
 from dew.training import Trainer
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
@@ -101,8 +102,8 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     changed = {**batch, RETURNS_KEY: batch[RETURNS_KEY] + .25}
     info = Step(jnp.array(0), jax.random.key(1), None)
     no_kl = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(TokenFeatures()))
-    before = scalar_loss(no_kl, state.params, batch, info)[0]
-    after = scalar_loss(no_kl, state.params, changed, info)[0]
+    before = no_kl.scalar_loss(state.params, batch, info)[0]
+    after = no_kl.scalar_loss(state.params, changed, info)[0]
     assert abs(float(before - after)) > .001
 
 
@@ -162,7 +163,7 @@ def test_composite_objective_and_parameter_gradients_match_verl():
                                        "bias": jnp.asarray(reference["objective_bias"])}}}
         info = Step(jnp.array(0), jax.random.key(1), state.averaged)
         def loss(parameters):
-            return scalar_loss(rollout.objective, {"params": parameters}, batch, info)[0]
+            return rollout.objective.scalar_loss({"params": parameters}, batch, info)[0]
         actual, gradient = jax.value_and_grad(loss)(params)
         assert float(actual) == pytest.approx(float(reference["objective_loss"]), abs=2e-6)
         observed = {

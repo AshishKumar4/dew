@@ -66,6 +66,14 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE)
 """What trains beside the model under `params` and the model never reads."""
 
 
+def _own_loss(name: str, kwargs: dict) -> None:
+    """Refuse the denoising loss's extras, which an objective with its own
+    loss would leave unused."""
+    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+    if unused:
+        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+
+
 def _without_loss_heads(variables: Variables) -> Variables:
     """`variables` without what the model never reads: the uncertainty head,
     the alignment projector, the frozen representation encoder, and an
@@ -341,6 +349,9 @@ class DiffusionObjective(Objective[Ratio]):
                                      None if self.guidance is None else unconditional)
 
     def _conditions(self, params, batch, key, *, dropout):
+        """The batch's conditions and the blank ones, the blank aligned to and
+        broadcast over the batch's rows. `dropout` blanks a drawn share of
+        the batch's own rows, classifier-free guidance's training dropout."""
         given = self.encoded_conditions(params, batch)
         # The unconditional prompt is fixed, so its encoding is a constant
         # and the text tower runs over the batch alone, once per step.
@@ -352,6 +363,9 @@ class DiffusionObjective(Objective[Ratio]):
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
                 given, aligned_conditions(given, unconditional))
+        else:
+            unconditional = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
+                                         given, aligned_conditions(given, unconditional))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
             spatial = latent_image_conditions(

@@ -1784,11 +1784,18 @@
  },
  "dew.sampling.text.Sampling": {
   "eos_id": null,
+  "frequency_penalty": 0.0,
+  "min_new_tokens": 0,
   "min_p": 0.0,
-  "pad_id": 0,
+  "no_repeat_ngram_size": 0,
+  "pad_id": null,
+  "presence_penalty": 0.0,
+  "repetition_penalty": 1.0,
+  "stop": [],
   "temperature": 1.0,
   "top_k": null,
-  "top_p": 1.0
+  "top_p": 1.0,
+  "typical_p": 1.0
  },
  "dew.training.distributed.Layout": {
   "host": [],

@@ -34,9 +34,10 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.records import integer, record as named_fields, text as named
+from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate
+from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -376,12 +377,16 @@ class TextGeneration:
     split over its batch axes and results keep that sharding.
 
     `logits` is the whole transform chain, `stopping` the criteria that run
-    beside the policy's EOS one, and `strategy` the device loop. `logits=None`
-    means the chain `sampling` compiles to. A call replaces each of them
-    whole, so a caller that wants to add to a bound chain writes
-    `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
-    replaces a bound chain with its own, because the policy it overrides is
-    what that chain was built from.
+    beside the policy's EOS and stop-string ones, and `strategy` the device
+    loop. `logits=None` means the chain `sampling` compiles to. A call
+    replaces each of them whole, so a caller that wants to add to a chain
+    writes `logits=task.sampling.transforms() + (mine,)`, and an explicit
+    `sampling=` on a call replaces a bound chain with its own, because the
+    policy it overrides is what that chain was built from. A call's policy
+    takes the task's EOS and pad ids where it leaves them None, so changing
+    one control is `sampling=replace(task.sampling, repetition_penalty=1.1)`
+    or a fresh `Sampling(...)`, and either still stops where the task does.
+    `sampling.stop` strings compile against `processor` once per policy.
 
     A call runs at `SHAPE_BUCKETS` shapes over a cache the bucket sizes,
     and hands back the shapes the request asked for, so two requests of
@@ -399,9 +404,31 @@ class TextGeneration:
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _freeze_variables(self, self.variables)
+        object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
+
+    def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
+        """Compile stop strings against the processor's vocabulary, sized for the model's head."""
+        if not strings:
+            return ()
+        if not isinstance(self.processor, (decoding.Referencing, decoding.Tokenizing, decoding.Vocabulary)):
+            raise ValueError("stop strings compile against the task's processor, and this task has none "
+                             "that lists its vocabulary; pass processor=")
+        return (decoding.stop_strings(self.processor, strings,
+                                      self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
+                  ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
+        """The policy, chain and criteria a call runs, the stop strings compiled
+        into criteria and the EOS and pad ids filled from the task's policy."""
+        policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
+        stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
+        chain = (self.logits if sampling is None else None) if logits is None else logits
+        criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
+        return replace(policy, stop=(), pad_id=policy.pad), chain, criteria
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -459,8 +486,7 @@ class TextGeneration:
         model = model_config.build()
         quantization = _saved_quantization(record)
         if quantization is not None:
-            from dew.training.quantization import apply_quantization
-            model = apply_quantization(model, quantization)
+            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 
@@ -487,12 +513,9 @@ class TextGeneration:
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
-            chain = self.logits if sampling is None else None
+            policy, chain, criteria = self._controls(sampling, logits, stopping)
             generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
-                              sampling=self.sampling if sampling is None else sampling,
-                              n=self.n if n is None else n,
-                              logits=chain if logits is None else logits,
-                              stopping=self.stopping if stopping is None else stopping,
+                              sampling=policy, n=self.n if n is None else n, logits=chain, stopping=criteria,
                               strategy=self.strategy if strategy is None else strategy)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]

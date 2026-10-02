@@ -405,6 +405,42 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
         errors.items(), key=lambda item: item[1])
 
 
+def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros():
+    """A DiT zero-initializes its output projection and its modulations, so
+    its first step's gradient reached 2 of the zoo DiT's 70 leaves, and every
+    DiT, UNet and MMDiT layout was judged on its output layer alone. The
+    tool draws every all-zero leaf, so each one carries a gradient."""
+    tool = load("layout_parity")
+    import benchmark_step
+
+    case = dataclasses.replace(tool.zoo()["dit"], dtype="float32")
+    _, gradient, _ = tool.trained(case, {}, benchmark_step.global_batch(case), steps=1, one_device=True)
+
+    silent = [leaf for leaf, values in gradient.items() if not np.any(values)]
+    assert not silent, f"{len(silent)} of {len(gradient)} leaves get no gradient: {silent[:4]}"
+
+
+def test_layout_parity_bounds_a_split_losss_sum_by_its_contraction():
+    """A sequence or tensor axis over the output splits the loss's own sum
+    over a row's elements, which reordering the rows never moves: the MMDiT's
+    loss of 1.2114 landed 5 fp32 ulps (5.96e-7) from one device's on tensor4,
+    past the 5.78e-7 its reorderings allowed, every gradient leaf within 0.09
+    of its bound. The loss is also held to twice gamma_N of its magnitude,
+    the most two orders of a sum of N terms may differ."""
+    tool = load("layout_parity")
+    u = float(np.finfo(np.float32).eps) / 2
+
+    assert tool.contraction_floor(4, 1.0) == pytest.approx(2 * 4 * u / (1 - 4 * u))
+    assert tool.contracted_terms({"image": np.zeros((8, 32, 32, 4)), "label": np.zeros(8)}) == 32768
+    judged = tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 5.96e-7, 1.4e-7, 1.2114, terms=32768)
+    assert judged["status"] == "works"
+    assert judged["loss_bound"] == pytest.approx(tool.contraction_floor(32768, 1.2114))
+    assert (
+        tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 1e-2, 1.4e-7, 1.2114, terms=32768)["status"]
+        == "MISMATCH"
+    )
+
+
 def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
     """A run's exit status is its verdict. A layout Dew refuses by design
     (LayoutRefused: a stage axis over a model with no pipeline) is a row with
@@ -610,7 +646,11 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     through the registry inside their objective, so their rows are its rows.
     An architecture named as covered without a case measuring it would leave
     the difference here nonempty."""
-    from dew import models
+    import dew.nn.backbones
+    import dew.nn.backbones.jepa
+    import dew.nn.diffusion_gemma
+    import dew.nn.multimodal  # noqa: F401  (registers the kind)
+    from dew.registry import models
 
     tool = load("benchmark_step")
     cases = tool.small_cases("bfloat16")

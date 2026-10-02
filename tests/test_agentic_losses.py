@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Step, mean_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
@@ -102,7 +102,7 @@ def _run(reference, rollouts=("a", "b", "c", "d"), proximal=True, mask=None, **o
 
     def scalar(current):
         loss, aux = objective.loss({"current": current}, batch, step)
-        return mean_loss(loss)[0], aux.metrics
+        return loss.mean()[0], aux.metrics
 
     (loss, metrics), grad = jax.value_and_grad(scalar, has_aux=True)(
         jnp.asarray(_place(reference["current"]))
@@ -135,7 +135,7 @@ def test_gspo_pools_each_chain_on_its_own(reference):
     objective = _objective(reference, policy_loss="gspo")
     merged, _ = objective.loss({"current": jnp.asarray(_place(reference["current"]))}, batch,
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
-    assert abs(float(mean_loss(merged)[0]) - loss) > 1e-3
+    assert abs(float(merged.mean()[0]) - loss) > 1e-3
 
 
 def test_token_corrections_match_verl_rollout_correction(reference):

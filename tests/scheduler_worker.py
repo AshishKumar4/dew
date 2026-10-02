@@ -39,12 +39,12 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import Dataset
+    from dew.data import DataPartition, Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler
     from dew.objectives.rl.sessions import Call, Session, Status
-    from dew.training import Layout, MeshSpec, Trainer, data_partition
+    from dew.training import Layout, MeshSpec, Trainer
 
     process = jax.process_index()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
@@ -96,7 +96,7 @@ def main() -> None:
         layout=Layout(min_shard=TINY_SHARD),
         rollout=rollout,
     )
-    partition = data_partition(trainer.device_mesh)
+    partition = DataPartition.of(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),
                                  groups=2, max_lag=1, ahead=1)

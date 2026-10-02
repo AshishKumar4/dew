@@ -7,6 +7,7 @@ count, what lands on disk and when, what a resume restores, what reaches the
 tracker, and what a failure does to the run.
 """
 
+import contextlib
 import dataclasses
 import gc
 import io
@@ -28,6 +29,7 @@ import pytest
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
 from rich.console import Console
+from steady_state import steady_state
 
 from dew import position
 from dew.artifacts import Representations
@@ -154,9 +156,64 @@ class RecordingTracker:
 # The loop
 # --------------------------------------------------------------------------
 
+def test_fit_lets_go_of_each_state_its_step_consumed():
+    """A step donates the state it is handed, so once the next state exists
+    nothing in fit may still hold the old one: its arrays have lost their
+    buffers, and a drain of every live array (`dew.profile`) waits on them."""
+    trainer = make_trainer()
+    placed, held, alive = trainer.place, [], []
+
+    def place():
+        state, shardings, position = placed()
+        held.append(weakref.ref(state))
+        return state, shardings, position
+
+    class Watching(RecordingTracker):
+        def log(self, scalars, step):
+            if "train/loss" in scalars:
+                gc.collect()
+                alive.append(held[0]() is not None)
+
+    trainer.place = place
+    trainer.tracker = Watching()
+    trainer.fit(Data(), steps=2, log_every=1)
+    assert alive == [False, False]
+
+
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+@pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
+def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(variant, tmp_path):
+    """Past its first two logging intervals and checkpoints the loop reruns
+    the programs it compiled, and the only data that crosses is the batches
+    it places and what it reads, by name, at the logging and checkpoint
+    cadences (`steady_state`). A float() of the loss in the loop, a fresh
+    counter built on the host, or a counter on another device than the
+    loss's would each fail it."""
+    window = contextlib.ExitStack()
+
+    class Steady(RecordingTracker):
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if step == 8:
+                window.enter_context(steady_state())
+            elif step == 24:
+                window.close()
+
+    options = {"ema": {}, "accumulation": {"accumulation": 2}, "dynamic_scale": {"dynamic_scale": True},
+               "schedule": {"optimizer": optax.inject_hyperparams(optax.adam)(
+                   learning_rate=optax.cosine_decay_schedule(1e-2, 24))},
+               "checkpoints": {"tmp_path": tmp_path}}[variant]
+    tracker = Steady()
+    try:
+        make_trainer(tracker=tracker, **options).fit(
+            Data(), steps=24, log_every=4, checkpoint_every=4 if variant == "checkpoints" else None)
+    finally:
+        window.close()
+    assert [step for step, scalars in tracker.scalars if "train/loss" in scalars] == [4, 8, 12, 16, 20, 24]
 
 
 def test_integer_root_key_matches_a_typed_key_bit_exactly():
@@ -666,11 +723,11 @@ import optax
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import models
+from dew.nn.backbones import SimpleDiT
 from dew.sampling import Euler
 from dew.training import Trainer
 
-model = models.SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
                                sampler=Euler(), steps=2, ema_decay=None)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
@@ -2065,11 +2122,11 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
 
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = scalar_loss(trainer.objective, state.params, batch,
+    expected, _ = trainer.objective.scalar_loss(state.params, batch,
                               Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
     advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)

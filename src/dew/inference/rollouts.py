@@ -565,6 +565,11 @@ class VLLMGenerateServer(_RequestServer):
                  workers: int = 64, routing: bool = False, timeout: float = 600.0):
         if sampling.top_k is None:
             raise ValueError("vLLM returns a sampling mask only under a finite top-k")
+        unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"the token route draws under temperature, top-k, top-p and min-p alone; "
+                             f"{unmatched} would not shape its draws")
         super().__init__(sampling, weights, version, workers)
         self._url = base_url.rstrip("/") + "/inference/v1/generate"
         self._routing = routing

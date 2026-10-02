@@ -18,7 +18,7 @@ from flax import linen as nn
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition, sample_trajectory
@@ -154,9 +154,9 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     current = {**old, "params": {"gain": jnp.asarray(0.9)}}
     reference = {**old, "params": {"gain": jnp.asarray(0.1)}}
     step = Step(jnp.asarray(0), jax.random.key(4), reference)
-    loss, _ = scalar_loss(objective, current, batch, step)
-    gradient = jax.grad(lambda gain: scalar_loss(
-        objective, {**current, "params": {"gain": gain}}, batch, step)[0])(current["params"]["gain"])
+    loss, _ = objective.scalar_loss(current, batch, step)
+    gradient = jax.grad(lambda gain: objective.scalar_loss(
+        {**current, "params": {"gain": gain}}, batch, step)[0])(current["params"]["gain"])
 
     expected_total, expected_gradient, clipped = 0.0, 0.0, 0
     expected_policy = 0.0
@@ -197,10 +197,10 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     assert float(stats.mass) == mask.sum()
     without_reference = FlowGRPOObjective(model, process, objective.inputs, sde=objective.sde,
                                            guidance=None, clip_range=0.001, adv_clip_max=2)
-    policy_only, _ = scalar_loss(without_reference, current, batch, step.replace(ema=None))
+    policy_only, _ = without_reference.scalar_loss(current, batch, step.replace(ema=None))
     assert float(policy_only) == pytest.approx(expected_policy / mask.sum(), abs=3e-6)
     with pytest.raises(ValueError, match="reference"):
-        scalar_loss(objective, current, batch, step.replace(ema=None))
+        objective.scalar_loss(current, batch, step.replace(ema=None))
 
 
 def test_deterministic_rollout_cannot_contribute_policy_gradient():
@@ -217,8 +217,8 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
     stats, _ = objective.loss(variables, batch, step)
     value, active = objective.reduce_loss(stats)
     assert float(stats.mass) == 0 and float(value) == 0 and not bool(active)
-    gradient = jax.grad(lambda gain: scalar_loss(
-        objective, {**variables, "params": {"gain": gain}}, batch, step)[0])(variables["params"]["gain"])
+    gradient = jax.grad(lambda gain: objective.scalar_loss(
+        {**variables, "params": {"gain": gain}}, batch, step)[0])(variables["params"]["gain"])
     assert float(gradient) == 0
 
 
@@ -251,9 +251,8 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     np.testing.assert_allclose(batch["advantages"], expected.reshape(-1), atol=2e-6)
     np.testing.assert_allclose(batch["timesteps"], np.broadcast_to([1, 2/3], (6, 2)), atol=1e-7)
     np.testing.assert_allclose(objective.log_probs(variables, batch), batch["old_log_probs"], atol=5e-6)
-    loss, _ = scalar_loss(objective, variables, batch, Step(jnp.asarray(0), jax.random.key(24), None))
-    gradients = jax.grad(lambda p: scalar_loss(
-        objective, {**variables, "params": p}, batch,
+    loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(24), None))
+    gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch,
         Step(jnp.asarray(0), jax.random.key(24), None))[0])(variables["params"])
     norm = float(optax.tree.norm(gradients))
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5

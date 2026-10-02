@@ -11,13 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 import tyro
 
 from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
-from dew.registry import models
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 
@@ -46,9 +47,9 @@ def main(config: Config):
     steps = config.steps or data.epoch_steps(config.epochs)
 
     prompt = tokenizer.encode(config.prompt)
-    model = models.build("causal_transformer", **config.model, vocab_size=int(meta["vocab_size"]),
-                         max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
-                         dtype="bfloat16")
+    model = CausalTransformer(**config.model, vocab_size=int(meta["vocab_size"]),
+                              max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
+                              dtype=jnp.bfloat16)
     objective = LMObjective(
         model,
         config.sequence_length,
