@@ -37,7 +37,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints, Ranking
-from dew.data.dataset import Checkpointable, Closeable, RampedStream, Reader, rows_of
+from dew.data.dataset import Checkpointable, Closeable, Dataset, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
@@ -107,7 +107,6 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.config import TrainerConfig
-    from dew.data import Dataset
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -1607,7 +1606,9 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed,
             sharded=_split_share(state.params))
         self._report(started, current)
-        if plan.dataset.held_out:
+        # Read through the type that declares it: fit takes any object with a
+        # Dataset's readers, and a held-out count is not one of them.
+        if isinstance(plan.dataset, Dataset) and plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
