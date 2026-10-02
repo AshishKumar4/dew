@@ -20,7 +20,8 @@ import numpy as np
 import pytest
 
 import dew
-from dew.interop import hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params
+from dew.interop import hub, load_params, save_hf_layout, save_params
+from dew.interop.hub import pull_from_hub
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
@@ -363,12 +364,13 @@ def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
 
 
 # ---------------------------------------------------------------------------------
-# Hub push and pull
+# Hub pull
 # ---------------------------------------------------------------------------------
 
 
 class _RecordingApi:
-    """Stands in for HfApi and keeps every call push_to_hub makes."""
+    """Stands in for HfApi and keeps every call a push makes, with the files
+    the uploaded folder held while the call ran."""
 
     def __init__(self):
         self.created = []
@@ -379,51 +381,32 @@ class _RecordingApi:
         self.created.append((repo_id, kwargs))
 
     def upload_folder(self, **kwargs):
-        # The real client reads the folder during the call, and a staged
-        # export is gone by the time the test looks, so the listing is taken
-        # here, where the client would take it.
         self.uploaded.append(kwargs)
         self.files.append({entry.name for entry in Path(kwargs["folder_path"]).iterdir()})
 
 
-@pytest.fixture
-def api(monkeypatch):
-    recording = _RecordingApi()
-    monkeypatch.setattr(hub, "HfApi", lambda: recording)
-    return recording
+def test_a_bundle_pushes_what_it_saves_to_a_created_repo(tmp_path, monkeypatch):
+    """`push_to_hub` is `save` into a staging directory and that directory
+    uploaded, to a repo created when missing; the privacy flag and the commit
+    message pass through."""
+    import huggingface_hub
 
+    from dew.interop import PretrainedDecoder
+    from dew.nn.backbones import CausalTransformer
 
-def test_push_creates_the_repo_and_uploads_the_export_directory(params, tmp_path, api):
-    export = tmp_path / "export"
-    save_hf_layout(params, {"architecture": "simple_dit"}, export)
+    api = _RecordingApi()
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(model, model.init(jax.random.key(0), np.zeros((1, 2), np.int32)),
+                                          tokenizer="byte")
+    bundle.push_to_hub("acme/dew-export", private=True, commit_message="step 1000")
+    bundle.save(tmp_path / "saved")
 
-    push_to_hub(export, "acme/dew-export")
-
-    assert api.created == [("acme/dew-export", {"private": False, "exist_ok": True})]
-    assert api.uploaded == [
-        {
-            "repo_id": "acme/dew-export",
-            "folder_path": str(export),
-            "commit_message": "Upload dew export",
-        }
-    ]
-    uploaded = Path(api.uploaded[0]["folder_path"])
-    assert {entry.name for entry in uploaded.iterdir()} == {
-        "model.safetensors",
-        "config.json",
-    }
-
-
-def test_push_passes_the_private_flag_and_the_commit_message_through(
-    params, tmp_path, api
-):
-    export = tmp_path / "export"
-    save_hf_layout(params, {"architecture": "simple_dit"}, export)
-
-    push_to_hub(export, "acme/held-back", private=True, commit_message="step 1000")
-
-    assert api.created == [("acme/held-back", {"private": True, "exist_ok": True})]
-    assert api.uploaded[0]["commit_message"] == "step 1000"
+    assert api.created == [("acme/dew-export", {"private": True, "exist_ok": True})]
+    assert [(call["repo_id"], call["commit_message"]) for call in api.uploaded] == [
+        ("acme/dew-export", "step 1000")]
+    assert api.files == [{entry.name for entry in (tmp_path / "saved").iterdir()}]
 
 
 def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
@@ -503,25 +486,6 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
     assert "exported" in capsys.readouterr().out
     with pytest.raises(FileNotFoundError):
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
-
-
-def test_push_exports_a_run_directory_and_uploads_that(tmp_path, api):
-    """A run directory is Dew's format and nothing on the Hub reads it, so
-    the push uploads what `export_run` writes; `raw` uploads the run itself,
-    which is the form `from_pretrained` pulls back."""
-    from test_inference import make_lm_run
-
-    run = tmp_path / "run"
-    run.mkdir()
-    make_lm_run(run)
-
-    push_to_hub(run, "acme/lm")
-
-    assert Path(api.uploaded[0]["folder_path"]) != run
-    assert api.files[0] == {"config.json", "generation_config.json", "model.safetensors"}
-
-    push_to_hub(run, "acme/lm-raw", raw=True)
-    assert api.uploaded[1]["folder_path"] == str(run)
 
 
 def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):

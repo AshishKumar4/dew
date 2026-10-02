@@ -235,11 +235,27 @@ class TextToImage:
                         layout: Layout | None = None, dtype: str | None = None,
                         param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
+        `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
+
+    @classmethod
+    def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
+                      ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
+        """A FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the
+        SD VAE) over Dew's own model.
+
+        `directory` is one checkpoint step, `config` the run config FlaxDiff's
+        trainer logged, and `jax_version` the jax the run trained under, from
+        its `requirements.txt`. `ema` and `best` pick the weights; `dtype` is
+        the model's compute dtype. `dew.interop.flaxdiff` reads the format.
+        """
+        from dew.interop import flaxdiff
+
+        return flaxdiff.text_to_image(directory, config, jax_version=jax_version, ema=ema, best=best,
+                                      dtype=dtype)
 
     def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
         """The process and explicit time grid a `steps` call walks; the grid

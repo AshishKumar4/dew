@@ -138,12 +138,12 @@ Results hold global arrays sharded by row, including any filler rows added so th
 
 ### SSD-backed decoder banks
 
-`SafetensorsBanks` and `stream_banked` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
+`SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
 
 ```python
 import jax
 
-from dew.inference import SafetensorsBanks, stream_banked
+from dew.inference import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
@@ -157,7 +157,7 @@ with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                          dtype="bfloat16", attention_impl="xla"),
         "scan_layers": True,
     })
-    variables = stream_banked(model, source)
+    variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
         key=0, sampling=Sampling(temperature=0.0)))
@@ -167,7 +167,7 @@ Use a downloaded checkpoint snapshot's local directory for the path. This path a
 
 `cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
 
-For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`host_banked`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
+For a source's `place` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`place`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
 
 Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
 
