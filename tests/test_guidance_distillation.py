@@ -32,8 +32,18 @@ from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-FLUX = {"in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1, "heads": 2, "head_dim": 12,
-        "joint_attention_dim": 16, "pooled_projection_dim": 10, "guidance_embeds": True, "axes_dims_rope": [4, 4, 4]}
+FLUX = {
+    "in_channels": 12,
+    "out_channels": 12,
+    "num_layers": 1,
+    "num_single_layers": 1,
+    "heads": 2,
+    "head_dim": 12,
+    "joint_attention_dim": 16,
+    "pooled_projection_dim": 10,
+    "guidance_embeds": True,
+    "axes_dims_rope": [4, 4, 4],
+}
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +67,9 @@ def runs(tmp_path_factory):
     checkpoints.save(1, state, None)
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"),
-                                                                                 scales=(1.0, 6.0)))
+    student = dataclasses.replace(
+        teacher, guidance_distill=GuidanceDistillation(teacher=str(root / "teacher"), scales=(1.0, 6.0))
+    )
     return root, student, batch
 
 

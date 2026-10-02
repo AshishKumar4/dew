@@ -171,7 +171,9 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
             offset = latent * (1 + g2 / (2 * t) * (s - t))
             means = [offset + (gain * latent + 0.1 * t) * coefficient for gain in (0.25, 0.9, 0.1)]
             old_mean, mean, reference_mean = means
-            log_ratio = (-np.square(following - mean) + np.square(following - old_mean)).mean() / (2 * variance)
+            log_ratio = (-np.square(following - mean) + np.square(following - old_mean)).mean() / (
+                2 * variance
+            )
             ratio = np.exp(log_ratio)
             advantage = np.clip(advantages[i], -2, 2)
             unclipped = -advantage * ratio
@@ -331,7 +333,7 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
         text=True, start_new_session=True) for rank, output in enumerate(outputs)]
     try:
         reports = [report_of(process, output, timeout=120)
-                   for process, output in zip(running, outputs)]
+                   for process, output in zip(running, outputs, strict=True)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -353,7 +355,7 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     assert reports[0]["metric_rows"] == 4 and reports[0]["preview_rows"] == 4
     assert reports[1]["metric_rows"] == 0 and reports[1]["preview_rows"] == 0
     assert reports[0]["validation_mean"] == pytest.approx(baseline["validation_mean"], abs=1e-6)
-    for report, output in zip(reports, outputs):
+    for report, output in zip(reports, outputs, strict=True):
         np.testing.assert_allclose(report["global_advantages"], expected_advantages, atol=2e-5)
         np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
         assert not report["x64_enabled"]
@@ -397,7 +399,9 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
     variance = jnp.asarray([0, 0.25], jnp.bfloat16)
     transition = GaussianTransition(mean, variance)
     key = jax.random.key(61)
-    expected = mean.astype(jnp.float32) + jnp.sqrt(variance.astype(jnp.float32))[:, None] * jax.random.normal(key, mean.shape)
+    expected = mean.astype(jnp.float32) + jnp.sqrt(variance.astype(jnp.float32))[:, None] * jax.random.normal(
+        key, mean.shape
+    )
     sampled = transition.sample(key)
     # The compiled draw and eager oracle differ by one fp32 ULP (1.19e-7).
     np.testing.assert_allclose(sampled, expected, atol=2e-7, rtol=1e-6)
@@ -530,8 +534,12 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     np.testing.assert_allclose(evaluated.images, np.clip(expected, -1, 1), atol=2e-6)
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)
-    data = Dataset(train=lambda partition: itertools.repeat(prompts), val=lambda partition: iter((prompts, prompts)),
-                   records=count, batch=count)
+    data = Dataset(
+        train=lambda partition: itertools.repeat(prompts),
+        val=lambda partition: iter((prompts, prompts)),
+        records=count,
+        batch=count,
+    )
     final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,), preview=True)
     assert int(final.updates) == 1
     observed = np.concatenate(metric.images)

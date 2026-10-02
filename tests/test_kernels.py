@@ -70,7 +70,7 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
     fused = value_and_grads('cudnn', query, key, value, causal=causal)
     reference = value_and_grads('xla', query, key, value, causal=causal)
 
-    for got, want in zip(fused, reference):
+    for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 

@@ -27,16 +27,24 @@ WIDTH = 24
 def engine_batch():
     rollouts = []
     for number, call in enumerate(RECORD["calls"]):
-        record = Call(tuple(call["prompt_ids"]), tuple(call["sampled_ids"]), tuple(call["behavior_log_probs"]),
-                      "length", 0, routed_experts=np.asarray(call["routed_experts"]),
-                      support=tuple(tuple(kept) for kept in call["support"]))
+        record = Call(
+            tuple(call["prompt_ids"]),
+            tuple(call["sampled_ids"]),
+            tuple(call["behavior_log_probs"]),
+            "length",
+            0,
+            routed_experts=np.asarray(call["routed_experts"]),
+            support=tuple(tuple(kept) for kept in call["support"]),
+        )
         rollouts.append(Session("t", "g", number, 0, (record,), Status.COMPLETED, float(number)))
     return rollouts, pack(rollouts, WIDTH, rows=len(rollouts), support_capacity=6 * WIDTH)
 
 
 @pytest.fixture(scope="module")
 def objective():
-    pretrained = Pretrained.load(str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(
+        str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference"
+    )
     grpo = GRPOObjective(pretrained.model, WIDTH - 1, sampling_temperature=RECORD["sampling"]["temperature"])
     return grpo, pretrained.variables
 
@@ -46,7 +54,8 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods(objective):
     support vLLM kept at its temperature, Dew's fp32 likelihoods are as
     close to transformers' float64 ones as transformers' own fp32 run
     (`reference_error`), and vLLM's reported ones as transformers' bf16 run
-    on the record's routing: both tie the scored likelihood to the engine's. The tempered full-vocabulary likelihood misses by far more."""
+    on the record's routing: both tie the scored likelihood to the engine's.
+    The tempered full-vocabulary likelihood misses by far more."""
     grpo, variables = objective
     _, batch = engine_batch()
     sampled = batch["response_mask"] != 0

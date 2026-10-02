@@ -26,7 +26,6 @@ from dew.interop.pretrained import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
-
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -48,7 +47,9 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     loaded, inputs = source
     np.testing.assert_array_equal(inputs.tokens, np.load(FIXTURE / "input_ids.npy"))
     model = loaded.model
-    output = jax.jit(lambda variables: model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    output = jax.jit(lambda variables: model.apply(variables, inputs.tokens, **inputs.kwargs()))(
+        loaded.variables
+    )
     valid = np.asarray(inputs.token_fields["attention_mask"])
     reference = np.load(FIXTURE / "logits.npy")
     np.testing.assert_allclose(np.asarray(output)[valid], reference[valid], atol=1e-4, rtol=0)
@@ -89,7 +90,9 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
                             ema_decay=None, pad_id=0)
     rows = 2 * jax.device_count()
     training_inputs = inputs.take_rows(jnp.arange(rows) % 2)
-    data = Dataset(train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows)
+    data = Dataset(
+        train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows
+    )
     trainer = Trainer(objective, optax.sgd(reference["learning_rate"]), key=jax.random.key(3),
                       mesh=MeshSpec(), layout=Layout(min_shard=2**30))
     state = trainer.fit(data, steps=1, log_every=1)
@@ -112,14 +115,18 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
 
 
 def test_model_inputs_alignment_preserves_media_identity(source):
-    loaded, inputs = source
+    _loaded, inputs = source
     padding = (~inputs.token_fields["attention_mask"]).sum(axis=1)
     aligned = jax.jit(lambda value: value.align_left(padding).take_rows(jnp.array([1, 0])))(inputs)
-    np.testing.assert_array_equal(aligned.conditioning["pixel_values"], inputs.conditioning["pixel_values"][jnp.array([1, 0])])
+    np.testing.assert_array_equal(
+        aligned.conditioning["pixel_values"], inputs.conditioning["pixel_values"][jnp.array([1, 0])]
+    )
     for row, old_row in enumerate((1, 0)):
         start = int(padding[old_row])
-        np.testing.assert_array_equal(aligned.token_fields["image_indices"][row, :inputs.tokens.shape[1] - start],
-                                      inputs.token_fields["image_indices"][old_row, start:])
+        np.testing.assert_array_equal(
+            aligned.token_fields["image_indices"][row, : inputs.tokens.shape[1] - start],
+            inputs.token_fields["image_indices"][old_row, start:],
+        )
     assert isinstance(aligned, ModelInputs)
 
 
@@ -138,7 +145,9 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
 def gemma4_video_batch():
     from transformers.video_utils import VideoMetadata
 
-    loaded = Pretrained.load(FIXTURE.parent / 'gemma4-native-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(
+        FIXTURE.parent / "gemma4-native-tiny", dtype="float32", attention_impl="reference"
+    )
     native = loaded.processor
     if native is None:
         raise ValueError('the Gemma4 fixture requires its saved Processor')
@@ -155,7 +164,7 @@ def gemma4_video_batch():
     # window AND (causal OR vision-group), not an unbounded group override.
     image = np.tile(frame, (3, 3, 1))
     images = [[image], [np.roll(image, 3, axis=0)]]
-    video_token, image_token = getattr(processor, 'video_token'), getattr(processor, 'image_token')
+    video_token, image_token = processor.video_token, processor.image_token
     text = [f'{video_token} {image_token} token4',
             f'{image_token} {video_token} token5']
     metadata = [VideoMetadata(total_num_frames=2, fps=2.0, width=side, height=side,
@@ -238,7 +247,9 @@ def test_gemma4_video_payload_must_match_positions_and_placeholders(gemma4_video
         values['video_position_ids'][0, 0, 0] = [-1, 0]
         message = 'paired'
     elif invalid == 'coordinate_bounds':
-        values['video_position_ids'][0, 0, 0, 0] = loaded.processor.config['vision_config']['position_embedding_size']
+        values["video_position_ids"][0, 0, 0, 0] = loaded.processor.config["vision_config"][
+            "position_embedding_size"
+        ]
         message = 'position_embedding_size'
     elif invalid == 'incomplete_pool':
         values['video_position_ids'][0, 0, 0] = [-1, -1]
@@ -385,7 +396,9 @@ def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
     if family == "gemma4":
         # The 2D position tables read (x, y); swapping them is the natural slip.
         positions = inputs.conditioning["image_position_ids"]
-        return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "image_position_ids": positions[..., ::-1]})
+        return dataclasses.replace(
+            inputs, conditioning={**inputs.conditioning, "image_position_ids": positions[..., ::-1]}
+        )
     if family == "qwen35":
         # Text-only rotary coordinates instead of the interleaved spatial ones.
         return dataclasses.replace(inputs, token_fields={
@@ -448,12 +461,15 @@ def test_training_reaches_the_gemma3n_vision_drop_path():
             rngs={"dropout": jax.random.key(seed)}))(loaded.variables))
 
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    np.testing.assert_array_equal(forward(loaded.model, True, 1), forward(loaded.model, True, 2))
-    first = forward(dropping, True, 1)
-    np.testing.assert_array_equal(first, forward(dropping, True, 1))
-    assert np.max(np.abs(first - forward(dropping, True, 2))[valid]) > 1e-3
+    np.testing.assert_array_equal(forward(loaded.model, train=True, seed=1),
+                                  forward(loaded.model, train=True, seed=2))
+    first = forward(dropping, train=True, seed=1)
+    np.testing.assert_array_equal(first, forward(dropping, train=True, seed=1))
+    assert np.max(np.abs(first - forward(dropping, train=True, seed=2))[valid]) > 1e-3
     expected = np.load(directory / "logits.npy")
-    np.testing.assert_allclose(forward(dropping, False, 1)[valid], expected[valid], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(
+        forward(dropping, train=False, seed=1)[valid], expected[valid], atol=1e-4, rtol=0
+    )
 
 
 @pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
@@ -463,7 +479,9 @@ def audio_source(request):
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     meta = json.loads((directory / "meta.json").read_text())
     assert loaded.processor is not None
-    inputs = loaded.processor(meta["prompts"], audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    inputs = loaded.processor(
+        meta["prompts"], audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)]
+    )
     return loaded, inputs, np.load(directory / "reference.npz")
 
 
@@ -477,7 +495,9 @@ def test_audio_only_processor_forward_and_greedy_continuation_match_reference(au
     loaded, inputs, reference = audio_source
     np.testing.assert_array_equal(inputs.tokens, reference["input_ids"])
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
+        loaded.variables
+    )
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
     generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
@@ -490,13 +510,21 @@ def test_gemma3n_left_padded_batch_has_finite_gradients():
     finite derivative there the masked slot's zero upstream gradient became
     NaN in the embedding table (observed on the pad row alone).
     """
-    loaded = Pretrained.load(FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(
+        FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference"
+    )
     model = loaded.model.language_model
     params = {"params": loaded.variables["params"]["language_model"]}
     tokens = jnp.asarray([[0, 0, 0, 5, 4, 7, 9, 3], [8, 4, 9, 7, 3, 2, 5, 6]], jnp.int32)
     valid = tokens != 0
-    inputs = ModelInputs(tokens, {"attention_mask": valid,
-                                  "positions": jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0).astype(jnp.int32)}, {})
+    inputs = ModelInputs(
+        tokens,
+        {
+            "attention_mask": valid,
+            "positions": jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0).astype(jnp.int32),
+        },
+        {},
+    )
 
     def loss(variables):
         logits = model.apply(variables, inputs.tokens, **inputs.kwargs())
@@ -572,9 +600,13 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
 
     def trained(gradient, destination):
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
-        loaded.save(destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)})
+        loaded.save(
+            destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)}
+        )
         restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
-        return restored, np.asarray(restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs()))[valid]
+        return restored, np.asarray(
+            restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
+        )[valid]
 
     restored, output = trained(gradient, tmp_path / "trained")
     np.testing.assert_allclose(output, reference, atol=bound, rtol=0)

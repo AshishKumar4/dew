@@ -123,10 +123,22 @@ def generate(process, model, solver, steps=100, count=256, shape=(8, 8, 3), seed
 
 
 @pytest.mark.parametrize(
-    "solver", [Euler(), DDIM(), DDPM(), DPMSolverMultistep(lower_order_final=False), DPMSolverMultistep(3, "dpmsolver"),
-               DPMSolverMultistep(2, "sde-dpmsolver++"), DPMSolverSinglestep(3, lower_order_final=True),
-               DEIS(), UniPC(), TCD(eta=0.0), TCD(eta=0.3)],
-    ids=solver_id)
+    "solver",
+    [
+        Euler(),
+        DDIM(),
+        DDPM(),
+        DPMSolverMultistep(lower_order_final=False),
+        DPMSolverMultistep(3, "dpmsolver"),
+        DPMSolverMultistep(2, "sde-dpmsolver++"),
+        DPMSolverSinglestep(3, lower_order_final=True),
+        DEIS(),
+        UniPC(),
+        TCD(eta=0.0),
+        TCD(eta=0.3),
+    ],
+    ids=solver_id,
+)
 def test_vp_sampler_converges(solver):
     process, model = vp_process()
     assert_gaussian_stats(generate(process, model, solver))
@@ -169,9 +181,24 @@ def test_pndm_converges_on_the_linear_table(solver):
 
 
 @pytest.mark.parametrize(
-    "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), RK4(),
-               KDPM2(), KDPM2(ancestral=True), LMS(), DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS()],
-    ids=solver_id)
+    "solver",
+    [
+        Euler(),
+        EulerAncestral(),
+        DDIM(),
+        Heun(),
+        MultiStepDPM(),
+        DDPM(),
+        RK4(),
+        KDPM2(),
+        KDPM2(ancestral=True),
+        LMS(),
+        DPMSolverMultistep(lower_order_final=False),
+        UniPC(),
+        DEIS(),
+    ],
+    ids=solver_id,
+)
 def test_karras_sampler_converges(solver):
     process, model = karras_process()
     assert_gaussian_stats(generate(process, model, solver))
@@ -439,7 +466,10 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
     return process, KarrasOracle(sigma_data=edm["sigma_data"])
 
 
-def walk(solver, process, model, x_T, times, key=jax.random.PRNGKey(0)):
+_DEFAULT_WALK_KEY = jax.random.PRNGKey(0)
+
+
+def walk(solver, process, model, x_T, times, key=_DEFAULT_WALK_KEY):
     """Every latent after each interval of `times`, the walk `sample` takes
     (its state, its per-step keys) without the final denoise; the reference
     tool records the same latents and draws the same per-step noise."""
@@ -467,7 +497,7 @@ def relative_gap(actual, expected) -> float:
     """The largest entry of |actual - expected| over the larger of 1 and the
     largest entry of |expected|, per leading index."""
     actual, expected = np.asarray(actual), np.asarray(expected)
-    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected))
+    return max(np.abs(a - e).max() / max(1.0, np.abs(e).max()) for a, e in zip(actual, expected, strict=True))
 
 
 @pytest.mark.parametrize("name", sorted(DIFFUSERS_CASES))
@@ -509,8 +539,12 @@ LIMIT_CASES = {
     "source.deis3": DEIS(3, lower_order_final=False),
     "source.unipc_x0_bh2": UniPC(3, lower_order_final=False),
     "source.unipc_x0_bh1_disabled": UniPC(3, "bh1", lower_order_final=False, disable_corrector=(0,)),
-    "source.unipc_eps_bh2_disabled": UniPC(3, predict_x0=False, lower_order_final=False, disable_corrector=(0,)),
-    "source.unipc_eps_bh1_disabled": UniPC(3, "bh1", predict_x0=False, lower_order_final=False, disable_corrector=(0,)),
+    "source.unipc_eps_bh2_disabled": UniPC(
+        3, predict_x0=False, lower_order_final=False, disable_corrector=(0,)
+    ),
+    "source.unipc_eps_bh1_disabled": UniPC(
+        3, "bh1", predict_x0=False, lower_order_final=False, disable_corrector=(0,)
+    ),
     "target.deis2": DEIS(2, lower_order_final=False),
     "target.deis3": DEIS(3, lower_order_final=False),
     "target.unipc_eps3": UniPC(3, predict_x0=False),
@@ -544,7 +578,9 @@ def test_solver_endpoint_latents_and_vjp_match_reference_limits(name):
     with np.load(DIFFUSERS_FIXTURES / "limits.npz") as fixture:
         x = jnp.asarray(fixture[f"{name}.x_T"])
         times = fixture[f"{name}.grid"]
-        expected, cotangent, expected_grad = (fixture[f"{name}.{field}"] for field in ("latents", "cotangent", "grad"))
+        expected, cotangent, expected_grad = (
+            fixture[f"{name}.{field}"] for field in ("latents", "cotangent", "grad")
+        )
     if name.startswith("target.kdpm2"):
         config = json.loads((DIFFUSERS_FIXTURES / "limits.json").read_text())["cases"][name]
         process = Process(KarrasVENoiseScheduler(sigma_min=0, sigma_max=config["sigma"], rho=1),
@@ -621,8 +657,17 @@ class Forgetful:
         return self.inner.init(x, times, process, key=key)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x, self.times, process, key=key),
-                                     key, process, denoise)
+        stepped, _ = self.inner.step(
+            x,
+            t,
+            t_next,
+            denoised,
+            eps,
+            self.inner.init(x, self.times, process, key=key),
+            key,
+            process,
+            denoise,
+        )
         return stepped, state
 
 
@@ -670,7 +715,9 @@ def test_lambda_solvers_land_on_the_clean_prediction_at_sigma_zero(solver):
         return solver.step(x, t, t_next, x_0, eps, state, key, process, denoise)
 
     fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0]), process, key=key))
-    assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(fresh, denoise(x, jnp.full((3,), 0.25))[0], atol=1e-6)
+    assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(
+        fresh, denoise(x, jnp.full((3,), 0.25))[0], atol=1e-6
+    )
 
     def two_steps(x):
         x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0]), process, key=key))
@@ -701,7 +748,9 @@ def test_consistency_sampling_in_one_step_is_the_consistency_function():
     assert jnp.allclose(generated, expected, atol=1e-6)
 
 
-@pytest.mark.parametrize("solver", [DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id)
+@pytest.mark.parametrize(
+    "solver", [DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id
+)
 def test_diffusers_solvers_resolve_the_karras_ode_more_accurately_than_euler(solver):
     """Twenty rho-spaced steps from sigma 80 down against the closed form,
     the bracket test_solvers_integrate_the_flow_ode_at_their_order sets:
@@ -848,8 +897,9 @@ class RecordedPath(DPMSolverSDE):
     def _noise(self, state, first, second, shape):
         starts = jnp.asarray([pair[0] for pair in self.intervals], jnp.float32)
         ends = jnp.asarray([pair[1] for pair in self.intervals], jnp.float32)
-        close = lambda asked, recorded: jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(  # noqa: E731
-            jnp.abs(recorded), 1e-3)
+        def close(asked, recorded):
+            return jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(
+                    jnp.abs(recorded), 1e-3)
         weights = (close(first, starts) & close(second, ends)).astype(jnp.float32)
         return jnp.sum(jnp.reshape(weights, (-1,) + (1,) * len(shape)) * self.draws, axis=0)
 
@@ -917,11 +967,13 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
         denoise = process.denoiser(model, params, {})
         solver = source_solver(name, schedule)
-        run = lambda value: walk(solver, process, model, value, times)  # noqa: E731
+        def run(value):
+            return walk(solver, process, model, value, times)
         latents = run(x_T)
         assert latents.shape == expected.shape
         assert relative_gap(latents, expected) < 1e-4
-        final = lambda value: run(value)[-1]  # noqa: E731
+        def final(value):
+            return run(value)[-1]
     else:
         model = ConditionalSourceOracle()
         rows = x_T.shape[0]

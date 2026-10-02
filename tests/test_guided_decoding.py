@@ -42,7 +42,10 @@ def tokenizer(tmp_path_factory):
     return AutoTokenizer.from_pretrained(path, local_files_only=True)
 
 
-def task(tokenizer, grammar, sampling=Sampling(temperature=0, eos_id=EOS)):
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
+
+
+def task(tokenizer, grammar, sampling=_DEFAULT_TASK_SAMPLING):
     model = CausalTransformer(vocab_size=EOS + 1, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=256, dtype="float32")
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))

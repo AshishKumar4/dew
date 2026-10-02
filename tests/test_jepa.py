@@ -101,8 +101,8 @@ def test_masks_are_reproducible_from_a_seed(mask):
     a = mask.sample(jax.random.PRNGKey(11), 4)
     b = mask.sample(jax.random.PRNGKey(11), 4)
     c = mask.sample(jax.random.PRNGKey(12), 4)
-    assert all(jnp.array_equal(x, y) for x, y in zip(a, b))
-    assert not all(jnp.array_equal(x, y) for x, y in zip(a, c))
+    assert all(jnp.array_equal(x, y) for x, y in zip(a, b, strict=True))
+    assert not all(jnp.array_equal(x, y) for x, y in zip(a, c, strict=True))
 
 
 def test_block_shapes_and_positions_actually_vary(mask):
@@ -405,13 +405,13 @@ def test_target_encoder_tracks_the_context_encoder(mask):
     context_moved = any(
         not np.allclose(a, b) for a, b in zip(
             jax.tree.leaves(state.ema["params"]["context_encoder"]),
-            jax.tree.leaves(initial["params"]["context_encoder"])))
+            jax.tree.leaves(initial["params"]["context_encoder"]), strict=True))
     assert context_moved, "the target encoder never followed the context encoder"
 
     # and it followed without jumping: still between where it started and now
     ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
     live = jax.tree.leaves(state.params["params"]["context_encoder"])
-    assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
+    assert any(not np.allclose(a, b) for a, b in zip(ema, live, strict=True)), "EMA is not lagging"
 
 
 @pytest.mark.mesh(devices=2)
