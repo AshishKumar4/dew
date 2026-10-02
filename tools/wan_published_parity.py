@@ -17,8 +17,10 @@ reference's RMS:
   latent each ends on and the frames it decodes.
 
 Both sides compute in true float32: TF32 is off in torch and JAX multiplies
-at HIGHEST. The prompt states alone are 22.7 GB, so the reference runs on a
-GPU with that room (CUDA torch), or on the host. `--stages prediction` needs
+at HIGHEST. The run exits 1 when a largest gap passes its stage's bound
+(`BOUNDS`), so a command that runs on after it stops on a failed parity.
+The prompt states alone are 22.7 GB, so the reference runs on a GPU with
+that room (CUDA torch), or on the host. `--stages prediction` needs
 only the transformer; it reads a fixed stand-in for the prompt states
 (unit-variance states on the first 24 positions, zeros after, as a padded
 prompt looks). `--reference FILE` keeps the reference arrays: written when
@@ -56,6 +58,10 @@ REVISION = "0fad780a534b6463e45facd96134c9f345acfa5b"
 PROMPTS = ["A red fox trotting through fresh snow at sunrise, its breath steaming in the cold air",
            "Waves rolling onto a black sand beach under a stormy sky"]
 TIMESTEP, GUIDANCE, SEED = 700.0, 5.0, 0
+# One call measured 2.0e-5 (RTX 4080 against torch on the host); a walk
+# carries each step's rounding into the next, ten steps of it. A wrong
+# shift, scale, sign or mask moves these by 1e-2 and more.
+BOUNDS = {"states": 1e-4, "prediction": 1e-4, "walk": 1e-3}
 
 
 def gap(actual, expected) -> dict[str, float]:
@@ -260,6 +266,10 @@ def main() -> None:
                       "jax_devices": [str(device) for device in jax.devices()],
                       "torch_device": "cuda" if torch.cuda.is_available() else "cpu",
                       "versions": {"jax": jax.__version__, "torch": torch.__version__}}}, indent=1))
+    failed = {name: value["max"] for name, value in gaps.items()
+              if value["max"] > BOUNDS[name.split(".")[0]]}
+    if failed:
+        raise SystemExit(f"parity bounds {BOUNDS} exceeded: {failed}")
 
 
 if __name__ == "__main__":
