@@ -264,13 +264,13 @@ def test_aggregate_does_not_accept_strings_for_object_owned_metrics(tmp_path):
 
 
 def test_validation_loss_reduces_additive_statistics_over_uneven_batches():
-    from dew.objectives.base import Mean
+    from dew.objectives.base import Ratio
     from dew.training import evaluate
 
     class Weighted(Overfit):
         def loss(self, params, batch, step):
             values = (params['params']['w'] - batch['target']) ** 2
-            return Mean(jnp.sum(values), jnp.asarray(values.size, jnp.float32)), Aux({})
+            return Ratio(jnp.sum(values), jnp.asarray(values.size, jnp.float32)), Aux({})
 
     objective = Weighted()
     variables = objective.init(jax.random.key(0))

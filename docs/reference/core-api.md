@@ -4,12 +4,12 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
+Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
 
 | Member | Contract |
 |---|---|
 | `init(key, variables=None)` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it once for shapes and once for values. `variables` is a held tree the caller supplies, which is how the trainer passes it as data; with `None` the objective uses its own (`DiffusionObjective.held_variables`, for example). An objective that holds nothing ignores it. |
-| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Mean(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
+| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Ratio(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
 | `reduce_loss(statistics)` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
 | `apply_effects(variables, effects)` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
 | `evaluate(variables, batch, step)` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |

@@ -265,7 +265,13 @@ class SafetensorsBanks:
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: str = "auto", read_ahead: bool = True):
-        from dew.interop.hf_decoders import _FAMILIES, _check_tree, translate_config, translate_weights
+        from dew.interop.hf_decoders import (
+            DecoderFamily,
+            _check_tree,
+            families,
+            translate_config,
+            translate_weights,
+        )
         from dew.interop.safetensors_io import read_weights
         from dew.registry import models, with_precision
 
@@ -278,7 +284,7 @@ class SafetensorsBanks:
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
         family = records.text(self.config.get("model_type"), "model_type")
-        if _FAMILIES[family].prepare_weights is not dict:
+        if families()[family].prepare_weights is not DecoderFamily.prepare_weights:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
