@@ -55,13 +55,12 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
     from dew import presets
     from dew.diffusion.process import Process
     for name in ('edm', 'flow_match', 'vp'):
-        original = presets[name]()()
+        original = presets[name](**({'regime': 'pixel'} if name == 'edm' else {}))()
         rebuilt = Process.from_json(original.to_json())
         time = jnp.linspace(.01, .99, 16)
-        for first, second in ((original, rebuilt),):
-            np.testing.assert_array_equal(first.rates(time).signal, second.rates(time).signal)
-            np.testing.assert_array_equal(first.rates(time).noise, second.rates(time).noise)
-            np.testing.assert_array_equal(first.loss_weight(time), second.loss_weight(time))
+        np.testing.assert_array_equal(original.schedule.rates(time).signal, rebuilt.schedule.rates(time).signal)
+        np.testing.assert_array_equal(original.schedule.rates(time).noise, rebuilt.schedule.rates(time).noise)
+        np.testing.assert_array_equal(original.loss_weight(time), rebuilt.loss_weight(time))
         assert rebuilt.prediction == original.prediction
 
 
