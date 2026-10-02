@@ -994,11 +994,11 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     assert restored.blank is not None
     old_blank = restored.blank(old.conditions)
 
-    denoiser_update = {**restored.variables, "params": jax.tree.map(lambda value: value + 0.03125,
-                                                               restored.variables["params"])}
+    denoiser_update = {**restored.params, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                             restored.params["params"])}
     assert restored.bind(denoiser_update).blank is restored.blank
-    encoders = jax.tree.map(lambda value: value + 0.03125, restored.variables["encoders"])
-    changed = {**restored.variables, "encoders": encoders}
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.params["encoders"])
+    changed = {**restored.params, "encoders": encoders}
     rebound = restored.bind(changed)
     fresh_objective = config.build(variables=changed)
     fresh = TextToImage.from_objective(fresh_objective, changed)
