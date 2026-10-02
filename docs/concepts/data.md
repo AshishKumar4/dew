@@ -148,7 +148,7 @@ print(data.records, data.steps_per_epoch)
 
 `caption_columns=()` reads a dataset without captions, for an unconditional or class-conditional run, and refuses a caption reader. A column the split does not hold is refused when the spec loads, with the columns it does hold. Without `val_split`, `val_batches` batches are held out of the head of the training split; `val_batches=None` with a `val_split` scores the whole named split.
 
-Validation reads each image through the deterministic resize, without the crop, flip and jitter training applies, so a metric scores the images a reference implementation would. `augment_validation=True` applies the training augmentation to validation too, with draws that repeat on every pass. A run record written before this field existed reads it as on, which is what those runs did.
+Validation reads each image through the deterministic resize, without the crop, flip and jitter training applies, so a metric scores the images a reference implementation would.
 
 ## Device image augmentation
 
@@ -197,9 +197,8 @@ local device. With several local devices, that device augments the whole
 local batch before the trainer redistributes the rows onto its mesh. This
 option does not shard augmentation across the local devices.
 
-Validation reads through the host's deterministic resize unless
-`augment_validation=True`, in which case it takes the training crop, flip and
-jitter on the same backend, with draws that repeat per record on every pass.
+Validation reads through the host's deterministic resize, whatever the
+training augmentation and backend.
 
 Given identical crop/flip/colour parameters, the JAX op is tested against the
 OpenCV bilinear host op in float64. On the RTX 4080 the largest absolute error

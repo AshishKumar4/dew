@@ -336,7 +336,7 @@ def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fi
         _hub_images(**fields).load(batch=4)
 
 
-def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
+def test_validation_is_scored_on_unaugmented_images(hub):
     """Training augments; a validation pass that crops, flips and jitters
     scores different images from the ones a reference metric reads."""
     def first_validation(**fields):
@@ -347,7 +347,9 @@ def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
 
     plain = first_validation(augmentation="none")
     np.testing.assert_array_equal(first_validation(augmentation="flip_jitter"), plain)
-    assert not np.array_equal(first_validation(augmentation="flip_jitter", augment_validation=True), plain)
+    np.testing.assert_array_equal(
+        first_validation(augmentation="flip_jitter", crop_scale=(0.5, 0.5), augmentation_size=SCALE * 2),
+        plain)
 
 
 def test_a_spec_that_holds_validation_out_of_training_says_how_many(hub):
