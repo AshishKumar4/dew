@@ -680,7 +680,8 @@ step = trainer.compile(state, batch)
 for _ in range(2):
     state, *_ = step(state, batch)
 leaves = jax.tree.leaves(jax.tree.map(lambda leaf: jax.random.key_data(leaf)
-                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf, state))
+                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                                      else leaf, state))
 np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 

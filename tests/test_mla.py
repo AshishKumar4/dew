@@ -121,7 +121,7 @@ def test_yarn_matches_the_reference_derivation():
                                rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(np.asarray(sin), tensors["sin"][0, ..., :half],
                                rtol=1e-5, atol=1e-6)
-    # (0.1 * ln(40) + 1) ** 2.
+    # The expected query scale is the square of 0.1 * ln(40) + 1.
     assert yarn_query_scale(yarn) == pytest.approx(
         (0.1 * math.log(40.0) + 1.0) ** 2, rel=1e-6)
 

@@ -3,7 +3,8 @@ with: a Rigel-shaped hybrid's forward, losses and gradients, AdamW steps over
 its muP parameter groups, and its learning-rate schedulers.
 
 The fixtures are float64 torch runs stored as float32
-(tools/lm_engine_reference.py). Dew runs here in float64, but the router's gate, the Mamba-2 scan internals and the
+(tools/lm_engine_reference.py). Dew runs here in float64, but the router's gate,
+the Mamba-2 scan internals and the
 head contract in float32 by design (`Router.logits`, `Mamba2`, `_logits`), so
 agreement is held to float32 resolution, a few ulps of 1.2e-7 relative to each
 tensor's largest entry, and not to float64's. Each feature under test moves

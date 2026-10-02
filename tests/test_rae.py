@@ -120,7 +120,8 @@ def test_decoder_gradients_match_the_source(variant):
             for layout in layouts if layout.name.startswith("vae/decoder.")}
     worst = max(gaps, key=gaps.get)
     print(
-        f"{config['encoder_type']}: latent gradient gap {code_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}"
+        f"{config['encoder_type']}: latent gradient gap {code_gap:.3g}; "
+        f"worst parameter {worst} {gaps[worst]:.3g}"
     )
     assert code_gap < GRADIENT
     assert gaps[worst] < GRADIENT, worst
