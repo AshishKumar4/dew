@@ -48,7 +48,7 @@ CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
       for model, layouts in sorted(CELLS_ON_FOUR.items()))])
 def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layouts, devices):
     tool = load("layout_parity")
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         rows = tool.run([model], layouts, dtype="float32", steps=1, anchor=True, mixture={},
                         objective={}, references=tool.References(), speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)

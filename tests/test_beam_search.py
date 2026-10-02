@@ -221,7 +221,7 @@ def test_a_renormalized_biased_search_matches_the_host_search(model):
                      strategy=Beam(width=3, length_penalty=penalty, early_stopping="never",
                                    stop_ids=1))
     expected = host_beam_shaped(module, params, PROMPT, 4, 3, (eos,), penalty, "never",
-                                entries, True)
+                                entries, renormalize=True)
     for row, (tokens, _, terminated, length) in enumerate(expected[:2]):
         assert int(found.lengths[row]) == length, (row, np.asarray(found.tokens)[row])
         np.testing.assert_array_equal(np.asarray(found.tokens)[row, 3:3 + length], tokens)

@@ -141,7 +141,7 @@ def float64():
     """float64 on the host's CPU device, which the test lanes keep beside an
     accelerator (conftest): a TPU compiles no float64 program ("While
     rewriting computation to not contain X64")."""
-    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         yield
 
 

@@ -2084,7 +2084,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     monitoring.register_event_listener(record)
     try:
         jax.config.update("jax_compilation_cache_dir", str(tmp_path))
-        jax.config.update("jax_enable_compilation_cache", True)
+        jax.config.update("jax_enable_compilation_cache", val=True)
         step = trainer.compile(state, batch)
         assert events, "the public compile must reach the compilation event listener"
         # Input placement is separate from executing the compiled transaction.

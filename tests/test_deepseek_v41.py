@@ -148,9 +148,9 @@ def test_the_quantizers_round_as_the_release_kernels():
     x[3, :32] = 0
     for jax_quant, torch_quant in (
             (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
-            (lambda v: fake_quant_fp4(v, 16, True),
+            (lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
              lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn)),
-            (lambda v: fake_quant_fp4(v, 32, False), lambda v: kernels.fp4_act_quant(v, 32, inplace=True))):
+            (lambda v: fake_quant_fp4(v, 32, e4m3_scale=False), lambda v: kernels.fp4_act_quant(v, 32, inplace=True))):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
         # under jit, where XLA GPU would delete a convert-pair rounding
         actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
@@ -186,7 +186,7 @@ def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, fo
 
 def test_the_quantizers_pass_their_gradient_straight_through():
     x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
-    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, True)):
+    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
         np.testing.assert_array_equal(jax.grad(lambda v, quant=quant: jnp.sum(quant(v) * v))(x),
                                       quant(x) + x)
 
@@ -197,7 +197,7 @@ def test_a_value_far_past_the_clamp_reads_back_as_what_it_rounds_to():
     that is the forward value in either dtype. `x + (rounded - x)` rounds
     the correction when x is far from what it rounds to: summed in bf16 it
     gives 2560 for 1e5, summed in fp32 3072 for 1e10."""
-    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, True))
+    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))
     for dtype in (jnp.bfloat16, jnp.float32):
         big = jnp.asarray([[lead] + [3.0] * 15 for lead in (1e5, 1e10)], dtype)
         expected = np.zeros(big.shape, np.float32)
@@ -541,6 +541,6 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
     hashed = [np.asarray(loaded.model.language_model.apply(
         language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
-        False, mask, method=lambda module, *inputs: module.engram_hashes(*inputs))) for mask in (media, None)]
+        decode=False, media=mask, method=loaded.model.language_model.engram_hashes)) for mask in (media, None)]
     after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
     assert np.any(hashed[0][:, after] != hashed[1][:, after])

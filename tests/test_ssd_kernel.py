@@ -66,11 +66,11 @@ def reference():
 def in_float64():
     """fp64 for one test, so both paths can be placed against an evaluation
     of the same scan that neither of them rounds."""
-    jax.config.update("jax_enable_x64", True)
+    jax.config.update("jax_enable_x64", val=True)
     try:
         yield
     finally:
-        jax.config.update("jax_enable_x64", False)
+        jax.config.update("jax_enable_x64", val=False)
 
 
 def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
@@ -480,7 +480,7 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size):
     # 4096-step scan of it did not finish in 20 minutes on a v6e. Only the
     # oracle runs with x64 on; the kernel and the XLA path compile as a
     # model compiles them.
-    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
         truth = jax.jit(stepwise_scan)(*exact)
         truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
@@ -509,7 +509,7 @@ def test_the_kernel_indexes_its_blocks_in_int32_under_x64(reference):
     the traced index maps, forward and backward, since only a TPU compiles
     Mosaic."""
     operands = scan_operands(reference, 128)
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         program = jax.make_jaxpr(jax.vjp(lambda *o: ssd_chunk_scan(*o, "tpu"), *operands)[1])(
             tuple(jnp.zeros_like(t) for t in ssd_chunk_scan(*operands, "tpu")))
         forward = jax.make_jaxpr(lambda *o: ssd_chunk_scan(*o, "tpu"))(*operands)

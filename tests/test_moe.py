@@ -527,7 +527,7 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
     bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
     group sizes. Exercise the routed experts, not just a hand-typed count.
     """
-    with jax.enable_x64(False):
+    with jax.enable_x64(new_val=False):
         experts, variables, x, weights, indices = routed_experts(top_k=2)
 
     def step(variables, x):

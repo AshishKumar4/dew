@@ -97,7 +97,7 @@ def test_unmask_reveals_the_schedules_share_with_the_models_token(rng):
     revealed = stepped != MASK
     share = (process.schedule.alpha(0.3) - process.schedule.alpha(0.8)) / (1 - process.schedule.alpha(0.8))
     assert abs(float(revealed.mean()) - float(share)) < 0.03
-    assert jnp.all(jnp.where(revealed, stepped == filled, True))
+    assert jnp.all(jnp.where(revealed, stepped == filled, y=True))
 
     same, _ = Unmask().step(x, t, t, filled, log_probs, (), rng, process, denoise)
     assert jnp.all(same == MASK)

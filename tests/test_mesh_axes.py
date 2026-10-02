@@ -721,16 +721,16 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
             out = jax.lax.with_sharding_constraint(out, outputs)
         return jnp.sum(out * cotangent)
 
-    alone = jax.grad(loss)(params, x, cotangent, False)
+    alone = jax.grad(loss)(params, x, cotangent, constrained=False)
     mesh = build_mesh(spec, jax.devices()[:4])
     with jax.set_mesh(mesh):
         split = jax.jit(jax.grad(loss), static_argnums=3)(
-            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, True)
+            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, constrained=True)
 
     # Each kernel entry's and bias entry's gradient sums one product per row
     # and output position, bounded as the taps' above.
     terms = shape[0] * shape[1] * shape[2]
-    magnitude = jax.grad(loss)(params, np.abs(x), np.abs(cotangent), False)
+    magnitude = jax.grad(loss)(params, np.abs(x), np.abs(cotangent), constrained=False)
     for got, want, size in zip(jax.tree.leaves(split), jax.tree.leaves(alone),
                                jax.tree.leaves(magnitude), strict=True):
         np.testing.assert_array_less(np.abs(got - want), terms * np.finfo(np.float32).eps * size)

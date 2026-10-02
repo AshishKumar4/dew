@@ -129,8 +129,8 @@ def test_a_source_processor_reads_bos_off_the_tokenizer_it_holds():
     over it does not fall back to EOS."""
     from dew.interop.pretrained import Processor
 
-    assert Processor(_byte_tokenizer(True), {}, {}, 256).bos_id == BOS
-    assert Processor(_byte_tokenizer(False), {}, {}, 256).bos_id is None
+    assert Processor(_byte_tokenizer(bos=True), {}, {}, 256).bos_id == BOS
+    assert Processor(_byte_tokenizer(bos=False), {}, {}, 256).bos_id is None
 
 
 def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_path):

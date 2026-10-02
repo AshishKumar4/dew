@@ -153,7 +153,7 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
     assert np.all(result.tokens[:, 4:] != 120)
     np.testing.assert_array_equal(result.lengths, 8)
     np.testing.assert_array_equal(result.decoder_steps, 5)
-    np.testing.assert_array_equal(result.terminated, False)
+    np.testing.assert_array_equal(result.terminated, desired=False)
     for row in range(3):
         tokens = jnp.concatenate([inputs.tokens[row:row + 1], jnp.full((1, 8), 120)], axis=1)
         valid = jnp.concatenate([inputs.token_fields["attention_mask"][row:row + 1], jnp.ones((1, 8), bool)], axis=1)

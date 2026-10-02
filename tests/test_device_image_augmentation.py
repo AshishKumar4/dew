@@ -55,7 +55,7 @@ def test_supplied_parameters_match_opencv_at_highest_precision(order, crop):
     from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 
     image = np.random.default_rng(7).integers(0, 256, (17, 21, 3)).astype(np.float64)
-    parameters = ImageParameters(np.asarray(crop), np.asarray(True),
+    parameters = ImageParameters(np.asarray(crop), np.ones((), dtype=bool),
                                  np.asarray([1.13, 0.97, 0.86]), np.asarray(order))
     # Observed on RTX 4080/OpenCV 5.0.0: maximum fp64 error 6.55e-6,
     # with identical rounded uint8 codes in all 18 cases.
@@ -97,7 +97,7 @@ def test_production_fp32_crop_and_colour_are_within_one_uint8_code():
     from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 
     image = np.random.default_rng(13).integers(0, 256, (160, 160, 3), dtype=np.uint8)
-    parameters = ImageParameters(np.asarray([5, 11, 143, 139]), np.asarray(True),
+    parameters = ImageParameters(np.asarray([5, 11, 143, 139]), np.ones((), dtype=bool),
                                  np.asarray([1.19, 1.05, 0.8]), np.asarray([2, 1, 0]))
     expected = apply_host(image.astype(np.float64), parameters, 128)
     actual = jax.jit(lambda x, p: apply_device(x, p, 128))(image, parameters)
@@ -113,7 +113,7 @@ def test_model_float64_mode_changes_no_data_draw():
     keys = np.random.default_rng(2).integers(0, 2**32, (4, 2), dtype=np.uint32)
     run = jax.jit(lambda images, raw: augment_batch(images, raw, size=12,
                   flip=True, jitter=True, crop_scale=(0.4, 0.9)))
-    with jax.enable_x64(False):
+    with jax.enable_x64(new_val=False):
         expected = run(image, keys)
     with jax.enable_x64():
         actual = run(image, keys)

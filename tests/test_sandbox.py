@@ -41,7 +41,7 @@ def wait_gone(pids, seconds=5.):
 
 def action(context, *tokens):
     return Action(tuple(context), tokens, (-.1,) * len(tokens), (0.,) * len(tokens),
-                  True, 0, SAMPLING)
+                  terminated=True, policy_step=0, sampling=SAMPLING)
 
 
 def test_worker_round_trip_and_process_group_cleanup():

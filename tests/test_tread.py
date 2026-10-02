@@ -67,7 +67,7 @@ def test_a_routed_forward_skips_each_span_on_the_drawn_tokens():
             assert kept.shape[1] == 16 - int(16 * {1: 0.5, 3: 0.25}[index])
             held, tokens = tokens, gather_tokens(tokens, kept)
             rotation = rotary_freqs(kept, 8, ROPE_THETA, dtype=jnp.float32)
-        tokens = block(tokens, condition, rotation, True)
+        tokens = block(tokens, condition, rotation, train=True)
         if index in (2, 3):
             tokens, rotation = scatter_tokens(held, kept, tokens), full
     np.testing.assert_array_equal(np.asarray(output), np.asarray(bound.output(tokens, order, 8, 8)))

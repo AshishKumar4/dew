@@ -467,7 +467,7 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     weights all perturbed, agrees exactly between the dispatches."""
     mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, False, False, None)
+        mesh, activation, skewed=False, scale_inputs=False, limit=None)
     rng = np.random.default_rng(523)
     dp = jax.device_put(jax.tree.map(
         lambda value: jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype), parameters), specs)
@@ -572,7 +572,7 @@ def test_rows_past_the_groups_stay_zero_where_the_ragged_dot_writes_them(monkeyp
     def project(x, kernel):
         if implementation == 'xla':
             return jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
-        return grouped_projection(x, kernel, sizes, jnp.bfloat16, False)
+        return grouped_projection(x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False)
 
     y, pullback = jax.vjp(project, x, kernel)
     dx, _ = pullback(jnp.ones_like(y))
@@ -594,7 +594,7 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
     sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
     projections = {
         "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
-        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, False),
+        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False),
     }
     for name, project in projections.items():
         def loss(x, kernel, project=project):

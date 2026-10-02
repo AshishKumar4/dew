@@ -550,10 +550,10 @@ def resumed_where_it_stopped(tmp_path: Path, run) -> None:
     exit code and output, SIGTERMed after the second step when `stop`."""
     steps, checkpoints = 8, tmp_path / "checkpoints"
     worker = ["--steps", str(steps), "--vary"]
-    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], False)
+    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], stop=False)
     assert code == 0, output
     code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints", str(checkpoints),
-                        "--step-seconds", "1"], True)
+                        "--step-seconds", "1"], stop=True)
     assert code == 128 + signal.SIGTERM, output
     assert "Terminating process" not in output and "Check failure" not in output, output
     stopped = re.search(r"Preempted at step (\d+)", output)
@@ -561,7 +561,7 @@ def resumed_where_it_stopped(tmp_path: Path, run) -> None:
     at = int(stopped[1])
     assert 2 <= at < steps, output
     code, output = run([*worker, "--out", str(tmp_path / "resumed.json"), "--checkpoints", str(checkpoints)],
-                       False)
+                       stop=False)
     assert code == 0, output
     whole, resumed = (json.loads((tmp_path / name).read_text()) for name in ("whole.json", "resumed.json"))
     # The state, the key and the data position all came back: every loss

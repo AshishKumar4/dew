@@ -1195,7 +1195,7 @@ def mode_training_contract(args) -> dict:
 
     checkpoints = Checkpoints(args.run_dir)
     def build():
-        return ShortScaleTrainer(Rows(True), optax.adamw(.03, weight_decay=.1),
+        return ShortScaleTrainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
                                  key=jax.random.PRNGKey(9), accumulation=2,
                                  dynamic_scale=True, checkpoints=checkpoints)
     trainer = build()

@@ -1260,7 +1260,7 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
     from jax.test_util import check_grads
 
     from dew.nn.mixers.attention import exclusive_self_attention
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         keys = jax.random.split(jax.random.key(0), 2)
         y = jax.random.normal(keys[0], (2, 5, 4, 8), jnp.float64)
         v = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64).at[1, 3, 1].set(0.0)

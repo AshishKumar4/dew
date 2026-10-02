@@ -281,7 +281,7 @@ def v4_read(tensors: dict[str, np.ndarray], name: str, fp4_experts: bool = True)
     (lambda: codecs.deepseek_v4(128, fp4_experts=True).names({"a.scale": E8M0_BYTE}), r"a\.scale .*a\.weight"),
     (lambda: v4_read({EXPERT: E4M3_PAIR, EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT),
      r"experts\.0\.w1\.weight .*int8 \[out, in / 2\].*got float8_e4m3fn \(2, 32\)"),
-    (lambda: v4_read({EXPERT: np.zeros((2, 16), np.int8), EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT, False),
+    (lambda: v4_read({EXPERT: np.zeros((2, 16), np.int8), EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT, fp4_experts=False),
      r"experts\.0\.w1\.weight .*float8_e4m3fn.*got int8 \(2, 16\)"),
     (lambda: v4_read({"l.wkv.weight": np.zeros((2, 32), ml_dtypes.bfloat16), "l.wkv.scale": E8M0_BYTE},
                      "l.wkv.weight"), r"l\.wkv\.weight .*got bfloat16 \(2, 32\)"),

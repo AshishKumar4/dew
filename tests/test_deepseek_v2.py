@@ -113,7 +113,7 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
                           method=type(model).hidden_states)
     expected = sum(
         deepseek_v2_aux_loss(sown["router"][layer]["mlp"]["gate"]["scores"][0],
-                             sown["router"][layer]["mlp"]["gate"]["indices"][0], 0.05, False)
+                             sown["router"][layer]["mlp"]["gate"]["indices"][0], 0.05, seq_aux=False)
         for layer in ("layers_0", "layers_1"))
     assert float(loss - base) == pytest.approx(float(expected), rel=1e-5)
     assert float(aux.metrics["aux_loss"]) == pytest.approx(float(expected), rel=1e-5)
