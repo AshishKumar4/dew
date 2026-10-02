@@ -13,6 +13,7 @@ from threading import Event
 import jax
 import jax.numpy as jnp
 import pytest
+from steady_state import guarded
 
 import dew
 from dew.telemetry.profile import active_profile
@@ -153,7 +154,7 @@ def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, n
     value = jnp.ones((64, 64), jnp.float32)
     compute(value).block_until_ready()
     observed.clear()
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(host_to_device="allow"):
         with dew.profile(tmp_path):
             pending = compute(value)
     assert pending.is_ready()

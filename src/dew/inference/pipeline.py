@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from etils import epath
 
@@ -197,7 +196,7 @@ class RunProcessor:
         rows = [text] if isinstance(text, str) else list(text)
         ids = [self.tokenizer.encode(row) for row in rows]
         tokens, fields = pad_token_rows(ids)
-        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
+        return ModelInputs(tokens, fields)
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         return [self.tokenizer.decode(row) for row in np.asarray(tokens)]

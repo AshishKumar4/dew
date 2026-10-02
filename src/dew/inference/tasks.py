@@ -31,7 +31,7 @@ from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
+from dew.nn.inputs import Media, ModelInputs, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -210,13 +210,13 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
     extra = width - inputs.tokens.shape[1]
     if extra < 1:
         return inputs
+    # On the host, where generation validates the rows before placing them.
     valid = inputs.token_fields.get("attention_mask")
-    if valid is None:
-        valid = jnp.ones(inputs.tokens.shape, bool)
+    valid = np.ones(inputs.tokens.shape, bool) if valid is None else local_rows(valid)
     left = ((0, 0), (extra, 0))
-    fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
-    return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
-                   token_fields={**fields, "attention_mask": jnp.pad(valid, left)})
+    fields = {name: np.pad(local_rows(value), left) for name, value in inputs.token_fields.items()}
+    return replace(inputs, tokens=np.pad(local_rows(inputs.tokens), left),
+                   token_fields={**fields, "attention_mask": np.pad(valid, left)})
 
 
 @functools.cache

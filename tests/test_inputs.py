@@ -6,6 +6,7 @@ copying resident inputs through the host.
 """
 
 import numpy as np
+from steady_state import guarded
 
 from dew.inputs import Field, pixel_field
 from dew.nn.vision import PIXEL_VALUES_KEY
@@ -28,7 +29,7 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     host_pixels = np.asarray(pixels)
     plan = RowPlan(build_mesh(MeshSpec()), 3, 8, 0, 1)
     key = jax.random.key(11)
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(host_to_device="allow"):
         local = local_rows(pixels, host=False)
         placed = plan.place(plan.pad({"pixels": local, "labels": np.arange(3)}))
         keys = plan.keys(key)
@@ -57,7 +58,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     mesh = build_mesh(MeshSpec())
     plan = RowPlan(mesh, 3, 8, 0, 1)
     key = jax.device_put(jax.random.key(11), NamedSharding(mesh, P()))
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(host_to_device="allow"):
         keys = plan.keys(key)
         jax.block_until_ready(keys)
     expected = jax.vmap(lambda row: jax.random.fold_in(jax.random.key(11), row))(jnp.arange(8))
@@ -82,7 +83,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     batch = {"text": ModelInputs(tokens, conditioning={"pixel_values": pixels}),
              "labels": labels, "weight": np.float32(0.5)}
     jax.block_until_ready(batch)
-    with jax.transfer_guard_device_to_host("disallow"):
+    with guarded(host_to_device="allow"):
         placed = shard_batch(mesh, batch)
         jax.block_until_ready(placed)
     np.testing.assert_array_equal(placed["text"].tokens, np.arange(rows * 4).reshape(rows, 4))

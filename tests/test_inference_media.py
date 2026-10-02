@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded
 from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
@@ -128,7 +129,7 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
     expected = task(host_inputs, 4, key=key).host()
     jax.block_until_ready(resident.conditioning)
     if family == "diffusion-gemma-workflow":
-        with jax.transfer_guard_device_to_host("disallow"):
+        with guarded(host_to_device="allow"):
             generated = task(resident, 4, key=key)
             jax.block_until_ready(generated.tokens)
     else:

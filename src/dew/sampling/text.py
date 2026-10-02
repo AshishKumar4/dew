@@ -571,15 +571,14 @@ def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarra
 def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
                n: int) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs whose validity
-    field is present only where a prompt is actually padded."""
+    """Host checks shared by every caller; returns the inputs, still where
+    they arrived, whose validity field is present only where a prompt is
+    actually padded. `RowPlan.place` moves them to the devices once."""
     valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
-    token_fields = {name: jnp.asarray(value) for name, value in fields.items()
-                    if name != "attention_mask"}
+    token_fields = {name: value for name, value in fields.items() if name != "attention_mask"}
     if not valid.all():
-        token_fields["attention_mask"] = jnp.asarray(valid.astype(bool))
-    prepared = ModelInputs(jnp.asarray(ids, jnp.int32), token_fields,
-                           {name: jnp.asarray(value) for name, value in conditioning.items()})
+        token_fields["attention_mask"] = valid.astype(bool)
+    prepared = ModelInputs(ids.astype(np.int32), token_fields, dict(conditioning))
     prepared.validate()
     return prepared
 
@@ -769,7 +768,7 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
     if plan.count == plan.rows:
         return padded
     existing = padded.token_fields.get("attention_mask")
-    valid = jnp.ones(padded.tokens.shape, bool) if existing is None else existing
+    valid = np.ones(padded.tokens.shape, bool) if existing is None else existing
     return replace(padded, token_fields={**padded.token_fields,
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
@@ -827,5 +826,6 @@ def generate(model: nn.Module, params: Variables,
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad_id, n,
                                                *components)
-    failure.throw()
+    # The error's flags are the one read a request waits on.
+    jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

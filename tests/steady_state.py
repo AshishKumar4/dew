@@ -85,17 +85,18 @@ def _guarded_buffer(array, flags):
 
 
 @contextlib.contextmanager
-def guarded() -> Iterator[None]:
+def guarded(host_to_device: str = "disallow") -> Iterator[None]:
     """Refuse every implicit host<->device transfer in the block, on any
     backend: `jax.transfer_guard("disallow")`, with CPU arrays' reads to
-    the host held to it too."""
+    the host held to it too. A request path whose own inputs are the point
+    of the transfer passes `host_to_device="allow"` and is held to reads."""
     global _guarding
     if _guarding == 0:
         jax_array.ArrayImpl._value = property(_guarded_value)
         jax_array.ArrayImpl.__buffer__ = _guarded_buffer
     _guarding += 1
     try:
-        with jax.transfer_guard("disallow"):
+        with jax.transfer_guard("disallow"), jax.transfer_guard_host_to_device(host_to_device):
             yield
     finally:
         _guarding -= 1
@@ -105,7 +106,7 @@ def guarded() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def steady_state(compiles: int = 0) -> Iterator[None]:
+def steady_state(compiles: int = 0, host_to_device: str = "disallow") -> Iterator[None]:
     """Run the block as a hot path's steady state: `guarded`, and tracing
     and compiling no program, or exactly `compiles` where the block brings a
     new shape bucket. Fails naming each program and where it was asked for."""
@@ -121,7 +122,7 @@ def steady_state(compiles: int = 0) -> Iterator[None]:
 
     jax.monitoring.register_event_duration_secs_listener(listen)
     try:
-        with guarded():
+        with guarded(host_to_device):
             yield
     finally:
         jax.monitoring.unregister_event_duration_listener(listen)
