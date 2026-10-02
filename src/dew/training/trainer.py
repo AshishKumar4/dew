@@ -65,7 +65,7 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, boolean, integers, json_value, record
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, xla_flag
+from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, gpu_free_bytes, xla_flag
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
@@ -365,24 +365,36 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
-    return min(placeable(m) - beside - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
+    return min(placeable(m, unclaimed(d, m)) - beside
+               - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
                for d, m in zip(devices, memory, strict=True))
 
 
-def placeable(memory: Mapping[str, int]) -> int:
+def unclaimed(device, memory: Mapping[str, int]) -> int | None:
+    """The bytes free on a GPU whose pool grows (`gpu_free_bytes`), the
+    most a new region of it can take; None for any other device."""
+    if device.platform != 'gpu' or memory.get('pool_bytes', memory['bytes_limit']) >= memory['bytes_limit']:
+        return None
+    return gpu_free_bytes(device.local_hardware_id)
+
+
+def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
     """The bytes one allocation can take from a device whose allocator
     reports `memory` (`Device.memory_stats`), the most a step's temporaries
     and every buffer beside them can need of one block.
 
     XLA's GPU pool, its BFC allocator, reports its size (pool_bytes) and its
     largest free block; a pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false)
-    can also take a new block from the part of its limit it has not taken.
-    cuda_async and a TPU's allocator report no pool, and their free bytes are
-    all there is to read."""
+    can also take a new block from the part of its limit it has not taken,
+    as far as the GPU has `unclaimed` bytes free. cuda_async and a TPU's
+    allocator report no pool, and their free bytes are all there is to read."""
     free = memory['bytes_limit'] - memory['bytes_in_use']
     if 'pool_bytes' not in memory:
         return free
-    return min(free, max(memory['largest_free_block_bytes'], memory['bytes_limit'] - memory['pool_bytes']))
+    growth = memory['bytes_limit'] - memory['pool_bytes']
+    if unclaimed is not None:
+        growth = min(growth, unclaimed)
+    return min(free, max(memory['largest_free_block_bytes'], growth))
 
 
 def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:

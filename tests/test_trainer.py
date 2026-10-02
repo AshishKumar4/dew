@@ -1759,7 +1759,7 @@ def device_memory(limit, in_use, largest=0, pool=None, platform="gpu"):
     stats = {"bytes_limit": int(limit), "bytes_in_use": int(in_use), "largest_free_block_bytes": int(largest)}
     if pool is not None:
         stats["pool_bytes"] = int(pool)
-    return SimpleNamespace(platform=platform, memory_stats=lambda: stats)
+    return SimpleNamespace(platform=platform, local_hardware_id=0, memory_stats=lambda: stats)
 
 
 def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
@@ -1789,7 +1789,10 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
     block to return to, and the next step needs a second block as large: the
     RTX 4080's 4096-token step, 6.5 GiB of temporaries with 10.45 GiB free in
     one block, failed so in 5 of 16 runs. With the partitioning off it fits."""
+    from dew.training import trainer as module
     from dew.training.trainer import step_headroom
+
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
     limit = 13.24 * GiB
     pool = device_memory(limit, 2.79 * GiB, largest=10.45 * GiB, pool=limit)
@@ -1806,12 +1809,31 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
 def test_a_growing_pool_places_temporaries_in_a_region_it_has_yet_to_take(monkeypatch):
     """A pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) takes a new
     region for an allocation its free blocks cannot hold, up to its limit."""
+    from dew.training import trainer as module
     from dew.training.trainer import step_headroom
+
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
     monkeypatch.setenv("XLA_FLAGS", "")
     growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
     assert step_headroom(planned_step(10 * GiB), [growing]) > 0
     assert step_headroom(planned_step(13.5 * GiB), [growing]) < 0
+
+
+def test_a_growing_pool_takes_no_more_of_its_limit_than_the_gpu_has_free(monkeypatch):
+    """A pool that grows takes a new region from the GPU, which another
+    process may already hold: past what the driver reports free, its limit
+    is a number, not memory."""
+    from dew.training import trainer as module
+    from dew.training.trainer import step_headroom
+
+    monkeypatch.setenv("XLA_FLAGS", "")
+    growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: 6 * GiB)
+    assert step_headroom(planned_step(5 * GiB), [growing]) > 0
+    assert step_headroom(planned_step(10 * GiB), [growing]) < 0
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
+    assert step_headroom(planned_step(10 * GiB), [growing]) > 0
 
 
 def test_an_allocator_without_a_pool_is_read_by_its_free_bytes(monkeypatch):
