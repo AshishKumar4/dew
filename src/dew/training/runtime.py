@@ -109,6 +109,7 @@ def prepare_process(wandb: Wandb | None = None,
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
     unpartition_gpu_pool()
+    keep_roundings()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 
@@ -198,6 +199,26 @@ def unpartition_gpu_pool() -> None:
     tiled head 95.5 and 95.6 ms on, 95.5 and 95.5 ms off."""
     if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
+
+
+def keep_roundings() -> None:
+    """Keep every rounding to a narrow dtype the program states, unless the
+    run named `--xla_allow_excess_precision`.
+
+    XLA's default lets a fusion carry an op's result wider than its dtype,
+    skipping the rounding: a bf16 residual sum fused into the RMSNorm that
+    reads it was normalized unrounded, and 23% of that norm's bf16 outputs
+    differed from the norm of the stored sum, on CPU and on an RTX 4080.
+    What fuses depends on the layout, so one device and four computed
+    different bf16 forwards of the same model and batch; with every rounding
+    kept they are bitwise the same (a 4-layer decoder and its 8-expert MoE
+    twin on 8 simulated CPU devices: hidden states, log partitions, losses,
+    routes). It also costs nothing: on the RTX 4080 a Qwen3-0.6B-width
+    decoder step went from 110.5 to 109.6 ms, the 176M hybrid DiT from 69.6
+    to 66.6 ms and its peak from 5.79 to 5.44 GiB, SimpleDiT-B from 76.0 to
+    73.0 ms (jax 0.11.2)."""
+    if xla_flag("xla_allow_excess_precision") is None:
+        apply_xla_flags("--xla_allow_excess_precision=false")
 
 
 def _pool_keys_alike() -> bool:

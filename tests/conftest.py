@@ -38,6 +38,10 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     environ.setdefault("JAX_PLATFORMS", "cpu")
     platforms = environ["JAX_PLATFORMS"].split(",")
     flags = [environ.get("XLA_FLAGS", "")]
+    if "--xla_allow_excess_precision" not in flags[0]:
+        # Every rounding the program states, as a run keeps them
+        # (`dew.training.runtime.keep_roundings`).
+        flags.append("--xla_allow_excess_precision=false")
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
