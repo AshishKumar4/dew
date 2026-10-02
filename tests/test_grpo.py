@@ -21,7 +21,7 @@ import pytest
 from flax import linen as nn
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.rollout import SampledRollout
 from dew.objectives.rl.sessions import (
@@ -196,7 +196,7 @@ def test_the_loss_reads_the_rolled_out_batch():
     batch = rollout_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     ids = np.asarray(batch[IDS_KEY])
     start = PROMPT_WIDTH - 1
@@ -220,7 +220,7 @@ def test_zero_beta_leaves_the_reference_unread():
     batch = rollout_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     assert np.isfinite(float(loss))
     assert "kl" not in aux.metrics
@@ -232,7 +232,7 @@ def test_a_positive_beta_needs_the_frozen_tree():
     params = objective.init(jax.random.key(0))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     with pytest.raises(ValueError, match="step.ema"):
-        scalar_loss(objective, params, rollout_batch(), step)
+        objective.scalar_loss(params, rollout_batch(), step)
 
 
 def test_a_misbuilt_objective_is_refused():
@@ -253,11 +253,11 @@ def test_a_misshapen_batch_is_refused():
 
     narrow = {key: value[:, :5] for key, value in batch.items()}
     with pytest.raises(ValueError, match="8 ids per row"):
-        scalar_loss(objective, params, narrow, step)
+        objective.scalar_loss(params, narrow, step)
 
     ragged = dict(batch, **{ADVANTAGES_KEY: jnp.zeros((ROWS, 2), jnp.float32)})
     with pytest.raises(ValueError, match="shape"):
-        scalar_loss(objective, params, ragged, step)
+        objective.scalar_loss(params, ragged, step)
 
 
 def test_evaluation_scores_prompt_perplexity():
@@ -306,7 +306,7 @@ def test_the_rollout_batch_feeds_the_objective():
     rolled = rollout(state, batch, jax.random.key(1))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
 
-    loss, aux = scalar_loss(objective, params, rolled, step)
+    loss, aux = objective.scalar_loss(params, rolled, step)
 
     assert np.isfinite(float(loss))
     assert rolled[IDS_KEY].shape == (4, width + RESPONSE_WIDTH)

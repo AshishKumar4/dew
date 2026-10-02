@@ -32,7 +32,6 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
 from dew.sampling import Sampling, sample
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import build_mesh
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -203,7 +202,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
 def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     variables = jax.device_put(source.variables, Layout().shardings(mesh, source.variables))
     expected = task(inputs, 8, key=7, steps=5, n=2).host()
     placed = task.bind(variables)(inputs, 8, key=7, steps=5, n=2)

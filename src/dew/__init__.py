@@ -25,7 +25,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.sampling import CFG, sample
-    from dew.telemetry.profile import profile
+    from dew.telemetry.profile import Profiler
     from dew.training import (
         Best,
         Checkpoints,
@@ -43,7 +43,6 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
         Trainer,
         TrainState,
         WandbTracker,
-        evaluate,
     )
 
 __version__ = "0.1.0"
@@ -55,7 +54,7 @@ _EXPORTS = {
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
     "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
-    "Evaluation": "dew.training", "evaluate": "dew.training",
+    "Evaluation": "dew.training",
     "ProfileWindow": "dew.training",
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
@@ -64,7 +63,7 @@ _EXPORTS = {
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
     "pipeline": "dew.inference",
-    "profile": "dew.telemetry.profile",
+    "Profiler": "dew.telemetry.profile",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -107,6 +106,7 @@ __all__ = [
     "Plateau",
     "Process",
     "ProfileWindow",
+    "Profiler",
     "Representations",
     "Step",
     "TensorBoardTracker",
@@ -119,8 +119,6 @@ __all__ = [
     "VideoGrid",
     "WandbTracker",
     "__version__",
-    "evaluate",
     "pipeline",
-    "profile",
     "sample",
 ]

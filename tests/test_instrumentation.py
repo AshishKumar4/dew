@@ -646,7 +646,7 @@ def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
 def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
     """With no scheduled window an explicit capture sees every step."""
     _capture_env(monkeypatch)
-    with dew.profile(tmp_path / "outer"):
+    with dew.Profiler(tmp_path / "outer"):
         make_trainer().fit(Data(batches), steps=3, log_every=1)
 
     assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"
@@ -655,8 +655,8 @@ def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
 def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch):
     """Both must refuse before training: neither trace is dropped silently."""
     _capture_env(monkeypatch)
-    with dew.profile(tmp_path / "outer"):
-        with pytest.raises(ValueError, match="dew.profile capture is active"):
+    with dew.Profiler(tmp_path / "outer"):
+        with pytest.raises(ValueError, match="dew.Profiler capture is active"):
             make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
                 Data(batches), steps=2)
 
@@ -666,7 +666,7 @@ def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):
     the tracer is only leased while it is running, so the steps after the stop
     allocate no scopes and the fit finishes unharmed."""
     _capture_env(monkeypatch)
-    outer = dew.profile(tmp_path / "outer")
+    outer = dew.Profiler(tmp_path / "outer")
     outer.start()
     try:
         scopes = []
@@ -741,7 +741,7 @@ def test_the_next_outer_capture_still_works(tmp_path, monkeypatch):
     """The two tests above exercise stopped and failed captures; a fresh
     context capture afterwards proves neither leaked the process-wide owner."""
     _capture_env(monkeypatch)
-    with dew.profile(tmp_path / "outer"):
+    with dew.Profiler(tmp_path / "outer"):
         make_trainer().fit(Data(batches), steps=2, log_every=1)
 
     assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"

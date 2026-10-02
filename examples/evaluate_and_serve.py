@@ -45,7 +45,7 @@ from dew.eval import clip_score, fid
 from dew.inference import TextGeneration, TextToImage
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
 from dew.sampling import Sampling
-from dew.training import evaluate
+from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -126,7 +126,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
 def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
     """The run's loss over a held-out split, through the evaluation contract.
 
-    `evaluate` is what the trainer calls at a validation step, minus the
+    `Evaluation.run` is what the trainer calls at a validation step, minus the
     optimizer and the tracker: the same objective, the same metric, one
     finite pass, and scalars every rank agrees on.
     """
@@ -136,7 +136,7 @@ def perplexity(task: TextGeneration, config: Config) -> dict[str, float]:
                         loading=Loading(workers=0)).load(batch=config.batch_size)
     if data.val is None:
         raise ValueError(f"{config.tokens} holds no val split to score")
-    scored = evaluate(LMObjective(task.model, config.sequence_length),
+    scored = Evaluation.run(LMObjective(task.model, config.sequence_length),
                       task.variables, data.val, key=jax.random.key(0),
                       metrics=[Perplexity()])
     return dict(scored.scores)

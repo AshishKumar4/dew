@@ -19,8 +19,6 @@ import numpy as np
 import optax
 import pytest
 
-from dew.objectives.base import scalar_loss
-
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 from flax import linen as nn
@@ -156,7 +154,7 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     batch = token_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     expected = reference_cross_entropy(logits, tokens[:, 1:])
@@ -174,7 +172,7 @@ def test_padded_targets_are_left_out_of_the_average():
     tokens = np.asarray(batch[TEXT_KEY])
     assert (tokens[:, 1:] == pad_id).any(), "this batch has no padding to skip"
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     masked = reference_cross_entropy(logits, tokens[:, 1:], pad_id=pad_id)
@@ -188,7 +186,7 @@ def test_a_batch_of_only_padding_does_not_divide_by_zero():
     params = objective.init(jax.random.key(0))
     batch = {TEXT_KEY: jnp.full((2, SEQ + 1), 5, jnp.int32)}
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
 
 
@@ -197,7 +195,7 @@ def test_aux_reports_perplexity_and_token_accuracy():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
 
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
@@ -216,7 +214,7 @@ def test_a_batch_with_no_room_for_the_shift_is_rejected():
     batch = {TEXT_KEY: jnp.zeros((2, SEQ), jnp.int32)}
 
     with pytest.raises(ValueError, match=f"{SEQ + 1} ids per row"):
-        scalar_loss(objective, params, batch, step_at())
+        objective.scalar_loss(params, batch, step_at())
 
 
 def test_dropout_runs_on_the_step_key():
@@ -226,9 +224,9 @@ def test_dropout_runs_on_the_step_key():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    first, _ = scalar_loss(objective, params, batch, step_at(key=1))
-    again, _ = scalar_loss(objective, params, batch, step_at(key=1))
-    other, _ = scalar_loss(objective, params, batch, step_at(key=2))
+    first, _ = objective.scalar_loss(params, batch, step_at(key=1))
+    again, _ = objective.scalar_loss(params, batch, step_at(key=1))
+    other, _ = objective.scalar_loss(params, batch, step_at(key=2))
 
     assert float(first) == pytest.approx(float(again))
     assert float(first) != pytest.approx(float(other))
@@ -246,7 +244,7 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     params = objective.init(jax.random.key(0))
     inputs = token_batch()[TEXT_KEY][:, :-1]
     hidden = objective.model.apply(params, inputs, method=Bf16LM.hidden_states)
-    loss, aux = scalar_loss(objective, params, token_batch(), step_at())
+    loss, aux = objective.scalar_loss(params, token_batch(), step_at())
 
     assert hidden.dtype == jnp.bfloat16
     assert objective.model.apply(params, inputs).dtype == jnp.float32
@@ -262,7 +260,7 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
     assert (targets == 0).any(), "this batch has no padding to skip"
 
-    _, aux = scalar_loss(objective, params, batch, step_at())
+    _, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
     kept = targets != 0
@@ -341,7 +339,7 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     """
     trainer = make_trainer(tmp_path, fsdp=fsdp)
     batch = next(cycle_batches(seed=7))
-    scored = jax.jit(lambda params: scalar_loss(trainer.objective, params, batch, step_at())[0])
+    scored = jax.jit(lambda params: trainer.objective.scalar_loss(params, batch, step_at())[0])
     before = float(scored(trainer.initial_state().params))
 
     state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
@@ -670,8 +668,8 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
              "text_positions": positions}
 
-    packed, _ = scalar_loss(objective, params, batch, step_at())
-    unpacked, _ = scalar_loss(objective, params, {TEXT_KEY: tokens}, step_at())
+    packed, _ = objective.scalar_loss(params, batch, step_at())
+    unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
 
     losses, weights = objective.token_scores(
         params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
@@ -703,7 +701,7 @@ def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": segment_ids}
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
     scores = objective.evaluate(params, batch, step_at())
     assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
@@ -729,7 +727,7 @@ def test_loss_role_counts_only_assistant_targets():
     batch = assistant_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, aux = scalar_loss(objective, params, batch, step_at())
+    loss, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     kept = np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT
@@ -748,7 +746,7 @@ def test_loss_role_without_the_roles_column_raises():
     params = objective.init(jax.random.key(0))
 
     with pytest.raises(ValueError, match="text_roles"):
-        scalar_loss(objective, params, token_batch(), step_at())
+        objective.scalar_loss(params, token_batch(), step_at())
 
 
 def test_a_roles_column_is_ignored_without_loss_role():
@@ -758,7 +756,7 @@ def test_a_roles_column_is_ignored_without_loss_role():
     params = objective.init(jax.random.key(0))
     batch = assistant_batch()
 
-    loss, _ = scalar_loss(objective, params, batch, step_at())
+    loss, _ = objective.scalar_loss(params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
@@ -774,7 +772,7 @@ def test_a_misaligned_roles_column_is_refused():
     batch[ROLES_KEY] = jnp.zeros((batch[TEXT_KEY].shape[0], SEQ), jnp.int8)
 
     with pytest.raises(ValueError, match="one per token"):
-        scalar_loss(objective, params, batch, step_at())
+        objective.scalar_loss(params, batch, step_at())
 
 
 def test_evaluation_weights_follow_loss_role():
@@ -809,8 +807,8 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     weights = (tokens[:, 1:] != pad_id).astype(np.float64)
     expected, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
 
-    loss, aux = scalar_loss(make_objective(pad_id=pad_id, z_loss=coefficient), params, batch, step_at())
-    without, plain_aux = scalar_loss(plain, params, batch, step_at())
+    loss, aux = make_objective(pad_id=pad_id, z_loss=coefficient).scalar_loss(params, batch, step_at())
+    without, plain_aux = plain.scalar_loss(params, batch, step_at())
 
     assert float(loss) == pytest.approx(expected, abs=1e-6)
     assert float(aux.metrics["z_loss"]) == pytest.approx(z_term, abs=1e-6)
@@ -836,7 +834,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
     _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:],
                                        np.ones(tokens[:, 1:].shape), coefficient)
     expected, = pullback(jnp.asarray(cotangent, jnp.float32))
-    actual = jax.grad(lambda p: scalar_loss(objective, {"params": p}, batch, step_at())[0])(params["params"])
+    actual = jax.grad(lambda p: objective.scalar_loss({"params": p}, batch, step_at())[0])(params["params"])
 
     for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
         scale = max(float(jnp.abs(want).max()), 1.0)

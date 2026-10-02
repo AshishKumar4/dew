@@ -187,12 +187,9 @@ For int8 quantization-aware training, install the `quantization` extra
 (`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
 
 ```python
-from dew.training.quantization import Quantization, apply_quantization
+from dew.training import Quantization
 
-model = apply_quantization(
-    model,
-    Quantization(dtype="int8", patterns=(".*dit_block_.*",)),
-)
+model = Quantization(dtype="int8", patterns=(".*dit_block_.*",)).apply(model)
 ```
 
 This selects the DiT transformer blocks for int8 quantization and leaves the
@@ -815,7 +812,7 @@ uses that path with `--attention-impl xla`.
 
 ### Standalone evaluation and local reports
 
-`evaluate` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
+`Evaluation.run` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
 
 ```python
 import itertools
@@ -824,7 +821,7 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, LocalTracker, Trainer, evaluate
+from dew import Dataset, Evaluation, LocalTracker, Trainer
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
@@ -857,7 +854,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
         key=jax.random.key(0),
         tracker=tracker,
     ).fit(data, steps=40, log_every=10)
-    result = evaluate(
+    result = Evaluation.run(
         objective,
         state.params,
         data.val,
@@ -894,12 +891,12 @@ Install `dewml[profile]`, or use `uv pip install -e '.[profile]'` from this chec
 ```python
 import dew
 
-with dew.profile("profiles/run"):
+with dew.Profiler("profiles/run"):
     state = trainer.fit(data, steps=1000)
 ```
 
 ```python
-prof = dew.profile("profiles/run")
+prof = dew.Profiler("profiles/run")
 prof.start()
 try:
     state = trainer.fit(data, steps=1000)
@@ -909,16 +906,16 @@ finally:
 
 Each capture gets a new directory, so restarting a profiler keeps earlier results. Without a path, the first start creates a persistent temporary directory, available as `prof.directory`. A capture keeps the native XPlane traces, the available HLO files, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's own viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
 
-A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `profile` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
+A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `Profiler` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
 
-To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.profile`, not both.
+To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.Profiler`, not both.
 
 ### Sweeping a hyperparameter
 
 `sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
 
 ```python
-from dew import LocalTracker, evaluate
+from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import grid_search, sweep
 from dew.data import TokenWindows
@@ -938,8 +935,8 @@ config = RunConfig(
 def trial(run: RunConfig) -> float:
     """Train one point and score it: the perplexity its own run ends on."""
     state = run.train(objective, data, name=run.trainer.name or "lm-rate")
-    return float(evaluate(objective, state.params, data.val, metrics=(Perplexity(),),
-                          key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
+    return float(Evaluation.run(objective, state.params, data.val, metrics=(Perplexity(),),
+                                key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:

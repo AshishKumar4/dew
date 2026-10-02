@@ -15,7 +15,6 @@ import optax
 import pytest
 
 from dew.data import DataPartition, Loading
-from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -28,7 +27,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.sharding import DECLARED, logical_axes
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
 from dew.training.optim import OPTIMIZER_MAP
 
@@ -150,7 +149,7 @@ def reference_losses(trainer, steps):
     def step(params, opt_state, batch, key):
         def loss_fn(trainable):
             from dew.objectives.base import Step
-            return scalar_loss(objective, {**params, "params": trainable}, batch,
+            return objective.scalar_loss({**params, "params": trainable}, batch,
                                   Step(step=jnp.zeros((), jnp.int32), key=key, ema=None))
 
         (loss, _), grads = jax.value_and_grad(loss_fn, has_aux=True)(params["params"])
@@ -191,7 +190,7 @@ def test_parameter_spec_falls_back_to_replication_when_indivisible():
 def declared_specs(variables, rules):
     """Parameter specs on a two-way fsdp mesh under one rule table."""
     shardings = Layout(rules=rules, min_shard=1).shardings(
-        build_mesh(MeshSpec(fsdp=2)), variables)
+        MeshSpec(fsdp=2).build(), variables)
     return jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
 
@@ -274,7 +273,7 @@ def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
     variables = {"params": {"q_proj": {
         "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
     with pytest.raises(ValueError, match="q_proj"):
-        Layout(min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)), variables)
+        Layout(min_shard=1).shardings(MeshSpec(fsdp=2).build(), variables)
 
 
 def test_a_declaration_that_names_one_axis_twice_is_refused_where_it_is_written():
@@ -303,7 +302,7 @@ def test_default_rules_keep_the_shape_heuristic_for_the_dit():
     DiT's shapes, so declaring the model moved none of its leaves."""
     variables = dit_variables()
     shardings = Layout(rules=DEFAULT_RULES, min_shard=1).shardings(
-        build_mesh(MeshSpec(fsdp=2)), variables)
+        MeshSpec(fsdp=2).build(), variables)
     expected = jax.tree.map(
         lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1), variables)
     assert jax.tree.map(lambda sharding: sharding.spec, shardings) == expected
@@ -313,7 +312,7 @@ def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
     """Every mesh has the tensor axis; at size 1 a rule onto it is dropped
     from the spec and the width falls to the next axis the rule names."""
     shardings = Layout(rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"},
-                       min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)),
+                       min_shard=1).shardings(MeshSpec(fsdp=2).build(),
                                               dit_variables())["params"]
 
     assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
@@ -330,7 +329,7 @@ def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused():
         Layout(rules={"embed": "fspd"})
     with pytest.raises(ValueError, match=r"the rules place params/.* on \['data'\]"):
         Layout(rules={"mlp": "data"}, min_shard=1).shardings(
-            build_mesh(MeshSpec(fsdp=2)), dit_variables())
+            MeshSpec(fsdp=2).build(), dit_variables())
 
 
 class IndivisibleModel(nn.Module):
@@ -398,7 +397,7 @@ def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
         num_kv_heads=1, mlp_features=128, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY)
     shardings = layout.shardings(mesh, variables)
 
@@ -406,13 +405,13 @@ def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
     layout.check(variables["params"], shardings["params"], mesh)
 
 
-def test_build_mesh_rejects_bad_fsdp_size():
+def test_mesh_build_rejects_bad_fsdp_size():
     with pytest.raises(ValueError):
-        build_mesh(MeshSpec(fsdp=3))
+        MeshSpec(fsdp=3).build()
 
 
-def test_build_mesh_axes():
-    mesh = build_mesh(MeshSpec(fsdp=2))
+def test_mesh_build_axes():
+    mesh = MeshSpec(fsdp=2).build()
     assert mesh.shape['data'] == jax.device_count() // 2
     assert mesh.shape['fsdp'] == 2
 
@@ -422,7 +421,7 @@ def test_build_mesh_axes():
 # --------------------------------------------------------------------------
 
 def test_shard_batch_splits_across_all_devices():
-    mesh = build_mesh(MeshSpec(fsdp=2))
+    mesh = MeshSpec(fsdp=2).build()
     batch = {"image": np.zeros((jax.device_count(), 4), np.float32)}
     sharded = shard_batch(mesh, batch)["image"]
     assert len(sharded.addressable_shards) == jax.device_count()
@@ -430,7 +429,7 @@ def test_shard_batch_splits_across_all_devices():
 
 
 def test_prefetch_iterator_preserves_order_and_terminates():
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     source = ({"x": np.full((jax.device_count(), 2), i, np.float32)} for i in range(5))
     with DevicePrefetchIterator(source, mesh, depth=2) as it:
         seen = [float(np.asarray(b["x"])[0, 0]) for b in it]
@@ -440,7 +439,7 @@ def test_prefetch_iterator_preserves_order_and_terminates():
 
 
 def test_prefetch_iterator_surfaces_source_errors():
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
 
     def broken():
         yield {"x": np.zeros((jax.device_count(), 2), np.float32)}
@@ -463,7 +462,7 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
         operations=[pygrain.Batch(jax.device_count(), drop_remainder=True)],
         worker_count=0,
     )
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     with DevicePrefetchIterator(iter(loader), mesh, depth=2) as it:
         next(it)
         next(it)
@@ -490,7 +489,7 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
                         packing_bins=2).load(batch=jax.device_count())
 
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2) as it:
         next(it)
         state = it.source_state
@@ -790,7 +789,7 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is not None, "iterator position was never captured"
 
-    mesh = build_mesh()
+    mesh = MeshSpec().build()
     with DevicePrefetchIterator(grain_image_loader(), mesh,
                                 source_state=position) as resumed:
         with DevicePrefetchIterator(grain_image_loader(), mesh) as fresh:
@@ -877,7 +876,7 @@ def muon_state_specs(variables, rules):
     solver = OPTIMIZER_MAP["muon"](1e-3)
     opt_state = jax.eval_shape(solver.init, variables)
     shardings = Layout(rules=rules, min_shard=1).shardings(
-        build_mesh(MeshSpec(fsdp=2)), (variables, opt_state))
+        MeshSpec(fsdp=2).build(), (variables, opt_state))
     return jax.tree.map(lambda sharding: sharding.spec, shardings)
 
 
@@ -976,7 +975,7 @@ def test_a_single_head_model_shards_a_dimension_it_can_split(fsdp_size):
     heads, where a spec naming the heads axis happens to work.
     """
     variables = single_head_variables()
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY)
     shardings = layout.shardings(mesh, variables)
     attention = shardings["params"]["dit_block_0"]["attention"]
@@ -1008,7 +1007,7 @@ def test_a_one_dimensional_parameter_shards_on_its_only_axis(fsdp_size):
     """
     variables = jax.eval_shape(
         OneLongVector().init, jax.random.key(0), jnp.ones((1, 4)))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY)
     shardings = layout.shardings(mesh, variables)
 
@@ -1032,7 +1031,7 @@ def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it
         mlp_features=124, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY)
     shardings = layout.shardings(mesh, variables)
 

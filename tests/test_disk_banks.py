@@ -14,15 +14,14 @@ from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop.safetensors_io import read_weights, save_sharded
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
-from dew.training import Layout
-from dew.training.distributed import build_mesh
+from dew.training import Layout, MeshSpec
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "mixtral-tiny"
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 
 
 def single_mesh():
-    return build_mesh(devices=[jax.devices()[0]])
+    return MeshSpec().build([jax.devices()[0]])
 
 
 def decoder(config, bank_layers):

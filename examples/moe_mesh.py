@@ -41,14 +41,14 @@ import tyro
 from jax.sharding import NamedSharding
 
 from dew import Layout, MeshSpec, Trainer
-from dew.data import ByteTokenizer, Loading, TokenWindows
+from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.nn.sharding import RESIDUAL, logical_spec
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
-from dew.training.distributed import DevicePrefetchIterator, batch_shardings, data_partition
+from dew.training.distributed import DevicePrefetchIterator, batch_shardings
 
 
 @dataclass
@@ -239,7 +239,7 @@ def main(config: Config) -> None:
     selections = jax.jit(lambda params, tokens: model.apply(params, tokens, mutable=["router"])[1]["router"])
 
     steps, frames = [], []
-    with DevicePrefetchIterator(data.train(data_partition(mesh)), mesh) as source:
+    with DevicePrefetchIterator(data.train(DataPartition.of(mesh)), mesh) as source:
         batch = next(source)
         step = trainer.compile(state, batch)
         operations, groups = all_to_all_ops(trainer.executable.as_text())

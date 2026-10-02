@@ -29,7 +29,7 @@ from dew.nn.attention import (
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu' or not bf16_dot_runs(),
                             reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
@@ -419,7 +419,7 @@ def test_auto_stays_on_xla_where_the_mesh_splits_the_sequence(tpu_backend):
     takes those calls (tests/test_sequence_parallel.py)."""
     query, key, _ = qkv((8, 512, 8, 128))
     assert tpu_runs(query, key)
-    with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, sequence=2))):
+    with jax.set_mesh(MeshSpec(fsdp=4, sequence=2).build()):
         assert not tpu_runs(query, key)
 
 
