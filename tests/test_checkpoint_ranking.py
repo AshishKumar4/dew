@@ -28,7 +28,8 @@ class Overfit(Objective):
 
     def evaluate(self, params, batch, step):
         weight = params['params']['w']
-        return TokenScores(jnp.broadcast_to(weight, (4, 1)), jnp.ones((4, 1)))
+        return TokenScores(jnp.broadcast_to(weight, (4, 1)), jnp.ones((4, 1)),
+                           correct=jnp.zeros((4, 1), dtype=bool))
 
 
 @dataclasses.dataclass
