@@ -800,7 +800,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation='auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None,
-                                 key_value_seq_lengths=None):
+                                 key_value_seq_lengths=None, dropout_rate=0.0,
+                                 dropout_rng=None, deterministic=True):
     """Attend over [B, S, H, D] queries, keys and values.
 
     Picks the kernel `implementation` names and returns [B, S, H, Dv]. The
@@ -838,7 +839,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     lengths instead.
 
     Under a mesh whose sequence axis is above one, the call runs through
-    `sequence_parallel_attention`.
+    `sequence_parallel_attention`. Active probability dropout uses Flax's
+    reference attention, independently per row, head and query. Explicit
+    fused kernels and sequence parallelism are refused for that draw.
 
     The result leaves here under the checkpoint name 'attention_output', so
     a remat policy can save it instead of replaying the kernel in the
@@ -846,6 +849,14 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     jax.checkpoint.
     """
     shards = sequence_shards()
+    if not 0 <= dropout_rate < 1:
+        raise ValueError(f"dropout_rate must be within [0, 1), got {dropout_rate}")
+    if dropout_rate and not deterministic:
+        out = _dropout_attention(
+            query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
+            causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
+            key_value_seq_lengths, dropout_rate, dropout_rng, shards)
+        return checkpoint_name(out, 'attention_output')
     if shards > 1 and segment_ids is not None:
         # The exchanges split an explicit mask along the sequence and have no
         # split for the ids, so the documents travel as the mask they stand
@@ -870,6 +881,33 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
                      key_value_seq_lengths=key_value_seq_lengths)
     return checkpoint_name(out, 'attention_output')
+
+
+def _dropout_attention(query, key, value, dtype, precision, force_fp32_for_softmax, implementation,
+                       causal, sliding_window, mask, bias, sinks, softcap, segment_ids,
+                       key_value_seq_lengths, dropout_rate, dropout_rng, shards):
+    """Apply one reference probability draw, retaining visibility and projection precision."""
+    if implementation not in ('auto', 'reference', 'xla'):
+        raise ValueError(f"{implementation} attention cannot apply probability dropout; use reference or auto")
+    if shards > 1:
+        raise ValueError("attention probability dropout requires sequence_shards=1")
+    if sinks is not None or softcap is not None:
+        raise ValueError("attention probability dropout does not support sinks or softcap")
+    if dropout_rng is None:
+        raise ValueError("training attention dropout requires dropout_rng")
+    mask = combined_attention_mask(
+        query.shape[-3], key.shape[-3], causal, sliding_window,
+        mask if segment_ids is None else with_documents(mask, segment_ids))
+    if key_value_seq_lengths is not None:
+        mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
+    return nn.dot_product_attention(
+        query, repeat_kv_heads(key, query.shape[-2]), repeat_kv_heads(value, query.shape[-2]),
+        bias=bias, mask=mask, dtype=dtype, dropout_rate=dropout_rate,
+        dropout_rng=dropout_rng, broadcast_dropout=False, deterministic=False,
+        force_fp32_for_softmax=(force_fp32_for_softmax
+                                and at_least_fp32(dtype or query.dtype) == jnp.float32),
+        qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
+        attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
 
 
 def with_documents(mask, segment_ids):

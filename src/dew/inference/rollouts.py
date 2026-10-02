@@ -43,6 +43,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import agreed, collective_host, stop_at_exit
+from dew.nn.inputs import key_seed, request_key
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
@@ -114,7 +115,7 @@ class RolloutServer(Protocol):
     @property
     def version(self) -> int: ...
 
-    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, seed: int) -> Future[Draw]: ...
+    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, key: int | jax.Array) -> Future[Draw]: ...
 
     def load(self, variables: Variables, version: int) -> None: ...
 
@@ -173,8 +174,9 @@ class NativeRolloutServer:
     def version(self) -> int:
         return self._version
 
-    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, seed: int) -> Future[Draw]:
+    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, key: int | jax.Array) -> Future[Draw]:
         """Queue one draw; a request the server refuses raises here and leaves the rest running."""
+        request = request_key(key)
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
         with self._lock:
@@ -182,7 +184,7 @@ class NativeRolloutServer:
                 raise RuntimeError("the rollout server stopped") from self._failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
-            ticket = self._server.submit(np.asarray(ids, np.int32), budget, seed=seed)
+            ticket = self._server.submit(np.asarray(ids, np.int32), budget, key=request)
             self._outstanding.add(future)
             version = self._version
 
@@ -436,7 +438,9 @@ class _RequestServer:
     def version(self) -> int:
         return self._version
 
-    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, seed: int) -> Future[Draw]:
+    def submit(self, prompt: Sequence[int], max_new_tokens: int, *, key: int | jax.Array) -> Future[Draw]:
+        seed = key_seed(key)
+        assert seed is not None
         return self._pool.submit(self._draw, _prompt(prompt), _budget(max_new_tokens), seed, self._version)
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
@@ -517,14 +521,8 @@ class OpenAIRolloutServer(_RequestServer):
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         # The pad id shapes Dew's packed rows; it is not a request field.
-        completion = self._completion(
-            [list(prompt)],
-            budget,
-            seed=seed,
-            sampling=replace(self._sampling, pad_id=0),
-            logprobs=0,
-            extra_body=self._return_ids,
-        )
+        completion = self._completion([list(prompt)], budget, key=seed, sampling=replace(self._sampling, pad_id=0),
+                                      logprobs=0, extra_body=self._return_ids)
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")

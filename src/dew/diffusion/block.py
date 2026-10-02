@@ -14,7 +14,7 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Generic, overload
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -207,21 +207,10 @@ class BlockProcess:
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
-    @overload
-    def generate(self, model: DiffusionGemma, variables: Variables,
-                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array, seed: None = None, n: int = 1,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
-
-    @overload
-    def generate(self, model: DiffusionGemma, variables: Variables,
-                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: None = None, seed: int, n: int = 1,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
 
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
+                 max_new_tokens: int, *, key: int | jax.Array | None = None,
                  n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Runs prefill, refinement and clean-token commits as one device
         computation.
@@ -242,7 +231,7 @@ class BlockProcess:
         own key, so it is what a single continuation draws.
         """
         def resolve() -> tuple[jax.Array, ModelInputs]:
-            request = request_key(key, seed)
+            request = request_key(key)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)

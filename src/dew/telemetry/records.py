@@ -74,6 +74,8 @@ class FitStarted:
     device_kind: str
     processes: int
     mesh: Mapping[str, int]
+    seed: int | None = None
+    """The supplied integer root seed; None means the caller supplied a JAX key."""
 
 
 @dataclasses.dataclass(frozen=True)

@@ -569,7 +569,8 @@ def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
     return {**_gemma3_export(model), 'attn_logit_softcapping': model.attn_logit_softcap}
 
 
-def _gemma4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _gemma4_prepare(tensors: Mapping[str, np.ndarray],
+                     _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
     """Split the routed branch's fused experts into dew's stacked `[E, in, out]` kernels.
 
     `Gemma4TextExperts` holds `gate_up_proj` as `[E, 2 * expert, hidden]` with

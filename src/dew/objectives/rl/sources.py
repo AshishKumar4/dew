@@ -158,7 +158,7 @@ class EnvironmentSource:
         handle.wake.clear()
         if handle.cancelled:
             return None
-        pending = self.server.submit(context, self.max_new_tokens, seed=seed)
+        pending = self.server.submit(context, self.max_new_tokens, key=seed)
         pending.add_done_callback(lambda _: handle.wake.set())
         handle.wake.wait()
         if handle.cancelled and not pending.done():
@@ -305,7 +305,7 @@ class PromptSource:
             self._serial += 1
         prompt = _Prompt.of(task)
         return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens,
-                                                              seed=_seed(self.seed, serial, k)))
+                                                              key=_seed(self.seed, serial, k)))
                 for k in range(samples)]
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:

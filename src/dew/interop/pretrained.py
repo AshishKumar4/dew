@@ -26,6 +26,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
 
     from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
+
 
 
 @dataclass(frozen=True)
@@ -1527,7 +1529,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"kind": "attention", "bidirectional_images": True}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family == "qwen3_5":
+    if family in _QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -1780,6 +1782,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    # The Transformers conditional classes ignore auxiliary prediction
+    # layers. A released config advertises a depth even when its checkpoint
+    # contains only the trunk; a source with mtp.* retains its actual depth.
+    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
+        text_fields['num_nextn_predict_layers'] = 0
+        record['text']['num_nextn_predict_layers'] = 0
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
@@ -1820,7 +1829,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # (Gemma 4's prepare) has no raw-name bindings.
     entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 

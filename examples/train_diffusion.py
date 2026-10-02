@@ -66,7 +66,7 @@ def main(config: Config, data=None, inputs=None):
     # The averaged weights stay on
     # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
-    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), seed=1).host().images
+    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), key=1).host().images
     pixels = uint8_pixels(images)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)

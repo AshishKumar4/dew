@@ -1,0 +1,20 @@
+{
+  "checkpoint": "facebook/opt-125m",
+  "revision": "27dcfa74d334bc871f3234de431e71c6eeba5dd6",
+  "storage": "The official pickle weights were repacked with transformers.save_pretrained. Dew loaded the identical fp32 tensors from the resulting safetensors directory.",
+  "dtype": "float32",
+  "precision": "highest",
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cu130",
+  "jax": "0.11.2.post3",
+  "device": "NVIDIA GeForce RTX 4080",
+  "reference_attention": "eager",
+  "tf32": false,
+  "prompt": "The capital of France is",
+  "max_abs_error": 0.000017881393432617188,
+  "bound": 0.00036499029374681413,
+  "argmax_agreement": true,
+  "generated": [[2, 133, 812, 9, 1470, 16, 5, 812, 9, 5, 1515, 3497]],
+  "generation_agreement": true,
+  "command": "PYTHONPATH=src python tools/classic_gpt_reference.py --checkpoint facebook/opt-125m --revision 27dcfa74d334bc871f3234de431e71c6eeba5dd6 --safetensors-directory opt-125m-safe --output opt-parity.json"
+}

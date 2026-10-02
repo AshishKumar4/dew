@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Literal
 
 import grain.python as pygrain
+import jax
 import numpy as np
 
 from dew.registry import datasets
@@ -30,10 +31,12 @@ from .dataset import (
     Batch,
     Dataset,
     DatasetSpec,
+    Reader,
     Records,
     Tokenize,
     checked_count,
     hold_out,
+    mapped,
     tokenized,
     train_stream,
     validation_pass,
@@ -295,10 +298,27 @@ class ImageTransform(pygrain.RandomMapTransform):
 
     def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
         image, caption, label = self.spec.record(element, rng)
+        size = self.spec.staging_size
         if isinstance(image, bytes):
-            image = decode_image(image, at_least=self.spec.image_size)
-        image = augment_image(self.augments, resize_image(image, self.spec.image_size), rng)
+            image = decode_image(image, at_least=size)
+        image = resize_image(image, size)
+        if self.spec.augmentation_backend == "host":
+            if (self.augments is not None
+                    and (self.spec.crop_scale != (1.0, 1.0) or size != self.spec.image_size)):
+                from .image_augmentation import apply_host, draw_host
+
+                parameters = draw_host(rng, image.shape, flip=self.augments.flip, jitter=self.augments.jitter,
+                                       crop_scale=self.spec.crop_scale)
+                pixels = apply_host(image, parameters, self.spec.image_size)
+                image = np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
+            else:
+                image = augment_image(self.augments, image, rng)
         record = {"image": image, CAPTION: caption}
+        if self.spec.augmentation_backend == "device":
+            # Grain keys its Philox by the data seed and global record position.
+            # Only the small key crosses the host augmentation boundary; the
+            # device draws crop, flip and colour independently for every row.
+            record["image_augmentation_key"] = rng.integers(0, 2**32, size=2, dtype=np.uint32)
         if label is not None:
             # the class index, which the JEPA linear/kNN probes score against
             record["label"] = np.int32(label)
@@ -323,9 +343,61 @@ class ImageDataset(DatasetSpec):
 
     image_size: int = 128
     augmentation: Augmentation = "flip_jitter"
+    augmentation_backend: Literal["host", "device"] = "host"
+    """Host OpenCV/NumPy, or JAX augmentation of the decoded device batch."""
+    crop_scale: tuple[float, float] = (1.0, 1.0)
+    """Uniform retained area fraction, resized bilinearly; (1, 1) keeps the full image.
+
+    Training and validation both use this crop and the augmentation mode.
+    Validation's per-record draws repeat each pass; augmentation="none"
+    keeps the full-image resize for evaluation.
+    """
+    augmentation_size: int | None = None
+    """Square decoded staging size before random crop; None uses image_size."""
     val_batches: int | None = 4
     val_split: str | None = None
     count: int | None = None
+
+    def __post_init__(self):
+        if self.augmentation_backend not in ("host", "device"):
+            raise ValueError("augmentation_backend must be host or device")
+        if len(self.crop_scale) != 2 or not 0 < self.crop_scale[0] <= self.crop_scale[1] <= 1:
+            raise ValueError("crop_scale must satisfy 0 < low <= high <= 1")
+        if self.augmentation_size is not None and (
+                type(self.augmentation_size) is not int or self.augmentation_size < 1):
+            raise ValueError("augmentation_size must be a positive integer or None")
+
+    @property
+    def staging_size(self) -> int:
+        """The dense host shape; none retains the old evaluation resize."""
+        if self.augmentation == "none":
+            return self.image_size
+        return self.image_size if self.augmentation_size is None else self.augmentation_size
+
+    def processed(self, stream: Reader) -> Reader:
+        """Tokenize on the host, then optionally augment the pixels on device.
+
+        `mapped` forwards Grain's saved position and close/stop methods. No
+        second RNG state or batch counter needs checkpointing, and changing
+        reader threads, process shares or batch size changes no record draw.
+        """
+        if self.augmentation_backend == "host":
+            return stream
+        from .image_augmentation import augment_batch
+
+        augment = image_augmentations(self.augmentation)
+        run = jax.jit(functools.partial(augment_batch, size=self.image_size,
+                      flip=augment is not None and augment.flip,
+                      jitter=augment is not None and augment.jitter,
+                      crop_scale=self.crop_scale if augment is not None else (1.0, 1.0)))
+
+        def stage(batch):
+            fields = dict(batch)
+            keys = fields.pop("image_augmentation_key")
+            fields["image"] = run(fields["image"], keys)
+            return fields
+
+        return mapped(stream, stage)
 
     def source(self, split: str | None = None) -> Records:
         """Opens the records by index (`__getitem__`, and `__len__` unless
@@ -377,14 +449,11 @@ class ImageDataset(DatasetSpec):
                             seed=self.seed, loading=self.loading), tokenize)
         if self.val_split and scored is not None:
             scored = bounded(scored, self.val_batches)
+        training = tokenized(train_stream(train, [ImageTransform(self)], batch=batch,
+                                          seed=self.seed, loading=self.loading), tokenize)
         return Dataset(
-            train=tokenized(
-                train_stream(
-                    train, [ImageTransform(self)], batch=batch, seed=self.seed, loading=self.loading
-                ),
-                tokenize,
-            ),
-            val=scored,
+            train=self.processed(training),
+            val=None if scored is None else self.processed(scored),
             records=len(train),
             batch=batch,
         )

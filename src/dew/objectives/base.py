@@ -324,12 +324,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
-    def tile_head(self) -> str | None:
+    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that holds its whole logits for the backward to a
-        bounded tile and say what it moved to, or None when there was nothing
-        to move: the fit ladder's first rung
-        (`dew.training.trainer.recompute_more`), which logs it. An objective
-        with no such head has nothing to move."""
+        bounded tile, `tile` or the objective's own, and say what it moved
+        to, or None when there was nothing to move: the fit ladder's first
+        rung (`dew.training.trainer.recompute_more`), which logs it, and the
+        rung a resumed run takes back. An objective with no such head has
+        nothing to move."""
         return None
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
