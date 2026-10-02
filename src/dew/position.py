@@ -50,11 +50,7 @@ class Global:
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    stored = dataclasses.asdict(place)
-    if not place.completed:
-        # A one-order position keeps the envelope it always had.
-        del stored["completed"]
-    return json.dumps({ENVELOPE: stored}).encode()
+    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
 
 
 def decode(position: bytes) -> Global | None:
@@ -73,11 +69,12 @@ def decode(position: bytes) -> Global | None:
     envelope = stored.get(ENVELOPE) if isinstance(stored, dict) else None
     if not isinstance(envelope, dict):
         return None
-    if not {"records", "order"} <= set(envelope):
+    fields = {field.name for field in dataclasses.fields(Global)}
+    if fields - set(envelope):
         raise ValueError(
-            f"a saved global data position is missing {sorted({'records', 'order'} - set(envelope))}; "
+            f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
-    completed = tuple((str(order), int(end)) for order, end in envelope.get("completed", ()))
+    completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
                   completed=completed)
 
@@ -89,10 +86,9 @@ def read(position: bytes) -> Global:
     if place is None:
         raise ValueError(
             "this training stream resumes from a global record count, and the "
-            "saved position is one process's own offset into its shard: either "
-            "a stream that batches its own records or one written before dew "
-            "stored a global count. There is no conversion; resume the run "
-            "that wrote it with the dataset that wrote it")
+            "saved position is one process's own offset into its shard, from a "
+            "stream that batches its own records. There is no conversion; resume "
+            "the run that wrote it with the dataset that wrote it")
     return place
 
 

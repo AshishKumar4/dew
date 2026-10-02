@@ -1258,6 +1258,17 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
 
 
+def test_a_global_position_round_trips_and_a_partial_one_is_refused():
+    """Dew writes every field of its global position, the phases a run
+    completed among them, and reads back only a position with all of them:
+    one without its completed phases is damaged, not a shorter format."""
+    for place in (position.Global(records=16, order="Counting"),
+                  position.Global(records=20, order="B", completed=(("A", 12),))):
+        assert position.decode(position.encode(place)) == place
+    with pytest.raises(ValueError, match=r"missing \['completed'\]"):
+        position.decode(json.dumps({position.ENVELOPE: {"records": 16, "order": "Counting"}}).encode())
+
+
 def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
     """Every process reports the same global position, so two that differ are
     two orders, and no one of them is this run's place in its own."""
