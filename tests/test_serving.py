@@ -156,6 +156,26 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
 
 
+def test_host_task_and_server_preserve_nonzero_lora_branches():
+    from dew.lora import LoRA
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    adapter, fresh = LoRA.fresh(bound.model, bound.variables, {}, rank=2,
+                                modules=("q_proj", "gate_proj"), key=jax.random.key(17))
+    trained = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + jax.random.normal(jax.random.key(29), leaf.shape) * .25
+        if getattr(path[-1], "key", None) == "lora_B" else leaf, fresh)
+    model = adapter.adapt(bound.model)
+    unplaced = TextGeneration(model, jax.tree.map(np.asarray, trained), bound.processor,
+                             sampling=bound.sampling)
+    placed = TextGeneration(model, trained, bound.processor, sampling=bound.sampling)
+    expected = placed("12", 6, key=3)
+    assert not np.array_equal(expected.host().raw_log_probs, bound("12", 6, key=3).host().raw_log_probs)
+    assert_same_generation(unplaced("12", 6, key=3), expected)
+    served = Server.from_task(unplaced, slots=2, capacity=128)
+    assert_same_generation(served(["12"], 6, key=3)[0], expected)
+
+
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     from dew.training.quantization import Quantization

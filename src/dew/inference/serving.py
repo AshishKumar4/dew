@@ -116,12 +116,16 @@ def _row_groups(mesh: Mesh | None) -> int:
 
 def _projection_groups(model: nn.Module, variables: Variables
                        ) -> dict[tuple[str, ...], tuple[str, tuple[str, ...], tuple[int, ...]]]:
+    from dew.lora import _Adapted
+
+    if isinstance(type(model), _Adapted):
+        return {}
     groups = {}
 
     def projections(next_fun, args, kwargs, context):
         module = context.module
         group = None
-        if context.method_name == "__call__":
+        if context.method_name == "setup":
             if isinstance(module, CausalSelfAttention) and not (module.kv_shared or module.k_eq_v):
                 width = module.num_heads * module.head_dim * (2 if module.output_gate else 1)
                 kv_width = module.num_kv_heads * module.head_dim
@@ -150,9 +154,16 @@ def _projection_groups(model: nn.Module, variables: Variables
                     groups[path] = group
         return next_fun(*args, **kwargs)
 
-    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), variables)
+    def visit(module: nn.Module) -> None:
+        # The projections are setup children. Binding and walking that
+        # hierarchy avoids tracing a decoder forward just to name weights.
+        module._try_setup()
+        for child in module._state.children.values():
+            if isinstance(child, nn.Module):
+                visit(child)
+
     with nn.intercept_methods(projections):
-        jax.eval_shape(model.apply, shapes, jax.ShapeDtypeStruct((1, 1), jnp.int32))
+        visit(model.bind(variables))
     return groups
 
 
@@ -183,6 +194,7 @@ def _pack_projections(
 
 
 def _inference_projections(model: nn.Module, variables: Variables) -> Variables:
+    """Pack constant projections; adapted models retain the paths their LoRA branches bind."""
     return _pack_projections(variables, _projection_groups(model, variables))
 
 
