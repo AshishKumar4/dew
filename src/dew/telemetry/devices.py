@@ -54,6 +54,8 @@ def keep_roundings() -> None:
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """
     global _late_policy_warned
+    # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
+    # test covers this path without opening a backend just to inspect it.
     bridge = sys.modules.get("jax._src.xla_bridge")
     if bridge is not None and bridge.backends_are_initialized():
         if not _late_policy_warned:
