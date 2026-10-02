@@ -105,8 +105,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import hf_decoders, load_pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
+from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -169,11 +169,11 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
     config = fixture_config("dream-tiny")
     config["model_type"] = alias
     (source / "config.json").write_text(json.dumps(config))
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     destination = tmp_path / "export"
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == config
-    restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = np.load(source / "input_ids.npy")
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   restored.model.apply(restored.variables, ids))
@@ -181,7 +181,7 @@ def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, mo
 
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
-    pretrained = load_pretrained(str(directory), dtype='float32',
+    pretrained = Pretrained.load(str(directory), dtype='float32',
                                  attention_impl='reference', **kwargs)
     return pretrained.model, pretrained.variables
 
@@ -199,7 +199,7 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     config = fixture_config("llama-tiny")
     config.update(is_llama_config=True, rope_interleaved=False)
     (directory / "config.json").write_text(json.dumps(config))
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     expected = np.load(original / "logits.npy")
@@ -776,7 +776,7 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     the fp32 reference logits the observed difference is 5.7e-02 on the
     reference kernel, tolerance 1e-01; dropping the scale moves them by 1.06."""
     directory = FIXTURES / "gemma3-tiny"
-    pretrained = load_pretrained(str(directory), dtype='bfloat16',
+    pretrained = Pretrained.load(str(directory), dtype='bfloat16',
                                  attention_impl='reference')
     model, variables = pretrained.model, pretrained.variables
     reference = np.load(directory / "logits.npy")
@@ -823,7 +823,7 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
     model, variables = fp32_decoder(FIXTURES / name)
     export = tmp_path / name
 
-    save_pretrained_decoder(model, variables, export, tokenizer="byte")
+    PretrainedDecoder.from_model(model, variables, tokenizer="byte").save(export)
     again, reloaded = fp32_decoder(export)
 
     # against the fixture's config, not the exported one read twice: a field
@@ -857,7 +857,7 @@ def test_an_export_carries_the_tokenizer_it_names(tmp_path):
     model, variables = fp32_decoder(FIXTURES / "llama-tiny")
     export = tmp_path / "named"
 
-    save_pretrained_decoder(model, variables, export, tokenizer=str(TOKENIZER))
+    PretrainedDecoder.from_model(model, variables, tokenizer=str(TOKENIZER)).save(export)
 
     assert (export / "tokenizer_config.json").exists()
     written = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
@@ -878,9 +878,8 @@ def test_a_tokenizer_object_is_exported_without_being_named(tmp_path):
     model, variables = fp32_decoder(FIXTURES / "llama-tiny")
     export = tmp_path / "object"
 
-    save_pretrained_decoder(model, variables, export,
-                            tokenizer=AutoTokenizer.from_pretrained(
-                                str(TOKENIZER), local_files_only=True))
+    PretrainedDecoder.from_model(model, variables, tokenizer=AutoTokenizer.from_pretrained(
+                                str(TOKENIZER), local_files_only=True)).save(export)
 
     assert (export / "tokenizer_config.json").exists()
     assert "tokenizer_name" not in json.loads(
@@ -913,7 +912,7 @@ def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
 
-    save_pretrained_decoder(model, variables, export)
+    PretrainedDecoder.from_model(model, variables).save(export)
     again, reloaded = fp32_decoder(export)
 
     assert json.loads((export / "config.json").read_text())['attention_bias'] is True
@@ -970,7 +969,7 @@ def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     reference = np.load(REAL / "reference.npz")
     ids = np.asarray(prompt['input_ids'], np.int32)[None]
 
-    pretrained = load_pretrained(prompt['repo'], dtype='float32',
+    pretrained = Pretrained.load(prompt['repo'], dtype='float32',
                                  attention_impl='reference',
                                  max_seq_len=int(ids.shape[1]))
     model, variables = pretrained.model, pretrained.variables
@@ -1007,7 +1006,7 @@ def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
     export = tmp_path / "exported"
-    save_pretrained_decoder(model, variables, export)
+    PretrainedDecoder.from_model(model, variables).save(export)
 
     ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
     ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
@@ -1022,7 +1021,7 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
     does and a biased export is a checkpoint it reads."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
-    save_pretrained_decoder(model, variables, export)
+    PretrainedDecoder.from_model(model, variables).save(export)
 
     ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
     ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
@@ -1058,7 +1057,7 @@ MIXED = ("sliding_attention", "full_attention")
 def test_an_export_transformers_reads_computes_what_dew_computes(tmp_path, fixture, changes, model_type):
     model, variables = fp32_decoder(FIXTURES / fixture)
     model = model.clone(**changes)
-    save_pretrained_decoder(model, variables, tmp_path / "exported")
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / "exported")
     assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == model_type
     ids = np.random.default_rng(0).integers(3, model.vocab_size, (2, 12))
     ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
@@ -1075,7 +1074,7 @@ def test_an_export_transformers_reads_computes_what_dew_computes(tmp_path, fixtu
 def test_an_export_no_family_carries_is_refused_naming_what_it_would_lose(tmp_path, fixture, changes, lost):
     model, variables = fp32_decoder(FIXTURES / fixture)
     with pytest.raises(ValueError, match=lost):
-        save_pretrained_decoder(model.clone(**changes), variables, str(tmp_path))
+        PretrainedDecoder.from_model(model.clone(**changes), variables).save(str(tmp_path))
     assert not (tmp_path / "config.json").exists()
 
 
@@ -1116,7 +1115,7 @@ def test_llada_logits_match_the_reference_implementation():
 
 @pytest.fixture(scope='module')
 def glm5_next_source():
-    return load_pretrained(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
+    return Pretrained.load(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
 
 
 def test_glm5_next_translates_the_released_text_config_and_refuses_the_wrapper():
@@ -1278,8 +1277,8 @@ def test_standalone_glm5_refuses_computation_without_a_source_inverse(
     field, value, glm5_next_source, tmp_path
 ):
     with pytest.raises(ValueError, match=field):
-        save_pretrained_decoder(glm5_next_source.model.clone(**{field: value}),
-                                glm5_next_source.variables, tmp_path)
+        PretrainedDecoder.from_model(glm5_next_source.model.clone(**{field: value}),
+                                     glm5_next_source.variables).save(tmp_path)
     assert not (tmp_path / "config.json").exists()
 
 

@@ -33,7 +33,8 @@ class MixerContext:
     and `kv_shared` with `kv_store_key` mark a layer that reads another
     layer's keys and values. A kind's own record (LoRA ranks, head splits, a
     yarn scaling) lives on the kind's value; this holds what the backbone
-    configures.
+    configures. `AttentionMixer` passes every field to `CausalSelfAttention`
+    by name, so a new field needs a namesake there or the build raises.
     """
 
     emb_features: int

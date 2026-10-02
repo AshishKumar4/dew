@@ -50,7 +50,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from test_diffusion_run_sources import batch_for
 
     from dew.config import ModelConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, ShortcutTraining, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
@@ -62,9 +62,9 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
             dtype="float32",
             attention_impl="xla",
         ),
-        data=OxfordFlowers(image_size=4),
+        data=TFDSImages(image_size=4),
         preset=presets.Shortcut(),
-        sampler=Euler(),
+        solver=Euler(),
         guidance=None,
         sampling_steps=3,
         val_metrics=(),

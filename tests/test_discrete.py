@@ -17,7 +17,7 @@ from dew.diffusion.schedules import CosineNoiseScheduler
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import Step
 from dew.objectives.diffusion import MaskedDiffusionObjective
-from dew.registry import presets, samplers
+from dew.registry import presets, solvers
 from dew.sampling import sample
 from dew.training import Trainer
 
@@ -190,7 +190,7 @@ def test_unmask_refuses_a_gaussian_process(rng):
 
 
 def test_the_mdlm_preset_is_registered_and_takes_no_conditions():
-    assert presets["mdlm"] is MDLM and samplers["unmask"] is Unmask
+    assert presets["mdlm"] is MDLM and solvers["unmask"] is Unmask
     process = presets.build("mdlm", mask_id=MASK, eps=1e-2)()
     assert process.mask_id == MASK and process.schedule == LogLinear(eps=1e-2)
     with pytest.raises(ValueError, match="no conditions"):

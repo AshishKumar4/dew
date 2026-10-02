@@ -907,7 +907,7 @@ class RecordedPath(DPMSolverSDE):
 def source_solver(name: str, schedule):
     """The case's solver, with the reference's recorded Brownian path where the
     source drew one."""
-    solver = schedule.solver()
+    solver = schedule.solver
     if f"{name}.noise" not in SOURCE_ARRAYS:
         return solver
     intervals = tuple((float(a), float(b)) for a, b in SOURCE_ARRAYS[f"{name}.intervals"])
@@ -1016,7 +1016,7 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
     model = SourceOracle()
     x_T = jax.random.normal(jax.random.PRNGKey(3), (2, 3, 4))
     denoise = process.denoiser(model, model.init(jax.random.PRNGKey(1), x_T[:1], jnp.ones((1,))), {})
-    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
+    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
                                        times=times, final_denoise=False))
     batch = run(x_T)
     for row in range(2):

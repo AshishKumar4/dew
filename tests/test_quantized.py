@@ -20,7 +20,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.codecs import (
     AMAX_FLOOR,
     BLOCK,
@@ -248,7 +248,7 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
     """The tiny DeepSeek fixture re-shipped the way the real one is: the
     config names the block, two projections are fp8 with `weight_scale_inv`
     partners (one of them with a partial block), everything else is as it
-    was. `load_pretrained` lands the dequantized weight, transposed
+    was. `Pretrained.load` lands the dequantized weight, transposed
     as every kernel is, and the untouched tensors bit for bit."""
     from dew.interop.safetensors_io import read_file
     directory = tmp_path / "fp8"
@@ -268,7 +268,7 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
         assert not np.array_equal(expected[name], tensors[name]), "quantization changed nothing"
     write_safetensors(directory / "model.safetensors", shipped)
 
-    variables = load_pretrained(str(directory), dtype="float32",
+    variables = Pretrained.load(str(directory), dtype="float32",
                                 attention_impl="reference").variables
 
     params = variables["params"]
@@ -602,13 +602,13 @@ def reexport(request, tmp_path_factory):
     write_safetensors(directory / "model.safetensors", shipped)
 
     names = scaled_names(load_shards(directory))
-    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
     written = fp8_blocks(REEXPORT_BLOCK, ue8m0=ue8m0).requantize(dense, names)
     shutil.copytree(directory, destination)
     write_safetensors(destination / "model.safetensors", written)
-    reloaded = load_pretrained(str(destination), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")
     return {"ue8m0": ue8m0, "names": names, "dense": dense, "written": written,
             "loaded": loaded, "values": values, "reloaded": reloaded,
             "destination": destination}

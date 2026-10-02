@@ -7,6 +7,7 @@ everywhere, since construction never imports it.
 import dataclasses
 import itertools
 import json
+from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +16,6 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig, _rebuild
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
@@ -23,6 +23,9 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.quantization import Quantization, quantize_for_serving
+
+import_module("dew.nn.backbones")  # registers the fixture kind
+
 
 VOCAB = 64
 SEQ_LEN = 8
@@ -634,12 +637,12 @@ def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch)
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.sampling import Sampling
 
     pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/gemma3-native-tiny"
-    source = load_pretrained(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
     task = source.text_generation(sampling=Sampling(temperature=0))
     image = np.load(directory / "raw_images.npy")[0]
     prompt = "token7 <start_of_image> token9"
@@ -889,13 +892,13 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2}, dtype="float32"),
-        data=OxfordFlowers(image_size=RES), text=None, guidance=None,
+        data=TFDSImages(image_size=RES), text=None, guidance=None,
         sampling_steps=2, val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
                               steps=1, eval_every=None, checkpoint_every=None,

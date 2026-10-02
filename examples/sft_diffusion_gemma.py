@@ -30,7 +30,7 @@ import tyro
 
 import dew
 from dew.data import ChatMessages, Loading
-from dew.interop import load_pretrained
+from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.base import thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -91,7 +91,7 @@ def main(config: Config) -> Path:
             raise ValueError("--chat names the conversations to fine-tune on: a hub "
                              "dataset id, a .jsonl file or a parquet file")
 
-    source = load_pretrained(config.model, dtype="bfloat16", param_dtype="float32")
+    source = PretrainedBlockDecoder.load(config.model, dtype="bfloat16", param_dtype="float32")
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
     adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,

@@ -30,8 +30,6 @@ from dew.eval import (
     SSIM,
     CLIPDistance,
     CLIPScore,
-    clip_score,
-    fid,
     peak_signal_noise_ratio as psnr,
     structural_similarity as ssim,
 )
@@ -243,7 +241,7 @@ def test_the_extractor_gives_pytorch_fids_features_and_distance_on_the_published
                                rtol=0, atol=1e-4)
     np.testing.assert_allclose(np.asarray(extract(unit_range(images_b))), reference["features_b"],
                                rtol=0, atol=1e-4)
-    assert fid(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
+    assert FID().score(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
 
 
 @pytest.mark.network
@@ -270,24 +268,24 @@ def fid_sets():
 
 
 def test_fid_refuses_an_image_set_it_cannot_score():
-    """Both sides of `fid` are uint8 [N, H, W, 3]. The refusal comes out of the
+    """Both sides of `FID.score` are uint8 [N, H, W, 3]. The refusal comes out of the
     batch parser before the extractor is asked for, so a call that cannot be
     scored never pays for the 90 MB of Inception weights, which is why this
     test needs no network."""
     images = np.zeros((4, 8, 8, 3), np.uint8)
     with pytest.raises(ValueError, match="generated: expected uint8"):
-        fid(images.astype(np.float32), images)
+        FID().score(images.astype(np.float32), images)
     with pytest.raises(ValueError, match="real: expected uint8"):
-        fid(images, images[0])
+        FID().score(images, images[0])
     with pytest.raises(ValueError, match="generated: no images"):
-        fid([], images)
+        FID().score([], images)
     with pytest.raises(ValueError, match="at least one image"):
-        fid(images, images, batch_size=0)
+        FID().score(images, images, batch_size=0)
 
 
 @pytest.mark.network
 def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it():
-    """`fid` scores two image sets with no objective, no dataset and no batch.
+    """`FID.score` scores two image sets with no objective, no dataset and no batch.
 
     One set twice has identical pooled statistics, so the distance is zero up
     to the rounding in the matrix square root. Observed -2.0e-05 with the
@@ -295,13 +293,13 @@ def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it()
     Adding 40 counts to every pixel moves the population, observed 10.6."""
     images, brighter = fid_sets()
 
-    assert abs(fid(images, images)) < 1e-3
-    assert fid(brighter, images) > 0
+    assert abs(FID().score(images, images)) < 1e-3
+    assert FID().score(brighter, images) > 0
 
 
 def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     """`weights` names the extractor's variables as a safetensors file, the way
-    `clip_score(modelname=)` names a local CLIP, so a distance is computable
+    `CLIPScore(modelname)` names a local CLIP, so a distance is computable
     with no download.
 
     The committed fixture is this module's own InceptionV3 at a sixteenth of
@@ -320,9 +318,9 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     weights = str(INCEPTION_TINY)
     record = json.loads((INCEPTION_TINY.parent / "source.json").read_text())
 
-    assert abs(fid(images, images, weights=weights)) < 1e-6
-    shifted = fid(brighter, images, weights=weights)
-    assert 0 < shifted < fid(np.full_like(images, 128), images, weights=weights)
+    assert abs(FID(weights=weights).score(images, images)) < 1e-6
+    shifted = FID(weights=weights).score(brighter, images)
+    assert 0 < shifted < FID(weights=weights).score(np.full_like(images, 128), images)
 
     metric = FID(weights=weights)
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
@@ -379,7 +377,7 @@ def test_fid_extraction_is_independent_of_small_batch_boundaries():
 @pytest.mark.network
 def test_the_fid_metric_and_the_function_report_the_same_distance():
     """The registered metric is that same path with a trainer's artifact and
-    batch in front of it, so a validation pass lands on the number `fid` gives
+    batch in front of it, so a validation pass lands on the number `FID.score` gives
     for the same pixels.
 
     One pass over one batch splits nothing, so the features and the statistics
@@ -392,7 +390,7 @@ def test_the_fid_metric_and_the_function_report_the_same_distance():
 
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
 
-    assert pooled == pytest.approx(fid(brighter, images), rel=1e-6)
+    assert pooled == pytest.approx(FID().score(brighter, images), rel=1e-6)
 
 
 @pytest.mark.network
@@ -407,8 +405,8 @@ def test_fid_pools_a_streamed_set_into_the_distance_of_the_whole_set():
     rounds differently the same headroom."""
     images, brighter = fid_sets()
 
-    whole = fid(brighter, images)
-    streamed = fid([brighter[:7], brighter[7:]], images, batch_size=3)
+    whole = FID().score(brighter, images)
+    streamed = FID().score([brighter[:7], brighter[7:]], images, batch_size=3)
 
     assert streamed == pytest.approx(whole, rel=1e-5)
 
@@ -741,7 +739,7 @@ def test_clip_score_metric_clamps_the_reference_cosine():
 
 
 def test_clip_score_over_images_and_prompts_is_the_metric_number():
-    """`clip_score` takes uint8 images and prompt strings, with no artifact
+    """`CLIPScore.score` takes uint8 images and prompt strings, with no artifact
     and no tokenized batch, and tokenizes them the way a run's loader does. It
     lands on the metric's value for the same fixture, and both land on the
     reference's own cosines: a different padding or truncation would move the
@@ -752,7 +750,7 @@ def test_clip_score_over_images_and_prompts_is_the_metric_number():
     generated, batch, cosine = clip_fixture()
     metric = CLIPScore(modelname=str(CLIP_TINY))
 
-    score = clip_score(images, prompts, modelname=str(CLIP_TINY))
+    score = CLIPScore(str(CLIP_TINY)).score(images, prompts)
 
     pooled = metric.finalize(metric(ImageGrid(generated), batch))
     assert score == pytest.approx(pooled, abs=1e-9), f"{score} against {pooled}"
@@ -767,12 +765,12 @@ def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
     prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
     images = np.load(CLIP_TINY / "reference.npz")["images"]
 
-    whole = clip_score(images, prompts, modelname=str(CLIP_TINY))
-    batched = clip_score(images, prompts, modelname=str(CLIP_TINY), batch_size=3)
+    whole = CLIPScore(str(CLIP_TINY)).score(images, prompts)
+    batched = CLIPScore(str(CLIP_TINY)).score(images, prompts, batch_size=3)
 
     assert batched == pytest.approx(whole, rel=1e-6)
     with pytest.raises(ValueError, match="equal counts"):
-        clip_score(images, prompts[:2], modelname=str(CLIP_TINY))
+        CLIPScore(str(CLIP_TINY)).score(images, prompts[:2])
 
 
 def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
@@ -780,10 +778,10 @@ def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
     alike instead of overrunning the position table."""
     images = np.load(CLIP_TINY / "reference.npz")["images"][:1]
 
-    long = clip_score(images, [" ".join(["word"] * 500)], modelname=str(CLIP_TINY))
+    long = CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 500)])
 
     assert np.isfinite(long)
-    assert clip_score(images, [" ".join(["word"] * 600)], modelname=str(CLIP_TINY)) == long
+    assert CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 600)]) == long
 
 
 def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():

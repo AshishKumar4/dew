@@ -15,7 +15,7 @@ from test_diffusion_run_sources import batch_for
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import Flow
 from dew.inputs import unit_range
@@ -55,7 +55,7 @@ def runs(tmp_path_factory):
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", FLUX, dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=8), preset=Flow(), sampler=Euler(), guidance=None,
+        data=TFDSImages(image_size=8), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")))
     objective = teacher.build()

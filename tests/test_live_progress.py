@@ -39,13 +39,13 @@ def pipe(tmp_path_factory):
     return TextToImage.from_run(str(directory))
 
 
-@pytest.mark.parametrize("sampler", [None, DPMSolverMultistep()], ids=["task-default", "dpm-solver"])
-def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, monkeypatch, sampler):
+@pytest.mark.parametrize("solver", [None, DPMSolverMultistep()], ids=["task-default", "dpm-solver"])
+def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, monkeypatch, solver):
     reports = []
     monkeypatch.setattr(progress, "_show", lambda report, png=None: reports.append(report))
     steps = 4
-    expected = pipe(["a lily"], steps=steps, key=0, sampler=sampler).host().images
-    images = progress.Reporting(pipe)(["a lily"], steps=steps, key=0, sampler=sampler).host().images
+    expected = pipe(["a lily"], steps=steps, key=0, solver=solver).host().images
+    images = progress.Reporting(pipe)(["a lily"], steps=steps, key=0, solver=solver).host().images
     np.testing.assert_array_equal(images, expected)
     # A walk of `steps` points takes steps - 1 solver steps; the model's last call,
     # the clean prediction at the final point, runs with the decode.

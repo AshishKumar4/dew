@@ -75,7 +75,7 @@ def main():
         max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl="xla",
         scan_layers=args.scan, remat=args.remat,
         mixture=Mixture(experts=4, top_k=2) if args.case == "sparse" else None,
-        num_kv_shared_layers=args.depth // 2 if args.case == "shared" else 0)
+        kv_shared_layers=tuple(range(args.depth // 2, args.depth)) if args.case == "shared" else None)
     objective = LMObjective(model, args.length)
     tokens = {"text": jnp.asarray(np.random.default_rng(0).integers(
         1, 256, (args.batch, args.length + 1)), jnp.int32)}

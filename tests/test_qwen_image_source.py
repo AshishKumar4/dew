@@ -223,9 +223,9 @@ def test_the_released_configs_and_weight_maps_translate():
 
 @pytest.fixture(scope="module")
 def loaded(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded, arrays, record):
@@ -275,7 +275,7 @@ def test_the_prompt_states_are_the_decoders_own_last_layer_output():
 
 
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its 40 default steps, no guidance, the sigmas its call lays out shifted
     by the mu of this latent's token count, and the RGBA decode. Both rows
     walk in one batch, the shorter prompt padded, and each lands on the
@@ -316,7 +316,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     from dew.checkpoints import Checkpoints
     from dew.inputs.diffusion import QwenImageConditioner
     from dew.interop.diffusion import component_tensors
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
@@ -368,7 +368,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         assert written.keys() == published.keys()
         for name, tensor in published.items():
             np.testing.assert_array_equal(written[name], tensor)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     rebuilt = QwenImageConditioner.from_pretrained(
         str(export), dtype="float32", **{key: value for key, value in
                                           again.inputs.conditions["conditioning"].encoder.to_json().items()

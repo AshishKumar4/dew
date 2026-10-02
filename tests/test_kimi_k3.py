@@ -24,7 +24,7 @@ from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.codecs import PACKED_MXFP4, decode_e2m1, quantize_packed_mxfp4
 from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
@@ -40,7 +40,7 @@ TINY = ROOT / "kimi-k3-tiny"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
         reference = {name: stored[name] for name in stored.files} | {
             name: exact[name] for name in exact.files
@@ -196,7 +196,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
         (TINY / "config.json").read_text()
     )
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     trained = flatten_dict(variables, sep=".")
     for name, after in flatten_dict(dict(restored.variables), sep=".").items():
         before = np.asarray(trained[name])
@@ -267,7 +267,7 @@ def test_a_quantization_scheme_other_than_mxfp4_is_refused(tmp_path):
     config["text_config"]["quantization_config"]["config_groups"]["group_0"]["weights"]["group_size"] = 16
     (directory / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match="group_size"):
-        load_pretrained(directory, dtype="float32", attention_impl="reference")
+        Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
 
 def test_a_nonzero_a_log_pad_is_refused():

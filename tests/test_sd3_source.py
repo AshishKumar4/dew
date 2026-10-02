@@ -198,10 +198,9 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(process.sampler_schedule.model_time(times[:-1]),
                                     arrays[f"{tag}.times"]) < 1e-5
                 denoise = process.denoiser(model, params, {})
-                def run(value, denoise=denoise, times=times):
-                    return sample(
-                                    denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
-                                    times=times, final_denoise=False)
+                def run(value, *, denoise=denoise, times=times):
+                    return sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
+                                  times=times, final_denoise=False)
                 x_T = jnp.asarray(arrays[f"{tag}.x_T"])
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
                 (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))
@@ -315,10 +314,10 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
     second case ships no third encoder, whose segment is the zero block the
     source writes at its CLIP window rather than at the sequence it asked for.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     for prefix, rows in (("", pipeline_record["prompts"]), ("negative_", pipeline_record["negatives"])):
@@ -338,7 +337,7 @@ def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_
 
 @pytest.mark.parametrize("case", PIPELINE_CASES)
 def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case):
-    """`load_pretrained().text_to_image()` reproduces the source's own call.
+    """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     The published directory decides everything: the transformer, the wide
     latent VAE with its shift and scale, the flow schedule's shifted sigmas,
@@ -346,11 +345,11 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     grid is bound to. The walk starts from the source's own latents so only
     the trajectory is under test.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.sampling.guidance import CFG
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
                             initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], key=0)
@@ -372,10 +371,10 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
     declares that class takes them: not the fifty steps and 7.5 of the older
     UNet pipelines, and not anything a test passes in.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     arrays = np.load(source / "sd3_pipeline.npz")
-    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / case), dtype="float32", attention_impl="xla")
     task = loaded.text_to_image()
     assert task.steps == pipeline_record["default_steps"]
     assert task.guidance.scale == pipeline_record["default_guidance"]
@@ -389,7 +388,7 @@ def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path)
     """A declared class another family's denoiser drives is refused: the
     shared unet/transformer check cannot tell Flux's transformer from SD3's,
     so the gate reads the pipeline family."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = tmp_path / "pipeline"
     shutil.copytree(source / "pipeline", directory)
@@ -397,7 +396,7 @@ def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path)
     index["_class_name"] = "FluxPipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match=r"FluxPipeline.*StableDiffusion3Pipeline"):
-        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 
 def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):
@@ -414,12 +413,12 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, pretrained=loaded.variables,
@@ -468,7 +467,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     np.testing.assert_array_equal(again.variables["buffers"]["pos_embed"], buffer)
     latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
     condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),

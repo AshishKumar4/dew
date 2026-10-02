@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from test_quantized import decode_e4m3fn, fetch
 
-from dew.interop import codecs, load_pretrained
+from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -410,8 +410,8 @@ def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, 
     weights that decode to the source's values."""
     stored, names = v4_release_storage(tmp_path, experts, scale_dtype)
 
-    loaded = load_pretrained(tmp_path / "quantized", dtype="float32", attention_impl="reference")
-    dense = load_pretrained(tmp_path / "dense", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "quantized", dtype="float32", attention_impl="reference")
+    dense = Pretrained.load(tmp_path / "dense", dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "export")
 
     assert set(loaded.quantized_tensors) == set(names)
@@ -609,7 +609,7 @@ def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_
     value its source grid cannot hold is refused: AutoAWQ's packing would
     spill it into the neighbouring codes and gptqmodel's would clamp it."""
     stored = integer_checkpoint(tmp_path / "source", method)
-    loaded = load_pretrained(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "export")
     written = read_weights(tmp_path / "export")
     assert set(written) == set(stored)

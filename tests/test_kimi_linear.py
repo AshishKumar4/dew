@@ -25,7 +25,7 @@ from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
@@ -39,7 +39,7 @@ TINY = ROOT / "kimi-linear-tiny"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
         reference = {name: stored[name] for name in stored.files} | {
             name: exact[name] for name in exact.files
@@ -162,7 +162,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
         (TINY / "config.json").read_text()
     )
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     trained = flatten_dict(variables, sep=".")
     for name, after in flatten_dict(restored.variables, sep=".").items():
         np.testing.assert_array_equal(np.asarray(after), np.asarray(trained[name]), err_msg=name)

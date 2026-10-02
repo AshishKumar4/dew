@@ -140,9 +140,9 @@ def test_an_unsupported_config_is_refused(source, change):
 
 @pytest.fixture(scope="module")
 def pipeline(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
@@ -161,7 +161,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
 
 
 def test_pipeline_walk_matches_the_source(pipeline, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's call: its
+    """`Pretrained.load().text_to_image()` reproduces the source's call: its
     50 default steps guided at 5.0 its way, which is Dew's 6.0, and at the
     recorded step count the latent it ends on and the image it decodes."""
     recorded = record["pipeline"]

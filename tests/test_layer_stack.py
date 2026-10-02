@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
@@ -38,7 +38,7 @@ FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 def fixture_pair(name, **overrides):
     """The fixture's model and its scanned twin, with the fixture's weights."""
     directory = FIXTURES / name
-    pretrained = load_pretrained(
+    pretrained = Pretrained.load(
         str(directory), dtype="float32", attention_impl="reference", **overrides)
     scanned = models.build("causal_transformer",
                            **{**pretrained.model_config, "scan_layers": True})
@@ -101,7 +101,7 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         num_layers=12,
         layer_types=("sliding_attention",) * 5 + ("full_attention",)
         + ("sliding_attention",) * 5 + ("full_attention",),
-        num_kv_shared_layers=4, max_seq_len=16)
+        kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
     config.update(overrides)
     return models.build("causal_transformer", **{**with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
@@ -116,7 +116,7 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         layer_types=("sliding_attention",) * 4 + ("full_attention",)
         + ("sliding_attention",) * 4 + ("full_attention",),
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
-        num_kv_shared_layers=2, max_seq_len=16)
+        kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
     return models.build("causal_transformer", **{**with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
@@ -469,7 +469,7 @@ def test_a_pipeline_refuses_a_stack_it_cannot_split_evenly():
     with pytest.raises(ValueError, match="layer 2 differs from layer 0 in routed"):
         run(tiny(mixture={"experts": 4, "top_k": 2, "layers": (2, 3)}))
     with pytest.raises(ValueError, match="layer 2 differs from layer 0 in provider"):
-        run(tiny(num_kv_shared_layers=1))
+        run(tiny(kv_shared_layers=(3,)))
 
 
 @mesh_lane
@@ -608,7 +608,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     8.7, 10.1 or NaN depending on the process, exact without jit and on a
     GPU: the compiled program is identical across processes, so the bad
     values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
-    loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
+    loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
     scanned = dataclasses.replace(loaded.model, scan_layers=True)

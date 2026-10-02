@@ -773,7 +773,7 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'kinds': {'linear_attention': {'window': 2}}}, "name no layer"),
     ({'kinds': {'full_attention': {'window': 0}}}, "window"),
     ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
-    ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
+    ({'use_double_wide_mlp': True}, "kv_shared_layers"),
     ({'per_layer_input_dim': 0}, "None is a model without them"),
     ({'mlp': 'unknown'}, "swiglu"),
 ])
@@ -1102,7 +1102,7 @@ def test_a_norm_under_jit_reads_the_bf16_sum_it_is_handed(norm):
     fp32 upcast was normalized unrounded: 23% of a bf16 RMSNorm's outputs,
     30% of a LayerNorm's, differed from the norm of the stored sum, on CPU
     and on an RTX 4080. Runs and this suite keep every rounding
-    (`dew.training.runtime.keep_roundings`). The oracle is the same norm
+    (`dew.telemetry.devices.keep_roundings`). The oracle is the same norm
     applied to the sum materialized by its own jit."""
     from dew.nn.attention import LayerNorm, RMSNorm
 

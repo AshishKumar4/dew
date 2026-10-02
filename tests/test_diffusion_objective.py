@@ -83,7 +83,7 @@ def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
     return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
-                              sampler=Euler())
+                              solver=Euler())
 
 
 def make_batch(count=8):
@@ -225,8 +225,16 @@ def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
     from dew.sampling import RK4
     unconditional = InputSpec(Field("image", (RES, RES, 3)))
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
-        DiffusionObjective(Zero(), presets.Cosine(), unconditional, sampler=RK4())
-    DiffusionObjective(Zero(), presets.Karras(), unconditional, sampler=RK4())
+        DiffusionObjective(Zero(), presets.Cosine(), unconditional, solver=RK4())
+    DiffusionObjective(Zero(), presets.Karras(), unconditional, solver=RK4())
+
+
+def test_a_solver_named_by_a_string_is_refused_with_the_object_to_pass():
+    unconditional = InputSpec(Field("image", (RES, RES, 3)))
+    with pytest.raises(
+        TypeError, match=r"solver='euler' names a solver; pass the solver itself, as Euler\(\)"
+    ):
+        DiffusionObjective(Zero(), presets.Flow(), unconditional, solver="euler")
 
 
 @pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
@@ -236,7 +244,7 @@ def test_singlestep_solver_generates_through_the_objective(order, steps):
 
     process = Process(LinearNoiseScheduler(1000), DirectPredictionTransform())
     objective = DiffusionObjective(Zero(), process, InputSpec(Field("image", (2, 2, 1))),
-                                   sampler=DPMSolverSinglestep(order), steps=steps, guidance=None)
+                                   solver=DPMSolverSinglestep(order), steps=steps, guidance=None)
     params = objective.init(jax.random.key(1))
     result = objective.evaluate(params, {"image": np.zeros((2, 2, 2, 1), np.uint8)},
                                 Step(step=jnp.asarray(0), key=jax.random.key(2), ema=None))
@@ -248,7 +256,7 @@ def test_objective_validates_the_real_terminal_grid_before_sampling():
 
     with pytest.raises(ValueError, match="sigma=0 target"):
         DiffusionObjective(Zero(), presets.Flow(), InputSpec(Field("image", (2, 2, 1))),
-                           sampler=UniPC(3, lower_order_final=False), steps=7, guidance=None)
+                           solver=UniPC(3, lower_order_final=False), steps=7, guidance=None)
 
 
 def test_loss_is_the_weighted_error_of_the_prediction():
@@ -569,7 +577,7 @@ def conditional_mmdit():
     model = SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
     preset = presets.EDM(sigma_max=1.0, regime="pixel")
-    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
+    objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(), guidance=CFG(2.0))
     variables = objective.init(jax.random.key(0))
     # The initialized zero output head otherwise hides conditioning gradients.
     variables = {**variables, "params": jax.tree.map(lambda leaf: leaf + 0.02, variables["params"])}
@@ -577,7 +585,7 @@ def conditional_mmdit():
     variables = {**variables, "encoders": {"textcontext": {"table": table}}}
     # The objective encodes the unconditional branch from the weights it is
     # built over, so it is rebuilt over the ones these tests sample under.
-    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(),
+    objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(),
                                    guidance=CFG(2.0), pretrained=variables)
     batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
              **inputs.tokenize(["ab", "cd", "ef", "gh"])}
@@ -589,10 +597,10 @@ def conditional_mmdit():
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
-                                 unconditional_prob=probability, steps=3, sampler=Euler(),
+                                 unconditional_prob=probability, steps=3, solver=Euler(),
                                  pretrained=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
-                                     unconditional_prob=0.0, steps=3, sampler=Euler(),
+                                     unconditional_prob=0.0, steps=3, solver=Euler(),
                                      pretrained=variables)
     mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
     explicit = source.inputs.tokenize([""] * 4)
@@ -619,7 +627,7 @@ def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mm
     encoded the prompt again would not notice."""
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
-                                 unconditional_prob=1.0, steps=3, sampler=Euler(),
+                                 unconditional_prob=1.0, steps=3, solver=Euler(),
                                  pretrained=variables)
     held = dropped.unconditional_conditions
     before = float(dropped.scalar_loss(variables, batch, step)[0])
@@ -635,7 +643,7 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     rebound = replace(condition.encoder, params=variables["encoders"]["textcontext"])
     inputs = replace(objective.inputs, conditions={"textcontext": replace(condition, encoder=rebound)})
     reconstructed = DiffusionObjective(objective.model, objective.process, inputs,
-                                       steps=3, sampler=Euler(), guidance=CFG(2.0))
+                                       steps=3, solver=Euler(), guidance=CFG(2.0))
     expected = reconstructed.evaluate(variables, batch, step).images
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)

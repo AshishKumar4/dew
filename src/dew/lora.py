@@ -710,7 +710,7 @@ def _attach(objective: object, adapter: LoRA) -> None:
     its objective, and the run adapts it once, before anything initialises
     it, so the adapted module is what the run traces and the adapter's own
     leaves are the only ones the optimizer moves. Code that builds its own
-    run adapts a source with `Pretrained.lora` instead, which returns a
+    run adapts a source with `PretrainedDecoder.lora` instead, which returns a
     new bundle. The adapted module is a subclass of the same class with
     the same fields, so what the objective read off the model at
     construction still holds.

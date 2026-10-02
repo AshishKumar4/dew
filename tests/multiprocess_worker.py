@@ -206,7 +206,7 @@ def indexed_loader(records: int, batch: int = BATCH):
 
     return pygrain.DataLoader(
         data_source=pygrain.RangeDataSource(0, records, 1),
-        sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
+        solver=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
                                      num_epochs=1,
                                      shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
@@ -867,7 +867,7 @@ def _evaluation_parts(case: _EvaluationCase):
     import jax
     import jax.numpy as jnp
 
-    from dew.artifacts import Representations, host
+    from dew.artifacts import Representations
     from dew.objectives.base import Aux, Objective
 
     class Numerical(Objective):
@@ -906,7 +906,7 @@ def _evaluation_parts(case: _EvaluationCase):
                 return Representations(features=local, labels=np.arange(3))
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
-            preview = host(Representations(features=features, labels=batch["x"][:, 0]))
+            preview = Representations(features=features, labels=batch["x"][:, 0])
             if case.rank == 0 and case.failure == "preview":
                 raise ValueError("preview decoding failed")
             return preview
@@ -1021,7 +1021,7 @@ def mode_evaluation_replicas(args) -> dict:
     import jax.numpy as jnp
     import optax
 
-    from dew.artifacts import Representations, host
+    from dew.artifacts import Representations
     from dew.data import Dataset
     from dew.objectives.base import Aux, Objective
     from dew.training import MeshSpec, Trainer
@@ -1061,11 +1061,7 @@ def mode_evaluation_replicas(args) -> dict:
                         key=state.key, mesh=trainer.device_mesh).scalars
     unconsumed = Evaluation.run(trainer.objective, state.params, data.val, key=state.key,
                           mesh=trainer.device_mesh).scalars
-    # Plain host stays usable on root alone for local arrays outside evaluation.
-    local = None
-    if jax.process_index() == 0:
-        local = host(jax.device_put(np.arange(3), jax.local_devices()[0])).tolist()
-    return {"measured": measured, "no_consumer": unconsumed, "local": local}
+    return {"measured": measured, "no_consumer": unconsumed}
 
 
 def _builtin_sampler_failure(kind, phase, source, rank, fault):
@@ -1130,7 +1126,7 @@ def mode_builtin_preview_failures(args) -> dict:
             objective = DiffusionObjective(
                 SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
                 presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
-                steps=2, sampler=Euler(), guidance=None)
+                steps=2, solver=Euler(), guidance=None)
             batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
         tracker = ScoreRecorder()
         trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
@@ -1549,8 +1545,8 @@ def mode_continuations(args) -> dict:
         arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
         if arrivals.tolist() != list(range(processes)):
             raise AssertionError("a rank did not return from the rejected request")
-    from dew.interop import load_pretrained
-    source = load_pretrained(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
+    from dew.interop import Pretrained
+    source = Pretrained.load(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
                              dtype="float32", attention_impl="xla", max_seq_len=32)
     canvas = source.block_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
                                                   Layout(min_shard=TINY)))
@@ -1860,12 +1856,12 @@ def mode_masked_generation(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference.pipeline import place
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.inputs import ModelInputs
     from dew.training import Layout, MeshSpec
 
     rank, processes = jax.process_index(), jax.process_count()
-    source = load_pretrained(Path(__file__).parent / "fixtures/hf/llada-tiny",
+    source = Pretrained.load(Path(__file__).parent / "fixtures/hf/llada-tiny",
                              dtype="float32", attention_impl="xla")
     task = source.text_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
                                               Layout(min_shard=TINY)))
