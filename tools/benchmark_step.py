@@ -506,7 +506,7 @@ def small_cases(dtype: str) -> list[Case]:
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
         Case("causal_transformer",
-             {**decoder, "mixture": {"experts": 8, "top_k": 2, "every": 2}},
+             {**decoder, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
              batch_size=16, seq_len=512),
         # The same decoder as a vision-conditioned one: SigLIP-so400m's widths
         # at four layers over a 448px crop, pooled to the 256 soft tokens

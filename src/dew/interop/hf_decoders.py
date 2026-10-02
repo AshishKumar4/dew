@@ -280,7 +280,6 @@ class MixtureFields(TypedDict, total=False):
     experts: int
     top_k: int
     layers: tuple[int, ...] | None
-    every: int | None
     score_function: str
     norm_topk_prob: bool
     scaling: float
@@ -410,7 +409,6 @@ class DecoderFields(TypedDict, total=False):
     causal: bool
     per_layer_input_dim: int | None
     per_layer_input_vocab: int | None
-    num_kv_shared_layers: int
     kv_shared_layers: tuple[int, ...] | None
     mixer: Mapping[str, object] | MixerBase | None
     """The mixer as its registry record, or as the built value a family
@@ -1843,7 +1841,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'per-layer input embeddings, KV sharing and the values norm have '
             'no counterpart in this dense tensor encoder: per_layer_input_dim, '
-            'num_kv_shared_layers, kv_shared_layers or v_norm is set')
+            'kv_shared_layers or v_norm is set')
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
     if (model.output_gate or model.partial_rotary_factor is not None
             or any(mixer is not None and not isinstance(mixer, AttentionMixer) for mixer in mixers)):
