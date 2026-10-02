@@ -280,8 +280,9 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
 
 
 def _split_share(params: Variables) -> float:
-    """The share of the bytes of `params`, placed arrays, that a parameter
-    axis splits (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
+    """The share of the bytes of `params`, placed arrays, every collection a
+    frozen split keeps among them, that a parameter axis splits
+    (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
     split nothing of a model whose parameters all sit below `Layout`'s
     `min_shard`, and the run's banner says how much it does."""
     total = split = 0
@@ -1604,7 +1605,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed,
-            sharded=_split_share(state.params["params"]))
+            sharded=_split_share(state.params))
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
