@@ -207,7 +207,8 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     assert all(
         bool(jnp.any(before != after))
         for before, after in zip(
-            jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True
+            jax.tree.leaves(initial.variables["params"]),
+            jax.tree.leaves(state.variables["params"]), strict=True
         )
     )
     trained = thaw(state.variables)

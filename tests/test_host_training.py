@@ -74,7 +74,8 @@ def close(left, right, bound=STREAMED_BOUND):
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
     elif FROZEN in getattr(left, "variables", {}):
-        left = dataclasses.replace(left, variables={**left.variables, FROZEN: unbanked(left.variables[FROZEN])})
+        left = dataclasses.replace(left, variables={
+            **left.variables, FROZEN: unbanked(left.variables[FROZEN])})
     for path, a, b in _leaves(left, right):
         np.testing.assert_allclose(a, b, atol=bound, rtol=0, err_msg=path)
 

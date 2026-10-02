@@ -308,7 +308,8 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
 
     make_trainer(arrays, tmp_path).fit(Data(batch), steps=3, log_every=1)
     resumed = make_trainer(arrays, tmp_path).fit(Data(batch), steps=5, log_every=1)
-    for straight, again in zip(jax.tree.leaves(state.variables), jax.tree.leaves(resumed.variables), strict=True):
+    for straight, again in zip(jax.tree.leaves(state.variables),
+                               jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(straight), np.asarray(again))
     assert Checkpoints(str(tmp_path / "distill")).latest == 5
 
