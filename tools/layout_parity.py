@@ -706,8 +706,11 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
     The loss floor comes from reordering the batch, which reassociates the
     sum over rows; a layout that splits a row's own contraction, a sequence
     or a tensor axis over the output, reassociates the sum over its elements
-    too, which no reordering of rows moves. The magnitude is the loss's own,
-    which a loss of nonnegative terms adds up to and a signed one's exceeds."""
+    too, which no reordering of rows moves. The magnitude is |loss|, which is
+    the sum of the terms' magnitudes for a loss of nonnegative terms (cross
+    entropy, squared error) and a lower estimate of it for a signed one (an
+    advantage-weighted GRPO loss); the floor only ever widens the bound, so
+    the estimate errs toward judging more strictly, never less."""
     import numpy as np
 
     eps = float(np.finfo(np.float32).eps)
