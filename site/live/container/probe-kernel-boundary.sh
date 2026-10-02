@@ -17,8 +17,8 @@ report={'uid':os.getuid(),'gid':os.getgid(),'uid_map':open('/proc/self/uid_map')
 try:
     os.setuid(0)
     report['setuid_zero']='allowed'
-except PermissionError:
-    report['setuid_zero']='denied'
+except OSError as error:
+    report['setuid_zero']=f'denied: errno {error.errno}'
 for path in ('/opt/hf','/opt/xla','/sessions/other/private.txt'):
     try:
         if path.endswith('private.txt'):
