@@ -105,7 +105,10 @@ def _with_averages(opt_state, averages):
     def put(node):
         if not _is_profiles(node):
             return node
-        return {**node, 'averages': averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+        return (
+            {**node, "averages": averages} if isinstance(node, Mapping) else node._replace(averages=averages)
+        )
+
     return jax.tree.map(put, opt_state, is_leaf=_is_profiles)
 
 
@@ -185,7 +188,9 @@ class Metrics(Mapping):
             names = [name for name in self._values if not name.startswith('checkpoint/')
                      and (name == key.name or name.endswith('/' + key.name))]
             if len(names) != 1:
-                raise KeyError(f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)")
+                raise KeyError(
+                    f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)"
+                )
             return self._values[names[0]]
         raise KeyError(key)
 
@@ -560,16 +565,27 @@ class _RankedSteps(preservation.PreservationPolicy):
     def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
                         context: preservation.PreservationContext) -> Sequence[bool]:
         held: set[int] = set()
-        full = [checkpoint for checkpoint in checkpoints if not (checkpoint.metrics or {}).get('checkpoint/weights_only', 0)]
-        held.update(checkpoint.step for checkpoint in sorted(full, key=lambda checkpoint: checkpoint.step)[-self.checkpoints.keep.latest:]
-                    if self.checkpoints.keep.latest)
+        full = [
+            checkpoint
+            for checkpoint in checkpoints
+            if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)
+        ]
+        held.update(
+            checkpoint.step
+            for checkpoint in sorted(full, key=lambda checkpoint: checkpoint.step)[
+                -self.checkpoints.keep.latest :
+            ]
+            if self.checkpoints.keep.latest
+        )
         groups: dict[str, list[tuple[float, int]]] = {}
         limits = self.checkpoints._rank_limits
         for checkpoint in checkpoints:
             scores = checkpoint.metrics or {}
             for key, value in scores.items():
                 if key.startswith('checkpoint/rank/'):
-                    groups.setdefault(key.removeprefix('checkpoint/rank/'), []).append((value, checkpoint.step))
+                    groups.setdefault(key.removeprefix("checkpoint/rank/"), []).append(
+                        (value, checkpoint.step)
+                    )
             if 'loss' in scores:
                 groups.setdefault('train/loss', []).append((scores['loss'], checkpoint.step))
         for name, scores in groups.items():
@@ -585,7 +601,9 @@ class _RankedSteps(preservation.PreservationPolicy):
                 previous = checkpoint.time
             if keep.where:
                 try:
-                    selected = keep.where(Kept(checkpoint.step, Metrics(checkpoint.metrics or {}), None, None))
+                    selected = keep.where(
+                        Kept(checkpoint.step, Metrics(checkpoint.metrics or {}), None, None)
+                    )
                 except KeyError:
                     selected = False
                 if selected:
@@ -839,8 +857,15 @@ class Checkpoints:
         persistent = self._open().latest_step()
         if persistent is not None and (not self._complete(persistent) or
                 (self._open().metadata(persistent).custom_metadata or {}).get('weights_only', False)):
-            persistent = max((step for step in self._open().all_steps() if self._complete(step) and
-                              not (self._open().metadata(step).custom_metadata or {}).get('weights_only', False)), default=None)
+            persistent = max(
+                (
+                    step
+                    for step in self._open().all_steps()
+                    if self._complete(step)
+                    and not (self._open().metadata(step).custom_metadata or {}).get("weights_only", False)
+                ),
+                default=None,
+            )
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent
@@ -859,10 +884,20 @@ class Checkpoints:
         persistent one."""
         return self.local_path if step == self._local_latest() else self.directory
 
-    def save(self, step: int, state: TrainState, saved: bytes | None,
-             metrics: Mapping[str, float] | None = None, *,
-             share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None,
-             weights_only: bool = False, primary: str | None = None, rung: JSON = None) -> None:
+    def save(
+        self,
+        step: int,
+        state: TrainState,
+        saved: bytes | None,
+        metrics: Mapping[str, float] | None = None,
+        *,
+        share: DataPartition | None = None,
+        ranking: Ranking | Sequence[Ranking] | None = None,
+        control: dict | None = None,
+        weights_only: bool = False,
+        primary: str | None = None,
+        rung: JSON = None,
+    ) -> None:
         """Write `state` under `step`, asynchronously.
 
         Sharded arrays go straight to orbax: gathering them onto the host
@@ -909,10 +944,21 @@ class Checkpoints:
                 scores[f'checkpoint/rank/{rank.metric}'] = rank.value if rank.mode == 'min' else -rank.value
                 rules[rank.metric] = dataclasses.asdict(rank)
         with region("checkpoint.submit"):
-            persistent.save(step, args=ocp.args.PyTreeSave(state_tree), metrics=scores, force=True,
-                            custom_metadata={'ema_deltas': deltas, 'profiles': profile_metadata,
-                                             'rankings': rules, 'primary': primary or (rankings[0].metric if rankings else None),
-                                             'control': copy.deepcopy(control or {}), 'weights_only': weights_only, 'rung': rung})
+            persistent.save(
+                step,
+                args=ocp.args.PyTreeSave(state_tree),
+                metrics=scores,
+                force=True,
+                custom_metadata={
+                    "ema_deltas": deltas,
+                    "profiles": profile_metadata,
+                    "rankings": rules,
+                    "primary": primary or (rankings[0].metric if rankings else None),
+                    "control": copy.deepcopy(control or {}),
+                    "weights_only": weights_only,
+                    "rung": rung,
+                },
+            )
         self._pending = (step, scores)
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
@@ -948,8 +994,16 @@ class Checkpoints:
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
-    def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None, control: dict | None = None, rung: JSON = None) -> None:
+    def save_local(
+        self,
+        step: int,
+        state: TrainState,
+        saved: bytes | None,
+        *,
+        share: DataPartition | None = None,
+        control: dict | None = None,
+        rung: JSON = None,
+    ) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -964,9 +1018,18 @@ class Checkpoints:
         local = self._open_local()
         self._metadata = None
         with region("checkpoint.submit_local"):
-            local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
-                       custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas, 'control': copy.deepcopy(control or {}), 'rung': rung})
+            local.save(
+                step,
+                args=ocp.args.PyTreeSave(state_tree),
+                force=True,
+                custom_metadata={
+                    "processes": jax.process_count(),
+                    "placement": written,
+                    "ema_deltas": deltas,
+                    "control": copy.deepcopy(control or {}),
+                    "rung": rung,
+                },
+            )
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()

@@ -14,7 +14,7 @@ unlike the released trainer's earlier float32 score conversion.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -58,6 +58,11 @@ def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
 
 
 
+_DEFAULT_SDE = FlowSDE()
+_DEFAULT_GUIDANCE = CFG(3.0)
+_DEFAULT_SAMPLER = Euler()
+
+
 @objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
     """Train a rectified-flow policy on clipped, coordinate-normalized gradients.
@@ -79,14 +84,14 @@ class FlowGRPOObjective(DiffusionObjective):
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
-    shown = {"loss": Shown(), "reward": Shown(better="higher")}
+    shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     _ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 sde: FlowSDE = FlowSDE(), beta: float = 0.0,
+                 sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
-                 guidance: CFG | None = CFG(3.0), sampler: Solver = Euler(),
+                 guidance: CFG | None = _DEFAULT_GUIDANCE, sampler: Solver = _DEFAULT_SAMPLER,
                  steps: int = 41, pretrained: Variables | None = None):
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")

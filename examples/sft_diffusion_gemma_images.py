@@ -158,9 +158,12 @@ def main(config: Config):
     generated = task(probe["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
                      key=3).host()
     tokenizer = ByteTokenizer()
-    captions = [tokenizer.decode([int(token) for token in row[config.prompt_tokens:config.prompt_tokens+length]
-                                  if token < 256])
-                for row, length in zip(np.asarray(generated.tokens), np.asarray(generated.lengths), strict=True)]
+    captions = [
+        tokenizer.decode(
+            [int(token) for token in row[config.prompt_tokens : config.prompt_tokens + length] if token < 256]
+        )
+        for row, length in zip(np.asarray(generated.tokens), np.asarray(generated.lengths), strict=True)
+    ]
     report = {"dataset": "oxford_flowers102/train", "records": data.records,
               "device": jax.devices()[0].device_kind, "steps": int(state.step),
               "updates": int(state.updates), "probe_sft_before": before, "probe_sft_after": after,

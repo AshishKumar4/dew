@@ -272,8 +272,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     def loss(self, params: Variables, batch: Batch, step: Step):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
             params, batch, step.key, train=True)
-        canvas_stats, encoder_stats = _row_mean(canvas_losses, target_mask), _row_mean(encoder_losses, encoder_target_mask)
-        support = self.decoder_loss_weight * target_mask.sum() + self.encoder_loss_weight * encoder_target_mask.sum()
+        canvas_stats, encoder_stats = (
+            _row_mean(canvas_losses, target_mask),
+            _row_mean(encoder_losses, encoder_target_mask),
+        )
+        support = (
+            self.decoder_loss_weight * target_mask.sum()
+            + self.encoder_loss_weight * encoder_target_mask.sum()
+        )
         stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
         return stats, Aux(metrics={"canvas_ce": mean_loss(canvas_stats)[0],
                                   "encoder_ce": mean_loss(encoder_stats)[0]})
@@ -312,18 +318,27 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         value = batch["text"]
         prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))
         tokens = prepared.tokens
-        if tokens.ndim != 2 or tokens.shape[1] != self.sequence_length or not jnp.issubdtype(tokens.dtype, jnp.integer):
+        if (
+            tokens.ndim != 2
+            or tokens.shape[1] != self.sequence_length
+            or not jnp.issubdtype(tokens.dtype, jnp.integer)
+        ):
             raise ValueError(f"block SFT expects integer [B, {self.sequence_length}] token rows")
         tokens = tokens.astype(jnp.int32)
         fields = prepared.token_fields
         response = tokens[:, self.prompt_length:]
         validity = fields.get("attention_mask")
-        response_valid = response != self.pad_token_id if validity is None else validity[:, self.prompt_length:]
+        response_valid = (
+            response != self.pad_token_id if validity is None else validity[:, self.prompt_length :]
+        )
         canvas_mask = jnp.asarray(batch.get("canvas_mask", response_valid), bool)
         if canvas_mask.shape != response.shape:
             raise ValueError("canvas_mask must align with all response tokens")
-        full_valid = (jnp.concatenate([tokens[:, :self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
-                      if validity is None else jnp.asarray(validity, bool))
+        full_valid = (
+            jnp.concatenate([tokens[:, : self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
+            if validity is None
+            else jnp.asarray(validity, bool)
+        )
         if full_valid.shape != tokens.shape:
             raise ValueError("attention_mask must align with the full sequence")
         canvas_mask &= full_valid[:, self.prompt_length:]
@@ -359,15 +374,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         SequenceTargetShift; a supplied mask is taken as given, except that
         media placeholders never become labels.
         """
-        shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
-        adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
+        shifted = jnp.concatenate(
+            [tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1
+        )
+        adjacent = full_valid & jnp.concatenate(
+            [full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1
+        )
         encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")
         if validity is not None:
             encoder_target_mask *= adjacent
         if text_slots is not None:
-            encoder_target_mask *= jnp.concatenate([text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
+            encoder_target_mask *= jnp.concatenate(
+                [text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1
+            )
         return jnp.where(encoder_target_mask != 0, shifted, 0), encoder_target_mask
 
     def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool

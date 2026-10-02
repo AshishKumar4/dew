@@ -37,6 +37,19 @@ def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
 
 
+@pytest.mark.parametrize("fields,causal,message", [
+    ({"head_dim": 3}, True, "head dim"),
+    ({"window": 0}, True, "window"),
+    ({"chunk": 0}, True, "chunk"),
+    ({"window": 2, "chunk": 2}, True, "one or the other"),
+    ({"chunk": 2}, False, "not causal"),
+    ({"num_kv_heads": 3}, True, "multiple"),
+    ({"num_kv_heads": 0}, True, "multiple"),
+])
+def test_layer_kinds_refuse_invalid_rotary_mask_and_grouped_head_geometry(fields, causal, message):
+    with pytest.raises(ValueError, match=message):
+        model = tiny(num_layers=1, layer_types=("special",), kinds={"special": fields}, causal=causal)
+        model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 @pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
 def test_decoder_dropout_is_training_only(rng, field):
     base = tiny(dropout_rate=0, attention_impl="reference")
@@ -1111,6 +1124,60 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     np.testing.assert_array_equal(np.asarray(out), expected)
     grad = np.asarray(jax.jit(jax.grad(loss))(weight), np.float64)
     assert np.max(np.abs(grad - expected_grad)) <= 1e-5 * np.max(np.abs(expected_grad))
+
+
+@pytest.mark.parametrize("norm", ["rms", "rms_scaled_in_fp32", "layer"])
+def test_a_norm_under_jit_reads_the_bf16_sum_it_is_handed(norm):
+    """transformers stores a residual sum as a bf16 tensor and its norm reads
+    that. XLA's default lets a fusion skip a rounding
+    (`xla_allow_excess_precision`), and a bf16 add fused into the norm's
+    fp32 upcast was normalized unrounded: 23% of a bf16 RMSNorm's outputs,
+    30% of a LayerNorm's, differed from the norm of the stored sum, on CPU
+    and on an RTX 4080. Runs and this suite keep every rounding
+    (`dew.training.runtime.keep_roundings`). The oracle is the same norm
+    applied to the sum materialized by its own jit."""
+    from dew.nn.attention import LayerNorm, RMSNorm
+
+    a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
+    b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
+    module = {"rms": RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16),
+              "rms_scaled_in_fp32": RMSNorm(epsilon=1e-5, dtype=jnp.bfloat16),
+              "layer": LayerNorm(epsilon=1e-5, dtype=jnp.bfloat16)}[norm]
+    variables = module.init(jax.random.key(2), a)
+
+    stored = jax.jit(jnp.add)(a, b)
+    fused = jax.jit(lambda a, b: module.apply(variables, a + b))(a, b)
+
+    np.testing.assert_array_equal(np.asarray(fused), np.asarray(jax.jit(module.apply)(variables, stored)))
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("mixture", [None, {"experts": 8, "top_k": 2, "expert_features": 32}])
+def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixture):
+    """The rows are independent, so splitting the batch over devices changes
+    no token's arithmetic. With XLA free to skip roundings, what fused on one
+    device and on four differed: the hidden states of a 4-layer bf16 decoder
+    matched in 13% of entries, an 8-expert MoE's top-2 routes differed in
+    0.3% of layer 0's choices and 2.8% of layer 3's, and its loss moved
+    2.6e-4. Every rounding kept, they are bitwise the same."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    config = dict(vocab_size=512, emb_features=64, num_layers=4, num_heads=8, num_kv_heads=4,
+                  head_dim=8, mlp_features=128, max_seq_len=33, dtype=jnp.bfloat16)
+    if mixture is not None:
+        config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
+    model = CausalTransformer(**config)
+    ids = jax.random.randint(jax.random.key(0), (16, 32), 0, 512)
+    params = model.init(jax.random.key(1), ids)
+
+    def hidden(params, ids):
+        return model.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    one = jax.jit(hidden)(params, ids)
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
+    split = jax.jit(hidden)(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    np.testing.assert_array_equal(np.asarray(one), np.asarray(split))
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])

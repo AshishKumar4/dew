@@ -514,7 +514,9 @@ def model_flops_utilization(
 
 def dew_cache_dir() -> str:
     """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
-    return os.path.expanduser(os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache'), 'dew'))
+    return os.path.expanduser(
+        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
+    )
 
 
 def default_compilation_cache_dir() -> str:

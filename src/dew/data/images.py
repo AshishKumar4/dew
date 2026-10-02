@@ -534,7 +534,7 @@ class HFImages(ImageDataset):
 
     name: str = ""
     split: str = "train"
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
     image_column: str = "image"
     caption_columns: tuple[str, ...] = ("caption", "text")
     label_column: str | None = LABEL
@@ -565,7 +565,8 @@ class HFImages(ImageDataset):
                 f"caption_columns={self.caption_columns!r}, and {held}; name its caption "
                 f"column, or set caption_columns=() for a dataset without captions")
         if self.label_column not in (None, LABEL, *columns):
-            raise ValueError(f"label_column={self.label_column!r}, and {held}; name its class column, or None")
+            raise ValueError(
+                f"label_column={self.label_column!r}, and {held}; name its class column, or None")
 
     def record(self, element: Batch | bytes, rng):
         element = _fields(element, "HFImages")

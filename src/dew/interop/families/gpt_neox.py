@@ -57,11 +57,15 @@ def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                 raise ValueError(f'{name} must hold the historical negative mask sentinel')
             continue
         if name.endswith('.attention.rotary_emb.inv_freq'):
-            rotated = int(dimension * records.number(config.get('partial_rotary_factor', 1.), 'partial_rotary_factor'))
+            rotated = int(
+                dimension * records.number(config.get("partial_rotary_factor", 1.0), "partial_rotary_factor")
+            )
             expected = inverse_frequencies(records.number(config.get('rope_theta', 10000.), 'rope_theta'),
                                            rotated, dtype=np.float32).astype(tensor.dtype)
             if not np.array_equal(tensor, expected):
-                raise ValueError(f'{name} disagrees with the configured rotary frequencies in its stored dtype')
+                raise ValueError(
+                    f"{name} disagrees with the configured rotary frequencies in its stored dtype"
+                )
             continue
         if '.attention.query_key_value.' not in name:
             prepared[name] = tensor

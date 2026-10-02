@@ -28,11 +28,13 @@ import dataclasses
 import functools
 import itertools
 import json
+import logging
 import math
 import sys
 import threading
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -46,6 +48,8 @@ from dew import position
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
 from dew.objectives.base import Batch
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -388,16 +392,17 @@ class Loading:
             return None
         line = (f"waiting for {self.workers} grain workers to stop, "
                 f"up to {self.workers * _grain_kill_seconds()} s")
-        timer = threading.Timer(_QUIET_STOP_SECONDS, print, (line,),
-                                {"file": sys.stderr, "flush": True})
+        timer = threading.Timer(_QUIET_STOP_SECONDS, _log.warning, (line,))
         timer.daemon = True
         try:
             timer.start()
         except RuntimeError as refused:
-            print(f"stopping {self.workers} grain workers without a progress line: {refused}",
-                  file=sys.stderr, flush=True)
+            _log.warning("stopping %s grain workers without a progress line: %s", self.workers, refused)
             return None
         return timer
+
+
+_DEFAULT_LOADING = Loading()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -523,7 +528,7 @@ class Dataset:
     def from_grain(cls, train: GrainPipeline, *, batch: int,
                    validation: GrainPipeline | None = None,
                    records: int | None = None,
-                   loading: Loading = Loading()) -> Dataset:
+                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
         """Builds a run over grain pipelines a caller built themselves.
 
         The order, the shuffle and what a record becomes are the caller's.
@@ -578,7 +583,7 @@ class Dataset:
     @classmethod
     def from_records(cls, records: InMemory, *, batch: int, seed: int = 0,
                      validation: InMemory | None = None,
-                     loading: Loading = Loading()) -> Dataset:
+                     loading: Loading = _DEFAULT_LOADING) -> Dataset:
         """Builds a run over records the caller holds: columns, rows or a source.
 
         `records` is a mapping of columns whose first axis is the record,

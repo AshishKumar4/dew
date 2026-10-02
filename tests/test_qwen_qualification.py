@@ -16,9 +16,8 @@ import pytest
 from flax.traverse_util import flatten_dict
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import families, _wrapper_sources, translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
-
 from dew.registry import models
 from dew.sampling import Sampling, generate
 

@@ -105,7 +105,9 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
     if os.path.isdir(name_or_dir):
         path = directory / filename
         if not path.is_file():
-            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}"))
+            present = sorted(
+                entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}")
+            )
             raise FileNotFoundError(f"{path} does not exist; the {suffix} files in {directory} are {present}")
         return path
     from huggingface_hub import hf_hub_download

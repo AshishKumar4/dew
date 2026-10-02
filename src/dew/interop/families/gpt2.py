@@ -145,7 +145,9 @@ def _gpt2_export_weights(model: CausalTransformer, variables: Mapping[str, objec
             target = target.replace('model.embed_tokens.', 'transformer.wte.')
             target = target.replace('model.norm.', 'transformer.ln_f.')
             target = target.replace('model.layers.', 'transformer.h.')
-            target = target.replace('.input_layernorm.', '.ln_1.').replace('.post_attention_layernorm.', '.ln_2.')
+            target = target.replace(".input_layernorm.", ".ln_1.").replace(
+                ".post_attention_layernorm.", ".ln_2."
+            )
             target = target.replace('.self_attn.o_proj.', '.attn.c_proj.')
             target = target.replace('.mlp.up_proj.', '.mlp.c_fc.').replace('.mlp.down_proj.', '.mlp.c_proj.')
         tensors[target] = np.asarray(value).T if name == 'lm_head.kernel' else np.asarray(value)
