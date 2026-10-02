@@ -79,7 +79,7 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -87,7 +87,7 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(data_path),
         split="train",
         image_size=64,
@@ -187,19 +187,16 @@ For int8 quantization-aware training, install the `quantization` extra
 (`pip install "dewml[quantization]"`, which brings Qwix) and wrap the model before you construct the objective:
 
 ```python
-from dew.training.quantization import Quantization, apply_quantization
+from dew.training import Quantization
 
-model = apply_quantization(
-    model,
-    Quantization(dtype="int8", patterns=(".*dit_block_.*",)),
-)
+model = Quantization(dtype="int8", patterns=(".*dit_block_.*",)).apply(model)
 ```
 
 This selects the DiT transformer blocks for int8 quantization and leaves the
 patch-embedding convolution in its configured floating-point dtype. Master
 weights remain fp32. Change `patterns` to select other module paths.
 
-Import model classes directly when writing Python: `from dew.nn.backbones import SimpleDiT, CausalTransformer`. The examples below also use `models.build(name, **fields)` for models selected by configuration; both construct the same Flax classes.
+Build a model from its class, `from dew.nn.backbones import SimpleDiT, CausalTransformer`. A run record names the class by its registered name instead (`simple_dit`), and `dew.registry.models` maps that name back to the class when a recipe rebuilds the run.
 
 ## Features
 
@@ -219,21 +216,21 @@ The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` hol
 ## Models
 
 [Supported models](https://dewml.dev/reference/models/) lists every checkpoint
-family `load_pretrained` reads, by the `model_type` in its `config.json`, and
-every architecture `models.build` trains from scratch. The site generates the
+family `Pretrained.load` reads, by the `model_type` in its `config.json`, and
+every architecture Dew trains from scratch. The site generates the
 page from Dew's registries when it builds. The notes below cover their
 training, inference and export workflows.
 
 ### Text decoders
 
-`load_pretrained` reads the checkpoint's `config.json` and builds a
+`Pretrained.load` reads the checkpoint's `config.json` and builds a
 `CausalTransformer`. Training uses `LMObjective`, generation uses
-`dew.sampling.generate` or `Pretrained.text_generation()`, and
+`dew.sampling.generate` or `PretrainedDecoder.text_generation()`, and
 `Pretrained.save` writes `config.json`, `model.safetensors` and
 `generation_config.json` back in the Hugging Face layout.
 
 `dtype` selects computation; `param_dtype` independently selects parameter
-storage. `load_pretrained` keeps FP32 parameters by default. Pass
+storage. `Pretrained.load` keeps FP32 parameters by default. Pass
 `param_dtype="bfloat16"` to reduce weight storage without changing the
 compute dtype. Non-parameter state retains its declared precision.
 
@@ -273,7 +270,7 @@ every released tensor's shape.
 
 ### Native multimodal models
 
-`load_pretrained` returns the model, the checkpoint's own processor, and the
+`Pretrained.load` returns the model, the checkpoint's own processor, and the
 weights. The processor turns text and raw media into `ModelInputs`, which
 `LMObjective`, `Trainer` and cached generation take unchanged. The export
 carries the processor and tokenizer files beside the weights.
@@ -308,7 +305,7 @@ Diffusion Gemma (`diffusion_gemma`) generates canvases and trains with text
 and image-conditioned SFT.
 
 `BlockDiffusionObjective` trains the canvas loss from the loaded weights and
-`Pretrained.block_generation()` decodes canvases. Text SFT follows Google's
+`PretrainedBlockDecoder.block_generation()` decodes canvases. Text SFT follows Google's
 published recipe. Image-conditioned SFT uses the same `ModelInputs`, `Dataset`
 and `Trainer` path. Images condition the clean encoder; their placeholder slots
 are not text targets. `BlockGeneration` takes the matching `images=` when it
@@ -333,7 +330,7 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 
 ### Pretrained diffusion and quantized checkpoints
 
-`load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
+`Pretrained.load` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
 The loader reads these quantized storage formats:
@@ -405,20 +402,20 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from dew import Trainer, metrics, models
+from dew import Trainer
 from dew.data import HFTokenizer, Loading, TokenWindows
-from dew.objectives.lm import LMObjective
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 tokenizer = HFTokenizer("gpt2")
 data = TokenWindows(path="data/tinystories", seq_len=256,
                     loading=Loading(workers=0)).load(batch=32)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=256, num_layers=4, num_heads=4, max_seq_len=256,
-                     dtype=jnp.bfloat16)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
+                          num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
 objective = LMObjective(model, seq_len=256)
 lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
-    data, steps=2000, log_every=500, eval_every=1000, metrics=(metrics.perplexity(),))
+    data, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.params, [tokenizer.encode("Once upon a time")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -569,8 +566,7 @@ masked_data = TokenWindows(path="data/tinystories", seq_len=127,
                            loading=Loading(workers=0)).load(batch=64)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
-masked_model = models.build(
-    "causal_transformer",
+masked_model = CausalTransformer(
     vocab_size=mask_id + 1,
     emb_features=256,
     num_layers=4,
@@ -585,7 +581,7 @@ masked_state = Trainer(
     optax.adamw(1e-3),
     key=jax.random.key(4),
 ).fit(masked_data, steps=4000, log_every=1000, eval_every=2000,
-      metrics=(metrics.perplexity(),))
+      metrics=(Perplexity(),))
 drawn = process.generate(masked_model, masked_state.averaged,
                          [tokenizer.encode("Once upon a time")], 48, key=jax.random.key(5))
 print(tokenizer.decode(drawn.tokens[0]))
@@ -607,28 +603,26 @@ from pathlib import Path
 import jax
 import optax
 
-from dew import Field, Trainer, metrics, models
-from dew.data import Loading, OxfordFlowers
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew import Field, Trainer
+from dew.data import Loading, TFDSImages
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         split="train",
         image_size=64,
         val_batches=2,
         loading=Loading(workers=0, threads=1, read_buffer=2),
     ).load(batch=16)
-    encoder = models.build(
-        "jepa_encoder",
+    encoder = JepaEncoder(
         patch_size=8,
         emb_features=64,
         num_layers=2,
         num_heads=4,
     )
-    predictor = models.build(
-        "jepa_predictor",
+    predictor = JepaPredictor(
         grid=(8, 8),
         emb_features=64,
         predictor_features=32,
@@ -638,7 +632,7 @@ def train_jepa():
     objective = JepaObjective(
         encoder,
         predictor,
-        mask=multi_block_mask((8, 8), num_targets=1, scale=(0.25, 0.25)),
+        mask=MultiBlockMask.for_grid((8, 8), num_targets=1, scale=(0.25, 0.25)),
         sample=Field("image", (64, 64, 3)),
         momentum_steps=20,
     )
@@ -651,7 +645,7 @@ def train_jepa():
         steps=20,
         log_every=10,
         eval_every=20,
-        metrics=(metrics.knn_probe(102),),
+        metrics=(KnnProbe(102),),
     )
 
 
@@ -670,12 +664,12 @@ import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
 
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.sampling import Sampling, generate
 
 checkpoint = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-pretrained = load_pretrained(
+pretrained = PretrainedDecoder.load(
     checkpoint,
     dtype="bfloat16",
     max_seq_len=512,
@@ -799,7 +793,7 @@ Which call continues a run depends on the artifact you kept:
 | A native checkpoint directory | The same run: optimizer state, the root key, and the data position | `Trainer(..., checkpoints=Checkpoints(directory))`, then `fit` |
 | A `TrainState` in memory | Generation from the weights you just trained | `objective.pipeline(state)` |
 | A saved run: `run.json` beside its checkpoints | Generation, with the model rebuilt from the record | `dew.pipeline(run_directory)` |
-| A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `load_pretrained(source)` for the variables |
+| A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `Pretrained.load(source)` for the variables |
 | Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.params)` |
 | A saved run another runtime has to read | The same layout, from the run alone | `dew.interop.export_run(run_directory, destination)`, or `dew export <run> <dest>` |
 
@@ -818,7 +812,7 @@ uses that path with `--attention-impl xla`.
 
 ### Standalone evaluation and local reports
 
-`evaluate` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
+`Evaluation.run` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dewml[plots]` for Matplotlib output.
 
 ```python
 import itertools
@@ -827,8 +821,9 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, LocalTracker, Trainer, evaluate, metrics, models
-from dew.objectives.lm import LMObjective, Samples
+from dew import Dataset, Evaluation, LocalTracker, Trainer
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
 
 row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
@@ -839,8 +834,7 @@ data = Dataset(
     records=8,
     batch=8,
 )
-model = models.build(
-    "causal_transformer",
+model = CausalTransformer(
     vocab_size=8,
     emb_features=32,
     num_layers=1,
@@ -860,11 +854,11 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
         key=jax.random.key(0),
         tracker=tracker,
     ).fit(data, steps=40, log_every=10)
-    result = evaluate(
+    result = Evaluation.run(
         objective,
         state.params,
         data.val,
-        metrics=(metrics.perplexity(),),
+        metrics=(Perplexity(),),
         key=jax.random.key(1),
         step=int(state.step),
         preview=True,
@@ -897,12 +891,12 @@ Install `dewml[profile]`, or use `uv pip install -e '.[profile]'` from this chec
 ```python
 import dew
 
-with dew.profile("profiles/run"):
+with dew.Profiler("profiles/run"):
     state = trainer.fit(data, steps=1000)
 ```
 
 ```python
-prof = dew.profile("profiles/run")
+prof = dew.Profiler("profiles/run")
 prof.start()
 try:
     state = trainer.fit(data, steps=1000)
@@ -912,26 +906,26 @@ finally:
 
 Each capture gets a new directory, so restarting a profiler keeps earlier results. Without a path, the first start creates a persistent temporary directory, available as `prof.directory`. A capture keeps the native XPlane traces, the available HLO files, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's own viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
 
-A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `profile` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
+A capture leaves JAX's Python tracer off. The tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is time the run doesn't spend. To trace differently, pass `Profiler` an `options=` value. To start a trace yourself the way a capture does, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
 
-To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.profile`, not both.
+To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the trace `directory`, the number of `steps` to trace, and the `warmup` steps to run first. The loop starts tracing after the warm-up, stops after the requested steps, and reports the window to the tracker as a `ProfileWindow` record. Use either this schedule or an outer `dew.Profiler`, not both.
 
 ### Sweeping a hyperparameter
 
-`sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
+`RunConfig.sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
 
 ```python
-from dew import LocalTracker, evaluate, metrics
+from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, sweep
-from dew.registry import datasets
+from dew.config.sweep import grid_search
+from dew.data import TokenWindows
 
 config = RunConfig(
     model=ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 32,
                                              "num_layers": 1, "num_heads": 2,
                                              "mlp_features": 64, "max_seq_len": 32}),
     # The synthetic batches above stand in for the dataset this names.
-    data=datasets["token_windows"](seq_len=16),
+    data=TokenWindows(seq_len=16),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
                           eval_every=None, checkpoint_every=None),
@@ -941,13 +935,13 @@ config = RunConfig(
 def trial(run: RunConfig) -> float:
     """Train one point and score it: the perplexity its own run ends on."""
     state = run.train(objective, data, name=run.trainer.name or "lm-rate")
-    return float(evaluate(objective, state.params, data.val, metrics=(metrics.perplexity(),),
-                          key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
+    return float(Evaluation.run(objective, state.params, data.val, metrics=(Perplexity(),),
+                                key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
 best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
@@ -967,7 +961,7 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
-Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. The sampler uses `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
+Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. `sample` runs the solver under `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
 `TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
@@ -1017,7 +1011,7 @@ This prints `Once upon a time, there was a little girl named Lily [8]` and `True
 4 prompt tokens the row also carries. `Generation` also returns `terminated`,
 and the `behavior_log_probs` and `raw_log_probs` a policy ratio needs.
 
-A task built by `Pretrained.text_generation()` carries the checkpoint's
+A task built by `PretrainedDecoder.text_generation()` carries the checkpoint's
 processor, so it accepts strings and `decode` returns text. Without a
 processor the task takes token rows or `ModelInputs`.
 
@@ -1036,7 +1030,7 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion import presets
 from dew.inference import TextToImage
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -1046,7 +1040,7 @@ run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
     model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 128,
                                      "num_layers": 4, "num_heads": 4}),
-    data=OxfordFlowers(
+    data=TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         image_size=64,
         val_batches=0,
@@ -1070,7 +1064,7 @@ def main():
     print(sorted(path.name for path in run.iterdir()))
 
     task = TextToImage.from_run(str(run))
-    images = task(["a flower", "another flower"], steps=20, sampler=Heun(),
+    images = task(["a flower", "another flower"], steps=20, solver=Heun(),
                   key=jax.random.key(1))
     print(images.host().images.shape, int(state.updates))
 
@@ -1090,9 +1084,11 @@ its shutdown is part of the run.
 
 ### Exporting a decoder and serving it
 
-`save_pretrained_decoder` writes the Hugging Face layout and asks the tokenizer
-the run trained with to save its own files into the same directory. Another
-runtime can read that directory as it is.
+`PretrainedDecoder.from_model(model, variables, tokenizer=...)` is a model
+trained in Dew as a source bundle, and its `save(directory)` writes the
+Hugging Face layout and asks the tokenizer the run trained with to save its
+own files into the same directory. Another runtime can read that directory as
+it is.
 
 Tokenize a corpus with the tokenizer the export will carry, so the token ids
 and the exported vocabulary are the same one. `tiny-tools` is the small
@@ -1107,39 +1103,40 @@ dew tokenize \
 ```
 
 ```python
-import json
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Trainer, models
-from dew.data import HFTokenizer, Loading, TokenWindows
-from dew.interop import load_pretrained, save_pretrained_decoder
+from dew import Trainer
+from dew.data import HFTokenizer, Loading, TokenCorpus, TokenWindows
+from dew.interop import PretrainedDecoder
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 
 tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
-meta = json.loads((tokens / "meta.json").read_text())
-tokenizer = HFTokenizer(meta["tokenizer"])
+corpus = TokenCorpus.read(tokens)
+tokenizer = HFTokenizer(corpus.tokenizer)
 
 data = TokenWindows(path=str(tokens), seq_len=128,
                     loading=Loading(workers=0, threads=1, read_buffer=2)
                     ).load(batch=16)
-model = models.build("causal_transformer", vocab_size=meta["vocab_size"],
-                     emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
-                     mlp_features=256, max_seq_len=128, dtype="float32",
-                     qk_norm=False, tie_embeddings=False)
+model = CausalTransformer(vocab_size=corpus.vocab_size,
+                          emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
+                          mlp_features=256, max_seq_len=128, dtype=jnp.float32,
+                          qk_norm=False, tie_embeddings=False)
 state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 
-save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(export)
 print(sorted(path.name for path in export.iterdir()))
 
-task = load_pretrained(str(export), dtype="float32").text_generation()
+task = PretrainedDecoder.load(str(export), dtype="float32").text_generation()
 drawn = task("The trainer", 12, key=jax.random.key(1),
              sampling=Sampling(temperature=0.0))
 print(task.decode(drawn))
@@ -1263,8 +1260,11 @@ def main():
 
     prepare_process(multi_host=True)
     try:
-        from dew import Checkpoints, MeshSpec, Trainer, models
+        import jax.numpy as jnp
+
+        from dew import Checkpoints, MeshSpec, Trainer
         from dew.data import Loading, TokenWindows
+        from dew.nn.backbones import CausalTransformer
         from dew.objectives.lm import LMObjective
 
         data = TokenWindows(
@@ -1272,15 +1272,14 @@ def main():
             seq_len=128,
             loading=Loading(workers=0, threads=1, read_buffer=2),
         ).load(batch=16)
-        model = models.build(
-            "causal_transformer",
+        model = CausalTransformer(
             vocab_size=256,
             emb_features=128,
             num_layers=2,
             num_heads=4,
             mlp_features=256,
             max_seq_len=128,
-            dtype="bfloat16",
+            dtype=jnp.bfloat16,
         )
         trainer = Trainer(
             LMObjective(model, seq_len=128),

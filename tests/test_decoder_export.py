@@ -89,7 +89,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.safetensors_io import save_hf_layout
 from tools import decoder_export_reference as tool
 
@@ -197,7 +197,7 @@ def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
 
 
 def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip):
-    """`load_pretrained` reads the export back into the same model with the
+    """`Pretrained.load` reads the export back into the same model with the
     trained values bit for bit, so it computes the same logits."""
     assert trip.reloaded.model == trip.source.model, "the export rebuilds a different model"
 
@@ -249,7 +249,7 @@ def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path)
     export = tmp_path / "rotated"
     dataclasses.replace(trip.source, weight_layouts=rotated).save(
         export, variables=trip.trained)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
 
     assert set(tool.source_tensors(export)) == set(trip.source_tensors), (
         "the rotation changed the tensor table, so the difference below is not numerical")
@@ -395,13 +395,13 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
         copyfile(TOKENIZER / name, directory / name)
 
-    source = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     assert source.processor is not None, "the source's tokenizer files were not read"
     export = tmp_path / "exported"
     source.save(export)
 
     assert (export / "tokenizer.json").is_file()
-    again = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     assert again.processor is not None, "the export carries no tokenizer"
     rows = np.arange(8, 32, dtype=np.int32).reshape(2, 12)
     assert again.processor.decode(rows) == source.processor.decode(rows)
@@ -415,7 +415,7 @@ def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp
     import torch
     from transformers import AutoModelForCausalLM
 
-    source = load_pretrained(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
     ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
     expected = np.asarray(source.model.apply(source.variables, ids))
     export = tmp_path / "export"
@@ -429,7 +429,7 @@ def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp
     with torch.no_grad():
         theirs = reference(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
     np.testing.assert_allclose(theirs, expected, atol=LOGITS, rtol=0)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="reference")
     np.testing.assert_allclose(np.asarray(again.model.apply(again.variables, ids)), expected, atol=LOGITS, rtol=0)
 
     source.save(export)
@@ -440,15 +440,14 @@ SYNTHETIC_CHECKPOINT = """
 import sys
 from pathlib import Path
 import jax, jax.numpy as jnp, numpy as np
-from dew.interop import load_pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
+from dew.interop import Pretrained, PretrainedDecoder
 
-source = load_pretrained(sys.argv[1], dtype="float32", attention_impl="reference")
+source = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
 model = source.model.clone(num_layers=12, layer_types=("full_attention",) * 12, vocab_size=16000,
                            emb_features=1024, num_heads=16, num_kv_heads=8, head_dim=64, mlp_features=3072)
 variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
                          model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
-save_pretrained_decoder(model, variables, sys.argv[2])
+PretrainedDecoder.from_model(model, variables).save(sys.argv[2])
 for asset in Path(sys.argv[1]).glob("tokenizer*"):
     (Path(sys.argv[2]) / asset.name).write_bytes(asset.read_bytes())
 """
@@ -491,7 +490,7 @@ def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, mon
     from dew.interop import safetensors_io
     from dew.interop.safetensors_io import read_weights
 
-    source = load_pretrained(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
+    source = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
     export = tmp_path / "export"
     source.save(export, max_shard_size=64 * 1024)
     first = read_weights(export)
@@ -553,8 +552,8 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     packed[scaled] = rounded
     packed[scaled + "_scale_inv"] = torch.ones((1, 1), dtype=torch.float32)
     save_file(packed, str(directory / "model.safetensors"))
-    quantized = load_pretrained(directory, dtype="float32", attention_impl="reference")
-    expected = load_pretrained(
+    quantized = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    expected = Pretrained.load(
         expected_directory, dtype="float32", attention_impl="reference"
     )
     ids = np.load(source / "input_ids.npy")
@@ -581,8 +580,8 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
     plain_directory = tmp_path / "decoded-export"
     save_hf_layout(float_export, plain_config, plain_directory)
-    decoded = load_pretrained(plain_directory, dtype="float32", attention_impl="reference")
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    decoded = Pretrained.load(plain_directory, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(tool.logits(reloaded, reloaded.variables, ids),
                                   tool.logits(decoded, decoded.variables, ids))
     for layout in quantized.weight_layouts:
@@ -611,7 +610,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "source"
     save_hf_layout(packed, config, directory)
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(source / "input_ids.npy")
     state = tool.train(tool.Case("gpt_oss", "gpt-oss-tiny"), loaded, ids)
     destination = tmp_path / "export"
@@ -633,8 +632,8 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     plain_directory = tmp_path / "decoded"
     plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
     save_hf_layout(decoded, plain_config, plain_directory)
-    plain = load_pretrained(plain_directory, dtype="float32", attention_impl="reference")
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    plain = Pretrained.load(plain_directory, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(tool.logits(plain, plain.variables, ids),
                                   tool.logits(reloaded, reloaded.variables, ids))
     missing = dataclasses.replace(loaded, quantized_tensors=())
@@ -654,7 +653,7 @@ def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
     save_hf_layout(tensors, json.loads((source / "config.json").read_text()), directory)
 
     with pytest.raises(ValueError, match=copy.replace(".", r"\.")):
-        load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+        Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
 
 
 def test_a_shared_copy_cannot_hide_an_undeclared_prediction_depth(tmp_path):
@@ -667,7 +666,7 @@ def test_a_shared_copy_cannot_hide_an_undeclared_prediction_depth(tmp_path):
     directory = tmp_path / "undeclared-depth"
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="undeclared prediction depth"):
-        load_pretrained(directory, dtype="float32", attention_impl="reference")
+        Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
 
 @pytest.mark.parametrize("name", ["deepseek_v2", "deepseek_v3", "deepseek_v32"])
@@ -682,7 +681,7 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
     save_hf_layout(tool.source_tensors(source), config, directory)
     ids = np.load(source / "input_ids.npy")
 
-    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     np.testing.assert_allclose(tool.logits(loaded, loaded.variables, ids),
                                tool.reference_logits(CASES[name], directory, ids),
                                atol=LOGITS, rtol=0)
@@ -747,8 +746,8 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
         config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "quantized"
     save_hf_layout(packed, config, directory)
-    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
-    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    masters = Pretrained.load(directory, dtype="bfloat16", attention_impl="xla")
+    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert masters.quantized_tensors == native.quantized_tensors
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
 
@@ -779,9 +778,9 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
     save_hf_layout(tensors, config, directory)
     if not same_values:
         with pytest.raises(ValueError, match="tie_word_embeddings"):
-            load_pretrained(directory, param_dtype="bfloat16")
+            Pretrained.load(directory, param_dtype="bfloat16")
     else:
-        loaded = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        loaded = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
         values = loaded.variables["params"]["embed_tokens"]["embedding"]
         assert np.asarray(values).dtype == ml_dtypes.bfloat16
         np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
@@ -806,7 +805,7 @@ def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path
     directory = tmp_path / "shared-decoder"
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="differs between the encoder and the decoder"):
-        load_pretrained(directory, param_dtype="bfloat16")
+        Pretrained.load(directory, param_dtype="bfloat16")
 
 
 def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tmp_path):
@@ -818,10 +817,10 @@ def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tm
     config = json.loads((source / "config.json").read_text())
     del config["text_config"]["tie_word_embeddings"]
     (source / "config.json").write_text(json.dumps(config))
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     destination = tmp_path / "export"
     loaded.save(destination)
-    restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     for expected, actual in zip(jax.tree.leaves(loaded.variables),
                                 jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(actual, expected)
@@ -849,9 +848,9 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
     from flax.core import unfreeze
     from transformers import Gemma4ForCausalLM
 
-    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.interop import PretrainedDecoder
 
-    loaded = load_pretrained(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
     model = loaded.model.clone(layer_scalar=mode)
     ids = np.load(FIXTURES / fixture / "input_ids.npy")
     if dense:
@@ -865,9 +864,9 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
         collection = "params" if mode == "trainable" else "constants"
         variables[collection][layer]["layer_scalar"] = jnp.full_like(scalar, 0.75 + index * 0.125)
     expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
-    save_pretrained_decoder(model, variables, tmp_path)
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
 
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
     reference, report = Gemma4ForCausalLM.from_pretrained(
@@ -893,7 +892,7 @@ def glm5_native_export_case(variant):
     from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
     from dew.nn.kda import KimiDeltaAttentionMixer
 
-    source = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", attention_impl="reference")
     model, variables = source.model, unfreeze(dict(source.variables))
     assert isinstance(model, CausalTransformer)
     params = variables["params"]
@@ -942,7 +941,7 @@ def glm5_native_export_case(variant):
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp
 
-    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.interop import PretrainedDecoder
     from dew.sampling import Sampling, Speculative, generate
 
     model, variables, ids = glm5_native_export_case(variant)
@@ -950,8 +949,8 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     if model.num_nextn_predict_layers:
         cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[1]
-    save_pretrained_decoder(model, {**variables, **cache}, tmp_path)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    PretrainedDecoder.from_model(model, {**variables, **cache}).save(tmp_path)
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
     np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], tmp_path, ids),

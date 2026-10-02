@@ -1,29 +1,21 @@
 """Representation autoencoders, diffusers' `AutoencoderRAE`.
 
-An independent linen port of diffusers 0.40.0
-src/diffusers/models/autoencoders/autoencoder_rae.py (Apache-2.0) and of the
-frozen encoders it builds from transformers 4.57.1 (DINOv2 with registers,
-SigLIP, ViT-MAE), channels last. An RAE encodes an image with a pretrained
-representation encoder, frozen, and reads its patch tokens as the latent: a
-`[grid, grid, width]` map whatever the image's size, since the image is
-resized (bicubic, as torch computes it) to the encoder's input first. A ViT
-decoder paints one patch per token.
+An independent linen port of diffusers 0.40.0 autoencoder_rae.py
+(Apache-2.0) and the frozen encoders it builds from transformers 4.57.1
+(DINOv2 with registers, SigLIP, ViT-MAE), channels last. The latent is the
+frozen encoder's patch tokens, a `[grid, grid, width]` map whatever the image
+size, since the image is first resized (bicubic, as torch computes it) to
+the encoder's input; a ViT decoder paints one patch per token.
 
-The three encoders are one pre-norm ViT and differ in their tables:
-
-- DINOv2 prepends a class token and four registers, scales each residual
-  branch by a learned layer scale, and resizes its 37x37 position table
-  (its 518-pixel pretraining) with antialiasing;
-- SigLIP has neither extra token and a tanh GELU;
-- ViT-MAE prepends a class token; its table is the 224-pixel one. The source
-  runs it with masking off, which keeps every patch in order.
-
-Each ends in a layer norm without scale or bias, as the source strips them,
-and the latent is the patch tokens alone. transformers' plain `Dinov2Model`,
-which REPA aligns to, is the same encoder as `dinov2_plain`: one class token,
-no registers, its table resized without antialiasing, its final norm kept
-(`load_dinov2`). The decoder's position table is the
-2-D sine-cosine one diffusers computes, a zero row for its class token first.
+The encoders are one pre-norm ViT with different tables: DINOv2 prepends a
+class token and four registers, scales each residual branch by a layer
+scale, and resizes its 37x37 position table with antialiasing; SigLIP has
+neither token and a tanh GELU; ViT-MAE prepends a class token at its
+224-pixel table, run with masking off. Each ends in an affine-free layer
+norm. `dinov2_plain` is transformers' `Dinov2Model`, which REPA aligns to:
+one class token, no registers, no antialiasing, its final norm kept
+(`load_dinov2`). The decoder's table is diffusers' 2-D sine-cosine one with a
+zero class row first.
 """
 from __future__ import annotations
 
@@ -46,7 +38,7 @@ from dew.nn.text_encoders import check_tree
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import AutoEncoder
+from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
@@ -419,7 +411,7 @@ def _statistic(values, grid: int, width: int, default: float) -> np.ndarray | fl
     return array.transpose(1, 2, 0)
 
 
-class RAEAutoencoder(AutoEncoder):
+class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     """Native RAE weights and the source's latent normalization,
     `(z - latents_mean) / (latents_std + 1e-5) * scaling_factor` on the way
     out and its inverse on the way in, per latent position where the
@@ -427,17 +419,10 @@ class RAEAutoencoder(AutoEncoder):
 
     def __init__(self, *, model: RAE, params: Variables, latents_mean=None, latents_std=None,
                  scaling_factor: float = 1.0):
-        self.model = model
-        self.params = params
+        super().__init__(model, params)
         self.latent_shift = _statistic(latents_mean, model.grid, model.encoder_width, 0.0)
         self.latent_scale = scaling_factor / (
             _statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5
-        )
-        self._encode = jax.jit(
-            lambda params, images: model.apply({"params": params}, images, method=model.encode)
-        )
-        self._decode = jax.jit(
-            lambda params, latents: model.apply({"params": params}, latents, method=model.decode)
         )
 
     @property
@@ -451,12 +436,6 @@ class RAEAutoencoder(AutoEncoder):
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         *lead, _, _, _ = shape
         return (*lead, self.model.grid, self.model.grid, self.latent_channels)
-
-    def encode_batch(self, params, x, key=None):
-        return self._encode(params, x)
-
-    def decode_batch(self, params, z):
-        return self._decode(params, z)
 
 
 def load_rae(
@@ -504,18 +483,12 @@ def load_dinov2(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
                 param_dtype: str = "float32", params: Variables | None = None
                 ) -> tuple[RepresentationEncoder, Variables, tuple[WeightLayout, ...]]:
     """Build a transformers `Dinov2Model` checkpoint, such as
-    `facebook/dinov2-base`, as a `RepresentationEncoder` of kind
-    `dinov2_plain` at the checkpoint's 518-pixel input, its parameters, and
-    their source layouts under `representation`. Its tensors are named as an
-    RAE's DINOv2 encoder's are, without the `encoder.` in front.
-
-    The encoder reads ImageNet-normalized `[B, S, S, 3]` pixels at its
-    `input_size`; `module.clone(input_size=224)` reads 224-pixel ones with
-    the position table resized to the 16x16 grid, as `Dinov2Model` resizes
-    it for a 224-pixel image.
-
-    Supplied `params` are bound unchanged: only the config is read, and no
-    source layouts are returned."""
+    `facebook/dinov2-base`, as a `dinov2_plain` `RepresentationEncoder` at its
+    518-pixel input, with its parameters and their source layouts under
+    `representation`. It reads ImageNet-normalized `[B, S, S, 3]` pixels;
+    `module.clone(input_size=224)` resizes the table to the 16x16 grid as
+    `Dinov2Model` does. Supplied `params` are bound unchanged, only the config
+    is read, and no layouts are returned."""
     from dew.interop import diffusion, sources
 
     directory = sources.snapshot(str(name_or_dir), revision, weights=params is None)

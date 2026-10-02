@@ -88,6 +88,7 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
     return jnp.mean(jnp.argmax(votes, axis=-1) == test_y)
 
 
+@metrics("linear_probe")
 @dataclass(frozen=True)
 class LinearProbe:
     """Report linear probe accuracy over each validation batch's representations."""
@@ -115,6 +116,7 @@ class LinearProbe:
         return mean_of_totals(accumulated)
 
 
+@metrics("knn_probe")
 @dataclass(frozen=True)
 class KnnProbe:
     """Report cosine k-NN accuracy over each validation batch's representations."""
@@ -137,13 +139,3 @@ class KnnProbe:
     def finalize(self, accumulated: tuple[float, float]) -> float:
         return mean_of_totals(accumulated)
 
-
-@metrics("linear_probe")
-def linear_probe(num_classes: int, steps: int = 100, learning_rate: float = 1e-2,
-                 weight_decay: float = 1e-4) -> LinearProbe:
-    return LinearProbe(num_classes, steps, learning_rate, weight_decay)
-
-
-@metrics("knn_probe")
-def knn_probe(num_classes: int, k: int = 20) -> KnnProbe:
-    return KnnProbe(num_classes, k)

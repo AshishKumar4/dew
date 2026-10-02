@@ -70,11 +70,12 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
 
 
 def test_builtin_autoencoder_record_uses_the_saved_parameters():
-    from dew.nn.autoencoders import AutoEncoder, SimpleAutoEncoder
+    from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
     image = jnp.ones((1, 8, 8, 3))
-    original = SimpleAutoEncoder(feature_depths=(4,), latent_channels=2, out_channels=3,
-                                 norm_groups=1, key=jax.random.key(0), sample_shape=image.shape,
-                                 dtype=jnp.float32)
+    module = AutoencoderKL(channels=(4,), latent_channels=2, layers_per_block=1, norm_groups=1,
+                           dtype=jnp.float32)
+    variables = module.init(jax.random.key(0), image)
+    original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
     rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
     np.testing.assert_array_equal(original.encode(image), rebuilt.encode(image))
     latent = original.encode(image)

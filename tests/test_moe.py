@@ -32,10 +32,10 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
@@ -184,9 +184,9 @@ def test_the_selection_bias_never_reaches_the_gate_values():
     hidden = jnp.asarray(tensors["hidden"])
     router = deepseek_router()
     variables = router_variables(tensors, bias=True)
-    weights, indices = router.apply(variables, hidden)
+    (weights, indices), sown = router.apply(variables, hidden, mutable=["router"])
 
-    scores = router.apply(variables, hidden, method=Router.scores)
+    scores = sown["router"]["scores"][0]
     biased = scores + jnp.asarray(tensors["mlp.gate.e_score_correction_bias"])
     scale = config["routed_scaling_factor"]
 
@@ -778,7 +778,7 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
                       out_features=32)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 4, 32)))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
     shardings = Layout(min_shard=min_shard_size).shardings(mesh, variables)
     return mesh, jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
@@ -825,7 +825,7 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
     model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    mesh = MeshSpec(fsdp=fsdp_size, expert=expert_size).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
 
@@ -851,7 +851,7 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
     model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(MeshSpec(fsdp=1, expert=8))
+    mesh = MeshSpec(fsdp=1, expert=8).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
 
@@ -860,16 +860,16 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
 
 
 @pytest.mark.mesh
-def test_build_mesh_rejects_an_expert_size_the_devices_cannot_hold():
+def test_mesh_build_rejects_an_expert_size_the_devices_cannot_hold():
     with pytest.raises(ValueError, match="expert 4"):
-        build_mesh(MeshSpec(fsdp=4, expert=4))
+        MeshSpec(fsdp=4, expert=4).build()
 
 
 @pytest.mark.mesh
 def test_the_batch_is_split_over_the_expert_axis_too():
     """Expert parallelism must not cost data parallelism: every device holds a
     slice of the batch whichever axis it sits on."""
-    mesh = build_mesh(MeshSpec(fsdp=2, expert=4))
+    mesh = MeshSpec(fsdp=2, expert=4).build()
     batch = shard_batch(mesh, np.zeros((jax.device_count(), 4), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
@@ -1007,7 +1007,7 @@ def test_balancing_needs_a_router_with_a_bias():
     trainer.objective.balance_rate = 0.01
     params = trainer.initial_state().params
     with pytest.raises(ValueError, match="bias=True"):
-        scalar_loss(trainer.objective, params, next(token_batches()),
+        trainer.objective.scalar_loss(params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
 
 
@@ -1125,7 +1125,7 @@ def test_a_forward_reads_the_expert_kernels_as_stored(experts, dispatch):
     x = jnp.zeros((4, 16, width), jnp.float32)
     shapes = jax.eval_shape(module.init, jax.random.key(0), x)
     variables = jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), shapes)
-    with jax.set_mesh(build_mesh(MeshSpec(expert=4, fsdp=2))), nn.logical_axis_rules(()):
+    with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()), nn.logical_axis_rules(()):
         program = str(jax.make_jaxpr(module.apply)(variables, x))
     kernels = [f"{experts},{rows},{columns}" for experts in (8, 2)
                for rows, columns in ((width, hidden), (hidden, width),

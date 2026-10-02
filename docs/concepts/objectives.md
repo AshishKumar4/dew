@@ -52,7 +52,7 @@ class Continued(Objective):
 
 `loss(variables, batch, step)` returns `(statistics, aux)`. `Ratio(total, mass)` holds additive terms that share one denominator; the mass is nonnegative and does not depend on the parameters. The trainer adds totals and masses over an accumulation window and then divides, treating zero mass as no data. A plain scalar is one term with unit mass; Dew does not infer token or row weights from a scalar.
 
-For a composite loss, return a pytree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`, keeping independent denominators separate. `scalar_loss(objective, variables, batch, step)` computes `(value, aux)` from the same statistics for direct differentiation. A loss that is not additive over the batch needs its own decomposition into additive statistics; a per-microbatch mean is not a substitute.
+For a composite loss, return a pytree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`, keeping independent denominators separate. `objective.scalar_loss(variables, batch, step)` computes `(value, aux)` from the same statistics for direct differentiation. A loss that is not additive over the batch needs its own decomposition into additive statistics; a per-microbatch mean is not a substitute.
 
 `Aux(metrics=...)` holds scalar arrays to report next to the loss. With a tracker configured, the trainer records them as `train/<name>` at the logging interval. They are measured on the training batch, not on the validation set.
 
@@ -84,7 +84,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Ratio, Objective, mean_loss
+from dew.objectives.base import Aux, Ratio, Objective
 
 
 class NormalizedRegressor(nn.Module):
@@ -107,7 +107,7 @@ class StatefulRegression(Objective):
         )
         errors = (prediction - batch["y"]) ** 2
         loss = Ratio(jnp.sum(errors), jnp.asarray(errors.size))
-        mse, _ = mean_loss(loss)
+        mse, _ = loss.mean()
         return loss, Aux(metrics={"mse": mse}, variables=updated)
 
 

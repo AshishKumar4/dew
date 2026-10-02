@@ -163,7 +163,8 @@ def test_train_lm_example_samples_what_it_trained(tmp_path):
     (tokens / "train.bin").write_bytes(text[:3600])
     (tokens / "val.bin").write_bytes(text[3600:])
     (tokens / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
+        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 3600,
+         "val_tokens": 400, "eos_id": None}))
     example = load_example("train_lm")
     config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
                             learning_rate=1e-2, model=dict(emb_features=16, num_layers=1, num_heads=2),
@@ -396,7 +397,7 @@ def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
-    `evaluate` scores over the held-out split, a greedy continuation, and a
+    `Evaluation.run` scores over the held-out split, a greedy continuation, and a
     served comparison that neither SDK can reach. An installed SDK reports
     the endpoint unreachable, an absent one is skipped, and neither needs an
     OpenAI key, which the smoke's environment does not carry."""
@@ -469,7 +470,7 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
                "    return packed\n"
                "RolloutScheduler.__call__ = counted\n"
                "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
-               "source = example.load_pretrained(str(example.SMOKE_MODEL), dtype='float32')\n"
+               "source = example.PretrainedDecoder.load(str(example.SMOKE_MODEL), dtype='float32')\n"
                "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
                "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n")
     finished = subprocess.run([sys.executable, "-c", program, str(tmp_path)], cwd=REPO_ROOT, env=single_device(),

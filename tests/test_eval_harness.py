@@ -78,7 +78,7 @@ def _pair(max_length: int, bos_directory=None):
 
     from dew.data.text import ByteTokenizer, HFTokenizer
     from dew.inference.pipeline import RunProcessor
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
     reference = _byte_tokenizer(bos_directory is not None)
@@ -87,7 +87,7 @@ def _pair(max_length: int, bos_directory=None):
     else:
         reference.save_pretrained(str(bos_directory))
         run_tokenizer = HFTokenizer(str(bos_directory), local_files_only=True)
-    loaded = load_pretrained(LLAMA, dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
     ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
                                 sampling=Sampling(eos_id=255)), batch_size=2)
@@ -242,6 +242,17 @@ def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
     assert isinstance(built, DewLM) and built.batch_size == 2
     with pytest.raises(ValueError, match="name it with --model_args run="):
         get_model("dew").create_from_arg_string("batch_size=2")
+
+
+def test_the_registry_builds_a_run_that_kept_no_average(tmp_path):
+    """A run trained without an EMA loads its live weights through the
+    registry, as `dew.pipeline` loads it; asking for the average still refuses."""
+    from lm_eval.api.registry import get_model
+
+    make_lm_run(tmp_path, ema_decay=None)
+    assert isinstance(get_model("dew").create_from_arg_string(f"run={tmp_path}"), DewLM)
+    with pytest.raises(ValueError, match="keeps no EMA"):
+        DewLM.from_run(str(tmp_path), ema=True)
 
 
 @pytest.mark.network

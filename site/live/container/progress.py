@@ -90,19 +90,19 @@ class Reporting:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.pipe, name)
 
-    def __call__(self, prompts, *, steps: int | None = None, sampler=None, decode: bool = True, **kw):
+    def __call__(self, prompts, *, steps: int | None = None, solver=None, decode: bool = True, **kw):
         count = self.pipe.steps if steps is None else steps
         # The solver steps between the grid's points; the model's last call, the
         # clean prediction at the final point, runs with the decode.
         process, times = self.pipe.prepared_process(count)
         walked = len(process.times(count) if times is None else times) - 1
-        solver = ReportingSolver(self.pipe.sampler if sampler is None else sampler)
+        reporting = ReportingSolver(self.pipe.solver if solver is None else solver)
         while not _steps.empty():
             _steps.get_nowait()
         # A call's first run of a program with host callbacks returns only when the
         # program has finished, so the call runs on its own thread and this one displays.
         with ThreadPoolExecutor(1) as pool:
-            call = pool.submit(self.pipe, prompts, steps=steps, sampler=solver, decode=decode, **kw)
+            call = pool.submit(self.pipe, prompts, steps=steps, solver=reporting, decode=decode, **kw)
             done = 0
             while done < walked:
                 try:

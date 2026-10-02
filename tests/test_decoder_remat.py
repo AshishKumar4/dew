@@ -31,10 +31,9 @@ from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
+from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.state import TrainState
 from dew.training.transaction import write_back
 
@@ -85,7 +84,7 @@ def training_step(model):
     def step(variables, state, tokens, key):
         info = Step(jnp.zeros((), jnp.int32), key, None)
         (loss, aux), grads = jax.value_and_grad(
-            lambda params: scalar_loss(objective, {**variables, "params": params},
+            lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
             has_aux=True)(variables["params"])
         updates, state = optimizer.update(grads, state, variables["params"])
@@ -182,7 +181,7 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     # Eight rows split four ways over data x fsdp hold two a device, which
     # two microbatches divide.
     mesh_spec = MeshSpec(fsdp=2, stage=2, microbatches=2)
-    mesh = build_mesh(mesh_spec)
+    mesh = mesh_spec.build()
     tokens = shard_batch(mesh, batch())
     variables = plain.init(jax.random.key(0), batch()["text"][:, :-1])
     variables = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
@@ -234,7 +233,7 @@ def gradient_step(model, variables, key):
 
     def loss(params):
         info = Step(jnp.zeros((), jnp.int32), key, None)
-        return scalar_loss(objective, {**variables, "params": params}, batch(), info)
+        return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
     return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
 
@@ -268,7 +267,7 @@ def residuals(model, variables, capsys):
 
     def loss(params):
         info = Step(jnp.zeros((), jnp.int32), jax.random.key(1), None)
-        return scalar_loss(objective, {**variables, "params": params}, batch(), info)[0]
+        return objective.scalar_loss({**variables, "params": params}, batch(), info)[0]
 
     capsys.readouterr()
     jax.ad_checkpoint.print_saved_residuals(loss, variables["params"])

@@ -1,36 +1,26 @@
 """Kimi Delta Attention: the linear-attention layer of GLM-5.3-Flash.
 
-KDA is the gated delta rule of `dew.nn.linear` with one change in the
-recurrence and a different parameterisation around it
-(`Glm5NextTextLinearAttention`, modeling_glm5_next.py:584-733):
+KDA is the gated delta rule of `dew.nn.linear` with a different recurrence
+decay and parameterisation (`Glm5NextTextLinearAttention`,
+modeling_glm5_next.py:584-733):
 
-- The decay is a vector per head, one entry per key dimension, not a
-  scalar per head: `S <- S * exp(g_t)[:, None]` scales the rows of the
-  `[Dk, Dv]` memory (modeling_glm5_next.py:468-471, 529-532). In the chunked
-  form that puts `g` in every decay product where GDN broadcasts one value.
-- `g` comes from a two-layer forget gate, `f_b_proj(f_a_proj(x)) + dt_bias`
-  over `[H, Dk]`, and with the released `linear_lower_bound` it is
-  `lower_bound * sigmoid(exp(A_log) * g)` rather than `-exp(A_log) *
-  softplus(g)` (`Glm5NextTextForgetGate`, modeling_glm5_next.py:319-335).
-- `beta = sigmoid(b_proj(x))` per head (modeling_glm5_next.py:697).
-- q, k and v have their own projections and their own depthwise convs,
-  which the reference concatenates and runs as one conv over `3 * H * Dk`
-  channels (modeling_glm5_next.py:607-615, 642-649); the release stores the
-  three convs apart as `q_conv1d`, `k_conv1d` and `v_conv1d` (transformers'
-  conversion concatenates them on load), and so does this module, whose
-  taps concatenate in the same order at call time.
-- The output gate is `g_b_proj(g_a_proj(x))` through a sigmoid-gated RMSNorm
-  with a weight, `o_norm` (modeling_glm5_next.py:339-358, 729-730), then
-  `o_proj`.
+- The decay is a vector per head over the key dimensions, `S <- S *
+  exp(g_t)[:, None]` (modeling_glm5_next.py:468-471, 529-532).
+- `g = f_b_proj(f_a_proj(x)) + dt_bias` over `[H, Dk]`, and with
+  `linear_lower_bound` the decay is `lower_bound * sigmoid(exp(A_log) * g)`
+  instead of `-exp(A_log) * softplus(g)` (:319-335).
+- `beta = sigmoid(b_proj(x))` per head (:697).
+- q, k and v have their own projections and depthwise convs, stored apart
+  as the release stores them and concatenated at call time in the
+  reference's order (:607-615, 642-649).
+- The output gate `g_b_proj(g_a_proj(x))` drives a sigmoid-gated weighted
+  RMSNorm, `o_norm` (:339-358, 729-730), then `o_proj`.
 - q and k are l2-normalised inside the rule as `x / sqrt(sum x^2 + eps)`
-  (modeling_glm5_next.py:416-424).
+  (:416-424).
 
-`chunk_kimi_delta_rule` is `chunk_kimi_delta_attention`
-(modeling_glm5_next.py:482-578) in fp32. The recurrent form is
-`dew.nn.linear.recurrent_delta_rule`, `recurrent_kimi_delta_attention`
-(modeling_glm5_next.py:428-478), which the gated delta rule shares with one
-decay per head. tests/test_kda.py holds both to a float64 oracle of the
-reference.
+`chunk_kimi_delta_rule` is `chunk_kimi_delta_attention` (:482-578) in fp32,
+and the recurrent form `dew.nn.linear.recurrent_delta_rule` (:428-478).
+tests/test_kda.py holds both to a float64 oracle of the reference.
 """
 
 from __future__ import annotations
@@ -100,12 +90,10 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
     state = (jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work))
-    # XLA:CPU workaround. Under a jitted scan over the layers (scan_layers),
-    # the chunk loop's zero initial state came back with other values in
-    # most processes: GLM-5-Next's scanned forward was off by 8.7, 10.1 or
-    # NaN, while the compiled module was byte-identical across good and bad
-    # runs. The barrier hands the loop a materialized zero, and the scan was
-    # exact in 0 of 20 processes. Remove it when XLA fixes the draft in
+    # XLA:CPU workaround: under a jitted scan over the layers the chunk
+    # loop's zero initial state came back with other values in most
+    # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
+    # The barrier materializes the zero. Remove it when XLA fixes the draft in
     # verification-evidence/upstream-reports/xla-cpu-scan-uninitialized.
     state = jax.lax.optimization_barrier(state)
 
@@ -141,28 +129,21 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     ("g_a_proj",): ("embed", None),
     ("g_b_proj",): (None, "heads"),
     ("g_proj",): ("embed", "heads"),
-}, heuristic=(("q_conv1d",), ("k_conv1d",), ("v_conv1d",)))
+})
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
 
-    Parameter names are the checkpoint's under the reference's module:
-    `q_proj`, `k_proj`, `v_proj`, `{q,k,v}_conv1d/weight` `[H Dk, 1, K]`, the
-    forget gate's `f_a_proj`, `f_b_proj`, `dt_bias` `[H Dk]` and `A_log` `[H]`
-    (which the release stores directly under the layer and transformers'
-    conversion renames under `forget_gate`; the loader keeps the released
-    names), `b_proj`, `g_a_proj`, `g_b_proj`, `o_norm/weight` `[Dk]`, `o_proj`.
+    Parameter names are the release's: `q_proj`, `k_proj`, `v_proj`,
+    `{q,k,v}_conv1d/weight` `[H Dk, 1, K]`, `f_a_proj`, `f_b_proj`, `dt_bias`
+    `[H Dk]` and `A_log` `[H]` directly under the layer (transformers renames
+    them under `forget_gate`), `b_proj`, `g_a_proj`, `g_b_proj`, `o_norm/weight`
+    `[Dk]`, `o_proj`. `lower_bound` is `linear_lower_bound`. The decode state is
+    `GatedDeltaNet`'s pair of `cache` leaves.
 
-    `lower_bound` is the config's `linear_lower_bound`: with it the decay is
-    `lower_bound * sigmoid(exp(A_log) * g)`, without it the softplus form
-    (modeling_glm5_next.py:327-335). The decode state is the same pair of
-    `cache` leaves `GatedDeltaNet` keeps, allocated on the first decode call.
-
-    `full_rank_gate` is Kimi K3's output gate, one `g_proj` from the model
-    width straight to the heads in place of the low-rank pair
-    (`use_full_rank_gate`, modeling_kimi_linear.py:531-537, 651-656 of
-    moonshotai/Kimi-K3 at f831ab6). The rest of K3's layer is this one: its
-    fla `chunk_kda` call takes the same gate, lower bound, beta sigmoid and
-    in-kernel l2 norm (fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
+    `full_rank_gate` is Kimi K3's output gate, one `g_proj` from the model width
+    to the heads (`use_full_rank_gate`, modeling_kimi_linear.py:531-537, 651-656
+    of moonshotai/Kimi-K3 at f831ab6); the rest of K3's layer is this one (fla
+    `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
     emb_features: int

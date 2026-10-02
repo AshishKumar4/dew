@@ -15,7 +15,7 @@ from PIL import Image
 
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
@@ -31,7 +31,7 @@ class Config:
 
 
 def main(config: Config):
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(config.data.expanduser()),
         split="train",
         image_size=64,

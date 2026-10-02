@@ -3,13 +3,13 @@
 A dataset is a frozen dataclass behind `@datasets(name)`, and `load(batch=)`
 turns it into a `Dataset` of batch iterators:
 
-    data = datasets.OxfordFlowers(image_size=128).load(batch=32)
+    data = TFDSImages(path="data/oxford_flowers102/2.1.1", image_size=128).load(batch=32)
     steps = epochs * data.steps_per_epoch
 
-The prepared web-scale image corpora (`CC3M`, `CC12M`, the LAION and
-DiffusionDB sets) are registered under their names in `dew.datasets` and
-importable from `dew.data.images`; this namespace holds what a run builds
-from.
+The specs here read a kind of store: prepared TFDS, Hugging Face, ArrayRecord
+shards, url tables, video trees. Which corpus they read, by name, bucket path
+and caption wording, is a recipe's choice; `recipes/diffusion/train.py`
+registers its own (`oxford_flowers102`, `cc12m`, the LAION sets and others).
 
 Importing this package registers every dataset and costs none of the heavy
 dependencies. cv2, tensorflow_datasets, HF `datasets`, the AV readers and
@@ -30,10 +30,8 @@ from .dataset import (
                       Ramp,
                       Reader,
                       Stage,
-                      mixture,
-                      ramped,
 )
-from .images import ArrayRecordImages, HFImages, ImageDataset, OxfordFlowers
+from .images import ArrayRecordImages, HFImages, ImageDataset, TFDSImages
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
 from .processors import AutoAudioProcessor
 from .prompts import Prompts
@@ -41,29 +39,27 @@ from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFOptions
 from .sources.text import (
     TokenBytes,
-    TokenColumn,
+    TokenCorpus,
     TokenDocumentSource,
     TokenRecords,
     TokenSource,
     TokenWindowSource,
-    write_tokens,
 )
 from .sources.tfds import TFDSOptions
-from .streaming import CombinedOnline, OnlineImages, OnlineVideos
-from .text import ByteTokenizer, HFTokenizer, tokenizer_for
+from .streaming import OnlineImages, OnlineVideos
+from .text import ByteTokenizer, HFTokenizer
 from .tokens import PackedTokens, TokenWindows
-from .video import LocalVideos, VideoDataset, VoxCeleb2
+from .video import LocalVideos, VideoDataset
 
 __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "AutoAudioProcessor",
            "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
-           "CombinedOnline", "Corpus", "DataPartition", "DataPhase", "Dataset",
+           "Corpus", "DataPartition", "DataPhase", "Dataset",
            "DatasetSpec",
            "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
-           "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
+           "Loading", "LocalVideos", "OnlineImages", "OnlineVideos",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
-           "TFDSOptions", "TokenBytes", "TokenColumn",
+           "TFDSImages", "TFDSOptions", "TokenBytes", "TokenCorpus",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
-           "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "mixture",
-           "ramped", "tokenizer_for", "write_tokens"]
+           "TokenWindows", "VideoDataset", "load"]

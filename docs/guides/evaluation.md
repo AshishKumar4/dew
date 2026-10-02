@@ -10,13 +10,14 @@ The example trains a tiny next-token decoder on synthetic token rows and measure
 import itertools
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Trainer, metrics
+from dew import Trainer
 from dew.data import Dataset
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.lm import LMObjective
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity
 
 train_tokens = np.tile(np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], np.int32), (8, 1))
 val_tokens = np.tile(np.array([1, 2, 3, 0, 1, 2, 3, 0, 1], np.int32), (8, 1))
@@ -24,11 +25,11 @@ data = Dataset(train=lambda partition: itertools.repeat({"text": train_tokens}),
                val=lambda partition: iter([{"text": val_tokens}]), records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
-                          dtype="float32", attention_impl="xla")
+                          dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
 trainer = Trainer(objective, optax.adam(0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
-                    metrics=(metrics.perplexity(),))
+                    metrics=(Perplexity(),))
 assert int(state.step) == 10
 ```
 
@@ -144,7 +145,7 @@ Reporting has no background queue and never drops a report, so the I/O costs tim
 | `FitStarted` | The fit began. |
 | `StepCompiled` | A training step compiled for a new batch shape, with the seconds it took, the remat it compiled under, and the per-axis link bandwidths and projection-spreading choices. |
 | `CheckpointRequested` | A checkpoint save was submitted asynchronously; it does not mean the checkpoint is durable. |
-| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.profile` capture reports no record. |
+| `ProfileWindow` | The directory a `Trainer` profile window wrote and the number of steps it traced, reported once the trace stopped. It copies no per-step layer tensors. A standalone `dew.Profiler` capture reports no record. |
 | `FitEnded` | The fit ended, with its status. |
 | `TrialFinished` | One sweep trial. |
 
@@ -152,9 +153,9 @@ Dew does not hash data contents or source revisions. Put their identities in the
 
 ## Hyperparameter sweeps
 
-`dew.config.sweep.sweep(config, space, *, train, trials, ledger, tracker, search=random_search, seed=0)` trains one trial per point of a search space through the entry point `train`, which trains a config and returns its score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It uses the normal training loop and has no scheduler.
+`config.sweep(space, *, train, trials, ledger, tracker, search=random_search, seed=0)` on a `RunConfig` trains one trial per point of a search space through the entry point `train`, which trains a config and returns its score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It uses the normal training loop and has no scheduler.
 
-A space maps dotted paths into the run record to the values a trial can take. `override` applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises instead of silently training the unchanged config.
+A space maps dotted paths into the run record to the values a trial can take. A point is applied through `to_dict` and `from_dict`, so a path the config class does not declare raises instead of silently training the unchanged config.
 
 | Search | Behavior |
 |---|---|
@@ -164,20 +165,20 @@ A space maps dotted paths into the run record to the values a trial can take. `o
 
 A finished trial is written to the ledger before it is reported, so rerunning an interrupted sweep continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
-The example continues the previous one and reuses `objective`, `data`, `metrics` and `jax`:
+The example continues the previous one and reuses `objective`, `data`, `Perplexity` and `jax`:
 
 ```python
-from dew import LocalTracker, evaluate
+from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, sweep
-from dew.registry import datasets
+from dew.config.sweep import grid_search
+from dew.data import TokenWindows
 
 config = RunConfig(
     model=ModelConfig("causal_transformer", {"vocab_size": 4, "emb_features": 16,
                                              "num_layers": 1, "num_heads": 2,
                                              "mlp_features": 32, "max_seq_len": 16}),
     # The synthetic batches above stand in for the dataset this names.
-    data=datasets["token_windows"](seq_len=8),
+    data=TokenWindows(seq_len=8),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
                           eval_every=None, checkpoint_every=None),
@@ -187,13 +188,13 @@ config = RunConfig(
 def trial(run: RunConfig) -> float:
     """Train one point and score it: the perplexity its own run ends on."""
     state = run.train(objective, data, name=run.trainer.name or "lm-rate")
-    return float(evaluate(objective, state.params, data.val, metrics=(metrics.perplexity(),),
-                          key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
+    return float(Evaluation.run(objective, state.params, data.val, metrics=(Perplexity(),),
+                                key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
 

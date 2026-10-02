@@ -12,9 +12,7 @@ turns into a subcommand (`data:token-windows --data.path ...`).
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
-file lacks takes its declared default, so a field added later must default to
-what runs recorded before it did; tests/fixtures/record_defaults.json holds
-every recorded field's default to that. A field the class does not have
+file lacks takes its declared default, and a field the class does not have
 raises.
 """
 
@@ -30,9 +28,11 @@ import sys
 import types
 import typing
 from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
+import optax
 import tyro
 from etils import epath
 
@@ -42,22 +42,31 @@ import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.data import Dataset, DatasetSpec, Ramp, ramped
-from dew.data.dataset import json_list_argument
+from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.data import Dataset, DatasetSpec, Ramp
+from dew.data.dataset import json_list_argument, ramped
 from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
-from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
+from dew.training.optim import (
+    BF16_STATE_OPTIMIZERS,
+    OPTIMIZER_MAP,
+    ParamGroup,
+    ScheduleBase,
+    learning_rate_schedule,
+    param_labels,
+    power_profiles,
+)
 from dew.training.quantization import Quantization, _quantize
 from dew.training.selection import Best
 from dew.training.state import TrainState
-from dew.training.tracker import LocalTracker, Trackers, WandbTracker
+from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
 
 JsonDict = Annotated[
@@ -182,8 +191,8 @@ class OptimConfig:
     weight_decay: float | None = None
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
     """Per-group learning-rate multipliers and weight decay, first match wins;
-    empty moves every parameter alike. `dew.training.optim.mup_param_groups`
-    is lm-engine's muP split."""
+    empty moves every parameter alike. `ParamGroup.mup` is lm-engine's muP
+    split."""
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
@@ -197,8 +206,67 @@ class OptimConfig:
     """Relative standard deviations of the power-function EMAs a run keeps
     for post-hoc EMA (`dew.training.optim.power_profiles`), such as Karras
     et al.'s (0.05, 0.10); every checkpoint save snapshots them, and
-    `dew.training.posthoc.reconstruct` builds an average of any other
+    `Checkpoints.posthoc_ema` builds an average of any other
     relative standard deviation from the snapshots. Empty keeps none."""
+
+    def build(self, steps: int) -> optax.GradientTransformation:
+        """Build the solver this config describes, with its schedule, parameter
+        groups and clipping.
+
+        `steps` is the run's length, which a schedule decays over unless the
+        config names its own end. `param_groups` runs one solver per group under
+        `optax.multi_transform`, each on the schedule times its multiplier and
+        with its own weight decay; the global-norm clip still reads every
+        gradient together, before the groups split them."""
+        learning_rate = learning_rate_schedule(self, steps)
+        opts = dict(self.optimizer_opts)
+        if self.weight_decay is not None:
+            opts['weight_decay'] = self.weight_decay
+            if self.optimizer in ('muon', 'muonclip'):
+                # Muon's weight_decay does not cover the AdamW group's norm scales.
+                opts.setdefault('adam_weight_decay', self.weight_decay)
+        make = OPTIMIZER_MAP[self.optimizer]
+        if self.state_dtype == 'bfloat16':
+            if self.optimizer not in BF16_STATE_OPTIMIZERS:
+                raise ValueError(
+                    f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
+                    f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
+            make = BF16_STATE_OPTIMIZERS[self.optimizer]
+        if self.param_groups:
+            names = [group.name for group in self.param_groups]
+            if len(set(names)) != len(names):
+                raise ValueError(f"param group names repeat: {names}")
+            solvers = {}
+            for group in self.param_groups:
+                group_opts = dict(opts)
+                if group.weight_decay is not None:
+                    group_opts['weight_decay'] = group.weight_decay
+                    if self.optimizer in ('muon', 'muonclip'):
+                        group_opts['adam_weight_decay'] = group.weight_decay
+                solvers[group.name] = make(
+                    _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
+            solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+        else:
+            solver = make(learning_rate, **opts)
+
+        if self.clip_grads > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
+        if self.forced_weight_normalization:
+            from dew.nn.mp import forced_weight_normalization
+
+            solver = optax.chain(solver, forced_weight_normalization())
+        if self.ema_profiles:
+            solver = power_profiles(solver, self.ema_profiles)
+        return solver
+
+
+def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
+    if multiplier == 1.0:
+        return learning_rate
+    if callable(learning_rate):
+        schedule = learning_rate
+        return lambda count: multiplier * schedule(count)
+    return multiplier * learning_rate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -285,9 +353,9 @@ class TrainerConfig:
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = 2
+    """Latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """Metric name and ranking policy; None selects validation loss or training loss."""
-    """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
     key: int = 0
@@ -544,28 +612,12 @@ def _has_default(field: dataclasses.Field) -> bool:
     return field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
 
 
-_FIELD_RENAMES: Mapping[type, Mapping[str, str]] = {TrainerConfig: {"seed": "key"}}
-
-
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
     """The record's fields as `cls` declares them. A field the record lacks
-    takes its declared default, which says what runs recorded before the
-    field existed did (tests/fixtures/record_defaults.json holds every
-    default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises.
-
-    A field whose default moved after runs were recorded without it says
-    what those runs meant as `metadata={"legacy": value}`, and a record
-    that lacks it reads as that value. Every record `to_dict` writes
-    carries the field, so code that builds the class takes the new default
-    and a recorded run keeps the old one."""
+    takes its declared default; a field `cls` does not declare, or a
+    required one the record lacks, raises."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
-    for old, new in _FIELD_RENAMES.get(cls, {}).items():
-        if old in values:
-            if new in values:
-                raise ValueError(f"{cls.__name__} record carries both {old} and {new}")
-            values = {new if key == old else key: value for key, value in values.items()}
     declared = [f for f in dataclasses.fields(cls) if _recorded(f)]
     unknown = sorted(set(values) - {f.name for f in declared})
     missing = [f.name for f in declared if f.name not in values and not _has_default(f)]
@@ -573,9 +625,8 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
-                values[f.name] if f.name in values else f.metadata["legacy"]))
-            for f in declared if f.name in values or "legacy" in f.metadata}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
+            for f in declared if f.name in values}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
@@ -648,8 +699,7 @@ class RunConfig:
     """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(
-        default_factory=lambda: datasets["oxford_flowers102"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
@@ -764,11 +814,14 @@ class RunConfig:
                         json_value(summary or {}), steps, packages_installed()), 0)
 
             agreed("run metadata", record_run)
-            state = Trainer.from_config(
-                trainer, objective, build_optimizer(self.optim, steps),
-                key=trainer.key,
-                checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout,
+            # The trainer holds mesh, layout, accumulation, dynamic_scale and
+            # profile; prepare_process read the process fields, and the rest
+            # are fit's arguments or built the checkpoints and the tracker.
+            state = Trainer(
+                objective, self.optim.build(steps), key=trainer.key,
+                mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
+                dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
+                rollout=rollout, profile=trainer.profile,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,
@@ -789,3 +842,31 @@ class RunConfig:
 
         finally:
             _closed(tracker, sys.exception())
+
+    def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
+              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+        """Train `trials` trials of this config over `space` and return the ledger.
+
+        Each trial draws a point from `space`, trains under the run name
+        `<trainer.name>/trial-<index>` so trials keep their own checkpoints and
+        tracking, and records the score `train` returns for it. `tracker`
+        receives that score as `sweep/value` at the trial's number and the
+        trial's `TrialFinished` record. A trial reaches `ledger` before it is
+        reported, so rerunning the same call continues an interrupted sweep.
+        """
+        path = Path(ledger)
+        if self.trainer.name is None:
+            raise ValueError("a sweep needs trainer.name: every trial trains under "
+                             "<trainer.name>/trial-<index>, and trials sharing one name would "
+                             "resume from each other")
+        finished = _read(path, space)
+        for index in range(len(finished), trials):
+            point = search(space, finished, seed)
+            name = f"{self.trainer.name}/trial-{index}"
+            value = train(override(self, {**point, "trainer.name": name}))
+            trial = TrialFinished(index, name, point, value)
+            finished.append(trial)
+            _write(path, space, finished)
+            tracker.log({"sweep/value": value}, index)
+            tracker.artifact(trial, index)
+        return finished

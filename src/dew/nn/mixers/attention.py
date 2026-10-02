@@ -98,20 +98,15 @@ class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
 
-    decode=True runs the call against the cache: the first call writes the
-    whole prompt and each later call appends one token, so prefill and decode
-    are one code path. Keys are rotated before they enter the cache, so the
-    rotary positions come from the cache index and not from the row index of
-    the token.
-
-    causal=False is full attention over the sequence, which a masked
-    diffusion model reads the whole corrupted sequence with; there is no
-    cache to decode against then, so decode=True raises.
-
-    kv_shared marks a layer that owns no K/V projections (Gemma 3n/4 style
-    cross-layer KV sharing): it reads the keys, values and their positions
-    that the designated earlier layer of the same layer type stashed in
-    `kv_store`, post rope and post norm, and keeps no cache of its own.
+    decode=True runs against the cache: the first call writes the prompt and
+    each later call appends, so prefill and decode are one path. Keys are
+    rotated before they are cached, so rotary positions come from the cache
+    index. causal=False is full attention, which a masked diffusion model reads
+    its corrupted sequence with; decoding then attends a bidirectional canvas
+    over the frozen prefix a causal prefill cached, and writes nothing back.
+    kv_shared marks a layer without K/V projections (Gemma 3n/4 cross-layer
+    sharing): it reads the keys, values and positions its provider stashed in
+    `kv_store`, post rope and norm, and keeps no cache.
     """
     emb_features: int
     num_heads: int
@@ -332,21 +327,12 @@ class CausalSelfAttention(nn.Module):
     def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
 
-        Key validity does, and image groups do on a layer that makes images
-        bidirectional. Rotary positions rotate q and k and leave visibility
-        alone, and an explicit pairwise mask builds its own below. Metadata
-        that restricts nothing keeps causality and the window as the flags
-        the fused kernels take, because a materialized [B, 1, S, S] mask
-        sends the call to the xla kernel and costs the fused one's time and
-        memory (the numbers are in docs/performance.md).
-
-        A validity array is opaque at trace time, so its contents decide
-        nothing here. An all-true one restricts as much as any other, and a
-        host that knows a row is unpadded says so by passing none.
-
-        Decoding always builds the mask, which carries the cache's own
-        validity, and a bidirectional-image layer writes its cached groups
-        while building it.
+        Key validity does, and image groups on a bidirectional-image layer; rotary
+        positions and an explicit pairwise mask do not. Otherwise causality and the
+        window stay flags, since a materialized [B, 1, S, S] mask sends the call to
+        the xla kernel (docs/performance.md). A validity array is opaque at trace
+        time, so a host that knows a row is unpadded passes none. Decoding always
+        builds the mask, which carries the cache's validity.
         """
         if decode:
             return metadata is not None or self.bidirectional_images
@@ -437,14 +423,10 @@ class CausalSelfAttention(nn.Module):
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
                         decode: bool, S: int):
-        """The positions the rotation and the mask read, the cache append
-        that writes a decode step's keys, and a bidirectional canvas's
-        frozen encoder prefix.
-
-        The cache slot carries position while decoding, so the rotation and
-        the mask both read it and not the row index of the token. A packed
-        batch supplies the position inside its document in place of the
-        row index, and RoPE restarts at every boundary.
+        """The positions the rotation and the mask read, the cache append that
+        writes a decode step's keys, and a bidirectional canvas's frozen encoder
+        prefix. Decoding reads positions off the cache slot; a packed batch supplies
+        each token's position in its document, so RoPE restarts at boundaries.
         """
         append = None
         prefix = None
@@ -708,11 +690,9 @@ class AttentionMixer(MixerBase):
     """Grouped-query attention with optional image-block masking and M-RoPE.
 
     Geometry, norms and kernel policy come from the decoder context. Image
-    bidirectionality, spatial rotary sections, NoPE and exclusive self
-    attention configure this mixer only: a hybrid names them on its
-    attention kind, `{"kind": "attention", "nope": true,
-    "exclusive_self_attention": true}`, and a mixer that does not implement
-    them has no field to take them.
+    bidirectionality, spatial rotary sections, NoPE and exclusive self attention
+    are this mixer's own fields, which a hybrid names on its attention kind
+    (`{"kind": "attention", "nope": true}`).
     """
 
     bidirectional_images: bool = False
@@ -733,45 +713,8 @@ class AttentionMixer(MixerBase):
                 raise ValueError("mrope_section must contain three nonnegative section widths")
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        return functools.partial(
-            CausalSelfAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            num_kv_heads=ctx.num_kv_heads,
-            head_dim=ctx.head_dim,
-            max_seq_len=ctx.max_seq_len,
-            causal=ctx.causal,
-            rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rope_scaling,
-            qk_norm=ctx.qk_norm,
-            qk_norm_scope=ctx.qk_norm_scope,
-            v_norm=ctx.v_norm,
-            k_eq_v=ctx.k_eq_v,
-            norm_eps=ctx.norm_eps,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            kv_shared=ctx.kv_shared,
-            kv_store_key=ctx.kv_store_key,
-            sliding_window=ctx.sliding_window,
-            attention_chunk=ctx.attention_chunk,
-            attention_bias=ctx.attention_bias,
-            o_proj_bias=ctx.o_proj_bias,
-            attention_scale=ctx.attention_scale,
-            attention_dropout_rate=ctx.attention_dropout_rate,
-            attention_sinks=ctx.attention_sinks,
-            yarn=ctx.yarn,
-            attn_logit_softcap=ctx.attn_logit_softcap,
-            output_gate=ctx.output_gate,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
-            partial_rotary_factor=ctx.partial_rotary_factor,
-            partial_rotary_type=ctx.partial_rotary_type,
-            kv_cache=ctx.kv_cache,
-            nope=self.nope,
-            exclusive_self_attention=self.exclusive_self_attention,
-            init_std=ctx.init_std,
-            output_init_std=ctx.output_init_std,
-            bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
+        # The context's fields and this kind's are CausalSelfAttention's, by name.
+        context = {field.name: getattr(ctx, field.name) for field in dataclasses.fields(ctx)}
+        kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+        return functools.partial(CausalSelfAttention, **context, **kind)
 

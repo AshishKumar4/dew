@@ -1,7 +1,7 @@
 """Load the native inference task for a saved run or published checkpoint.
 
 A run directory holds run.json and checkpoints; sources load through
-dew.interop.load_pretrained. Causal text uses TextGeneration, native MDLM
+`dew.interop.Pretrained.load`. Causal text uses TextGeneration, native MDLM
 uses MaskedGeneration, DiffusionGemma uses BlockGeneration, and image
 diffusion uses TextToImage. Weights are placed once on a mesh
 under a layout, the way the trainer places a train state. The default mesh
@@ -122,21 +122,29 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    from dew.interop import load_pretrained
-    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.interop import (
+        Pretrained,
+        PretrainedBlockDecoder,
+        PretrainedDecoder,
+        PretrainedMaskedDecoder,
+        PretrainedPipeline,
+    )
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "float32" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (load_pretrained(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
               if dtype is None else
-              load_pretrained(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+              Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                               layout=layout))
-    if loaded.process is not None:
-        return loaded.text_to_image()
-    if isinstance(loaded.model, DiffusionGemma):
-        return loaded.block_generation()
-    return loaded.text_generation()
+    match loaded:
+        case PretrainedPipeline():
+            return loaded.text_to_image()
+        case PretrainedBlockDecoder():
+            return loaded.block_generation()
+        case PretrainedDecoder() | PretrainedMaskedDecoder():
+            return loaded.text_generation()
+    raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
 
 
 def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) -> Variables:
@@ -148,11 +156,11 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
     a frozen node can't be updated, so frozen nodes are first rebuilt as
     dicts over the same leaves.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
     from dew.training.host import stream
 
     variables = _updatable(variables)
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(device_mesh, variables)
     chosen_layout.check(variables, shardings, device_mesh)

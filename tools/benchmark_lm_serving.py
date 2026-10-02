@@ -105,7 +105,7 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     host_wall = time.perf_counter() - began
     stream = io.StringIO()
     pstats.Stats(profile, stream=stream).sort_stats("tottime").print_stats(30)
-    with dew.profile(directory) as capture:
+    with dew.Profiler(directory) as capture:
         for _ in range(steps):
             with capture.region("serve.decode"):
                 server.step()
@@ -160,7 +160,7 @@ def dew_points(args):
     began = time.perf_counter()
     task = dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16")
     task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_id=None),
-                               logits=None, stopping=None)
+                               logits=None, stopping=())
     if args.vocab_limit > task.model.vocab_size:
         raise ValueError("--vocab-limit exceeds the model vocabulary")
     capacity = args.prompt + args.output

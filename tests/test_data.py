@@ -32,7 +32,6 @@ from dew.data import (
     ImageDataset,
     Loading,
     LocalVideos,
-    VoxCeleb2,
     images,
     video,
 )
@@ -59,16 +58,15 @@ def test_an_unknown_dataset_is_refused():
 def test_a_spec_field_the_dataset_has_no_declaration_for_is_refused():
     """A misspelled knob built a dataset other than the one asked for."""
     with pytest.raises(ValueError, match=r"no field for \['image_scale'\]"):
-        datasets.build("oxford_flowers102", image_scale=64)
-    assert datasets.build("oxford_flowers102", image_size=64).image_size == 64
+        datasets.build("tfds_images", image_scale=64)
+    assert datasets.build("tfds_images", image_size=64).image_size == 64
 
 
-@pytest.mark.parametrize("name", ["cc12m", "combined_30m"])
-def test_arrayrecord_datasets_require_an_explicit_path(name):
+def test_arrayrecord_datasets_require_an_explicit_path():
     """The default was one developer's bucket mount, and an unset path reached
     os.path.join(None, ...) inside the source."""
     with pytest.raises(ValueError, match="path="):
-        datasets[name]().load(batch=8)
+        datasets["array_record_images"](shards=("cc12m",)).load(batch=8)
 
 
 def test_an_unknown_augmentation_is_refused():
@@ -625,6 +623,69 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     stream.close()
 
 
+class _Corpus:
+    """Records of one named corpus, described by that name as a source with
+    an identity is (`describe`)."""
+
+    def __init__(self, name, length=16):
+        self.name, self.length = name, length
+
+    def __repr__(self):
+        return f"_Corpus({self.name!r})"
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        return {"index": np.int32(index)}
+
+
+def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
+    """Two corpora of one type and length, each with a slice held out, were
+    described the same, so a position saved over one resumed the other."""
+    def stream(name):
+        train, _ = hold_out(_Corpus(name), 16, 4, "corpus")
+        return train_stream(train, [], batch=4, seed=0, loading=Loading(threads=1, read_buffer=1))(
+            DataPartition())
+
+    saved = stream("flowers")
+    next(saved)
+    state = saved.get_state()
+    saved.close()
+
+    other = stream("faces")
+    with pytest.raises(ValueError, match="_Corpus\\('flowers'\\)"):
+        other.set_state(state)
+    resumed = stream("flowers")
+    resumed.set_state(state)
+    resumed.close()
+
+
+def test_records_listed_in_memory_are_described_by_their_count_not_their_contents():
+    """A list has a repr, and it is every record: a saved position held it all."""
+    rows = [{"x": np.full(64, index, np.float32)} for index in range(512)]
+    stream = Dataset.from_records(rows, batch=8).train(DataPartition())
+    next(stream)
+
+    assert len(stream.get_state()) < 512
+    stream.close()
+
+
+def test_a_filtering_grain_dataset_is_refused_for_a_global_position():
+    """A filter yields fewer records than the indices it reads, so a record
+    count no longer says where a resumed run starts: one resumed on records
+    it had already read. Grain's own ElasticIterator refuses it the same way."""
+    filtered = pygrain.MapDataset.source(_Points(16)).filter(lambda point: point["index"] % 3)
+
+    shuffled = filtered.seed(0).shuffle()
+    mixed = pygrain.MapDataset.mix([_grain_points(), filtered.repeat(2)])
+    for pipeline in (filtered, shuffled, mixed):
+        with pytest.raises(ValueError, match="filter"):
+            Dataset.from_grain(pipeline, batch=4, **WORKERS)
+    with pytest.raises(ValueError, match="filter"):
+        Dataset.from_grain(_grain_points(), validation=filtered, batch=4, **WORKERS)
+
+
 # ---------------------------------------------------------------------------------
 # Clip sampling uses a local RNG
 # ---------------------------------------------------------------------------------
@@ -669,49 +730,6 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
     return clips
 
 
-def test_voxceleb2_scans_the_tree_recursively(tmp_path):
-    clips = _voxceleb_tree(tmp_path)
-    records = VoxCeleb2(path=str(tmp_path)).source()
-
-    assert [record["video_path"] for record in records] == sorted(str(c) for c in clips)
-
-
-def test_voxceleb2_renders_captions_from_the_template(tmp_path):
-    _voxceleb_tree(tmp_path)
-
-    templated = VoxCeleb2(path=str(tmp_path), prompt_template="a video of {identity} speaking")
-    captions = {record["caption"] for record in templated.source()}
-    assert captions == {"a video of id00012 speaking", "a video of id00015 speaking"}
-
-    plain = VoxCeleb2(path=str(tmp_path)).source()
-    assert {record["caption"] for record in plain} == {"a video of a person speaking"}
-
-    # A placeholder the source does not fill is a misspelling, not a caption.
-    with pytest.raises(ValueError, match=r"may use \{identity\}"):
-        VoxCeleb2(path=str(tmp_path), prompt_template="a video of {speaker}").source()
-
-
-def test_voxceleb2_reads_the_requested_split(tmp_path):
-    _voxceleb_tree(tmp_path, split="train")
-    _voxceleb_tree(tmp_path, split="test", identities=("id00017",))
-
-    train = VoxCeleb2(path=str(tmp_path), split="train").source()
-    test = VoxCeleb2(path=str(tmp_path), split="test").source()
-    assert len(train) == 4
-    assert len(test) == 2
-    assert all(os.sep + "train" + os.sep in record["video_path"] for record in train)
-    assert all(os.sep + "test" + os.sep in record["video_path"] for record in test)
-    assert {record["video_path"] for record in train}.isdisjoint({record["video_path"] for record in test})
-    assert {record["video_path"].split(os.sep)[-3] for record in test} == {"id00017"}
-
-
-def test_voxceleb2_reports_missing_roots_clearly(tmp_path):
-    with pytest.raises(ValueError, match="dataset root"):
-        VoxCeleb2().source()
-    with pytest.raises(ValueError, match="split 'train' not found"):
-        VoxCeleb2(path=str(tmp_path)).source()
-
-
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
@@ -724,7 +742,7 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
         LocalVideos().source()
 
 
-def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
+def test_video_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
     """End to end with the reader stubbed and the audio model's extractor
     built here, so its weights are the only thing not real. The extractor
     takes the padded waveform whole and normalises it as one clip, which is
@@ -734,8 +752,8 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = VoxCeleb2(path=str(tmp_path), prompt_template="a video of {identity}",
-                     frame_size=32, frames=4, audio_padding=1)
+    spec = LocalVideos(path=str(tmp_path), caption="a video of a speaker",
+                       frame_size=32, frames=4, audio_padding=1)
     records = spec.source()
     frame_samples = 640
     seen = {}
@@ -759,7 +777,7 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
     assert seen["num_frames"] == 4 and seen["audio_padding"] == 1
     assert seen["seed"] == int(np.random.default_rng(0).integers(0, 2**32 - 1))
     assert batch["video"].shape == (4, 32, 32, 3)
-    assert batch["caption"] == "a video of id00012"
+    assert batch["caption"] == "a video of a speaker"
     waveform = batch["audio"]["full_audio"]
     assert waveform.shape == (6, frame_samples) and waveform[0, 0] == -0.5
     flat = waveform.reshape(-1)
@@ -775,7 +793,7 @@ def test_a_clip_is_decoded_at_the_rate_its_audio_model_reads(tmp_path, monkeypat
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     _voxceleb_tree(tmp_path)
-    spec = VoxCeleb2(path=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
+    spec = LocalVideos(path=str(tmp_path), frame_size=32, frames=4, audio_padding=1)
 
     def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed, sample_rate=16000,
                                  fps=25.0):
@@ -796,6 +814,9 @@ def keep_captions(captions):
     """A caption reader that hands the words back, so a test reads what the
     dataset wrote before a run's encoder tokenizes it."""
     return {"caption": np.asarray(captions)}
+
+
+CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 
 
 # ---------------------------------------------------------------------------------
@@ -819,7 +840,7 @@ class Augmenting(ImageDataset):
                        first=0 if split is None else 1000)
 
     def record(self, element, rng):
-        template = images.PROMPT_TEMPLATES[int(rng.integers(len(images.PROMPT_TEMPLATES)))]
+        template = CAPTION_TEMPLATES[int(rng.integers(len(CAPTION_TEMPLATES)))]
         name = ["rose", "tulip", "lotus", "orchid", "marigold"][element["index"] % 5]
         return element["image"], template.format(name), element["index"]
 
@@ -914,13 +935,13 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capl
     close over 8 s: slow, but bounded by grain itself, so the close must not
     call it a hang, and says what it waits for. sft_gemma4's four workers
     took 5.1 to 7.4 s to stop, past a budget of 2 s and 1 s a worker."""
-    from dew.training import MeshSpec, build_mesh
+    from dew.training import MeshSpec
     from dew.training.distributed import DevicePrefetchIterator
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
     data = Lingering(length=64, image_size=8, seed=3, val_batches=None, loading=loading)
     stream = data.load(batch=4).train(DataPartition())
-    prefetch = DevicePrefetchIterator(stream, build_mesh(MeshSpec(), jax.devices()[:1]))
+    prefetch = DevicePrefetchIterator(stream, MeshSpec().build(jax.devices()[:1]))
     # grain interleaves its workers' batches in turn: one batch from each
     # means every worker has read a record and lingers.
     for _ in range(loading.workers):
@@ -1245,7 +1266,7 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
-    assert out["caption"] in {template.format("rose") for template in images.PROMPT_TEMPLATES}
+    assert out["caption"] in {template.format("rose") for template in CAPTION_TEMPLATES}
     assert out["label"] == 5 and out["label"].dtype == np.int32
 
 

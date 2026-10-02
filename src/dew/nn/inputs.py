@@ -14,15 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.core import Tracer
-from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:
     from PIL.Image import Image
-
-ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
-TreeT = TypeVar("TreeT")
 
 # What a caller hands a host processor as one media argument: pixels or audio
 # samples in an array, a PIL image, or one entry per row of either. The source's
@@ -48,11 +44,9 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     """Pad ragged token rows and their scalar token fields on the host.
 
     Filler IDs carry no content; attention_mask alone marks real slots. Rows
-    that all fill the width take no filler, so no attention_mask comes back.
-    Absent validity is how a host says every slot is real. An all-true mask
-    would say the same thing in a form the model cannot read the contents
-    of, and it would cost it the fused attention kernel.
-    Tokenizer state is not involved in this numeric layout operation.
+    that all fill the width come back without one: absent validity says every
+    slot is real, which an all-true mask would hide from the model and cost it
+    the fused attention kernel.
     """
     if padding_side not in ("left", "right"):
         raise ValueError("padding_side must be left or right")
@@ -108,15 +102,12 @@ def host_token_rows(array: np.ndarray) -> np.ndarray:
 class ModelInputs:
     """Token rows with sequence-aligned fields and row-aligned conditioning.
 
-    Every leaf has batch axis zero. ``token_fields`` also has sequence axis
-    one, with the same length as ``tokens``. ``conditioning`` holds media
-    payloads and their valid lengths; it contains no text-slot coordinates.
-    A token field such as ``image_indices`` identifies the media feature read
-    at that text slot, with -1 for text. Slicing a prompt therefore preserves
-    feature identity without rewriting indices hidden in media payloads.
-
-    The processor validates field names and values for its model on the host.
-    These shape-preserving operations also work inside JIT.
+    Every leaf has batch axis zero, and ``token_fields`` sequence axis one at
+    ``tokens``' length. ``conditioning`` holds media payloads and their valid
+    lengths; a token field such as ``image_indices`` names the media feature
+    read at each text slot (-1 for text), so slicing a prompt keeps feature
+    identity. The processor validates fields on the host; these shape-preserving
+    operations also work inside JIT.
     """
 
     tokens: jax.Array
@@ -290,12 +281,9 @@ def _validity_agnostic[TreeT](tree: TreeT) -> TreeT:
 def assembly_signature(tree: InputTree, controls: tuple = ()) -> np.ndarray:
     """`generation_signature` of the tree with validity left out.
 
-    Whether a process's own rows needed padding is rank-local, so a digest
-    that counted validity would refuse a pool that agrees on everything else.
-    This one still carries every other field, shape, dtype and control, so a
-    real schema disagreement is still refused, and it is fixed-width and
-    computed from local structure alone, which is what lets it be the first
-    thing a pool agrees on.
+    Whether a process's own rows needed padding is rank-local, so this digest,
+    which still carries every other field, shape, dtype and control, is the
+    fixed-width first thing a pool agrees on.
     """
     return generation_signature(_validity_agnostic(tree), controls)
 
@@ -328,18 +316,12 @@ def agreed_validity[TreeT: InputTree](tree: TreeT, processes: int, *, controls: 
                                       phase: str = "input") -> TreeT:
     """One validity schema for the whole pool, agreed before arrays are built.
 
-    A host that padded nothing carries no validity, which is what keeps
-    attention on its fused kernel. Padding is a property of a process's own
-    rows, so one process can omit the field while another carries it, and the
-    same step would then receive two different pytrees. Where any process
-    carries validity for a site, every process materializes it; where none
-    does, the omission stays.
-
-    The collectives are fixed-shape and their number does not depend on what
-    this process holds: the validity-agnostic signature is agreed first, and
-    the site count that sizes the presence vector comes from that agreed
-    schema. Both run on the calling thread, so call this where the caller's
-    other collectives are issued, in the same order on every process.
+    A host that padded nothing carries no validity, which keeps attention on its
+    fused kernel, so processes may differ; where any process carries validity
+    for a site, every process materializes it. The collectives are fixed-shape
+    and fixed in number (the validity-agnostic signature first, then the
+    presence vector its schema sizes) and run on the calling thread, so call
+    this in the same order as the caller's other collectives on every process.
     """
     if processes <= 1:
         return tree
@@ -375,12 +357,13 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     if isinstance(leaf, jax.Array) and leaf.is_fully_addressable and not host:
         return leaf
     if not isinstance(leaf, jax.Array) or leaf.is_fully_addressable:
-        return np.asarray(leaf)
+        return np.asarray(jax.device_get(leaf))
     if leaf.ndim == 0:
-        return np.asarray(leaf.addressable_shards[0].data)
+        return np.asarray(jax.device_get(leaf.addressable_shards[0].data))
     pieces: dict[tuple[int, ...], np.ndarray] = {}
     for shard in leaf.addressable_shards:
-        pieces.setdefault(tuple(part.start or 0 for part in shard.index), np.asarray(shard.data))
+        pieces.setdefault(tuple(part.start or 0 for part in shard.index),
+                          np.asarray(jax.device_get(shard.data)))
     blocks = []
     for start in sorted({key[0] for key in pieces}):
         columns = sorted(key for key in pieces if key[0] == start)
@@ -508,7 +491,7 @@ class RowPlan:
         """Place padded host or device rows, row-sharded on a mesh."""
         sharding = self.sharding
         if sharding is None:
-            return jax.tree.map(jnp.asarray, tree)
+            return jax.device_put(tree)
 
         def put(leaf):
             rows = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
@@ -525,14 +508,17 @@ class RowPlan:
         A request key replicated over a multi-process mesh is not
         addressable, and folding it would hand
         `make_array_from_process_local_data` rows this process cannot place.
-        Every replica holds the same key data, so the rows fold from this
-        process's own replica and stay device-resident throughout.
+        Every replica holds the same key data, so on a mesh the rows fold
+        from this process's first replica, on its one device, and are sliced
+        from there to their devices. Folded on every device of a replicated
+        key, they went through the host to be split: jax reshards a
+        multi-device array whose shards hold no target slice by reading it.
         """
-        local = key if key.is_fully_addressable else key.addressable_data(0)
-        indices = jnp.arange(self.count, dtype=jnp.uint32,
-                             device=local.sharding) + self.process * self.rows
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         sharding = self.sharding
+        local = key if sharding is None else key.addressable_data(0)
+        start = self.process * self.rows
+        indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
+        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         if sharding is None:
             return row_keys
         sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))

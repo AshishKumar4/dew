@@ -1,11 +1,11 @@
 # Distributed training
 
-Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `build_mesh` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
+Dew places a run on several devices with two objects. A `MeshSpec` says how many devices each of six named mesh axes takes, and `MeshSpec.build` arranges the devices into a `jax.sharding.Mesh` with those axes. A `Layout` maps the logical axis names that Dew's modules give their parameters, such as `embed` and `mlp`, to mesh axes. `Trainer` uses both to initialize, place and update the state, and XLA compiles the collectives the placement needs. The model, the objective and the data do not change with the mesh.
 
 ![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-light.svg)
 ![A mesh of 8 devices with fsdp=2 and tensor=2, so data=2. The batch's 16 rows split into 4 blocks over data and fsdp, each held by a tensor pair. An MLP kernel of shape (256, 1024) splits its rows over fsdp and its columns over tensor, and each block is held by one device of each data index.](../assets/mesh-dark.svg)
 
-The figure is computed by `docs/assets/figures.py` from the placements `build_mesh`, `Layout().shardings` and `batch_shardings` return.
+The figure is computed by `docs/assets/figures.py` from the placements `MeshSpec.build`, `Layout().shardings` and `batch_shardings` return.
 
 ## Example
 
@@ -21,12 +21,13 @@ import jax
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 
-model = models.build("causal_transformer", vocab_size=512, emb_features=256, num_layers=2,
-                     num_heads=4, mlp_features=1024, max_seq_len=64)
+model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
+                          num_heads=4, mlp_features=1024, max_seq_len=64)
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Dataset(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
@@ -53,7 +54,7 @@ Each device holds a `(128, 512)` block of the `(256, 1024)` kernel: the rows spl
 
 ## Mesh
 
-`MeshSpec` fields name the devices each axis takes; `data` takes the rest. The product of the fields must divide the device count, or `build_mesh` raises `LayoutRefused`.
+`MeshSpec` fields name the devices each axis takes; `data` takes the rest. The product of the fields must divide the device count, or `MeshSpec.build` raises `LayoutRefused`.
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
@@ -65,11 +66,11 @@ Each device holds a `(128, 512)` block of the `(256, 1024)` kernel: the rows spl
 | `stage` | `stage` | The decoder's layer stack, into pipeline stages |
 
 ```python
-from dew.training import build_mesh
+from dew.training import MeshSpec
 
-print(dict(build_mesh(MeshSpec(fsdp=4)).shape))
-print(dict(build_mesh(MeshSpec(fsdp=2, expert=4)).shape))
-print(dict(build_mesh(MeshSpec(fsdp=4, sequence=2)).shape))
+print(dict(MeshSpec(fsdp=4).build().shape))
+print(dict(MeshSpec(fsdp=2, expert=4).build().shape))
+print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
@@ -114,7 +115,7 @@ A checkpoint of that state is written before training goes on. Orbax copies a de
 
 `Layout(host_parameters=("params/layers_*",))` keeps a root decoder stack in pinned host memory for inference. Each model declares every physical stack with a `DecoderBank`, which holds a namespace below every variables collection and its `StackView`. `MultimodalTransformer` puts its decoder under `language_model`. `DiffusionGemma` declares `text` once for the scope its encoder and decoder share. To select a nested stack, use a path such as `params/language_model/layers_*` or `params/text/layers_*`.
 
-A scanned decoder declares one bank per run of like layers. An unscanned decoder declares one bank per layer. Both stream through the same fetch loop. `dew.inference.host_banked(model, source, layout=...)` reads each physical bank once and rejects two different views of the same namespace. The fetch loop holds the current layer and the next one. GPU peak-memory bounds and whether the transfers overlap with compute have not been measured. Selected leaves keep their FSDP and tensor PartitionSpecs. External cache arrays stay on the device under their logical per-layer paths. `Trainer.place` rejects host-parameter layouts, because the backward pass and optimizer paths for them do not exist.
+A scanned decoder declares one bank per run of like layers. An unscanned decoder declares one bank per layer. Both stream through the same fetch loop. A `LayerBanks` source's `place(model, layout=...)` reads each physical bank once and rejects two different views of the same namespace. The fetch loop holds the current layer and the next one. GPU peak-memory bounds and whether the transfers overlap with compute have not been measured. Selected leaves keep their FSDP and tensor PartitionSpecs. External cache arrays stay on the device under their logical per-layer paths. `Trainer.place` rejects host-parameter layouts, because the backward pass and optimizer paths for them do not exist.
 
 On a TPU, pinned banks keep their layer axis major-most in physical memory. A fetch retains that axis until the copy reaches device memory, then squeezes it there. This avoids incompatible host tile bitcasts while retaining per-layer transfers. Bank sources must honor any JAX `Format` supplied in their placement; both built-in sources do.
 
@@ -125,7 +126,7 @@ On a TPU, pinned banks keep their layer axis major-most in physical memory. A fe
 
 Both read the entry leaves outside the declared stacks, and both accept namespaces relative to a collection for bank reads. Media, embeddings and heads stay entries even when they share a parent module with a decoder. Each entry and bank placement finishes before the next read starts. `CausalTransformer(bank_layers=N)` limits how large a bank is when it is built. It does not cap the pinned allocator or free storage that the source owns. `StackView` still exposes the logical `layers_N` paths for saving and export. Synthetic generation exists only in `tools/benchmark_host_offload.py`.
 
-Loading a published checkpoint onto a mesh streams it leaf by leaf, but it does not stream banks into pinned host memory. `load_pretrained(source, mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline(source)` calls, never builds the translated model on the host. Each decoder leaf is a recipe over the memory-mapped checkpoint: which stored tensors, whether to transpose, whether to stack experts, and the storage dtype. `jax.make_array_from_callback` reads only the part each device holds, casting and transposing that part alone. The mapped pages are released once the leaf lands. The host holds at most one device shard of one leaf at a time, plus the towers, projectors and any dequantized quantized tensors, which are still built whole. Qwen3-0.6B loaded in float32 peaks at 3.9 GB RSS this way, against 6.2 GB for loading first and placing after, on one RTX 4080. On an 8-device CPU mesh the figures are 4.0 GB against 5.9 GB, and 2.4 GB of that is the placed model itself. For Qwen3.8-27B (55.6 GB in bf16) on an 8-device mesh, the recipes cover 54.6 GB of the checkpoint, the largest single read is 0.32 GB, each device holds 6.95 GB, and the vision tower built on the host is 0.92 GB.
+Loading a published checkpoint onto a mesh streams it leaf by leaf, but it does not stream banks into pinned host memory. `Pretrained.load(source, mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline(source)` calls, never builds the translated model on the host. Each decoder leaf is a recipe over the memory-mapped checkpoint: which stored tensors, whether to transpose, whether to stack experts, and the storage dtype. `jax.make_array_from_callback` reads only the part each device holds, casting and transposing that part alone. The mapped pages are released once the leaf lands. The host holds at most one device shard of one leaf at a time, plus the towers, projectors and any dequantized quantized tensors, which are still built whole. Qwen3-0.6B loaded in float32 peaks at 3.9 GB RSS this way, against 6.2 GB for loading first and placing after, on one RTX 4080. On an 8-device CPU mesh the figures are 4.0 GB against 5.9 GB, and 2.4 GB of that is the placed model itself. For Qwen3.8-27B (55.6 GB in bf16) on an 8-device mesh, the recipes cover 54.6 GB of the checkpoint, the largest single read is 0.32 GB, each device holds 6.95 GB, and the vision tower built on the host is 0.92 GB.
 
 Host-parameter placement works only for decoder stack variables. Dew rejects a selection that includes an embedding table, a head or a prediction depth. Matching leaves of every layer in a bank must have the same memory kind and PartitionSpec. The stage pipeline and training through a banked store are rejected. In JAX 0.11.1, reverse-mode autodiff through the fetch loop does not lower: its transpose asks for a `dynamic_update_slice` whose operands sit in different memory spaces. A small forward-mode probe agrees with resident placement. That probe does not show that backward re-fetch or training works.
 
@@ -139,7 +140,7 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## Batches
 
-`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` read one share of every global batch, and `dew.training.data_partition(mesh)` returns the `DataPartition(index, count, readers, reader)` of this process. Processes whose devices hold the same rows read the same share: under `stage` or `sequence` axes that span processes, several processes hold one row shard and count as `readers` of one share. A loader cuts its records `index::count`, so global batch *k* holds the same records at every process count. `shard_batch` assembles the shares into global arrays of whole rows.
+`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` read one share of every global batch, and `DataPartition.of(mesh)` returns the `DataPartition(index, count, readers, reader)` of this process. Processes whose devices hold the same rows read the same share: under `stage` or `sequence` axes that span processes, several processes hold one row shard and count as `readers` of one share. A loader cuts its records `index::count`, so global batch *k* holds the same records at every process count. `shard_batch` assembles the shares into global arrays of whole rows.
 
 For custom data, take the partition you are handed and read that share alone. Two readers of one share must read the same records in the same order. A source that returns rows in whatever order its fetches finish, such as `UrlStream`, refuses a partition with more than one reader. If each process repeats the full dataset on its own, the run trains on a different distribution.
 

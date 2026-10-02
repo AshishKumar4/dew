@@ -17,13 +17,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models, with_precision
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.training import Layout, MeshSpec
 from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -38,7 +38,7 @@ FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 def fixture_pair(name, **overrides):
     """The fixture's model and its scanned twin, with the fixture's weights."""
     directory = FIXTURES / name
-    pretrained = load_pretrained(
+    pretrained = Pretrained.load(
         str(directory), dtype="float32", attention_impl="reference", **overrides)
     scanned = models.build("causal_transformer",
                            **{**pretrained.model_config, "scan_layers": True})
@@ -273,7 +273,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     outcomes = []
     for model in (plain, scanned):
         objective = LMObjective(model, 11, balance_rate=0.01, aux_loss_alpha=0.1)
-        loss, aux = scalar_loss(objective, variables, batch, step)
+        loss, aux = objective.scalar_loss(variables, batch, step)
         assert aux.effects is not None
         outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
                          objective.apply_effects(variables, aux.effects)["moe"]))
@@ -350,14 +350,14 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     """The objective's loss, metrics and gradients on `spec`'s mesh over
     `devices` (every device by default), with the pipeline's schedule in
     context the way the trainer's compiled step puts it there."""
-    mesh = build_mesh(spec, devices)
+    mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
     batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
     def loss(params):
-        return scalar_loss(objective, {**variables, "params": params}, batch, step)
+        return objective.scalar_loss({**variables, "params": params}, batch, step)
 
     with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
@@ -533,7 +533,7 @@ def test_a_pipeline_refuses_microbatches_that_do_not_divide_a_devices_rows():
 def test_decoding_under_a_stage_axis_is_refused():
     model = tiny()
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, stage=2))):
+    with jax.set_mesh(MeshSpec(fsdp=4, stage=2).build()):
         with pytest.raises(ValueError, match="decode outside jax.set_mesh"):
             model.apply(variables, jnp.ones((1, 1), jnp.int32), decode=True, mutable=["cache"])
 
@@ -545,7 +545,7 @@ def test_a_layout_rule_onto_the_stage_axis_is_refused():
     variables = jax.eval_shape(tiny().init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     with pytest.raises(ValueError, match="stage axis holds the pipeline"):
         Layout(rules={"mlp": "stage"}, min_shard=1).shardings(
-            build_mesh(MeshSpec(fsdp=4, stage=2)), variables)
+            MeshSpec(fsdp=4, stage=2).build(), variables)
 
 
 def test_scanned_dropout_uses_the_supplied_rng():
@@ -606,7 +606,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     8.7, 10.1 or NaN depending on the process, exact without jit and on a
     GPU: the compiled program is identical across processes, so the bad
     values came from its run (`chunk_kimi_delta_rule`'s workaround)."""
-    loaded = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
+    loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
     scanned = dataclasses.replace(loaded.model, scan_layers=True)

@@ -1,21 +1,14 @@
 """Stable Diffusion 3's own MM-DiT, as the published transformer computes it.
 
-`SimpleMMDiT` is Dew's own dual-stream model, trained from scratch on Dew's
-conventions. This module is the other thing: the arithmetic of Diffusers
-0.34.0's `SD3Transformer2DModel`, so a published checkpoint's tensors mean
-here what they mean there. The differences from the scratch model are not
-cosmetic - the modulation channel order, the joint attention's image-then-
-context concatenation, the position buffer's centred crop, the separate
-timestep and pooled-text embedders that are summed, the last block's
-context-only continuous norm, and SD3.5's ninefold modulation with a second
-self-attention - so the two stay separate rather than one growing flags.
-
-The interface is Dew's: NHWC noisy latents, a model time, a
-`DenoisingCondition` carrying the text tokens and the pooled text vector,
-and NHWC velocity out. Position embeddings are a persistent sin/cos buffer
-in the source, not a learned parameter, so they ride in the `buffers`
-collection: an optimizer never sees them and the checkpoint's own stored
-values are what the model reads and what export writes back.
+The arithmetic of Diffusers 0.34.0's `SD3Transformer2DModel`, apart from
+`SimpleMMDiT`: the modulation channel order, the image-then-context joint
+attention, the position buffer's centred crop, the summed timestep and
+pooled-text embedders, the last block's context-only norm, and SD3.5's
+ninefold modulation with a second self-attention. The interface is Dew's:
+NHWC latents, a model time, a `DenoisingCondition` with the text tokens and
+pooled vector, NHWC velocity out. The source's sin/cos position buffer rides
+in the `buffers` collection, so no optimizer sees it and the checkpoint's
+stored values are what is read and exported.
 """
 
 from __future__ import annotations
@@ -31,6 +24,7 @@ from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
+from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -39,16 +33,11 @@ if TYPE_CHECKING:
 
 
 def sincos_position(channels: int, grid: int, *, base_size: int):
-    """`get_2d_sincos_pos_embed` at the grid the source builds its buffer on.
-
-    The source meshes width first and then reads that first mesh into the
-    leading half of the channels, so the leading half carries the column
-    coordinate and the trailing half the row, each as sine then cosine over
-    frequencies 10000^-(2i/half); both axes are divided by `grid / base_size`.
-
-    This is only the buffer's initializer. A published checkpoint stores the
-    buffer and that stored value is what a load reads; this is here so a
-    model built without one starts where the source starts.
+    """`get_2d_sincos_pos_embed` at the grid the source builds its buffer on:
+    the leading half of the channels carries the column, the trailing half the
+    row, each sine then cosine over 10000^-(2i/half), both axes divided by
+    `grid / base_size`. Only the initializer; a loaded checkpoint brings its
+    stored buffer.
     """
     steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
     columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
@@ -255,8 +244,7 @@ class SD3Block(nn.Module):
                ("timestep_embedder_linear_1",): (None, "embed"),
                ("timestep_embedder_linear_2",): (None, "embed"),
                ("text_embedder_linear_1",): (None, "embed"),
-               ("text_embedder_linear_2",): (None, "embed")},
-              heuristic=(("pos_embed_proj",),))
+               ("text_embedder_linear_2",): (None, "embed")})
 class SD3Transformer(nn.Module):
     """Diffusers 0.34.0's `SD3Transformer2DModel` over Dew's interface.
 
@@ -348,9 +336,7 @@ class SD3Transformer(nn.Module):
         image = _modulate(_layer_norm(self.dtype)(image), shift, scale)
         image = nn.Dense(patch * patch * self.out_channels, dtype=self.dtype,
                          precision=self.precision, name="proj_out")(image)
-        image = image.reshape(image.shape[0], rows, columns, patch, patch, self.out_channels)
-        image = image.transpose(0, 1, 3, 2, 4, 5)
-        return image.reshape(image.shape[0], rows * patch, columns * patch, self.out_channels)
+        return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 
 __all__ = ["SD3Block", "SD3Transformer", "sincos_position"]

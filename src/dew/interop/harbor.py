@@ -61,9 +61,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dew.inference.clients import decode_routed_experts
+from dew.objectives.rl.sessions import Call, Session, Status, Task
 from dew.records import JSON
-
-from .sessions import Call, Session, Status, Task
 
 if TYPE_CHECKING:
     from types import TracebackType

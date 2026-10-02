@@ -14,7 +14,6 @@ from dew.inference.banks import (
     LayerBanks,
     at_namespace,
     entry_tree,
-    host_banked,
     in_namespace,
     narrowed,
 )
@@ -39,7 +38,7 @@ def fixture(kind):
     media = {"pixel_values": jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8)}
     vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1,
                          num_heads=2, image_size=8, patch_size=4)
-    projection = GemmaProjector(vision_width=16, text_width=16,
+    projection = GemmaProjector(text_width=16,
                                patches_per_side=2, tokens_per_side=1)
     if kind == "root":
         return text, text.init(jax.random.key(0), tokens), tokens, indices, media
@@ -80,7 +79,7 @@ def host_layout(site):
                   host_parameters=("/".join(("params", *site.namespace, "layers_*")),))
 
 
-class SelectedReads:
+class SelectedReads(LayerBanks):
     """A storage boundary that forbids transferring decoder layers as entries."""
 
     def __init__(self, source: LayerBanks, sites: tuple[DecoderBank, ...]):
@@ -126,8 +125,8 @@ def test_declared_banks_preserve_canonical_values_layout_and_model_reads(kind):
     model, variables, tokens, indices, media = fixture(kind)
     sites = model.bank_sites
     source = SelectedReads(HeldBanks(variables), sites)
-    resident = host_banked(model, HeldBanks(variables), layout=DEVICE)
-    hosted = host_banked(model, source, layout=host_layout(sites[0]))
+    resident = HeldBanks(variables).place(model, layout=DEVICE)
+    hosted = source.place(model, layout=host_layout(sites[0]))
     identical(unpack(hosted, sites, source.shapes()), variables)
     identical(narrowed(hosted, entry_tree(source.shapes(), sites)),
               narrowed(resident, entry_tree(source.shapes(), sites)))
@@ -158,15 +157,15 @@ def test_shared_decoder_readers_allocate_one_canonical_owner_and_refuse_conflict
     (site,) = model.bank_sites
     repeated = DeclaredOwners((site, site))
     source = SelectedReads(HeldBanks(variables), model.bank_sites)
-    store = host_banked(repeated, source, layout=host_layout(site))
+    store = source.place(repeated, layout=host_layout(site))
     assert len(source.reads) == len(site.view.groups)
     identical(unpack(store, model.bank_sites, source.shapes()), variables)
-    reference = host_banked(model, HeldBanks(variables), layout=DEVICE)
+    reference = HeldBanks(variables).place(model, layout=DEVICE)
     identical(scores(model, store, tokens, indices, media),
               scores(model, reference, tokens, indices, media))
     conflicting = DecoderBank(site.namespace, StackView(((0, 1), (1, 3))))
     with pytest.raises(ValueError, match="conflicting decoder views"):
-        host_banked(DeclaredOwners((site, conflicting)), HeldBanks(variables), layout=DEVICE)
+        HeldBanks(variables).place(DeclaredOwners((site, conflicting)), layout=DEVICE)
 
 
 def first_leaf(tree):
@@ -193,10 +192,10 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
     checkpoints.save(0, state, None)
     checkpoints.wait()
     source = SelectedReads(CheckpointBanks(str(tmp_path), ema=True), model.bank_sites)
-    restored = host_banked(model, source, layout=host_layout(site))
+    restored = source.place(model, layout=host_layout(site))
     expected = merge(variables, averaged)
     identical(unpack(restored, model.bank_sites, source.shapes()), expected)
-    resident = host_banked(model, HeldBanks(expected), layout=DEVICE)
+    resident = HeldBanks(expected).place(model, layout=DEVICE)
     identical(scores(model, restored, tokens, indices, media),
               scores(model, resident, tokens, indices, media))
 
@@ -235,18 +234,18 @@ def test_a_missing_nested_owner_or_layer_is_rejected_before_entry_transfer():
 
     wrong = DeclaredOwners((DecoderBank(("missing",), site.view),))
     with pytest.raises(ValueError, match="holds layers"):
-        host_banked(wrong, MetadataOnly(variables), layout=DEVICE)
+        MetadataOnly(variables).place(wrong, layout=DEVICE)
     scope = dict(in_namespace(variables, site.namespace)["params"])
     scope.pop("layers_1")
     broken = {**variables, "params": {**variables["params"], "language_model": scope}}
     with pytest.raises(ValueError, match="holds layers"):
-        host_banked(model, MetadataOnly(broken), layout=DEVICE)
+        MetadataOnly(broken).place(model, layout=DEVICE)
 
 
 def test_nested_entry_offload_cannot_treat_a_decoder_owner_as_one_fetch():
     model, variables, _, _, _ = fixture("multimodal")
     with pytest.raises(ValueError, match="stack does not fetch"):
-        host_banked(model, HeldBanks(variables), layout=Layout(
+        HeldBanks(variables).place(model, layout=Layout(
             min_shard=1, tolerance=1.0, host_parameters=("params/language_model/*",)))
 
 
@@ -257,8 +256,8 @@ def test_an_unscanned_decoder_banks_one_layer_at_a_time():
     (site,) = unscanned.bank_sites
     assert site.view.groups == tuple((index, 1) for index in range(4))
     source = SelectedReads(HeldBanks(variables), unscanned.bank_sites)
-    resident = host_banked(unscanned, HeldBanks(variables), layout=DEVICE)
-    hosted = host_banked(unscanned, source, layout=host_layout(site))
+    resident = HeldBanks(variables).place(unscanned, layout=DEVICE)
+    hosted = source.place(unscanned, layout=host_layout(site))
     identical(unpack(hosted, unscanned.bank_sites, source.shapes()), variables)
     layers = in_namespace(hosted, site.namespace)["params"]
     device_layers = in_namespace(resident, site.namespace)["params"]

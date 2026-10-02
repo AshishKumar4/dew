@@ -16,7 +16,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
-from dew.training import DEFAULT_RULES, MeshSpec, build_mesh
+from dew.training import DEFAULT_RULES, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
@@ -51,7 +51,7 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
     parameters = reference.init(jax.random.key(19), x, weights, indices)
     expected = jax.jit(jax.value_and_grad(functools.partial(objective, reference, indices),
                                         (0, 1, 2), has_aux=True))(parameters, x, weights)
-    mesh = build_mesh(MeshSpec(expert=shards, fsdp=fsdp))
+    mesh = MeshSpec(expert=shards, fsdp=fsdp).build()
     with jax.set_mesh(mesh):
         actual = jax.jit(jax.value_and_grad(functools.partial(
             objective, reference.clone(dispatch='exchange'), indices),
@@ -69,7 +69,7 @@ def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, False))
     model = ExpertMLP(8, 16, 8)
     parameters = model.init(jax.random.key(19), x, weights, indices)
-    mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
+    mesh = MeshSpec(expert=4, fsdp=2).build()
     columns = NamedSharding(mesh, P('expert', None, 'fsdp'))
     parameter_specs = {'params': {
         'gate_proj': {'kernel': columns}, 'up_proj': {'kernel': columns},
@@ -101,7 +101,7 @@ def test_decoder_exchange_retains_logits_and_expert_bias_observations(parallel):
     expected, observations = reference.apply(parameters, tokens, mutable=['router'])
     from dataclasses import replace
     exchanged = reference.clone(mixture=replace(mixture, dispatch='exchange'))
-    mesh = build_mesh(MeshSpec(expert=2))
+    mesh = MeshSpec(expert=2).build()
     with jax.set_mesh(mesh):
         actual, actual_observations = jax.jit(lambda p, t: exchanged.apply(
             p, t, mutable=['router']))(parameters, tokens)
@@ -116,7 +116,7 @@ def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
     module = ExpertMLP(6, 12, 8, dispatch='exchange')
     parameters = module.init(jax.random.key(0), x, weights, indices)
     for shards in (1, 4):
-        mesh = build_mesh(MeshSpec(expert=shards))
+        mesh = MeshSpec(expert=shards).build()
         with jax.set_mesh(mesh), pytest.raises(ValueError, match='divides num_experts'):
             module.apply(parameters, x, weights, indices)
 
@@ -129,7 +129,7 @@ def test_exchange_refuses_experts_the_rules_keep_off_the_expert_axis():
     module = ExpertMLP(8, 12, 8, dispatch='exchange')
     parameters = module.init(jax.random.key(0), x, weights, indices)
     rules = tuple(rule for rule in DEFAULT_RULES if rule[0] != 'exp')
-    with (jax.set_mesh(build_mesh(MeshSpec(expert=2), jax.devices()[:4])), nn.logical_axis_rules(rules),
+    with (jax.set_mesh(MeshSpec(expert=2).build(jax.devices()[:4])), nn.logical_axis_rules(rules),
           pytest.raises(ValueError, match='first dimension over the expert axis')):
         module.apply(parameters, x, weights, indices)
 
@@ -195,7 +195,7 @@ def test_capacity_drops_the_same_slots_on_every_layout(spec, batch, length, top_
     expected = jax.jit(gradient(functools.partial(objective, dropless, routing)))(
         parameters, x, np.where(kept, weights, 0).astype(np.float32))
     dropping = dropless.clone(dispatch=dispatch, capacity_factor=1.0)
-    with jax.set_mesh(build_mesh(spec, jax.devices()[:4])):
+    with jax.set_mesh(spec.build(jax.devices()[:4])):
         actual = jax.jit(gradient(functools.partial(objective, dropping, routing)))(
             parameters, x, weights)
     (value, out), (d_parameters, d_x, d_weights) = actual

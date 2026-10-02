@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.verify import _ROUNDING
 from dew.sampling.text import Sampling
 
@@ -65,7 +65,7 @@ def check_checkpoint(checkpoint, output, revision=None):
                                                      do_sample=False, eos_token_id=None).cpu().numpy()[:, -3:])
     del reference
     torch.cuda.empty_cache()
-    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
+    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
                              revision=revision)
     language = loaded.model.language_model.clone(precision=jax.lax.Precision.HIGHEST)
     model = loaded.model.clone(language_model=language, precision=jax.lax.Precision.HIGHEST)

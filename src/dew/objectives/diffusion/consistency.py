@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.diffusion.process import Process, aligned_conditions
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec, unit_range
@@ -38,7 +38,7 @@ from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 from dew.sampling.solvers import Consistency
 
-from .objective import FAKE_SCORE, TEACHER, DiffusionObjective
+from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, _own_loss
 
 Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 """A rectified-flow velocity v(x, rf) at rf time."""
@@ -182,7 +182,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     it was, here the idle network's gradient is zero for that step: an
     optimizer whose update moves on a zero gradient, such as Adam's momentum,
     still moves it. Sampling walks the student's multistep consistency
-    sampler, `Consistency`.
+    solver, `Consistency`.
 
     sCM's loss differentiates the student in time, so its time embedding
     must be smooth in it: `simple_dit(time_scale=0.002)`, which a run config
@@ -215,15 +215,11 @@ class ConsistencyDistillationObjective(DiffusionObjective):
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
-        unused = sorted(
-            key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None
-        )
-        if unused:
-            raise ValueError(f"rCM trains on its own losses, which read none of {unused}")
+        _own_loss("rCM", kwargs)
         if consistency_weight <= 0 and dmd_weight <= 0:
             raise ValueError("rCM needs a consistency or a distribution-matching loss")
         kwargs.setdefault("guidance", None)
-        kwargs.setdefault("sampler", Consistency())
+        kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
         super().__init__(model, process, inputs, **kwargs)
         self.teacher = teacher
@@ -304,9 +300,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         if self.autoencoder is not None:
             samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
         count = samples.shape[0]
-        given, unconditional = self._conditions(params, batch, drop_key, dropout=False)
-        blank = jax.tree.map(lambda value, null: jnp.broadcast_to(null, value.shape),
-                             given, aligned_conditions(given, unconditional))
+        given, blank = self._conditions(params, batch, drop_key, dropout=False)
         iteration = step.step
         warm = iteration < self.tangent_warmup
         student_phase = (self.dmd_weight <= 0) | warm | (

@@ -65,7 +65,6 @@ def test_llama4_wrapper_translates_to_three_records():
     assert record["text_model_type"] == "llama4_text"
     assert record["tower"]["kind"] == "llama4"
     assert record["projector"]["kind"] == "llama4"
-    assert record["projector"]["vision_width"] == 64
     assert record["image_token_id"] == 92
     assert record["tokens_per_image"] == 1
 
@@ -81,7 +80,7 @@ def test_gemma4_wrapper_translates_to_three_records():
     assert record["tower"]["pooling_kernel_size"] == 2
     assert record["projector"]["kind"] == "gemma4"
     assert record["projector"] == {
-        "kind": "gemma4", "vision_width": 32, "text_width": 32,
+        "kind": "gemma4", "text_width": 32,
         "norm_eps": 1e-06}
     assert record["image_token_id"] == 60
     # The pooled count follows the image resolution, so the record leaves it
@@ -125,7 +124,6 @@ def test_the_released_qwen35_wrapper_translates():
     config = json.loads((FIXTURES / "qwen35-0.8b" / "config.json").read_text())
     record = translate_wrapper_config(config)
     assert record["tower"]["hidden_size"] == 768
-    assert record["tower"]["out_hidden_size"] == 1024
     assert record["projector"] == {
         "kind": "qwen3_5", "vision_width": 768, "merge_size": 2,
         "out_width": 1024}
@@ -142,7 +140,7 @@ def test_the_released_scout_wrapper_translates():
     assert record["tower"]["image_size"] == 336
     assert record["tokens_per_image"] == 144
     assert record["projector"] == {
-        "kind": "llama4", "vision_width": 4096, "text_width": 5120}
+        "kind": "llama4", "text_width": 5120}
 
 
 def wrapper_pixels(directory, record):
@@ -230,9 +228,11 @@ def _multimodal_logits(name, image_id, shift=0):
         fields["final_logit_softcap"] = None
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", fields, dtype="float32", attention_impl="reference"))
-    return (np.asarray(model.apply(variables["language_model"], ids,
-                                   input_embeddings=np.asarray(soft),
-                                   embedding_positions=positions)),
+    language = variables["language_model"]
+    embedded = model.apply(language, ids, method=lambda decoder, ids: decoder.scaled_embeddings(
+        decoder.token_embeddings(ids)))
+    embedded = embedded.at[np.arange(len(ids))[:, None], positions].set(soft.astype(embedded.dtype))
+    return (np.asarray(model.apply(language, ids, input_embeddings=embedded)),
             np.load(directory / "wrapper_ref.npy"), positions)
 
 

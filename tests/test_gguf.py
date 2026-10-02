@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import pytest
 
-from dew.interop import gguf as dew_gguf, load_pretrained
+from dew.interop import Pretrained, gguf as dew_gguf
 
 gguf = pytest.importorskip("gguf")
 torch = pytest.importorskip("torch")
@@ -207,7 +207,7 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
                hf_tensors("llama", rng), rng)
 
-    pretrained = load_pretrained(tmp_path, dtype="float32", attention_impl="reference",
+    pretrained = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference",
                                  gguf_file="model.gguf")
     reference = AutoModelForCausalLM.from_pretrained(str(tmp_path), gguf_file="model.gguf",
                                                      dtype=torch.float32)
@@ -242,8 +242,8 @@ def test_the_files_tokenizer_loads_without_torch(tmp_path):
 import sys
 sys.modules["torch"] = None
 import numpy as np
-from dew.interop import load_pretrained
-loaded = load_pretrained(sys.argv[1], dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+from dew.interop import Pretrained
+loaded = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference", gguf_file="model.gguf")
 print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
 """
     run = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True,
@@ -287,7 +287,7 @@ def test_a_missing_file_names_the_files_there(tmp_path):
     write_gguf(tmp_path / "model-Q8_0.gguf", "llama", gguf.GGMLQuantizationType.F32, {}, rng)
 
     with pytest.raises(FileNotFoundError, match=r"\['model-Q8_0.gguf'\]"):
-        load_pretrained(tmp_path, gguf_file="model-Q4_K_M.gguf")
+        Pretrained.load(tmp_path, gguf_file="model-Q4_K_M.gguf")
 
 
 # Pinned: the bounds below are this commit's files.
@@ -319,7 +319,7 @@ def test_released_gguf_logits_match_transformers(name):
 
     if not available(name):
         pytest.skip(f"{REPO}/{name} at {REVISION[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
-    pretrained = load_pretrained(REPO, revision=REVISION, gguf_file=name, dtype="float32",
+    pretrained = Pretrained.load(REPO, revision=REVISION, gguf_file=name, dtype="float32",
                                  attention_impl="reference", max_seq_len=64)
     reference = AutoModelForCausalLM.from_pretrained(REPO, revision=REVISION, gguf_file=name,
                                                      dtype=torch.float32)

@@ -1,27 +1,18 @@
 """Z-Image's single-stream transformer (S3-DiT), as Diffusers 0.40.0's
 `ZImageTransformer2DModel` runs it for text-to-image.
 
-The latent is cut into 2x2 patches, one token each, and the prompt states
-are the text encoder's own. Each stream is padded to a multiple of 32
-tokens: the image's padding holds a learned image pad token at position
-(0, 0, 0), the prompt's a learned caption pad token. Two refiner blocks
-modulated by the time run over the image tokens, two unmodulated ones over
-the prompt, and then the main blocks over both joined, image first. Every
-block is pre- and post-normed: RMS norms before and after the attention and
-the SwiGLU feed-forward, the residual branches gated by the tanh of the time
-modulation. A three-axis rotary table places prompt token i at (1 + i, 0, 0)
-and image patch (h, w) at (1 + P, h, w), P being the padded prompt length,
-which differs row to row; the source looks each position up in a table it
-computed in float64 and rounded to float32, so this does too.
-
-Beyond the padding the source pads each batch to its longest row and masks
-those keys. Here the prompt region is the conditioner's budget wide, rounded
-up to 32, the prompt and its padding lead it, and the rest is masked the
-same way.
-
-The source is called with the time 1 - sigma and its output is the negated
-flow; this module takes Dew's model time, sigma times the training count,
-and returns the flow Dew's process reads, so the conversion lives here.
+2x2 latent patches are one token each; each stream pads to a multiple of 32
+tokens with a learned pad token (the image's at position (0, 0, 0)). Two
+time-modulated refiner blocks run over the image, two unmodulated over the
+prompt, then the main blocks over both, image first; every block RMS-norms
+before and after attention and the SwiGLU, its residuals gated by the tanh
+of the time modulation. The three-axis rotary places prompt token i at
+(1 + i, 0, 0) and patch (h, w) at (1 + P, h, w), P the padded prompt length,
+looked up in a float64 table rounded to float32 as the source does. The
+source pads a batch to its longest row and masks; here the prompt region is
+the conditioner's budget rounded up to 32, masked the same way. The source
+takes time 1 - sigma and returns the negated flow; this takes Dew's model
+time and returns Dew's flow.
 """
 
 from __future__ import annotations
@@ -37,6 +28,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
@@ -234,9 +226,8 @@ class ZImageTransformer(nn.Module):
         embedded = self._embedded_time(time, x.dtype)
         pad_image = self.param("x_pad_token", nn.initializers.zeros, (1, self.dim))
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
-        patches = x.reshape(batch, rows, 2, columns, 2, channels).transpose(0, 1, 3, 2, 4, 5).reshape(
-            batch, count, 4 * channels)
-        image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(patches)
+        image = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision, name="x_embedder")(
+            patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
@@ -278,8 +269,7 @@ class ZImageTransformer(nn.Module):
                              name="final_modulation")(nn.silu(embedded))[:, None]
         out = nn.Dense(4 * channels, dtype=self.dtype, precision=self.precision, name="final_linear")(
             _layer_norm(self.dtype)(joined[:, :count]) * scale)
-        out = out.reshape(batch, rows, columns, 2, 2, channels).transpose(0, 1, 3, 2, 4, 5).reshape(x.shape)
-        return -out
+        return -unpatchify(out, 2, *x.shape[1:])
 
 
 __all__ = ["ZImageBlock", "ZImageTransformer", "rotary_table"]

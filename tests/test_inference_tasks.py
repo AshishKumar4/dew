@@ -12,7 +12,7 @@ import pytest
 from test_text_rollout_contract import decoder
 
 from dew.inference import BlockGeneration, TextGeneration
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, generate
 
@@ -65,7 +65,7 @@ def test_prepared_rows_and_text_requests_are_kept_apart():
 def test_a_loaded_source_generates_from_text_with_its_own_policy():
     """The Gemma3 source turns prompts and images into a conditioned greedy
     continuation and decodes it back through its own tokenizer."""
-    loaded = load_pretrained(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     task = loaded.text_generation()
@@ -75,16 +75,29 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
                                   np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy"))
     assert loaded.processor is not None
     assert task.decode(generated) == tuple(loaded.processor.decode(generated.tokens[:, -3:]))
-    with pytest.raises(TypeError):
-        loaded.block_generation()
+    assert not hasattr(loaded, "block_generation")
+
+
+def test_a_source_loads_as_its_kind_and_a_kind_refuses_another():
+    """`Pretrained.load` returns the kind the source is, with the methods
+    that kind has; called on a kind, it refuses a source of another."""
+    from dew.interop import PretrainedBlockDecoder, PretrainedDecoder, PretrainedMaskedDecoder
+
+    assert type(Pretrained.load(FIXTURES / "llama-tiny", dtype="float32")) is PretrainedDecoder
+    assert type(Pretrained.load(FIXTURES / "llada-tiny", dtype="float32")) is PretrainedMaskedDecoder
+    gemma = PretrainedBlockDecoder.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32",
+                                        max_seq_len=32)
+    assert type(gemma) is PretrainedBlockDecoder
+    with pytest.raises(TypeError, match="is a PretrainedMaskedDecoder source, not a PretrainedDecoder"):
+        PretrainedDecoder.load(FIXTURES / "llada-tiny", dtype="float32")
 
 
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew import Dataset, Trainer
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
 
-    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
                              max_seq_len=8)
     options = dict(ema_decay=None, head_chunks=1, pad_id=0, z_loss=1e-4)
     explicit = LMObjective(source.model, 4, pretrained=source.variables, **options)
@@ -96,8 +109,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     batch = {"text": np.tile(np.asarray([[1, 3, 5, 7, 0], [2, 4, 6, 8, 9]], np.int32),
                               (count // 2, 1))}
     step = Step(step=jnp.asarray(0), key=jax.random.key(13), ema=None)
-    loss = lambda objective: jax.jit(scalar_loss, static_argnums=0)(
-        objective, objective.init(key), batch, step)[0]
+    loss = lambda objective: jax.jit(objective.scalar_loss)(objective.init(key), batch, step)[0]
     np.testing.assert_array_equal(loss(bundled), loss(explicit))
     data = Dataset(train=lambda partition: iter([batch]), val=None, records=count, batch=count)
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
@@ -110,7 +122,7 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
 
 
 def test_a_pretrained_bundle_refuses_a_second_initial_tree():
-    source = load_pretrained(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla")
     with pytest.raises(ValueError, match="already supplies"):
         source.lm_objective(4, pretrained=source.variables)
 
@@ -120,7 +132,7 @@ def test_media_prompts_are_processed_once_and_keep_their_continuations():
     continuation count, and the continuations expand afterwards: each row
     carries the prompt, the image features and the conditioned continuation of
     the prompt it sits under."""
-    loaded = load_pretrained(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     expected = np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy")
@@ -157,7 +169,7 @@ def test_media_prompts_are_processed_once_and_keep_their_continuations():
 
 
 def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims():
-    loaded = load_pretrained(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
                              max_seq_len=32)
     task = loaded.block_generation()
     assert isinstance(task, BlockGeneration)
@@ -293,7 +305,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     from dew.nn.inputs import BATCH_AXES
     from dew.training import Layout, MeshSpec
 
-    loaded = load_pretrained(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
                              max_seq_len=32)
     plain = loaded.block_generation()
     placed = plain.bind(place(loaded.variables, MeshSpec(fsdp=2), Layout(min_shard=2 ** 6)))

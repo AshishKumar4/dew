@@ -1,4 +1,4 @@
-"""Tier 3: `load_pretrained(..., fallback="torchax")` over transformers' own forward.
+"""Tier 3: `Pretrained.load(..., fallback="torchax")` over transformers' own forward.
 
 The offline cases build a tiny random GPT-NeoX, an architecture Dew has no
 family for and whose rotary `inv_freq` is a buffer, save it the way
@@ -28,7 +28,7 @@ from huggingface_hub import try_to_load_from_cache
 from jax.sharding import PartitionSpec as P
 
 from dew.data.dataset import Dataset
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout
 from dew.objectives.base import Step
 
@@ -60,7 +60,7 @@ def source(tmp_path_factory):
 @pytest.fixture(scope="module")
 def loaded(source):
     with pytest.warns(UserWarning, match="tier 3"):
-        return load_pretrained(source[0], fallback="torchax", dtype="float32")
+        return Pretrained.load(source[0], fallback="torchax", dtype="float32")
 
 
 @pytest.fixture(scope="module")
@@ -114,7 +114,7 @@ def test_a_load_puts_nothing_on_a_device(source):
     caller's placement moves them, so a model larger than one device loads.
     Any transfer to a device during the load raises under the guard."""
     with jax.transfer_guard_host_to_device("disallow"), pytest.warns(UserWarning, match="tier 3"):
-        load_pretrained(source[0], fallback="torchax", dtype="float32")
+        Pretrained.load(source[0], fallback="torchax", dtype="float32")
 
 
 @pytest.mark.mesh
@@ -159,14 +159,13 @@ def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
 
 def test_the_fallback_refuses_what_it_cannot_run(source, loaded, tmp_path):
     with pytest.raises(ValueError, match="the one fallback is 'torchax'"):
-        load_pretrained("nobody/nothing", fallback="torch")
+        Pretrained.load("nobody/nothing", fallback="torch")
     config = {**transformers.GPTNeoXConfig(**TINY).to_dict(),
               "quantization_config": {"quant_method": "awq", "bits": 4}}
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match=r"float weights only.*awq"):
-        load_pretrained(tmp_path, fallback="torchax")
-    with pytest.raises(TypeError, match="generate with transformers"):
-        loaded.text_generation()
+        Pretrained.load(tmp_path, fallback="torchax")
+    assert not hasattr(loaded, "text_generation")
 
 
 GPT2 = ("openai-community/gpt2", "607a30d783dfa663caf39e06633721c8d4cfcd7e")
@@ -188,7 +187,7 @@ def test_released_gpt2_matches_transformers(dtype):
             and not isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str)):
         pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     with pytest.warns(UserWarning, match="tier 3"):
-        loaded = load_pretrained(repo, revision=revision, fallback="torchax", dtype=dtype, param_dtype=dtype)
+        loaded = Pretrained.load(repo, revision=revision, fallback="torchax", dtype=dtype, param_dtype=dtype)
     assert loaded.processor is not None
     ids = np.asarray(loaded.processor("The Cascade Range runs from northern California through").tokens)
     expected = torch_logits(transformers.AutoModelForCausalLM.from_pretrained(

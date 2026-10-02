@@ -8,25 +8,18 @@ and, per batch element and head, runs
     S' = exp(acs_C-1) S + sum_j exp(segsum_C-1,j) x_j B_j^T      (the write)
 
 with `segsum_ij = sum_{j < k <= i} A dt_k`, `acs` its cumulative sum and `x`
-already carrying its `dt`. XLA runs that as six einsums over the whole batch,
-so every chunk's `[C, C]` segment sums, its `[C, C]` Gram matrix and its
-`[P, N]` state cross HBM. The kernel keeps them inside one program and writes
-only `y`, the final state, and (when a gradient needs it) the state each chunk
-entered with.
+carrying its `dt`. XLA's six einsums send every chunk's `[C, C]` segment
+sums and Gram matrix and its `[P, N]` state through HBM; the kernel keeps
+them in one program and writes only `y`, the final state and, for a
+gradient, each chunk's entering state. Mosaic's grid is ordered and a
+revisited window survives a step, so `grid=(batch, heads, chunks)` runs the
+chunk innermost with the state in the shared output window.
 
-Mosaic's grid is ordered and a window it revisits survives a grid step, so
-the kernel runs `grid=(batch, heads, chunks)` with the chunk innermost and the
-state in the output window the chunks share; `_chunk_forward` and
-`_chunk_backward` hold one chunk's work.
-
-The backward pass is the reverse recurrence, `dS_n = exp(acs_C-1) dS_n+1 +
-dy^T (C exp(acs))`, with each chunk's own gradients from the matrices the
-forward built. It is written by hand rather than left to autodiff, which
-would hold every intermediate of every chunk alive to the backward pass.
-
-The XLA path stays the oracle and the fallback: GPU and CPU take it, and so
-does any geometry `ssd_kernel_runs` refuses. tests/test_ssd_kernel.py holds the kernel
-to `chunk_ssd` and to `jax.grad` of it.
+The backward is the hand-written reverse recurrence, `dS_n = exp(acs_C-1)
+dS_n+1 + dy^T (C exp(acs))`, since autodiff would keep every chunk's
+intermediates. The XLA path is the oracle and the fallback for GPU, CPU and
+refused geometries; tests/test_ssd_kernel.py holds the kernel to `chunk_ssd`
+and its `jax.grad`.
 """
 
 from __future__ import annotations
@@ -74,19 +67,12 @@ def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
 def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str, *,
                     dtype: DTypeLike) -> bool:
     """Whether the SSD kernel is chosen for this geometry and the scan's
-    `dtype`: a tpu backend, a float32 scan (the kernel computes in float32,
-    so a wider one takes the XLA path, which computes in its own dtype), a
-    chunk long enough to pay for a program, three widths that are powers of
-    two so that Mosaic's tiling throws no lanes away, and a tile inside the
-    per-program budget.
-
-    A GPU takes the XLA path. A Triton port of this kernel ran 6x to 12x
-    slower than XLA on an RTX 4080 wherever it compiled, and every chunk of
-    128 or 256 overflowed shared memory (docs/performance.md); it was
-    removed.
-
-    `chunk_ssd` asks this at trace time and takes the XLA path when it says
-    no, the way attention's 'auto' asks `cudnn_runs`.
+    `dtype`: a tpu backend, a float32 scan (a wider one takes the XLA path in
+    its own dtype), a chunk long enough to pay for a program, three
+    power-of-two widths so Mosaic's tiling wastes no lanes, and a tile inside
+    the per-program budget. A Triton port ran 6x to 12x slower than XLA on an
+    RTX 4080 and overflowed shared memory at chunks of 128 and 256
+    (docs/performance.md), so a GPU takes the XLA path.
     """
     if backend != 'tpu' or jnp.dtype(dtype) != jnp.float32:
         return False
