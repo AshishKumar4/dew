@@ -205,6 +205,109 @@ def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
                               np.asarray(penalized([[1, 2]], 6, key=jax.random.key(1), n=1).tokens))
 
 
+def test_one_policy_holds_the_common_controls_in_the_reference_order():
+    """Penalties, n-gram bans and the EOS floor run before the warpers, and
+    typical filtering after min-p, which is `_get_logits_processor`'s order;
+    presence and frequency sit beside the repetition penalty, as vLLM applies
+    its penalties together. Every control at its neutral value adds nothing."""
+    from dew.sampling import decoding
+
+    policy = Sampling(temperature=0.7, top_k=5, top_p=0.9, min_p=0.05, eos_id=5,
+                      repetition_penalty=1.1, presence_penalty=0.5, frequency_penalty=0.25,
+                      no_repeat_ngram_size=3, min_new_tokens=2, typical_p=0.8)
+    assert [type(transform) for transform in policy.transforms()] == [
+        decoding.RepetitionPenalty, decoding.PresencePenalty, decoding.FrequencyPenalty,
+        decoding.NoRepeatNGram, decoding.MinNewTokens, decoding.Temperature, decoding.TopK,
+        decoding.TopP, decoding.MinP, decoding.Typical]
+    assert [type(transform) for transform in replace(policy, temperature=0).transforms()] == [
+        decoding.RepetitionPenalty, decoding.PresencePenalty, decoding.FrequencyPenalty,
+        decoding.NoRepeatNGram, decoding.MinNewTokens, decoding.Greedy]
+    assert Sampling(temperature=0.7).transforms() == (decoding.Temperature(0.7),)
+    with pytest.raises(ValueError, match="eos_id"):
+        Sampling(min_new_tokens=2).transforms()
+    for bad in ({"repetition_penalty": 0.0}, {"no_repeat_ngram_size": -1}, {"min_new_tokens": -1},
+                {"typical_p": 1.5}, {"stop": ("",)}, {"stop": "\n\n"}, {"presence_penalty": float("nan")}):
+        with pytest.raises(ValueError):
+            Sampling(**bad)
+
+
+def test_a_sources_generation_config_becomes_its_sampling_value(task):
+    """The common controls a source declares land in `task.sampling`, so the
+    task binds no chain of its own, and a caller changes one control by
+    replacing it on that value while the others, EOS included, still apply."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
+    from dew.sampling import decoding
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={
+        "do_sample": True, "temperature": 0.7, "top_k": 5, "eos_token_id": 5, "pad_token_id": 3,
+        "repetition_penalty": 1.3, "no_repeat_ngram_size": 2, "min_new_tokens": 2, "typical_p": 0.9})
+    bound = source.text_generation()
+    assert bound.logits is None
+    assert bound.sampling == Sampling(temperature=0.7, top_k=5, eos_id=5, pad_id=3, repetition_penalty=1.3,
+                                      no_repeat_ngram_size=2, min_new_tokens=2, typical_p=0.9)
+    greedy = bound([[1, 2]], 6, key=1, n=1, sampling=replace(bound.sampling, temperature=0))
+    explicit = bound([[1, 2]], 6, key=1, n=1, logits=(
+        decoding.RepetitionPenalty(1.3), decoding.NoRepeatNGram(2),
+        decoding.MinNewTokens(2, jnp.asarray([5], jnp.int32)), decoding.Greedy()))
+    for name in ("tokens", "lengths", "terminated", "behavior_log_probs"):
+        np.testing.assert_array_equal(getattr(greedy, name), getattr(explicit, name))
+
+
+def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
+    """EOS and padding are the model's and the tokenizer's, so a call-level
+    policy that names neither stops and pads where the task does."""
+    first = task([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
+    eos = int(first.tokens[0, 3])
+    bound = replace(task, sampling=Sampling(temperature=0, eos_id=eos, pad_id=11))
+
+    drawn = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
+
+    assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
+    np.testing.assert_array_equal(drawn.tokens[0, 4:], 11)
+    named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_id=12, pad_id=0))
+    assert named.lengths.tolist() == [4] and not named.terminated.any()
+
+
+def test_stop_strings_in_the_policy_end_a_row_as_the_compiled_criterion_does(task, tmp_path):
+    """`stop=` compiles against the task's processor, once for the bound
+    policy and on the call for a call's own; plain `generate` has no
+    vocabulary to compile them against and says so."""
+    from tokenizers import Tokenizer, decoders, models
+    from transformers import PreTrainedTokenizerFast
+
+    from dew.data import HFTokenizer
+    from dew.inference import RunProcessor
+    from dew.sampling import decoding
+
+    pieces = ["st", "op", "sto", "pper", "x", "yy", "a", "b", "c", "d", "e", "f"]
+    vocabulary = {"<unk>": 0, **{piece: index for index, piece in enumerate(pieces, start=1)}}
+    backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
+    backend.decoder = decoders.Fuse()
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>").save_pretrained(tmp_path)
+    tokenizer = HFTokenizer(str(tmp_path))
+    order = jnp.asarray([vocabulary["st"], vocabulary["op"], vocabulary["yy"]], jnp.int32)
+
+    def scripted(state, logits):
+        pick = jnp.take(order, jnp.clip(state.step, 0, len(order) - 1))
+        return jnp.where(jnp.arange(logits.shape[-1])[None, :] == pick[:, None], 0.0, -jnp.inf)
+
+    processed = replace(task, processor=RunProcessor(tokenizer))
+    expected = processed([[1, 2]], 4, key=0, logits=(scripted,),
+                         stopping=(decoding.stop_strings(tokenizer.tokenizer, "stop", 13),))
+    called = processed([[1, 2]], 4, key=0, logits=(scripted,), sampling=Sampling(stop=("stop",)))
+    bound = replace(processed, sampling=Sampling(stop=("stop",)))([[1, 2]], 4, key=0, logits=(scripted,))
+    assert expected.lengths.tolist() == [2] and expected.terminated.tolist() == [True]
+    for drawn in (called, bound):
+        np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+        assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
+    with pytest.raises(ValueError, match="processor"):
+        replace(task, sampling=Sampling(stop=("stop",)))
+    with pytest.raises(ValueError, match="stop"):
+        generate(task.model, task.variables, [[1, 2]], 2, sampling=Sampling(stop=("stop",)))
+
+
 def test_unsupported_source_controls_report_their_reason(task):
     """An unsupported active source control names itself and the missing behavior."""
     from pathlib import Path

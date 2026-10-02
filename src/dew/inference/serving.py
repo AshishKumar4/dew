@@ -720,8 +720,11 @@ class Server:
         self.model = model
         self.variables = variables
         self.processor = processor
-        self.sampling = sampling
-        self.pad_id = sampling.pad_id
+        if sampling.stop:
+            raise ValueError("a server takes stop strings compiled into stopping; build it with "
+                             "Server.from_task, which compiles the task's")
+        self.pad_id = sampling.pad
+        self.sampling = dataclasses.replace(sampling, pad_id=self.pad_id)
         self.transforms = transforms
         self.stopping = stopping
         self.slots = slots
@@ -810,7 +813,8 @@ class Server:
                                  "processes would need them to agree on every step's admission")
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
-        transforms, stopping, strategy = resolve(task.sampling, task.logits, task.stopping, task.strategy)
+        policy, chain, criteria = task._controls(None, None, None)
+        transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
         if not isinstance(strategy, Sample):
             raise ValueError("a server runs the row-wise sampler; beam and speculative loops are batch-wide")
         if chunk is not None and (type(chunk) is not int or chunk < 1):
@@ -846,7 +850,7 @@ class Server:
             model = model.clone(kv_cache=dataclasses.replace(layout, pages=count, groups=groups))
             rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
                               for _ in range(groups)], chunk, rounded // layout.page_size)
-        return cls(model, task.variables, task.processor, sampling=task.sampling,
+        return cls(model, task.variables, task.processor, sampling=policy,
                    transforms=transforms, stopping=stopping, grammar=strategy.grammar, rows=rows,
                    slots=slots, capacity=rounded,
                    admission=(max(groups, min(slots, 8 * decode_steps) // groups * groups) if admission is None
