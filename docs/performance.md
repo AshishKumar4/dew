@@ -29,28 +29,29 @@ rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
 `tools/reference_runs/scoreboard.py` builds the reference-run rows into one
 table.
 
-RTX 4080 16 GiB, Dew at `42292e99` (jax 0.11.2.post3), torch 2.13.0+cu130,
+RTX 4080 16 GiB, Dew at `4d392f0a` (jax 0.11.2.post3), torch 2.13.0+cu130,
 transformers 5.17.0, SDPA attention. Each Dew row is two processes, given
 as their range; each torch row is one process, or two where a range is
-given:
+given. Dew as installed, cuDNN attention; with tokamax installed
+(docs/installation.md) where the row says so:
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 100.4-101.9 ms, MFU 44.1-44.8% | 112.1-112.4 ms, 40.0% | 1.10-1.12 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 154.0-154.2 ms, MFU 58.3-58.4% | 168.6-169.1 ms, 53.3% | 1.09-1.10 |
-| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 79.2 ms | 112.5 ms | 1.42 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 52.2 ms | 49.4 ms (flash), 50.0 (cuDNN) | 0.95 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.43-7.52 ms | 8.07 ms | 1.07-1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 76.4-76.5 ms, MFU 59.2-59.3% | 76.4 ms (flash) | 1.00 |
-| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 69.7-72.7 ms, MFU 35.9-37.4% | no torch port | |
-| 176M hybrid DiT (published config) | batch 32 | 116.6-122.3 ms, MFU 42.6-44.8% | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 96.2 ms, MFU 46.7-46.8% | 112.1-112.4 ms, 40.0% | 1.17 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 148.1 ms, MFU 60.7% | 168.6-169.1 ms, 53.3% | 1.14 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 78.1 ms | 112.5 ms | 1.44 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 49.1 ms; tokamax 48.4-48.5 | 49.4 ms (flash), 50.0 (cuDNN) | 1.01; 1.02 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.41-7.46 ms | 8.07 ms | 1.08-1.09 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 72.6-72.7 ms, MFU 62.3-62.4%; tokamax 71.1 | 76.4 ms (flash) | 1.05; 1.07 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 66.5-66.6 ms, MFU 39.2%; tokamax 66.3-66.4 | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 110.2-110.3 ms, MFU 47.3%; tokamax 109.6 | no torch port | |
 
 The Dew decoder and SimpleDiT rows take a fresh host batch every step, and
 match the fixed-batch rows ("Comparison with PyTorch" below has both ways
-for both frameworks, and the commands). On Qwen3-0.6B at 1 x 1024 torch
-waits 25.1 ms a step on its host, which its 2 x 1024 step hides; on the
-MoE it waits 20.9 ms, and on device time alone Dew is 1.24x faster (79.0
-against 98.3 ms busy).
+for both frameworks, and the commands). Qwen3-0.6B at 1 x 1024 keeps both
+devices busy (torch 110.3 ms of its 112.1 ms step in the second process,
+Dew 96.0 of 96.2); on the MoE torch idles 20.9 ms a step on its host, and
+on device time alone Dew is 1.26x faster (78.1 against 98.3 ms busy).
 
 Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
 undilated ones over their interleaved grids (75.4 to 70.2 ms at batch 16);
@@ -62,7 +63,23 @@ without the hole that made Qwen3-0.6B at 2 x 1024 recompute (185.7 to
 their gradient to bf16 once, as torch autocast and MaxText do ("The
 vocabulary head" below has the quality comparison): the 3-layer decoder
 59.9 to 52.2 ms, the MoE 92.7 to 79.2, Qwen3-0.6B at 2 x 1024 161.2 to
-154.0.
+154.0. From `42292e99` to `4d392f0a` (92 merges from every lane) Qwen3-0.6B
+at 1 x 1024 went from 100.4-101.9 to 96.2 ms, at 2 x 1024 from 154.0 to
+148.1, the decoder from 52.2 to 49.1 and the hybrid DiT at batch 32 from
+116.6-122.3 to 110.2-110.3. Two of those changes are the training step's:
+every bf16 rounding of a program is kept
+(`--xla_allow_excess_precision=false`), and the step compiles without XLA's
+dot merger, which took Qwen3-0.6B at 1 x 1024 from 97.7-98.0 to 94.1-94.2
+ms in its own A/B ("XLA flags" below has both).
+
+Where the time goes, Qwen3-0.6B at 1 x 1024 (device kernels per step, XProf
+for Dew, the torch profiler for torch): GEMMs 42.2 ms against 42.3, and
+attention 8.7 against 7.2. The rest, the update, the casts, the norms and
+the loss, is 45.0 ms in Dew (copies 28.0, with the fused update; converts
+10.7; reductions 5.7; elementwise 0.6) against torch's 60.8 (optimizer
+39.5, copies 13.8, elementwise 6.0, loss 1.0, reductions 0.5). Both cast
+the fp32 master weights to bf16 every step and the gradients back; torch's
+casts are its `_to_copy` kernels.
 
 Where Dew wins: the optimizer update. XLA fuses Adam (or AdamW), the EMA
 and the finiteness guard into one bandwidth-bound pass over the state,
@@ -73,21 +90,13 @@ clipping at 39.5. GEMMs run at par or better (44.5 against 47.2 ms on the
 rows, where torch.compile's reaches 25 ms; it is 13.0 ms on Qwen3-0.6B at
 2 x 1024, hidden behind the device.
 
-Where Dew loses:
-
-- Attention: cuDNN's fused kernels take 5.6 ms forward and backward on the
-  768-wide SimpleDiT (head dimension 64, 256 tokens) against
-  FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
-  dimension 128, causal, 1024 tokens). With tokamax installed
-  (docs/installation.md), 'auto' runs its Pallas-Triton kernel for heads up to
-  64 wide: 4.3 ms on the SimpleDiT, and its step 73.1 to 71.5 ms ("tokamax's
-  attention" below).
-- Converts and reductions: 11.0 and 5.6 ms of Qwen3-0.6B's step at 1 x
-  1024, 15.9 and 9.8 of the MoE's, where torch.compile casts inside its
-  GEMMs and elementwise kernels. Not yet attributed by scope.
-- The 3-layer decoder, whose vocabulary head (50304 columns, 8192 tokens)
-  is most of the step: 2.8 ms behind, after the head's rounding took 7.7
-  ms off.
+Where Dew loses: attention. cuDNN's fused kernels take 5.6 ms forward and
+backward on the 768-wide SimpleDiT (head dimension 64, 256 tokens) against
+FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
+dimension 128, causal, 1024 tokens). With tokamax installed, 'auto' runs
+its Pallas-Triton kernel for heads up to 64 wide: 4.3 ms on the SimpleDiT
+("tokamax's attention" below); at 128 wide cuDNN stays faster (Qwen3-0.6B's
+widths at 2 x 1024, 148.8-149.0 against 151.1 ms a step).
 
 A100 40 GB (Colab), the latest records:
 
