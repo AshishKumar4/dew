@@ -163,7 +163,8 @@ Import `LMObjective` from `dew.objectives.lm`.
 LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_tile=None,
             samples=None, pretrained=None, balance_rate=None, aux_loss_alpha=None,
             seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, router_z_loss=0.0,
-            qk_stats=False, indexer=None, trainable=None, token_accuracy=True)
+            qk_stats=False, indexer=None, trainable=None, token_accuracy=True,
+            processor=None)
 IndexerTraining(phase, weight=1.0)
 ```
 
