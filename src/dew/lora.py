@@ -1,46 +1,33 @@
 """Adapt a variables tree with low-rank deltas (LoRA, arXiv 2106.09685).
 
-An adapter is a set of rank-`r` deltas on the kernels of Dense modules.
 Beside a target kernel `W`, `[in..., out...]`, the tree holds `lora_A`,
 `[in..., r]`, and `lora_B`, `[r, out...]`, and the module computes
 `x W + scale * (x A) B` with `scale = alpha / r` (`alpha / sqrt(r)` for
-rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel
-and the factors are gone. A target is the path of its module's leaves in
-the tree, `("params", "layers_0", "self_attn", "q_proj")`, so one
-description serves every model and every collection.
+rsLoRA, arXiv 2312.03732). Merged, `scale * A B` is added into the kernel and
+the factors are gone. A target is its module's path in the tree,
+`("params", "layers_0", "self_attn", "q_proj")`, so one description serves
+every model and every collection.
 
-One object carries all of it. `LoRA.fresh` draws an adapter on the
-projections a model binds, `LoRA.load` reads one off disk onto them, and the
-adapter that comes back adapts the model (`adapt`), says what trains
-(`trainable`), folds itself in (`merge`) and writes itself out (`save`),
-since it holds the bindings it was built over.
+`LoRA.fresh` draws an adapter on the projections a model binds and `LoRA.load`
+reads one off disk; the adapter adapts the model (`adapt`), names what trains
+(`trainable`), folds itself in (`merge`) and writes itself out (`save`).
+`adapt` wraps `apply` and `init` in a Flax method interceptor rather than
+swapping modules, and owns what PEFT's wrapper layers do: the factor shapes
+of a `DenseGeneral` with several contracted axes, the kernel path's compute
+dtype, dropout on the branch input, and the parameter names the merge, the
+export and the trainable filter agree on.
 
-`LoRA.adapt` makes a model compute the branch without a module of its own
-for every projection: it wraps `apply` and `init` in a Flax method
-interceptor that adds the branch to each target `Dense`'s output and reads
-or creates the factors as that module's own parameters. What it hides is
-the per-module bookkeeping PEFT does with wrapper layers: the factor shapes
-of a `DenseGeneral` with several contracted axes, the compute dtype the
-kernel path uses, dropout on the branch input, and the parameter naming
-the merge, the export and the trainable filter agree on.
-
-Two files are read and written, both what the references produce natively.
-PEFT's directory (`adapter_config.json`, `adapter_model.safetensors`, keys
-`base_model.model.<module>.lora_A.weight`) is what Transformers loads; the
-Diffusers file (`pytorch_lora_weights.safetensors`, keys
-`<component>.<module>.lora_A.weight`, the PEFT config per component in the
-header's `lora_adapter_metadata`) is what a pipeline's `load_lora_weights`
-reads. Kohya/sgm keys (`lora_unet_...`, `.alpha` tensors) are not accepted.
-Source module names resolve to tree paths through `Pretrained.layouts`, the
-bindings a source's export runs backwards, so an adapter is placed exactly
-where the base tensor it modifies went. An adapter attaches to a model and
-its variables, not to a loader: a model built from the registry passes no
-layouts and `bound_layouts` reads the names and shapes off its own kernels,
-so a run that never touched a published checkpoint adapts the same way.
-`RunConfig.lora` is that path from a config: the run adapts the module its
+The files are the references' own: PEFT's directory (`adapter_config.json`,
+`adapter_model.safetensors`, keys `base_model.model.<module>.lora_A.weight`),
+which Transformers loads, and the Diffusers file
+(`pytorch_lora_weights.safetensors`, keys `<component>.<module>.lora_A.weight`,
+each component's PEFT config in the header's `lora_adapter_metadata`), which a
+pipeline's `load_lora_weights` reads. Kohya/sgm keys are not accepted. Names
+resolve to tree paths through a loaded source's `Pretrained.layouts`; a model
+built from the registry passes none, and `bound_layouts` reads the names and
+shapes off its own kernels. `RunConfig.lora` adapts the module a run's
 objective trains and freezes everything but the factors.
 """
-
 from __future__ import annotations
 
 import dataclasses
