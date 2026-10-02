@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
@@ -271,7 +271,7 @@ def run_record(directory: str) -> Mapping[str, object]:
     return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
 
 
-def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
+def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
     from dew.config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
@@ -299,7 +299,8 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
+def _saved_run(directory: str,
+               dtype: DTypeLike | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
     record = run_record(directory)
     return record, _saved_model(record, dtype), _saved_processor(record)
@@ -446,7 +447,7 @@ class TextGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
         rebuilt the way the recipe built it, over the weights of its latest
         checkpoint (or `step`), decoding through the run's own tokenizer.
@@ -484,7 +485,8 @@ class TextGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -551,7 +553,7 @@ class BlockGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
         `run.json` records over the weights of its latest checkpoint (or
         `step`), sampling over the canvas the model declares.
@@ -581,7 +583,8 @@ class BlockGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -640,7 +643,7 @@ class MaskedGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
         its `run.json` records over the weights of its latest checkpoint (or
         `step`), refined with MDLM over the run's own mask token.
@@ -668,7 +671,8 @@ class MaskedGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.

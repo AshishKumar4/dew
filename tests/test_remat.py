@@ -364,7 +364,7 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
         return 0 if rung[1] == 'minimal' else -1
 
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
-    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective: options)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))

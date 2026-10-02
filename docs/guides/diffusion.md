@@ -83,4 +83,40 @@ A representation autoencoder (RAE) encodes with a frozen pretrained vision encod
 
 To condition on sound, `HFAudio` (`hf_audio`) runs a transformers audio model, such as wav2vec2 or Whisper's encoder, through torchax (the `torchax` extra) and hands the model its last hidden states under the same `textcontext` keyword. A run selects it with `DiffusionRunConfig(data=LocalVideos(...), text=None, audio=AudioCondition())`, or `text:None audio:audio-condition` on the command line. The video dataset's `audio_model` names the tower, its clips' `audio` field carries the extractor's input, and the clip length sets the waveform length every clip and the silent unconditional input are encoded at. Sampling takes one `{"audio": waveform}` record per sample, mono at the extractor's rate.
 
+## Fine-tuning a published pipeline
+
+`PretrainedPipeline.load(name_or_dir)` reads a published pipeline in the diffusers layout (SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image) into a bundle: the denoiser as `model`, its process, its text conditioning and its autoencoder. `pipe.diffusion_objective(**options)` builds a `DiffusionObjective` that starts from the pipeline's weights and trains the whole denoiser. The text encoders and the autoencoder stay frozen. Evaluation samples the way the pipeline does, with its own solver, step count and guidance, unless you pass `solver=`, `steps=` or `guidance=`. Training batches carry uint8 NHWC images at the pipeline's resolution and `objective.inputs.tokenize(captions)`. The recipe's `--pretrained` flag runs the same full fine-tuning from the command line.
+
+`pipe.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the denoiser projections that `modules` names, the way Diffusers' `target_modules` does. `to_q`, `to_k`, `to_v` and `to_out.0` are the attention projections of each family's transformer and of the SD UNet. Names match the denoiser alone, so a text encoder is never adapted. B starts at zero, so the adapted pipeline samples exactly what the source does until it trains. Its `diffusion_objective` trains the adapter's factors and keeps every other weight frozen:
+
+<!-- not run: downloads FLUX.1-schnell and needs an image dataset -->
+```python
+import jax
+import optax
+
+from dew.interop import PretrainedPipeline
+from dew.training import Trainer
+
+pipe = PretrainedPipeline.load("black-forest-labs/FLUX.1-schnell", dtype="bfloat16")
+key = jax.random.key(0)
+tuned = pipe.lora(rank=16, modules=("to_q", "to_k", "to_v", "to_out.0"), key=key)
+objective = tuned.diffusion_objective()
+state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=1000)
+tuned.adapter.save(state.params, "flux-adapter")
+tuned.save("flux-merged", variables=state.params)
+images = objective.pipeline(state)(["a red bird"], key=0).host().images
+```
+
+`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.params` as it comes back. `LoRA.load(pipe.model, pipe.variables, pipe.layouts, path)` reads such a file back, or one Diffusers or a PEFT trainer wrote.
+
+<!-- not run: needs torch, diffusers and peft -->
+```python
+from diffusers import FluxPipeline
+
+pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell")
+pipe.load_lora_weights("flux-adapter")
+```
+
+`DiffusionObjective(..., trainable=)` takes the same filter for code that builds the objective itself. It chooses among the denoiser's own leaves, so it trains the plain denoising loss: a loss head (`uncertainty`, `alignment`, `end_to_end`) or an objective with a loss of its own (MeanFlow, shortcut, distillation, Flow-GRPO) refuses one.
+
 [Recipes](../recipes.md) runs diffusion training on real datasets from the command line. [Supported models](../models.md) lists the published diffusion checkpoints that load.

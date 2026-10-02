@@ -28,13 +28,14 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.backbones.causal_transformer import DecoderBank
@@ -281,7 +282,7 @@ class SafetensorsBanks(LayerBanks):
     """
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
-                 param_dtype: str = "auto", read_ahead: bool = True):
+                 param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
         from dew.interop.hf_decoders import (
             DecoderFamily,
             _check_tree,
@@ -290,7 +291,7 @@ class SafetensorsBanks(LayerBanks):
             translate_weights,
         )
         from dew.interop.safetensors_io import read_weights
-        from dew.registry import models, with_precision
+        from dew.registry import dtype_name, models, with_precision
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
@@ -307,9 +308,11 @@ class SafetensorsBanks(LayerBanks):
         tensors = read_weights(folder)
         if param_dtype == "auto":
             from dew.interop.pretrained import _checkpoint_dtype
-            param_dtype = _checkpoint_dtype(self.config, tensors)
+            storage = _checkpoint_dtype(self.config, tensors)
+        else:
+            storage = dtype_name(param_dtype)
         self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype=param_dtype, lazy=True)
+            tensors, record, family, param_dtype=storage, lazy=True)
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
