@@ -1093,7 +1093,7 @@ def test_a_norm_under_jit_reads_the_bf16_sum_it_is_handed(norm):
     fp32 upcast was normalized unrounded: 23% of a bf16 RMSNorm's outputs,
     30% of a LayerNorm's, differed from the norm of the stored sum, on CPU
     and on an RTX 4080. Runs and this suite keep every rounding
-    (`dew.training.runtime.keep_roundings`). The oracle is the same norm
+    (`dew.telemetry.devices.keep_roundings`). The oracle is the same norm
     applied to the sum materialized by its own jit."""
     from dew.nn.attention import LayerNorm, RMSNorm
 
