@@ -349,5 +349,4 @@ class AdversarialDistillationObjective(DiffusionObjective):
                 Aux(metrics=metrics, variables={SPECTRAL: jax.lax.stop_gradient(spectral)}))
 
 
-__all__ = ["SPECTRAL", "AdversarialDistillationObjective", "BatchNormLocal", "Head", "Heads", "SpectralConv",
-           "hinge_discriminator", "hinge_generator", "r1_penalty", "timestep_embedding"]
+__all__ = ["AdversarialDistillationObjective"]
