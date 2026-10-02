@@ -230,7 +230,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
                                     scored=scored)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True):
+    def pipeline(self, state: TrainState, *, ema: bool | None = None):
         """The student as its inference task; the teacher stays behind."""
         return self.student.pipeline(
             replace(state, params=self.student_variables(state.params),

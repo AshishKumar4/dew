@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -140,6 +140,38 @@ class Shown:
     percent: bool = False
     group: str | None = None
 
+
+
+@dataclass(frozen=True)
+class TrainingScalar[Statistics, Additions]:
+    """An objective-owned training report selected for ranking or stopping."""
+    owner: Objective[Statistics, Additions]
+    name: str
+    shown: Shown
+
+
+class TrainingScalars[Statistics, Additions]:
+    """Typed, completable attributes for the objective's declared training reports.
+
+    Dynamic objectives may use item lookup. Undeclared attributes fail at
+    access, before a fit starts; completion lists the objective's own names.
+    """
+    loss: TrainingScalar[Statistics, Additions]
+
+    def __init__(self, owner: Objective[Statistics, Additions]):
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        try:
+            return self._owner._scalar(name)
+        except ValueError as missing:
+            raise AttributeError(str(missing)) from missing
+
+    def __getitem__(self, name: str) -> TrainingScalar[Statistics, Additions]:
+        return self._owner._scalar(name)
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(object.__dir__(self)) | {'loss'} | set(self._owner.shown))
 
 
 @struct.dataclass
@@ -305,6 +337,33 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
+    @property
+    def _validation_loss(self):
+        """Reuse the statistics program only while its model and head stay fixed.
+
+        Fit's ladder replaces the immutable Flax model and may change a
+        tiled head. Argument shapes alone cannot identify those programs.
+        Keep only the current specialization, not a history of old models.
+        """
+        held = vars(self)
+        model, head = held.get('model'), held.get('head_tile')
+        cached = held.get('_validation_loss_cache')
+        if cached is None or cached[0] is not model or cached[1] != head:
+            compiled = jax.jit(lambda variables, batch, step: self.loss(variables, batch, step)[0])
+            cached = (model, head, compiled)
+            self._validation_loss_cache = cached
+        return cached[2]
+
+    @property
+    def scalars(self) -> TrainingScalars[Loss, Effects]:
+        return TrainingScalars(self)
+
+    def _scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
+        """Select a declared training scalar; `objective.loss` selects the loss itself."""
+        if name != 'loss' and name not in self.shown:
+            raise ValueError(f"the objective does not declare training scalar {name!r}")
+        return TrainingScalar(self, name, self.shown.get(name, Shown(better='lower')))
+
     @abstractmethod
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """Additive loss statistics and the reports from one realized batch.
@@ -361,18 +420,20 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def _pipeline_weights(self, state: TrainState, ema: bool) -> Variables:
-        if self._ema_is_reference or not ema:
+    def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
+        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.params
         return state.averaged
 
-    def pipeline(self, state: TrainState, *, ema: bool = True) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
         """The trained model as its inference task over `state`'s weights.
 
-        Ordinary generative objectives require `state.averaged` when `ema`
-        is True; False selects live parameters. Reference-policy objectives
-        publish the trained policy, never their frozen loss reference. Arrays
-        retain their placement. Objectives without a generation task raise.
+        `ema` None takes `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, as `dew.pipeline` reads a
+        run; True requires the average and False selects live parameters.
+        Reference-policy objectives publish the trained policy, never their
+        frozen loss reference. Arrays retain their placement. Objectives
+        without a generation task raise.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -401,6 +462,7 @@ def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
 S = TypeVar("S")
 
 
+@runtime_checkable
 class Metric(Protocol[S]):
     """Reduce a validation pass to one scalar, on the host.
 

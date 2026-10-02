@@ -804,13 +804,13 @@ G4V_TEXT_WIDTH = 32
 G4V_IMAGE = 60
 
 
-def gemma4_vision_tiny_config() -> Gemma4VisionConfig:
+def gemma4_vision_tiny_config(head_dim: int = 8) -> Gemma4VisionConfig:
     """Two layers of width 32 over a 4x4 patch grid pooled by 2 into four
     soft tokens, with one grouped-query repeat and the released
     standardization on."""
     return Gemma4VisionConfig(
         hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=head_dim,
         hidden_activation="gelu_pytorch_tanh", rms_norm_eps=1e-6,
         patch_size=8, pooling_kernel_size=2, position_embedding_size=64,
         rope_parameters={"rope_type": "default", "rope_theta": 100.0},
@@ -826,7 +826,7 @@ def gemma4_positions(grid: int, batch: int) -> np.ndarray:
     return np.stack([one] * batch, axis=0)
 
 
-def gemma4_vision_tiny_system(seed: int = 1234):
+def gemma4_vision_tiny_system(seed: int = 1234, *, head_dim: int = 8, device: str = 'cpu'):
     """A tiny Gemma 4 vision trunk and multimodal embedder with scattered
     weights, on patchified pixels as the processor emits them.
 
@@ -837,42 +837,43 @@ def gemma4_vision_tiny_system(seed: int = 1234):
     """
     from types import SimpleNamespace
 
-    vconf = gemma4_vision_tiny_config()
+    vconf = gemma4_vision_tiny_config(head_dim)
     torch.manual_seed(seed)
     tower = Gemma4VisionModel(vconf)
     scatter_weights(tower, seed)
     with torch.no_grad():
         tower.std_bias.copy_(torch.randn(32) * 0.5)
         tower.std_scale.copy_(1.0 + torch.randn(32) * 0.05)
-    tower = tower.float().eval()
+    tower = tower.float().eval().to(device)
     pixels = np.random.RandomState(11).rand(BATCH, 16, 192).astype(np.float32)
     positions = gemma4_positions(4, BATCH)
     with torch.no_grad():
-        last = tower(pixel_values=torch.from_numpy(pixels),
-                     pixel_position_ids=torch.from_numpy(positions),
-                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+        last = tower(pixel_values=torch.from_numpy(pixels).to(device),
+                     pixel_position_ids=torch.from_numpy(positions).to(device),
+                     return_dict=True).last_hidden_state.to(torch.float32).cpu().numpy()
     # The trunk strips padding with a boolean mask, which flattens the batch;
     # the fixture has no padding, so the reshape back is the same tokens.
     last = last.reshape(BATCH, -1, vconf.hidden_size)
     projector = Gemma4MultimodalEmbedder(
         vconf, Gemma4TextConfig(hidden_size=G4V_TEXT_WIDTH))
     scatter_weights(projector, seed + 1)
-    projector = projector.float().eval()
+    projector = projector.float().eval().to(device)
     with torch.no_grad():
-        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+        soft = projector(torch.from_numpy(last).to(device)).to(torch.float32).cpu().numpy()
     return {"tower": tower, "projector": projector, "vconf": vconf,
             "pixels": pixels, "positions": positions, "last": last,
             "soft": soft}
 
 
-def write_gemma4_vision_tiny() -> None:
+def write_gemma4_vision_tiny(*, head_dim: int = 8, device: str = 'cpu',
+                           name: str = 'gemma4-vision-tiny') -> None:
     """The Gemma 4 trunk and embedder as Dew reads them: bare tensor names,
     the tower config, the text width, fixed patches and positions, and both
     fp32 reference outputs."""
     from safetensors.torch import save_file
 
-    system = gemma4_vision_tiny_system()
-    directory = FIXTURES / "gemma4-vision-tiny"
+    system = gemma4_vision_tiny_system(head_dim=head_dim, device=device)
+    directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     save_file(system["tower"].state_dict(), directory / "model.safetensors")
     save_file(system["projector"].state_dict(), directory / "projector.safetensors")

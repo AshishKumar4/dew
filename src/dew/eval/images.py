@@ -21,7 +21,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
-from dew.objectives.base import Batch
+from dew.objectives.base import Batch, Shown
 from dew.registry import metrics
 
 from .common import ImageMetric, metric_device
@@ -93,8 +93,12 @@ def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DE
     _equal_counts(pixels.shape[0], len(prompts))
     if pixels.shape[0] == 0:
         raise ValueError("clip_score: no images to score")
-    from dew.data.processors import AutoTextTokenizer
-    tokens = AutoTextTokenizer(tensor_type="np", modelname=modelname)(list(prompts))
+    from dew.data.text import load_tokenizer
+    # CLIP's own context bounds a caption, so an overlong one is truncated
+    # to it rather than overrunning the position table.
+    tokenizer = load_tokenizer(modelname)
+    tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
+                       truncation=True, return_tensors="np")
     total = 0.0
     with metric_device():
         for start in range(0, pixels.shape[0], batch_size):
@@ -128,12 +132,19 @@ def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
 
 
 @metrics("clip_score")
+class CLIPScore(ImageMetric):
+    """Mean CLIPScore of the sampled images and the validation batch's prompts."""
+    shown = Shown(better='higher')
+
+    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
+        def measure(artifact, batch):
+            return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
+        super().__init__(name='clip_score', measure=measure)
+
+
 def clip_score_metric(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
     """Score standard CLIPScore over a validation pass, the same number `clip_score`
     reports for the images and prompts the pass consumed.
     """
 
-    def measure(artifact, batch):
-        return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
-
-    return ImageMetric(name="clip_score", measure=measure)
+    return CLIPScore(modelname, field)

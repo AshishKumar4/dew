@@ -39,12 +39,34 @@ def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkey
 
     script = example("sft_diffusion_gemma_images")
     config = script.Config(flowers="unused", image_size=16, prompt_tokens=24,
-                           batch_size=8, steps=2, features=16, vision_features=8,
+                           batch_size=8, steps=2, features=16, vision_features=16,
                            out=tmp_path / "caption")
     pixels = np.arange(8 * 16 * 16 * 3, dtype=np.uint8).reshape(8, 16, 16, 3)
     batch = script.caption_batch({"image": pixels, "label": np.arange(8) % 2}, config,
                                  ["pink rose", "yellow tulip"])
-    data = Dataset(train=lambda partition: iter([batch] * config.steps), val=None,
+    class Rows:
+        def __init__(self):
+            self.index = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= config.steps:
+                raise StopIteration
+            self.index += 1
+            return batch
+
+        def close(self):
+            pass
+
+        def get_state(self):
+            return str(self.index).encode()
+
+        def set_state(self, state):
+            self.index = int(state)
+
+    data = Dataset(train=lambda partition: Rows(), val=None,
                    records=8 * config.steps, batch=8)
     monkeypatch.setattr(script, "flowers_data", lambda selected: data)
     state = script.main(config)

@@ -1,0 +1,115 @@
+---
+interface Props {
+	models: { id: string; label: string }[];
+	cell: string;
+}
+const { models, cell } = Astro.props;
+---
+
+<div class="live-text" data-live-text>
+	{models.length > 1 && <label class="live-text-model">Model
+		<select data-model>{models.map((model) => <option value={model.id}>{model.label}</option>)}</select>
+	</label>}
+	<div class="live-text-grid">
+		<div class="sampler-editor">
+			<div class="sampler-editor-bar"><span>generate.py</span><span class="sampler-editor-actions">
+				<button type="button" class="sampler-reset" data-text-reset>Reset</button>
+				<button type="button" class="sampler-run" data-text-run>Run</button>
+			</span></div>
+			<textarea data-text-cell rows="5" spellcheck="false" autocapitalize="off" aria-label="Editable text generation cell">{cell}</textarea>
+		</div>
+		<div class="live-text-result">
+			<div class="live-text-output" data-text-output></div>
+			<p class="sampler-status" data-text-status aria-live="polite">Run the cell on a live CPU kernel.</p>
+		</div>
+	</div>
+	<div class="turnstile-holder" data-text-turnstile></div>
+</div>
+
+<script>
+	import type { LiveSession } from '../../scripts/live';
+	import { renderOutput } from '../../scripts/live';
+	import { landingKernel, reserveKernel, onKernelClose, closeKernel } from '../../scripts/landing-kernel';
+
+	const panel = document.querySelector<HTMLElement>('[data-live-text]');
+	if (panel) {
+		const editor = panel.querySelector<HTMLTextAreaElement>('textarea[data-text-cell]')!;
+		const picker = panel.querySelector<HTMLSelectElement>('[data-model]');
+		const run = panel.querySelector<HTMLButtonElement>('[data-text-run]')!;
+		const output = panel.querySelector<HTMLElement>('[data-text-output]')!;
+		const status = panel.querySelector<HTMLElement>('[data-text-status]')!;
+		const holder = panel.querySelector<HTMLElement>('[data-text-turnstile]')!;
+		const original = editor.value;
+		let session: LiveSession | undefined;
+		let running = false;
+		let stopping = false;
+		onKernelClose((message) => {
+			session = undefined;
+			if (!running) status.textContent = `${message} Press Run to start a new one.`;
+		});
+		picker?.addEventListener('change', () => {
+			editor.value = editor.value.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`);
+		});
+		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => {
+			editor.value = picker ? original.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`) : original;
+		});
+		const execute = async () => {
+			let release: () => void;
+			try { release = reserveKernel(); }
+			catch (error) { status.textContent = error instanceof Error ? error.message : String(error); return; }
+			running = true;
+			stopping = false;
+			run.textContent = 'Stop';
+			output.replaceChildren();
+			if (output.getBoundingClientRect().bottom > innerHeight) output.scrollIntoView({ block: 'center', behavior: 'smooth' });
+			let timer: number | undefined;
+			let phase = 'Starting';
+			let since = performance.now();
+			const setPhase = (text: string) => {
+				phase = text;
+				since = performance.now();
+				status.textContent = text;
+			};
+			try {
+				timer = window.setInterval(() => { if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`; }, 1000);
+				session = await landingKernel(holder, setPhase);
+				if (stopping) { closeKernel(); throw new Error('Stopped.'); }
+				const started = performance.now();
+				setPhase('Generating');
+				const result = await session.run(editor.value, (message) => {
+					if (message.type === 'display' && message.text) {
+						try {
+							const progress = JSON.parse(message.text)['dew-progress'];
+							if (progress?.stage === 'load') { setPhase(`Loading ${progress.model}`); return; }
+							if (progress?.stage === 'generate') { setPhase(progress.first ? 'Compiling the first generation' : 'Generating'); return; }
+						} catch { /* Ordinary text output, not a progress report. */ }
+					}
+					renderOutput(output, message);
+				});
+				window.clearInterval(timer);
+				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
+					: result.status === 'ok' ? `Generated in ${((performance.now() - started) / 1000).toFixed(1)} s.`
+					: 'The cell stopped with an error.';
+			} catch (error) {
+				closeKernel();
+				status.textContent = error instanceof Error ? error.message : String(error);
+			} finally {
+				window.clearInterval(timer);
+				release();
+				running = false;
+				run.textContent = 'Run';
+				run.disabled = false;
+			}
+		};
+		run.addEventListener('click', () => {
+			if (!running) void execute();
+			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt(); }
+		});
+		editor.addEventListener('keydown', (event) => {
+			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {
+				event.preventDefault();
+				void execute();
+			}
+		});
+	}
+</script>

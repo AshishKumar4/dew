@@ -13,10 +13,10 @@ stderr (JAX's and Python's warnings) is kept apart. Every byte written to the
 terminal goes to `--cast`, an asciinema v2 recording, and capture.json keeps
 the screen as it was when the script exited, cell by cell with its colours.
 
-`--where` names the machine for the caption. The page reads the commit of the
-installed Dew from pip's record of a git install, so install Dew from GitHub
-or a local clone with `pip install "dewml @ git+..."`, not an editable
-install.
+`--where` names the machine for the caption. Dew's commit comes from the
+imported checkout (with clean source) or pip's record of a git install.
+`--script` and `--output` also record the other small landing examples through
+this same path; arguments after `--` go to that script.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import fcntl
+import hashlib
 import json
 import os
 import platform
@@ -35,6 +36,7 @@ import sys
 import termios
 import time
 from importlib.metadata import distribution, version
+from importlib.util import find_spec
 from pathlib import Path
 
 import pyte
@@ -45,13 +47,19 @@ ROWS = 200
 
 
 def installed_commit() -> str:
+    directory = Path(find_spec("dew").origin).parents[2]
+    if (directory / ".git").exists():
+        changes = subprocess.check_output(["git", "-C", str(directory), "status", "--porcelain", "--", "src/dew"], text=True)
+        if changes:
+            raise SystemExit("commit Dew's source changes before recording")
+        return subprocess.check_output(["git", "-C", str(directory), "rev-parse", "HEAD"], text=True).strip()
     record = distribution("dewml").read_text("direct_url.json")
     if record is None:
         raise SystemExit("dewml was not installed from git, so the page cannot name the commit it ran")
     return json.loads(record)["vcs_info"]["commit_id"]
 
 
-def run_on_terminal(script: Path, columns: int) -> tuple[int, float, list[tuple[float, str]], str]:
+def run_on_terminal(script: Path, columns: int, arguments: list[str] | None = None) -> tuple[int, float, list[tuple[float, str]], str]:
     """Run `script` with stdout on a pseudo-terminal: its exit code, its
     seconds, what it wrote to the terminal with the time of each write, and
     its stderr."""
@@ -61,7 +69,7 @@ def run_on_terminal(script: Path, columns: int) -> tuple[int, float, list[tuple[
            "LINES": str(ROWS)}
     env.pop("NO_COLOR", None)
     started = time.monotonic()
-    child = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL, stdout=secondary,
+    child = subprocess.Popen([sys.executable, str(script), *(arguments or [])], stdin=subprocess.DEVNULL, stdout=secondary,
                              stderr=subprocess.PIPE, env=env, cwd=script.parent)
     os.close(secondary)
     writes: list[tuple[float, str]] = []
@@ -120,8 +128,13 @@ def screen_cells(text: str, columns: int) -> list[list[dict]]:
     # A terminal moves to the next line's start on \n only through the pty's
     # output translation, which already turned the child's \n into \r\n.
     stream.feed(text)
+    return terminal_cells(screen, columns)
+
+
+def terminal_cells(screen: DimScreen, columns: int) -> list[list[dict]]:
+    """Read the current terminal as styled runs, without trailing empty rows."""
     rows = []
-    for y in range(ROWS):
+    for y in range(screen.lines):
         line = screen.buffer[y]
         runs: list[dict] = []
         for x in range(columns):
@@ -149,25 +162,33 @@ def main() -> None:
     # Wide enough for the display's header line to name the whole mesh.
     parser.add_argument("--columns", type=int, default=96)
     parser.add_argument("--cast", type=Path, default=Path("hero.cast"), help="where to write the recording")
+    parser.add_argument("--script", type=Path, default=DATA / "hero.py")
+    parser.add_argument("--output", type=Path, default=DATA / "capture.json")
+    parser.add_argument("arguments", nargs=argparse.REMAINDER, help="script arguments after --")
     options = parser.parse_args()
 
-    script = DATA / "hero.py"
-    code, seconds, writes, stderr = run_on_terminal(script, options.columns)
+    script = options.script.resolve()
+    arguments = options.arguments
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    code, seconds, writes, stderr = run_on_terminal(script, options.columns, arguments)
     if code != 0:
-        raise SystemExit(f"hero.py exited {code}:\n{stderr}")
+        raise SystemExit(f"{script.name} exited {code}:\n{stderr}")
     header = {"version": 2, "width": options.columns, "height": ROWS, "timestamp": int(time.time()),
               "env": {"TERM": "xterm-256color"}}
     options.cast.write_text("\n".join([json.dumps(header)] + [json.dumps([round(t, 6), "o", text]) for t, text in writes]) + "\n")
     capture = {
-        "about": "The screen site/src/data/hero.py left on a terminal, written by site/scripts/capture_snippets.py.",
+        "about": f"The screen {script.name} left on a terminal, written by site/scripts/capture_snippets.py.",
+        "arguments": arguments,
+        "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
         "meta": {"where": options.where, "python": platform.python_version(),
                  "jax": version("jax"), "flax": version("flax"), "optax": version("optax"),
                  "dew": installed_commit(), "date": time.strftime("%Y-%m-%d")},
         "hero": {"returncode": code, "seconds": round(seconds, 1), "columns": options.columns,
                  "screen": screen_cells("".join(text for _, text in writes), options.columns)},
     }
-    (DATA / "capture.json").write_text(json.dumps(capture, indent="\t") + "\n")
-    print(f"wrote {DATA / 'capture.json'} and {options.cast}")
+    options.output.write_text(json.dumps(capture, indent="\t") + "\n")
+    print(f"wrote {options.output} and {options.cast}")  # noqa: T201
 
 
 if __name__ == "__main__":

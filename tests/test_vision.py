@@ -224,6 +224,21 @@ def test_gemma4_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) > 3.0
 
 
+def test_gemma4_widened_head_computes_the_reference_features():
+    from flax.errors import ScopeParamShapeError
+
+    fixture = load_fixture('gemma4-vision-wide-tiny')
+    record = V.translate_gemma4_vision_config(fixture['config'])
+    tower = towers.from_record(record).build()
+    variables = V.translate_gemma4_vision_weights(fixture['tensors'])
+    positions = np.load(FIXTURES / 'gemma4-vision-wide-tiny' / 'positions.npy')
+    actual = np.asarray(tower.apply(variables, fixture['pixels'], positions))
+    np.testing.assert_allclose(actual, fixture['tower_ref'], atol=1e-4, rtol=0)
+    wrong = tower.clone(head_dim=None)
+    with pytest.raises(ScopeParamShapeError):
+        wrong.apply(variables, fixture['pixels'], positions)
+
+
 def test_qwen35_tower_matches_the_reference_implementation():
     """fp32 parity on the tiny Qwen 3.5 trunk, and the resampled positions
     are live: with the table zeroed the trunk leaves the reference by more
@@ -266,7 +281,6 @@ def test_qwen35_projector_matches_the_reference_implementation():
 
 
 @pytest.mark.parametrize("field,value,message", [
-    ("head_dim", 16, "head_dim"),
     ("hidden_activation", "swiglu", "hidden_activation"),
     ("attention_bias", True, "attention_bias"),
     ("attention_dropout", 0.1, "training-time"),

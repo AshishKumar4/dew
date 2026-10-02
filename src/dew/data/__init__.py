@@ -35,7 +35,7 @@ from .dataset import (
 )
 from .images import ArrayRecordImages, HFImages, ImageDataset, OxfordFlowers
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
-from .processors import AutoAudioProcessor, AutoTextTokenizer
+from .processors import AutoAudioProcessor
 from .prompts import Prompts
 from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFOptions
@@ -55,7 +55,7 @@ from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
 __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
-           "AutoAudioProcessor", "AutoTextTokenizer",
+           "AutoAudioProcessor",
            "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
            "CombinedOnline", "Corpus", "DataPartition", "DataPhase", "Dataset",
            "DatasetSpec",

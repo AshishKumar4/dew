@@ -1,4 +1,183 @@
 {
+ "dew.checkpoints.Keep": {
+  "every": null,
+  "interval": null,
+  "latest": 2
+ },
+ "dew.nn.audio.Gemma3nAudio": {
+  "conf_attention_chunk_size": 12,
+  "conf_attention_context_left": 13,
+  "conf_attention_context_right": 0,
+  "conf_attention_logit_cap": 50,
+  "conf_conv_kernel_size": 5,
+  "conf_num_attention_heads": 8,
+  "conf_num_hidden_layers": 12,
+  "conf_reduction_factor": 4,
+  "conf_residual_weight": 0.5,
+  "gradient_clipping": 10000000000,
+  "hidden_size": 1536,
+  "initializer_range": 0.02,
+  "input_feat_size": 128,
+  "rms_norm_eps": 0.000001,
+  "sscp_conv_channel_size": [
+   128,
+   32
+  ],
+  "sscp_conv_group_norm_eps": 0.001,
+  "sscp_conv_kernel_size": [
+   [
+    3,
+    3
+   ],
+   [
+    3,
+    3
+   ]
+  ],
+  "sscp_conv_stride_size": [
+   [
+    2,
+    2
+   ],
+   [
+    2,
+    2
+   ]
+  ]
+ },
+ "dew.nn.audio.Gemma4Audio": {
+  "attention_chunk_size": 12,
+  "attention_context_left": 13,
+  "attention_context_right": 0,
+  "attention_invalid_logits_value": -1000000000,
+  "attention_logit_cap": 50,
+  "conv_kernel_size": 5,
+  "gradient_clipping": 10000000000,
+  "hidden_act": "silu",
+  "hidden_size": 1024,
+  "initializer_range": 0.02,
+  "num_attention_heads": 8,
+  "num_hidden_layers": 12,
+  "output_proj_dims": 1536,
+  "residual_weight": 0.5,
+  "rms_norm_eps": 0.000001,
+  "subsampling_conv_channels": [
+   128,
+   32
+  ],
+  "use_clipped_linears": true
+ },
+ "dew.nn.vision.DeepseekV41Projector": {
+  "downsample_ratio": "required",
+  "out_width": "required",
+  "vision_width": "required"
+ },
+ "dew.nn.vision.DeepseekV41Vision": {
+  "hidden_size": 1024,
+  "intermediate_size": 2816,
+  "num_attention_heads": 16,
+  "num_hidden_layers": 32,
+  "patch_size": 14,
+  "rope_theta": 10000
+ },
+ "dew.nn.vision.Gemma3nProjector": {
+  "norm_eps": 0.000001,
+  "text_width": "required",
+  "vision_width": "required",
+  "vocab_offset": 262144,
+  "vocab_size": 128
+ },
+ "dew.nn.vision.Gemma3nVision": {
+  "channel_multiplier": 1,
+  "drop_path_rate": 0,
+  "fix_stem": null,
+  "group_size": null,
+  "in_chans": 3,
+  "layer_scale_init_value": 0.00001,
+  "msfa_indices": [
+   -2,
+   -1
+  ],
+  "msfa_output_resolution": 16,
+  "pad_type": "same",
+  "stem_bias": true,
+  "stem_size": 64
+ },
+ "dew.nn.vision.Gemma4Projector": {
+  "norm_eps": 0.000001,
+  "text_width": "required",
+  "vision_width": "required"
+ },
+ "dew.nn.vision.Gemma4Vision": {
+  "head_dim": null,
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 1152,
+  "intermediate_size": 4304,
+  "num_heads": 16,
+  "num_key_value_heads": 16,
+  "num_layers": 27,
+  "patch_size": 16,
+  "pooling_kernel_size": 3,
+  "position_embedding_size": 10240,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 100,
+  "standardize": false,
+  "use_clipped_linears": false
+ },
+ "dew.nn.vision.GemmaProjector": {
+  "norm_eps": 0.000001,
+  "patches_per_side": "required",
+  "text_width": "required",
+  "tokens_per_side": "required",
+  "vision_width": "required"
+ },
+ "dew.nn.vision.Llama4Projector": {
+  "text_width": "required",
+  "vision_width": "required"
+ },
+ "dew.nn.vision.Llama4Vision": {
+  "hidden_size": 1408,
+  "image_size": 336,
+  "intermediate_size": 5632,
+  "layer_norm_eps": 0.00001,
+  "num_channels": 3,
+  "num_heads": 16,
+  "num_layers": 32,
+  "patch_size": 14,
+  "pixel_shuffle_ratio": 0.5,
+  "projector_input_dim": 4096,
+  "projector_output_dim": 4096,
+  "rope_theta": 10000
+ },
+ "dew.nn.vision.Qwen35Projector": {
+  "merge_size": "required",
+  "out_width": "required",
+  "vision_width": "required"
+ },
+ "dew.nn.vision.Qwen35Vision": {
+  "depth": 27,
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 1152,
+  "in_channels": 3,
+  "intermediate_size": 4304,
+  "num_heads": 16,
+  "num_position_embeddings": 2304,
+  "out_hidden_size": 3584,
+  "patch_size": 16,
+  "spatial_merge_size": 2,
+  "temporal_patch_size": 2
+ },
+ "dew.nn.vision.SiglipVision": {
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 768,
+  "image_size": 224,
+  "intermediate_size": 3072,
+  "layer_norm_eps": 0.000001,
+  "num_channels": 3,
+  "num_heads": 12,
+  "num_layers": 12,
+  "patch_size": 16
+ },
  "dew.config.ModelConfig": {
   "architecture": "simple_dit",
   "attention_impl": "auto",
@@ -43,6 +222,7 @@
   "accumulation": 1,
   "batch_ramp": null,
   "batch_size": 32,
+  "best": null,
   "checkpoint_dir": "./checkpoints",
   "checkpoint_every": "epoch",
   "compilation_cache_dir": {
@@ -1794,6 +1974,14 @@
   ],
   "tile_size": null,
   "weight_only": false
+ },
+ "dew.training.selection.Best": {
+  "metric": "required",
+  "mode": null,
+  "split": null,
+  "threshold": null,
+  "top": 1,
+  "weights_only": false
  },
  "dew.training.trainer.ProfileWindow": {
   "directory": "required",
