@@ -1049,7 +1049,7 @@ def single_device_bias(steps):
     A fresh process is the only way to change the device count, so this
     subprocess runs the same trainer at one device and prints the bias.
     """
-    script = """
+    script = f"""
 import numpy as np, jax, optax
 from dew.registry import models
 import dew.nn.backbones
@@ -1057,16 +1057,16 @@ from dew.objectives.lm import LMObjective
 from dew.training import Trainer, MeshSpec, Layout
 import test_moe as suite
 
-model = models.build("causal_transformer", **{
+model = models.build("causal_transformer", **{{
     **suite.moe_config(),
-    "mixture": {**suite.moe_config()["mixture"], "bias": True}})
+    "mixture": {{**suite.moe_config()["mixture"], "bias": True}}}})
 trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
-state = trainer.fit(suite.Data(suite.token_batches), steps=%d)
+state = trainer.fit(suite.Data(suite.token_batches), steps={steps})
 bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
-""" % steps
+"""
     environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
                    "JAX_PLATFORMS": "cpu",
                    "PYTHONPATH": os.pathsep.join(
