@@ -204,7 +204,7 @@ class FlowGRPO:
                              "scores each sample with an image metric's per-sample measure")
 
         def reward(images, batch):
-            return np.asarray(metric.measure(ImageGrid(images), batch))
+            return np.asarray(metric.fn(ImageGrid(images), batch))
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
