@@ -1,6 +1,7 @@
 """DPO: the preference loss against TRL, and the objective around it.
 
-`preference_logsigmoid` must match TRL 1.12's DPO path with the defaults
+`preference_logsigmoid_terms`, averaged over pairs as `DPOObjective` does,
+must match TRL 1.12's DPO path with the defaults
 (`sigmoid` loss, `reverse_kl`): the same per-token terms summed under the
 shifted completion mask, the `[chosen, rejected]` chunking, and
 `mean(-logsigmoid(beta * delta))`. The reference is
@@ -23,9 +24,15 @@ from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import DPOObjective
-from dew.rl import preference_logsigmoid
+from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
+
+
+def preference_logsigmoid(*halves_and_beta):
+    """The pair mean of the DPO sigmoid terms, the loss `DPOObjective` reduces to."""
+    terms, _ = preference_logsigmoid_terms(*halves_and_beta)
+    return jnp.mean(terms)
 VOCAB = 8
 PAIRS = 2
 WIDTH = 6

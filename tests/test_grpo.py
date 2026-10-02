@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from test_rl_surrogate import clipped_surrogate, token_mean
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.base import Step, scalar_loss
@@ -33,7 +34,7 @@ from dew.objectives.rl.sessions import (
     RESPONSE_MASK_KEY,
     SEGMENT_IDS_KEY,
 )
-from dew.rl import clipped_surrogate, k3_kl, token_log_ratio, token_mean
+from dew.rl import k3_kl, token_log_ratio
 from dew.sampling import Sampling
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "grpo.npz"
