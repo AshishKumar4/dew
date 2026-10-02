@@ -27,15 +27,16 @@ import sys
 import time
 from pathlib import Path
 
+import multiprocess_worker as worker
 import numpy as np
 import pytest
+
+from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
-import multiprocess_worker as worker
 
-from dew.position import ENVELOPE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")

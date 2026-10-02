@@ -11,6 +11,7 @@ network.
 
 import json
 import sys
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -21,13 +22,13 @@ import pytest
 
 import dew
 from dew.interop import hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params
+from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
-import safetensors
+safetensors = import_module("safetensors")
 
-from dew.interop.safetensors_io import read_file, write_file
 
 
 @pytest.fixture

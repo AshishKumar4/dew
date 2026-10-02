@@ -5,6 +5,7 @@ everywhere, since construction never imports it.
 """
 
 import dataclasses
+import itertools
 import json
 
 import jax
@@ -22,7 +23,6 @@ from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
 from dew.training.quantization import Quantization, apply_quantization, quantize_for_serving
-import itertools
 
 VOCAB = 64
 SEQ_LEN = 8

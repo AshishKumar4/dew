@@ -21,9 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
@@ -39,6 +36,10 @@ from dew.objectives.lm import LMObjective
 from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 RES = 16
 FRAMES = 2

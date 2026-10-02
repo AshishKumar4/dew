@@ -11,9 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -31,6 +28,10 @@ from dew.telemetry.instrumentation import (
 )
 from dew.training import ProfileWindow, Trainer
 from dew.training.distributed import shard_batch
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 BATCH = 8
 

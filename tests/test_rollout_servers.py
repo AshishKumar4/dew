@@ -20,6 +20,7 @@ import threading
 import time
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -27,12 +28,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-openai = pytest.importorskip("openai", reason="optional inference-clients extra")
-import httpx2
-
 from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
 from dew.interop import load_pretrained
 from dew.sampling import Sampling
+
+openai = pytest.importorskip("openai", reason="optional inference-clients extra")
+httpx2 = import_module("httpx2")
+
 
 FIXTURE = Path(__file__).parent / "fixtures/hf/qwen2-tiny"
 EOS = 7

@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from absl import flags
 
 from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenWindows, write_tokens
 from dew.data.dataset import describe
@@ -44,7 +45,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # grain's worker processes read absl flags; a test that never ran absl.app
 # would trip UnparsedFlagAccessError at any worker_count > 0.
-from absl import flags
 
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
