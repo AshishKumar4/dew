@@ -828,7 +828,7 @@
   "emb_features": 512,
   "embedding_dropout_rate": 0.0,
   "embedding_multiplier": 1.0,
-  "embedding_norm": false,
+
   "embedding_scale": false,
   "embedding_zero_ids": [],
   "engram": null,
