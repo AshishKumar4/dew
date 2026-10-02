@@ -135,6 +135,60 @@ Every process supplies its own rows. All cooperating processes must supply the s
 
 Results hold global arrays sharded by row, including any filler rows added so the batch divides across devices. `result.host()` returns the same record with NumPy arrays for this process's real rows; it does not gather rows from other processes. Filler rows are added as prompts, before any continuation exists, so all continuations of a prompt stay on the process that asked for them. Token generation and image prior noise use keys per global row. Canvas refinement and an explicitly sampled VAE posterior use keys for the whole batch, so changing the placed batch shape can change their draws.
 
+### SSD-backed decoder banks
+
+`SafetensorsBanks` and `stream_banked` run a decoder whose layer weights do not fit in device memory or host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The existing banked inference loop fetches a layer at execution, with one host read-ahead slot for the following layer. No full decoder stack is loaded or captured as a compiled constant.
+
+```python
+import jax
+
+from dew import models
+from dew.inference import SafetensorsBanks, stream_banked
+from dew.interop.hf_decoders import translate_config
+from dew.registry import with_precision
+from dew.sampling.text import Sampling, generate
+
+with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
+                       cache_bytes=0, param_dtype="auto") as source:
+    record = translate_config(source.config)
+    record["max_seq_len"] = 128
+    model = models.build("causal_transformer", {
+        **with_precision("causal_transformer", record,
+                         dtype="bfloat16", attention_impl="xla"),
+        "scan_layers": True,
+    })
+    variables = stream_banked(model, source)
+    generated = jax.block_until_ready(generate(
+        model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
+        seed=0, sampling=Sampling(temperature=0.0)))
+```
+
+Use a downloaded checkpoint snapshot's local directory for the path. This path accepts unquantized registered decoder families whose translation stays lazy; it refuses a quantized codec or family preparation that might materialize the model. It does not download a Hub repository, load a tokenizer or replace `dew.pipeline`'s resident loader. Tokenize inputs separately, or bind these variables to `TextGeneration` with the matching processor.
+
+`cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
+
+Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
+
+On CPU and an RTX 4080, the tiny Mixtral checkpoint's singleton banks and a genuine four-layer scan match the all-resident model bitwise, including the runtime-fetched expert weights. The two-layer GPU scan has a different legitimate RMSNorm fusion because an effectful one-trip loop cannot be peeled; its logit gap stays within the elementwise spread of the same resident weights' singleton and scanned fusions, with a measured maximum of 1.61e-6 at the highest matmul precision. Cached greedy tokens match.
+
+The real GPT-OSS BF16 weights were also compared on the RTX 4080 using the first two layers (both attention kinds), real embeddings, final norm and head: all prefill and decode logits and greedy tokens were bitwise equal to the existing host-banked path for three prompts and three decode steps, at the highest matmul precision. The resident host-bank reference peaked at 7.23 GB RSS and SSD streaming at 4.59 GB. A third host-resident layer exceeded the 8 GiB job budget; each layer is 1.646 GB, and pinned placement and allocator overhead are additional to that total. This was a prefix check, not a claimed full-depth reference comparison.
+
+`tools/benchmark_disk_banks.py` measures one cache budget per fresh process, including peak RSS, live device allocations, allocator pool size, physical storage reads and decode throughput. Its host read time includes I/O and layout conversion and can overlap compute, so it must not be added to elapsed time. An optional trace records the host reads, transfers and GPU kernels; the serial probe separately measures a row read and its host-to-device copy.
+
+The initial full-depth measurement used `unsloth/gpt-oss-20b-BF16` at revision `cc89b3e7fd423253264883a80a4fa5abc619649f`: 41.83 GB of weights, 24 layers of 1.646 GB each, on an RTX 4080 with 16 GB VRAM, from local NVMe under `/mnt/scratch`, with an 8 GiB host-memory cap. With no retained host cache and read-ahead enabled, two three-token decode intervals took 255.36 and 261.56 seconds: 0.0116 tokens/s, with 4.98 GB peak RSS, 5.80 GB peak live device allocations and an 8.59 GB peak allocator pool. This was a shared workstation, not a controlled bandwidth comparison; the two measured prefills took 64.15 and 101.45 seconds. Priority was changed during this initial run; subsequent large disk reads start under `ionice -c3 nice -n 19`.
+
+The cache-size curve below uses a separate fresh process per point, a four-token prompt, one measured greedy decode, BF16 storage and compute, and the highest matmul precision. `--no-warmup` compiles both programs without an extra weight sweep; cache initialization already reads the model once. Read-ahead is enabled. Peak live device storage stayed at 5.80 GB and the allocator pool at 8.59 GB for every point:
+
+| Host-cache budget (GiB) | Retained layers | Decode seconds/token | Tokens/s | Peak RSS (GB) | Physical reads for measured prefill + decode (GB) |
+|---|---|---|---|---|---|
+| 0 | 0 | 33.59 | 0.0298 | 4.75 | 77.45 |
+| 1.6 | 1 | 50.49 | 0.0198 | 6.53 | 75.79 |
+| 3.2 | 2 | 64.87 | 0.0154 | 8.10 | 69.77 |
+
+Retained layers occupy 1.646 GB each. These single-interval measurements do not show a throughput gain from enlarging the cache: physical reads fall and RSS rises, but the shared workstation and its memory-limited filesystem cache make this a capacity measurement, not a controlled cache speedup. All points drew the same first greedy token.
+
+A separate zero-cache, read-ahead-disabled trace covered one prefill and one decode in 183.10 seconds. Its non-overlapping intervals were 173.10 seconds reading and converting host rows, 9.65 seconds in GPU host-to-device copies, and 0.044 seconds in device compute and layout kernels. That interval's decode took 80.21 seconds (0.0125 tokens/s), with 4.33 GB peak RSS. Host reads dominate this protocol; the trace does not establish a read-ahead speedup.
+
 ## Calls and results
 
 A call takes exactly one of `seed` and `key`; `seed=n` means `jax.random.key(n)`.

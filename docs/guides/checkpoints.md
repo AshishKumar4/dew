@@ -107,12 +107,59 @@ final step: 10 latest: 10
 | `restore(template, step=None)` | Read a step into the structure of `template`. |
 | `stored(step=None)` | The shapes and dtypes each saved state field holds, without reading values. |
 | `wait()` | Block until asynchronous saves have finished. |
+| `profile_steps()`, `profile_metadata(step)`, `restore_profiles(step)` | The post-hoc EMA snapshots (below). |
 
 Saves are asynchronous; `wait()` returns once they are durable. Constructing `Checkpoints` opens nothing; the Orbax managers are created on first use.
 
+## The EMA copy on disk
+
+Orbax compresses every array of a checkpoint with zstd, which in the two runs below saves 6 to 9% on weights and Adam moments: past the sign and exponent, their bits look random. An EMA copy is different, because it agrees with the weights it follows in its sign, exponent and leading mantissa bits. `Checkpoints` stores each EMA leaf that has its weight's floating dtype and shape as the XOR of the two, split into byte planes: a leading `uint8` axis with one plane per byte, least significant first. The XOR is zero wherever the two agree, and the planes gather those zeros into long runs, which zstd compresses well. The step's metadata lists the leaves stored this way. `restore` and `stored` return them bit for bit, as the run trained them, in the dtype and placement the template asks for and on any mesh. Checkpoints written before this change list no such leaves and restore as they were written.
+
+| Run | EMA, zstd alone | XOR, then zstd | XOR and byte planes, then zstd |
+|---|---|---|---|
+| 176M-parameter DiT, fp32, step 1.35M | 652.7 MB | 560.3 MB | 488.6 MB (−25%) |
+| 8.7M-parameter DiT, fp32, step 750, decay 0.999 | 32.2 MB | 30.8 MB | 28.2 MB (−12%) |
+
+How much the XOR saves depends on how close a run's EMA sits to its weights, which follows its updates and its decay; the table measures two runs. Written through `Checkpoints` with JAX's CPU backend, the 176M model's weights and EMA take 1139.4 MB instead of 1306.0 MB. In three processes of three saves and restores each, alternating with processes running the code before this change, a compiled save blocked the step for 0.19 to 0.46 s instead of 0.04 to 0.14 s, the time to compute the planes, and landed on disk in 1.9 to 3.7 s instead of 1.8 to 2.3 s, apart from saves that took 17 to 74 s either way while the shared disk was busy. Restores took 1.45 to 1.59 s instead of 1.31 to 1.71 s. The first save and the first restore of a process each compile one small program per distinct EMA leaf shape (19 for this model): there, a save blocked for 1.0 to 2.7 s and a restore took 2.0 to 3.0 s.
+
+On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2, the same checkpoint's weights and EMA (175.6M fp32 parameters, step 1.35M) gave the following timings. The variants were interleaved in one process for five saves and restores each; the table gives medians of attempts 1–4, excluding the first calls.
+
+| EMA storage | Weights and EMA | Save blocks the step | Save becomes durable | Restore |
+|---|---|---|---|---|
+| EMA as itself, zstd | 1306.0 MB | 0.49 s | 5.78 s | 2.35 s |
+| XOR byte planes, zstd | 1139.4 MB | 0.59 s | 5.28 s | 2.53 s |
+
+Both variants restored the EMA bit for bit. These are checkpoint timings, not training-step timings.
+
+Planes are computed on the devices that hold the EMA. So a save holds one more EMA-sized buffer there until Orbax has copied it to the host, which fits in memory that the step's gradient frees between steps. EMA leaves in pinned host memory, as a host layout keeps them, are written as themselves: Orbax writes them from their own buffers, and differencing them would keep a second copy in the memory the layout exists to spare. EMA leaves whose dtype differs from their weight's are also stored as themselves.
+
+## Post-hoc EMA
+
+An EMA's length is usually picked before training and judged after it. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) picks it afterwards. `OptimConfig.ema_profiles`, such as `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`, which keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state. They are sharded, placed and saved with that state. A snapshot is the ordinary checkpoint itself, retained by Orbax's public preservation policy even after `keep` would prune it. There is one atomic save, not a separate write of the averages: an interrupted save cannot publish a state without its profiles.
+
+```python
+from dew.training.posthoc import reconstruct
+
+averaged = reconstruct(run_directory, 0.07)             # at the latest snapshot
+averaged = reconstruct(run_directory, 0.07, step=40000)
+```
+
+`reconstruct` returns the `params` collection as host arrays, in the weights' structure and dtypes. It weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`), which gives the same weights as NVlabs' `phema.py` to the last bit on the paper's setting, and reads one snapshot at a time. Its accuracy depends on how many snapshots there are: in a 96-step CPU run tracking 0.05 and 0.10, an average of 0.07 rebuilt from snapshots every 4 steps differed from one tracked directly by at most 1.2e-7 (weights of scale 2), every 8 steps by 4.8e-7, every 16 steps by 5.7e-6; the tracked 0.05 average was 1.3e-4 from it.
+
+Each profile holds one more copy of the weights in memory. Retaining the whole checkpoint costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot: about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB, but the separate-manager design added blocking setup and a gap between commits; the one-checkpoint design keeps the state and profiles atomic. Empty `ema_profiles` retains the ordinary `keep` policy.
+
+In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state saved with and without snapshot retention blocked for median 14.9 and 15.2 ms respectively (six warmed pairs). No extra parameter bytes are transferred or serialized for a snapshot. On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention likewise added no measured blocking cost. The full state included weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each; these are medians of attempts 1–4. Restore was not timed for this comparison.
+
+| Retention | Full checkpoint | Save blocks the step | Save becomes durable |
+|---|---|---|---|
+| Inline profiles, no snapshot retention | 3762.1 MB | 1.41 s | 14.80 s |
+| Checkpoint retained as a snapshot | 3762.1 MB | 1.38 s | 14.71 s |
+
+Both variants wrote the same bytes. Snapshot retention changes which steps stay on disk, not what each save transfers.
+
 ## Preemption
 
-A scheduler stops a job with SIGTERM and kills it a grace period later: Slurm's `KillWait`, Kubernetes' termination grace period, a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on (JAX's `reached_preemption_sync_point` in a pool, the signal itself in a lone process), writes that step's state and data position, skips the final validation, and raises `dew.training.Preempted`. Uncaught, it ends the program with exit status 143, SIGTERM's, so the scheduler sees a stopped job rather than a finished one; a Kubernetes pod failure policy can ignore that code. The same command run again resumes from the checkpoint, and with deterministic ops its losses are the uninterrupted run's to the bit.
+A scheduler stops a job with SIGTERM and kills it a grace period later: Slurm's `KillWait`, Kubernetes' termination grace period, a spot VM's notice. `Trainer.fit` stops at the next step every process agrees on (JAX's `reached_preemption_sync_point` in a pool, the signal itself in a lone process), writes that step's state and data position, skips the final validation, and raises `dew.training.Preempted`. Uncaught, it ends the program with exit status 143, SIGTERM's, so the scheduler sees a stopped job rather than a finished one; a Kubernetes pod failure policy can ignore that code. The same command run again resumes from the checkpoint. On a GPU, `--xla_gpu_deterministic_ops=true` orders the reductions, so a resumed run can match the uninterrupted one to the bit. XLA still picks GEMM and convolution kernels at compile time by live timing, and a resumed process compiles again, so it can pick kernels that round differently ([XLA's determinism notes](https://openxla.org/xla/determinism)). `--xla_gpu_autotune_level=0` removes that choice, at a cost. On an RTX 4080 the 176M hybrid DiT's step went from 139 to 151 ms (8%), and a 67M decoder's from 79.8 to 81.5 ms (2%). Whether the choice actually differs in practice is unconfirmed. Two runs of a CIFAR-10 LADD distillation under deterministic ops alone ended a step apart from an uninterrupted run, by 3.5e-14 in the patch convolution's gradient, which Adam carried to 8e-6. But 20 fresh processes training a DiT under deterministic ops alone all agreed to the bit, as did 20 with autotuning off. Dew's CUDA test lane sets both flags as a precaution.
 
 The save has to fit in the scheduler's grace: a step and one checkpoint write. `dew launch` gives a pool it was told to stop 300 seconds before it kills the ranks, and a second signal kills them at once ([Training on several nodes](multi-node.md)).
 

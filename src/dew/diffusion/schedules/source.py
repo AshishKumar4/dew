@@ -91,7 +91,7 @@ Kind = Literal[
     "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
 ]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
-Origin = Literal["scheduler", "linspace"]
+Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
@@ -319,6 +319,19 @@ _KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
                   "KDPM2Discrete", "KDPM2AncestralDiscrete")
 
 
+def empirical_mu(tokens: int, steps: int) -> float:
+    """`compute_empirical_mu`, the shift FLUX.2's pipelines fit to the latent
+    token count and the step count and hand the scheduler in place of its
+    own. Past 4300 tokens it is the 200-step line; below, it interpolates
+    linearly in the steps between the 10- and the 200-step lines."""
+    a1, b1 = 8.73809524e-05, 1.89833333
+    a2, b2 = 0.00016927, 0.45666666
+    if tokens > 4300:
+        return float(a2 * tokens + b2)
+    m_200, m_10 = a2 * tokens + b2, a1 * tokens + b1
+    slope = (m_200 - m_10) / 190.0
+    return float(slope * steps + m_200 - 200.0 * slope)
+
 @dataclass(frozen=True)
 class _Flow:
     """Holds a rectified-flow file's shift controls and the shift they name.
@@ -347,8 +360,9 @@ class _Flow:
         slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
         return tokens * slope + self.base_shift - slope * self.base_tokens
 
-    def base(self, tokens: int | None) -> float:
-        """The shift this file names at `tokens` latent tokens.
+    def base(self, tokens: int | None, mu: float | None = None) -> float:
+        """The shift this file names at `tokens` latent tokens, or at the
+        `mu` a pipeline hands the scheduler itself.
 
         The static and the dynamic forms are the same map with a different
         base. shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
@@ -356,15 +370,16 @@ class _Flow:
         """
         if not self.dynamic:
             return self.shift
-        if tokens is None:
-            raise ValueError("Dynamic shifting needs the latent token count; bind the "
-                             "geometry through the task's grid")
-        mu = self.mu(tokens)
+        if mu is None:
+            if tokens is None:
+                raise ValueError("Dynamic shifting needs the latent token count; bind the "
+                                 "geometry through the task's grid")
+            mu = self.mu(tokens)
         return float(np.exp(mu)) if self.kind == "exponential" else mu
 
-    def shifted(self, sigmas: np.ndarray, tokens: int | None) -> np.ndarray:
+    def shifted(self, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
         """The sigmas after this file's shift."""
-        base = self.base(tokens)
+        base = self.base(tokens, mu)
         return base * sigmas / (1 + (base - 1) * sigmas)
 
     def stretched(self, sigmas: np.ndarray) -> np.ndarray:
@@ -725,13 +740,14 @@ class SourceSchedule:
 
         `origin` is where the sigmas start, which is a pipeline fact rather
         than a config one. SD3 lets the scheduler lay them out between its own
-        sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes
+        sigma extremes, Flux hands it `linspace(1, 1/N, N)`, and FLUX.2 hands
+        it the same with its own mu (`empirical_mu`). Then comes
         the file's shift, then whichever sigma conversion it asks for, then
         the appended zero.
         """
         policy = self.policy
         count = policy.train_steps
-        if origin == "linspace":
+        if origin in ("linspace", "empirical"):
             sigmas = np.linspace(1.0, 1.0 / steps, steps, dtype=np.float64)
         else:
             # The class's own sigma extremes, which its constructor already
@@ -743,7 +759,13 @@ class SourceSchedule:
                 trained = flow.shifted(trained, tokens)
             times = np.linspace(float(trained[0]) * count, float(trained[-1]) * count, steps)
             sigmas = np.asarray(times, np.float64) / count
-        sigmas = flow.stretched(flow.shifted(sigmas, tokens))
+        mu = None
+        if origin == "empirical":
+            if not flow.dynamic or tokens is None:
+                raise ValueError("FLUX.2's pipeline hands a dynamically shifting scheduler its own mu, "
+                                 "which reads the latent token count")
+            mu = empirical_mu(tokens, steps)
+        sigmas = flow.stretched(flow.shifted(sigmas, tokens, mu))
         if policy.transform != "none":
             sigmas = _transformed_sigmas(policy.transform, float(sigmas[-1]), float(sigmas[0]),
                                          steps, policy.rho)

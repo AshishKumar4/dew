@@ -27,13 +27,20 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
 from dew.inputs import Condition, Field, InputSpec
-from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
+from dew.inputs.diffusion import (
+    Composition,
+    DiffusionConditioner,
+    HiddenStatesConditioner,
+    QwenImageConditioner,
+    T5Segment,
+)
 from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.generation_config import (
@@ -298,11 +305,12 @@ class Processor:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") not in ("qwen3_5", "gemma4"):
+            if ("pixel_values_videos" in values
+                    and self.config.get("model_type") not in (*_QWEN35_TYPES, "gemma4")):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if self.config.get("model_type") == "qwen3_5":
+            if self.config.get("model_type") in _QWEN35_TYPES:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -334,7 +342,7 @@ class Processor:
         image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
-        qwen = self.config.get("model_type") == "qwen3_5"
+        qwen = self.config.get("model_type") in _QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
         video_id = (self.config.get("video_token_id", 258884) if gemma else
                     self.config.get("video_token_id") if qwen else None)
@@ -1103,7 +1111,7 @@ class _Call(NamedTuple):
     it pads its T5 tower to. Qwen-Image's pipeline pads to the longest prompt
     of a call, so its budget is the prompt window Dew pads each row to."""
 
-    family: Literal["sd", "sdxl", "sd3", "flux", "qwen_image"]
+    family: Literal["sd", "sdxl", "sd3", "flux", "flux2", "qwen_image", "z_image"]
     steps: int
     guidance: float
     guided: bool
@@ -1126,6 +1134,13 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
     "FluxPipeline": _Call("flux", 28, 3.5, guided=False, sequence=512),
     # `true_cfg_scale` defaults to 1.0: the release samples unguided.
     "QwenImage21Pipeline": _Call("qwen_image", 40, 1.0, guided=True, sequence=512),
+    # FLUX.2 [dev] embeds its 4.0; [klein] guides two branches at 4.0 unless
+    # its index marks it step-distilled, which `_call_policy` reads.
+    "Flux2Pipeline": _Call("flux2", 50, 4.0, guided=False, sequence=512),
+    "Flux2KleinPipeline": _Call("flux2", 50, 4.0, guided=True, sequence=512),
+    # Z-Image guides as `pos + 5.0 (pos - neg)`, which is Dew's
+    # `neg + 6.0 (pos - neg)`.
+    "ZImagePipeline": _Call("z_image", 50, 6.0, guided=True, sequence=512),
     "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
@@ -1153,6 +1168,9 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
     if found.family != expected.family:
         raise ValueError(f"The declared pipeline {published!r} is a {found.family} pipeline, and "
                          f"this directory's denoiser belongs to {denoiser.pipeline!r}")
+    if published == "Flux2KleinPipeline" and records.boolean(index.get("is_distilled", False), "is_distilled"):
+        # A step-distilled [klein] ignores its guidance scale.
+        return found._replace(guided=False)
     return found
 
 
@@ -1247,6 +1265,32 @@ class _QwenImageText:
 
 
 @dataclass(frozen=True)
+class _HiddenStatesText:
+    """The text encoder FLUX.2 (`pipeline="flux2"`: Mistral-3 for [dev],
+    Qwen3 for [klein]) or Z-Image (`"z_image"`: Qwen3) reads hidden states
+    from, which `HiddenStatesConditioner` runs, padded to the call's token
+    budget. `embeds_guidance` marks FLUX.2 [dev]'s transformer, which reads
+    the guidance scale as an input."""
+
+    pipeline: Literal["flux2", "z_image"]
+    embeds_guidance: bool = False
+
+    def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
+              policy: _Call, compute, size: int, *, param_dtype: str,
+              attention_impl: str = "auto", params: Variables | None = None
+              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+        """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
+        return _hidden_states_conditioning(
+            directory, index, compute, size, pipeline=self.pipeline, tokens=policy.sequence,
+            guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
+            attention_impl=attention_impl, params=params)
+
+    def unconditional(self, index: Mapping[str, object]) -> dict:
+        """The empty prompt a guided call encodes as its negative."""
+        return {"text": ""}
+
+
+@dataclass(frozen=True)
 class _Denoiser:
     """Holds what one architecture contributes to a diffusion source.
 
@@ -1263,7 +1307,7 @@ class _Denoiser:
     weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    text: _TextTowers | _QwenImageText
+    text: _TextTowers | _QwenImageText | _HiddenStatesText
     patch: int
     latent_input: int
     sample_size: int
@@ -1430,6 +1474,10 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
         return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "QwenImage21Transformer2DModel":
         return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "Flux2Transformer2DModel":
+        return _flux2_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "ZImageTransformer2DModel":
+        return _z_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
@@ -1523,6 +1571,64 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
         context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
 
 
+def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build FLUX.2's transformer over its VAE's folded latent, one token per
+    position, conditioned by stacked text-encoder states.
+
+    Its pipelines render at `default_sample_size` 128 through the VAE's 8x,
+    which is 64 folded positions, and hand the scheduler `linspace(1, 1/N,
+    N)` with their own empirical mu.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.flux2 import Flux2Transformer
+
+    fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = Flux2Transformer(**fields)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_flux2_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params}, layouts
+
+    built = {"name": "flux2_transformer",
+             "fields": {**fields, "dtype": dtype, "axes_dims_rope": list(fields["axes_dims_rope"])}}
+    guided = fields["guidance_embeds"]
+    return _Denoiser(
+        component="transformer", model=model, weights=weights, built=built, config=config,
+        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=fields["in_channels"], sample_size=64,
+        context_width=fields["joint_attention_dim"],
+        pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
+
+
+def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
+    """Build Z-Image's single-stream transformer over the Flux VAE's latent,
+    cut into 2x2 patches, conditioned by its Qwen3 encoder's second-to-last
+    layer.
+
+    Its pipeline renders at 1024 pixels by default, 128 latent positions
+    through the VAE's 8x, and hands its statically shifting scheduler
+    `linspace(1, 1/N, N)`.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.z_image import ZImageTransformer
+
+    fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = ZImageTransformer(**fields)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_z_image_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params}, layouts
+
+    built = {"name": "z_image_transformer",
+             "fields": {**fields, "dtype": dtype, "axes_dims": list(fields["axes_dims"]),
+                        "axes_lens": list(fields["axes_lens"])}}
+    return _Denoiser(
+        component="transformer", model=model, weights=weights, built=built, config=config,
+        text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=128,
+        context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
+
+
 def _component_config(directory: Path, name: str) -> dict:
     """Read one published component's own config file."""
     file = "scheduler_config.json" if name == "scheduler" else "config.json"
@@ -1549,6 +1655,9 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
     if config.get("_class_name") == "AutoencoderKLQwenImage21":
         from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
         return load_qwen_image_vae(directory, compute, param_dtype=param_dtype, params=params)
+    if config.get("_class_name") == "AutoencoderKLFlux2":
+        from dew.nn.autoencoders.flux2 import load_flux2_vae
+        return load_flux2_vae(directory, compute, param_dtype=param_dtype, params=params)
     model = AutoencoderKL(
         channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
         image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
@@ -1721,6 +1830,116 @@ def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat1
     return encoder
 
 
+_FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] = MappingProxyType({
+    "qwen3": ("qwen3", (9, 18, 27)), "mistral3": ("mistral3", (10, 20, 30))})
+"""Each FLUX.2 text encoder's `model_type`, the template its pipeline
+formats a prompt with, and the `hidden_states` it stacks."""
+
+
+def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal: bool):
+    """Map a hidden-states text encoder's tensors: a Qwen3 language model's
+    own names, or a Mistral-3's language model as the Mistral decoder's with
+    its vision tower and projector held as stored, which a text prompt never
+    reads and an export writes back. A Mistral-3 checkpoint names its
+    language model `language_model.model.` and its head
+    `language_model.lm_head` (transformers 4.50 and 5 write these), or
+    `model.language_model.` and `lm_head` (4.52 to 4.57)."""
+    decoder = decoders._FAMILIES[family]
+
+    def path(name: str) -> tuple[str, ...] | None:
+        if not multimodal or name == "lm_head.weight":
+            return decoder.weight_path(name, record)
+        if name == "language_model.lm_head.weight":
+            return decoder.weight_path("lm_head.weight", record)
+        for prefix in ("model.language_model.", "language_model.model."):
+            if name.startswith(prefix):
+                return decoder.weight_path("model." + name.removeprefix(prefix), record)
+        if name.removeprefix("model.").startswith(("vision_tower.", "multi_modal_projector.")):
+            return ("visual", name)
+        raise ValueError(f"unknown tensor name {name!r}")
+    return path
+
+
+def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+                                pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
+                                param_dtype: str, attention_impl: str, params: Variables | None = None
+                                ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],
+                                           dict[str, Mapping[str, object]]]:
+    """Build FLUX.2's or Z-Image's conditioner: the text encoder's language
+    model, the tokenizer and chat template, the parameters and their layouts.
+    Z-Image reads the output of the encoder's second-to-last layer with the
+    template's thinking on."""
+    from dew.data.text import load_tokenizer
+    from dew.interop import diffusion
+
+    config = _component_config(directory, "text_encoder")
+    kind = records.text(config.get("model_type"), "model_type")
+    known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
+    if kind not in known:
+        raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
+    template, layers = known[kind]
+    multimodal = kind == "mistral3"
+    text = dict(records.record(config["text_config"], "text_config")) if multimodal else config
+    if multimodal:
+        text["tie_word_embeddings"] = records.boolean(config.get("tie_word_embeddings", False),
+                                                      "tie_word_embeddings")
+    record = decoders.translate_config(text)
+    named = dtype_name(compute)
+    if named is None:
+        raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
+    decoder = models.build("causal_transformer",
+                           with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl))
+    if not isinstance(decoder, CausalTransformer):
+        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    if pipeline == "z_image":
+        layers = (decoder.num_layers - 1,)
+    if max(layers) >= decoder.num_layers:
+        # transformers' last hidden state is the final norm's output, which
+        # none of these pipelines reads of its released encoder.
+        raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
+                         "encoder does not have before its final norm")
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tower, layouts = diffusion.record_layouts(
+            "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
+            _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
+            ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype)
+        params = {"text_encoder": tower}
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    encoder = HiddenStatesConditioner(
+        decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory), height, width,
+        template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
+        param_dtype=param_dtype)
+    return encoder, layouts, {"text_encoder": config}
+
+
+def load_hidden_states_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
+                                   param_dtype: str = "float32", revision: str | None = None,
+                                   attention_impl: str = "auto", tokens: int = 512,
+                                   params: Variables | None = None) -> HiddenStatesConditioner:
+    """Load FLUX.2's or Z-Image's text conditioning, or bind supplied
+    parameters using metadata only."""
+    compute = resolve_dtype(dtype)
+    resolve_dtype(param_dtype)
+    directory = sources.snapshot(checkpoint, revision, weights=False)
+    with open(directory / "model_index.json") as handle:
+        index = json.load(handle)
+    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
+    text = denoiser.text
+    if not isinstance(text, _HiddenStatesText):
+        raise ValueError(f"{checkpoint} is neither a FLUX.2 nor a Z-Image checkpoint")
+    if params is None:
+        directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
+    policy = _call_policy(index, denoiser)
+    encoder, _, _ = _hidden_states_conditioning(
+        directory, index, compute, denoiser.sample_size * 16, pipeline=text.pipeline, tokens=tokens,
+        guidance=policy.guidance if text.embeds_guidance else None, param_dtype=param_dtype,
+        attention_impl=attention_impl, params=params)
+    return encoder
+
+
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
                   params: Variables | None = None):
     """Build the safety head a file declares: the finish, its parameters, their
@@ -1793,7 +2012,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"kind": "attention", "bidirectional_images": True}}
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family == "qwen3_5":
+    if family in _QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -2046,6 +2265,13 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
     record = decoders.translate_wrapper_config(config)
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
+    # The Transformers conditional classes ignore auxiliary prediction
+    # layers. A released config advertises a depth even when its checkpoint
+    # contains only the trunk; a source with mtp.* retains its actual depth.
+    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+            and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
+        text_fields['num_nextn_predict_layers'] = 0
+        record['text']['num_nextn_predict_layers'] = 0
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
@@ -2086,7 +2312,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # (Gemma 4's prepare) has no raw-name bindings.
     entry = decoders._FAMILIES[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is dict:
+    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
