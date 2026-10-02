@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src import source_info_util
+from reference_error import assert_fp32_reduction_bound
 from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew.diffusion.process import DenoisingCondition
@@ -502,9 +503,13 @@ def test_a_rounding_survives_the_reduction_it_feeds(helper):
     held = jax.jit(lambda v: getattr(precision, helper)(v, jnp.bfloat16).astype(jnp.float32))
     sums = np.asarray(jax.jit(lambda v: jnp.sum(held(v), axis=-1))(x), np.float64)
     squares = np.asarray(jax.jit(lambda v: jnp.mean(jnp.square(held(v)), axis=-1))(x), np.float64)
-    np.testing.assert_allclose(sums, rounded.sum(-1), rtol=0, atol=1e-3)
-    assert np.min(np.abs(sums - x.astype(np.float64).sum(-1))) > 1e-2
-    np.testing.assert_allclose(squares, np.mean(rounded ** 2, -1), rtol=1e-6)
+    assert_fp32_reduction_bound(sums, rounded.sum(-1), np.abs(rounded).sum(-1), x.shape[-1])
+    mean_square = np.mean(rounded ** 2, -1)
+    assert_fp32_reduction_bound(squares, mean_square, mean_square, x.shape[-1] + 2)
+    # The bound is a worst case (4.8 on these sums), wider than what dropping
+    # the rounding moves them (at most 0.96), so each sum must also be nearer
+    # the rounded values' than the unrounded ones'.
+    assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
 def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():
