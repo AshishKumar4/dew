@@ -26,8 +26,8 @@ import tyro
 
 from dew.config import ModelConfig
 from dew.data import PackedTokens, TokenWindows, tokenizer_for
-from dew.objectives.lm import LMObjective, LMRunConfig, Samples
-from dew.registry import datasets, metrics, models
+from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
+from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
 if TYPE_CHECKING:
@@ -301,7 +301,7 @@ def main(config: LmRunConfig) -> TrainState:
     summary = {"model": fields, "arguments": run_summary(config, fields),
                "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
-    validation = (metrics.perplexity(),)
+    validation = (Perplexity(),)
     pretrained = None if source is None else source.variables
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,

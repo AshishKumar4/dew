@@ -10,13 +10,14 @@ The example trains a tiny next-token decoder on synthetic token rows and measure
 import itertools
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Trainer, metrics
+from dew import Trainer
 from dew.data import Dataset
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.lm import LMObjective
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity
 
 train_tokens = np.tile(np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], np.int32), (8, 1))
 val_tokens = np.tile(np.array([1, 2, 3, 0, 1, 2, 3, 0, 1], np.int32), (8, 1))
@@ -24,11 +25,11 @@ data = Dataset(train=lambda partition: itertools.repeat({"text": train_tokens}),
                val=lambda partition: iter([{"text": val_tokens}]), records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
-                          dtype="float32", attention_impl="xla")
+                          dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
 trainer = Trainer(objective, optax.adam(0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
-                    metrics=(metrics.perplexity(),))
+                    metrics=(Perplexity(),))
 assert int(state.step) == 10
 ```
 
@@ -164,20 +165,20 @@ A space maps dotted paths into the run record to the values a trial can take. `o
 
 A finished trial is written to the ledger before it is reported, so rerunning an interrupted sweep continues at the trial it stopped on and does not retrain finished trials. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, plus its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
-The example continues the previous one and reuses `objective`, `data`, `metrics` and `jax`:
+The example continues the previous one and reuses `objective`, `data`, `Perplexity` and `jax`:
 
 ```python
 from dew import LocalTracker, evaluate
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import grid_search, sweep
-from dew.registry import datasets
+from dew.data import TokenWindows
 
 config = RunConfig(
     model=ModelConfig("causal_transformer", {"vocab_size": 4, "emb_features": 16,
                                              "num_layers": 1, "num_heads": 2,
                                              "mlp_features": 32, "max_seq_len": 16}),
     # The synthetic batches above stand in for the dataset this names.
-    data=datasets["token_windows"](seq_len=8),
+    data=TokenWindows(seq_len=8),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
                           eval_every=None, checkpoint_every=None),
@@ -187,7 +188,7 @@ config = RunConfig(
 def trial(run: RunConfig) -> float:
     """Train one point and score it: the perplexity its own run ends on."""
     state = run.train(objective, data, name=run.trainer.name or "lm-rate")
-    return float(evaluate(objective, state.params, data.val, metrics=(metrics.perplexity(),),
+    return float(evaluate(objective, state.params, data.val, metrics=(Perplexity(),),
                           key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
 
 

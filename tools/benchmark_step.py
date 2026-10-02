@@ -60,7 +60,8 @@ import optax
 import tyro
 from jax.sharding import Mesh
 
-from dew import models  # naming a registry fills it
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
 from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.diffusion import presets
@@ -84,7 +85,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import float64_twin, projectors, resolve_dtype, towers, with_precision
+from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Layout, MeshSpec, Trainer, build_mesh

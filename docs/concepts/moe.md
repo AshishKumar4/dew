@@ -1,19 +1,20 @@
 # Mixture of experts
 
-A mixture-of-experts (MoE) layer holds several feed-forward networks, called experts, in place of one. For each token, a router scores the experts, picks the `top_k` best and sums their outputs weighted by the router's scores. In Dew a `causal_transformer` becomes sparse through its `mixture` field, a `Mixture` value (`dew.nn.backbones.causal_transformer`) or a mapping of its fields.
+A mixture-of-experts (MoE) layer holds several feed-forward networks, called experts, in place of one. For each token, a router scores the experts, picks the `top_k` best and sums their outputs weighted by the router's scores. In Dew a `CausalTransformer` becomes sparse through its `mixture` field, a `Mixture` value from `dew.nn.backbones`.
 
 ## Example
 
 ```python
 import jax
 import jax.numpy as jnp
-from dew import models
 
-model = models.build(
-    "causal_transformer", vocab_size=32, emb_features=16,
+from dew.nn.backbones import CausalTransformer, Mixture
+
+model = CausalTransformer(
+    vocab_size=32, emb_features=16,
     num_layers=2, num_heads=2, mlp_features=32, max_seq_len=8,
-    mixture={"experts": 4, "top_k": 2, "every": 1},
-    dtype="float32", attention_impl="xla",
+    mixture=Mixture(experts=4, top_k=2, every=1),
+    dtype=jnp.float32, attention_impl="xla",
 )
 tokens = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
 variables = model.init(jax.random.key(0), tokens)

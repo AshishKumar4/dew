@@ -1,6 +1,6 @@
 # Language models
 
-`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `causal_transformer` from `dew.models`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `load_pretrained`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
+`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `CausalTransformer` from `dew.nn.backbones`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `load_pretrained`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
 
 ## Example
 
@@ -43,19 +43,20 @@ This is the layout `dew tokenize` writes: `train.bin` and `val.bin` hold the tok
 import jax
 import optax
 
-from dew import Trainer, metrics, models
+from dew import Trainer
 from dew.data import Loading, TokenWindows
-from dew.objectives.lm import LMObjective
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 data = TokenWindows(path="data/stories-byte", seq_len=64,
                     loading=Loading(workers=0)).load(batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=128)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 lm_state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
-    data, steps=300, log_every=100, eval_every=300, metrics=(metrics.perplexity(),))
+    data, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.params, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -353,9 +354,9 @@ masked_data = TokenWindows(path="data/stories-byte", seq_len=63,
                            loading=Loading(workers=0)).load(batch=16)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
-masked_model = models.build("causal_transformer", vocab_size=mask_id + 1,
-                            emb_features=64, num_layers=2, num_heads=2,
-                            mlp_features=256, max_seq_len=64, causal=False)
+masked_model = CausalTransformer(vocab_size=mask_id + 1,
+                                 emb_features=64, num_layers=2, num_heads=2,
+                                 mlp_features=256, max_seq_len=64, causal=False)
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
 masked_state = Trainer(masked_objective, optax.adamw(3e-3), key=jax.random.key(4)).fit(
     masked_data, steps=1000, log_every=500)

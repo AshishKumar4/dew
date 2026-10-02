@@ -547,7 +547,7 @@ Prepared `DenoisingInputs` can supply encoded native conditions and initial late
 
 ## Configuration and registries
 
-A registry maps names to known classes or factories. For example, `models.build(name, **fields)` validates model fields and reconstructs supported configuration records. Ordinary Python constructors provide a clearer typed interface when the class is known. Dynamic lookup cannot provide the same static type information as a specific constructor.
+Code builds every model, preset, solver, dataset and metric from its class. `dew.registry` maps the names that configuration files, the command line and run records use to those classes and back; `RunConfig.from_dict` and `ModelConfig.build` read a record through it.
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 

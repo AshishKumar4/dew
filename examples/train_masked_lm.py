@@ -23,9 +23,9 @@ import tyro
 from dew.data import ByteTokenizer, DataPartition, Loading, TokenWindows
 from dew.diffusion.discrete import DiscreteProcess, LogLinear
 from dew.inference import RunProcessor
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.registry import models
 from dew.training import Checkpoints, Trainer
 
 
@@ -59,11 +59,11 @@ def main(config: Config):
     data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length - 1,
                         val_batches=1, loading=Loading(workers=0, threads=2)).load(batch=config.batch_size)
     prompt = tokenizer.encode(config.prompt)
-    model = models.build("causal_transformer", vocab_size=257, causal=False,
-                         emb_features=config.features, num_layers=config.layers, num_heads=config.heads,
-                         mlp_features=4 * config.features, dtype="float32",
-                         precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
-                         max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens))
+    model = CausalTransformer(vocab_size=257, causal=False,
+                              emb_features=config.features, num_layers=config.layers, num_heads=config.heads,
+                              mlp_features=4 * config.features, dtype=jnp.float32,
+                              precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
+                              max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens))
     objective = MaskedDiffusionObjective(model, DiscreteProcess(LogLinear(), mask_id=256),
                                         config.sequence_length,
                                         ema_decay=None, steps=config.sample_steps, decode=tokenizer.decode)

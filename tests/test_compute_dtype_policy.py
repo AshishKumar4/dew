@@ -65,12 +65,16 @@ import optax
 import pytest
 from test_precision_policy import build_model, tiny_inputs
 
-from dew import models  # the attribute import is what registers every family
+import dew.nn.backbones  # noqa: F401  (registers the kind)
+import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
+import dew.nn.multimodal  # noqa: F401  (registers the kind)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import TEXT_KEY
+from dew.registry import models
 from dew.telemetry.instrumentation import (
     _COMPUTATION,
     _INSTRUCTION,
