@@ -236,7 +236,7 @@ def test_streaming_replays_the_completion_it_would_have_returned(client, continu
 def test_chat_carries_the_template_the_export_does_not(client, continuation):
     """The gap between a served export and a chat endpoint.
 
-    `save_pretrained_decoder` writes no chat template, so vLLM has nothing
+    `PretrainedDecoder.from_model(...).save` writes no chat template, so vLLM has nothing
     to render a conversation with and refuses one. A request that carries
     its own template is answered, whole or streamed, and with a template
     that renders the turn as the bare prompt the answer is the completion's

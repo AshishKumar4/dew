@@ -6,7 +6,7 @@ helpers around them fetch a repo (or read a local directory) and read the
 safetensors shards in their stored dtype without torch. Parameter binding
 defaults to FP32, independently of compute dtype, so dew.interop.Pretrained.load
 builds a model whose variables a forward pass takes straight away, and
-save_pretrained_decoder writes one back out in the HF layout.
+`PretrainedDecoder.from_model(...).save` writes one back out in the HF layout.
 
 Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
@@ -28,17 +28,19 @@ import os
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
+from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
@@ -1767,6 +1769,11 @@ class NamedTokenizer(Protocol):
     name: str
 
 
+GENERATION_DEFAULTS: Mapping[str, object] = MappingProxyType({"do_sample": True, "use_cache": True})
+"""The generation_config.json an export writes when nothing names one: sampling
+with the KV cache, which is what transformers' generate reads by default."""
+
+
 def save_export_assets(
     directory,
     *,
@@ -1780,11 +1787,7 @@ def save_export_assets(
     A name is resolved through `tokenizer_for` from local files only and recorded under
     `tokenizer_name`, which is the whole record for the byte vocabulary.
     """
-    values: dict[str, object] = (
-        {"do_sample": True, "use_cache": True}
-        if generation_config is None
-        else dict(generation_config)
-    )
+    values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
     name: str | None = None
     writer: ExportTokenizer | None = None
     if isinstance(tokenizer, str):
@@ -1807,39 +1810,7 @@ def save_export_assets(
         json.dump(values, handle, indent=2)
 
 
-def save_pretrained_decoder(model, variables, directory, *,
-                            tokenizer: str | ExportTokenizer | None = None,
-                            generation_config: Mapping[str, object] | None = None,
-                            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-    """Write a decoder back out in the HF layout: config.json and its weights,
-    in shards of at most `max_shard_size` with their index once they exceed it.
-
-    Derive the config from native computation and encode all variable
-    collections through the matching family. Source-bound exports instead
-    retain their source layout in Pretrained.save. Gemma4 writes frozen or
-    trainable layer-scalar values into HF buffers; reloading that layout
-    preserves computation, not the native scalar training policy.
-
-    `tokenizer` is the vocabulary the weights were trained against, by object
-    or by name; `save_export_assets` writes its files beside them, so one call
-    leaves a directory `Pretrained.load` reads back with its processor.
-    `Pretrained.save` writes a decoder's weights through the same encoder
-    (`Pretrained.export`), so the two leave the same weights behind.
-    """
-    from dew.interop.safetensors_io import save_hf_layout
-
-    if not isinstance(model, CausalTransformer):
-        raise ValueError(
-            f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    config = _export_config(model)
-    _refuse_lossy_export(model, config)
-    hf_tensors = export_decoder_weights(model, variables, config)
-
-    save_hf_layout(hf_tensors, config, directory, max_shard_size)
-    save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
-
-
-def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+def export_decoder_weights(model: nn.Module, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Encode whole native variables as canonical model.* / lm_head.* tensors.
 

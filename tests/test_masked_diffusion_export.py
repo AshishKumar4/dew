@@ -38,7 +38,7 @@ import numpy as np
 import pytest
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from test_masked_diffusion import flat
 from tools import masked_diffusion_export_reference as tool
 
@@ -146,7 +146,7 @@ def test_the_bidirectional_reading_is_what_the_reference_agrees_with(trip):
 
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
 def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
-    """The other writer: `save_pretrained_decoder` derives the config from a
+    """The other writer: `PretrainedDecoder.from_model` derives the config from a
     built model, for a masked-diffusion model that came from no checkpoint.
     It has to write names its own family reads back, so LLaDA's leaves go
     out under the release's OLMo-style spellings and Dream's config carries
@@ -154,7 +154,7 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     source = Pretrained.load(str(FIXTURES / fixture), dtype="float32",
                              attention_impl="reference")
 
-    save_pretrained_decoder(source.model, source.variables, tmp_path)
+    PretrainedDecoder.from_model(source.model, source.variables).save(tmp_path)
     written = json.loads((tmp_path / "config.json").read_text())
     reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
 

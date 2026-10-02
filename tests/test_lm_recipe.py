@@ -216,19 +216,19 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
 def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
     """A local HF-layout decoder, the way a --pretrained run is pointed at one.
 
-    Exported through save_pretrained_decoder, so the directory has the shape
+    Exported through `PretrainedDecoder.from_model(...).save`, so the directory has the shape
     a hub repo has: config.json, model.safetensors, the generation_config
     that records which tokenizer its ids come from, and that tokenizer's own
     files whenever it is one that has any.
     """
-    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.interop import PretrainedDecoder
     from dew.registry import models
 
     model = models.build("causal_transformer", vocab_size=vocab_size, emb_features=16,
                          num_layers=1, num_heads=2, num_kv_heads=1, mlp_features=32,
                          max_seq_len=SEQ, tie_embeddings=False)
     variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
-    save_pretrained_decoder(model, variables, str(directory), tokenizer=tokenizer)
+    PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer).save(str(directory))
     return directory
 
 

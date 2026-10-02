@@ -16,7 +16,8 @@ from test_hf_decoders import GEMMA4_MOE, fixture_config, flat_tree, fp32_decoder
 
 from dew.interop import Pretrained
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
-from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.interop.hf_decoders import translate_config, translate_weights
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models, with_precision
 
@@ -89,7 +90,7 @@ def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
     pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
     model, variables = pretrained.model, pretrained.variables
     export = tmp_path / "gpt-oss"
-    save_pretrained_decoder(model, variables, export)
+    PretrainedDecoder.from_model(model, variables).save(export)
     round_trip = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     again, reloaded = round_trip.model, round_trip.variables
     assert again == model
@@ -1341,7 +1342,7 @@ def test_llama4_logits_match_the_reference_implementation():
 def test_llama4_export_is_refused_by_name(tmp_path):
     model, variables = fp32_decoder(LLAMA4)
     with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
 
 def test_a_chunked_kind_no_config_carries_is_refused_on_export(tmp_path):
@@ -1353,7 +1354,7 @@ def test_a_chunked_kind_no_config_carries_is_refused_on_export(tmp_path):
         kinds={"chunked_attention": {"chunk": 4}})
     variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     with pytest.raises(ValueError, match="chunk"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
 
 
@@ -1611,5 +1612,5 @@ def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
 def test_standalone_gemma4_refuses_unrepresentable_native_computation(changes, field, tmp_path):
     model, variables = fp32_decoder(GEMMA4_MOE)
     with pytest.raises(ValueError, match=field):
-        save_pretrained_decoder(model.clone(**changes), variables, str(tmp_path))
+        PretrainedDecoder.from_model(model.clone(**changes), variables).save(str(tmp_path))
     assert not (tmp_path / "config.json").exists()

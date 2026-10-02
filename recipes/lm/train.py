@@ -172,9 +172,9 @@ def checkpoint_tokenizer(directory: Path, name: str) -> str:
     """The tokenizer name the checkpoint in `directory`, read as `name`,
     expects its ids to come from.
 
-    A checkpoint written by save_pretrained_decoder records the name it was
-    exported with, since the path or repo it happens to sit at says nothing;
-    any other hub repo is its own tokenizer's name.
+    A checkpoint written by `PretrainedDecoder.from_model(...).save` records
+    the name it was exported with, since the path or repo it happens to sit at
+    says nothing; any other hub repo is its own tokenizer's name.
     """
     generation_config = directory / "generation_config.json"
     if generation_config.is_file():

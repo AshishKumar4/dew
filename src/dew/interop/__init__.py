@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .codecs import dequantize_fp8_blocks, fp8_format
     from .export import export_run
-    from .hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+    from .hf_decoders import translate_config, translate_weights
     from .hub import pull_from_hub, push_to_hub
     from .pretrained import (
         Pretrained,
@@ -32,7 +32,7 @@ _EXPORTS = {
     "dequantize_fp8_blocks": "codecs", "fp8_format": "codecs",
     "export_run": "export",
     "pull_from_hub": "hub", "push_to_hub": "hub",
-    "save_pretrained_decoder": "hf_decoders", "translate_config": "hf_decoders",
+    "translate_config": "hf_decoders",
     "translate_weights": "hf_decoders",
     "load_params": "safetensors_io", "save_hf_layout": "safetensors_io", "save_params": "safetensors_io",
 }
@@ -64,7 +64,6 @@ __all__ = [
     "push_to_hub",
     "save_hf_layout",
     "save_params",
-    "save_pretrained_decoder",
     "split_revision",
     "translate_config",
     "translate_weights",

@@ -216,14 +216,15 @@ print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
 
 `bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
 
-`save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
+`PretrainedDecoder.from_model` makes a trained `CausalTransformer` a source bundle, and its `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 
 ```python
 import dew
-from dew.interop import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 
-save_pretrained_decoder(model, lm_state.params, "stories-decoder", tokenizer="byte",
-                        generation_config={"do_sample": False, "max_new_tokens": 24})
+trained = PretrainedDecoder.from_model(model, lm_state.params, tokenizer="byte",
+                                       generation_config={"do_sample": False, "max_new_tokens": 24})
+trained.save("stories-decoder")
 task = dew.pipeline("stories-decoder", dtype="float32")
 print(task.sampling)
 result = task([tokenizer.encode("At night")], key=0).host()
@@ -235,7 +236,7 @@ Sampling(temperature=0.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.
 At night, Lily went home. She wa [24]
 ```
 
-The directory holds `config.json`, `generation_config.json` and `model.safetensors`. `generation_config.json` sets the task's defaults: `do_sample: false` becomes `temperature=0.0`, and `max_new_tokens` the budget, so the call passes neither. The byte vocabulary has no Hugging Face tokenizer files, so the export records only `tokenizer_name: "byte"` and the loaded task takes token rows. An export with an `HFTokenizer` carries the tokenizer's files and its task accepts strings and returns `result.text`. `save_pretrained_decoder` refuses a model whose computation the exported config would not reproduce, and names the field.
+The directory holds `config.json`, `generation_config.json` and `model.safetensors`. `generation_config.json` sets the task's defaults: `do_sample: false` becomes `temperature=0.0`, and `max_new_tokens` the budget, so the call passes neither. The byte vocabulary has no Hugging Face tokenizer files, so the export records only `tokenizer_name: "byte"` and the loaded task takes token rows. An export with an `HFTokenizer` carries the tokenizer's files and its task accepts strings and returns `result.text`. `from_model` refuses a model whose computation the exported config would not reproduce, and names the field.
 
 A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way; the published checkpoint needs enough host and device memory for its weights and cache. `LMObjective.policy(params)` returns the same kind of task bound to a training tree, and `SampledRollout` samples with it. To serve the weights with Ollama or vLLM, export them and point the runtime at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) walks through it.
 
@@ -327,7 +328,7 @@ mm_state = mm_trainer.fit(mm_data, steps=1, log_every=1)
 bundle.save("gemma3-tiny-step1", variables=mm_state.params)
 ```
 
-`bundle.save(directory, variables=...)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both in Dew and in Transformers. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. Past `max_shard_size` (default `"5GB"`) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, `save_pretrained_decoder` of a Gemma 4 or GLM-5-next model, and a DiffusionGemma export build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
+`bundle.save(directory, variables=...)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both in Dew and in Transformers. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. Past `max_shard_size` (default `"5GB"`) the weights go out as numbered shards with their index. A dense decoder or a source-layout checkpoint builds each tensor on the host only when its shard is written; a quantized source, a `from_model` export of a Gemma 4 or GLM-5-next model, and a DiffusionGemma export build the whole export first. Saving over an earlier export replaces it in one step: the new shards take fresh names and the index is written last, so a save that stops partway leaves the previous export whole, and files the export did not write, such as `model.fp16.safetensors`, are left alone.
 
 Each family's processor emits what its reference implementation expects:
 
