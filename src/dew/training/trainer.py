@@ -39,6 +39,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
 from dew.nn.sharding import (
+    BATCH_AXES,
     SEQUENCE_AXIS,
     STAGE_AXIS,
     TENSOR_AXIS,
@@ -1303,7 +1304,11 @@ class Trainer(Generic[Loss, Effects]):
         # scopes share whichever profiler owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            self._check_pipelined_batch(dataset.batch, self.device_mesh)
+            if self.mesh.stage > 1:
+                # Before the state is placed; every other mesh's batch is
+                # checked with its stream (`_check_stream`), a ramp's at each
+                # of its stages.
+                self._check_batch(dataset.batch, self.device_mesh)
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview)
             state, shardings, position = self.place()
@@ -1441,7 +1446,7 @@ class Trainer(Generic[Loss, Effects]):
             return True
         if current < steps:
             run.source = plan.dataset.train(data_partition(mesh))
-            self._check_stream(run.source, mesh,
+            self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every))
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
@@ -1578,14 +1583,15 @@ class Trainer(Generic[Loss, Effects]):
 
         return agreed("profiling window setup", own_window)
 
-    def _check_pipelined_batch(self, batch: int, mesh: Mesh) -> None:
-        """Refuse, before anything is placed, a global batch that a pipeline
-        cannot cut into its microbatches (`batch_divisor`): each device's
-        rows are cut into M microbatches, and a device that holds none of a
-        microbatch's rows computes another's again. The message names the
-        batches and the microbatch counts that fit. A rollout's rows are
-        its own, so a run with one is checked where its step traces."""
-        if self.mesh.stage == 1 or self.rollout is not None:
+    def _check_batch(self, batch: int, mesh: Mesh) -> None:
+        """Refuse, before anything is placed, a global batch the mesh cannot
+        split (`batch_divisor`): its rows shard over the batch axes as whole
+        rows, and a pipeline cuts each device's rows again into M
+        microbatches, where a device that holds none of a microbatch's rows
+        computes another's again. The message names the row shards, and the
+        batches and the microbatch counts that fit. A rollout's rows are its
+        own, so a run with one is checked where its step traces."""
+        if self.rollout is not None:
             return
         divisor = batch_divisor(mesh, self.mesh)
         if batch % divisor == 0:
@@ -1594,6 +1600,12 @@ class Trainer(Generic[Loss, Effects]):
         shards = divisor // count
         suggestions = [f"a batch that is a multiple of {divisor} rows, {-(-batch // divisor) * divisor} "
                        f"the nearest above {batch}"]
+        axes = " x ".join(f"{axis} {mesh.shape[axis]}" for axis in BATCH_AXES if mesh.shape[axis] > 1)
+        if count == 1:
+            raise LayoutRefused(
+                f"a global batch of {batch} rows over the {shards} row shards of {axes} leaves some "
+                f"device without whole rows; use {suggestions[0]}, or a mesh whose batch axes "
+                f"({' x '.join(BATCH_AXES)}) divide {batch}")
         if batch % shards == 0:
             fitting = [m for m in range(self.mesh.stage, batch // shards + 1, self.mesh.stage)
                        if (batch // shards) % m == 0]
@@ -1605,12 +1617,13 @@ class Trainer(Generic[Loss, Effects]):
             f"leaves some microbatch without rows on some device, which then computes another "
             f"microbatch's again; use {' or '.join(suggestions)}")
 
-    def _check_stream(self, source, mesh: Mesh, *, checkpointing: bool) -> None:
+    def _check_stream(self, source, mesh: Mesh, batch: int, *, checkpointing: bool) -> None:
         """Refuse a training stream this run cannot checkpoint or cannot shard.
 
         A checkpoint written without the data position would replay the data
-        on resume. A ramp stage whose batch the mesh cannot divide fails
-        where it is placed or traced, which for a later stage is an hour in.
+        on resume. A `batch` the mesh cannot divide fails where it is placed
+        or traced (`_check_batch`), and a ramp stage's, for a later stage,
+        an hour in.
         """
         if checkpointing and not isinstance(source, Checkpointable):
             raise ValueError(
@@ -1620,6 +1633,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"resume. Train it with checkpoint_every=None "
                 f"(--trainer.checkpoint-every None)")
         if not isinstance(source, RampedStream):
+            self._check_batch(batch, mesh)
             return
         if self.accumulation > 1:
             raise ValueError(
