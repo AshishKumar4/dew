@@ -128,7 +128,7 @@ def sample(pipe: TextToImage, key: int | jax.Array, decode_batch: int) -> tuple[
     """Every prompt's image as uint8 pixels, and how many non-finite values
     the latents and the decoded pixels held before the pixels were clipped
     and cast, which would hide them."""
-    latents = pipe(list(PROMPTS), key=key, steps=STEPS, sampler=DPMSolverMultistep(), guidance=GUIDANCE,
+    latents = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE,
                    decode=False).latents
     decode = jax.jit(pipe.autoencoder.decode)
     decoded = np.concatenate([np.asarray(decode(pipe.params["autoencoder"], latents[i:i + decode_batch]), np.float32)

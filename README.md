@@ -79,7 +79,7 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -87,7 +87,7 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(data_path),
         split="train",
         image_size=64,
@@ -604,12 +604,12 @@ import jax
 import optax
 
 from dew import Field, Trainer
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = OxfordFlowers(
+    data = TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         split="train",
         image_size=64,
@@ -961,7 +961,7 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
-Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. The sampler uses `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
+Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. `sample` runs the solver under `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
 `TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
@@ -1030,7 +1030,7 @@ import optax
 
 from dew import Checkpoints, Trainer
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 from dew.diffusion import presets
 from dew.inference import TextToImage
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -1040,7 +1040,7 @@ run = Path("runs/flowers-run")
 config = DiffusionRunConfig(
     model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 128,
                                      "num_layers": 4, "num_heads": 4}),
-    data=OxfordFlowers(
+    data=TFDSImages(
         path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
         image_size=64,
         val_batches=0,
@@ -1064,7 +1064,7 @@ def main():
     print(sorted(path.name for path in run.iterdir()))
 
     task = TextToImage.from_run(str(run))
-    images = task(["a flower", "another flower"], steps=20, sampler=Heun(),
+    images = task(["a flower", "another flower"], steps=20, solver=Heun(),
                   key=jax.random.key(1))
     print(images.host().images.shape, int(state.updates))
 

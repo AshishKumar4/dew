@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -359,7 +359,7 @@ def make_objective(case: Case, model, encoder):
                              MASK, sample=sample)
     inputs = InputSpec(sample, {"textcontext": Condition(encoder, field="text")})
     return DiffusionObjective(model, presets.EDM(regime="pixel"), inputs, steps=SAMPLER_STEPS,
-                              guidance=CFG(2.0), sampler=Euler())
+                              guidance=CFG(2.0), solver=Euler())
 
 
 def make_trainer(case: Case, tmp_path, fsdp, tracker=None):
@@ -531,8 +531,8 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=8), text=None, guidance=None,
-        sampler=Euler(), sampling_steps=SAMPLER_STEPS)
+        data=TFDSImages(image_size=8), text=None, guidance=None,
+        solver=Euler(), sampling_steps=SAMPLER_STEPS)
 
 
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():

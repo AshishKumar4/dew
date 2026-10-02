@@ -21,7 +21,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.sampling import CFG, sample
-from dew.sampling.flow import FlowSDE, flow_transition, sample_trajectory
+from dew.sampling.flow import FlowSDE, flow_transition
 from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 
@@ -99,8 +99,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
     variables = model.init(jax.random.key(0), x, jnp.ones(2), offset=offset)
     denoise = process.denoiser(model, variables, {"offset": offset}, {"offset": jnp.zeros_like(offset)})
     solver, guidance, key = FlowSDE(noise_level=0.5), CFG(2, interval=(0.1, 0.8)), jax.random.key(1)
-    trajectory = jax.jit(lambda start: sample_trajectory(
-        denoise, start, 5, solver=solver, guidance=guidance, key=key))(x)
+    trajectory = jax.jit(lambda start: solver.trajectory(denoise, start, 5, guidance=guidance, key=key))(x)
     ordinary = sample(denoise, x, 5, solver=solver, guidance=guidance, key=key)
     np.testing.assert_array_equal(trajectory.samples, ordinary)
     for index in range(4):
@@ -117,7 +116,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
         variance = g_squared * -dt
         expected = (-0.5 * ((action - mean)**2 / variance + np.log(2 * math.pi * variance))).sum(1)
         np.testing.assert_allclose(trajectory.log_probs[:, index], expected, atol=3e-6, rtol=2e-6)
-    deterministic = sample_trajectory(denoise, x, 5, solver=FlowSDE(0), key=key)
+    deterministic = FlowSDE(0).trajectory(denoise, x, 5, key=key)
     assert np.isnan(deterministic.log_probs).all()
     assert not np.asarray(deterministic.stochastic).any()
 
@@ -144,8 +143,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
                                   clip_range=0.001, adv_clip_max=2)
     old = objective.init(jax.random.key(2))
     x = jnp.asarray([[0.1, -0.7], [0.5, 0.8], [-0.9, 0.2], [0.3, -0.4]])
-    trajectory = sample_trajectory(process.denoiser(model, old, {}), x, 4,
-                                   solver=objective.sde, key=jax.random.key(3))
+    trajectory = objective.sde.trajectory(process.denoiser(model, old, {}), x, 4, key=jax.random.key(3))
     mask = np.asarray([[1, 1, 0], [1, 0, 0], [1, 1, 1], [0, 1, 1]], bool)
     advantages = np.asarray([-3, 1, 2.5, -1], np.float32)
     batch = trajectory_batch(trajectory, advantages, mask)
@@ -208,8 +206,8 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
                                   sde=FlowSDE(0), guidance=None, beta=0.1)
     variables = objective.init(jax.random.key(7))
     x = jnp.asarray([[0.1, -0.2], [0.3, 0.4]])
-    trajectory = sample_trajectory(process.denoiser(model, variables, {}), x, 3,
-                                   solver=objective.sde, key=jax.random.key(8))
+    trajectory = objective.sde.trajectory(process.denoiser(model, variables, {}), x, 3,
+                                          key=jax.random.key(8))
     batch = trajectory_batch(trajectory, [-1, 1], np.ones((2, 2), bool))
     step = Step(jnp.asarray(0), jax.random.key(9), variables)
     stats, _ = objective.loss(variables, batch, step)
@@ -528,7 +526,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
                                objective.encode(initial.params["encoders"]))
     noise_key, sample_key = jax.random.split(step.key)
     expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),
-                      objective.steps, solver=objective.sampler, guidance=objective.guidance, key=sample_key)
+                      objective.steps, solver=objective.solver, guidance=objective.guidance, key=sample_key)
     np.testing.assert_allclose(evaluated.images, np.clip(expected, -1, 1), atol=2e-6)
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)
