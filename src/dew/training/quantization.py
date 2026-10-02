@@ -599,3 +599,6 @@ def _quantize(objective: object, spec: Quantization) -> None:
             f"{type(objective).__name__} keeps no `model`; train an objective that "
             f"holds one, or leave the quantization unset")
     objective.model = spec.apply(objective.model)
+
+
+__all__ = ["ModelObjective", "Quantization"]

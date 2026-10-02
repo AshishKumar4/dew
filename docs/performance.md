@@ -96,7 +96,11 @@ FlashAttention-2's 4.4 in torch, and 8.7 against 7.2 on Qwen3-0.6B (head
 dimension 128, causal, 1024 tokens). With tokamax installed, 'auto' runs
 its Pallas-Triton kernel for heads up to 64 wide: 4.3 ms on the SimpleDiT
 ("tokamax's attention" below); at 128 wide cuDNN stays faster (Qwen3-0.6B's
-widths at 2 x 1024, 148.8-149.0 against 151.1 ms a step).
+widths at 2 x 1024, 148.8-149.0 against 151.1 ms a step). Kernel by kernel
+on Qwen3-0.6B at 1 x 1024, the gap is cuDNN's 2.56 ms forward and 5.25
+backward (with its grouped-query head reduction) against FlashAttention-2's
+2.05 and 4.56 kernels; no alternative on this stack closes it ("At 128-wide heads"
+below).
 
 A100 40 GB (Colab), the latest records:
 
@@ -384,7 +388,8 @@ rounds of 10 calls, each checked against fp32 XLA at HIGHEST
 | 4 x 1024 causal, 16 over 8, of 128 (Qwen3-0.6B) | 1.541 | 1.288 | 1.242 | 1.260 |
 | 4 x 1024 causal, window of 256 | 0.579 | 0.587 | 0.535 | no window |
 
-tokamax's errors are cuDNN's at every shape (dq and dk 4.8e-3 to 6.6e-3);
+tokamax's errors are cuDNN's at the 64-wide shapes (dq and dk 4.8e-3 to
+6.6e-3), and not at 128 (below);
 JAX's `mha` reaches 8.5e-3 because its backward forms `rowsum(o * do)` as a
 bf16 product, and an fp32 one gives cuDNN's errors at the same speed. In the
 training step the gain holds at 64-wide heads and not at 128: SimpleDiT-B
@@ -393,6 +398,28 @@ at batch 32, attention 5.62 to 4.33 ms and the step 73.1 to 71.5; the
 1 x 1024, 9.13 to 9.24 ms and 97.6 to 98.4. So with tokamax installed
 'auto' takes it for heads up to 64 wide and calls with no window, mask or
 bias (`dew.nn.attention.triton_runs`), at tokamax's heuristic config.
+
+At 128-wide heads, 2026-10-02 (Qwen3-0.6B's: 16 query heads over 8, causal,
+1024 tokens; RTX 4080, bf16; Dew at `14087252`), nothing on this stack beats
+cuDNN with gradients as accurate:
+
+- In the training step at 1 x 1024 (XProf, command buffers on, kernels per
+  step), tokamax's forward is faster and its backward slower: 2.16 ms
+  forward against cuDNN's 2.56, and 7.14 backward plus 0.27 for
+  `rowsum(o * do)` against cuDNN's 5.07 plus 0.18 for its head reduction;
+  the step 95.96 against 94.07 ms. torch's FlashAttention-2 kernels take 2.05 and
+  4.56.
+- tokamax's gradients are less accurate there: dk and dv reach 5.2e-3 and
+  4.6e-3 of their maximum at batch 1 against cuDNN's 4.9e-3 and 2.8e-3, and
+  6.7e-3 and 4.8e-3 at batch 2 against 4.7e-3 and 3.5e-3. Its best grid
+  config (blocks of 32, keeping openxla/tokamax#1494's constraint) has the
+  same errors.
+- cuDNN with BNTH inputs runs as BTNH does (0.385 against 0.381 ms a call
+  at batch 1, 0.721 against 0.716 at batch 2), and cuDNN 9.27.0 as 9.25.1
+  (Qwen3-0.6B's widths at 1 x 1024 94.20 and 94.08 against 94.23 and 94.19
+  ms, attention 9.09 against 9.11; SimpleDiT-B and the decoder alike).
+  `uv pip install` resolves the newest cuDNN under 10, so a fresh install
+  gets 9.27.
 
 tokamax trails JAX's `mha` by 10-18% at 64-wide heads in its backward
 (0.35 against 0.29 ms of the SimpleDiT-B call; the forwards are 0.093 and

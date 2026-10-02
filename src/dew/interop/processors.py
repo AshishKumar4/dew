@@ -457,12 +457,7 @@ class Processor:
                 raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
             expected = np.full(features.shape[0], slots)
             capacity = slots
-        runs = []
-        for row in tokens:
-            locations = np.flatnonzero(row == audio_id)
-            runs.append(
-                [] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1)
-            )
+        runs = _placeholder_runs(tokens, audio_id, None)
         counts = np.array([len(row) for row in runs], np.int32)
         if int(counts.sum()) != features.shape[0]:
             raise ValueError("input_features and audio placeholder runs disagree")

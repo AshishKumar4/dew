@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file, save_file
 
-from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, translate, weight_path
+from dew.interop.hf_decoders import translate_weights
+from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, weight_path
 from dew.interop.pretrained import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
@@ -91,13 +92,13 @@ def test_every_fixture_tensor_has_a_place_and_an_unknown_one_none(hf_config, ten
 
 
 def test_the_translated_weights_reproduce_the_reference_logits(hf_config, tensors):
-    """The whole checkpoint: the fixture's tensors through `translate`, the
+    """The whole checkpoint: the fixture's tensors through `translate_weights`, the
     model `config_from_hf` names, against the reference's fp32 logits on
     the fixture's own tokens. Largest observed difference 9.4e-07 on logits
     of magnitude 1.7; every argmax equal."""
     config = config_from_hf(hf_config)
     model = CausalTransformer(**config, max_seq_len=16)
-    variables = translate(tensors, config)
+    variables = translate_weights(tensors, config, "mamba2")
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     template = jax.eval_shape(model.init, jax.random.key(0), ids)
     assert jax.tree.map(jnp.shape, template) == jax.tree.map(jnp.shape, variables)
@@ -112,10 +113,10 @@ def test_the_translated_weights_reproduce_the_reference_logits(hf_config, tensor
 def test_a_tied_head_is_checked_and_dropped(hf_config, tensors):
     config = config_from_hf({**hf_config, "tie_word_embeddings": True})
     tied = {**tensors, "lm_head.weight": tensors["backbone.embeddings.weight"]}
-    variables = translate(tied, config)
+    variables = translate_weights(tied, config, "mamba2")
     assert "lm_head" not in variables["params"]
-    with pytest.raises(ValueError, match="tied"):
-        translate(tensors, config)
+    with pytest.raises(ValueError, match="not the embedding it claims to copy"):
+        translate_weights(tensors, config, "mamba2")
 
 
 def test_the_source_pins_the_reference():

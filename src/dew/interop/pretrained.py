@@ -13,14 +13,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
-import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NamedTuple, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
@@ -60,8 +59,8 @@ from dew.interop.processors import (
     ProcessorCall as ProcessorCall,
     _hosts,
 )
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
-from dew.interop.streaming import SourceLeaf
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.streaming import SourceLeaf, WeightLayout
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -71,7 +70,7 @@ from dew.nn.text_encoders import ParamTree
 from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
-    models,
+    from_record,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -91,109 +90,9 @@ if TYPE_CHECKING:
 
 
 
-@dataclass(frozen=True)
-class WeightLayout:
-    """Holds an existing source tensor's location and reversible storage layout.
-
-    `expert_index` is the expert a per-expert source tensor holds. The
-    loader stacks those tensors onto an expert dimension
-    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
-    expert of a layer and the index says which slice this tensor is.
-
-    `dtype` is the width the source stores this tensor in where that is
-    not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
-    and int32 in the collection, and the export writes back what the
-    checkpoint held.
-
-    `padded` is the length a 1-D source tensor stores past its leaf's, as
-    zeros, for the names its family declares (`DecoderFamily.zero_padded`):
-    Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
-    entries. The family's prepare step checks and trims the tail, and export
-    writes the zeros back.
-    """
-
-    name: str
-    paths: tuple[tuple[str, ...], ...]
-    shape: tuple[int, ...]
-    transpose: tuple[int, ...] | None = None
-    concatenate: int | None = None
-    expert_index: int | None = None
-    dtype: np.dtype | None = None
-    padded: int | None = None
-
-    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
-        if path[-1] == "layer_scalar":
-            if scalar_mode not in ("frozen", "trainable"):
-                raise ValueError("layer_scalar export requires an explicit model mode")
-            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
-        node: object = variables
-        for part in path:
-            if not isinstance(node, Mapping):
-                raise ValueError(f"parameter path {path} does not traverse a mapping")
-            node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
-            raise ValueError(
-                f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
-            )
-        return node
-
-    def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
-        """The dtype `export` writes, read from the leaf without copying it."""
-        if self.dtype is not None:
-            return np.dtype(self.dtype)
-        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
-
-    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
-        leaves = []
-        for path in self.paths:
-            node = self._leaf(variables, path, scalar_mode)
-            if self.expert_index is not None:
-                # Slice the expert where the leaf lives. One stacked leaf
-                # answers for E source tensors, so copying it to the host
-                # per tensor would move the whole stack E times.
-                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
-                    raise ValueError(
-                        f"{self.name} is expert {self.expert_index} of {path}, which "
-                        f"holds {node.shape}")
-                node = node[self.expert_index]
-            leaves.append(np.asarray(node))
-        value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
-        if self.transpose is not None:
-            value = value.transpose(self.transpose)
-        if self.padded is not None:
-            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
-        if value.size != math.prod(self.shape):
-            raise ValueError(
-                f"{self.name} assembles {value.shape} from {self.paths}, which does not "
-                f"fill the source's {self.shape}")
-        value = np.ascontiguousarray(value).reshape(self.shape)
-        return value if self.dtype is None else value.astype(self.dtype)
-
-    def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-        """Return the leaf of `shape` whose export is `tensor`.
-
-        The inverse of `export` for a layout that binds one whole leaf; a
-        tensor assembled from several leaves has no single leaf to restore.
-        """
-        if len(self.paths) != 1 or self.concatenate is not None or self.expert_index is not None:
-            raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
-        if tensor.shape != self.shape:
-            raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
-        transpose = self.transpose or tuple(range(len(shape)))
-        stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
-        return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
-
-
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Map a per-expert leaf path to the stacked leaf the loaded tree holds.
-
-    A checkpoint that names one tensor per expert maps through the family
-    to `experts/K/projection/kernel`, a path `hf_decoders._stack_experts`
-    consumed on the way in: the tree keeps one `experts/projection/kernel`
-    stacked in expert order, so that leaf and K are where the tensor's
-    values live.
-    """
+    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
+    `experts/K/projection/kernel` path into, and K."""
     if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
             and path[-1] == "kernel"):
         return (*path[:-3], path[-2], path[-1]), int(path[-3])
@@ -226,20 +125,26 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
-    """Return the text family's leaf map plus its inverse storage operations."""
+    """Return the leaves the text family maps a source tensor to and the
+    storage operations that rebuild it from them; a `packed` tensor is built
+    from the layouts of its parts."""
     family = decoders.families()[model_type]
-    # A family whose checkpoint packs its experts as `[E, out, in]`
-    # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
-    # back swapped.
-    from dew.interop.families.gemma import _gemma4_prepare
+    packing = family.packing(text_name)
+    if packing is None:
+        return _leaf_layout(name, text_name, tensor, family, config, variables, component)
+    parts = [_leaf_layout(part, part, value, family, config, variables, component)
+             for part, value in packing.split(text_name, tensor).items()]
+    if any(part is None for part in parts):
+        raise ValueError(f"packed tensor {name!r} has no parameter path")
+    return packing.layout(name, [part for part in parts if part is not None])
 
-    packed = family.prepare_weights is _gemma4_prepare
 
+def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoders.DecoderFamily,
+                 config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    concatenate = None
     expert_index = None
     head_name, embedding_name = family.tied_head_names
     if text_name == head_name and config["tie_embeddings"]:
@@ -249,20 +154,6 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if embedding is None:
             raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
         paths = (nested(embedding),)
-    elif text_name.endswith(".experts.gate_up_proj") and (packed or model_type == "llama4_text"):
-        names = [
-            text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")
-        ]
-        paths_list = []
-        for key in names:
-            path = family.weight_path(key, config)
-            if path is None:
-                raise ValueError(f"fused expert tensor {name!r} has no parameter path")
-            paths_list.append(nested(path))
-        paths = tuple(paths_list)
-        concatenate = -1
-        if packed:
-            transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
         if path is None:
@@ -272,14 +163,11 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if path[-1] == "kernel" and tensor.ndim == 2:
             lead = _leading_axes(variables, paths[0], expert_index)
             transpose = (*range(lead), lead + 1, lead)
-        elif text_name.endswith(".experts.down_proj") and packed:
-            transpose = (0, 2, 1)
-    # A weight is fp32 in the tree whatever the checkpoint stored it as, so
-    # only an index table's own width has to be carried back.
+    # A floating weight is written in its leaf's dtype; an index table
+    # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
     padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
-    return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored, padded)
+    return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 
 
 def _wrapper_layouts(tensors, record, variables):
@@ -561,19 +449,7 @@ class Pretrained:
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                # Each tensor is assembled when its shard is written (`save_sharded`).
-                specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                            for name, value in self.retained_tensors.items()},
-                         **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(values, scalar_mode))
-                            for name, layout in layouts.items()}}
-                return LazyTensors(
-                    specs,
-                    lambda name: (
-                        layouts[name].export(values, scalar_mode)
-                        if name in layouts
-                        else self.retained_tensors[name]
-                    ),
-                )
+                return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -990,6 +866,7 @@ class _TextTowers:
     towers: tuple[str, ...]
     t5_tower: str | None = None
     embeds_guidance: bool = False
+    conditioner: ClassVar[type[DiffusionConditioner]] = DiffusionConditioner
 
     def components(self, index: Mapping[str, object]) -> tuple[str, ...]:
         """The text components this directory holds, which a conditioner load fetches."""
@@ -1016,9 +893,7 @@ class _TextTowers:
             if params is None:
                 text_params = {**text_params, self.t5_tower: t5_params}
             layouts += t5_layouts
-        height, width = index.get("dew_height", size), index.get("dew_width", size)
-        if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-            raise ValueError("Image geometry must contain positive integer dimensions")
+        height, width = _geometry(index, size)
         encoder = DiffusionConditioner(
             towers, tokenizers, names, text_params, str(directory), height, width,
             denoiser.context_width, composition=self.composition, t5=t5,
@@ -1038,6 +913,8 @@ class _TextTowers:
 class _QwenImageText:
     """Qwen-Image's Qwen3-VL text encoder, which `QwenImageConditioner` runs
     over its pipeline's chat template, padded to the call's token budget."""
+
+    conditioner: ClassVar[type[QwenImageConditioner]] = QwenImageConditioner
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: int, *, param_dtype: str,
@@ -1063,6 +940,7 @@ class _HiddenStatesText:
 
     pipeline: Literal["flux2", "z_image"]
     embeds_guidance: bool = False
+    conditioner: ClassVar[type[HiddenStatesConditioner]] = HiddenStatesConditioner
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: int, *, param_dtype: str,
@@ -1081,14 +959,9 @@ class _HiddenStatesText:
 
 @dataclass(frozen=True)
 class _Denoiser:
-    """Holds what one architecture contributes to a diffusion source.
-
-    Model construction and conditioning conventions use metadata only.
-    The weight reader is invoked only by a complete source load; a restored
-    conditioner can reuse the same architecture metadata without reading
-    denoiser or autoencoder weights. `text` is the family's text
-    conditioning: which components it reads, how it builds its encoder and
-    the unconditional row its pipeline guides against.
+    """Holds what one architecture contributes to a diffusion source, from
+    metadata alone: only a complete source load calls `weights`, and `text`
+    is how the family conditions on its prompt.
     """
 
     component: str
@@ -1110,12 +983,10 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                            variables: Variables | None = None) -> PretrainedPipeline:
     """Read a published latent diffusion directory into native modules and variables.
 
-    Two denoiser families ship this layout: a UNet reading one or two CLIP
-    towers through cross attention, and an MM-DiT transformer reading them
-    jointly beside a T5 tower. The directory's own denoiser component selects
-    the family, and everything the families share - the autoencoder, the text
-    towers, the geometry, the conditioning, the safety head a file declares,
-    the schedule and the call policy - is read once here.
+    The directory's own denoiser component selects the family (`_denoiser`),
+    and everything the families share - the autoencoder, the text towers,
+    the geometry, the conditioning, the safety head a file declares, the
+    schedule and the call policy - is read once here.
 
     Supplied `variables` are a saved tree in this layout, bound as they are:
     every module is built from the directory's metadata and no weight file is
@@ -1197,11 +1068,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
 
 
-def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
-                               param_dtype: str = "float32", revision: str | None = None,
-                               attention_impl: str = "auto", params: Variables | None = None
-                               ) -> DiffusionConditioner:
-    """Load conditioning weights, or bind supplied parameters using metadata only."""
+def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, HiddenStatesConditioner)](
+        checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
+        revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
+        params: Variables | None = None) -> C:
+    """Load the text conditioning a pipeline's denoiser reads, which must be a
+    `kind`, or bind supplied parameters using metadata only. `tokens` replaces
+    the pipeline's own prompt budget."""
     from dew.nn.autoencoders import AutoencoderKL
 
     compute = resolve_dtype(dtype)
@@ -1210,18 +1083,26 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
     denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    if not isinstance(denoiser.text, _TextTowers):
-        raise ValueError(f"{checkpoint} conditions through its Qwen3-VL encoder; "
-                         "build it with QwenImageConditioner.from_pretrained")
+    text = denoiser.text
+    if text.conditioner is not kind:
+        raise ValueError(f"{checkpoint} conditions through a {text.conditioner.__name__}; "
+                         f"build it with {text.conditioner.__name__}.from_pretrained")
+    towers = isinstance(text, _TextTowers)
     if params is None:
         # snapshot_download returns a commit directory. Keep both fetches on
         # that commit even when the requested Hub branch moves between them.
         directory = sources.snapshot(checkpoint, directory.name,
-                                       weights=denoiser.text.components(index))
-    vae = AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
-    encoder, _, _ = denoiser.text.build(
-        directory, index, denoiser, _call_policy(index, denoiser), compute,
-        denoiser.sample_size * vae.downscale_factor, param_dtype=param_dtype, params=params)
+                                     weights=text.components(index) if towers else ("text_encoder",))
+    policy = _call_policy(index, denoiser)
+    # The CLIP families' geometry is their VAE's; the language-model encoders
+    # are bound at 16 pixels per latent position.
+    scale = (AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
+             .downscale_factor if towers else 16)
+    encoder, _, _ = text.build(
+        directory, index, denoiser, policy if tokens is None else policy._replace(sequence=tokens), compute,
+        denoiser.sample_size * scale, param_dtype=param_dtype, attention_impl=attention_impl, params=params)
+    if not isinstance(encoder, kind):
+        raise TypeError(f"{type(text).__name__} built a {type(encoder).__name__}, not a {kind.__name__}")
     return encoder
 
 
@@ -1280,6 +1161,24 @@ def _denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _De
                      f"{published!r}")
 
 
+def _transformer_weights(directory: Path, translate: Callable[..., tuple[ParamTree, tuple[WeightLayout, ...]]]
+                         ) -> Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]:
+    """Read a transformer denoiser's parameters, and their layouts, from its component."""
+    from dew.interop import diffusion
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = translate(diffusion.component_tensors(directory, "transformer"),
+                                    param_dtype=param_dtype)
+        return {"params": params}, layouts
+    return weights
+
+
+def _built(name: str, fields: Mapping[str, object], dtype: str | None) -> dict:
+    """The registry record a denoiser was built from, its tuples as JSON lists."""
+    return {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
+                                        for key, value in fields.items()}, "dtype": dtype}}
+
+
 def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """Build SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
@@ -1287,19 +1186,15 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     from dew.nn.backbones.sd3 import SD3Transformer
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = SD3Transformer(**fields)
 
     def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
         params, buffers, layouts = diffusion.translate_sd3_weights(
             diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
         return {"params": params, "buffers": buffers}, layouts
 
-    built = {"name": "sd3_transformer",
-             "fields": {**fields, "dtype": dtype,
-                        "dual_attention_layers": list(fields["dual_attention_layers"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights,
-        built=built, config=config,
+        component="transformer", model=SD3Transformer(**fields), weights=weights,
+        built=_built("sd3_transformer", fields, dtype), config=config,
         text=_TextTowers("sd3", ("text_encoder", "text_encoder_2"), t5_tower="text_encoder_3"),
         patch=fields["patch_size"],
         latent_input=fields["in_channels"], sample_size=records.integer(config["sample_size"], "sample_size"),
@@ -1318,19 +1213,10 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
     from dew.nn.backbones.flux import FluxTransformer
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = FluxTransformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_flux_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "flux_transformer",
-             "fields": {**fields, "dtype": dtype,
-                        "axes_dims_rope": list(fields["axes_dims_rope"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights,
-        built=built, config=config,
+        component="transformer", model=FluxTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_flux_weights),
+        built=_built("flux_transformer", fields, dtype), config=config,
         text=_TextTowers("flux", ("text_encoder",), t5_tower="text_encoder_2",
                          embeds_guidance=fields["guidance_embeds"]), patch=2,
         latent_input=fields["in_channels"] // 4,
@@ -1353,17 +1239,10 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     from dew.nn.backbones.qwen_image import QwenImageTransformer
 
     fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = QwenImageTransformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_qwen_image_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "qwen_image_transformer",
-             "fields": {**fields, "dtype": dtype, "axes_dims_rope": list(fields["axes_dims_rope"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights, built=built, config=config,
+        component="transformer", model=QwenImageTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_qwen_image_weights),
+        built=_built("qwen_image_transformer", fields, dtype), config=config,
         text=_QwenImageText(), patch=1,
         latent_input=fields["in_channels"], sample_size=64,
         context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
@@ -1381,30 +1260,14 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     from dew.nn.backbones.flux2 import Flux2Transformer
 
     fields = diffusion.flux2_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = Flux2Transformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_flux2_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "flux2_transformer",
-             "fields": {**fields, "dtype": dtype, "axes_dims_rope": list(fields["axes_dims_rope"])}}
     guided = fields["guidance_embeds"]
     return _Denoiser(
-        component="transformer",
-        model=model,
-        weights=weights,
-        built=built,
-        config=config,
-        text=_HiddenStatesText("flux2", embeds_guidance=guided),
-        patch=1,
-        latent_input=fields["in_channels"],
-        sample_size=64,
-        context_width=fields["joint_attention_dim"],
-        pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline",
-        origin="empirical",
-    )
+        component="transformer", model=Flux2Transformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_flux2_weights),
+        built=_built("flux2_transformer", fields, dtype), config=config,
+        text=_HiddenStatesText("flux2", embeds_guidance=guided), patch=1,
+        latent_input=fields["in_channels"], sample_size=64, context_width=fields["joint_attention_dim"],
+        pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
 
 def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
@@ -1420,18 +1283,10 @@ def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, atten
     from dew.nn.backbones.z_image import ZImageTransformer
 
     fields = diffusion.z_image_fields(config, dtype=dtype, attention_impl=attention_impl)
-    model = ZImageTransformer(**fields)
-
-    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_z_image_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
-        return {"params": params}, layouts
-
-    built = {"name": "z_image_transformer",
-             "fields": {**fields, "dtype": dtype, "axes_dims": list(fields["axes_dims"]),
-                        "axes_lens": list(fields["axes_lens"])}}
     return _Denoiser(
-        component="transformer", model=model, weights=weights, built=built, config=config,
+        component="transformer", model=ZImageTransformer(**fields),
+        weights=_transformer_weights(directory, diffusion.translate_z_image_weights),
+        built=_built("z_image_transformer", fields, dtype), config=config,
         text=_HiddenStatesText("z_image"), patch=2, latent_input=fields["in_channels"], sample_size=128,
         context_width=fields["cap_feat_dim"], pipeline="ZImagePipeline", origin="linspace")
 
@@ -1441,6 +1296,14 @@ def _component_config(directory: Path, name: str) -> dict:
     file = "scheduler_config.json" if name == "scheduler" else "config.json"
     with open(directory / name / file) as handle:
         return json.load(handle)
+
+
+def _geometry(index: Mapping[str, object], size: int) -> tuple[int, int]:
+    """The (height, width) a pipeline is bound to: the index's own, or `size` square."""
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    return height, width
 
 
 def _present(index: Mapping[str, object], name: str) -> bool:
@@ -1602,9 +1465,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     built = with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl)
-    decoder = models.build("causal_transformer", built)
-    if not isinstance(decoder, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    decoder = from_record(CausalTransformer, built)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = diffusion.record_layouts(
@@ -1612,34 +1473,11 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
             _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
             param_dtype=param_dtype)
         params = {"text_encoder": tower}
-    height, width = index.get("dew_height", size), index.get("dew_width", size)
-    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-        raise ValueError("Image geometry must contain positive integer dimensions")
+    height, width = _geometry(index, size)
     encoder = QwenImageConditioner(
         decoder, load_tokenizer(str(directory / "processor")), params, str(directory),
         height, width, tokens=tokens, param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
-
-
-def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
-                                param_dtype: str = "float32", revision: str | None = None,
-                                attention_impl: str = "auto", tokens: int = 512,
-                                params: Variables | None = None):
-    """Load Qwen-Image's text conditioning, or bind supplied parameters using metadata only."""
-    compute = resolve_dtype(dtype)
-    resolve_dtype(param_dtype)
-    directory = sources.snapshot(checkpoint, revision, weights=False)
-    with open(directory / "model_index.json") as handle:
-        index = json.load(handle)
-    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    if not isinstance(denoiser.text, _QwenImageText):
-        raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
-    if params is None:
-        directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
-    encoder, _, _ = _qwen_image_conditioning(
-        directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
-        param_dtype=param_dtype, attention_impl=attention_impl, params=params)
-    return encoder
 
 
 _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] = MappingProxyType({
@@ -1699,12 +1537,8 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     named = dtype_name(compute)
     if named is None:
         raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
-    decoder = models.build(
-        "causal_transformer",
-        with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl),
-    )
-    if not isinstance(decoder, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    decoder = from_record(CausalTransformer, with_precision("causal_transformer", record, dtype=named,
+                                                            attention_impl=attention_impl))
     if pipeline == "z_image":
         layers = (decoder.num_layers - 1,)
     if max(layers) >= decoder.num_layers:
@@ -1719,39 +1553,12 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
             _hidden_states_path(record, records.text(text["model_type"], "model_type"), multimodal),
             ("encoders", "conditioning", "text_encoder"), param_dtype=param_dtype)
         params = {"text_encoder": tower}
-    height, width = index.get("dew_height", size), index.get("dew_width", size)
-    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-        raise ValueError("Image geometry must contain positive integer dimensions")
+    height, width = _geometry(index, size)
     encoder = HiddenStatesConditioner(
         decoder, load_tokenizer(str(directory / "tokenizer")), params, str(directory), height, width,
         template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens, guidance=guidance,
         param_dtype=param_dtype)
     return encoder, layouts, {"text_encoder": config}
-
-
-def load_hidden_states_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
-                                   param_dtype: str = "float32", revision: str | None = None,
-                                   attention_impl: str = "auto", tokens: int = 512,
-                                   params: Variables | None = None) -> HiddenStatesConditioner:
-    """Load FLUX.2's or Z-Image's text conditioning, or bind supplied
-    parameters using metadata only."""
-    compute = resolve_dtype(dtype)
-    resolve_dtype(param_dtype)
-    directory = sources.snapshot(checkpoint, revision, weights=False)
-    with open(directory / "model_index.json") as handle:
-        index = json.load(handle)
-    denoiser = _denoiser(directory, dtype=dtype, attention_impl=attention_impl)
-    text = denoiser.text
-    if not isinstance(text, _HiddenStatesText):
-        raise ValueError(f"{checkpoint} is neither a FLUX.2 nor a Z-Image checkpoint")
-    if params is None:
-        directory = sources.snapshot(checkpoint, directory.name, weights=("text_encoder",))
-    policy = _call_policy(index, denoiser)
-    encoder, _, _ = _hidden_states_conditioning(
-        directory, index, compute, denoiser.sample_size * 16, pipeline=text.pipeline, tokens=tokens,
-        guidance=policy.guidance if text.embeds_guidance else None, param_dtype=param_dtype,
-        attention_impl=attention_impl, params=params)
-    return encoder
 
 
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
@@ -2089,9 +1896,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
-    language_model = models.build("causal_transformer", wrapper["text"])
-    if not isinstance(language_model, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
     variables = _native_variables({**parts, "language_model": decoders.with_constants(
@@ -2114,7 +1919,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
     built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
-    model = models.build("causal_transformer", built)
+    model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
     decoders._check_tree(variables, model)
@@ -2123,10 +1928,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # derived-export family binds too; `save` picks its writer by
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
-    # (Gemma 4's prepare) has no raw-name bindings.
+    # (GPT-2's and GPT-NeoX's prepare) has no raw-name bindings.
     entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
+    if entry.preserve_source_layout or entry.prepare is decoders.DecoderFamily.prepare:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 

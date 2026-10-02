@@ -662,3 +662,6 @@ def learning_rate_schedule(config: OptimConfig, steps: int):
     """The rate `config` names: its schedule over a `steps`-update run, or
     the constant `learning_rate` when it names none."""
     return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
+
+
+__all__ = ["Cosine", "Linear", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "ScheduleBase"]

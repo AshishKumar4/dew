@@ -75,3 +75,6 @@ def coefficients(snapshots: Sequence[tuple[int, float]], updates: int, std: floa
     target = _correlation(times, gammas, np.float64(updates), exponent(std))
     weights = np.linalg.solve(gram, target)
     return weights / weights.sum()
+
+
+__all__ = ["coefficients", "exponent", "power_decay"]
