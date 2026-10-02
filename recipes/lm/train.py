@@ -134,7 +134,7 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
     trained with: continuing pretraining on ids from another vocabulary trains
     the embedding table against noise.
     """
-    from dew.interop import PretrainedDecoder, split_revision
+    from dew.interop import Pretrained, split_revision
 
     overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
@@ -148,7 +148,7 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
             f"--model.config max_seq_len is {context!r}; the context a checkpoint "
             f"is reloaded at is a number of tokens")
     name, revision = split_revision(pretrained)
-    loaded = PretrainedDecoder.load(
+    loaded = Pretrained.load(
         name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=context, revision=revision)
     expected = checkpoint_tokenizer(loaded.source, name)
