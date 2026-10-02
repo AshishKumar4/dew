@@ -491,6 +491,37 @@ np.testing.assert_array_equal(actual,expected)
     assert result.returncode == 0, result.stderr[-4000:]
 
 
+def test_import_after_live_jax_warns_once_without_claiming_a_flag():
+    """The late-import path neither reopens the backend nor advertises a new policy."""
+    import subprocess
+    import sys
+
+    script = """
+import logging
+import os
+import jax
+import jax.numpy as jnp
+jax.block_until_ready(jnp.add(1,2))
+captured=[]
+class Capture(logging.Handler):
+    def emit(self,record):
+        captured.append(record.getMessage())
+logger=logging.getLogger("dew.telemetry.devices")
+logger.addHandler(Capture())
+import dew
+from dew.telemetry.devices import keep_roundings,xla_flag
+keep_roundings()
+assert xla_flag("xla_allow_excess_precision") is None
+assert len(captured)==1,captured
+assert "Restart" in captured[0] and "before importing JAX" in captured[0],captured
+"""
+    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_allow_excess_precision"))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=60)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 @pytest.mark.parametrize("name", ["qwen3-tiny", "llama-tiny", "mistral-tiny", "gemma3-tiny",
                                   "olmo3-yarn-tiny", "mixtral-tiny", "deepseek-v3-tiny"])
 def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
