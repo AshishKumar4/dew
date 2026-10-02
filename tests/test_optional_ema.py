@@ -57,7 +57,7 @@ def test_metadata_inspection_and_restore_share_the_committed_snapshot(tmp_path, 
     checkpoints.wait()
     stored = checkpoints.stored()
     placement = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-    template = {"params": jax.tree.map(
+    template = {"variables": jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=placement), stored["variables"])}
 
     def repeated_metadata(self, infos):
