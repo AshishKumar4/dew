@@ -1109,17 +1109,19 @@ def mode_builtin_preview_failures(args) -> dict:
         original_generate = TextGeneration.__call__
         closed = []
 
-        def validation(*, batch=batch, case=case, closed=closed):
-            try:
-                yield batch
-            finally:
-                closed.append(case)
-
-        data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(), records=6, batch=6)
         for phase in ("setup", "generation", "preflight"):
             for source in (0, 1):
                 case = f"{kind}-{phase}-{source}"
                 fault = ValueError(f"{case}: local sampler failure before device work")
+
+                def validation(*, batch=batch, case=case, closed=closed):
+                    try:
+                        yield batch
+                    finally:
+                        closed.append(case)
+
+                data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(),
+                               records=6, batch=6)
 
                 def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
                     if phase == "generation" and rank == source:
