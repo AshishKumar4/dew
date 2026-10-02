@@ -245,9 +245,9 @@ def test_sharing_without_a_provider_and_sharing_everything_are_refused():
     base = with_precision("causal_transformer", config,
                           dtype="float32", attention_impl="xla")
     with pytest.raises(ValueError, match="no earlier full_attention layer"):
-        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 3}).kv_sharing
+        _ = models.build("causal_transformer", **{**base, "num_kv_shared_layers": 3}).kv_sharing
     with pytest.raises(ValueError, match="leave a provider"):
-        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 4}).kv_sharing
+        _ = models.build("causal_transformer", **{**base, "num_kv_shared_layers": 4}).kv_sharing
 
 
 def test_the_features_leave_a_plain_tree_unchanged(rng):
