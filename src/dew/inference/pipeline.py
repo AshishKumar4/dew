@@ -109,9 +109,8 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               step: int | str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.inference.tasks import run_record
     record = run_record(str(root), step)
-    if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
-        raise ValueError("run.json must name its objective kind")
-    kind = record["objective"]
+    from dew.records import text
+    kind = text(record['objective'], 'objective')
     task = SAVED_TASKS.get(kind)
     if task is None:
         supported = ", ".join(list(SAVED_TASKS)[:-1]) + f" and {list(SAVED_TASKS)[-1]}"

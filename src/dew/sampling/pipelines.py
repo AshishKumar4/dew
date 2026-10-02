@@ -212,28 +212,31 @@ class TextToImage:
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
         from dew.checkpoints import Checkpoints
-        from dew.config import ModelConfig, _rebuild
+        from dew.config import ModelConfig, _built
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
-        from dew.registry import configured, objectives, samplers
+        from dew.records import integer, record as fields, text
+        from dew.registry import objectives, samplers
 
         record = run_record(directory, step)
-        config = ModelConfig.from_dict(record['model'])
+        config = ModelConfig.from_dict(fields(record['model'], 'model'))
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
             config = replace(config, dtype=compute)
-        averaged = False if objectives[record['objective']]._ema_is_reference else ema
+        averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
         params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
                                                  param_dtype=param_dtype)
-        inputs = InputSpec.from_json(record['inputs'], params=params.get('encoders', {}))
+        inputs = InputSpec.from_json(fields(record['inputs'], 'inputs'), params=params.get('encoders', {}))
         autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
-            record['autoencoder'], params=params['autoencoder'])
-        solver_record = record['solver']
-        solver = samplers.build(solver_record['name'], solver_record['fields'])
-        guidance = _rebuild(CFG | None, configured(record['guidance']))
-        return cls(config.build(), Process.from_json(record['process']), inputs, params, autoencoder,
-                   steps=record['sampling_steps'], guidance=guidance, sampler=solver)
+            fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
+        solver_record = fields(record['solver'], 'solver')
+        solver = samplers.build(text(solver_record['name'], 'solver name'),
+                                fields(solver_record['fields'], 'solver fields'))
+        guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
+                   inputs, params, autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
+                   guidance=guidance, sampler=solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
