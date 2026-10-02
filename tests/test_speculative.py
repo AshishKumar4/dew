@@ -58,13 +58,13 @@ def scripted(target, drafts, rows):
                      depths=1)
 
 
-def run(target, drafts, rows, budget, block, seed=0, stopping=(), transforms=()):
+def run(target, drafts, rows, budget, block, key=0, stopping=(), transforms=()):
     """One speculative run over fixed distributions."""
-    return run_with(Speculative(block=block), target, drafts, rows, budget, seed, stopping,
+    return run_with(Speculative(block=block), target, drafts, rows, budget, key, stopping,
                     transforms)
 
 
-def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms=()):
+def run_with(plan, target, drafts, rows, budget, key=0, stopping=(), transforms=()):
     """One run of a given speculative plan over fixed distributions."""
     state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
                          positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32))
@@ -72,7 +72,7 @@ def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms
                       valid=jnp.concatenate([jnp.ones((rows, 1), bool),
                                              jnp.zeros((rows, budget), bool)], axis=1),
                       step=jnp.zeros(rows, jnp.int32), active=jnp.ones(rows, bool),
-                      keys=jax.random.split(jax.random.key(seed), rows), prompt_width=1)
+                      keys=jax.random.split(jax.random.key(key), rows), prompt_width=1)
     ops = scripted(target, drafts, rows)
 
     def body(carried, opening):
@@ -305,12 +305,12 @@ def test_a_draft_that_loses_confidence_ends_the_block_on_a_target_draw():
     would ask for the positive part of `p - q` where the two are equal, which
     is nothing at all."""
     target = spread({3: 0.5, 4: 0.5})
-    open_ = run(target, [target] * 3, 512, 5, 4, seed=2)
+    open_ = run(target, [target] * 3, 512, 5, 4, key=2)
     np.testing.assert_array_equal(np.asarray(open_.valid).sum(axis=1), 5)
     assert set(np.unique(np.asarray(open_.tokens)[np.asarray(open_.valid)]).tolist()) == {3, 4}
     # A threshold no draft of this distribution can meet truncates every block
     # after its free target draw, and the emitted law is unchanged.
-    guarded = run_with(Speculative(block=4, confidence=0.9), target, [target] * 3, 512, 5, seed=2)
+    guarded = run_with(Speculative(block=4, confidence=0.9), target, [target] * 3, 512, 5, key=2)
     np.testing.assert_array_equal(np.asarray(guarded.valid).sum(axis=1), 5)
     share = float(np.mean(np.asarray(guarded.tokens)[np.asarray(guarded.valid)] == 3))
     assert abs(share - 0.5) < 0.03, f"share {share:g}"

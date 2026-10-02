@@ -176,7 +176,7 @@ class FlowTrajectory:
 
 def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
                       solver: FlowSDE = FlowSDE(), guidance: Guidance | None = None,
-                      key: jax.Array) -> FlowTrajectory:
+                      key: int | jax.Array) -> FlowTrajectory:
     """Record FlowSDE transitions over the same time grid and keys as sample.
 
     steps counts grid points, including both endpoints. A ten-transition
@@ -187,6 +187,8 @@ def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
     """
     if steps < 2:
         raise ValueError("a trajectory needs at least two time points")
+    from dew.nn.inputs import request_key
+    key = request_key(key)
     process = denoise.process
     predict = denoise if guidance is None else guidance(denoise)
     times = process.times(steps)

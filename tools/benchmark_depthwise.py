@@ -153,13 +153,13 @@ def checkpoint(args):
             conv._depthwise_3x3 = partial(reference, precision=None)
             conv._cuda_depthwise_3x3 = partial(reference, precision=None)
             jax.clear_caches()
-            before = pipeline(prompt, seed=17, steps=20)
+            before = pipeline(prompt, key=17, steps=20)
             jax.block_until_ready(before)
         finally:
             conv._depthwise_3x3 = original
             conv._cuda_depthwise_3x3 = original_cuda
         jax.clear_caches()
-        after = pipeline(prompt, seed=17, steps=20)
+        after = pipeline(prompt, key=17, steps=20)
         jax.block_until_ready(after)
         vae = pipeline.autoencoder
         float_vae = StableDiffusionVAE(

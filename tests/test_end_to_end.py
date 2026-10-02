@@ -176,5 +176,5 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     for got, want in zip(jax.tree.leaves(restored.params["autoencoder"]),
                          jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    expected = task.pipeline(state, ema=False)(["a red bird"], seed=9).host().images
-    np.testing.assert_array_equal(restored(["a red bird"], seed=9).host().images, expected)
+    expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
+    np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)

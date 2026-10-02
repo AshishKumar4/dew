@@ -69,5 +69,5 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     step = trainer.compile(state, batch)
     for _ in range(3):
         state, *_ = step(state, batch)
-    images = task.pipeline(state)(["a red bird"], seed=9).host().images
+    images = task.pipeline(state)(["a red bird"], key=9).host().images
     assert np.all(np.isfinite(images))

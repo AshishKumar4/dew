@@ -543,8 +543,8 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     # The export writes the layer scalars into the reference's buffers, so
     # the reloaded tree is the source's shape, not the run's; what has to
     # survive is the canvas the two decode.
-    wanted = task([[1, 5, 7]], 3, seed=4).host()
-    actual = reloaded.block_generation()([[1, 5, 7]], 3, seed=4).host()
+    wanted = task([[1, 5, 7]], 3, key=4).host()
+    actual = reloaded.block_generation()([[1, 5, 7]], 3, key=4).host()
     np.testing.assert_array_equal(actual.tokens, wanted.tokens)
     np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
 

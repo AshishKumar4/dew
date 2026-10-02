@@ -36,7 +36,7 @@ def sampled(softcap=None, temperature=0.7):
     if softcap is not None:
         # Large enough logits that the cap bends them.
         params = jax.tree.map(lambda leaf: leaf * 3.0, params)
-    drawn = obj.policy(params, sampling)([[1, 2, 3], [4, 5, 6]], NEW, seed=7).host()
+    drawn = obj.policy(params, sampling)([[1, 2, 3], [4, 5, 6]], NEW, key=7).host()
     assert (drawn.lengths == NEW).all(), "the fixture wants full-length draws"
     tokens = jnp.asarray(drawn.tokens)
     hidden = obj.token_scores(params, tokens).hidden
