@@ -90,6 +90,15 @@ class DiscreteProcess:
     T = 1.0
     """The fully masked end of the time domain, as a Gaussian process names it."""
 
+    def to_json(self) -> dict:
+        if not isinstance(self.schedule, LogLinear):
+            raise TypeError("custom masking schedules need an explicit record declaration")
+        return {'mask_id': self.mask_id, 'eps': self.schedule.eps}
+
+    @classmethod
+    def from_json(cls, record: Mapping) -> DiscreteProcess:
+        return cls(LogLinear(eps=record['eps']), record['mask_id'])
+
     def sample_t(self, key, n: int) -> jax.Array:
         """`n` times stratified over [0, 1), MDLM's antithetic draw.
 

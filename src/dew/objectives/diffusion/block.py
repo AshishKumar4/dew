@@ -195,6 +195,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.trainable = trainable
         self.head_chunks = head_chunks
 
+    def inference_record(self):
+        from dew.config import ModelConfig, _to_json
+        from dew.diffusion.block import BlockProcess
+        from dew.interop.hf_decoders import _export_config
+        from dew.registry import objectives
+        if self.model.conditioner is not None:
+            raise TypeError("multimodal block training needs an explicit inference record declaration")
+        model = ModelConfig.from_model(self.model)
+        config = {'model_type': 'diffusion_gemma', 'text_config': _export_config(self.model.text),
+                  'canvas_length': self.canvas_size}
+        return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
+                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size, 'tokenizer': None,
+                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json(),
+                'diffusion_gemma': {'config': config, 'generation_config': {}}}
+
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None = None) -> BlockGeneration:
         """Publish the state's weights as a `BlockGeneration` task.

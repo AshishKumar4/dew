@@ -563,22 +563,16 @@ class BlockGeneration:
         the two dtypes override computation and storage.
         """
         from dew.checkpoints import Checkpoints
-        from dew.interop import diffusion_gemma
-
+        from dew.diffusion.block import BlockProcess
         record, model_config, processor = _saved_run(directory, dtype, step)
-        canvas = model_config.config["max_seq_len"]
-        if not isinstance(canvas, int):
-            raise ValueError(
-                f"run.json records max_seq_len as {canvas!r}; the canvas a "
-                f"block-diffusion run decodes is a number of tokens")
-        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
-                                      attention_impl=model_config.attention_impl,
-                                      max_seq_len=canvas)
-        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
-        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
-        return cls(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
-                   processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
+        model = model_config.build()
+        if not isinstance(model, DiffusionGemma):
+            raise TypeError("block checkpoint must declare DiffusionGemma")
+        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout,
+                                                      param_dtype=param_dtype)
+        return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
+                   processor,
+                   max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -651,7 +645,8 @@ class MaskedGeneration:
         run's preview budget becomes the response length a call omits.
         """
         from dew.checkpoints import Checkpoints
-        from dew.diffusion.discrete import MDLM
+        from dew.diffusion.discrete import DiscreteProcess
+        from dew.registry import solvers
 
         record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
@@ -663,7 +658,14 @@ class MaskedGeneration:
         mask_id = model.mask_token_id
         variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
-        return cls(model, variables, MDLM(mask_id=mask_id)(), processor,
+        process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
+        if process.mask_id != mask_id:
+            raise ValueError("model and process mask token disagree")
+        solver = named_fields(record['solver'], 'solver')
+        return cls(model, variables, process, processor,
+                   solver=solvers.build(named(solver['name'], 'solver'),
+                                        named_fields(solver['fields'], 'fields')),
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
                    pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
                    max_new_tokens=budget or None)
 
