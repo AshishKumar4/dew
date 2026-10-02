@@ -236,15 +236,6 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     return np.clip(pixels, 0, 255, out=pixels).astype(np.uint8)
 
 
-PROMPT_TEMPLATES = (
-    "a photo of a {}",
-    "a photo of a {} flower",
-    "This is a photo of a {}",
-    "This is a photo of a {} flower",
-    "A photo of a {} flower",
-)
-
-
 @functools.cache
 def class_names(path: str) -> tuple[str, ...]:
     """The class names of a labels file, one per line, read once per process."""
@@ -349,11 +340,6 @@ class ImageDataset(DatasetSpec):
     val_batches: int | None = 4
     val_split: str | None = None
     count: int | None = None
-    augment_validation: bool = dataclasses.field(default=False, metadata={"legacy": True})
-    """Whether validation takes the training crop, flip and jitter. Off, it
-    reads the deterministic full-image resize a reference metric compares
-    against. On, each record's draws repeat every pass. A record that lacks
-    the field was written when validation was augmented, and reads as on."""
 
     def __post_init__(self):
         if self.augmentation_backend not in ("host", "device"):
@@ -441,7 +427,9 @@ class ImageDataset(DatasetSpec):
                                      type(self).__name__)
         if self.val_split:
             validation = self.source(self.val_split)
-        evaluated = self if self.augment_validation else dataclasses.replace(
+        # Validation reads the deterministic full-image resize a reference
+        # metric compares against, not the training crop, flip and jitter.
+        evaluated = dataclasses.replace(
             self, augmentation="none", augmentation_backend="host", crop_scale=(1.0, 1.0))
         scored = None if validation is None else tokenized(
             validation_pass(validation, [ImageTransform(evaluated)], batch=batch,
@@ -459,15 +447,19 @@ class ImageDataset(DatasetSpec):
         )
 
 
-@datasets("oxford_flowers102")
+@datasets("tfds_images")
 @dataclasses.dataclass(frozen=True)
-class OxfordFlowers(ImageDataset):
-    """Reads prepared Oxford Flowers ArrayRecords, captioned from their class
-    names.
+class TFDSImages(ImageDataset):
+    """Reads a prepared TFDS image dataset's ArrayRecords, captioned from its
+    class names: the `image` and `label` features of oxford_flowers102,
+    cifar10, food101 and the like.
 
     Preparation runs separately. Reading uses TFDS metadata and NumPy image
     decoding through its read-only builder, without TensorFlow or dataset
     generation code in the training process.
+
+    A record's caption is one of `caption_templates`, drawn from the
+    record's rng, filled with its class name.
     """
 
     path: str | None = None
@@ -475,12 +467,13 @@ class OxfordFlowers(ImageDataset):
     split: str = "all"
     labels: str | None = None
     """Class-name file override; unset reads label.labels.txt in path."""
+    caption_templates: tuple[str, ...] = ("a photo of a {}",)
 
     def source(self, split: str | None = None):
         if not self.path:
             raise ValueError(
-                "OxfordFlowers needs path= (--data.path) pointing to prepared "
-                "TFDS ArrayRecords. Prepare oxford_flowers102 separately with "
+                "TFDSImages needs path= (--data.path) pointing to prepared TFDS "
+                "ArrayRecords. Prepare the dataset separately with "
                 "download_and_prepare(file_format='array_record'), then pass "
                 "the builder.data_dir version directory to training.")
         import tensorflow_datasets as tfds
@@ -491,16 +484,16 @@ class OxfordFlowers(ImageDataset):
                                decoders={"image": tfds.decode.SkipDecoding()})
 
     def record(self, element: Batch | bytes, rng):
-        element = _fields(element, "OxfordFlowers")
+        element = _fields(element, "TFDSImages")
         label = int(element["label"])
         # The template comes from the record's rng, like the augmentation.
         # A module-global random.choice would key a record's caption to how
         # many workers and processes produced the batch.
-        template = PROMPT_TEMPLATES[int(rng.integers(len(PROMPT_TEMPLATES)))]
+        template = self.caption_templates[int(rng.integers(len(self.caption_templates)))]
         labels = self.labels
         if labels is None:
             if self.path is None:
-                raise ValueError("OxfordFlowers captions need labels= or a prepared path=.")
+                raise ValueError("TFDSImages captions need labels= or a prepared path=.")
             labels = os.path.join(self.path, "label.labels.txt")
         return element["image"], template.format(class_names(labels)[label]), label
 
@@ -617,65 +610,3 @@ class ArrayRecordImages(ImageDataset):
             return (image, element['caption'].decode('utf-8'),
                     None if label is None else int(np.frombuffer(label, np.int32)[0]))
         return element['jpg'], element['txt'].decode('utf-8'), None
-
-
-# The msml612 shards live in gs://msml612-diffusion-data, read through a gcs
-# fuse mount handed over as `path`.
-
-@datasets("laion12m_coco")
-@dataclasses.dataclass(frozen=True)
-class Laion12mCoco(ArrayRecordImages):
-    """laion-aesthetics-12M (score >= 6) plus MS-COCO 2017: 228 shards, 236 GiB, about 15M samples."""
-    shards: tuple[str, ...] = ("arrayrecord2/laion12m_coco",)
-
-
-@datasets("laion2b_aesthetic")
-@dataclasses.dataclass(frozen=True)
-class Laion2bAesthetic(ArrayRecordImages):
-    """laion-2B-en aesthetic >= 4.2 subset: 569 shards, 550 GiB, larger but noisier."""
-    shards: tuple[str, ...] = ("arrayrecord2/laion2B-en-aesthetic",)
-
-
-@datasets("diffusiondb")
-@dataclasses.dataclass(frozen=True)
-class DiffusionDB(ArrayRecordImages):
-    """diffusiondb (SD synthetic images and prompts): 31 shards, 60 GiB, 1.97M samples."""
-    shards: tuple[str, ...] = ("arrayrecord2/diffusiondb",)
-
-
-@datasets("cc3m")
-@dataclasses.dataclass(frozen=True)
-class CC3M(ArrayRecordImages):
-    """Conceptual Captions 3M: 50 shards, 37 GiB, about 3.3M samples (shard 00039 missing)."""
-    shards: tuple[str, ...] = ("arrayrecord2/cc3m",)
-
-
-@datasets("combined_msml612")
-@dataclasses.dataclass(frozen=True)
-class CombinedMsml612(ArrayRecordImages):
-    """The four msml612 datasets together, about 883 GiB and 20M samples."""
-    shards: tuple[str, ...] = (
-        "arrayrecord2/laion12m_coco",
-        "arrayrecord2/laion2B-en-aesthetic",
-        "arrayrecord2/diffusiondb",
-        "arrayrecord2/cc3m",
-    )
-
-
-@datasets("cc12m")
-@dataclasses.dataclass(frozen=True)
-class CC12M(ArrayRecordImages):
-    """Conceptual Captions 12M, in the arrayrecord2 layout of the msml612 bucket."""
-    shards: tuple[str, ...] = ("arrayrecord2/cc12m",)
-
-
-@datasets("combined_30m")
-@dataclasses.dataclass(frozen=True)
-class Combined30M(ArrayRecordImages):
-    """Four arrayrecord2 shard sets of the msml612 bucket, about 30M samples."""
-    shards: tuple[str, ...] = (
-        "arrayrecord2/laion-aesthetics-12m+mscoco-2017",
-        "arrayrecord2/cc12m",
-        "arrayrecord2/aestheticCoyo_0.26_clip_5.5aesthetic_256plus",
-        "arrayrecord2/playground+leonardo_x4+cc3m.parquet",
-    )

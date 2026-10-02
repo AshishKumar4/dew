@@ -1,4 +1,6 @@
 {
+  "alignment": null,
+  "audio": null,
   "autoencoder": {
     "dtype": "bfloat16",
     "latent_scale": null,
@@ -9,7 +11,13 @@
   "data": {
     "fields": {
       "augmentation": "flip_jitter",
+      "augmentation_backend": "host",
+      "augmentation_size": null,
       "count": null,
+      "crop_scale": [
+        1.0,
+        1.0
+      ],
       "image_size": 256,
       "loading": {
         "read_buffer": 128,
@@ -25,8 +33,9 @@
       "val_batches": 4,
       "val_split": null
     },
-    "name": "laion12m_coco"
+    "name": "array_record_images"
   },
+  "distill": null,
   "ema_decay": null,
   "guidance": {
     "interval": [
@@ -36,7 +45,9 @@
     "rescale": 0.0,
     "scale": 5.0
   },
+  "guidance_distill": null,
   "lora": null,
+  "mean_flow": null,
   "model": {
     "architecture": "hybrid_dit",
     "attention_impl": "auto",
@@ -61,6 +72,8 @@
   "objective": "diffusion",
   "optim": {
     "clip_grads": 0.0,
+    "ema_profiles": [],
+    "forced_weight_normalization": false,
     "learning_rate": 0.0001,
     "optimizer": "adamw",
     "optimizer_opts": {},
@@ -82,7 +95,11 @@
     },
     "name": "edm"
   },
-  "sampler": {
+  "pretrained": null,
+  "rl": null,
+  "sampling_steps": 20,
+  "shortcut": null,
+  "solver": {
     "fields": {
       "algorithm": "dpmsolver++",
       "euler_at_final": false,
@@ -92,7 +109,6 @@
     },
     "name": "dpmsolver_multistep"
   },
-  "sampling_steps": 20,
   "text": {
     "checkpoint": "openai/clip-vit-large-patch14",
     "dtype": "bfloat16",
@@ -107,6 +123,7 @@
     "accumulation": 1,
     "batch_ramp": null,
     "batch_size": 128,
+    "best": null,
     "checkpoint_dir": "run",
     "checkpoint_every": "epoch",
     "compilation_cache_dir": null,
@@ -114,6 +131,7 @@
     "epochs": null,
     "eval_every": "epoch",
     "keep": 1,
+    "key": 0,
     "layout": {
       "host": [],
       "host_parameters": [],
@@ -275,11 +293,11 @@
     "name": "text-to-image-176m",
     "profile": null,
     "quantization": null,
-    "seed": 0,
     "steps": 1350000,
     "wandb": null,
     "xla_flags": null
   },
+  "uncertainty": null,
   "unconditional_prob": 0.12,
   "val_metrics": []
 }

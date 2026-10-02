@@ -30,8 +30,8 @@ from absl import flags
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-from dew.data import DataPartition, Loading, OxfordFlowers, images
-from dew.data.images import CC12M, ImageTransform
+from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages, images
+from dew.data.images import ImageTransform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +67,10 @@ def _pack_records(records):
     return bytes(packed)
 
 
+CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
+"""More than one, so a test can see which the record's rng drew."""
+
+
 def _element_for(kind, seed=0):
     image = _synthetic_image(seed)
     if kind == "tfds":
@@ -76,10 +80,11 @@ def _element_for(kind, seed=0):
 
 
 def _spec(kind, labels_file, augmentation="flip_jitter"):
-    """The TFDS flowers spec, or an arrayrecord one: `record` is what differs."""
+    """A prepared TFDS spec, or an arrayrecord one: `record` is what differs."""
     if kind == "tfds":
-        return OxfordFlowers(image_size=SCALE, augmentation=augmentation, labels=str(labels_file))
-    return CC12M(image_size=SCALE, augmentation=augmentation)
+        return TFDSImages(image_size=SCALE, augmentation=augmentation, labels=str(labels_file),
+                          caption_templates=CAPTION_TEMPLATES)
+    return ArrayRecordImages(image_size=SCALE, augmentation=augmentation, shards=("cc12m",))
 
 
 def _resized(kind, element):
@@ -114,14 +119,13 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
         "sys.modules['transformers'] = None",
         "",
         "import numpy as np",
-        "from dew.data import OxfordFlowers",
-        "from dew.data.images import CC12M",
+        "from dew.data import ArrayRecordImages, TFDSImages",
         "from dew.data.images import ImageTransform, augment_image, image_augmentations",
         "",
         "labels = sys.argv[1]",
         "image = np.zeros((9, 11, 3), dtype=np.uint8)",
         "for mode in ('none', 'flip_only', 'flip_jitter'):",
-        "    for spec in (OxfordFlowers(labels=labels, augmentation=mode), CC12M(augmentation=mode)):",
+        "    for spec in (TFDSImages(labels=labels, augmentation=mode), ArrayRecordImages(augmentation=mode)):",
         "        ImageTransform(spec)",
         "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
         "    assert out.dtype == np.uint8 and out.shape == image.shape",
@@ -244,8 +248,7 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
     if kind == "gcs":
         assert out["caption"] == "a yellow tulip"
     else:
-        assert out["caption"] in {template.format(LABELS[2])
-                                  for template in images.PROMPT_TEMPLATES}
+        assert out["caption"] in {template.format(LABELS[2]) for template in CAPTION_TEMPLATES}
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
@@ -295,7 +298,7 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
 def test_the_default_augmentation_is_flip_jitter(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    spec = dataclasses.replace(_spec(kind, labels_file), augmentation=OxfordFlowers().augmentation)
+    spec = dataclasses.replace(_spec(kind, labels_file), augmentation=TFDSImages().augmentation)
     transform = ImageTransform(spec)
 
     base = _resized(kind, element)
@@ -335,13 +338,13 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
 def test_the_caption_template_comes_from_the_record_rng(tmp_path):
     """A module-global random.choice picked the template, so a record's caption
     moved with the worker and process count while its image did not."""
-    spec = OxfordFlowers(labels=str(_write_labels(tmp_path)))
+    spec = TFDSImages(labels=str(_write_labels(tmp_path)), caption_templates=CAPTION_TEMPLATES)
     element = {"image": _synthetic_image(), "label": 1}
 
     captions = [spec.record(element, _record_rng(draw))[1] for draw in range(DRAWS)]
 
     assert len(set(captions)) > 1  # the rng really does pick the template
-    assert set(captions) <= {t.format(LABELS[1]) for t in images.PROMPT_TEMPLATES}
+    assert set(captions) <= {t.format(LABELS[1]) for t in CAPTION_TEMPLATES}
     assert spec.record(element, _record_rng(3))[1] == captions[3]
     assert spec.record(element, _record_rng(3))[2] == 1
 
@@ -378,9 +381,11 @@ def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
 # ---------------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
-class Flowers(OxfordFlowers):
-    """The flowers spec over synthetic records, one label per record so a
+class Flowers(TFDSImages):
+    """A prepared TFDS spec over synthetic records, one label per record so a
     batch says which records it carries."""
+
+    caption_templates: tuple[str, ...] = ("a photo of a {}", "a photo of a {} flower")
 
     def source(self):
         return [{"image": _synthetic_image(i), "label": i} for i in range(RECORDS)]
