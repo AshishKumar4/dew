@@ -1,6 +1,7 @@
 """Evaluation ranks precisely the weights saved, with independent best trackers."""
 import dataclasses
 import datetime
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp

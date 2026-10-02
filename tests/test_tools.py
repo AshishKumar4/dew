@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
