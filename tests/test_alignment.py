@@ -130,10 +130,10 @@ def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
 
     restored = TextToImage.from_run(str(tmp_path), ema=False)
     published = objective.pipeline(state, ema=False)
-    assert REPRESENTATION not in restored.variables
-    assert ALIGNMENT not in restored.variables["params"]
-    assert jax.tree.structure(restored.variables) == jax.tree.structure(published.params)
-    for actual, expected in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published.params),
+    assert REPRESENTATION not in restored.params
+    assert ALIGNMENT not in restored.params["params"]
+    assert jax.tree.structure(restored.params) == jax.tree.structure(published.params)
+    for actual, expected in zip(jax.tree.leaves(restored.params), jax.tree.leaves(published.params),
                                 strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
     np.testing.assert_array_equal(restored([{}, {}], key=9).host().images,

@@ -800,7 +800,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 
     expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
     for expected, actual in zip(
-        jax.tree.leaves(expected_params), jax.tree.leaves(restored.variables), strict=True
+        jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True
     ):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
@@ -836,13 +836,13 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                   reference(["a red bird"], steps=2, key=5).host().images)
     owned = restored.inputs.conditions["textcontext"].encoder.params
     for owner_leaf, bound_leaf in zip(
-        jax.tree.leaves(owned), jax.tree.leaves(restored.variables["encoders"]["textcontext"]), strict=True
+        jax.tree.leaves(owned), jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True
     ):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
     assert isinstance(restored.autoencoder, StableDiffusionVAE)
     for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
-                                      jax.tree.leaves(restored.variables["autoencoder"]), strict=True):
+                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
         assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
         np.testing.assert_array_equal(owner_leaf, bound_leaf)
 
@@ -901,7 +901,7 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(encoder, CharTable)
     stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
-    table = restored.variables["encoders"]["textcontext"]["table"]
+    table = restored.params["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
     assert encoder.params["table"].dtype == table.dtype
     np.testing.assert_array_equal(encoder.params["table"], table)
