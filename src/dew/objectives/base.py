@@ -15,6 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, runtime_checkable
 
 import jax
@@ -148,15 +149,13 @@ class TrainingScalar[Statistics, Additions]:
     shown: Shown
 
 
-class TrainingValues[Statistics, Additions]:
+class TrainingScalars[Statistics, Additions]:
     """Typed, completable attributes for the objective's declared training reports.
 
     Dynamic objectives may use item lookup. Undeclared attributes fail at
     access, before a fit starts; completion lists the objective's own names.
     """
     loss: TrainingScalar[Statistics, Additions]
-    ce: TrainingScalar[Statistics, Additions]
-    aux_loss: TrainingScalar[Statistics, Additions]
 
     def __init__(self, owner: Objective[Statistics, Additions]):
         self._owner = owner
@@ -337,9 +336,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         own `held_variables`. An objective that holds nothing ignores it.
         """
 
+    @cached_property
+    def _validation_loss(self):
+        """One reusable compiled loss, specialized by mesh and batch shape.
+
+        Validation needs statistics, not the optimizer's gradient program.
+        Keep the bound callable alive so repeated passes reuse compilation.
+        """
+        return jax.jit(self.loss)
+
     @property
-    def values(self) -> TrainingValues[Loss, Effects]:
-        return TrainingValues(self)
+    def scalars(self) -> TrainingScalars[Loss, Effects]:
+        return TrainingScalars(self)
 
     def _scalar(self, name: str) -> TrainingScalar[Loss, Effects]:
         """Select a declared training scalar; `objective.loss` selects the loss itself."""

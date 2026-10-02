@@ -618,6 +618,8 @@ class Checkpoints:
         self._rank_limits: dict[str, int] = {}
         self._rank_modes: dict[str, str] = {}
         self._pending: tuple[int, dict[str, float]] | None = None
+        self._step_cache: dict[int, Kept] = {}
+        self._custom_cache: dict[int, dict] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         self._manager = None
@@ -648,29 +650,54 @@ class Checkpoints:
         """Whether an evaluation would enter any of its trackers' best-K sets."""
         return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
+    def _cache_step(self, step: int, metadata) -> Kept:
+        custom = metadata.custom_metadata or {}
+        rules = custom.get('rankings') or {}
+        selection = next(iter(rules.values()), {})
+        checkpoint = Kept(
+            step=step,
+            metrics=Metrics(metadata.metrics or {}),
+            ranked_by=custom.get('primary') or next(iter(rules), None),
+            mode=selection.get('mode'),
+            kind='weights' if custom.get('weights_only') else 'state',
+            rankings=copy.deepcopy(rules))
+        self._step_cache[step] = checkpoint
+        self._custom_cache[step] = copy.deepcopy(custom)
+        return checkpoint
+
     def kept(self) -> list[Kept]:
-        """Committed retained steps, oldest first, with their metrics and ranking rule."""
-        kept = []
+        """Committed retained steps, oldest first; immutable metadata is cached."""
         persistent = self._open()
-        for step in sorted(persistent.all_steps()):
-            if not self._complete(step):
-                continue
-            metadata = persistent.metadata(step)
-            custom = metadata.custom_metadata or {}
-            selection = next(iter((custom.get('rankings') or {}).values()), {})
-            kept.append(Kept(step, Metrics(metadata.metrics or {}), custom.get('primary') or next(iter(custom.get('rankings') or {}), None), selection.get('mode'), 'weights' if custom.get('weights_only') else 'state', custom.get('rankings') or {}))
-        return kept
+        active = set(persistent.all_steps())
+        for step in set(self._step_cache) - active:
+            del self._step_cache[step]
+            self._custom_cache.pop(step, None)
+        retained = []
+        for step in sorted(active):
+            checkpoint = self._step_cache.get(step)
+            if checkpoint is None:
+                if not self._complete(step):
+                    continue
+                checkpoint = self._cache_step(step, persistent.metadata(step))
+            # Callers own the returned nested rules; changing them must not
+            # mutate the committed metadata cached for later queries.
+            retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
+        return retained
 
     def control(self, step: int) -> dict:
-        persistent = self._open_local() if step == self._local_latest() else self._open()
-        return dict((persistent.metadata(step).custom_metadata or {}).get('control', {}))
+        if step == self._local_latest():
+            custom = self._open_local().metadata(step).custom_metadata or {}
+        else:
+            self.kept()
+            custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+        return copy.deepcopy(custom.get('control', {}))
 
     def _best_step(self, name: str | None) -> int | None:
         candidates = []
         retained = self.kept()
         if name is None:
             for checkpoint in reversed(retained):
-                custom = self._open().metadata(checkpoint.step).custom_metadata or {}
+                custom = self._custom_cache[checkpoint.step]
                 if custom.get('primary'):
                     name = custom['primary']
                     break
@@ -706,7 +733,11 @@ class Checkpoints:
                 self.directory, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler())
             for step in self._manager.all_steps():
-                custom = self._manager.metadata(step).custom_metadata or {}
+                if not self._complete(step):
+                    continue
+                metadata = self._manager.metadata(step)
+                self._cache_step(step, metadata)
+                custom = metadata.custom_metadata or {}
                 if custom.get('profiles') is not None:
                     self._profile_snapshots.add(step)
                 for name, rule in (custom.get('rankings') or {}).items():
@@ -763,6 +794,8 @@ class Checkpoints:
         return held if held >= 0 and bool(np.all(steps == held)) else None
 
     def _complete(self, step: int) -> bool:
+        if step in self._step_cache:
+            return step in self._open().all_steps()
         path = epath.Path(self.path(step))
         return path.exists() and ocp.utils.is_checkpoint_finalized(path)
 
@@ -859,7 +892,8 @@ class Checkpoints:
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
         """The updates and relative standard deviations of a snapshot, without reading its averages."""
-        custom = self._open().metadata(step).custom_metadata or {}
+        self.kept()
+        custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
         profiles = custom.get('profiles')
         if profiles is None:
             raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
