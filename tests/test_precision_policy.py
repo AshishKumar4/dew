@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src import source_info_util
+from reference_error import assert_fp32_reduction_bound
 from test_architectures import CASES as ARCHITECTURE_CASES
 
 from dew.diffusion.process import DenoisingCondition
@@ -488,6 +489,27 @@ def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
     assert rounded.dtype == source
     assert jnp.array_equal(rounded, x.astype(target).astype(source), equal_nan=True)
     assert not jnp.array_equal(rounded, x)
+
+
+@pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
+def test_a_rounding_survives_the_reduction_it_feeds(helper):
+    """XLA:CPU's YNNPACK reduce fusion sums the unrounded values of a bare
+    `astype` round trip, even with excess precision off (openxla/xla#49978);
+    the helpers' optimization barrier keeps the rounding a sum and a mean
+    of squares read, as a norm's statistics do."""
+    from dew.nn import precision
+    x = np.random.default_rng(0).normal(size=(8, 4096)).astype(np.float32) * 3
+    rounded = x.astype(jnp.bfloat16).astype(np.float64)
+    held = jax.jit(lambda v: getattr(precision, helper)(v, jnp.bfloat16).astype(jnp.float32))
+    sums = np.asarray(jax.jit(lambda v: jnp.sum(held(v), axis=-1))(x), np.float64)
+    squares = np.asarray(jax.jit(lambda v: jnp.mean(jnp.square(held(v)), axis=-1))(x), np.float64)
+    assert_fp32_reduction_bound(sums, rounded.sum(-1), np.abs(rounded).sum(-1), x.shape[-1])
+    mean_square = np.mean(rounded ** 2, -1)
+    assert_fp32_reduction_bound(squares, mean_square, mean_square, x.shape[-1] + 2)
+    # The bound is a worst case (4.8 on these sums), wider than what dropping
+    # the rounding moves them (at most 0.96), so each sum must also be nearer
+    # the rounded values' than the unrounded ones'.
+    assert np.all(np.abs(sums - rounded.sum(-1)) < np.abs(sums - x.astype(np.float64).sum(-1)))
 
 
 def test_a_value_already_in_the_dtype_keeps_its_rounding_under_jit():

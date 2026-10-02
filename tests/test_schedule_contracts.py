@@ -46,6 +46,36 @@ def test_generalized_weight_is_the_fp64_edm_lambda_with_two_fp32_roundings():
     np.testing.assert_allclose(schedule.weight(times), reference, rtol=2 * np.finfo(np.float32).eps, atol=0)
 
 
+def test_model_time_is_log_sigma_over_four_without_an_epsilon_guard():
+    schedule = LinearSigma(sigma_min=0, sigma_max=1)
+    times = np.float64([.5, 1.])
+    # The supplied times are dyadic and produce exact stored fp32 sigmas.
+    # The logarithm rounds in fp32; division by four is exact binary scaling.
+    expected = np.log(np.float64([.5, 1.])) / 4
+    np.testing.assert_allclose(schedule.model_time(times), expected,
+                               rtol=2 * np.finfo(np.float32).eps, atol=0)
+    assert np.isneginf(np.asarray(schedule.model_time(np.float32(0))))
+
+
+def test_base_prior_scale_squares_both_nonunit_signal_and_noise_rates():
+    class PartialSignal(NoiseScheduler):
+        T = 1.
+
+        def rates(self, t):
+            return 1 - t / 2, 3 * t / 2
+
+        def sample_t(self, key, n):
+            return jax.random.uniform(key, (n,))
+
+        def weight(self, t):
+            return jnp.ones_like(t)
+
+    # alpha(T)=1/2 and sigma(T)=3/2 are exactly representable; the fp64
+    # reference rounds only its square root back to the production dtype.
+    expected = np.float32(np.sqrt(np.float64(.5 ** 2 + 1.5 ** 2)))
+    np.testing.assert_array_equal(PartialSignal().prior_scale(), expected)
+
+
 def test_generalized_training_times_are_the_unit_domains_exact_uniform_draws():
     with jax.enable_x64():
         key, count = jax.random.key(7), 8
