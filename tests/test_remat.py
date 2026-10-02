@@ -432,15 +432,16 @@ def test_a_step_xla_refuses_for_memory_compiles_again_one_rung_up(monkeypatch):
 
 
 def test_a_step_xla_refuses_at_every_rung_raises_its_refusal(monkeypatch):
-    """Where XLA refuses the last rung too, the run stops with XLA's own
-    refusal."""
+    """Where XLA refuses the last rung too, the run stops with the refusal it
+    already gave, with no compile of that rung again: on a large program each
+    one costs minutes."""
     rungs = {(tiled, remat) for tiled in (False, True) for remat in (None, 'minimal', 'full')}
     trainer, attempts = refusing_trainer(monkeypatch, rungs)
     state, _, _ = trainer.place()
 
     with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED: Ran out of memory on HBM"):
         trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert attempts[:3] == [(False, None), (True, None), (True, 'minimal')]
+    assert attempts == [(False, None), (True, None), (True, 'minimal'), (True, 'full')]
 
 
 def test_a_compile_error_that_is_not_about_memory_is_not_a_rung(monkeypatch):
