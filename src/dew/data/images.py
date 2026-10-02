@@ -17,7 +17,7 @@ import functools
 import importlib
 import os
 import struct
-from collections.abc import Mapping
+from collections.abc import Mapping, Sized
 from typing import Literal
 
 import grain.python as pygrain
@@ -41,7 +41,6 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
-from .providers import Counted
 from .sources.hf import HFOptions, HubOptions
 from .tokens import bounded
 
@@ -419,17 +418,17 @@ class ImageDataset(DatasetSpec):
     def records(self, source: Records) -> int:
         """The records the run uses, from the head of the source.
 
-        A source that cannot count itself is `Counted`'s other case, where
+        A source that cannot count itself (no `__len__`) is the other case, where
         the spec's own `count` is the whole record of how many there are.
         """
         name = type(self).__name__
         if self.count is None:
-            if not isinstance(source, Counted):
+            if not isinstance(source, Sized):
                 raise ValueError(
                     f"{name} reports no length, so it needs count= set to the "
                     "records it holds")
             return len(source)
-        if isinstance(source, Counted):
+        if isinstance(source, Sized):
             return checked_count(self.count, len(source), name)
         return self.count
 
