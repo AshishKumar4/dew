@@ -181,7 +181,8 @@ def test_the_gradients_match_torch_autograd():
     block = reference_block()
     hidden, valid = inputs()
     cotangent = np.random.RandomState(1).randn(B, S, E).astype(np.float32) * valid[..., None]
-    x = torch.from_numpy(hidden).requires_grad_(requires_grad=True)
+    needs_grad = True
+    x = torch.from_numpy(hidden).requires_grad_(needs_grad)
     block(x, torch.from_numpy(valid))[0].mul(torch.from_numpy(cotangent)).sum().backward()
     theirs = {name: None if p.grad is None else p.grad.numpy() for name, p in block.named_parameters()}
     assert x.grad is not None
