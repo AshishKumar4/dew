@@ -68,7 +68,7 @@ from dew.nn.text_encoders import ParamTree
 from dew.objectives.base import Variables
 from dew.registry import (
     dtype_name,
-    models,
+    from_record,
     precision_fields,
     projectors,
     resolve_dtype,
@@ -1408,9 +1408,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     built = with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl)
-    decoder = models.build("causal_transformer", built)
-    if not isinstance(decoder, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    decoder = from_record(CausalTransformer, built)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = diffusion.record_layouts(
@@ -1482,12 +1480,8 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     named = dtype_name(compute)
     if named is None:
         raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
-    decoder = models.build(
-        "causal_transformer",
-        with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl),
-    )
-    if not isinstance(decoder, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    decoder = from_record(CausalTransformer, with_precision("causal_transformer", record, dtype=named,
+                                                            attention_impl=attention_impl))
     if pipeline == "z_image":
         layers = (decoder.num_layers - 1,)
     if max(layers) >= decoder.num_layers:
@@ -1845,9 +1839,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     text: decoders.DecoderFields = {**text_fields, **precision_fields(
         "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
     wrapper: decoders.WrapperFields = {**record, "text": text}
-    language_model = models.build("causal_transformer", wrapper["text"])
-    if not isinstance(language_model, CausalTransformer):
-        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
     variables = _native_variables({**parts, "language_model": decoders.with_constants(
@@ -1870,7 +1862,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
     built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
-    model = models.build("causal_transformer", built)
+    model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
     decoders._check_tree(variables, model)
