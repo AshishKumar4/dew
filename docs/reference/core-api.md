@@ -160,7 +160,7 @@ This object does not write `run.json`; run configuration saving is separate. Use
 Import `LMObjective` from `dew.objectives.lm`.
 
 ```text
-LMObjective(model, seq_len, *, ema_decay=0.999, pad_id=None, head_chunks=4, head_tile=None,
+LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_tile=None,
             samples=None, pretrained=None, balance_rate=None, aux_loss_alpha=None,
             seq_aux=True, loss_role=None, mtp_weight=None, z_loss=0.0, router_z_loss=0.0,
             qk_stats=False, indexer=None, trainable=None, token_accuracy=True)
