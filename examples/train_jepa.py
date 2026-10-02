@@ -1,7 +1,8 @@
 """Train an I-JEPA encoder on Oxford Flowers, probe it, save the encoder.
 
-    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
-    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --steps 20 --image-size 32 --patch-size 4
+python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
+python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 \
+    --steps 20 --image-size 32 --patch-size 4
 """
 from dataclasses import dataclass, field
 from pathlib import Path

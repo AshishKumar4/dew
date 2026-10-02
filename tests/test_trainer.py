@@ -11,6 +11,7 @@ import dataclasses
 import gc
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -571,19 +572,19 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
 
 
-def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, caplog):
     """A process that cannot fit the rung its checkpoint trained on moves up
     the ladder, never down, and says the run now computes otherwise."""
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
-    capsys.readouterr()
+    caplog.clear()
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
     assert trainer_module.remat_record(objective.model.remat) == 'full'
-    assert "the rung its checkpoint trained on" in capsys.readouterr().err
+    assert "the rung its checkpoint trained on" in caplog.text
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
@@ -1257,13 +1258,20 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
     screen = io.StringIO()
     evaluation_budgets = []
     render_metrics = display.TrainingDisplay.metrics
+    advance_step = display.TrainingDisplay.step
 
     def metrics(panel, rows, inner, lines, *, evaluation=False):
         if evaluation:
             evaluation_budgets.append(lines)
         return render_metrics(panel, rows, inner, lines, evaluation=evaluation)
 
+    def step(panel, number):
+        advance_step(panel, number)
+        if number == 2:
+            logging.getLogger("dew.training.test").warning("diagnostic above the live panel")
+
     monkeypatch.setattr(display.TrainingDisplay, "metrics", metrics)
+    monkeypatch.setattr(display.TrainingDisplay, "step", step)
     monkeypatch.setattr(display, "terminal", lambda console: True)
     monkeypatch.setattr(display, "Console", lambda: Console(file=screen, width=width, height=40,
                                                             force_terminal=True, color_system=None))
@@ -1271,6 +1279,7 @@ def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch)
                                            metrics=(Spread([]),))
 
     output = screen.getvalue()
+    assert "diagnostic above the live panel" in output
     assert "eval val at step" not in output
     assert evaluation_budgets and max(evaluation_budgets) < 40
     last = output.rpartition("dew · ")[2]

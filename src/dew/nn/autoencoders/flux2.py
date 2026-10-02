@@ -60,9 +60,14 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
             {"params": params}, unfold(latent), method=model.decode))
         self.latent_shift = np.asarray(mean, np.float32)
         self.latent_scale = 1.0 / np.sqrt(np.asarray(variance, np.float32) + np.float32(epsilon))
-        if self.latent_shift.shape != (4 * model.latent_channels,) or self.latent_scale.shape != self.latent_shift.shape:
-            raise ValueError(f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
-                             f"channel ({4 * model.latent_channels},)")
+        if (
+            self.latent_shift.shape != (4 * model.latent_channels,)
+            or self.latent_scale.shape != self.latent_shift.shape
+        ):
+            raise ValueError(
+                f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
+                f"channel ({4 * model.latent_channels},)"
+            )
 
     @property
     def downscale_factor(self) -> int:
@@ -86,27 +91,44 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     directory = sources.snapshot(str(name_or_dir), revision, weights=(subfolder,))
     config = json.loads((directory / subfolder / "config.json").read_text())
     if config.get("_class_name") != "AutoencoderKLFlux2":
-        raise ValueError(f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2")
+        raise ValueError(
+            f"{directory / subfolder} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2"
+        )
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     if not config.get("mid_block_add_attention", True) or config.get("act_fn", "silu") != "silu":
         raise ValueError("the port computes the published VAE: SiLU and mid-block attention")
     model = AutoencoderKL(
-        channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
-        image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
-        norm_groups=config["norm_num_groups"], quantize=diffusion.flag(config, "use_quant_conv", default=True),
+        channels=tuple(config["block_out_channels"]),
+        latent_channels=config["latent_channels"],
+        image_channels=config["in_channels"],
+        blocks_per_level=config["layers_per_block"],
+        norm_groups=config["norm_num_groups"],
+        quantize=diffusion.flag(config, "use_quant_conv", default=True),
         post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
         decoder_channels=tuple(config["decoder_block_out_channels"])
-        if config.get("decoder_block_out_channels") else None, dtype=compute)
+        if config.get("decoder_block_out_channels")
+        else None,
+        dtype=compute,
+    )
     tensors = diffusion.component_tensors(directory, subfolder)
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         params, layouts = diffusion.record_layouts(
-            "vae", tensors, lambda name: None if name in STATISTICS else _vae_path(name, np.ndim(tensors[name])),
-            ("autoencoder",), param_dtype=param_dtype)
+            "vae",
+            tensors,
+            lambda name: None if name in STATISTICS else _vae_path(name, np.ndim(tensors[name])),
+            ("autoencoder",),
+            param_dtype=param_dtype,
+        )
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     check_tree({"params": params}, model, frame)
-    autoencoder = Flux2Autoencoder(model=model, params=params, mean=tensors["bn.running_mean"],
-                                   variance=tensors["bn.running_var"], epsilon=config.get("batch_norm_eps", 1e-4))
+    autoencoder = Flux2Autoencoder(
+        model=model,
+        params=params,
+        mean=tensors["bn.running_mean"],
+        variance=tensors["bn.running_var"],
+        epsilon=config.get("batch_norm_eps", 1e-4),
+    )
     return autoencoder, params, layouts, config

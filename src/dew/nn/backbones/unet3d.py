@@ -44,7 +44,9 @@ class TemporalBlock(nn.Module):
         h = h.transpose(0, 2, 1, 3).reshape(B * H * W, frames, C)
 
         h = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(h)
-        freqs_cis = rotary_freqs(jnp.arange(frames), C // self.heads, ROPE_THETA, dtype=at_least_fp32(h.dtype))
+        freqs_cis = rotary_freqs(
+            jnp.arange(frames), C // self.heads, ROPE_THETA, dtype=at_least_fp32(h.dtype)
+        )
         h = NormalAttention(
             query_dim=C,
             heads=self.heads,

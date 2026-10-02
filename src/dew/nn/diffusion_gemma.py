@@ -171,7 +171,9 @@ class DiffusionGemma(nn.Module):
             self.conditioner.initialize_parameters()
         embedded = self.decoder.embed_tokens(tokens)
         table = self.decoder.embed_tokens.embedding
-        scaled = (embedded * jnp.asarray(math.sqrt(self.text.emb_features), table.dtype)).astype(embedded.dtype)
+        scaled = (embedded * jnp.asarray(math.sqrt(self.text.emb_features), table.dtype)).astype(
+            embedded.dtype
+        )
         if self_conditioning_logits is None:
             signal = jnp.zeros_like(scaled)
         else:

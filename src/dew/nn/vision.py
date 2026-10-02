@@ -34,8 +34,7 @@ exact-GELU MLP and lays the image out as its decoder reads it.
 
 import dataclasses
 import functools
-from collections.abc import Callable
-from typing import Mapping
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -815,8 +814,12 @@ class Gemma4VisionTransformer(nn.Module):
                 use_clipped_linears=self.use_clipped_linears, name=f"layers_{index}")
             for index in range(self.num_layers)]
         if self.standardize:
-            self.std_bias = self.variable("constants", "std_bias", jnp.zeros, (self.hidden_size,), jnp.float32)
-            self.std_scale = self.variable("constants", "std_scale", jnp.ones, (self.hidden_size,), jnp.float32)
+            self.std_bias = self.variable(
+                "constants", "std_bias", jnp.zeros, (self.hidden_size,), jnp.float32
+            )
+            self.std_scale = self.variable(
+                "constants", "std_scale", jnp.ones, (self.hidden_size,), jnp.float32
+            )
 
     def __call__(self, pixel_values, pixel_position_ids=None) -> jax.Array:
         pixels = jnp.asarray(pixel_values)
@@ -859,7 +862,9 @@ class Gemma4VisionTransformer(nn.Module):
         values = jnp.where(valid[..., None], hidden_states, 0).astype(jnp.float32) / kernel ** 2
         # Segment sums avoid the reference pooler's [patches, soft_tokens]
         # one-hot matrix while preserving its position-indexed block average.
-        pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(values, indices)
+        pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(
+            values, indices
+        )
         pooled = pooled * self.hidden_size ** 0.5
         if self.standardize:
             pooled = (pooled - self.std_bias.value) * self.std_scale.value
@@ -1101,7 +1106,9 @@ class Qwen35VisionTransformer(nn.Module):
             batch, channels, height, width = pixels.shape
             stride = patch * merge
             if channels != self.in_channels or height % stride or width % stride:
-                raise ValueError(f"pixel_values must be {self.in_channels}-channel images tiled by {stride}px blocks")
+                raise ValueError(
+                    f"pixel_values must be {self.in_channels}-channel images tiled by {stride}px blocks"
+                )
             rows, columns = height // patch, width // patch
             blocks = pixels.reshape(batch, channels, rows // merge, merge, patch,
                                     columns // merge, merge, patch)
@@ -1112,7 +1119,9 @@ class Qwen35VisionTransformer(nn.Module):
             pixels = frames.reshape(batch, rows * columns, -1)
             grid_thw = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
         if pixels.ndim != 3 or pixels.shape[-1] != self.in_channels * self.temporal_patch_size * patch ** 2:
-            raise ValueError("packed Qwen pixels must be [B, patches, C * temporal_patch_size * patch_size**2]")
+            raise ValueError(
+                "packed Qwen pixels must be [B, patches, C * temporal_patch_size * patch_size**2]"
+            )
         batch, length, _ = pixels.shape
         if grid_thw is None or grid_thw.shape != (batch, 3):
             raise ValueError("packed Qwen pixels require aligned [B, 3] grid_thw")
@@ -1337,14 +1346,21 @@ class DeepseekV41ProjectorModule(nn.Module):
         images, rows, columns, _ = image_features.shape
         padded = jnp.pad(image_features, ((0, 0), (0, -rows % ratio), (0, -columns % ratio), (0, 0)))
         high, wide = padded.shape[1] // ratio, padded.shape[2] // ratio
-        squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(0, 1, 3, 5, 2, 4)
+        squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(
+            0, 1, 3, 5, 2, 4
+        )
         dense = functools.partial(nn.Dense, self.out_width, dtype=self.dtype, precision=self.precision)
         aligned = dense(name="w2")(jax.nn.gelu(dense(name="w1")(
             squares.reshape(images, high, wide, -1)), approximate=False))
         start, newline, end = (
-            self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(aligned.dtype)
-            for name in ("image_start", "image_newline", "image_end"))
-        lines = jnp.concatenate([aligned, jnp.broadcast_to(newline, (images, high, 1, self.out_width))], axis=2)
+            self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(
+                aligned.dtype
+            )
+            for name in ("image_start", "image_newline", "image_end")
+        )
+        lines = jnp.concatenate(
+            [aligned, jnp.broadcast_to(newline, (images, high, 1, self.out_width))], axis=2
+        )
         return jnp.concatenate([jnp.broadcast_to(start, (images, 1, self.out_width)),
                                 lines.reshape(images, high * (wide + 1), self.out_width),
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
@@ -1586,11 +1602,15 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
             "middle layer this trunk never returns")
     rope = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
     theta = records.number(rope.get("rope_theta", vision.get("rope_theta", 10000.0)), "rope_theta")
-    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(vision.get("projector_dropout", 0.0), "projector_dropout"):
+    if records.number(vision.get("attention_dropout", 0.0), "attention_dropout") or records.number(
+        vision.get("projector_dropout", 0.0), "projector_dropout"
+    ):
         raise ValueError("attention_dropout/projector_dropout is training-time")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
-    output_dim = records.integer(vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim")
+    output_dim = records.integer(
+        vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim"
+    )
     if output_dim != records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
@@ -1604,7 +1624,9 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "image_size": _image_size(vision.get("image_size", 336), "image_size"),
         "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
         "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": records.number(vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"),
+        "layer_norm_eps": records.number(
+            vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
+        ),
         "rope_theta": theta,
         "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
         "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
@@ -1624,7 +1646,9 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"mm_tokens_per_image ({mm_tokens_per_image}) is not a square, this "
             "projector pools a grid into a grid")
-    patches = records.integer(vision["image_size"], "image_size") // records.integer(vision["patch_size"], "patch_size")
+    patches = records.integer(vision["image_size"], "image_size") // records.integer(
+        vision["patch_size"], "patch_size"
+    )
     if patches % side:
         raise ValueError(
             f"{patches} patches per side do not split over {side} soft tokens per side")
@@ -1694,7 +1718,11 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
         hf_name.split("."))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
-    collection = "constants" if path[-1] in ("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max") else "params"
+    collection = (
+        "constants"
+        if path[-1] in ("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max")
+        else "params"
+    )
     return (collection, *path)
 
 
@@ -1758,11 +1786,15 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Mapping[s
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "num_heads": heads,
-        "num_key_value_heads": records.integer(vision.get("num_key_value_heads", heads), "num_key_value_heads"),
+        "num_key_value_heads": records.integer(
+            vision.get("num_key_value_heads", heads), "num_key_value_heads"
+        ),
         "head_dim": records.integer(head_dim, "head_dim"),
         "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
         "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": records.integer(vision.get("position_embedding_size", 10240), "position_embedding_size"),
+        "position_embedding_size": records.integer(
+            vision.get("position_embedding_size", 10240), "position_embedding_size"
+        ),
         "hidden_act": activation,
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
         "rope_theta": records.number(rope.get("rope_theta", vision.get("rope_theta", 100.0)), "rope_theta"),
@@ -1791,7 +1823,12 @@ _QWEN35_VISION_TENSORS = {
 
 def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
-    if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit() or parts[-1] not in ("weight", "bias"):
+    if (
+        len(parts) < 4
+        or parts[0] != "blocks"
+        or not parts[1].isdigit()
+        or parts[-1] not in ("weight", "bias")
+    ):
         return None
     block, leaf = f"blocks_{parts[1]}", parts[-1]
     if len(parts) == 4 and parts[2] in ("norm1", "norm2"):
@@ -2018,7 +2055,9 @@ class Gemma3nProjectorModule(nn.Module):
 
     def setup(self):
         if min(self.vision_width, self.text_width, self.vocab_size) < 1 or self.vocab_offset < 0:
-            raise ValueError("vision/text widths and vocab_size must be positive; vocab_offset is nonnegative")
+            raise ValueError(
+                "vision/text widths and vocab_size must be positive; vocab_offset is nonnegative"
+            )
         if self.norm_eps <= 0:
             raise ValueError("norm_eps must be positive")
         self.embedding = nn.Embed(self.vocab_size, self.vision_width, dtype=self.dtype,
@@ -2213,10 +2252,14 @@ TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
 _TOWER_WEIGHTS = {"siglip": translate_siglip_vision_weights, "llama4": translate_llama4_vision_weights,
                   "qwen3_5": translate_qwen35_vision_weights, "gemma3n": translate_gemma3n_vision_weights,
                   "deepseek_v41": translate_deepseek_v41_vision_weights}
-_PROJECTOR_WEIGHTS = {"gemma": translate_gemma_projector_weights, "llama4": translate_llama4_projector_weights,
-                      "gemma4": translate_gemma4_projector_weights, "qwen3_5": translate_qwen35_projector_weights,
-                      "gemma3n": translate_gemma3n_projector_weights,
-                      "deepseek_v41": translate_deepseek_v41_projector_weights}
+_PROJECTOR_WEIGHTS = {
+    "gemma": translate_gemma_projector_weights,
+    "llama4": translate_llama4_projector_weights,
+    "gemma4": translate_gemma4_projector_weights,
+    "qwen3_5": translate_qwen35_projector_weights,
+    "gemma3n": translate_gemma3n_projector_weights,
+    "deepseek_v41": translate_deepseek_v41_projector_weights,
+}
 
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:

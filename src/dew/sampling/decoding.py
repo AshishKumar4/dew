@@ -158,13 +158,23 @@ def _ids(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
 
 
 def _positive(name: str, value: float | int | str | bool | None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise ValueError(f"{name} must be a finite positive number")
     return float(value)
 
 
 def _unit(name: str, value: float | int | str | bool | None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
         raise ValueError(f"{name} must be finite and between zero and one")
     return float(value)
 

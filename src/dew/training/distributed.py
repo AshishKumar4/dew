@@ -13,8 +13,7 @@ import queue
 import statistics
 import threading
 import time
-from collections.abc import Callable, Mapping
-from typing import Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import numpy as np
@@ -125,7 +124,10 @@ def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxis
 
 
 
-def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh:
+_DEFAULT_MESH = MeshSpec()
+
+
+def build_mesh(spec: MeshSpec = _DEFAULT_MESH, devices: list | None = None) -> Mesh:
     """Build the six-axis device mesh `spec` describes.
 
     Parameters shard over 'fsdp', 'expert' and 'tensor', batches over the

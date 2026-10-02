@@ -907,7 +907,7 @@ class Lingering(Augmenting):
 
 
 @pytest.mark.slow
-def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capsys):
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caplog):
     """grain stops a stream's worker processes one after another, each
     finishing the batch in its hands before it exits, and kills a worker
     that has not exited within 25 s. Four workers taking 2 s each keep a
@@ -928,7 +928,7 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caps
     began = time.perf_counter()
     prefetch.close()
     assert time.perf_counter() - began > loading.workers * data.seconds
-    assert "waiting for 4 grain workers to stop" in capsys.readouterr().err
+    assert "waiting for 4 grain workers to stop" in caplog.text
 
 
 def test_a_stop_closes_grain_when_no_thread_can_announce_it(monkeypatch):
