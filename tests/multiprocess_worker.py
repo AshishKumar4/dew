@@ -1735,7 +1735,7 @@ def mode_decoding_components(args) -> dict:
     from dew.inference.pipeline import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
-    from dew.sampling import Beam, Sampling, Speculative, decoding
+    from dew.sampling import Sampling, decoding
     from dew.training import Layout, MeshSpec
 
     rank, processes = jax.process_index(), jax.process_count()
@@ -1808,6 +1808,28 @@ def mode_decoding_components(args) -> dict:
                       stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
         if int(agreed.lengths.sum()) < 1:
             raise AssertionError("the agreed request emitted nothing")
+    searched, drafted = _ragged_decoding_checks(model, params, prompts, placed, request)
+    return {
+        "process_index": rank,
+        "rows": int(result.rows),
+        "tokens": result.tokens.tolist(),
+        "lengths": result.lengths.tolist(),
+        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
+        "refused": refused,
+        "beam_tokens": searched.tokens.tolist(),
+        "beam_lengths": searched.lengths.tolist(),
+        "draft_tokens": drafted.tokens.tolist(),
+        "draft_lengths": drafted.lengths.tolist(),
+    }
+
+
+def _ragged_decoding_checks(model, params, prompts, placed, request):
+    """Check search and speculation while peers finish different-length rows."""
+    import jax.numpy as jnp
+
+    from dew.inference import TextGeneration
+    from dew.sampling import Beam, Sampling, Speculative, decoding
+
     # Ragged rows: a criterion ends some of them early, so the search and the
     # speculative block both have to finish while their peers keep going.
     # A token the greedy walk of the global prompts reaches at different
@@ -1828,18 +1850,7 @@ def mode_decoding_components(args) -> dict:
                            stopping=early)(request, 5, key=7).host()
     if not np.array_equal(drafted.tokens, plain.tokens):
         raise AssertionError("speculation and sampling disagreed on a greedy pool run")
-    return {
-        "process_index": rank,
-        "rows": int(result.rows),
-        "tokens": result.tokens.tolist(),
-        "lengths": result.lengths.tolist(),
-        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
-        "refused": refused,
-        "beam_tokens": searched.tokens.tolist(),
-        "beam_lengths": searched.lengths.tolist(),
-        "draft_tokens": drafted.tokens.tolist(),
-        "draft_lengths": drafted.lengths.tolist(),
-    }
+    return searched, drafted
 
 
 def mode_masked_generation(args) -> dict:
