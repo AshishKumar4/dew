@@ -52,6 +52,7 @@
   "epochs": null,
   "eval_every": "epoch",
   "keep": 2,
+  "key": 0,
   "layout": {
    "class": "dew.training.distributed.Layout",
    "sets": {}
@@ -65,7 +66,6 @@
   "name": null,
   "profile": null,
   "quantization": null,
-  "seed": 0,
   "steps": null,
   "wandb": null,
   "xla_flags": null

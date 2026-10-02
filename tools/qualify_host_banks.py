@@ -323,7 +323,7 @@ def main(case: Case) -> None:
 
     _record_decode(record, model, store, changed["cache"], logits, case)
 
-    greedy = generate(model, store, tokens, case.new_tokens, seed=case.seed,
+    greedy = generate(model, store, tokens, case.new_tokens, key=case.seed,
                       sampling=Sampling(temperature=0.0))
     record["generate_tokens"] = np.asarray(greedy.tokens).tolist()
     record["allocator"] = {name: int(value) for name, value in
