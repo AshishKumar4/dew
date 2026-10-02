@@ -46,7 +46,8 @@ capsh --drop=all --no-new-privs --user=visitor_probe -- -c \
  'bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/check.py'
 
 # The model-serving process is not subject to these guest limits.
-cat > /sessions/probe/resource.py <<'PYCODE'
+rm -f /sessions/probe/resource.py
+cat > /sessions/probe/limit_case.py <<'PYCODE'
 import os, resource, sys, threading, time
 sys.path.insert(0,'/opt/live')
 import guest_limits
@@ -76,13 +77,13 @@ elif mode=='cpu':
 elif mode=='wall':
     time.sleep(60)
 PYCODE
-chown visitor_probe:visitor_probe /sessions/probe/resource.py
+chown visitor_probe:visitor_probe /sessions/probe/limit_case.py
 for mode in memory fork; do
-  capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/resource.py $mode"
+  capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/limit_case.py $mode"
 done
 for mode in cpu wall; do
   set +e
-  timeout -s KILL 3 capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/resource.py $mode"
+  timeout -s KILL 3 capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/limit_case.py $mode"
   result=$?
   set -e
   echo "limit_probe $mode exit=$result"
