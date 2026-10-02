@@ -193,6 +193,8 @@ max-statements = 75
 
 [tool.ruff.lint.isort]
 known-first-party = ["dew"]
+# The lane bootstrap must execute before JAX reads backend configuration.
+force-to-top = ["lane_environment"]
 # `from x import A as B, C` is one line in this tree; splitting it per alias
 # turns three-name imports into three lines and hides the shared origin.
 combine-as-imports = true

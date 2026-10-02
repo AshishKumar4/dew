@@ -121,7 +121,7 @@ def test_yarn_matches_the_reference_derivation():
                                rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(np.asarray(sin), tensors["sin"][0, ..., :half],
                                rtol=1e-5, atol=1e-6)
-    # (0.1 * ln(40) + 1) ** 2.
+    # The expected query scale is the square of 0.1 * ln(40) + 1.
     assert yarn_query_scale(yarn) == pytest.approx(
         (0.1 * math.log(40.0) + 1.0) ** 2, rel=1e-6)
 
@@ -243,7 +243,7 @@ def test_auto_and_the_reference_agree_on_the_mla_gradients(name):
         mla_module(settings, attention_impl="auto"), variables, hidden))
     largest = max(float(np.max(np.abs(np.asarray(leaf)))) for leaf in reference)
     difference = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
-                     for a, b in zip(reference, auto))
+                     for a, b in zip(reference, auto, strict=True))
     assert difference < 1e-6 * largest
 
 
@@ -294,14 +294,14 @@ def mla_record(settings: dict) -> dict:
 
 def mla_model(settings: dict, **overrides) -> CausalTransformer:
     """A one-layer decoder whose mixer is the fixture's block."""
-    fields = dict(
-        vocab_size=37, emb_features=settings["hidden_size"], num_layers=1,
-        num_heads=settings["num_attention_heads"],
-        head_dim=settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
-        mlp_features=48, max_seq_len=64, rope_theta=float(settings["rope_theta"]),
-        norm_eps=float(settings["rms_norm_eps"]), qk_norm=False,
-        attention_bias=bool(settings["attention_bias"]),
-        mixer=mla_record(settings), attention_impl="reference")
+    fields = {
+        "vocab_size": 37, "emb_features": settings["hidden_size"], "num_layers": 1,
+        "num_heads": settings["num_attention_heads"],
+        "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
+        "mlp_features": 48, "max_seq_len": 64, "rope_theta": float(settings["rope_theta"]),
+        "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
+        "attention_bias": bool(settings["attention_bias"]),
+        "mixer": mla_record(settings), "attention_impl": "reference"}
     return CausalTransformer(**{**fields, **overrides})
 
 
@@ -356,7 +356,7 @@ def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
             jax.random.key(0), tokens)
     mismatched = dict(mla_record(settings))
     mismatched["yarn"] = dict(mismatched["yarn"], rope_theta=5000.0)
-    with pytest.raises(ValueError, match="rope_theta .* disagree"):
+    with pytest.raises(ValueError, match=r"rope_theta .* disagree"):
         mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
 

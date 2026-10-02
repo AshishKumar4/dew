@@ -52,7 +52,8 @@ def reference():
 
 def terms(fixture):
     """The fixture rollout as float32 arrays with the KL strength."""
-    get = lambda key: np.asarray(fixture[key], np.float32)
+    def get(key):
+        return np.asarray(fixture[key], np.float32)
     return (get("old_log_probs"), get("current_log_probs"), get("ref_log_probs"),
             get("advantages"), get("response_mask"), float(fixture["beta"]))
 
@@ -124,7 +125,7 @@ def test_a_flat_mean_moves_the_loss(reference):
     dilutes the short tails: observed move 0.082."""
     old, current, ref, advantages, mask, beta = terms(reference)
     ratio = token_log_ratio(jnp.asarray(current), jnp.asarray(old))
-    pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
+    _pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
     kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
     flat = jnp.mean(jnp.asarray(mask) * -jnp.asarray(advantages) * jnp.exp(ratio))
 
@@ -233,7 +234,7 @@ def test_a_positive_beta_needs_the_frozen_tree():
                               PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
     params = objective.init(jax.random.key(0))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError, match="step.ema"):
+    with pytest.raises(ValueError, match=r"step.ema"):
         objective.scalar_loss(params, rollout_batch(), step)
 
 
@@ -293,8 +294,9 @@ def test_the_rollout_batch_feeds_the_objective():
     width = PROMPT_WIDTH
     prompts = np.tile(np.arange(1, width + 1, dtype=np.int32), (2, 1))
     info = max(len("rule"), len("other"))
-    pad = lambda text: np.pad(
-        np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+    def pad(text):
+        return np.pad(
+            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
     batch = {
         PROMPT_KEY: prompts,
         LENGTH_KEY: np.full(2, width, np.int32),
@@ -325,7 +327,8 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
                              max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")
-    pad = lambda text: np.pad(np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+    def pad(text):
+        return np.pad(np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
 
     def batch(offset):
         rows = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None] + offset

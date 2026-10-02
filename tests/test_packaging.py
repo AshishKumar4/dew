@@ -20,9 +20,14 @@ def test_the_accelerator_extras_install_what_the_installed_jax_asks_for():
         return canonicalize_name(requirement.name), frozenset(requirement.extras), str(requirement.specifier)
 
     for extra in ("cuda12", "cuda13", "tpu"):
-        wanted = {key(requirement) for requirement in map(Requirement, importlib.metadata.requires("jax") or ())
-                  if requirement.marker is not None and requirement.marker.evaluate({"extra": extra})
-                  and not requirement.marker.evaluate({"extra": ""}) and requirement.name != "jaxlib"}
+        wanted = {
+            key(requirement)
+            for requirement in map(Requirement, importlib.metadata.requires("jax") or ())
+            if requirement.marker is not None
+            and requirement.marker.evaluate({"extra": extra})
+            and not requirement.marker.evaluate({"extra": ""})
+            and requirement.name != "jaxlib"
+        }
         assert wanted, f"the installed jax has no {extra} extra"
         assert {key(Requirement(line)) for line in extras.get(extra, ())} == wanted, extra
 

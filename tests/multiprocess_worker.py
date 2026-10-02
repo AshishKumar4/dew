@@ -582,7 +582,8 @@ def mode_fit(args) -> dict:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
             loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
-        open_train = lambda partition: iter(loader)
+        def open_train(partition):
+            return iter(loader)
     val, available = None, None
     scored = []
     evaluate = trainer.objective.evaluate
@@ -942,6 +943,12 @@ def _evaluation_parts(case: _EvaluationCase):
                 raise ValueError("tracker rendering failed")
             assert np.shape(artifact.features) == (8, 1)
 
+    batches, validation = _evaluation_data(case)
+    return Numerical, Ratio, Drawing, batches, validation
+
+
+def _evaluation_data(case: _EvaluationCase):
+    """The validation iterator and its failure lifecycle, separate from consumers."""
     def batches():
         try:
             count = 0 if case.failure == "empty" else (
@@ -963,7 +970,7 @@ def _evaluation_parts(case: _EvaluationCase):
             raise OSError("iterator construction failed")
         return batches()
 
-    return Numerical, Ratio, Drawing, batches, validation
+    return batches, validation
 
 
 def mode_evaluation_contract(args) -> dict:
@@ -1047,7 +1054,9 @@ def mode_evaluation_replicas(args) -> dict:
     state, _, _ = trainer.place()
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
-    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3)
+    data = Dataset(
+        train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3
+    )
     measured = Evaluation.run(trainer.objective, state.params, data.val, metrics=(Count(),),
                         key=state.key, mesh=trainer.device_mesh).scalars
     unconsumed = Evaluation.run(trainer.objective, state.params, data.val, key=state.key,
@@ -1055,12 +1064,37 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed}
 
 
+def _builtin_sampler_failure(kind, phase, source, rank, fault):
+    """A sampler failure at its public invocation or artifact preflight seam."""
+    import jax
+
+    import dew.sampling.text as text_sampling
+
+    def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
+        if phase == "generation" and rank == source:
+            raise fault
+        if kind == "diffusion":
+            result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
+        else:
+            result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
+        if phase == "preflight" and rank == source:
+            result = jax.device_put(result, jax.local_devices()[0])
+            result.delete()
+        if kind == "lm":
+            return text_sampling.Generation(
+                tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
+                terminated=jax.numpy.zeros((1,), bool),
+                behavior_log_probs=jax.numpy.zeros((1, 1)),
+                raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
+        return result
+    return sample_failure
+
+
 def mode_builtin_preview_failures(args) -> dict:
     """Exercise nested builtin preview failures while both ranks remain alive."""
     import jax
     import optax
 
-    import dew.sampling.text as text_sampling
     from dew.data import Dataset
     from dew.diffusion import presets
     from dew.diffusion.discrete import MDLM
@@ -1071,7 +1105,7 @@ def mode_builtin_preview_failures(args) -> dict:
     from dew.objectives.diffusion import DiffusionObjective
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler, text as text_sampling
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     rank = jax.process_index()
@@ -1103,35 +1137,21 @@ def mode_builtin_preview_failures(args) -> dict:
         original_generate = TextGeneration.__call__
         closed = []
 
-        def validation():
-            try:
-                yield batch
-            finally:
-                closed.append(case)
-
-        data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(), records=6, batch=6)
         for phase in ("setup", "generation", "preflight"):
             for source in (0, 1):
                 case = f"{kind}-{phase}-{source}"
                 fault = ValueError(f"{case}: local sampler failure before device work")
 
-                def sample_failure(*sample_args, **kwargs):
-                    if phase == "generation" and rank == source:
-                        raise fault
-                    if kind == "diffusion":
-                        result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
-                    else:
-                        result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
-                    if phase == "preflight" and rank == source:
-                        result = jax.device_put(result, jax.local_devices()[0])
-                        result.delete()
-                    if kind == "lm":
-                        return text_sampling.Generation(
-                            tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
-                            terminated=jax.numpy.zeros((1,), bool),
-                            behavior_log_probs=jax.numpy.zeros((1, 1)),
-                            raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
-                    return result
+                def validation(*, batch=batch, case=case, closed=closed):
+                    try:
+                        yield batch
+                    finally:
+                        closed.append(case)
+
+                data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(),
+                               records=6, batch=6)
+
+                sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
 
                 if phase == "setup":
                     if rank == source:
@@ -1187,7 +1207,7 @@ def mode_training_contract(args) -> dict:
 
     checkpoints = Checkpoints(args.run_dir)
     def build():
-        return ShortScaleTrainer(Rows(True), optax.adamw(.03, weight_decay=.1),
+        return ShortScaleTrainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
                                  key=jax.random.PRNGKey(9), accumulation=2,
                                  dynamic_scale=True, checkpoints=checkpoints)
     trainer = build()
@@ -1259,7 +1279,7 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
     captured = None if rank == 0 else object()
 
     def rewrite(state, logits):
-        return logits if captured is None else logits
+        return jax.lax.select(captured is None, logits, logits)
 
     for fault in ("token", "length", "key", "component"):
         broken = {name: np.array(value, copy=True) for name, value in local.items()}
@@ -1318,7 +1338,10 @@ def mode_rollout(args) -> dict:
 
     def inputs_for(records):
         tokens = jnp.asarray(records["prompt"])
-        mask = jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+        mask = (
+            jnp.arange(tokens.shape[1])[None, :]
+            >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+        )
         return ModelInputs(tokens, {"attention_mask": mask})
 
     greedy = generate(model, params, inputs_for(batch), 4, key=jax.random.key(1),
@@ -1350,8 +1373,12 @@ def mode_rollout(args) -> dict:
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
-    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls).host()
-    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
+    through_task = TextGeneration(model, state.params)(
+        resident, 4, key=jax.random.key(27), sampling=controls
+    ).host()
+    direct = generate(
+        model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls
+    ).host()
     invalid_errors = {}
     if processes > 1:
         invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
@@ -1425,8 +1452,9 @@ def mode_inference_pipeline(args) -> dict:
             "guidance": lambda: images(prompts, steps=3, key=5, guidance="invalid" if rank == 1 else 3.0),
             "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, key=5),
             "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, key=5),
-            "prepared": lambda: images(replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared,
-                                        steps=3, key=5),
+            "prepared": lambda: images(
+                replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared, steps=3, key=5
+            ),
             "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, key=5),
             "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, key=5),
             "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, key=5),
@@ -1703,7 +1731,7 @@ def mode_decoding_components(args) -> dict:
     from dew.inference.pipeline import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
-    from dew.sampling import Beam, Sampling, Speculative, decoding
+    from dew.sampling import Sampling, decoding
     from dew.training import Layout, MeshSpec
 
     rank, processes = jax.process_index(), jax.process_count()
@@ -1738,15 +1766,27 @@ def mode_decoding_components(args) -> dict:
     refused = []
     if processes > 1:
         divergences = {
-            "criterion payload": (chain, (decoding.EndOfSequence(
-                jnp.asarray([3 if rank == 1 else 5], jnp.int32)),)),
+            "criterion payload": (
+                chain,
+                (decoding.EndOfSequence(jnp.asarray([3 if rank == 1 else 5], jnp.int32)),),
+            ),
             "transform identity": (
-                chain[:1] + (jax.tree_util.Partial(
-                    (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last),)
-                + chain[2:], ()),
+                (
+                    *chain[:1],
+                    jax.tree_util.Partial(
+                        (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last
+                    ),
+                    *chain[2:],
+                ),
+                (),
+            ),
             "transform payload": (
-                (decoding.RepetitionPenalty(1.3),
-                 decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32))), ()),
+                (
+                    decoding.RepetitionPenalty(1.3),
+                    decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32)),
+                ),
+                (),
+            ),
         }
         for name, (logits, stopping) in divergences.items():
             try:
@@ -1764,6 +1804,28 @@ def mode_decoding_components(args) -> dict:
                       stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
         if int(agreed.lengths.sum()) < 1:
             raise AssertionError("the agreed request emitted nothing")
+    searched, drafted = _ragged_decoding_checks(model, params, prompts, placed, request)
+    return {
+        "process_index": rank,
+        "rows": int(result.rows),
+        "tokens": result.tokens.tolist(),
+        "lengths": result.lengths.tolist(),
+        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
+        "refused": refused,
+        "beam_tokens": searched.tokens.tolist(),
+        "beam_lengths": searched.lengths.tolist(),
+        "draft_tokens": drafted.tokens.tolist(),
+        "draft_lengths": drafted.lengths.tolist(),
+    }
+
+
+def _ragged_decoding_checks(model, params, prompts, placed, request):
+    """Check search and speculation while peers finish different-length rows."""
+    import jax.numpy as jnp
+
+    from dew.inference import TextGeneration
+    from dew.sampling import Beam, Sampling, Speculative, decoding
+
     # Ragged rows: a criterion ends some of them early, so the search and the
     # speculative block both have to finish while their peers keep going.
     # A token the greedy walk of the global prompts reaches at different
@@ -1784,18 +1846,7 @@ def mode_decoding_components(args) -> dict:
                            stopping=early)(request, 5, key=7).host()
     if not np.array_equal(drafted.tokens, plain.tokens):
         raise AssertionError("speculation and sampling disagreed on a greedy pool run")
-    return {
-        "process_index": rank,
-        "rows": int(result.rows),
-        "tokens": result.tokens.tolist(),
-        "lengths": result.lengths.tolist(),
-        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
-        "refused": refused,
-        "beam_tokens": searched.tokens.tolist(),
-        "beam_lengths": searched.lengths.tolist(),
-        "draft_tokens": drafted.tokens.tolist(),
-        "draft_lengths": drafted.lengths.tolist(),
-    }
+    return searched, drafted
 
 
 def mode_masked_generation(args) -> dict:

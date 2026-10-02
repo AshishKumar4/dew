@@ -15,16 +15,12 @@ afterwards.
 
 import json
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
@@ -40,6 +36,10 @@ from dew.objectives.lm import LMObjective
 from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 RES = 16
 FRAMES = 2
@@ -106,7 +106,7 @@ class Case:
     config: dict
     frames: int = 0
     """Video architectures take (frames, H, W, C) samples; 0 means images."""
-    predictor: Optional[dict] = None
+    predictor: dict | None = None
     """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
     seq_len: int = 0
     """Set for language models: batches are token windows, not images."""
@@ -281,7 +281,8 @@ def model_variables(case: Case):
     """The case's variables as shapes."""
     model = models.build(case.architecture, **case.config)
     rng = jax.random.key(0)
-    init = lambda *args: jax.eval_shape(model.init, *args)
+    def init(*args):
+        return jax.eval_shape(model.init, *args)
     if case.is_lm:
         return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
     sample = jnp.ones((1, *case.sample_shape), jnp.float32)
@@ -295,7 +296,7 @@ def text_condition() -> Condition:
     return Condition(StubText.from_pretrained("stub"), field="text", unconditional="")
 
 
-def batches(case: Case, encoder: Optional[ConditionEncoder]):
+def batches(case: Case, encoder: ConditionEncoder | None):
     """uint8-range samples, as the data pipeline delivers them, with labels for
     the probes and tokenized text for the conditioned models."""
     rng = np.random.default_rng(0)

@@ -189,9 +189,11 @@ def test_a_container_has_no_network_a_read_only_root_and_a_deadline():
 
 def test_a_runtime_that_cannot_start_the_container_raises():
     # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
-    with SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet:
-        with pytest.raises(RuntimeError, match="created no container"):
-            fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+    with (
+        SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet,
+        pytest.raises(RuntimeError, match="created no container"),
+    ):
+        fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
