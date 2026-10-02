@@ -228,7 +228,7 @@ class TextToImage:
         params = restore_variables(directory, ema=averaged, step=step, mesh=mesh, layout=layout,
                                    param_dtype=param_dtype, parameter_roots=config.parameter_roots)
         objective = config.build(variables=params)
-        return cls.from_objective(objective, _with_drawn_tables(objective, params))
+        return cls.from_objective(objective, params)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
@@ -643,51 +643,6 @@ def restore_variables(directory: str, *, ema: bool | None, step: int | str | Non
         params = merge(params, values["ema"])
 
     return params
-
-
-def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> Variables:
-    """`variables` with every Fourier table the objective's model draws and
-    the checkpoint lacks (`is_fourier_table`).
-
-    A run written before the table became a variable trained against the
-    table its variable initializer draws. Apply the saved parameters with only
-    constants mutable: parameters are read, not drawn. Flax still checks their
-    shapes abstractly. The shape pass finds absent tables, and the compiled
-    pass computes only those leaves.
-    """
-    from flax.traverse_util import flatten_dict, unflatten_dict
-
-    from dew.checkpoints import absent
-    from dew.nn.blocks import is_fourier_table
-
-    def constants(params):
-        conditions = objective.encode(params.get("encoders", {}))
-        if objective.inputs.mask is not None:
-            conditions = {**conditions, "mask": jnp.zeros((1, *objective.latent_shape[:-1], 1)),
-                          "masked_image": jnp.zeros((1, *objective.latent_shape))}
-        _, tables = objective.model.apply(
-            objective.trainable(params), jnp.ones((1, *objective.latent_shape)), jnp.ones((1,)),
-            **conditions, mutable=["constants"])
-        return tables
-
-    drawn = [path for path in absent(jax.eval_shape(constants, variables), variables)
-             if is_fourier_table(path)]
-    if not drawn:
-        return variables
-
-    def leaf(tree, path):
-        for entry in path:
-            tree = tree[entry.key]
-        return tree
-
-    mesh = mesh_of(variables)
-    values = jax.jit(lambda params: [leaf(constants(params), path) for path in drawn],
-                     out_shardings=None if mesh is None else
-                     jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))(variables)
-    flat = flatten_dict(variables, keep_empty_nodes=True)
-    flat.update({tuple(entry.key for entry in path): value
-                 for path, value in zip(drawn, values, strict=True)})
-    return unflatten_dict(flat)
 
 
 @functools.cache

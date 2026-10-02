@@ -545,19 +545,6 @@ def _filled(template, restored: dict, step: int):
     return template.replace(**restored)
 
 
-def absent(expected, held) -> list[jax.tree_util.KeyPath]:
-    """The paths of `expected`'s leaves that `held` has no leaf at.
-
-    `held` is what a checkpoint stores (`Checkpoints.stored`, or a restored
-    tree): a model that gained a variable after the checkpoint was written
-    expects a leaf the checkpoint lacks, and `Checkpoints.restore` refuses
-    it unless the caller supplies it.
-    """
-    have = {jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(held)[0]}
-    return [path for path, _ in jax.tree_util.tree_flatten_with_path(expected)[0]
-            if jax.tree_util.keystr(path) not in have]
-
-
 class _RankedSteps(preservation.PreservationPolicy):
     def __init__(self, checkpoints):
         self.checkpoints = checkpoints
@@ -1151,8 +1138,7 @@ class Checkpoints:
         mesh this run is using. `None` restores every leaf as a host array.
         A template leaf the checkpoint lacks is refused by name, unless the
         template holds it as a concrete array, which is then restored as it
-        stands: that is how a caller supplies what an older checkpoint did
-        not store (`absent` finds those leaves).
+        stands.
 
         A step that is the local one every process holds is read from the
         local directory, onto the placement it was written with; any other

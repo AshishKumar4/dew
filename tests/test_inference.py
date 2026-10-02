@@ -9,8 +9,6 @@ trainer has just written.
 
 import dataclasses
 import json
-import shutil
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +29,7 @@ from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.sampling import CFG, Euler, Heun, TextToImage
-from dew.sampling.pipelines import Images, _with_drawn_tables
+from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -177,71 +175,6 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     assert pipe.process.schedule.shift == 3.0 and pipe.process.schedule.logit_mean == 0.5
     assert type(pipe.process.prediction) is FlowMatchPredictionTransform
     assert pipe.process.sampling is None
-
-
-def test_legacy_fourier_restore_applies_saved_weights_without_initializing_them(monkeypatch):
-    """Only the missing deterministic table is drawn; saved weights are authoritative."""
-    config = run_config("unused")
-    objective = config.build()
-    original = objective.init(jax.random.key(0))
-    stored = {name: tree for name, tree in original.items() if name != "constants"}
-
-    def forbidden_init(*args, **kwargs):
-        raise AssertionError("a restored model must not initialize a second set of weights")
-
-    monkeypatch.setattr(type(objective.model), "init", forbidden_init)
-    restored = _with_drawn_tables(objective, stored)
-    for got, want in zip(jax.tree.leaves(restored["constants"]),
-                         jax.tree.leaves(original["constants"]), strict=True):
-        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
-                                      np.ascontiguousarray(want).view(np.uint8))
-    assert all(got is want for got, want in zip(jax.tree.leaves(restored["params"]),
-                                               jax.tree.leaves(stored["params"]), strict=True))
-    given = objective.encode(stored["encoders"])
-    x, t = jnp.ones((1, *objective.latent_shape)), jnp.ones((1,))
-    with jax.default_matmul_precision("highest"):
-        expected = jax.jit(objective.model.apply)(original, x, t, **given)
-        actual = jax.jit(objective.model.apply)(restored, x, t, **given)
-    np.testing.assert_array_equal(actual, expected)
-
-
-def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_it_did(
-        tmp_path, monkeypatch):
-    """A checkpoint written before FourierEmbedding's table became a variable
-    lacks it. Loading or resuming the run takes the table from the model's
-    init, which draws the one the run trained against, so the run samples
-    and trains on bit for bit as it did, on the suite's 8-device mesh too,
-    where each device's batch is smaller than the table."""
-    from dew.nn.blocks import FourierEmbedding
-
-    tables = []
-
-    def drawn_in_setup(self):  # FourierEmbedding.setup before the table was a variable
-        drawn = np.random.RandomState(42).normal(size=(self.features // 2,))
-        tables.append(drawn.astype(np.float32) * self.scale)
-        self.frequencies = SimpleNamespace(value=jnp.asarray(drawn, dtype=jnp.float32) * self.scale)
-
-    old, resumed_before = tmp_path / "old", tmp_path / "resumed-before"
-    with monkeypatch.context() as before:
-        before.setattr(FourierEmbedding, "setup", drawn_in_setup)
-        make_run(old)
-        shutil.copytree(old, resumed_before)
-        sampled = TextToImage.from_run(str(old))(["a", "b"], key=4).host().images
-        _, trained = make_run(resumed_before, steps=3)
-    assert "constants" not in Checkpoints(str(old)).stored()["params"]
-
-    pipe = TextToImage.from_run(str(old))
-    table = pipe.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
-    np.testing.assert_array_equal(np.asarray(table), tables[0])
-    np.testing.assert_array_equal(pipe(["a", "b"], key=4).host().images, sampled)
-
-    _, resumed = make_run(old, steps=3)
-    np.testing.assert_array_equal(
-        np.asarray(resumed.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]),
-        tables[0])
-    for expected, actual in zip(jax.tree.leaves(trained.params["params"]),
-                                jax.tree.leaves(resumed.params["params"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):
