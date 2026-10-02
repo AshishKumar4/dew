@@ -70,11 +70,12 @@ class Inference:
         try:
             started = time.perf_counter()
             if self.kind == "text":
-                from dew.interop import load_pretrained
+                import jax.numpy as jnp
+                from dew.interop import PretrainedDecoder
                 from dew.inference import Server
                 from dew.sampling import Sampling
 
-                bundle = load_pretrained(f"/opt/models/{TEXT_MODEL}", dtype="float32", max_seq_len=256)
+                bundle = PretrainedDecoder.load(f"/opt/models/{TEXT_MODEL}", dtype=jnp.float32, max_seq_len=256)
                 task = bundle.text_generation(sampling=Sampling(temperature=0))
                 server = Server.from_task(task, slots=4, capacity=128)
                 # Server accepts bare token rows. The source processor supplies ordinary

@@ -35,7 +35,8 @@ for line in pathlib.Path('/opt/live/text-models').read_text().split():
 print('download_seconds',time.perf_counter()-start,flush=True)
 # Install configs used by from_pretrained while outbound access is still allowed.
 from dew.sampling import TextToImage, CFG, DPMSolverMultistep
-from dew.interop import load_pretrained
+import jax.numpy as jnp
+from dew.interop import PretrainedDecoder
 from dew.inference import Server
 from dew.sampling import Sampling
 import jax
@@ -45,7 +46,7 @@ for steps in (15,30):
     t=time.perf_counter()
     pipe(['a turquoise alpine lake'],key=0,steps=steps,sampler=DPMSolverMultistep(),guidance=CFG(5.0)).host()
     print('image_warm',steps,time.perf_counter()-t,flush=True)
-bundle=load_pretrained('/opt/models/HuggingFaceTB/SmolLM2-135M-Instruct',dtype='float32',max_seq_len=256)
+bundle=PretrainedDecoder.load('/opt/models/HuggingFaceTB/SmolLM2-135M-Instruct',dtype=jnp.float32,max_seq_len=256)
 server=Server.from_task(bundle.text_generation(sampling=Sampling(temperature=0)),slots=4,capacity=128)
 ids=bundle.processor('The capital of France is').tokens[0]
 for _ in range(4): server.submit(ids,24,key=0)
