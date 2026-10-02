@@ -419,7 +419,7 @@ BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad
                 max_new_tokens=None, max_length=None, n=1)
 task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
-Pretrained.load(name_or_dir, *, dtype="bfloat16", param_dtype="float32", attention_impl="auto",
+Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, attention_impl="auto",
                 max_seq_len=None, revision=None, gguf_file=None, single_file=None, mesh=None,
                 layout=None, fallback=None) -> the kind it is called on, or the kind the source is
 PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
@@ -540,7 +540,7 @@ The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers s
 from dew.interop import PretrainedPipeline
 from dew.objectives.diffusion import DiffusionObjective
 
-source = PretrainedPipeline.load("./image-checkpoint", dtype="float32")
+source = PretrainedPipeline.load("./image-checkpoint", dtype=jnp.float32)
 images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
 objective = DiffusionObjective(
     source.model, source.process, source.inputs,
