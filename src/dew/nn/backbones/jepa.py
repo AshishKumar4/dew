@@ -27,11 +27,7 @@ from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pa
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..sharding import constrain, down_projection
-
-
-def gather_tokens(tokens, indices):
-    """Select tokens per sample: [B, S, F] and [B, N] -> [B, N, F]."""
-    return jnp.take_along_axis(tokens, indices[..., None], axis=-2)
+from .dit import gather_tokens
 
 
 class TokenStack(nn.Module):

@@ -15,14 +15,6 @@ from .conv import Conv
 from .precision import at_least_fp32
 
 
-def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
-    """S4D-Lin real part: A_real_n = -1/2 for every state, stored as the log
-    of its negative (Gu, Gupta, Goel and Re, "On the Parameterization and
-    Initialization of Diagonal State Space Models", 2022, section 4; S5's
-    HiPPO-N poles share the same real part, Smith et al. 2023, section 4.1)."""
-    return jnp.full(shape, jnp.log(0.5), dtype)
-
-
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
     """S4D-Lin imaginary part: A_imag_n = pi * n."""
     state_dim = shape[0]
@@ -59,10 +51,12 @@ class S5Layer(nn.Module):
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
 
         # A: diagonal complex state matrix, S4D-Lin init, parameterized as
-        # log of the negative real part for stability
+        # log of the negative real part for stability: A_real_n = -1/2 for
+        # every state (Gu, Gupta, Goel and Re 2022, section 4; S5's HiPPO-N
+        # poles share it, Smith et al. 2023, section 4.1)
         log_A_real = self.param(
             'log_A_real',
-            hippo_log_a_real_init,
+            nn.initializers.constant(jnp.log(0.5), jnp.float32),
             (self.state_dim,)
         )
         A_imag = self.param(
