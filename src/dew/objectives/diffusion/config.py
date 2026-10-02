@@ -741,7 +741,7 @@ class DiffusionRunConfig(RunConfig):
         name, revision = split_revision(self.pretrained)
         height, width = self.sample_field().shape[-3:-1]
         return load_diffusion_source(
-            name, revision=revision, dtype=self.model.dtype,
+            name, revision=revision, dtype=self.model.dtype or "bfloat16",
             param_dtype=self.model.param_dtype or "float32",
             attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
 

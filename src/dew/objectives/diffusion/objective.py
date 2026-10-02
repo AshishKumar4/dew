@@ -226,7 +226,7 @@ class DiffusionObjective(Objective[Ratio]):
         return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
                 'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
-                'solver': _to_json(self.sampler, type(self.sampler)),
+                'solver': _to_json(self.solver, type(self.solver)),
                 'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:

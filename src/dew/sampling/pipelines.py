@@ -217,7 +217,7 @@ class TextToImage:
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
         from dew.records import integer, record as fields, text
-        from dew.registry import objectives, samplers
+        from dew.registry import objectives, solvers
 
         record = run_record(directory, step)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
@@ -231,12 +231,12 @@ class TextToImage:
         autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
             fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
-        solver = samplers.build(text(solver_record['name'], 'solver name'),
+        solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
                    inputs, params, autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
-                   guidance=guidance, sampler=solver)
+                   guidance=guidance, solver=solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
