@@ -553,11 +553,11 @@ class CausalTransformer(nn.Module):
     cache cursor.
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
-    a kind does. KV sharing has two spellings that resolve to one plan:
-    `num_kv_shared_layers` trailing layers (Gemma 3n/4) or `kv_shared_layers`
-    by index (GLM's IndexShare). A sharing layer reads what the last earlier
-    non-sharing layer of its kind stashed: keys and values for attention,
-    the indexer's selection for MLA.
+    a kind does. `kv_shared_layers` names the layers that share by index (a
+    trailing run for Gemma 3n/4, one after every indexer layer for GLM's
+    IndexShare). A sharing layer reads what the last earlier non-sharing
+    layer of its kind stashed: keys and values for attention, the indexer's
+    selection for MLA.
 
     Active attention dropout runs the reference kernel, and an explicit
     fused kernel that cannot drop probabilities is refused.
@@ -673,8 +673,7 @@ class CausalTransformer(nn.Module):
     """Gemma 3n/4 per-layer inputs: an extra table read per layer and added
     to its input through its own gate."""
     per_layer_input_vocab: int | None = None  # None: vocab_size
-    num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    kv_shared_layers: tuple[int, ...] | None = None  # the sharing layers named one by one
+    kv_shared_layers: tuple[int, ...] | None = None  # layers reusing a provider's K/V; None disables
     mixer: MixerBase | None = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
@@ -843,38 +842,20 @@ class CausalTransformer(nn.Module):
         mixture = self.mixture
         if mixture is None:
             return ()
-        if mixture.layers is not None:
-            return tuple(mixture.layers)
-        if mixture.every is not None:
-            return tuple(index for index in range(self.num_layers)
-                         if (index + 1) % mixture.every == 0)
-        return tuple(range(self.num_layers))
+        return tuple(range(self.num_layers)) if mixture.layers is None else mixture.layers
 
     @property
     def sharing_layers(self) -> tuple[int, ...]:
-        """The layers that read another layer's stash, in order: the trailing
-        num_kv_shared_layers or the ones kv_shared_layers names."""
-        if self.num_kv_shared_layers and self.kv_shared_layers is not None:
-            raise ValueError(
-                "num_kv_shared_layers and kv_shared_layers both name the sharing "
-                "layers; a model spells them one way")
-        if self.kv_shared_layers is not None:
-            outside = sorted(index for index in self.kv_shared_layers
-                             if not 0 <= index < self.num_layers)
-            if outside:
-                raise ValueError(
-                    f"kv_shared_layers {outside} name no layer of a "
-                    f"{self.num_layers}-layer model")
-            return tuple(sorted(set(self.kv_shared_layers)))
-        if not self.num_kv_shared_layers:
+        """The layers that read another layer's stash, in order."""
+        if self.kv_shared_layers is None:
             return ()
-        first = self.num_layers - self.num_kv_shared_layers
-        if first <= 0:
+        outside = sorted(index for index in self.kv_shared_layers
+                         if not 0 <= index < self.num_layers)
+        if outside:
             raise ValueError(
-                f"num_kv_shared_layers ({self.num_kv_shared_layers}) has to leave "
-                f"a provider: it must be between 1 and num_layers - 1 "
-                f"({self.num_layers - 1})")
-        return tuple(range(first, self.num_layers))
+                f"kv_shared_layers {outside} name no layer of a "
+                f"{self.num_layers}-layer model")
+        return tuple(sorted(set(self.kv_shared_layers)))
 
     @property
     def kv_sharing(self) -> dict:
@@ -1098,7 +1079,7 @@ class CausalTransformer(nn.Module):
         if self.use_double_wide_mlp and not sharing:
             raise ValueError(
                 "use_double_wide_mlp widens the MLP of the layers that share "
-                "their keys and values, so it needs num_kv_shared_layers set")
+                "their keys and values, so it needs kv_shared_layers set")
         ple = self.per_layer_input_dim
         if ple is not None and ple < 1:
             raise ValueError(

@@ -101,7 +101,7 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         num_layers=12,
         layer_types=("sliding_attention",) * 5 + ("full_attention",)
         + ("sliding_attention",) * 5 + ("full_attention",),
-        num_kv_shared_layers=4, max_seq_len=16)
+        kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
     config.update(overrides)
     return models.build("causal_transformer", **{**with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
@@ -116,7 +116,7 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         layer_types=("sliding_attention",) * 4 + ("full_attention",)
         + ("sliding_attention",) * 4 + ("full_attention",),
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
-        num_kv_shared_layers=2, max_seq_len=16)
+        kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
     return models.build("causal_transformer", **{**with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
@@ -469,7 +469,7 @@ def test_a_pipeline_refuses_a_stack_it_cannot_split_evenly():
     with pytest.raises(ValueError, match="layer 2 differs from layer 0 in routed"):
         run(tiny(mixture={"experts": 4, "top_k": 2, "layers": (2, 3)}))
     with pytest.raises(ValueError, match="layer 2 differs from layer 0 in provider"):
-        run(tiny(num_kv_shared_layers=1))
+        run(tiny(kv_shared_layers=(3,)))
 
 
 @mesh_lane
