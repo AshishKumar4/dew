@@ -239,14 +239,15 @@ class TextToImage:
                    guidance=guidance, solver=solver)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
+        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)), ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
     @classmethod
