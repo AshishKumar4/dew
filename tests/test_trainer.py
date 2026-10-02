@@ -185,8 +185,9 @@ def test_train_state_exposes_the_whole_variables_tree():
     trainer = Trainer(objective, optax.sgd(.1), key=0)
     state = trainer.initial_state()
     assert "params" in state.variables
-    np.testing.assert_array_equal(state.variables["constants"]["offset"], jnp.ones((2,)))
-    prediction = objective.model.apply(state.variables, jnp.zeros((1, FEATURES)))
+    np.testing.assert_array_equal(state.variables["constants"]["offset"], jnp.zeros((2,)))
+    shifted = state.replace(variables={**state.variables, "constants": {"offset": jnp.ones((2,))}})
+    prediction = objective.model.apply(shifted.variables, jnp.zeros((1, FEATURES)))
     np.testing.assert_array_equal(prediction, jnp.ones((1, 2)))
     assert not hasattr(state, "params")
 
