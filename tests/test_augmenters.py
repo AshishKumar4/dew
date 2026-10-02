@@ -353,7 +353,7 @@ def test_a_record_caption_is_taken_as_it_is(column):
 
 
 def test_a_record_with_no_caption_column_says_what_it_has():
-    with pytest.raises(KeyError, match="'caption' or a 'text' column"):
+    with pytest.raises(KeyError, match=r"one of the columns \['caption', 'text'\], this one has \['image', 'url'\]"):
         images.record_caption({"image": None, "url": "x"})
 
 
