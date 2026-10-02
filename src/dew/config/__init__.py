@@ -664,8 +664,7 @@ class RunConfig:
     """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(
-        default_factory=lambda: datasets["oxford_flowers102"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
