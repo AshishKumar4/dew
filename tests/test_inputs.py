@@ -7,14 +7,6 @@ copying resident inputs through the host.
 
 import numpy as np
 
-from dew.inputs import Field, pixel_field
-from dew.nn.vision import PIXEL_VALUES_KEY
-
-
-def test_pixel_field_names_the_batch_key_and_shape():
-    assert pixel_field(28, 28) == Field(PIXEL_VALUES_KEY, (3, 28, 28))
-    assert pixel_field(16, 16, 1).shape == (1, 16, 16)
-
 
 def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     import jax

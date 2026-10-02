@@ -363,7 +363,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
     `processor` of None, which is also what leaves a directory that
     `ollama create` and llama.cpp's converter refuse.
     """
-    from dew.data import tokenizer_for
+    from dew.data.text import tokenizer_for
     from dew.interop import load_pretrained
 
     recipe = load_recipe()

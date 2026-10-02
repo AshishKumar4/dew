@@ -15,7 +15,7 @@ import optax
 
 from dew import Field, Trainer
 from dew.data import Dataset
-from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 
 rng = np.random.default_rng(0)
 images = rng.integers(0, 256, size=(8, 16, 16, 3), dtype=np.uint8)
@@ -24,7 +24,7 @@ data = Dataset(train=lambda partition: itertools.repeat({"image": images}),
 encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
 predictor = JepaPredictor(grid=(4, 4), emb_features=32,
                           predictor_features=16, num_layers=1, num_heads=2)
-mask = multi_block_mask((4, 4), num_targets=1, scale=(0.25, 0.25))
+mask = MultiBlockMask.for_grid((4, 4), num_targets=1, scale=(0.25, 0.25))
 objective = JepaObjective(encoder, predictor, mask=mask,
                           sample=Field("image", (16, 16, 3)))
 trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(0))
@@ -34,7 +34,7 @@ assert state.ema is not None
 print("Completed three JEPA training steps.")
 ```
 
-16×16 images with 4×4 patches give a 4×4 grid. The predictor's `grid` must match the encoder's patch grid, and `multi_block_mask` picks target blocks on that grid; a combination of `scale` and aspect ratio that leaves no block that fits raises an error.
+16×16 images with 4×4 patches give a 4×4 grid. The predictor's `grid` must match the encoder's patch grid, and `MultiBlockMask.for_grid` picks target blocks on that grid; a combination of `scale` and aspect ratio that leaves no block that fits raises an error.
 
 | Part | Role |
 |---|---|

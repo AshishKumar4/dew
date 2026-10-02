@@ -605,7 +605,7 @@ import optax
 
 from dew import Field, Trainer
 from dew.data import Loading, OxfordFlowers
-from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
@@ -632,7 +632,7 @@ def train_jepa():
     objective = JepaObjective(
         encoder,
         predictor,
-        mask=multi_block_mask((8, 8), num_targets=1, scale=(0.25, 0.25)),
+        mask=MultiBlockMask.for_grid((8, 8), num_targets=1, scale=(0.25, 0.25)),
         sample=Field("image", (64, 64, 3)),
         momentum_steps=20,
     )
@@ -912,12 +912,12 @@ To trace a chosen window of training, pass `Trainer` a `ProfileWindow` with the 
 
 ### Sweeping a hyperparameter
 
-`sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
+`RunConfig.sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
 
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, sweep
+from dew.config.sweep import grid_search
 from dew.data import TokenWindows
 
 config = RunConfig(
@@ -940,8 +940,8 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
 best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
@@ -1101,7 +1101,6 @@ dew tokenize \
 ```
 
 ```python
-import json
 from pathlib import Path
 
 import jax
@@ -1110,7 +1109,7 @@ import numpy as np
 import optax
 
 from dew import Trainer
-from dew.data import HFTokenizer, Loading, TokenWindows
+from dew.data import HFTokenizer, Loading, TokenCorpus, TokenWindows
 from dew.interop import load_pretrained, save_pretrained_decoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -1118,13 +1117,13 @@ from dew.sampling import Sampling
 
 tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
-meta = json.loads((tokens / "meta.json").read_text())
-tokenizer = HFTokenizer(meta["tokenizer"])
+corpus = TokenCorpus.read(tokens)
+tokenizer = HFTokenizer(corpus.tokenizer)
 
 data = TokenWindows(path=str(tokens), seq_len=128,
                     loading=Loading(workers=0, threads=1, read_buffer=2)
                     ).load(batch=16)
-model = CausalTransformer(vocab_size=meta["vocab_size"],
+model = CausalTransformer(vocab_size=corpus.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,
                           qk_norm=False, tie_embeddings=False)
