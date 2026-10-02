@@ -918,3 +918,59 @@ def test_diffusers_loads_a_saved_pipeline_adapter_and_predicts_what_dew_does(fam
     for name in theirs:
         np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
     assert json.loads(metadata[lora.DIFFUSERS_METADATA]) == json.loads(published[lora.DIFFUSERS_METADATA])
+
+
+def test_a_filter_trains_the_denoising_loss_alone(pipelines):
+    """`trainable` chooses among the model's leaves, so a loss head beside
+    them, or a subclass with a loss of its own, refuses one at init."""
+    from test_mean_flow import objective as mean_flow
+
+    tuned = pipelines["sd3"].lora(rank=2, modules=("to_q",), key=jax.random.key(0))
+    with pytest.raises(ValueError, match="DiffusionObjective trains a loss or heads of its own"):
+        tuned.diffusion_objective(uncertainty=8).init(jax.random.key(0))
+    own_loss = mean_flow()
+    own_loss.trainable = lambda path: True
+    with pytest.raises(ValueError, match="MeanFlowObjective trains a loss or heads of its own"):
+        own_loss.init(jax.random.key(0))
+
+
+def test_a_run_config_adapter_trains_a_diffusion_models_factors_and_nothing_else(tmp_path):
+    """`--lora` on a diffusion run, as on a decoder run: the adapted model's
+    init draws the factors, and two steps move them and leave the base
+    weights and the text tower bitwise."""
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import TFDSImages
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+    from dew.sampling import Euler
+
+    rows = jax.device_count()
+    config = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                         "num_heads": 2}, dtype="float32", attention_impl="xla"),
+        data=TFDSImages(image_size=8), solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
+        val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2, eval_every=None,
+                              checkpoint_every=None, compilation_cache_dir=None))
+    objective = config.build()
+    # The DiT's blocks are adaLN-Zero: with their modulation frozen at zero, no
+    # branch inside them carries a gradient, and the output projection does.
+    held = objective.model_variables(objective.init(jax.random.key(0)))
+    adapter, _ = LoRA.fresh(objective.model, held, {}, rank=2, alpha=4.0, modules=("final_proj",),
+                            key=jax.random.key(1))
+    config = dataclasses.replace(config, lora=adapter)
+    batch = {"image": np.full((rows, 8, 8, 3), 200, np.uint8), **objective.inputs.tokenize(["a"] * rows)}
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
+
+    state = config.train(objective, data, name="run")
+
+    assert objective.trainable is not None
+    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
+    moved = _flat(state.params["params"])
+    assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
+                          for target in adapter.targets for factor in lora.FACTORS}
+    for name, leaf in moved.items():
+        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
+    for collection in (FROZEN, "encoders"):
+        for before, after in zip(jax.tree.leaves(initial.params[collection]),
+                                 jax.tree.leaves(state.params[collection]), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)

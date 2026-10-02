@@ -814,15 +814,13 @@ class PretrainedPipeline(Pretrained):
         samples the way the source does (its solver, step count and
         guidance) unless they are passed, and an adapted bundle supplies its
         adapter's filter as `trainable`, so the run moves the factors alone.
-        The text towers and the VAE never train. An inpainting pipeline
-        trains on masks an image dataset does not carry, and is refused.
+        The text towers and the VAE never train. Batches carry the source's
+        input fields, an inpainting source's mask among them.
         """
         from dew.objectives.diffusion import DiffusionObjective
 
         if "pretrained" in options:
             raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        if self.inputs.mask is not None:
-            raise ValueError("an inpainting pipeline trains on masks an image dataset does not carry")
         if self.adapter is not None:
             if "trainable" in options:
                 raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
