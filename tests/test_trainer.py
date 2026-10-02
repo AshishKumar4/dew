@@ -178,6 +178,24 @@ def test_integer_root_seed_is_recorded_at_fit_start():
     assert started.seed == 23
 
 
+@pytest.mark.mesh
+def test_the_banner_says_how_much_of_the_parameters_the_mesh_splits(capsys):
+    """MeshSpec(fsdp=2, tensor=2) over a model whose every parameter sits
+    below the layout's min_shard splits nothing, and the run said only
+    "mesh data 2 x fsdp 2 x tensor 2". The record and the banner carry the
+    share of the parameters' bytes a parameter axis splits: none of the
+    affine map's, then all of them once the floor is one element."""
+    from dew.telemetry.records import FitStarted
+
+    for min_shard, share in ((2**16, 0.0), (1, 1.0)):
+        tracker = RecordingTracker()
+        Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2, tensor=2), tracker=tracker,
+                layout=Layout(min_shard=min_shard, tolerance=1.0)).fit(Data(), steps=1)
+        started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+        assert started.sharded == share
+        assert f"{share:.0%} of the parameters' bytes split" in capsys.readouterr().out
+
+
 def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
     def build(path=None):
         return Trainer(Regression(), optax.adam(1e-3), key=0,
