@@ -69,8 +69,8 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
-    def loss(self, params, batch, step):
-        prediction = self.model.apply(params, batch["x"])
+    def loss(self, variables, batch, step):
+        prediction = self.model.apply(variables, batch["x"])
         return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
 
 
@@ -177,6 +177,19 @@ def test_fit_lets_go_of_each_state_its_step_consumed():
     trainer.tracker = Watching()
     trainer.fit(Data(), steps=2, log_every=1)
     assert alive == [False, False]
+
+
+def test_train_state_exposes_the_whole_variables_tree():
+    objective = Regression()
+    objective.model = AffineWithOffset()
+    trainer = Trainer(objective, optax.sgd(.1), key=0)
+    state = trainer.initial_state()
+    assert "params" in state.variables
+    np.testing.assert_array_equal(state.variables["constants"]["offset"], jnp.zeros((2,)))
+    shifted = state.replace(variables={**state.variables, "constants": {"offset": jnp.ones((2,))}})
+    prediction = objective.model.apply(shifted.variables, jnp.zeros((1, FEATURES)))
+    np.testing.assert_array_equal(prediction, jnp.ones((1, 2)))
+    assert not hasattr(state, "params")
 
 
 def test_fit_trains_to_the_step_it_was_asked_for():
@@ -359,8 +372,8 @@ class Keyed(Regression):
     runs that draw different keys land in different places.
     """
 
-    def loss(self, params, batch, step):
-        base, aux = super().loss(params, batch, step)
+    def loss(self, variables, batch, step):
+        base, aux = super().loss(variables, batch, step)
         factor = 1.0 + 0.01 * jax.random.normal(step.key, ())
         return base * factor, aux
 
@@ -378,8 +391,8 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     resumed = make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=4, log_every=1)
     whole = make_trainer(objective=Keyed()).fit(Data(), steps=4, log_every=1)
 
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
+    for expected, actual in zip(jax.tree.leaves(whole.variables),
+                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
 
 
@@ -387,9 +400,9 @@ def test_the_ema_lags_the_parameters_at_the_configured_decay():
     trainer = make_trainer()
     state = trainer.initial_state()
     batch = next(Counting())
-    starts = [np.asarray(leaf) for leaf in jax.tree.leaves(state.params)]  # the step consumes `state`
+    starts = [np.asarray(leaf) for leaf in jax.tree.leaves(state.variables)]  # the step consumes `state`
     new_state, *_ = trainer.compile(state, batch)(state, batch)
-    for start, end, ema in zip(starts, jax.tree.leaves(new_state.params),
+    for start, end, ema in zip(starts, jax.tree.leaves(new_state.variables),
                                jax.tree.leaves(new_state.ema), strict=True):
         np.testing.assert_allclose(ema, .5 * start + .5 * np.asarray(end), rtol=1e-6)
     assert int(new_state.step) == int(new_state.updates) == 1
@@ -499,9 +512,9 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     tokens.tofile(tmp_path / "val.bin")
 
     class WindowsRegression(Regression):
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             x = batch["text"][:, :FEATURES].astype(jnp.float32) / 32
-            return super().loss(params, {"x": x, "y": 2 * x[:, :2]}, step)
+            return super().loss(variables, {"x": x, "y": 2 * x[:, :2]}, step)
 
     class Observed(Forwarding):
         def __init__(self, source, seen):
@@ -782,7 +795,7 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     state, _, _ = trainer.place()
     batch = next(Counting())
     step = trainer.compile(state, batch)
-    stale = jax.tree.leaves(state.params)[0]
+    stale = jax.tree.leaves(state.variables)[0]
     advanced, _loss, _, finite, _ = step(state, batch)
     assert bool(finite) and int(advanced.step) == 1
     assert stale.is_deleted()
@@ -844,7 +857,7 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     state, _, position = resumed.place()
 
     assert int(state.step) == 3, "the step counter was reset"
-    for field in ("params", "opt_state", "ema"):
+    for field in ("variables", "opt_state", "ema"):
         for before, after in zip(jax.tree.leaves(getattr(trained, field)),
                                  jax.tree.leaves(getattr(state, field)), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=field)
@@ -855,7 +868,7 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
 def held_state(params, ema):
     """A train state that holds `params` and `ema` and scalars beside them."""
     count = jnp.zeros((), jnp.int32)
-    return TrainState(step=count, microstep=count, updates=count, params=params,
+    return TrainState(step=count, microstep=count, updates=count, variables=params,
                       opt_state={"count": count}, ema=ema,
                       key=jax.random.key_data(jax.random.key(0)), scale=None,
                       window_size=jnp.ones((), jnp.int32), accumulation=None)
@@ -906,12 +919,12 @@ def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
 
     whole, _ = checkpoints.restore()
     ema_alone, _ = checkpoints.restore({"ema": typed(state.ema)})
-    pinned, _ = checkpoints.restore({"params": typed(state.params),
+    pinned, _ = checkpoints.restore({"variables": typed(state.variables),
                                      "ema": typed(state.ema, "pinned_host")})
-    resumed, _ = checkpoints.restore(held_state(typed(state.params), typed(state.ema)))
+    resumed, _ = checkpoints.restore(held_state(typed(state.variables), typed(state.ema)))
     for restored in (whole["ema"], ema_alone["ema"], pinned["ema"], resumed.ema):
         assert jax.tree.all(jax.tree.map(same_bits, state.ema, restored))
-    assert jax.tree.all(jax.tree.map(same_bits, state.params, resumed.params))
+    assert jax.tree.all(jax.tree.map(same_bits, state.variables, resumed.variables))
     assert all(leaf.sharding.memory_kind == "pinned_host" for leaf in jax.tree.leaves(pinned["ema"]))
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), checkpoints.stored()["ema"]) == \
         jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), state.ema)
@@ -937,7 +950,7 @@ def test_an_ema_held_in_lists_comes_back_bit_for_bit(tmp_path):
 
     whole, _ = checkpoints.restore()
     alone, _ = checkpoints.restore({"ema": typed(ema)})
-    beside, _ = checkpoints.restore({"params": typed(params, jnp.bfloat16), "ema": typed(ema)})
+    beside, _ = checkpoints.restore({"variables": typed(params, jnp.bfloat16), "ema": typed(ema)})
     for restored in (whole["ema"], alone["ema"], beside["ema"]):
         assert jax.tree.all(jax.tree.map(same_bits, ema, restored))
 
@@ -989,7 +1002,7 @@ def test_a_checkpoint_without_a_leaf_the_model_now_has_is_refused_by_name(tmp_pa
     make_trainer(tmp_path).fit(Data(), steps=2, log_every=1)
     grown = Regression()
     grown.model = AffineWithOffset()
-    with pytest.raises(ValueError, match=r"holds no .*\['params'\]\['constants'\]\['offset'\]"):
+    with pytest.raises(ValueError, match=r"holds no .*\['variables'\]\['constants'\]\['offset'\]"):
         make_trainer(tmp_path, objective=grown).place()
 
 
@@ -1001,8 +1014,8 @@ def test_a_resumed_run_continues_the_data_where_it_stopped(tmp_path):
     resumed = make_trainer(tmp_path).fit(Data(), steps=4, log_every=1)
     whole = make_trainer().fit(Data(), steps=4, log_every=1)
 
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
+    for expected, actual in zip(jax.tree.leaves(whole.variables),
+                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
     # The position written at the end names the batch a resume would read next.
     _, position = Checkpoints(str(tmp_path / "run")).restore(share=DataPartition())
@@ -1108,7 +1121,7 @@ def test_a_newer_local_checkpoint_wins_the_resume_and_leaves_the_persistent_one(
 
     assert int(resumed.step) == 9
     assert jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
-                        resumed.params, whole.params) == jax.tree.map(lambda _: True, whole.params)
+                        resumed.variables, whole.variables) == jax.tree.map(lambda _: True, whole.variables)
     assert all(path.read_bytes() == data for path, data in before.items())
     assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6, 9]
 
@@ -1545,8 +1558,8 @@ def test_goodput_arithmetic():
 # --------------------------------------------------------------------------
 
 class Diverging(Regression):
-    def loss(self, params, batch, step):
-        loss, aux = super().loss(params, batch, step)
+    def loss(self, variables, batch, step):
+        loss, aux = super().loss(variables, batch, step)
         return loss * jnp.nan, aux
 
 
@@ -1574,12 +1587,12 @@ class ScaledObjective(Objective):
     def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}}
 
-    def loss(self, params, batch, step):
-        return jnp.sum(params["params"]["w"] ** 2) * batch["scale"][0], Aux({})
+    def loss(self, variables, batch, step):
+        return jnp.sum(variables["params"]["w"] ** 2) * batch["scale"][0], Aux({})
 
 
 def host(state):
-    return np.array(state.params["params"]["w"]), np.array(state.ema["params"]["w"])
+    return np.array(state.variables["params"]["w"]), np.array(state.ema["params"]["w"])
 
 
 @pytest.mark.parametrize("accum", [1, 2])
@@ -1602,7 +1615,7 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     assert int(state.step) == counted + 1
     assert int(state.microstep) == advanced
     assert float(state.scale.scale) == scaled / 2
-    np.testing.assert_array_equal(state.params["params"]["w"], w)
+    np.testing.assert_array_equal(state.variables["params"]["w"], w)
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
     state, *_ = step(state, good)
     w, ema = host(state)
@@ -1649,24 +1662,24 @@ class Counted(Objective):
     def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": jnp.zeros(())}}
 
-    def loss(self, params, batch, step):
-        loss = jnp.sum(params["params"]["w"] ** 2)
-        return loss, Aux({}, variables={"stats": {"seen": params["stats"]["seen"] + 1}})
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        return loss, Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
 
 
 def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path):
     trainer = make_trainer(tmp_path, objective=Counted())
     state = trainer.fit(Data(), steps=3, log_every=1)
-    assert float(state.params["stats"]["seen"]) == 3.0
+    assert float(state.variables["stats"]["seen"]) == 3.0
 
     restored, _ = trainer.checkpoints.restore()
-    assert float(restored["params"]["stats"]["seen"]) == 3.0
+    assert float(restored["variables"]["stats"]["seen"]) == 3.0
 
 
 def test_the_optimizer_never_touches_a_non_parameter_collection():
     state = make_trainer(objective=Counted(), optimizer=optax.adamw(1e-2, weight_decay=1.0)).fit(
         Data(endless), steps=2, log_every=1)
-    assert float(state.params["stats"]["seen"]) == 2.0
+    assert float(state.variables["stats"]["seen"]) == 2.0
     assert set(state.opt_state[0].mu) == {"w"}
 
 
@@ -1695,8 +1708,8 @@ class TwoTrees(Objective):
         return {"params": {"tracked": {"w": jnp.ones((2,))},
                            "untracked": {"w": jnp.ones((2,))}}}
 
-    def loss(self, params, batch, step):
-        total = sum(jnp.sum(leaf ** 2) for leaf in jax.tree.leaves(params))
+    def loss(self, variables, batch, step):
+        total = sum(jnp.sum(leaf ** 2) for leaf in jax.tree.leaves(variables))
         return total, Aux({})
 
 
@@ -1706,9 +1719,9 @@ def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
     state = make_trainer(objective=objective).fit(Data(endless), steps=2, log_every=1)
 
     assert set(state.ema["params"]) == {"tracked"}
-    live = state.params["params"]
+    live = state.variables["params"]
     assert not np.allclose(state.ema["params"]["tracked"]["w"], live["tracked"]["w"])
-    merged = merge(state.params, state.ema)
+    merged = merge(state.variables, state.ema)
     assert merged["params"]["untracked"] is live["untracked"]
     np.testing.assert_array_equal(merged["params"]["tracked"]["w"], state.ema["params"]["tracked"]["w"])
 
@@ -1741,7 +1754,7 @@ class TwoPlayers(Objective):
     def init(self, key, variables=None):
         return {"params": {"gen": {"g": jnp.zeros(())}, "disc": {"d": jnp.zeros(())}}}
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         raise AssertionError("the custom step never calls the single loss")
 
     def generator_loss(self, params, batch):
@@ -1765,7 +1778,7 @@ def two_optimizers(gen, disc):
 def alternating(gen, disc):
     def make_step(objective, optimizer):
         def step(state, batch):
-            trainable = state.params["params"]
+            trainable = state.variables["params"]
 
             def generator(operand):
                 loss, grads = jax.value_and_grad(objective.generator_loss)(trainable, batch)
@@ -1784,7 +1797,7 @@ def alternating(gen, disc):
                 microstep=state.microstep + 1,
                 updates=state.updates + 1,
                 opt_state=opt_state,
-                params={**state.params, "params": params},
+                variables={**state.variables, "params": params},
             )
             return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step
@@ -1806,13 +1819,13 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     state = trainer().fit(Data(), steps=2, log_every=1)
     # Step 0 moved the generator half way to 1 (lr 0.25 on a gradient of 2(g - 1));
     # step 1 moved the discriminator half way to the generator.
-    assert float(state.params["params"]["gen"]["g"]) == pytest.approx(0.5)
-    assert float(state.params["params"]["disc"]["d"]) == pytest.approx(0.25)
+    assert float(state.variables["params"]["gen"]["g"]) == pytest.approx(0.5)
+    assert float(state.variables["params"]["disc"]["d"]) == pytest.approx(0.25)
     assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
     resumed = trainer().fit(Data(), steps=4, log_every=1)
-    assert float(resumed.params["params"]["gen"]["g"]) == pytest.approx(0.75)
-    assert float(resumed.params["params"]["disc"]["d"]) == pytest.approx(0.5)
+    assert float(resumed.variables["params"]["gen"]["g"]) == pytest.approx(0.75)
+    assert float(resumed.variables["params"]["disc"]["d"]) == pytest.approx(0.5)
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
@@ -2062,7 +2075,7 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
     monkeypatch.setattr(jax, "device_put", recorded)
     trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
-    params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
+    params = dict(jax.tree_util.tree_leaves_with_path(shardings.variables))
     sharded = 0
     for path, leaf in jax.tree_util.tree_leaves_with_path(weights):
         copy = held[path]
@@ -2071,7 +2084,7 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
         sharded += not copy.sharding.is_fully_replicated
         assert not leaf.is_deleted()
     assert sharded
-    jax.tree.map(np.testing.assert_array_equal, state.params, weights)
+    jax.tree.map(np.testing.assert_array_equal, state.variables, weights)
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
@@ -2088,7 +2101,7 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
 
     abstract = dataclasses.replace(
-        state, params=jax.tree.map(shape, state.params, shardings.params),
+        state, variables=jax.tree.map(shape, state.variables, shardings.variables),
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
@@ -2096,7 +2109,7 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
 
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = trainer.objective.scalar_loss(state.params, batch,
+    expected, _ = trainer.objective.scalar_loss(state.variables, batch,
                               Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
     advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)

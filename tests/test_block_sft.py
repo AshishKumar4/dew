@@ -151,16 +151,16 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.params, expected, 2e-6)
-    replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.params)
+    assert_tree_close(updated.variables, expected, 2e-6)
+    replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert_tree_close(objective(readback).init(jax.random.key(0)), updated.params, 0)
+    assert_tree_close(objective(readback).init(jax.random.key(0)), updated.variables, 0)
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=2, log_every=1)
-    assert_tree_close(resumed.params, direct.params, 0)
+    assert_tree_close(resumed.variables, direct.params, 0)
     assert int(resumed.updates) == 2
 
 
@@ -294,23 +294,23 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.params, expected, 2e-6)
+    assert_tree_close(updated.variables, expected, 2e-6)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
-        jax.tree.leaves(updated.params["params"]["conditioner"]), strict=True))
+        jax.tree.leaves(updated.variables["params"]["conditioner"]), strict=True))
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(
                           data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=2, log_every=1)
-    assert_tree_close(resumed.params, direct.params, 0)
+    assert_tree_close(resumed.variables, direct.params, 0)
     assert_tree_close(resumed.opt_state, direct.opt_state, 0)
     assert int(resumed.updates) == 2
 
-    replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.params)
+    replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, pretrained=readback.variables)
-    assert_tree_close(restored.init(jax.random.key(0)), resumed.params, 0)
-    original_loss = obj.scalar_loss(resumed.params, {"text": inputs}, step)[0]
+    assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
+    original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
     restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
     np.testing.assert_array_equal(restored_loss, original_loss)
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
@@ -351,7 +351,7 @@ def test_trainable_filter_freezes_the_rest_and_moves_only_what_it_keeps(source):
     state = trainer.fit(dataset(jax.tree.map(
         lambda value: np.concatenate([value] * (math.lcm(2, jax.device_count()) // 2), axis=0), batch)),
         steps=1, log_every=1)
-    assert sorted(state.params) == sorted(variables)
+    assert sorted(state.variables) == sorted(variables)
     assert "frozen" not in obj.pipeline(state, ema=False).variables
 
 

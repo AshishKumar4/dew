@@ -1457,8 +1457,8 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
         def init(self, key, variables=None):
             return self.model.init(key, jnp.zeros((1, 3)))
 
-        def loss(self, params, batch, step):
-            return jnp.mean((self.model.apply(params, batch["x"]) - batch["y"]) ** 2), Aux({})
+        def loss(self, variables, batch, step):
+            return jnp.mean((self.model.apply(variables, batch["x"]) - batch["y"]) ** 2), Aux({})
 
     def run(steps, directory=None):
         trainer = Trainer(
@@ -1474,8 +1474,8 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
     resumed = run(4, tmp_path / "run")
     whole = run(4)
 
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
+    for expected, actual in zip(jax.tree.leaves(whole.variables),
+                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
 
 
@@ -1615,9 +1615,9 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
         def init(self, key, variables=None):
             return self.model.init(key, jnp.zeros((1, 2)))
 
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             target = batch["index"][:, None].astype(jnp.float32)
-            return jnp.mean((self.model.apply(params, batch["x"]) - target) ** 2), Aux({})
+            return jnp.mean((self.model.apply(variables, batch["x"]) - target) ** 2), Aux({})
 
     def run(steps, directory=None):
         trainer = Trainer(
@@ -1632,8 +1632,8 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     resumed = run(5, tmp_path / "run")
     whole = run(5)
 
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
+    for expected, actual in zip(jax.tree.leaves(whole.variables),
+                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
 
 
@@ -1651,8 +1651,8 @@ def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
         def init(self, key, variables=None):
             return self.model.init(key, jnp.zeros((1, 2)))
 
-        def loss(self, params, batch, step):
-            return jnp.mean(self.model.apply(params, batch["x"]) ** 2), Aux({})
+        def loss(self, variables, batch, step):
+            return jnp.mean(self.model.apply(variables, batch["x"]) ** 2), Aux({})
 
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))

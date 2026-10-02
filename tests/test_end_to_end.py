@@ -109,15 +109,15 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     task = objective(EndToEnd())
     trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
-    before = jax.tree.map(np.asarray, state.params[LATENT_STATS])
+    before = jax.tree.map(np.asarray, state.variables[LATENT_STATS])
     state, *_ = trainer.compile(state, BATCH)(state, BATCH)
-    after = state.params[LATENT_STATS]
+    after = state.variables[LATENT_STATS]
     assert not np.allclose(np.asarray(after["mean"]), np.asarray(before["mean"]))
 
-    published = TextToImage.from_objective(task, state.params)
+    published = TextToImage.from_objective(task, state.variables)
     assert AUTOENCODER not in published.params["params"] and LATENT_STATS not in published.params
     for got, want in zip(jax.tree.leaves(published.params["autoencoder"]),
-                         jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
+                         jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_allclose(np.asarray(published.autoencoder.latent_scale),
                                1 / np.sqrt(np.asarray(after["var"]) + 1e-4), rtol=1e-6)
@@ -174,8 +174,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     for weights in (tmp_path / "rae/dinov2_plain").glob("*.safetensors"):
         weights.unlink()
     restored = TextToImage.from_run(str(run))
-    for got, want in zip(jax.tree.leaves(restored.params["autoencoder"]),
-                         jax.tree.leaves(state.params["params"][AUTOENCODER]), strict=True):
+    for got, want in zip(jax.tree.leaves(restored.variables["autoencoder"]),
+                         jax.tree.leaves(state.variables["params"][AUTOENCODER]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)

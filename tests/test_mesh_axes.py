@@ -541,8 +541,8 @@ def step_text(spec, model):
         sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"],
     )
 
-    def loss(params, rest, text):
-        return objective.scalar_loss({**rest, "params": params}, {"text": text},
+    def loss(variables, rest, text):
+        return objective.scalar_loss({**rest, "params": variables}, {"text": text},
                            Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))[0]
 
     placed = jax.tree.map(
@@ -735,8 +735,8 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     shape = jax.eval_shape(block.apply, {"params": params}, x).shape
     cotangent = rng.normal(size=shape).astype(np.float32)
 
-    def loss(params, x, cotangent, constrained):
-        out = block.apply({"params": params}, x)
+    def loss(variables, x, cotangent, constrained):
+        out = block.apply({"params": variables}, x)
         if constrained and outputs is not None:
             out = jax.lax.with_sharding_constraint(out, outputs)
         return jnp.sum(out * cotangent)

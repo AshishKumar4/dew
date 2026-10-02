@@ -34,7 +34,7 @@ def main() -> None:
         batch=jax.device_count(),
     )
     state = trainer.fit(data, steps=1, log_every=1)
-    np.save(directory / "parameters.npy", np.asarray(state.params["params"]["table"]))
+    np.save(directory / "parameters.npy", np.asarray(state.variables["params"]["table"]))
     (directory / "episodes.json").write_text(json.dumps([episode_record(episode) for episode in records]))
     assert int(state.updates) == 1
 

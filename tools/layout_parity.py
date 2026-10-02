@@ -342,8 +342,8 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
             state = super().initial_state(initializer, key)
-            params = {**state.params, "params": _drawn(state.params["params"], jax.random.key(7))}
-            return dataclasses.replace(state, params=params, opt_state=self.optimizer.init(params["params"]))
+            params = {**state.variables, "params": _drawn(state.variables["params"], jax.random.key(7))}
+            return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
 
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), mesh=bench.mesh_spec(fields),
@@ -494,7 +494,7 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
         return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
 
-    wide = widened(state.params)
+    wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)
     # The trainer's first step: its key folded with the step, which draws a
     # diffusion objective's noise and a masked one's masks, and the frozen
@@ -502,8 +502,8 @@ def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                 with_ema(wide, None if state.ema is None else widened(state.ema)))
 
-    def loss(params, batch):
-        return objective.scalar_loss({**wide, "params": params}, batch, step)[0]
+    def loss(variables, batch):
+        return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(wide["params"], batch)
     return float(value), {jax.tree_util.keystr(path): np.asarray(leaf)

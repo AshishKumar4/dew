@@ -41,7 +41,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
     state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
-    result = Evaluation.run(objective, state.params, data.val, key=state.key, step=state.step,
+    result = Evaluation.run(objective, state.variables, data.val, key=state.key, step=state.step,
                       schedule_step=state.microstep, averaged=state.averaged,
                       metrics=(Perplexity(),), preview=True, mesh=trainer.device_mesh)
     logged = next(item for item in tracker.scalars if "val/perplexity" in item)
@@ -64,8 +64,8 @@ class ScheduledScores(Objective):
     def init(self, key, variables=None):
         return {"params": {"offset": jnp.zeros(())}}
 
-    def loss(self, params, batch, step):
-        return params["params"]["offset"], Aux({})
+    def loss(self, variables, batch, step):
+        return variables["params"]["offset"], Aux({})
 
     def evaluate(self, params, batch, step):
         return TokenScores(

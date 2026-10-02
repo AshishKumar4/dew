@@ -160,14 +160,14 @@ def test_images_as_pil_are_this_processs_real_rows_as_8_bit_pixels():
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
     """The EMA copy is what a run publishes; `ema=False` reads the live ones."""
     objective, state = make_run(tmp_path)
-    averaged = merge(state.params, state.ema)
+    averaged = merge(state.variables, state.ema)
 
     pipe = TextToImage.from_run(str(tmp_path))
     for expected, loaded in zip(jax.tree.leaves(averaged["params"]),
                                 jax.tree.leaves(pipe.params["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     live = TextToImage.from_run(str(tmp_path), ema=False)
-    for expected, loaded in zip(jax.tree.leaves(state.params["params"]),
+    for expected, loaded in zip(jax.tree.leaves(state.variables["params"]),
                                 jax.tree.leaves(live.params["params"]), strict=True):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
@@ -210,11 +210,17 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
 
 
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):
-    make_run(tmp_path)
+    main, pinned = tmp_path / "main", tmp_path / "pinned"
+    make_run(main)
+    make_run(pinned, preset=Flow(shift=3.0))
     import dew.interop.hub as hub
-    monkeypatch.setattr(hub, "pull_from_hub", lambda repo_id, revision=None: tmp_path)
+    monkeypatch.setattr(hub, "snapshot_download", lambda repo_id, revision=None: main if revision is None
+                        else {"pinned": pinned}[revision])
     pipe = TextToImage.from_pretrained("user/flowers-dit")
     assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
+    selected = TextToImage.from_pretrained("user/flowers-dit", revision="pinned")
+    assert isinstance(selected.process.schedule, FlowMatchingScheduler)
+    assert selected.process.schedule.shift == 3.0
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
@@ -295,7 +301,7 @@ def test_an_unconditional_unet_takes_a_step():
         Dataset(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
 
     assert int(state.step) == 1
-    leaves = jax.tree.leaves(state.params["params"])
+    leaves = jax.tree.leaves(state.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
@@ -426,7 +432,7 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
-    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(live.params), strict=True):
+    for expected, bound in zip(jax.tree.leaves(state.variables), jax.tree.leaves(live.params), strict=True):
         assert bound is expected
     drawn = pipe(["a", "b"], key=4).host().images
     assert drawn.shape == (2, RES, RES, 3)
@@ -494,7 +500,7 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     objective, state = make_lm_run(run, ema_decay=None)
     published = objective.pipeline(state)
     for expected, bound in zip(
-        jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True
+        jax.tree.leaves(state.variables), jax.tree.leaves(published.variables), strict=True
     ):
         assert bound is expected
     export_run(str(run), tmp_path / "export")
@@ -572,7 +578,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     make_run(tmp_path)
     plain = TextToImage.from_run(str(tmp_path))
     placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=2 ** 6))
-    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.params)}
+    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables)}
     assert any("fsdp" in str(spec) for spec in specs)
     result = placed(["a", "b", "c"], steps=3, key=7)
     assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
@@ -591,7 +597,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     prediction, and over a one-point grid hands the noise itself to the
     decode and clip that end every call."""
     objective, state = make_run(tmp_path)
-    plain = TextToImage.from_objective(objective, state.params)
+    plain = TextToImage.from_objective(objective, state.variables)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
     key = jax.random.key(3)
     reference = plain(["a"], steps=4, solver=Heun(), key=key).host().images
@@ -757,7 +763,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()
     initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
-    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
+    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.variables))
     params = {**params, "constants": {**params["constants"], "scale": jnp.asarray([1.003], jnp.float32)}}
     params["params"]["packed"] = jnp.asarray([16777217], jnp.int32)
     params["encoders"]["textcontext"]["constants"] = {
@@ -766,7 +772,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     averaged = {"params": {first: jax.tree.map(lambda leaf: leaf.astype(jnp.float32) + 0.03125,
                                              params["params"][first])},
                 "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
-    state = dataclasses.replace(initial, params=params, ema=averaged)
+    state = dataclasses.replace(initial, variables=params, ema=averaged)
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None)
     checkpoints.wait()
@@ -853,7 +859,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     _, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
     assert isinstance(baseline, TextGeneration)
-    first = next(iter(state.params["params"]))
+    first = next(iter(state.variables["params"]))
 
     def move_to_frozen(variables):
         trainable = dict(variables["params"])
@@ -863,7 +869,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     assert state.ema is not None
     step = int(state.step) + 1
     frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
-                                 params=move_to_frozen(state.params), ema=move_to_frozen(state.ema))
+                                 variables=move_to_frozen(state.variables), ema=move_to_frozen(state.ema))
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(step, frozen, None)
     checkpoints.wait()
@@ -893,7 +899,7 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
     assert isinstance(restored, TextToImage)
     encoder = restored.inputs.conditions["textcontext"].encoder
     assert isinstance(encoder, CharTable)
-    stored = merge(state.params, state.ema)
+    stored = merge(state.variables, state.ema)
     expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
     table = restored.params["encoders"]["textcontext"]["table"]
     assert table.dtype == jnp.bfloat16
@@ -918,10 +924,53 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path):
+@pytest.mark.parametrize("precision", ["highest", None])
+def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path, precision):
     """The checkpoint's task and the objective's pipeline encode the empty
     CLIP prompt with the same eager arithmetic, not a fused one-row JIT.
     Keep the denoiser float32 and CLIP bf16, as the published hybrid DiT is.
+    The construction precision travels with the artifact, not the caller's
+    context at restore.
+    """
+    from pathlib import Path
+
+    config = dataclasses.replace(
+        run_config(tmp_path, preset=Flow()),
+        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
+                           dtype="bfloat16"),
+        guidance=CFG(5.0), ema_decay=None)
+    with jax.default_matmul_precision(precision):
+        objective = config.build()
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
+    state = trainer.initial_state()
+    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
+             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    checkpoints = Checkpoints(str(tmp_path))
+    artifact = objective.inference_record()
+    assert artifact["condition_precision"] == precision
+    checkpoints.save(1, state, None, artifact=artifact)
+    checkpoints.wait()
+    original = objective.pipeline(state, ema=False)
+    with jax.default_matmul_precision("default" if precision == "highest" else "highest"):
+        restored = TextToImage.from_run(str(tmp_path), ema=False)
+
+    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    assert restored.blank is not None
+    assert restored.blank.precision == precision
+    want = objective.blank_conditions(prepared.conditions)
+    got = restored.blank(prepared.conditions)
+    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
+                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
+
+
+def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
+    """A restored task warms both branches, then binds a new encoder tree.
+    Its conditional and unconditional features and samples match a fresh
+    task over those weights, not the old cached unconditional features.
+    Binding only a denoiser update preserves the cache.
     """
     from pathlib import Path
 
@@ -939,14 +988,29 @@ def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path):
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    original = objective.pipeline(state, ema=False)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
-
-    prepared = original.prepare(["a bird", "a cat"], key=0, steps=8)
+    prompts = ["a bird", "a cat"]
+    old = restored.prepare(prompts, key=0, steps=8)
     assert restored.blank is not None
-    want = objective.blank_conditions(prepared.conditions)
-    got = restored.blank(prepared.conditions)
-    for actual, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+    old_blank = restored.blank(old.conditions)
+
+    denoiser_update = {**restored.params, "params": jax.tree.map(lambda value: value + 0.03125,
+                                                             restored.params["params"])}
+    assert restored.bind(denoiser_update).blank is restored.blank
+    encoders = jax.tree.map(lambda value: value + 0.03125, restored.params["encoders"])
+    changed = {**restored.params, "encoders": encoders}
+    rebound = restored.bind(changed)
+    fresh_objective = config.build(variables=changed)
+    fresh = TextToImage.from_objective(fresh_objective, changed)
+    bound_inputs = rebound.prepare(prompts, key=0, steps=8)
+    fresh_inputs = fresh.prepare(prompts, key=0, steps=8)
+    assert rebound.blank is not None and fresh.blank is not None
+    new_blank = rebound.blank(bound_inputs.conditions)
+    expected_blank = fresh.blank(fresh_inputs.conditions)
+    assert any(not np.array_equal(np.asarray(left), np.asarray(right))
+               for left, right in zip(jax.tree.leaves(old_blank), jax.tree.leaves(new_blank), strict=True))
+    for actual, expected in zip(jax.tree.leaves((bound_inputs.conditions, new_blank)),
+                                jax.tree.leaves((fresh_inputs.conditions, expected_blank)), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-    np.testing.assert_array_equal(restored(["a bird", "a cat"], steps=8, key=0).host().images,
-                                  original(["a bird", "a cat"], steps=8, key=0).host().images)
+    np.testing.assert_array_equal(rebound(prompts, steps=8, key=0).host().images,
+                                  fresh(prompts, steps=8, key=0).host().images)

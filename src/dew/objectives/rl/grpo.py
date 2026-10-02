@@ -233,13 +233,13 @@ class GRPOObjective(LMObjective):
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
                       None if weights is None else jnp.asarray(weights, jnp.float32), proximal)
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         """Score the policy surrogate over the trainable tokens, plus the KL to the reference.
 
         The policy is rescored from the rollout's own ids, so every term
         reads the tokens that were actually drawn.
         """
-        terms = self._terms(params, batch)
+        terms = self._terms(variables, batch)
         mask = terms.mask
         if self._cap is not None and not terms.proximal:
             raise ValueError(

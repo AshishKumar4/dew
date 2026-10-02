@@ -1100,7 +1100,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "xla_flags": config.xla_flags,
             "devices": trainer.device_mesh.devices.size,
             "device_kind": jax.devices()[0].device_kind,
-            "params": parameter_count(state.params),
+            "params": parameter_count(state.variables),
             "measured_steps": config.steps,
             "compile_seconds": round(compile_seconds, 2),
             # The rung the trainer compiled the step under, the model's own

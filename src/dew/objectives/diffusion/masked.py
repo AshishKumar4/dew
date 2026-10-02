@@ -133,9 +133,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                 "Pretrained.load and model.init return")
         return pretrained
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
-            params, batch, step.key, train=True)
+            variables, batch, step.key, train=True)
         nelbo = Ratio(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={

@@ -203,13 +203,13 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     task = config.build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))
-    expected = task.model_variables(state.params)
+    expected = task.model_variables(state.variables)
     for got, want in zip(jax.tree.leaves(params[TEACHER]), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     # The student reads the teacher's Fourier table, built at the teacher's time scale.
     table = params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
     np.testing.assert_array_equal(np.asarray(table), np.asarray(
-        state.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
+        state.variables["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
 
     def gradients(step):
         def loss(tree):

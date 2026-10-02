@@ -159,7 +159,7 @@ class FlowGRPOObjective(DiffusionObjective):
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)))
         return values.T
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """Score the clipped policy gradient over the recorded transitions.
 
         The scan carries nothing between transitions; each one contributes
@@ -177,7 +177,7 @@ class FlowGRPOObjective(DiffusionObjective):
         if advantages.shape != times.shape:
             raise ValueError("advantages must hold one value per trajectory or per transition")
         advantages = jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max)
-        predict = self._predictor(params, batch)
+        predict = self._predictor(variables, batch)
         reference = None
         if self.beta > 0:
             if step.ema is None:
@@ -406,7 +406,7 @@ class FlowRollout:
         the next collective.
         """
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
-        generated = agreed("flow rollout generation", lambda: self._generate(state.params, expanded, key))
+        generated = agreed("flow rollout generation", lambda: self._generate(state.variables, expanded, key))
         (trajectory, images), context = collective_host(
             (generated, expanded), phase="flow rollout")
 

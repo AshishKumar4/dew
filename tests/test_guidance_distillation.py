@@ -118,6 +118,6 @@ def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, t
     checkpoints.wait()
     config.save(str(tmp_path / "student"))
     restored = TextToImage.from_run(str(tmp_path / "student"))
-    assert restored.guidance is None and TEACHER not in restored.params
+    assert restored.guidance is None and TEACHER not in restored.variables
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)

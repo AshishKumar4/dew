@@ -48,8 +48,8 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
-    def loss(self, params, batch, step):
-        prediction = self.model.apply(params, batch["x"])
+    def loss(self, variables, batch, step):
+        prediction = self.model.apply(variables, batch["x"])
         return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
 
 
@@ -96,7 +96,7 @@ class Data:
 
 
 def leaves(state):
-    return [np.asarray(leaf).tobytes() for leaf in jax.tree.leaves(state.params)]
+    return [np.asarray(leaf).tobytes() for leaf in jax.tree.leaves(state.variables)]
 
 
 def make_trainer(tmp_path=None, **kwargs):

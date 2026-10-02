@@ -117,7 +117,7 @@ data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, record
 objective = StatefulRegression()
 trainer = Trainer(objective, optax.sgd(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
-running_mean = np.asarray(state.params["batch_stats"]["norm"]["mean"])
+running_mean = np.asarray(state.variables["batch_stats"]["norm"]["mean"])
 assert np.all(running_mean > 0)
 print("Stored running mean:", running_mean)
 ```

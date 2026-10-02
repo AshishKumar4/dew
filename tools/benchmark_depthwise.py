@@ -143,7 +143,8 @@ def checkpoint(args):
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
     from dew.sampling import TextToImage
 
-    pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m')
+    pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
+                                           revision='0964f57387afc938927b1047f19ed32b63fe0619')
     original = conv._polyphase_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
     with jax.default_matmul_precision('highest'):

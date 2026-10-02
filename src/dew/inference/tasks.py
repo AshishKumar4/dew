@@ -253,12 +253,12 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-def _pulled(repo_id: str) -> str:
+def _pulled(repo_id: str, revision: str | None) -> str:
     """Download a run directory published to the Hub and return its local path."""
     import os
 
     from dew.interop.hub import pull_from_hub
-    return os.fspath(pull_from_hub(repo_id))
+    return os.fspath(pull_from_hub(repo_id, revision=revision))
 
 
 def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
@@ -484,7 +484,8 @@ class TextGeneration:
                    max_new_tokens=budget if budget else None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextGeneration:
@@ -492,7 +493,7 @@ class TextGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 
@@ -576,7 +577,8 @@ class BlockGeneration:
                    max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> BlockGeneration:
@@ -584,7 +586,7 @@ class BlockGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 
@@ -673,7 +675,8 @@ class MaskedGeneration:
                    max_new_tokens=budget or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> MaskedGeneration:
@@ -681,7 +684,7 @@ class MaskedGeneration:
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
         """
-        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+        return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
 

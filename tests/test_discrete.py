@@ -328,7 +328,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0))
     state = trainer.fit(Dataset(train=lambda partition: corpus_batches(), val=None, records=None, batch=16),
                         steps=1000, log_every=500)
-    params = state.params
+    params = state.variables
 
     loss, aux = objective.scalar_loss(
         params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None)

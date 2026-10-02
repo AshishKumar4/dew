@@ -130,7 +130,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
 
     state = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(0)).initial_state()
 
-    built, held = flat(state.params), flat(variables)
+    built, held = flat(state.variables), flat(variables)
     assert built.keys() == held.keys()
     for name, leaf in built.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
@@ -235,7 +235,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     resumed = Trainer(objective, optax.sgd(0.05), key=key,
         checkpoints=Checkpoints(str(tmp_path / "run"))).fit(data, steps=2, checkpoint_every=1, log_every=1)
     direct = Trainer(objective, optax.sgd(0.05), key=key).fit(data, steps=2, log_every=1)
-    for left, right in zip(jax.tree.leaves(resumed.params), jax.tree.leaves(direct.params), strict=True):
+    for left, right in zip(jax.tree.leaves(resumed.variables), jax.tree.leaves(direct.params), strict=True):
         np.testing.assert_array_equal(left, right)
     for left, right in zip(jax.tree.leaves(resumed.averaged), jax.tree.leaves(direct.averaged), strict=True):
         np.testing.assert_array_equal(left, right)
@@ -265,7 +265,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert converted.model.dtype == jnp.float32
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
 
-    source.save(tmp_path / "published", variables=resumed.params)
+    source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
     expected = live(prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)

@@ -108,8 +108,8 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
+    def loss(variables):
+        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
         return objective.reduce_loss(statistics)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
@@ -210,8 +210,8 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
+    def loss(variables):
+        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
         return objective.reduce_loss(statistics)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
@@ -288,8 +288,8 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
+    def loss(variables):
+        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
         return objective.reduce_loss(statistics)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])

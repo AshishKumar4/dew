@@ -834,13 +834,13 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, np.zeros((1, FEATURES), np.float32))
 
-    def loss(self, params, batch, step):
+    def loss(self, variables, batch, step):
         import jax.numpy as jnp
 
         features = jnp.stack([jnp.sin(batch["id"].astype(jnp.float32) * (index + 1))
                               for index in range(FEATURES)], axis=-1)
         target = jnp.stack([features[:, 0] * 2, features[:, 1] - 1], axis=-1)
-        return jnp.mean((self.model.apply(params, features) - target) ** 2), Aux({})
+        return jnp.mean((self.model.apply(variables, features) - target) ** 2), Aux({})
 
 
 def regression_trainer(directory: Path) -> Trainer:
@@ -852,7 +852,7 @@ def regression_trainer(directory: Path) -> Trainer:
 
 def parameters(state) -> dict:
     return {"/".join(str(part) for part in path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_flatten_with_path(state.params)[0]}
+            for path, leaf in jax.tree_util.tree_flatten_with_path(state.variables)[0]}
 
 
 def assert_same(left: dict, right: dict, why: str) -> None:

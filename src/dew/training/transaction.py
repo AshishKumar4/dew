@@ -282,8 +282,8 @@ class Transaction:
         previous = state.accumulation
         assert previous is not None and previous.attempts is not None
         batch = jax.tree.map(lambda x: x[index], previous.batches)
-        variables = state.params if previous.variables is None else {
-            **state.params, **jax.tree.map(lambda x: x[index], previous.variables)}
+        variables = state.variables if previous.variables is None else {
+            **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         step_info = Step(state.microstep - fill + index,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
@@ -325,7 +325,7 @@ class Transaction:
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
         accepted = jnp.asarray(a=True) if scale is None else finite
-        numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
+        numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
 
         def chosen(take, taken, kept):
@@ -333,18 +333,19 @@ class Transaction:
             return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
 
         def commit(current):
-            native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.params["params"])
+            native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.variables["params"])
             native_finite = _all_finite(native)
 
             def apply(current):
                 if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
                     update, opt_state = self.optimizer.update(
-                        native, current.opt_state, current.params["params"], qk_stats=qk)
+                        native, current.opt_state, current.variables["params"], qk_stats=qk)
                 else:
                     update, opt_state = self.optimizer.update(
-                        native, current.opt_state, current.params["params"]
+                        native, current.opt_state, current.variables["params"]
                     )
-                params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
+                params = {
+                    **current.variables, "params": optax.apply_updates(current.variables["params"], update)}
                 if self.aux_shape.effects is not None:
                     params = write_back(params, self.objective.apply_effects(
                         params, self.effects_tree.unflatten(effects)))
@@ -353,7 +354,7 @@ class Transaction:
                     if averaged is None:
                         raise ValueError("the objective declares EMA but the state carries none")
                     averaged = ema_update(averaged, params, self.objective.ema.decay(current.updates))
-                return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
+                return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
                                            updates=current.updates + 1)
 
             if scale is None:
@@ -372,7 +373,7 @@ class Transaction:
                 due, commit, lambda x: (x, jnp.asarray(a=True)), numerical)
         finite = finite & native_finite
         if scale is not None:
-            accepted = finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
+            accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
         if previous is not None:
             candidate = pending.candidate
             assert candidate is not None
@@ -387,7 +388,7 @@ class Transaction:
                         attempts=acc.attempts.at[pending.fill].set(state.step),
                     )
                     if acc.variables is not None:
-                        reads = {name: state.params[name] for name in acc.variables}
+                        reads = {name: state.variables[name] for name in acc.variables}
                         acc = dataclasses.replace(acc, variables=jax.tree.map(
                             lambda held, x: held.at[pending.fill].set(x), acc.variables, reads))
                 return acc
@@ -422,9 +423,9 @@ class Transaction:
 
         def run(state, batch):
             step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                        with_ema(state.params, state.ema))
+                        with_ema(state.variables, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(state.params, batch, step_info)
+            realized = realize(state.variables, batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             gradient = unscale(realized.pullback(cotangent), factor)
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)
@@ -459,11 +460,11 @@ class Transaction:
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
                 return finish(state, batch, aux, pending, gradient)
-            if FROZEN not in state.params:
+            if FROZEN not in state.variables:
                 return finish(state, batch, realized.aux, pending, gradient)
-            held = state.params[FROZEN]
-            moving = {name: tree for name, tree in state.params.items() if name != FROZEN}
-            advanced, loss, aux = finish(dataclasses.replace(state, params=moving), batch,
+            held = state.variables[FROZEN]
+            moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
+            advanced, loss, aux = finish(dataclasses.replace(state, variables=moving), batch,
                                          realized.aux, pending, gradient)
-            return dataclasses.replace(advanced, params={**advanced.params, FROZEN: held}), loss, aux
+            return dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}), loss, aux
         return run

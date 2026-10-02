@@ -52,7 +52,7 @@ class TrainState:
     step: jax.Array
     microstep: jax.Array
     updates: jax.Array
-    params: Variables
+    variables: Variables
     opt_state: optax.OptState
     ema: Variables | None
     key: jax.Array
@@ -66,5 +66,5 @@ class TrainState:
         if self.ema is None:
             raise ValueError(
                 "the objective keeps no EMA, so there are no averaged weights; "
-                "read state.params")
-        return merge(self.params, self.ema)
+                "read state.variables")
+        return merge(self.variables, self.ema)

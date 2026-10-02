@@ -108,7 +108,7 @@ def train(task, steps, lr, log_every=0, head_lr=None, seed=0, rows_per_step=128,
         done = (index + 1) // accumulation
         if eval_every and (index + 1) % accumulation == 0 and done % eval_every == 0:
             if evaluate is not None:
-                print(json.dumps({"step": done, **evaluate(state.params)}), flush=True)
+                print(json.dumps({"step": done, **evaluate(state.variables)}), flush=True)
             save(done)
         if stop is not None and (index + 1) % accumulation == 0 and done == stop:
             return state
@@ -142,10 +142,10 @@ if teacher_steps:
     teacher = DiffusionObjective(network(), flow, spec(), guidance=None, solver=Euler(),
                                  steps=2, ema_decay=None)
     state = train(teacher, teacher_steps, 2e-4)
-    teacher_model = teacher.model_variables(state.params)
+    teacher_model = teacher.model_variables(state.variables)
     leaves, _ = jax.tree.flatten(teacher_model)
     np.savez(saved, *[np.asarray(leaf) for leaf in leaves])
-    print(json.dumps({"teacher": {f"euler_{n}_cfg1.5": score(teacher, state.params, n, Euler(), CFG(1.5))
+    print(json.dumps({"teacher": {f"euler_{n}_cfg1.5": score(teacher, state.variables, n, Euler(), CFG(1.5))
                                   for n in (1, 4, 25)}, "seconds": round(time.time() - started)}), flush=True)
     sys.exit()
 template = DiffusionObjective(network(), flow, spec(), guidance=None, solver=Euler(), steps=2, ema_decay=None)

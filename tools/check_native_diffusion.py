@@ -96,8 +96,8 @@ def train_and_reload(source, reference, key, given, noise):
         batch[source.inputs.mask.key] = (reference["mask"][None, ..., None] >= 128).astype(np.float32)
     variables = objective.init(key)
     step = Step(jnp.asarray(0), key, None)
-    def loss(params):
-        value, _ = objective.loss({**variables, "params": params}, batch, step)
+    def loss(variables):
+        value, _ = objective.loss({**variables, "params": variables}, batch, step)
         return value.total / value.mass
     value, grads = jax.jit(jax.value_and_grad(loss))(variables["params"])
     updated = jax.tree.map(lambda p, g: p - 1e-3 * g, variables["params"], grads)
@@ -212,8 +212,8 @@ def regress(directory, case):
         batch = {"image": reference["pixels"][None], **source.inputs.tokenize(["cat"]),
                  "mask": (reference["mask"][None, ..., None] >= 128).astype(np.float32)}
         other = {**batch, "mask": 1 - batch["mask"]}
-        def loss(params, data):
-            value, _ = objective.loss({**source.variables, "params": params}, data, Step(jnp.asarray(0), key, None))
+        def loss(variables, data):
+            value, _ = objective.loss({**source.variables, "params": variables}, data, Step(jnp.asarray(0), key, None))
             return value.total / value.mass
         gradient = jax.jit(jax.grad(loss))
         first, second = gradient(source.variables["params"], batch), gradient(source.variables["params"], other)

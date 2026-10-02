@@ -107,7 +107,7 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     restored = dew.pipeline(str(tmp_path), ema=False, dtype="bfloat16", param_dtype="float32")
     assert isinstance(restored, BlockGeneration)
     expected_vars = {name: jax.tree.map(lambda leaf: leaf.astype(jnp.float32), value)
-                     if name in ("params", FROZEN) else value for name, value in state.params.items()}
+                     if name in ("params", FROZEN) else value for name, value in state.variables.items()}
     expected_model = objective.model.clone(text=objective.model.text.clone(dtype=jnp.bfloat16))
     expected_task = BlockGeneration(expected_model, place(expected_vars, None, None),
                                     BlockProcess(expected_model.canvas_length, expected_model.vocab_size))

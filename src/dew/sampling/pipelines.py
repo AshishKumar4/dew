@@ -164,8 +164,14 @@ class TextToImage:
         object.__setattr__(self, "params", freeze(dict(self.params)))
 
     def bind(self, variables: Variables) -> TextToImage:
-        """Bind another variables snapshot without rebuilding the model or encoders."""
-        return replace(self, params=variables)
+        """Bind another snapshot. Changed encoder leaves get a new lazy blank;
+        a denoiser-only change keeps the already encoded branch."""
+        from dew.objectives.diffusion.objective import FixedBlank
+
+        blank = self.blank
+        if isinstance(blank, FixedBlank):
+            blank = blank.rebind(variables.get("encoders", {}))
+        return replace(self, params=variables, blank=blank)
 
     def quantized(self, spec: Quantization) -> TextToImage:
         """This task with its denoiser's weights stored quantized as `spec`
@@ -192,7 +198,7 @@ class TextToImage:
         return cls(objective.model, objective.process, objective.inputs,
                    _without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   blank=objective.blank_conditions)
+                   blank=objective._fixed_blank.rebind(variables.get("encoders", {})))
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
@@ -209,10 +215,9 @@ class TextToImage:
         `layout`, the way the trainer places them; without one the default
         mesh uses the current pool.
         The configured unconditional prompt uses the same eager encoding as
-        an objective's pipeline, at the matmul precision in force here. A
-        training objective captures that default at its construction; when
-        it was built under a different `jax.default_matmul_precision`
-        context, restore under the same context to preserve its blank's bits.
+        an objective's pipeline, at its recorded construction-time matmul
+        precision. The required `condition_precision` field is None when
+        the objective used JAX's default, independent of the caller's context.
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
@@ -240,22 +245,25 @@ class TextToImage:
         solver = solvers.build(text(solver_record['name'], 'solver name'),
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        precision = record['condition_precision']
+        precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
                    inputs, _without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
                    guidance=guidance, solver=solver,
-                   blank=FixedBlank(inputs, params.get("encoders", {}),
-                                    jax.config.jax_default_matmul_precision))
+                   blank=FixedBlank(inputs, params.get("encoders", {}), precision))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
+    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
+                        ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
                         param_dtype: DTypeLike | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
+        return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
+                            ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
     @classmethod

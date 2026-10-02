@@ -126,16 +126,18 @@ class ReportingModels:
     """`load`, one of the setup cell's loaders, reporting each model's load and
     handing back what it loads wrapped in `wrap`, once per model."""
 
-    def __init__(self, load: Callable[[str], Any], wrap: Callable[[Any], Any]) -> None:
+    def __init__(self, load: Callable[..., Any], wrap: Callable[[Any], Any]) -> None:
         self.load = load
         self.wrap = wrap
-        self.loaded: dict[str, Any] = {}
+        self.loaded: dict[tuple[str, str | None], Any] = {}
 
-    def __call__(self, name: str) -> Any:
-        if name not in self.loaded:
+    def __call__(self, name: str, *, revision: str | None = None) -> Any:
+        key = (name, revision)
+        if key not in self.loaded:
             _show({"stage": "load", "model": name})
-            self.loaded[name] = self.wrap(self.load(name))
-        return self.loaded[name]
+            loaded = self.load(name) if revision is None else self.load(name, revision=revision)
+            self.loaded[key] = self.wrap(loaded)
+        return self.loaded[key]
 
 
 class ReportingText:

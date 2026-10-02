@@ -236,7 +236,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
 
     optimizer = optax.sgd(1e-3)
     state = Trainer(objective, optimizer, key=jax.random.key(21)).initial_state()
-    variables = state.params
+    variables = state.variables
     prompts = {**inputs.tokenize(["red", "blue"]), "target": np.asarray([-0.3, 0.6], np.float32)}
 
     def reward(images, context):
@@ -280,7 +280,7 @@ def test_zero_reward_variance_has_no_training_support():
     batch = rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(42))
     assert batch["latents"].shape[:2] == (6, 3)
     assert np.isfinite(batch["old_log_probs"]).all()
-    params = {**state.params, "params": {"gain": jnp.asarray(0.9)}}
+    params = {**state.variables, "params": {"gain": jnp.asarray(0.9)}}
     stats, _ = objective.loss(params, batch, Step(state.microstep, jax.random.key(43), state.averaged))
     value, active = objective.reduce_loss(stats)
     assert float(stats.mass) == 0 and float(value) == 0 and not bool(active)
@@ -460,7 +460,7 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
     change = float(optax.tree.norm(jax.tree.map(
-        lambda a, b: a - b, final.params["params"], initial.params["params"])))
+        lambda a, b: a - b, final.variables["params"], initial.variables["params"])))
     assert np.isfinite(change) and change > 1e-6
     np.testing.assert_allclose(collected["advantages"], oracle, atol=2e-6)
     np.testing.assert_array_equal(collected["rewards"], raw)
@@ -522,12 +522,12 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
     initial = trainer.place()[0]
     step = Step(initial.microstep, jax.random.key(102), initial.averaged)
-    evaluated = objective.evaluate(initial.params, prompts, step)
-    previewed = objective.preview(initial.params, prompts, step)
+    evaluated = objective.evaluate(initial.variables, prompts, step)
+    previewed = objective.preview(initial.variables, prompts, step)
     tokens = {keyword: prompts[condition.field] for keyword, condition in inputs.conditions.items()}
-    conditions = objective.encode(initial.params["encoders"], tokens)
-    denoiser = process.denoiser(model, objective.model_variables(initial.params), conditions,
-                               objective.encode(initial.params["encoders"]))
+    conditions = objective.encode(initial.variables["encoders"], tokens)
+    denoiser = process.denoiser(model, objective.model_variables(initial.variables), conditions,
+                               objective.encode(initial.variables["encoders"]))
     noise_key, sample_key = jax.random.split(step.key)
     expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),
                       objective.steps, solver=objective.solver, guidance=objective.guidance, key=sample_key)

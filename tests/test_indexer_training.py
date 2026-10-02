@@ -518,20 +518,20 @@ def test_the_warmup_trains_through_the_trainer():
     state = trainer.fit(Data(token_batches), steps=3, log_every=1)
 
     assert jax.tree.structure(state.opt_state) == jax.tree.structure(
-        optax.adam(1e-2).init(initial.params["params"]))
-    assert all(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(state.params["params"]))
-    frozen_before = jax.tree.leaves(initial.params[FROZEN])
-    frozen_after = jax.tree.leaves(state.params[FROZEN])
+        optax.adam(1e-2).init(initial.variables["params"]))
+    assert all(is_indexer(path) for path, _ in jax.tree_util.tree_leaves_with_path(state.variables["params"]))
+    frozen_before = jax.tree.leaves(initial.variables[FROZEN])
+    frozen_after = jax.tree.leaves(state.variables[FROZEN])
     assert all(bool(jnp.all(a == b)) for a, b in zip(frozen_before, frozen_after, strict=True))
     moved = jax.tree.leaves(jax.tree.map(lambda a, b: jnp.any(a != b),
-                                         initial.params["params"], state.params["params"]))
+                                         initial.variables["params"], state.variables["params"]))
     assert all(bool(x) for x in moved)
     kls = [entry["train/indexer_kl"] for entry in tracker.scalars if "train/indexer_kl" in entry]
     assert len(kls) == 3 and all(np.isfinite(kls)) and kls[-1] < kls[0], kls
-    assert state.params[FROZEN]["layers_0"]["self_attn"]["kv_b_proj"]["kernel"].sharding.spec == (
-        state.params["params"]["layers_0"]["self_attn"][INDEXER]["wq_b"]["kernel"].sharding.spec)
+    assert state.variables[FROZEN]["layers_0"]["self_attn"]["kv_b_proj"]["kernel"].sharding.spec == (
+        state.variables["params"]["layers_0"]["self_attn"][INDEXER]["wq_b"]["kernel"].sharding.spec)
     abstract = jax.eval_shape(trainer.initial_state)
-    trainer.layout.check(abstract.params, trainer.shardings(abstract).params, trainer.device_mesh)
+    trainer.layout.check(abstract.variables, trainer.shardings(abstract).variables, trainer.device_mesh)
 
 
 def test_the_selection_breaks_a_tie_at_the_lower_key_index():

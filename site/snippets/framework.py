@@ -72,7 +72,7 @@ def lm(out, smoke):
     state = trainer.fit(data, steps=3)
     # End snippet: lm
     assert int(state.step) == 3 and int(state.updates) == 3
-    return {"steps": int(state.step), "parameters": sum(x.size for x in jax.tree.leaves(state.params))}
+    return {"steps": int(state.step), "parameters": sum(x.size for x in jax.tree.leaves(state.variables))}
 
 
 def diffusion(out, smoke):
@@ -108,7 +108,8 @@ def sample_public(out, smoke):
         hub.pull_from_hub = lambda repo_id, revision=None: snapshot
     # Begin snippet: sample-public
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
-    pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
+    pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m",
+                                       revision="0964f57387afc938927b1047f19ed32b63fe0619")
     result = pipe(["green and purple northern lights over a frozen lake"],
                   key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
@@ -194,10 +195,10 @@ def pretrained(out, smoke):
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
-    bundle.save(out / "export", variables=state.params, max_shard_size="128MB")
+    bundle.save(out / "export", variables=state.variables, max_shard_size="128MB")
     # End snippet: finetune
     assert int(state.updates) == 1
-    pairs = zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(state.params), strict=True)
+    pairs = zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(state.variables), strict=True)
     assert any(not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in pairs)
     assert (out / "export/config.json").is_file()
     return {"source": source, "text": list(text), "steps": int(state.step), "export": "export"}
@@ -277,7 +278,7 @@ def reliability(out, smoke):
         # Begin snippet: profile
         import dew
         with dew.Profiler(out / "profile"):
-            logits = objective.model.apply(resumed.params, jnp.zeros((1, 8), jnp.int32))
+            logits = objective.model.apply(resumed.variables, jnp.zeros((1, 8), jnp.int32))
             logits.block_until_ready()
         # End snippet: profile
     return {"saved_step": int(state.step), "resumed_step": int(resumed.step), "bit_exact": exact}

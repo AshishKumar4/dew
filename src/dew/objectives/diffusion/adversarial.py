@@ -286,21 +286,21 @@ class AdversarialDistillationObjective(DiffusionObjective):
             grids.append(tokens.reshape(tokens.shape[0], side, side, tokens.shape[-1]).astype(jnp.float32))
         return grids
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, renoise_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
-        conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
+        conditions, _ = self._conditions(variables, batch, drop_key, dropout=True)
         indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
         t = jnp.asarray(self.student_times)[indices]
         noise = jax.random.normal(noise_key, samples.shape)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
-        student = self.process.denoiser(self.model, self.model_variables(params), conditions)
+        student = self.process.denoiser(self.model, self.model_variables(variables), conditions)
         clean, _ = student(noisy, t)
 
         level_key, renoise_noise = jax.random.split(renoise_key)
@@ -308,7 +308,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,)))
         rates = broadcast_rates(schedule, level, samples)
         renoise = jax.random.normal(renoise_noise, samples.shape)
-        teacher = jax.lax.stop_gradient(params[TEACHER])
+        teacher = jax.lax.stop_gradient(variables[TEACHER])
 
         def renoised(x):
             return rates[0] * x + rates[1] * renoise
@@ -317,7 +317,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
         fake = self._features(teacher, renoised(clean), level, conditions)
         held = self._features(teacher, renoised(jax.lax.stop_gradient(clean)), level, conditions)
         condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions))
-        heads = params["params"][DISCRIMINATOR]
+        heads = variables["params"][DISCRIMINATOR]
 
         def score(head_params, spectral, features, *, update=False):
             scores, updated = self.heads.apply(
@@ -325,7 +325,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
                                                update=update, mutable=[SPECTRAL])
             return scores, updated[SPECTRAL]
 
-        real_scores, spectral = score(heads, params[SPECTRAL], real, update=True)
+        real_scores, spectral = score(heads, variables[SPECTRAL], real, update=True)
         held_scores, _ = score(heads, spectral, held)
         fake_scores, _ = score(jax.lax.stop_gradient(heads), spectral, fake)
         discriminator = hinge_discriminator(real_scores, held_scores)
