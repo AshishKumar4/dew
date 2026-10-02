@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import pathlib
 import statistics
+from queue import Empty
 import time
 import urllib.request
 
@@ -36,7 +37,17 @@ def main():
             client.start_channels()
             kernels.append((model["id"], client, 0))
             try:
-                client.wait_for_ready(timeout=30)
+                deadline=time.perf_counter()+30
+                while True:
+                    client.kernel_info()
+                    try:
+                        message=client.get_shell_msg(timeout=1)
+                        if message['msg_type']=='kernel_info_reply':
+                            break
+                    except Empty:
+                        pass
+                    if time.perf_counter()>deadline:
+                        raise TimeoutError('kernel_info did not reply within 30 seconds')
             except Exception:
                 print('KERNEL_STATUS',request('/api/kernels/'+model['id']),flush=True)
                 for proc in pathlib.Path('/proc').glob('[0-9]*'):
