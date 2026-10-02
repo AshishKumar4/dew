@@ -108,9 +108,13 @@ def described(value, annotation):
 
 
 def snapshot_default(field: dataclasses.Field, annotation):
-    """What a record lacking `field` reads as. A factory other than a class
-    or a lambda computes its default where it runs (the compilation cache is
-    under the user's home), so the snapshot names the factory."""
+    """What a record lacking `field` reads as: its `legacy` value when the
+    default moved after runs were recorded, else the default. A factory
+    other than a class or a lambda computes its default where it runs (the
+    compilation cache is under the user's home), so the snapshot names the
+    factory."""
+    if "legacy" in field.metadata:
+        return described(field.metadata["legacy"], annotation)
     factory = field.default_factory
     if factory is not dataclasses.MISSING and not isinstance(factory, type) and factory.__name__ != "<lambda>":
         value = factory()
