@@ -156,6 +156,14 @@ def test_a_pass_over_the_prepared_split_reads_every_record_once():
     np.testing.assert_array_equal(np.sort(pixels), np.arange(10, 26))
 
 
+def test_prepared_tfds_rows_without_preprocess_arrive_as_32_bit_fields():
+    batch = next(dew.data.load("tfds/dew_images", batch=4, options=TFDSOptions(path=str(PREPARED)),
+                               **READ).train(DataPartition()))
+
+    assert batch["label"].dtype == np.int32
+    assert batch["image"].dtype == np.uint8 and batch["image"].shape[0] == 4
+
+
 def test_the_data_dir_above_a_prepared_version_resolves_by_name():
     """A caller who prepared into a data_dir names the builder, not the
     version directory TFDS chose inside it."""
@@ -350,6 +358,31 @@ def test_a_split_the_caller_already_has_is_read_as_it_is():
 
     assert data.records == 8
     assert sorted(i for b in indices(data.train(DataPartition()), 2) for i in b) == list(range(8))
+
+
+def test_rows_without_preprocess_arrive_as_arrays_of_32_bit_fields():
+    """A row's lists and Python numbers become arrays, so a list column is
+    one [batch, n] field rather than n separate ones, and the 64-bit types
+    `datasets` hands back narrow to what a device holds."""
+    table = datasets.Dataset.from_dict({
+        "x": [[float(i), -float(i)] for i in range(8)],
+        "label": list(range(8)),
+        "name": [f"row {i}" for i in range(8)]})
+
+    batch = next(dew.data.load("hf/in-memory", batch=4, dataset=table, **READ).train(DataPartition()))
+
+    assert batch["x"].shape == (4, 2) and batch["x"].dtype == np.float32
+    np.testing.assert_array_equal(batch["x"][:, 0], -batch["x"][:, 1])
+    assert batch["label"].shape == (4,) and batch["label"].dtype == np.int32
+    assert sorted(batch["name"].tolist()) == sorted(f"row {i}" for i in batch["label"].tolist())
+
+
+def test_a_64_bit_value_a_32_bit_field_cannot_hold_is_refused_by_name():
+    table = datasets.Dataset.from_dict({"id": [2**40 + i for i in range(4)]})
+
+    with pytest.raises(ValueError, match="field 'id' holds 1099511627776"):
+        next(dew.data.load("hf/in-memory", batch=4, dataset=table, **READ).train(DataPartition()))
+
 
 
 # ---------------------------------------------------------------------------

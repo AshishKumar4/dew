@@ -39,6 +39,7 @@ import jax
 import numpy as np
 import tyro
 from absl import flags
+from numpy.typing import ArrayLike
 
 from dew import position
 
@@ -145,6 +146,52 @@ type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
+
+type InMemory = Mapping[str, ArrayLike] | Indexed
+"""Records a caller holds, for `Dataset.from_records`: columns whose first
+axis is the record, or anything `Indexed`."""
+
+
+class Columns:
+    """Reads records out of equal-length columns, one row of each per record.
+
+    The description a saved position compares against names the fields, their
+    per-record shapes and dtypes and the record count; it cannot tell apart
+    two tables of the same layout, as no source description can without
+    reading its data.
+    """
+
+    def __init__(self, columns: Mapping[str, ArrayLike]):
+        held = {name: np.asarray(column) for name, column in columns.items()}
+        if not held:
+            raise ValueError("in-memory records need at least one column")
+        first, *_ = held
+        for name, column in held.items():
+            if column.ndim == 0:
+                raise ValueError(
+                    f"column {name!r} is a single value; a column holds one value per "
+                    f"record along its first axis")
+            if len(column) != len(held[first]):
+                raise ValueError(
+                    f"a column holds one row per record, and {name!r} holds "
+                    f"{len(column)} records and {first!r} holds {len(held[first])}")
+        self._columns = held
+
+    def __len__(self) -> int:
+        return len(next(iter(self._columns.values())))
+
+    def __getitem__(self, index: int) -> Batch:
+        return {name: column[index] for name, column in self._columns.items()}
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{name} {column.dtype}{list(column.shape[1:])}"
+                           for name, column in self._columns.items())
+        return f"Columns({fields}; {len(self)} records)"
+
+
+def in_memory(records: InMemory) -> Indexed:
+    """`records` as a source read by index: columns wrapped, the rest as given."""
+    return Columns(records) if isinstance(records, Mapping) else records
 
 
 def json_argument[Options: DataclassInstance](
@@ -290,9 +337,16 @@ class Loading:
     records one worker reads ahead. `worker_buffer` alone counts batches, the
     batches one worker holds ready for the process that trains, because a
     worker stacks the records it read and hands whole batches back.
+
+    No workers is grain's own default: records are read by threads of the
+    process that trains. Worker processes each import the program again, so
+    they cost seconds and a process's memory apiece before the first batch,
+    and pay off only once decoding or augmentation outruns the threads. On
+    a sixteen-record pipeline, 32 workers took 18 s and 7 GiB to the first
+    batch, against no measurable time and 0.2 GiB without them.
     """
 
-    workers: int = 32
+    workers: int = 0
     threads: int = 64
     read_buffer: int = 128
     worker_buffer: int = 2
@@ -517,6 +571,34 @@ class Dataset:
             train=training,
             val=None if validation is None else validating,
             records=len(mapped) if records is None and mapped is not None else records,
+            batch=batch,
+        )
+
+    @classmethod
+    def from_records(cls, records: InMemory, *, batch: int, seed: int = 0,
+                     validation: InMemory | None = None,
+                     loading: Loading = Loading()) -> Dataset:
+        """Builds a run over records the caller holds: columns, rows or a source.
+
+        `records` is a mapping of columns whose first axis is the record,
+        `{"x": x, "y": y}`, a sequence of per-record mappings, or any source
+        read by index. Training reshuffles them from `seed` every epoch, the
+        stream every spec reads (`train_stream`), so the position a
+        checkpoint saves is a global record count and each process reads its
+        own share of every batch. `validation` is read once, in order, in
+        whole batches.
+        """
+        held = None if validation is None else in_memory(validation)
+        if held is not None and len(held) < batch:
+            raise ValueError(
+                f"{len(held)} validation records, fewer than one batch of {batch}: a "
+                f"pass is whole batches, so it would score nothing")
+        source = in_memory(records)
+        return cls(
+            train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
+            val=None if held is None else validation_pass(held, [], batch=batch, seed=seed,
+                                                          loading=loading),
+            records=len(source),
             batch=batch,
         )
 
