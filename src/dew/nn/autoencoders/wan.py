@@ -40,7 +40,7 @@ from .api import AutoEncoder
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
 class WanRMSNorm(nn.Module):

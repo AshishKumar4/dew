@@ -13,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
-import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -58,8 +57,8 @@ from dew.interop.processors import (
     ProcessorCall as ProcessorCall,
     _hosts,
 )
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
-from dew.interop.streaming import SourceLeaf
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.streaming import SourceLeaf, WeightLayout
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -86,100 +85,6 @@ if TYPE_CHECKING:
     from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
 
-
-
-@dataclass(frozen=True)
-class WeightLayout:
-    """Holds an existing source tensor's location and reversible storage layout.
-
-    `expert_index` is the expert a per-expert source tensor holds. The
-    loader stacks those tensors onto an expert dimension
-    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
-    expert of a layer and the index says which slice this tensor is.
-
-    `dtype` is the width the source stores this tensor in where that is
-    not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
-    and int32 in the collection, and the export writes back what the
-    checkpoint held.
-
-    `padded` is the length a 1-D source tensor stores past its leaf's, as
-    zeros, for the names its family declares (`DecoderFamily.zero_padded`):
-    Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
-    entries. The family's prepare step checks and trims the tail, and export
-    writes the zeros back.
-    """
-
-    name: str
-    paths: tuple[tuple[str, ...], ...]
-    shape: tuple[int, ...]
-    transpose: tuple[int, ...] | None = None
-    concatenate: int | None = None
-    expert_index: int | None = None
-    dtype: np.dtype | None = None
-    padded: int | None = None
-
-    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
-        if path[-1] == "layer_scalar":
-            if scalar_mode not in ("frozen", "trainable"):
-                raise ValueError("layer_scalar export requires an explicit model mode")
-            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
-        node: object = variables
-        for part in path:
-            if not isinstance(node, Mapping):
-                raise ValueError(f"parameter path {path} does not traverse a mapping")
-            node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
-            raise ValueError(
-                f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
-            )
-        return node
-
-    def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
-        """The dtype `export` writes, read from the leaf without copying it."""
-        if self.dtype is not None:
-            return np.dtype(self.dtype)
-        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
-
-    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
-        leaves = []
-        for path in self.paths:
-            node = self._leaf(variables, path, scalar_mode)
-            if self.expert_index is not None:
-                # Slice the expert where the leaf lives. One stacked leaf
-                # answers for E source tensors, so copying it to the host
-                # per tensor would move the whole stack E times.
-                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
-                    raise ValueError(
-                        f"{self.name} is expert {self.expert_index} of {path}, which "
-                        f"holds {node.shape}")
-                node = node[self.expert_index]
-            leaves.append(np.asarray(node))
-        value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
-        if self.transpose is not None:
-            value = value.transpose(self.transpose)
-        if self.padded is not None:
-            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
-        if value.size != math.prod(self.shape):
-            raise ValueError(
-                f"{self.name} assembles {value.shape} from {self.paths}, which does not "
-                f"fill the source's {self.shape}")
-        value = np.ascontiguousarray(value).reshape(self.shape)
-        return value if self.dtype is None else value.astype(self.dtype)
-
-    def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-        """Return the leaf of `shape` whose export is `tensor`.
-
-        The inverse of `export` for a layout that binds one whole leaf; a
-        tensor assembled from several leaves has no single leaf to restore.
-        """
-        if len(self.paths) != 1 or self.concatenate is not None or self.expert_index is not None:
-            raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
-        if tensor.shape != self.shape:
-            raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
-        transpose = self.transpose or tuple(range(len(shape)))
-        stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
-        return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
 
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
@@ -223,20 +128,26 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
-    """Return the text family's leaf map plus its inverse storage operations."""
+    """Return the leaves the text family maps a source tensor to and the
+    storage operations that rebuild it from them; a `packed` tensor is built
+    from the layouts of its parts."""
     family = decoders.families()[model_type]
-    # A family whose checkpoint packs its experts as `[E, out, in]`
-    # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
-    # back swapped.
-    from dew.interop.families.gemma import _gemma4_prepare
+    packing = family.packing(text_name)
+    if packing is None:
+        return _leaf_layout(name, text_name, tensor, family, config, variables, component)
+    parts = [_leaf_layout(part, part, value, family, config, variables, component)
+             for part, value in packing.split(text_name, tensor).items()]
+    if any(part is None for part in parts):
+        raise ValueError(f"packed tensor {name!r} has no parameter path")
+    return packing.layout(name, [part for part in parts if part is not None])
 
-    packed = family.prepare_weights is _gemma4_prepare
 
+def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoders.DecoderFamily,
+                 config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
 
     transpose = None
-    concatenate = None
     expert_index = None
     head_name, embedding_name = family.tied_head_names
     if text_name == head_name and config["tie_embeddings"]:
@@ -246,20 +157,6 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if embedding is None:
             raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
         paths = (nested(embedding),)
-    elif text_name.endswith(".experts.gate_up_proj") and (packed or model_type == "llama4_text"):
-        names = [
-            text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")
-        ]
-        paths_list = []
-        for key in names:
-            path = family.weight_path(key, config)
-            if path is None:
-                raise ValueError(f"fused expert tensor {name!r} has no parameter path")
-            paths_list.append(nested(path))
-        paths = tuple(paths_list)
-        concatenate = -1
-        if packed:
-            transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
         if path is None:
@@ -269,14 +166,11 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         if path[-1] == "kernel" and tensor.ndim == 2:
             lead = _leading_axes(variables, paths[0], expert_index)
             transpose = (*range(lead), lead + 1, lead)
-        elif text_name.endswith(".experts.down_proj") and packed:
-            transpose = (0, 2, 1)
-    # A weight is fp32 in the tree whatever the checkpoint stored it as, so
-    # only an index table's own width has to be carried back.
+    # A floating weight is written in its leaf's dtype; an index table
+    # carries the width the checkpoint stored it in back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
     padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
-    return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored, padded)
+    return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
 
 
 def _wrapper_layouts(tensors, record, variables):
@@ -546,19 +440,7 @@ class Pretrained:
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                # Each tensor is assembled when its shard is written (`save_sharded`).
-                specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                            for name, value in self.retained_tensors.items()},
-                         **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(values, scalar_mode))
-                            for name, layout in layouts.items()}}
-                return LazyTensors(
-                    specs,
-                    lambda name: (
-                        layouts[name].export(values, scalar_mode)
-                        if name in layouts
-                        else self.retained_tensors[name]
-                    ),
-                )
+                return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -2053,10 +1935,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # derived-export family binds too; `save` picks its writer by
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
-    # (Gemma 4's prepare) has no raw-name bindings.
+    # (GPT-2's and GPT-NeoX's prepare) has no raw-name bindings.
     entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare_weights is decoders.DecoderFamily.prepare_weights:
+    if entry.preserve_source_layout or entry.prepare is decoders.DecoderFamily.prepare:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 

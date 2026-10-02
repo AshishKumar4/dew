@@ -443,7 +443,7 @@ DEEPSEEK_V41 = DecoderFamily(
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in _kind_mixers(fields)),
     'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
-    weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
+    weight_path=_deepseek_v41_path, prepare=_deepseek_v4_prepare,
     preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the

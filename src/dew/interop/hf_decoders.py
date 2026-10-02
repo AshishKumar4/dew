@@ -25,14 +25,13 @@ import functools
 import json
 import operator
 import os
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
@@ -44,7 +43,7 @@ from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
-from dew.interop.streaming import LazyTree, SourceLeaf, materialize
+from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture, RematPolicy
@@ -1468,19 +1467,67 @@ def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
     return None if path is None else ('params', *path)
 
 
+# The decoder's tensors outside its layers, read one way on load and the
+# other on export.
+_TRUNK: Mapping[str, tuple[str, ...]] = {
+    'model.norm.weight': ('norm', 'scale'), 'model.norm.bias': ('norm', 'bias'),
+    'model.embed_tokens.weight': ('embed_tokens', 'embedding'),
+    'model.embed_positions.weight': ('embed_positions', 'embedding'),
+    'model.embed_tokens_per_layer.weight': ('embed_tokens_per_layer', 'embedding'),
+    'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
+    'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
+}
+_TRUNK_NAMES = {path: name for name, path in _TRUNK.items()}
+# Gemma 4's per-layer residual. Gate and projection are kernels, the post
+# norm is a scale. The values norm carries no weight, so it maps nothing.
+_PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
+                     'post_per_layer_input_norm': 'scale'}
+
+
+type Renames = tuple[tuple[str, str], ...]
+"""A family's own names onto the ones `_dew_path` reads, as (source, shared)
+pairs of dotted fragments: a load respells left to right, an export right to
+left, so one table holds both directions."""
+
+
+def _renamed(name: str, renames: Renames, *, export: bool = False) -> str:
+    """Respell `name` through `renames` in one pass over its dotted parts.
+
+    At each part the first pair whose fragment starts there replaces it and
+    the pass moves past it, so a respelled part is never read again and the
+    reverse pass undoes the forward one.
+    """
+    pairs = [(old.split('.'), new) for old, new in
+             ((shared, source) if export else (source, shared) for source, shared in renames)]
+    parts, spelled, index = name.split('.'), [], 0
+    while index < len(parts):
+        for old, new in pairs:
+            if parts[index:index + len(old)] == old:
+                spelled.append(new)
+                index += len(old)
+                break
+        else:
+            spelled.append(parts[index])
+            index += 1
+    return '.'.join(spelled)
+
+
+def _renamed_path(renames: Renames, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """`_dew_path` of a family whose names differ from the shared ones by `renames`."""
+    return _dew_path(_renamed(name, renames), config)
+
+
+def _renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
+    """`_hf_name` respelled in the family's own names: `_renamed_path` backwards."""
+    name = _hf_name(dew_name, config)
+    return None if name is None else _renamed(name, renames, export=True)
+
+
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
-    if parts in (['model', 'norm', 'weight'], ['model', 'norm', 'bias']):
-        return ('norm', 'scale' if parts[-1] == 'weight' else 'bias')
-    if parts == ['model', 'embed_tokens', 'weight']:
-        return ('embed_tokens', 'embedding')
-    if parts == ['model', 'embed_tokens_per_layer', 'weight']:
-        return ('embed_tokens_per_layer', 'embedding')
-    if parts == ['model', 'per_layer_model_projection', 'weight']:
-        return ('per_layer_model_projection', 'kernel')
-    if parts == ['model', 'per_layer_projection_norm', 'weight']:
-        return ('per_layer_projection_norm', 'scale')
+    if hf_name in _TRUNK:
+        return _TRUNK[hf_name]
     if len(parts) == 3 and parts[:2] == ['model', 'hc_head'] and parts[2] in _V4_HEAD:
         return ('hc_head', parts[2])
     if parts == ['lm_head', 'weight']:
@@ -1534,14 +1581,8 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
             return ('self_attn', tail[0], 'kernel')
         if tail in _LINEAR_LEAVES:
             return ('self_attn', *tail)
-    # Gemma 4's per-layer residual. Gate and projection are kernels, the
-    # post norm is a scale. The values norm carries no weight, so it maps
-    # nothing.
-    if len(parts) == 5 and leaf == 'weight':
-        if module in ('per_layer_input_gate', 'per_layer_projection'):
-            return (module, 'kernel')
-        if module == 'post_per_layer_input_norm':
-            return (module, 'scale')
+    if len(parts) == 5 and leaf == 'weight' and module in _PER_LAYER_INPUTS:
+        return (module, _PER_LAYER_INPUTS[module])
     norms = _norm_names(bool(config.get('sandwich_norms')))
     if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
         return (norms[module], 'scale' if leaf == 'weight' else 'bias')
@@ -1851,31 +1892,76 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     family = families()[records.text(config['model_type'], 'model_type')]
     if model.mixture is not None and family.export_path is _hf_name:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
+    return _decoder_tensors(model, variables, config)
+
+
+def _decoder_tensors(model: CausalTransformer, variables: Mapping[str, object],
+                     config: Mapping[str, object]) -> LazyTensors:
+    """Write every leaf under the name the family's `export_path` gives it.
+
+    Each leaf is stored as the load oriented it, a 2-D kernel transposed, and
+    the family's `packed` tensors are built from their parts. Gemma 4's layer
+    scalars are read from the collection `model.layer_scalar` names.
+    """
+    family = families()[records.text(config['model_type'], 'model_type')]
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
-    # Each tensor comes to the host when it is read, so a sharded writer
-    # holds one shard of the export, not all of it.
-    sources: dict[str, tuple[jax.Array | np.ndarray, bool]] = {}
-    specs: dict[str, jax.ShapeDtypeStruct] = {}
-    for name, value in flatten_dict(dict(params), sep='.').items():
+    tree = variables if 'params' in variables else {'params': params}
+    leaves = dict(flatten_dict(dict(params), sep='.'))
+    constants = tree.get('constants')
+    if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
+        leaves.update((name, value) for name, value in flatten_dict(dict(constants), sep='.').items()
+                      if name.endswith('.layer_scalar'))
+    layouts: dict[str, WeightLayout] = {}
+    for name, value in leaves.items():
         target = family.export_path(name, config)
-        if target is not None:
-            if not isinstance(value, (jax.Array, np.ndarray)):
-                raise TypeError(f'{name} is a {type(value).__name__}, not an array')
-            kernel = name.endswith('.kernel')
-            sources[target] = (value, kernel)
-            specs[target] = jax.ShapeDtypeStruct(value.shape[::-1] if kernel else value.shape, value.dtype)
+        if target is None:
+            continue
+        if not isinstance(value, (jax.Array, np.ndarray)):
+            raise TypeError(f'{name} is a {type(value).__name__}, not an array')
+        if target in layouts:
+            raise ValueError(f'{name} and {layouts[target].paths[0]} both write {target}')
+        kernel = name.endswith('.kernel') and value.ndim == 2
+        layouts[target] = WeightLayout(target, (('params', *name.split('.')),), value.shape[::-1]
+                                       if kernel else value.shape, (1, 0) if kernel else None)
+    return _layout_tensors(_packed_layouts(layouts, family.packed), tree, model.layer_scalar)
 
-    def build(target: str) -> np.ndarray:
-        # A kernel is transposed on its device and copied to the host
-        # contiguous: numpy copies a transposed bfloat16 kernel at 0.15 GiB/s
-        # on the RTX 3090 box's CPU, where the round trip over PCIe moves
-        # several GiB/s.
-        value, kernel = sources[target]
-        return np.asarray(jnp.asarray(value).T) if kernel else np.ascontiguousarray(np.asarray(value))
 
-    return LazyTensors(specs, build)
+def _packed_layouts(layouts: Mapping[str, WeightLayout],
+                    packed: Sequence["Packed"]) -> dict[str, WeightLayout]:
+    """`layouts` with each `packed` source tensor built from its parts' layouts,
+    in the place of its first part."""
+    result: dict[str, WeightLayout] = {}
+    for name, layout in layouts.items():
+        found = next(((packing, part) for packing in packed for part in packing.parts
+                      if name.endswith(part)), None)
+        if found is None:
+            result[name] = layout
+            continue
+        packing, part = found
+        stem = name.removesuffix(part)
+        missing = [stem + other for other in packing.parts if stem + other not in layouts]
+        if missing:
+            raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
+        if part == packing.parts[0]:
+            result[stem + packing.name] = packing.layout(
+                stem + packing.name, [layouts[stem + other] for other in packing.parts])
+    return result
+
+
+def _layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, object],
+                    scalar_mode: str | None = None,
+                    retained: Mapping[str, np.ndarray] | None = None) -> LazyTensors:
+    """The layouts' tensors and `retained` beside them, each built when it is
+    read, so a sharded writer holds one shard of the export, not all of it."""
+    kept = retained or {}
+    specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
+                for name, value in kept.items()},
+             **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables, scalar_mode))
+                for name, layout in layouts.items()}}
+    return LazyTensors(specs, lambda name: (
+        layouts[name].export(variables, scalar_mode) if name in layouts else kept[name]))
 
 
 def _export_config(model) -> Mapping[str, object]:
@@ -2055,16 +2141,16 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     None is the tied lm_head, whose embedding copy is written instead.
     """
     parts = dew_name.split('.')
-    if parts in (['norm', 'scale'], ['norm', 'bias']):
-        return 'model.norm.' + ('weight' if parts[-1] == 'scale' else 'bias')
-    if parts == ['embed_tokens', 'embedding']:
-        return 'model.embed_tokens.weight'
+    if tuple(parts) in _TRUNK_NAMES:
+        return _TRUNK_NAMES[tuple(parts)]
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
 
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
         module, leaf = parts[1], parts[-1]
+        if len(parts) == 3 and _PER_LAYER_INPUTS.get(module) == leaf:
+            return f'model.layers.{index}.{module}.weight'
         if len(parts) == 4 and module in _PROJECTIONS:
             if parts[2] in _PROJECTIONS[module] and leaf in ('kernel', 'bias'):
                 return (f'model.layers.{index}.{module}.{parts[2]}.'
@@ -2077,6 +2163,53 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
     raise ValueError(f"unknown parameter path {dew_name!r}")
+
+
+@dataclass(frozen=True)
+class Packed:
+    """One source tensor that holds several the path map reads: `parts`,
+    concatenated on `axis`, then permuted by `transpose`.
+
+    Each name is a suffix after the stem a tensor and its parts share. A load
+    splits the tensor into views of its parts (`DecoderFamily.prepare_weights`)
+    and an export packs their leaves back (`layout`), so the one entry is
+    both directions.
+    """
+
+    name: str
+    parts: tuple[str, ...]
+    axis: int = -1
+    transpose: tuple[int, ...] | None = None
+
+    def split(self, name: str, tensor: np.ndarray) -> dict[str, np.ndarray]:
+        """The parts of the source tensor `name`, as views of it."""
+        stem = name.removesuffix(self.name)
+        stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        return {stem + part: piece for part, piece in
+                zip(self.parts, np.split(stored, len(self.parts), axis=self.axis), strict=True)}
+
+    def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
+        """The layout of the source tensor `name`, from each part's one-leaf layout."""
+        ndim = len(parts[0].shape)
+        # A part's axis k is its leaf's axis order[k].
+        order = parts[0].transpose or tuple(range(ndim))
+        axis = self.axis % ndim
+        shape = [*parts[0].shape]
+        shape[axis] = sum(part.shape[axis] for part in parts)
+        back = tuple(range(ndim)) if self.transpose is None else tuple(
+            int(k) for k in np.argsort(self.transpose))
+        transpose = tuple(order[k] for k in back)
+        return WeightLayout(name, tuple(path for part in parts for path in part.paths),
+                            tuple(shape[k] for k in back),
+                            None if transpose == tuple(range(ndim)) else transpose,
+                            None if len(parts) == 1 else order[axis] - ndim)
+
+
+# Gemma 4, Qwen3-Next and Qwen 3.5 MoE hold their routed experts as torch
+# Linears, `gate_up_proj` `[E, 2 * expert, hidden]` with the gate in the first
+# rows and `down_proj` `[E, hidden, expert]`, where dew stacks `[E, in, out]`.
+_FUSED_EXPERTS = (Packed('.experts.gate_up_proj', ('.experts.gate_proj', '.experts.up_proj'), -1, (0, 2, 1)),
+                  Packed('.experts.down_proj', ('.experts.down_proj',), -1, (0, 2, 1)))
 
 
 class WeightPreparer(Protocol):
@@ -2110,18 +2243,24 @@ class DecoderFamily:
     export_path: Callable[[str, Mapping[str, object]], str | None] = _hf_name
     export_weights: Callable[[CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
-    """Whole-variable encoder; dense families retain their export_path loop."""
+    """Whole-variable encoder; the families with one add their checks or
+    storage to the shared writer (`_decoder_tensors`)."""
     sandwich_norms: bool = False
-    prepare_weights: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
-    """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
-    split their fused expert kernels. A quantized format is undone before this,
-    by `Pretrained.load`, which records what it undid for the export."""
+    prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
+    """Storage the path map cannot read as stored that no `packed` entry
+    describes: GPT-2's causal buffers, GPT-NeoX's head-interleaved qkv,
+    DeepSeek V4's grouped output projection. A quantized format is undone
+    before this, by `Pretrained.load`, which records what it undid for the
+    export."""
+    packed: tuple[Packed, ...] = ()
+    """Source tensors that hold several the path map reads, split on load and
+    packed again on export: fused experts and GPT-2's Conv1D projections."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""
     zero_padded: tuple[str, ...] = ()
     """Suffixes of the 1-D source tensors a checkpoint stores longer than their
-    leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare_weights` checks and
+    leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare` checks and
     trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
     constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = lambda directory, record: {}
     """The `constants` entries a family derives from its source directory beside
@@ -2130,6 +2269,23 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+
+    def prepare_weights(self, tensors: Mapping[str, np.ndarray],
+                        config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """The checkpoint's tensors as the path map reads them: `prepare`'s, with
+        every `packed` tensor split into its parts."""
+        prepared = self.prepare(tensors, config)
+        if not self.packed:
+            return prepared
+        split: dict[str, np.ndarray] = {}
+        for name, tensor in prepared.items():
+            packing = self.packing(name)
+            split.update({name: tensor} if packing is None else packing.split(name, tensor))
+        return split
+
+    def packing(self, name: str) -> Packed | None:
+        """The `packed` entry the source tensor `name` is, if any."""
+        return next((packing for packing in self.packed if name.endswith(packing.name)), None)
 
 
 def _bundled(model_type: str) -> DecoderFamily | None:

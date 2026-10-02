@@ -27,7 +27,7 @@ from .api import ModuleAutoEncoder
 from .kl import AutoencoderKL
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
 """The batch norm's buffers: its statistics become the latent normalization,
