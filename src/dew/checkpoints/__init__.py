@@ -165,8 +165,9 @@ class Ranking:
 
 def _recorded_rank(metrics):
     # Orbax records the metrics file only when best_fn is configured. The
-    # retention policy and named readers use every independently stored rank.
-    return next((value for key, value in metrics.items() if key.startswith('checkpoint/rank/')), None)
+    # retention policy and named readers use every independently stored rank;
+    # this hands orbax the first, or None for a save that recorded none.
+    return metrics.get(next((key for key in metrics if key.startswith('checkpoint/rank/')), None))
 
 
 class Metrics(Mapping):
