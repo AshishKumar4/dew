@@ -1587,6 +1587,8 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed)
         self._report(started, current)
+        if plan.dataset.held_out:
+            self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 

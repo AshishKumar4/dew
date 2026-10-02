@@ -460,6 +460,7 @@ class ImageDataset(DatasetSpec):
             val=None if scored is None else evaluated.processed(scored),
             records=len(train),
             batch=batch,
+            held_out=0 if validation is None or self.val_split else held_out,
         )
 
 
