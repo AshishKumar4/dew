@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import DataPartition, Loading, OxfordFlowers
+from dew.data import DataPartition, Loading, TFDSImages
 
 pytestmark = pytest.mark.network
 
@@ -37,7 +37,7 @@ VAL_RECORDS = 4 * BATCH
 @pytest.fixture(scope="module")
 def flowers():
     """The Dataset a recipe loads from the registered spec, in-process."""
-    return OxfordFlowers(path=os.environ["DEW_FLOWERS_PATH"], image_size=SIZE,
+    return TFDSImages(path=os.environ["DEW_FLOWERS_PATH"], image_size=SIZE,
                          loading=Loading(workers=0)).load(batch=BATCH)
 
 
