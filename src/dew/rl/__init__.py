@@ -11,6 +11,11 @@ keeps the split into a separate distribution a directory move
 (`docs/design/plan.md`, section 5.1). tests/test_rl_imports.py walks the tree
 and fails when either half of that stops being true.
 
+`sandbox` runs untrusted programs and tool sessions in bounded subprocesses
+or containers, which a verifiable reward scores completions with. It reads
+the episode types in `dew.objectives.rl`, so it is imported as
+`dew.rl.sandbox` and not from this package.
+
 `advantage` and `surrogate` port Apache-2.0 code from Tunix and verl and carry
 their notice; the rest of Dew is MIT.
 """

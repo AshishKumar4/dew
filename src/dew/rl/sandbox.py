@@ -1,10 +1,16 @@
-"""A fleet of sandboxed workers that run untrusted programs for verifiable rewards.
+"""Run untrusted programs and tool sessions in bounded Linux subprocesses.
+
+`SubprocessEnvironment` is an episode environment whose worker runs under
+the caller's OS permissions with bounded CPU, memory, time and IO. It has no
+filesystem or network isolation, so hostile code needs an outer boundary.
+Dew never selects or executes it by default.
 
 A `Program` is files written into a fresh temporary directory, an argv run
 there without a shell, and the text fed to its stdin. A runner executes one
 program under `SandboxLimits` and reports an `Outcome`: how it ended, its
 exit code, its capped output and the seconds it took. `SandboxFleet` runs
-programs on `workers` threads at once, each program in its own process.
+programs on `workers` threads at once, each program in its own process,
+which is what a verifiable reward scores completions with.
 
 Two runners exist. `ProcessRunner` starts the program through the same
 launcher as `SubprocessEnvironment`: RLIMIT_CPU and RLIMIT_AS, no core
@@ -23,7 +29,10 @@ program at all.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import json
+import math
 import os
 import selectors
 import signal
@@ -32,16 +41,221 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
-from .sandbox import SandboxLimits, launch
+from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
+from dew.records import JSON
 
+
+@dataclass(frozen=True)
+class SandboxLimits:
+    """Bound one worker by RLIMIT_CPU and RLIMIT_AS, plus parent-enforced session and IO limits.
+
+    Forked children inherit the resource limits. Process-group cleanup handles
+    descendants that stay in that group; this is not a cgroup aggregate limit.
+    """
+
+    wall_seconds: float = 30.
+    cpu_seconds: int = 10
+    memory_bytes: int = 256 * 1024 ** 2
+    message_bytes: int = 1024 ** 2
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.wall_seconds) or self.wall_seconds <= 0:
+            raise ValueError("sandbox wall_seconds must be finite and positive")
+        for name in ("cpu_seconds", "memory_bytes", "message_bytes"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"sandbox {name} must be a positive integer")
+
+
+def _observation(value: object) -> Observation:
+    """Read one decoded JSON response as an `Observation`."""
+    if not isinstance(value, Mapping):
+        raise ValueError("sandbox response must be an observation object")
+    context, status, detail = value.get("context"), value.get("status"), value.get("detail", "")
+    if not isinstance(context, list) or not isinstance(status, str) or not isinstance(detail, str):
+        raise ValueError("sandbox observation needs context ids, a status name and string detail")
+    try:
+        state = EpisodeStatus[status.upper()]
+    except KeyError:
+        raise ValueError(f"unknown sandbox observation status {status!r}") from None
+    return Observation(tuple(context), state, detail)
+
+
+def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
+    """Start `command` in `directory` under `limits`, in its own session, with piped streams.
+
+    The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
+    parent-death signal, then execs the command with a minimal environment.
+    """
+    launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
+    return subprocess.Popen(
+        [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
+         str(os.getpid()), *command], cwd=directory,
+        env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+
+
+class _ProcessEnvironment:
+    """Drive one sandboxed worker process over a line-delimited JSON protocol."""
+
+    def __init__(self, command: tuple[str, ...], limits: SandboxLimits,
+                 identity: EpisodeId, directory: str):
+        self.identity, self.limits = identity, limits
+        self.deadline = time.monotonic() + limits.wall_seconds
+        self.output = bytearray()
+        self.process = launch(command, limits, directory)
+        assert (
+            self.process.stdin is not None
+            and self.process.stdout is not None
+            and self.process.stderr is not None
+        )
+        self.stdin, self.stdout, self.stderr = self.process.stdin, self.process.stdout, self.process.stderr
+        for stream in (self.stdin, self.stdout, self.stderr):
+            os.set_blocking(stream.fileno(), False)
+
+    def _decoded(self) -> JSON:
+        """Take the first complete line out of the read buffer as JSON."""
+        line, _, rest = self.output.partition(b"\n")
+        self.output = rest
+        try:
+            return json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("sandbox returned malformed JSON") from error
+
+    def _pump(self, ready: selectors.BaseSelector, event: selectors.SelectorKey, request: bytes,
+              sent: int, diagnostic: bytearray) -> int:
+        """Write the pending request to one ready stream, or read a chunk from it.
+
+        Returns how much of the request has been written. A stream with
+        nothing left is unregistered, so the selector itself reports when
+        the worker can no longer answer.
+        """
+        descriptor = event.fd
+        if event.data == "stdin":
+            try:
+                sent += os.write(descriptor, request[sent:])
+            except BrokenPipeError:
+                ready.unregister(self.stdin)
+            else:
+                if sent == len(request):
+                    ready.unregister(self.stdin)
+            return sent
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            ready.unregister(event.fileobj)
+        elif event.data == "stdout":
+            self.output.extend(chunk)
+        else:
+            diagnostic.extend(chunk)
+        if len(self.output) + len(diagnostic) > self.limits.message_bytes:
+            raise ValueError("sandbox response exceeds message_bytes")
+        return sent
+
+    def _request(self, operation: str, payload: Mapping[str, object]) -> JSON:
+        """Send one request and return the worker's decoded reply.
+
+        The loop selects over all three streams at once, because a worker
+        that never reads its input can still fill the pipe with output,
+        and a deadlock there would outlive the wall clock. It carries how
+        much of the request is `sent`, the undecoded `self.output`, and the
+        stderr `diagnostic` an exit reports.
+        """
+        request = json.dumps({"operation": operation, **payload}, allow_nan=False).encode() + b"\n"
+        if len(request) > self.limits.message_bytes:
+            raise ValueError("sandbox request exceeds message_bytes")
+        sent = 0
+        diagnostic = bytearray()
+        with selectors.DefaultSelector() as ready:
+            ready.register(self.stdin, selectors.EVENT_WRITE, "stdin")
+            ready.register(self.stdout, selectors.EVENT_READ, "stdout")
+            ready.register(self.stderr, selectors.EVENT_READ, "stderr")
+            while True:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox exceeded wall_seconds")
+                if sent == len(request) and b"\n" in self.output:
+                    return self._decoded()
+                for event, _ in ready.select(min(remaining, .1)):
+                    sent = self._pump(ready, event, request, sent, diagnostic)
+                if self.process.poll() is not None and not ready.get_map():
+                    raise ChildProcessError(
+                        f"sandbox exited with code {self.process.returncode}: "
+                        f"{diagnostic.decode('utf-8', errors='replace')}")
+
+    def reset(self) -> Observation:
+        return _observation(self._request("reset", {"episode": asdict(self.identity)}))
+
+    def step(self, action: Action) -> Observation:
+        record = {"context": list(action.context), "tokens": list(action.tokens),
+                  "terminated": action.terminated, "policy_step": action.policy_step}
+        return _observation(self._request("step", {"action": record}))
+
+    def get_state(self) -> bytes:
+        reply = self._request("get_state", {})
+        state = reply.get("state") if isinstance(reply, Mapping) else None
+        if not isinstance(state, str):
+            raise ValueError("sandbox get_state must return a base64 state string")
+        return base64.b64decode(state, validate=True)
+
+    def set_state(self, state: bytes) -> None:
+        reply = self._request("set_state", {"state": base64.b64encode(state).decode("ascii")})
+        if not isinstance(reply, Mapping) or reply.get("restored") is not True:
+            raise ValueError("sandbox set_state must acknowledge restored state")
+
+    def close(self) -> None:
+        # The group is already gone when the sandbox exited on its own.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        try:
+            self.process.wait(timeout=5)
+        finally:
+            for stream in (self.stdin, self.stdout, self.stderr):
+                stream.close()
+
+
+@dataclass(frozen=True)
+class SubprocessEnvironment:
+    """A user-selected JSON-lines worker implementing reset and step.
+
+    command is an argv tuple, executed without a shell in a temporary working
+    directory. Each request has an operation and either an episode identity
+    or an action record. Replies contain context (integer ids), status
+    (running/completed/truncated/cancelled/error) and optional string detail.
+
+    Session exit kills the process group on success, error or cancellation.
+    The direct worker also receives SIGKILL if its parent dies. Neither
+    mechanism replaces filesystem/network isolation or controls descendants
+    that deliberately leave the group.
+    """
+
+    command: tuple[str, ...]
+    limits: SandboxLimits = SandboxLimits()
+
+    def __post_init__(self) -> None:
+        if sys.platform != "linux":
+            raise NotImplementedError(
+                "SubprocessEnvironment currently requires Linux resource and parent-death limits"
+            )
+        if not self.command or any(not isinstance(part, str) or not part for part in self.command):
+            raise ValueError("sandbox command must be a nonempty argv tuple")
+
+    @contextmanager
+    def __call__(self, identity: EpisodeId) -> Iterator[Environment]:
+        with tempfile.TemporaryDirectory(prefix="dew-episode-") as directory:
+            worker = _ProcessEnvironment(self.command, self.limits, identity, directory)
+            try:
+                yield worker
+            finally:
+                worker.close()
 
 class Verdict(Enum):
     """How a program ended."""

@@ -48,8 +48,8 @@ from dew.data import tokenizer_for
 from dew.data.dataset import Dataset
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
 from dew.interop import load_pretrained
+from dew.interop.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
-from dew.objectives.rl.harbor import HARBOR_KEY, Gateway, HarborSource
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
 from dew.sampling import Sampling

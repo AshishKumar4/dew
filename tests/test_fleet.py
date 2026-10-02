@@ -16,16 +16,12 @@ import time
 
 import pytest
 
-from dew.objectives.rl import (
-    CodeReward,
-    ContainerRunner,
-    MathReward,
-    Program,
-    SandboxFleet,
-    SandboxLimits,
-    Verdict,
-    code_block,
-)
+from test_examples import load_example
+
+from dew.rl.sandbox import ContainerRunner, Program, SandboxFleet, SandboxLimits, Verdict
+
+RLVR = load_example("train_rlvr")
+CodeReward, code_block = RLVR.CodeReward, RLVR.code_block
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="the fleet's limits are Linux process limits")
 
@@ -137,30 +133,6 @@ def test_code_block_prefers_the_last_tagged_block():
     assert code_block(text) == "second\n"
     assert code_block("```\nonly\n```") == "only\n"
     assert code_block("no code") is None
-
-
-def test_math_reward_compares_rational_answers():
-    reward = MathReward()
-    assert reward("math", r"so \boxed{\frac{1}{2}}", "0.5", "") == 1.0
-    assert reward("math", r"\boxed{1,024}", "1024", "") == 1.0
-    assert reward("math", r"\boxed{-3/4}", "-0.75", "") == 1.0
-    assert reward("math", r"\boxed{7}", "8", "") == 0.0
-    assert reward("math", "the answer is 8", "8", "") == 0.0
-    assert MathReward(require_boxed=False)("math", "the answer is 8.", "8", "") == 1.0
-    assert reward("math", r"\boxed{x+1}", "x+1", "") == 1.0
-    assert reward("math", r"\boxed{12,345.5}", "12345.5", "") == 1.0
-
-
-def test_math_reward_does_not_merge_a_list_into_one_number():
-    reward = MathReward()
-    assert reward("math", r"\boxed{1,2}", "12", "") == 0.0
-    assert reward("math", r"\boxed{12}", "1, 2", "") == 0.0
-    assert reward("math", r"\boxed{3,5}", "35", "") == 0.0
-    assert reward("math", r"\boxed{2 3}", "23", "") == 0.0
-    assert MathReward(require_boxed=False)("math", "the roots are 1,2", "12", "") == 0.0
-
-
-IMAGE = "python:3.12-slim"
 
 
 def _image_present() -> bool:
