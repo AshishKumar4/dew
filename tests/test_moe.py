@@ -619,8 +619,6 @@ def leaf_names(variables):
 
 @pytest.mark.parametrize("settings,expected", [
     ({"mixture": {"experts": 4}}, (0, 1, 2, 3)),
-    ({"mixture": {"experts": 4, "every": 2}}, (1, 3)),
-    ({"mixture": {"experts": 4, "every": 4}}, (3,)),
     ({"mixture": {"experts": 4, "layers": (0, 2)}}, (0, 2)),
     ({}, ()),
 ])
@@ -728,9 +726,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
 
 @pytest.mark.parametrize("mixture,message", [
     ({"experts": 0}, "dense model has no mixture"),
-    ({"experts": 4, "every": 2, "layers": (1,)}, "only"),
     ({"experts": 4, "layers": (4,)}, "outside"),
-    ({"experts": 4, "every": 0}, "positive"),
     ({"experts": 4, "top_k": 5}, "top_k"),
     ({"experts": 4, "implementation": "megablox"}, "implementation"),
 ])
@@ -748,11 +744,11 @@ def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
     same weights through either kernel give the same logits."""
     pytest.importorskip("tokamax")
     tokens = jax.random.randint(jax.random.key(0), (2, SEQ_LEN), 0, VOCAB)
-    reference = decoder(mixture=Mixture(experts=4, top_k=2, every=2))
+    reference = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1, 3)))
     variables = reference.init(jax.random.key(1), tokens)
     expected = reference.apply(variables, tokens)
     logits = decoder(mixture=Mixture(
-        experts=4, top_k=2, every=2, implementation='tokamax')).apply(variables, tokens)
+        experts=4, top_k=2, layers=(1, 3), implementation='tokamax')).apply(variables, tokens)
 
     # Observed 0 on CPU, where tokamax lowers to the same ragged_dot.
     assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5

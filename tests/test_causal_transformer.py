@@ -772,7 +772,7 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'kinds': {'linear_attention': {'window': 2}}}, "name no layer"),
     ({'kinds': {'full_attention': {'window': 0}}}, "window"),
     ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
-    ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
+    ({'use_double_wide_mlp': True}, "kv_shared_layers"),
     ({'per_layer_input_dim': 0}, "None is a model without them"),
     ({'mlp': 'unknown'}, "swiglu"),
 ])

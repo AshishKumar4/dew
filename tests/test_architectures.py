@@ -256,7 +256,7 @@ CASES = [
         "layer_types": ("sliding_attention", "sliding_attention"),
         "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
         "altup": {"num_inputs": 3}, "laurel_rank": 8,
-        "per_layer_input_dim": 8, "num_kv_shared_layers": 1,
+        "per_layer_input_dim": 8, "kv_shared_layers": (1,),
     }, seq_len=SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The

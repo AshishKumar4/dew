@@ -172,7 +172,7 @@ ENTRIES = (
             and (
                 fields.get("v_norm")
                 or fields.get("per_layer_input_dim")
-                or fields.get("num_kv_shared_layers")
+                or fields.get("kv_shared_layers")
             )
         ),
         "diffusion_gemma_text",
@@ -207,7 +207,7 @@ ENTRIES = (
             and not (
                 fields.get("v_norm")
                 or fields.get("per_layer_input_dim")
-                or fields.get("num_kv_shared_layers")
+                or fields.get("kv_shared_layers")
             )
             and not fields.get("output_gate")
             and not fields.get("qk_norm")
@@ -428,7 +428,7 @@ ENTRIES = (
         ("gemma4_text",),
         _gemma4_config,
         lambda fields: bool(
-            fields.get("v_norm") or fields.get("per_layer_input_dim") or fields.get("num_kv_shared_layers")
+            fields.get("v_norm") or fields.get("per_layer_input_dim") or fields.get("kv_shared_layers")
         ),
         "gemma4_text",
         "Gemma4ForCausalLM",
