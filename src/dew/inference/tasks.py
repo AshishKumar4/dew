@@ -88,7 +88,9 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
         text = None
     if text is not None:
         if processor is None:
-            raise ValueError("text requests need a processor; pass ModelInputs or token rows")
+            raise ValueError("text requests need a processor: pass processor= where the task is built, "
+                             "as objective.pipeline(state, processor=source.processor) does, or request "
+                             "ModelInputs or token rows")
         return processor(text, images=images)
     if images is not None:
         raise ValueError("images travel with text through the processor; prepared rows carry them in ModelInputs")
