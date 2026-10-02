@@ -7,27 +7,30 @@ A `Dataset` supplies the batches a run trains and validates on. A batch is a dic
 
 ## Dataset
 
-```python
-import itertools
+Records you already hold in memory become a `Dataset` through `Dataset.from_records`:
 
+```python
 import numpy as np
 from dew.data import DataPartition, Dataset
 
-x = np.arange(16, dtype=np.float32).reshape(8, 2)
+x = np.arange(32, dtype=np.float32).reshape(16, 2)
 y = x.sum(axis=1, keepdims=True)
-batch = {"features": x, "target": y}
-data = Dataset(train=lambda partition: itertools.repeat(batch),
-               val=lambda partition: iter([batch]), records=8, batch=8)
+data = Dataset.from_records({"features": x, "target": y}, batch=8, seed=0,
+                            validation={"features": x[:8], "target": y[:8]})
 
 first = next(data.train(DataPartition()))
 print({name: value.shape for name, value in first.items()})
-print(data.steps_per_epoch)
+print(data.records, data.steps_per_epoch)
 ```
 
 ```text
 {'features': (8, 2), 'target': (8, 1)}
-1
+16 2
 ```
+
+`from_records` takes a mapping of columns whose first axis is the record, as here, a list of per-record mappings, or any source with `__len__` and `__getitem__`. Training reshuffles the records from `seed` every epoch, reads each one once per epoch, and saves its position in a checkpoint, so a resumed run reads the records it had not reached. With several processes, each reads its own share of every batch. `validation` is read once in order, in whole batches. The example validates on training records only to show the argument; a validation result needs records the model does not train on.
+
+Every reader returns the same `Dataset` value:
 
 | Field | Meaning |
 |---|---|
@@ -36,11 +39,24 @@ print(data.steps_per_epoch)
 | `records` | The number of training records, or `None` when unknown. |
 | `batch` | The global batch size. |
 
-The example uses the same records for both splits only to show the two iterators; a validation result needs records the model does not train on.
-
 `train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails, and a training step's exception kept after the run does not keep its closed prefetch iterator alive.
 
 The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`), and the built-in readers read only that share.
+
+A `Dataset` can also be built from the two functions directly, for a stream no reader covers:
+
+```python
+import itertools
+
+import numpy as np
+from dew.data import Dataset
+
+x = np.arange(16, dtype=np.float32).reshape(8, 2)
+batch = {"features": x, "target": x.sum(axis=1, keepdims=True)}
+data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
+```
+
+Such a function has to do what `from_records` does for you: read only the share its partition names, and give its iterator `get_state` and `set_state` if the run checkpoints (see [Resuming the data stream](#resuming-the-data-stream)). This one does neither, so it suits a single-process run with `checkpoint_every=None`. `Dataset.from_grain` takes a Grain pipeline you built yourself.
 
 `Dataset.steps_per_epoch` is `records // batch`, or `None` when `records` is `None`. A stream without a record count needs an explicit `steps` in `fit`.
 
@@ -89,7 +105,7 @@ The training stream is shuffled: the first window of the first batch is window 4
 
 Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `tools/tokenize_text.py` writes `train.bin`, `val.bin` and `meta.json` from raw text.
 
-Other specifications include `OxfordFlowers`, `HFImages`, `DocumentChunks`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
+Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
 
 | Field | Meaning |
 |---|---|
@@ -100,12 +116,12 @@ Other specifications include `OxfordFlowers`, `HFImages`, `DocumentChunks`, `Cha
 
 | `Loading` field | Default | Counts |
 |---|---|---|
-| `workers` | 32 | Grain worker processes; `0` reads in the training process |
+| `workers` | 0 | Grain worker processes; `0` reads in the training process |
 | `threads` | 64 | Record reads one worker keeps in flight |
 | `read_buffer` | 128 | Records one worker reads ahead |
 | `worker_buffer` | 2 | Batches one worker holds ready |
 
-Use `Loading(workers=0)` for small local runs, and raise the settings only after measuring the input pipeline on your data and hardware.
+The default reads in the training process, as Grain's own default does. Worker processes each import the program again, so they cost seconds and memory before the first batch, and pay off only when decoding or augmentation outruns the reading threads. Raise `workers` only after measuring the input pipeline on your data and hardware. A script that starts workers needs an `if __name__ == "__main__":` guard, because each worker imports the script.
 
 Image sources can need network access the first time. Token-window sources read files written by `tools/tokenize_text.py`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
 
@@ -273,7 +289,7 @@ python examples/train_masked_lm.py \
 
 ## TFDS and Hugging Face datasets
 
-`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. `preprocess(record, rng)` turns one provider record into batch fields. Without it, the provider's records are the batch fields as they come; there is no default conversion, because every provider's rows have their own structure. `dataset=` takes a Hugging Face split that is already in memory:
+`dew.data.load("<provider>/<name>", batch=...)` reads a dataset that TFDS or Hugging Face already holds and returns a `Dataset`. `preprocess(record, rng)` turns one provider record into batch fields. Without it, each field of a record reaches the batch as an array: a list column becomes one `[batch, n]` field, 64-bit numbers become 32-bit ones, and strings and bytes stay as they are. Nothing is decoded, renamed or dropped. An integer that does not fit in 32 bits is refused by name. `dataset=` takes a Hugging Face split that is already in memory:
 
 ```python
 import datasets
@@ -349,6 +365,6 @@ Which process holds which row of a step depends on the process count, so randomn
 
 ## Multiple processes
 
-`Dataset.batch` is the global batch. With several JAX processes each process reads its share and Dew assembles the global arrays with `jax.make_array_from_process_local_data`. The built-in readers split records between processes themselves. A custom `train` function must read only the share its `partition` names, `partition.index` of `partition.count`, or every process trains on the same records.
+`Dataset.batch` is the global batch. With several JAX processes each process reads its share and Dew assembles the global arrays with `jax.make_array_from_process_local_data`. The built-in readers and `Dataset.from_records` split records between processes themselves. A custom `train` function must read only the share its `partition` names, `partition.index` of `partition.count`, or every process trains on the same records.
 
 Before a multi-process run, check on the target topology that process shares do not overlap, that sharding is as expected and that a resume continues the stream. [Distributed training](distributed.md) describes placement.

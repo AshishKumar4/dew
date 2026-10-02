@@ -492,7 +492,13 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
     takes its declared default, which says what runs recorded before the
     field existed did (tests/fixtures/record_defaults.json holds every
     default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises."""
+    record lacks, raises.
+
+    A field whose default moved after runs were recorded without it says
+    what those runs meant as `metadata={"legacy": value}`, and a record
+    that lacks it reads as that value. Every record `to_dict` writes
+    carries the field, so code that builds the class takes the new default
+    and a recorded run keeps the old one."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
     for old, new in _FIELD_RENAMES.get(cls, {}).items():
@@ -507,8 +513,9 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
-            for f in declared if f.name in values}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
+                values[f.name] if f.name in values else f.metadata["legacy"]))
+            for f in declared if f.name in values or "legacy" in f.metadata}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:

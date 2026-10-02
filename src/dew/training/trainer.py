@@ -1539,7 +1539,8 @@ class Trainer(Generic[Loss, Effects]):
         shown = {**TRAINER_SHOWN, **self.objective.shown, **_reported(self.rollout, plan.metrics)}
         agreed("training announcement", functools.partial(
             self._display.start, started, model=type(self.objective if model is None else model).__name__,
-            batch=plan.dataset.batch, precision=precision, shown=shown))
+            batch=plan.dataset.batch, precision=precision, shown=shown,
+            averaged=self.objective.ema is not None and not self.objective._ema_is_reference))
         return False
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,

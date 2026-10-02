@@ -492,6 +492,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     the full pass. It also slices the forward that an evaluation or a
     scoring pass runs.
 
+    `ema_decay` keeps an exponential moving average of the trained leaves
+    at that decay, and evaluation and previews then read the average. None,
+    the default, keeps none: no second copy of the weights, and validation
+    scores the weights that trained.
+
     `pretrained` is a variables dict to start from instead of a fresh
     init. A `dew.interop.load_pretrained(...)` bundle's `lm_objective`
     builds the objective with its model and variables together. The
@@ -576,7 +581,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         model,
         seq_len: int,
         *,
-        ema_decay: float | None = 0.999,
+        ema_decay: float | None = None,
         pad_id: int | None = None,
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
@@ -691,7 +696,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         return TextGeneration(self.model, thaw(params), sampling=sampling)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> TextGeneration:
         """Publish the decoder over the state's weights as a generation task.
 
         It samples and is budgeted the way this objective's previews are,
