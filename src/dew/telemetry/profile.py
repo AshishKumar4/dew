@@ -164,6 +164,16 @@ class Profiler:
     directory, the first start allocates a persistent temporary root. Collection
     covers this process and drains only JAX's default backend, without copying
     array values to the host. Other processes must enter their own captures.
+
+    A capture carries the HLO of every executable alive in the process, not
+    only of the work it traced, and its stop exports all of it. A training
+    run's window pays little for that: 0.95 s and 3.4 MB for a 4-layer
+    decoder's fit that had evaluated and sampled first (RTX 4080), whose
+    op_profile, hlo_stats and roofline_model reports are built from it and
+    come out nearly empty without it. A long-lived process that has compiled
+    many other programs pays for each (400 unrelated ones made a CPU capture
+    of small work take 15 s and 75 MB); pass options with `enable_hlo_proto`
+    off there when the trace and kernel reports are enough.
     """
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, *,
