@@ -110,6 +110,8 @@ GPU reductions are not bitwise repeatable by default, so a second run can contin
 
 Use one tokenizer everywhere: data preparation, model construction, decoding and checkpoint export. `ByteTokenizer` has a vocabulary of 256 and uses ID 255 as its EOS. `HFTokenizer(name)` wraps a Hugging Face tokenizer with that model's vocabulary and chat template, and downloads its files on first use.
 
+`ByteTokenizer` and `HFTokenizer` have `encode` and `decode`, and `tokenizer_for(name)` returns the first for `"byte"` and the second for any other name. A source loaded with `load_pretrained` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
+
 `tools/tokenize_text.py` (in a repository checkout) tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
 
 ```bash
