@@ -376,7 +376,7 @@ def test_the_layout_default_tolerance_is_two_percent():
     """A layout that names no tolerance carries the library's 2%, without
     the config repeating the number."""
     assert Layout().tolerance == 0.02
-    with pytest.raises(ValueError, match="2.00%"):
+    with pytest.raises(ValueError, match=r"2.00%"):
         Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
                 mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1)).fit(Data(batches), steps=0)
 

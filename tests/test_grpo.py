@@ -231,7 +231,7 @@ def test_a_positive_beta_needs_the_frozen_tree():
                               PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
     params = objective.init(jax.random.key(0))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    with pytest.raises(ValueError, match="step.ema"):
+    with pytest.raises(ValueError, match=r"step.ema"):
         scalar_loss(objective, params, rollout_batch(), step)
 
 

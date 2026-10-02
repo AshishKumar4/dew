@@ -946,7 +946,7 @@ def test_a_corrupt_zone_cache_is_named_rather_than_emptied(fake):
     back through the zone search."""
     config_dir().mkdir(parents=True, exist_ok=True)
     (config_dir() / "zones.json").write_text("{not json")
-    with pytest.raises(ValueError, match="zones.json.*delete it"):
+    with pytest.raises(ValueError, match=r"zones.json.*delete it"):
         tpu_config.cached_zone("slice")
 
 

@@ -198,11 +198,10 @@ def test_source_close_failure_preserves_primary_and_is_reported_once(body_fails)
     cleanup = OSError("source close failed")
     primary = RuntimeError("body failed")
     source = Source(close_failure=cleanup)
-    with pytest.raises((RuntimeError, OSError)) as raised:
-        with DevicePrefetchIterator(source, build_mesh()) as stream:
-            next(stream)
-            if body_fails:
-                raise primary
+    with pytest.raises((RuntimeError, OSError)) as raised, DevicePrefetchIterator(source, build_mesh()) as stream:
+        next(stream)
+        if body_fails:
+            raise primary
     assert raised.value is (primary if body_fails else cleanup)
     if body_fails:
         assert any("source close failed" in note for note in primary.__notes__)

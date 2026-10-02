@@ -220,7 +220,7 @@ def test_beta_without_pairs_and_weights_outside_their_range_are_refused():
     teacher = LMObjective(teacher_model, SEQ, ema_decay=None)
     with pytest.raises(ValueError, match="none were named"):
         DistillationObjective(student, teacher, beta=0.5)
-    with pytest.raises(ValueError, match="alpha=1.5"):
+    with pytest.raises(ValueError, match=r"alpha=1.5"):
         DistillationObjective(student, teacher, alpha=1.5)
     with pytest.raises(ValueError, match="temperature=0"):
         DistillationObjective(student, teacher, temperature=0.0)

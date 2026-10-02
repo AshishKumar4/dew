@@ -842,7 +842,7 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
 
     hostile = tmp_path / "hostile.pickle"
     hostile.write_bytes(pickle.dumps(print))
-    with pytest.raises(pickle.UnpicklingError, match="builtins.print"):
+    with pytest.raises(pickle.UnpicklingError, match=r"builtins.print"):
         load_arrays(hostile)
 
 

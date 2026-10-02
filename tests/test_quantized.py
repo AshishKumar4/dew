@@ -126,7 +126,7 @@ def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
 
 
 def test_a_scale_without_its_weight_is_refused():
-    with pytest.raises(ValueError, match="scales model.layers.0.mlp.up_proj.weight, which"):
+    with pytest.raises(ValueError, match=r"scales model.layers.0.mlp.up_proj.weight, which"):
         fp8_blocks(BLOCK).dequantize({"model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1))})
 
 
@@ -470,7 +470,7 @@ def test_a_weight_that_is_not_finite_is_refused_rather_than_written(value):
     weight = np.ones((4, 4), np.float32)
     weight[2, 3] = value
 
-    with pytest.raises(ValueError, match="1 value.*not finite"):
+    with pytest.raises(ValueError, match=r"1 value.*not finite"):
         quantize_fp8_blocks(weight, block=2)
 
 
@@ -528,7 +528,7 @@ def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
     """A source tensor that was quantized and is missing from the export
     would otherwise be written dense under a config that calls it
     quantized, which is the lie this whole path exists to avoid."""
-    with pytest.raises(KeyError, match="up_proj.weight"):
+    with pytest.raises(KeyError, match=r"up_proj.weight"):
         fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
                                           ("model.layers.0.mlp.up_proj.weight",))
 
@@ -537,7 +537,7 @@ def test_the_packer_refuses_to_overwrite_an_existing_scale_partner():
     tensors = {"a.weight": np.ones((16, 16), np.float32),
                "a.weight_scale_inv": np.ones((1, 1), np.float32)}
 
-    with pytest.raises(ValueError, match="a.weight_scale_inv is already"):
+    with pytest.raises(ValueError, match=r"a.weight_scale_inv is already"):
         fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, ("a.weight",))
 
 

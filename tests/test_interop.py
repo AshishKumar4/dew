@@ -196,7 +196,7 @@ def test_an_fp4_tensor_with_an_odd_last_axis_is_refused_by_name(tmp_path):
     path = tmp_path / "odd.safetensors"
     raw_safetensors(path, {"w": ("F4", (2, 3), bytes(3))})
 
-    with pytest.raises(ValueError, match="'w'.*F4 with shape \\(2, 3\\)"):
+    with pytest.raises(ValueError, match=r"'w'.*F4 with shape \(2, 3\)"):
         read_file(path)
 
 

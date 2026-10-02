@@ -356,7 +356,7 @@ def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
             jax.random.key(0), tokens)
     mismatched = dict(mla_record(settings))
     mismatched["yarn"] = dict(mismatched["yarn"], rope_theta=5000.0)
-    with pytest.raises(ValueError, match="rope_theta .* disagree"):
+    with pytest.raises(ValueError, match=r"rope_theta .* disagree"):
         mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
 

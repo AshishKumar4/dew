@@ -32,9 +32,9 @@ def test_fid_pools_unequal_batches_and_singletons():
 def test_fid_refuses_insufficient_or_nonfinite_populations():
     one = GaussianStats.from_features(np.ones((1, 3)), population="generated")
     real = GaussianStats.from_features(np.eye(3), population="real")
-    with pytest.raises(ValueError, match="generated.*at least two"):
+    with pytest.raises(ValueError, match=r"generated.*at least two"):
         FID().finalize(FIDStats(one, real))
-    with pytest.raises(ValueError, match="real.*finite"):
+    with pytest.raises(ValueError, match=r"real.*finite"):
         GaussianStats.from_features([[1, np.nan]], population="real")
 
 

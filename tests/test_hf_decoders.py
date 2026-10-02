@@ -1234,7 +1234,7 @@ def test_glm5_next_null_kv_head_count_uses_query_heads():
 def test_glm5_next_refuses_disagreeing_layer_schedules():
     config = fixture_config('glm5-next-tiny')
     linear = {**config['linear_attn_config'], 'kda_layers': [0, 1]}
-    with pytest.raises(ValueError, match='linear_attn_config.kda_layers'):
+    with pytest.raises(ValueError, match=r"linear_attn_config.kda_layers"):
         translate_config({**config, 'linear_attn_config': linear})
 
 

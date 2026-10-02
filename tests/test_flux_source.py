@@ -460,5 +460,5 @@ def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path)
     index = json.loads((directory / "model_index.json").read_text())
     index["_class_name"] = "StableDiffusion3Pipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="StableDiffusion3Pipeline.*FluxPipeline"):
+    with pytest.raises(ValueError, match=r"StableDiffusion3Pipeline.*FluxPipeline"):
         load_pretrained(str(directory), dtype="float32", attention_impl="xla")

@@ -182,7 +182,7 @@ def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
                          preprocess=image_and_label, **READ)
     assert data.records == 16
 
-    with pytest.raises(ValueError, match="holds version '1.0.0'"):
+    with pytest.raises(ValueError, match=r"holds version '1.0.0'"):
         dew.data.load("tfds/dew_images", batch=4,
                       options=TFDSOptions(path=str(PREPARED), version="2.0.0"),
                       preprocess=image_and_label, **READ)

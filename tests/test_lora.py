@@ -358,7 +358,7 @@ def test_refusals_name_the_reason(decoder, tmp_path):
     prefix = lora.PEFT_PREFIX + "model.layers.0.self_attn.q_proj"
     a, b = fixture[prefix + ".lora_A.weight"], fixture[prefix + ".lora_B.weight"]
 
-    with pytest.raises(ValueError, match="layers.5.self_attn.q_proj, which this source does not bind"):
+    with pytest.raises(ValueError, match=r"layers.5.self_attn.q_proj, which this source does not bind"):
         LoRA.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "unbound", {
             lora.PEFT_PREFIX + "model.layers.5.self_attn.q_proj.lora_A.weight": a,
             lora.PEFT_PREFIX + "model.layers.5.self_attn.q_proj.lora_B.weight": b}))
@@ -385,14 +385,14 @@ def test_a_per_expert_source_tensor_takes_no_adapter():
     expert's delta has no leaf of its own."""
     mixtral = load_pretrained(ROOT / "tests" / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
                               attention_impl="reference")
-    with pytest.raises(ValueError, match="experts.0.w1 is assembled from several leaves"):
+    with pytest.raises(ValueError, match=r"experts.0.w1 is assembled from several leaves"):
         LoRA.fresh(mixtral.model, mixtral.variables, mixtral.layouts, rank=2, alpha=2.0,
                    modules=("w1",), key=jax.random.key(0))
 
 
 def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference):
     adapter = LoRA({("params", "embed_tokens"): lora.Target(2, 2.0)})
-    with pytest.raises(TypeError, match="params/embed_tokens.*targets nn.Dense and nn.DenseGeneral kernels"):
+    with pytest.raises(TypeError, match=r"params/embed_tokens.*targets nn.Dense and nn.DenseGeneral kernels"):
         adapter.adapt(decoder.model).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
 
 

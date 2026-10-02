@@ -69,9 +69,9 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
 
 def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
     recipe = load_recipe()
-    with pytest.raises(FileNotFoundError, match="meta.json"):
+    with pytest.raises(FileNotFoundError, match=r"meta.json"):
         recipe.token_directories(str(tmp_path))
-    with pytest.raises(ValueError, match="--data.path"):
+    with pytest.raises(ValueError, match=r"--data.path"):
         recipe.token_directories(None)
 
 
@@ -347,7 +347,7 @@ def test_a_pretrained_run_refuses_overrides_and_a_foreign_tokenizer(tmp_path):
     # the tokenizer it names rather than only recording the name.
     foreign = export_tiny_decoder(tmp_path / "foreign", tokenizer=str(TOKENIZER),
                                   vocab_size=384)
-    with pytest.raises(ValueError, match="expects .*tiny-tools"):
+    with pytest.raises(ValueError, match=r"expects .*tiny-tools"):
         recipe.main(pretrained_config(recipe, tokens, foreign, "--trainer.steps", "1"))
 
 

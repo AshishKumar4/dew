@@ -106,7 +106,7 @@ def test_steps_and_epochs_are_one_choice():
     config = parse(RunConfig, ["--trainer.epochs", "2"])
     data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
-    with pytest.raises(ValueError, match="--trainer.steps"):
+    with pytest.raises(ValueError, match=r"--trainer.steps"):
         config.trainer.total_steps(Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10))
 
 

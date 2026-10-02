@@ -72,15 +72,13 @@ def test_wall_time_limit_kills_a_hung_worker():
 
 
 def test_memory_limit_ends_the_worker_with_its_diagnostic():
-    with environment("allocate")(IDENTITY) as session:
-        with pytest.raises(ChildProcessError, match="MemoryError"):
-            session.reset()
+    with environment("allocate")(IDENTITY) as session, pytest.raises(ChildProcessError, match="MemoryError"):
+        session.reset()
 
 
 def test_worker_exit_reports_its_code_and_stderr():
-    with environment("crash")(IDENTITY) as session:
-        with pytest.raises(ChildProcessError, match="code 3.*worker boom"):
-            session.reset()
+    with environment("crash")(IDENTITY) as session, pytest.raises(ChildProcessError, match=r"code 3.*worker boom"):
+        session.reset()
 
 
 def test_malformed_reply_is_refused():
@@ -135,9 +133,8 @@ def test_episodes_collect_through_subprocess_workers():
 
 
 def test_cpu_limit_kills_a_busy_worker():
-    with environment("cpu", cpu_seconds=1, wall_seconds=10.)(IDENTITY) as session:
-        with pytest.raises(ChildProcessError, match="code -9"):
-            session.reset()
+    with environment("cpu", cpu_seconds=1, wall_seconds=10.)(IDENTITY) as session, pytest.raises(ChildProcessError, match="code -9"):
+        session.reset()
 
 
 def test_cancellation_releases_the_real_worker():
