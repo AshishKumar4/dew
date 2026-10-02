@@ -157,7 +157,7 @@ def train_and_export(root: Path) -> Path:
         config.model.architecture, {**FIELDS, "vocab_size": meta["vocab_size"]},
         dtype="float32", attention_impl="xla"))
     export = root / "export"
-    save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+    save_pretrained_decoder(model, state.variables, str(export), tokenizer=tokenizer)
     return export
 
 

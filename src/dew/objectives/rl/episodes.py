@@ -549,7 +549,7 @@ class EpisodeRollout:
 
             cohort = repr((int(state.step), tuple(np.asarray(jax.random.key_data(key)).tolist())))
             fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
-                                policy_digest(state.params)))
+                                policy_digest(state.variables)))
             return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))
 
         run = agreed("episode journal open", open_journal)
@@ -591,7 +591,7 @@ class EpisodeRollout:
                 raise ValueError("task_id must be a nonempty vector of integer task identities")
             if key.shape != ():
                 raise ValueError("episode key must be one PRNG key")
-            policy = self.policy.bind(state.params)
+            policy = self.policy.bind(state.variables)
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
                          tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)

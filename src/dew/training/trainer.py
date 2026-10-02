@@ -512,7 +512,7 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
     trains as it did."""
     if mesh.devices.flat[0].platform != "tpu":
         return
-    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state.params)
+    wide = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables)
             if leaf.dtype in (jnp.float64, jnp.complex128)]
     if wide:
         others = f" and {len(wide) - 1} more parameters" if len(wide) > 1 else ""
@@ -877,7 +877,7 @@ class Trainer(Generic[Loss, Effects]):
             scale=(jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale())
                    if self.dynamic_scale else None),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
-            params=params,
+            variables=params,
             opt_state=self.optimizer.init(params["params"]),
             # The average starts equal to the parameters but as its own
             # buffers: the step donates the state, and a buffer can be
@@ -912,9 +912,9 @@ class Trainer(Generic[Loss, Effects]):
         sits where the realization reads it (`execution.resident`) for the
         whole run."""
         mesh = self.state_mesh
-        params = dict(state.params)
+        params = dict(state.variables)
         frozen = params.pop(FROZEN, None) if self.host_master else None
-        placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
+        placed = self.layout.shardings(mesh, dataclasses.replace(state, variables=params, accumulation=None))
         # A root key is one value; a legacy key's uint32 words are not parameter axes.
         placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
@@ -922,7 +922,7 @@ class Trainer(Generic[Loss, Effects]):
             for field in (() if self.host_master else self.layout.host)})
         if frozen is not None:
             placed = dataclasses.replace(
-                placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)}
+                placed, variables={**placed.variables, FROZEN: self._frozen_shardings(state, frozen)}
             )
         accumulation = state.accumulation
         if accumulation is None:
@@ -936,7 +936,7 @@ class Trainer(Generic[Loss, Effects]):
             layout = batch_shardings(mesh, sample) if batches else self.layout.shardings(mesh, sample)
             return jax.tree.map(lambda s: NamedSharding(mesh, P(None, *s.spec)), layout)
         pending = dataclasses.replace(pending,
-            gradient=None if accumulation.gradient is None else placed.params["params"],
+            gradient=None if accumulation.gradient is None else placed.variables["params"],
             batches=buffered_shardings(accumulation.batches, batches=True),
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
@@ -966,7 +966,7 @@ class Trainer(Generic[Loss, Effects]):
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         refuse_wide_floats(abstract, self.device_mesh)
         shardings = self.shardings(abstract)
-        self.layout.check(abstract.params, shardings.params, self.device_mesh)
+        self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
         checkpoints = self.checkpoints
         resume = None if checkpoints is None else checkpoints.latest
         if checkpoints is None or resume is None:
@@ -980,9 +980,9 @@ class Trainer(Generic[Loss, Effects]):
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
-        if self.host_master and FROZEN in abstract.params:
-            abstract = dataclasses.replace(abstract, params={**abstract.params, FROZEN: self._banked_frozen(
-                abstract.params[FROZEN],
+        if self.host_master and FROZEN in abstract.variables:
+            abstract = dataclasses.replace(abstract, variables={**abstract.variables, FROZEN: self._banked_frozen(
+                abstract.variables[FROZEN],
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
@@ -1047,7 +1047,7 @@ class Trainer(Generic[Loss, Effects]):
         arrays the objective already holds on the devices stay wherever they
         were placed for as long as it holds them."""
         variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
-            jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
+            jax.tree_util.tree_leaves_with_path(abstract.variables), jax.tree.leaves(shardings.variables),
             strict=True)}
         replicated = NamedSharding(self.device_mesh, P())
 
@@ -1115,8 +1115,8 @@ class Trainer(Generic[Loss, Effects]):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
         from dew.training.execution import resident
         rows = self.layout.shardings(
-            self.state_mesh, dataclasses.replace(state, params={FROZEN: frozen}, accumulation=None))
-        return resident(rows.params[FROZEN], self.bank_sites, self.device_mesh)
+            self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
+        return resident(rows.variables[FROZEN], self.bank_sites, self.device_mesh)
 
     @functools.cached_property
     def bank_sites(self):
@@ -1149,8 +1149,8 @@ class Trainer(Generic[Loss, Effects]):
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
-            if FROZEN in state.params:
-                check_bank_pool(bank_bytes(state.params[FROZEN], self.bank_sites), self.device_mesh)
+            if FROZEN in state.variables:
+                check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the
                 # bank lands where it stays resident before the next is
                 # stacked, so the host holds one bank in transit, not the
@@ -1158,7 +1158,7 @@ class Trainer(Generic[Loss, Effects]):
                 # tree holds the placed bank where each row was. An
                 # objective placed this way holds banks at its rows afterwards
                 # and does not seed a second trainer.
-                targets = shardings.params[FROZEN]
+                targets = shardings.variables[FROZEN]
 
                 def stack(rows, path):
                     target = targets
@@ -1175,13 +1175,13 @@ class Trainer(Generic[Loss, Effects]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.params[FROZEN], stack, release)
-                state = dataclasses.replace(state, params={**state.params, FROZEN: frozen})
-        params = stream(state.params, shardings.params, held)
+                frozen = self._banked_frozen(state.variables[FROZEN], stack, release)
+                state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
+        params = stream(state.variables, shardings.variables, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
-        rest = dataclasses.replace(state, params=None, ema=None)
-        placed = transfer(rest, dataclasses.replace(shardings, params=None, ema=None))
-        return dataclasses.replace(placed, params=params, ema=ema)
+        rest = dataclasses.replace(state, variables=None, ema=None)
+        placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
+        return dataclasses.replace(placed, variables=params, ema=ema)
 
     # ------------------------------------------------------------------
     # The step
@@ -1192,7 +1192,7 @@ class Trainer(Generic[Loss, Effects]):
         # memory space than the moving ones, and the loss the realization
         # runs reads a snapshot in one space. The step's key is drawn inside
         # the trace, so an abstract state compiles a step as a placed one does.
-        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.params)
+        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
             return self.objective.loss(
@@ -1210,10 +1210,10 @@ class Trainer(Generic[Loss, Effects]):
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
             return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
 
-        trainable = jax.tree.map(shape, state.params["params"])
+        trainable = jax.tree.map(shape, state.variables["params"])
         records = jax.tree.map(shape, batch)
         mutable = (None if shared or aux.variables is None else
-                   jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
+                   jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
 
         def zeros(leaf):
             dtype = (
@@ -1602,8 +1602,8 @@ class Trainer(Generic[Loss, Effects]):
         run.current = current = int(state.step)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
-            sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), _split_share(state.params),
+            sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), _split_share(state.variables),
             seed=self.seed)
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
@@ -1629,7 +1629,7 @@ class Trainer(Generic[Loss, Effects]):
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         model = _model_of(self.objective)
-        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.params["params"])})
+        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         compute = getattr(model, "dtype", None)
         precision = "/".join(stored)
         if compute is not None and [str(jnp.dtype(compute))] != stored:
@@ -2321,8 +2321,8 @@ class Trainer(Generic[Loss, Effects]):
         does."""
         paused = time.perf_counter()
         self._display.status("evaluating")
-        mesh, params = self.device_mesh, state.params
-        averaged = with_ema(state.params, self._fetched(state, shardings).ema)
+        mesh, params = self.device_mesh, state.variables
+        averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
             from dew.training.execution import HostExecution

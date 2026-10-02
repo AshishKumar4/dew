@@ -93,15 +93,15 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     trainer = Trainer(objective, optax.sgd(reference["learning_rate"]), key=jax.random.key(3),
                       mesh=MeshSpec(), layout=Layout(min_shard=2**30))
     state = trainer.fit(data, steps=1, log_every=1)
-    output = loaded.model.apply(state.params, inputs.tokens, **inputs.kwargs())
+    output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
     expected = np.load(FIXTURE / "updated_logits.npy")
     np.testing.assert_allclose(np.asarray(output)[valid], expected[valid], atol=1e-4, rtol=0)
     before = np.load(FIXTURE / "logits.npy")
     assert np.max(np.abs(np.asarray(output)[valid] - before[valid])) > 1e-3
-    loaded.save(tmp_path, variables=state.params)
+    loaded.save(tmp_path, variables=state.variables)
     reloaded = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.params),
+    for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.variables),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
     restored = reloaded.model.apply(reloaded.variables, inputs.tokens, **inputs.kwargs())
@@ -313,7 +313,7 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
     trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
                       mesh=MeshSpec(), layout=Layout(min_shard=2**30))
     state = trainer.fit(data, steps=1, log_every=1)
-    loaded.save(tmp_path, variables=state.params)
+    loaded.save(tmp_path, variables=state.variables)
     before = load_file(str(directory / "model.safetensors"))
     after = load_file(str(tmp_path / "model.safetensors"))
     for name in ("std_bias", "std_scale"):
@@ -524,8 +524,8 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
                             ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
 
-    def loss(params, pixels):
-        values = {**loaded.variables, "params": params}
+    def loss(variables, pixels):
+        values = {**loaded.variables, "params": variables}
         data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
         statistics, _ = objective.loss(values, {"text": data}, step)
         return objective.reduce_loss(statistics)[0]

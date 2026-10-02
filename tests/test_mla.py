@@ -202,8 +202,8 @@ def test_mla_reproduces_the_v32_block():
 def readout_gradients(module, variables, hidden):
     """Gradients of one fixed non-uniform readout of the block's output, so a
     value column that came back in the wrong place moves them."""
-    def loss(params):
-        out = module.apply(params, hidden)
+    def loss(variables):
+        out = module.apply(variables, hidden)
         weights = jax.random.normal(jax.random.key(0), out.shape, out.dtype)
         return jnp.sum(out * weights)
     return jax.grad(loss)(variables)
@@ -432,10 +432,10 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     losses = [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
     assert len(losses) == 2 and all(np.isfinite(losses)), losses
     assert losses[1] < losses[0], losses
-    bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+    bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
     assert np.any(np.asarray(bias) != 0), "the bias never moved"
-    attention = state.params["params"]["layers_0"]["self_attn"]
-    experts = state.params["params"]["layers_1"]["mlp"]["experts"]
+    attention = state.variables["params"]["layers_0"]["self_attn"]
+    experts = state.variables["params"]["layers_1"]["mlp"]["experts"]
     assert attention["kv_b_proj"]["kernel"].sharding.spec == P(None, "fsdp")
     assert attention["indexer"]["wq_b"]["kernel"].sharding.spec == P(None, "fsdp")
     assert experts["gate_proj"]["kernel"].sharding.spec == P(

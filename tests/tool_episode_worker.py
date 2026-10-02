@@ -60,7 +60,7 @@ def main() -> None:
         failed = f"{type(error).__name__}: {error}"
     if mode == "ok":
         assert state is not None
-        parameters = collective_host(state.params, phase="episode pool test parameters")
+        parameters = collective_host(state.variables, phase="episode pool test parameters")
         np.savez(output.with_suffix(".npz"), **{
             jax.tree_util.keystr(path): np.asarray(value)
             for path, value in jax.tree_util.tree_flatten_with_path(parameters)[0]})

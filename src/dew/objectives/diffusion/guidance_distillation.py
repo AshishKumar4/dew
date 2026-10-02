@@ -84,11 +84,11 @@ class GuidanceDistillationObjective(DiffusionObjective):
         state.setdefault(TEACHER, self.teacher_variables)
         return state
 
-    def loss(self, params, batch, step: Step):
+    def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
         count = samples.shape[0]
         low, high = self.scales
         scale = jax.random.uniform(scale_key, (count,), minval=low, maxval=high)
@@ -99,17 +99,17 @@ class GuidanceDistillationObjective(DiffusionObjective):
         noisy, c_in, _ = self.process.prediction.forward_diffusion(samples, noise, rates)
 
         teacher = self.teacher
-        frozen = jax.lax.stop_gradient(params[TEACHER])
+        frozen = jax.lax.stop_gradient(variables[TEACHER])
         given, blank = teacher._conditions(frozen, batch, drop_key, dropout=False)
         denoise = teacher.process.denoiser(teacher.model, teacher.trainable(frozen), given, blank)
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guided_target(conditional, unconditional, scale))
 
-        conditions, _ = self._conditions(params, batch, drop_key, dropout=False)
+        conditions, _ = self._conditions(variables, batch, drop_key, dropout=False)
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
             raise ValueError("the student's conditioning carries no guidance input to distill into")
-        output = self.model.apply(self.trainable(params), noisy * c_in, schedule.model_time(t),
+        output = self.model.apply(self.trainable(variables), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=True,
                                   rngs={"dropout": jax.random.fold_in(step.key, 1)})
         assert isinstance(output, jax.Array)

@@ -149,7 +149,7 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
                        accumulation=k, dynamic_scale=dynamic_scale, checkpoints=checkpoints)
     train = trainer()
     state, _, _ = train.place()
-    expected_params, expected_opt, expected_ema = state.params["params"], state.opt_state, state.ema
+    expected_params, expected_opt, expected_ema = state.variables["params"], state.opt_state, state.ema
     dtype = objective.compute_dtype
     x = jnp.array([[1.1234567890123, 2.2345678901234], [2.3456789012345, -1.4567890123456]], dtype)
     y = jnp.array([[.01234567890123], [1.2345678901234]], dtype)
@@ -181,10 +181,10 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
                 checkpoints.save(1, state, None, {"loss": float(loss)})
             if micro < k - 1 and state.accumulation.gradient is not None:
                 for gradient, parameter in zip(jax.tree.leaves(state.accumulation.gradient),
-                                                jax.tree.leaves(state.params["params"]), strict=True):
+                                                jax.tree.leaves(state.variables["params"]), strict=True):
                     assert gradient.dtype == jnp.promote_types(parameter.dtype, jnp.float32)
         np.testing.assert_allclose(loss, expected_loss, rtol=tolerance, atol=tolerance * .1)
-        compare(state.params["params"], expected_params, tolerance=tolerance)
+        compare(state.variables["params"], expected_params, tolerance=tolerance)
         compare(state.opt_state, expected_opt, tolerance=tolerance, moment_rounding=True)
         compare(state.ema, expected_ema, tolerance=tolerance)
     assert int(state.updates) == 2
@@ -278,14 +278,14 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     assert bool(accepted)
     # The step consumes the state, so the prefix is read before the rejected step.
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
-    prefix_params = jax.tree.map(np.asarray, prefix.params)
+    prefix_params = jax.tree.map(np.asarray, prefix.variables)
     # Each finalized contribution fits fp16; their fp32 sum does not.
     rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.array(False)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5
     compare(rejected.accumulation, prefix_accumulation, exact=True)
-    compare(rejected.params, prefix_params, exact=True)
+    compare(rejected.variables, prefix_params, exact=True)
 
 
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])
@@ -337,19 +337,19 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         trainer = build()
         state, _, _ = trainer.place()
         batch = {"text": jnp.ones((jax.device_count(), 5), jnp.int32)}
-        _, aux = objective.loss(state.params, batch, Step(state.microstep, state.key, state.params))
+        _, aux = objective.loss(state.variables, batch, Step(state.microstep, state.key, state.variables))
         counts = jax.tree.map(np.asarray, aux.effects)
         assert all(x.dtype == np.int64 for x in jax.tree.leaves(counts))
         def expected_bias(bias, count):
             total = sum(int(x) for x in count)
             direction = np.array([np.sign(total - count.size * int(x)) for x in count])
             return (np.asarray(bias, np.float64) + .02 * direction).astype(bias.dtype)
-        expected = jax.tree.map(expected_bias, state.params["moe"], counts)
+        expected = jax.tree.map(expected_bias, state.variables["moe"], counts)
         step = trainer.compile(state, batch)
         prefix, *_ = step(state, batch)
         checkpoints.save(1, prefix, None, {"loss": 0.})
         actual, *_ = step(prefix, batch)
-        compare(actual.params["moe"], expected, exact=True)
+        compare(actual.variables["moe"], expected, exact=True)
         for _ in range(2):
             actual, *_ = step(actual, batch)
         checkpoints.wait()

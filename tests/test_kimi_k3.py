@@ -151,8 +151,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
                             ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
+    def loss(variables):
+        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
         return objective.reduce_loss(statistics)[0]
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])

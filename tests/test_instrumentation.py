@@ -49,8 +49,8 @@ class Regression(Objective):
     def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, 3)))
 
-    def loss(self, params, batch, step):
-        return jnp.mean((self.model.apply(params, batch["x"]) - batch["y"]) ** 2), Aux({})
+    def loss(self, variables, batch, step):
+        return jnp.mean((self.model.apply(variables, batch["x"]) - batch["y"]) ** 2), Aux({})
 
 
 class Data:
@@ -568,9 +568,9 @@ def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     seen = []
 
     class Counting(Regression):
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             seen.append(step)
-            return super().loss(params, batch, step)
+            return super().loss(variables, batch, step)
 
     trainer = Trainer(Counting(), optax.adam(1e-3), key=jax.random.key(0),
                       profile=ProfileWindow(str(tmp_path / "profile"), steps=2, warmup=2))

@@ -424,7 +424,7 @@ def run_case(case: Case, tmp_path, fsdp):
 def test_architecture_trains_data_parallel(case, tmp_path):
     """8x1: every parameter replicated, the batch split across every device."""
     _, state = run_case(case, tmp_path, fsdp=1)
-    assert not fsdp_leaves(state.params), "nothing may shard on a 1-wide fsdp axis"
+    assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)
@@ -432,7 +432,7 @@ def test_architecture_trains_under_fsdp(case, tmp_path):
     """2x4: the parameter tree really split four ways, moments and EMA with it."""
     _, state = run_case(case, tmp_path, fsdp=4)
 
-    sharded = fsdp_leaves(state.params)
+    sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
         assert param.addressable_shards[0].data.size == param.size // 4, \
@@ -440,7 +440,7 @@ def test_architecture_trains_under_fsdp(case, tmp_path):
 
     # Adam's moments and the EMA copy follow the params they track, without
     # the optimizer or the model ever describing a layout.
-    param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.params["params"])]
+    param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
     assert param_specs == [leaf.sharding.spec
                            for leaf in jax.tree.leaves(state.opt_state[0].mu)]
     ema_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)}
@@ -510,7 +510,7 @@ def test_a_placed_state_carries_the_layout_the_declarations_derive(case, tmp_pat
     trainer, _ = make_trainer(case, tmp_path, fsdp_size)
     state, shardings, _ = trainer.place()
     path, expected = NAMED_LEAF[case.name]
-    leaf = state.params["params"]
+    leaf = state.variables["params"]
     for key in path:
         leaf = leaf[key]
     assert leaf.sharding.spec == expected, f"{path} {leaf.shape}"

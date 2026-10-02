@@ -184,8 +184,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
         return jnp.mean(jnp.square(student - teacher), axis=-1)
 
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Effects]]:
-        statistics, aux, student, teacher = self._predictions(params, batch, step)
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Effects]]:
+        statistics, aux, student, teacher = self._predictions(variables, batch, step)
         alpha, temperature, beta = (jnp.asarray(schedule(step.step), jnp.float32) for schedule in
                                     (self.alpha, self.temperature, self.beta))
         # Every term is summed with the student's weights and divided by its
@@ -201,7 +201,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                     "distill/kl": soft / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
                     "distill/teacher_loss": jnp.sum(teacher.losses * weights) / counted}
         if self.features:
-            projections = params["params"].get(PROJECTIONS, {})
+            projections = variables["params"].get(PROJECTIONS, {})
             distances = []
             for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
@@ -226,6 +226,6 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     def pipeline(self, state: TrainState, *, ema: bool | None = None):
         """The student as its inference task; the teacher stays behind."""
         return self.student.pipeline(
-            replace(state, params=self.student_variables(state.params),
+            replace(state, variables=self.student_variables(state.variables),
                     ema=None if state.ema is None else self.student_variables(state.ema)),
             ema=ema)

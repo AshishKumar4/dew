@@ -194,7 +194,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         data, steps=1, log_every=1, checkpoint_every=None)
     assert int(state.step) == 1
     movement = 0.0
-    for old, actual, reference in zip(jax.tree.leaves(params), jax.tree.leaves(state.params),
+    for old, actual, reference in zip(jax.tree.leaves(params), jax.tree.leaves(state.variables),
                                      jax.tree.leaves(expected)):
         np.testing.assert_allclose(actual, reference, atol=2e-6, rtol=2e-6)
         movement += float(jnp.sum(jnp.abs(actual - old)))

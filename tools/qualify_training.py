@@ -204,7 +204,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
         data, steps=STEPS, log_every=1, checkpoint_every=CHECKPOINT_STEP
     )
     elapsed = time.perf_counter() - started
-    stats, _, _ = objective.predict(state.params, probe, step, train=False)
+    stats, _, _ = objective.predict(state.variables, probe, step, train=False)
     final_loss = float(objective.reduce_loss(stats)[0])
     restored, _, position = trainer.place()
     if not position:
@@ -212,7 +212,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
 
     arrays = _restored_state(state, restored)
     np.savez(run / "state.npz", **arrays)
-    _check_export(run, source, state.params, probe)
+    _check_export(run, source, state.variables, probe)
     report = {
         "mode": mode,
         "backend": jax.default_backend(),

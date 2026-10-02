@@ -372,10 +372,10 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     source = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
     state = train(case, source, ids)
     export = workspace / case.name
-    source.save(export, variables=state.params)
+    source.save(export, variables=state.variables)
     reloaded = load_pretrained(str(export), dtype="float32", attention_impl="reference")
-    return RoundTrip(case, source, state.params, export, ids,
-                     logits(source, state.params, ids), reloaded,
+    return RoundTrip(case, source, state.variables, export, ids,
+                     logits(source, state.variables, ids), reloaded,
                      reference_logits(case, export, ids),
                      source_tensors(directory), source_tensors(export))
 
@@ -533,8 +533,8 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     source = trip.source
     ids = jnp.asarray(trip.ids, jnp.int32)
 
-    def loss(params):
-        logits = jnp.asarray(source.model.apply({**source.variables, "params": params}, ids),
+    def loss(variables):
+        logits = jnp.asarray(source.model.apply({**source.variables, "params": variables}, ids),
                              jnp.float32)
         return -jnp.mean(jnp.take_along_axis(
             jax.nn.log_softmax(logits[:, :-1], axis=-1), ids[:, 1:, None], axis=-1))
@@ -603,8 +603,8 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
     step = Step(step=jnp.asarray(0), key=jax.random.key(SEED), ema=None)
     batch = {'text': jnp.asarray(trip.ids, jnp.int32)}
 
-    def loss(params):
-        return scalar_loss(objective, {**source.variables, 'params': params}, batch, step)[0]
+    def loss(variables):
+        return scalar_loss(objective, {**source.variables, 'params': variables}, batch, step)[0]
 
     our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
     model, _ = reference_model(case, FIXTURES / case.fixture)

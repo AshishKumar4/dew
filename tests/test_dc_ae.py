@@ -243,9 +243,9 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     state = trainer.fit(Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
                         steps=2, log_every=100)
 
-    for before, after in zip(jax.tree.leaves(initial.params["autoencoder"]),
-                             jax.tree.leaves(state.params["autoencoder"]), strict=True):
+    for before, after in zip(jax.tree.leaves(initial.variables["autoencoder"]),
+                             jax.tree.leaves(state.variables["autoencoder"]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     moved = [not np.array_equal(np.asarray(before), np.asarray(after)) for before, after in
-             zip(jax.tree.leaves(initial.params["params"]), jax.tree.leaves(state.params["params"]), strict=True)]
+             zip(jax.tree.leaves(initial.variables["params"]), jax.tree.leaves(state.variables["params"]), strict=True)]
     assert any(moved)

@@ -1026,10 +1026,10 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         return tokens[:, :-1], tokens[:, 1:]
 
-    def loss(self, params, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
+    def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
-            return self._warmup_loss(params, batch, step)
-        statistics, aux, _ = self._scored_loss(params, batch, step, train=True)
+            return self._warmup_loss(variables, batch, step)
+        statistics, aux, _ = self._scored_loss(variables, batch, step, train=True)
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool,

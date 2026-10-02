@@ -203,8 +203,8 @@ def test_the_layer_gradients_are_the_recurrence_gradients(case):
     expected = adjoint(p, u64, w64, EXACT)
     terms = adjoint(p, u64, w64, MAGNITUDES)
 
-    def loss(params, u):
-        return jnp.sum(w * layer.apply({"params": params}, u))
+    def loss(variables, u):
+        return jnp.sum(w * layer.apply({"params": variables}, u))
 
     parameters, inputs = jax.grad(loss, argnums=(0, 1))(params, u)
     actual = {**{name: parameters[name] for name in LEAVES}, "u": inputs}

@@ -789,8 +789,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
         info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3),
                     ema=None)
 
-        def loss(params):
-            return scalar_loss(objective, {**variables, "params": params},
+        def loss(variables):
+            return scalar_loss(objective, {**variables, "params": variables},
                                   placed_batch, info)
 
         with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
@@ -816,8 +816,8 @@ def test_stochastic_rounding_draws_from_its_own_stream():
     quantized = apply_quantization(
         model, Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform"))
 
-    def loss(params, key):
-        result = quantized.apply({"params": params}, values,
+    def loss(variables, key):
+        result = quantized.apply({"params": variables}, values,
                                  rngs={"stochastic_rounding": key})
         return jnp.mean(result ** 2)
 
@@ -890,8 +890,8 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     noise_level = jnp.ones((1,), jnp.float32)
     # Compiled, as a run computes: XLA:GPU compiles an int8 convolution only
     # with its dequantization fused in, and eagerly the convolution runs alone.
-    quantized_out = jax.jit(objective.model.apply)(state.params, image, noise_level)
-    plain_out = jax.jit(plain.model.apply)(state.params, image, noise_level)
+    quantized_out = jax.jit(objective.model.apply)(state.variables, image, noise_level)
+    plain_out = jax.jit(plain.model.apply)(state.variables, image, noise_level)
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 
@@ -905,7 +905,7 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
         def init(self, key, variables=None):
             return {"params": {}}
 
-        def loss(self, params, batch, step):
+        def loss(self, variables, batch, step):
             return jnp.zeros(()), Aux({})
 
     config = diffusion_run(tmp_path, quantization=Quantization())

@@ -134,11 +134,11 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
 
     state = trainer.fit(data, steps=4, log_every=1)
 
-    assert objective_loss(objective, state.params, batch) < objective_loss(objective, loaded.variables, batch)
-    moved = state.params["params"]
+    assert objective_loss(objective, state.variables, batch) < objective_loss(objective, loaded.variables, batch)
+    moved = state.variables["params"]
     assert all(bool(jnp.any(jnp.asarray(params[name]) != moved[name])) for name in params)
     for name, buffer in buffers.items():
-        np.testing.assert_array_equal(np.asarray(state.params["buffers"][name]), buffer)
+        np.testing.assert_array_equal(np.asarray(state.variables["buffers"][name]), buffer)
     layer = "gpt_neox.layers.0"
     assert moved[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
     # The row-parallel projection, [embed, mlp] in torch: the residual width

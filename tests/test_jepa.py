@@ -279,7 +279,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
     initial = trainer.initial_state()
-    before = context_ablation(objective, initial.params, initial.ema,
+    before = context_ablation(objective, initial.variables, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
     assert before[1] / before[0] < 1.5, "a fresh predictor should not favour any context"
 
@@ -289,7 +289,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     state = trainer.fit(Data(batches, batch=16), steps=150, log_every=50)
 
-    after = context_ablation(objective, state.params, state.ema,
+    after = context_ablation(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
     assert after[0] < before[0] / 2, "held-out prediction error did not improve"
     assert after[1] / after[0] > 5.0, "the predictor still ignores its context"
@@ -409,7 +409,7 @@ def test_target_encoder_tracks_the_context_encoder(mask):
 
     # and it followed without jumping: still between where it started and now
     ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
-    live = jax.tree.leaves(state.params["params"]["context_encoder"])
+    live = jax.tree.leaves(state.variables["params"]["context_encoder"])
     assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
 
 
@@ -435,7 +435,7 @@ def test_jepa_trains_under_fsdp(mask):
     trainer.tracker = Tracker()
     state = trainer.fit(Data(image_batches, batch=jax.device_count()), steps=2, log_every=1)
 
-    sharded = [p for p in jax.tree.leaves(state.params) if 'fsdp' in str(p.sharding.spec)]
+    sharded = [p for p in jax.tree.leaves(state.variables) if 'fsdp' in str(p.sharding.spec)]
     assert sharded, "no JEPA parameter was sharded over the fsdp axis"
     for param in sharded:
         assert param.addressable_shards[0].data.size == param.size // 2
@@ -443,7 +443,7 @@ def test_jepa_trains_under_fsdp(mask):
     # The target encoder is a second copy of the same subtree, so it must land
     # on the mesh the same way, not gathered onto every device
     encoder_specs = [p.sharding.spec for p in
-                     jax.tree.leaves(state.params["params"]["context_encoder"])]
+                     jax.tree.leaves(state.variables["params"]["context_encoder"])]
     assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]
     assert int(state.step) == 2
     ticks = [entry for entry in logged if "train/loss" in entry]

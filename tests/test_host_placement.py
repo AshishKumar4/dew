@@ -75,8 +75,8 @@ def test_host_resident_state_trains_the_same_model(tmp_path):
     on_device = fit(DEVICE, tmp_path / "device", 4)
     on_host = fit(HOST, tmp_path / "host", 4)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
-    assert memory_kinds(on_host.params) == memory_kinds(on_device.opt_state) == {"device"}
-    assert identical(on_host.params, on_device.params)
+    assert memory_kinds(on_host.variables) == memory_kinds(on_device.opt_state) == {"device"}
+    assert identical(on_host.variables, on_device.variables)
     assert identical(on_host.opt_state, on_device.opt_state)
     assert identical(on_host.ema, on_device.ema)
 
@@ -88,10 +88,10 @@ def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
     reference = fit(DEVICE, tmp_path / "device", 6)
     assert int(resumed.step) == 6
     assert memory_kinds(resumed.opt_state) == memory_kinds(resumed.ema) == {"pinned_host"}
-    assert identical(resumed.params, reference.params)
+    assert identical(resumed.variables, reference.variables)
     assert identical(resumed.opt_state, reference.opt_state)
     assert identical(resumed.ema, reference.ema)
-    assert not identical(resumed.params, saved.params)
+    assert not identical(resumed.variables, saved.variables)
 
 
 def test_a_layout_places_only_the_state_it_can_fetch():
@@ -433,7 +433,7 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     assert np.array_equal(np.asarray(scanned.apply(on_host, tokens)),
                           np.asarray(scanned.apply(resident, tokens)))
     trained = StackView(scanned.bind({}).groups).unstack(resident)
-    assert identical(trained, state.params)
+    assert identical(trained, state.variables)
 
 
 @pytest.mark.mesh

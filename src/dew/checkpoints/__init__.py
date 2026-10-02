@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
 
-STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
+STATE_LEAVES = ("step", "microstep", "updates", "variables", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
 """The train-state fields a checkpoint persists; anything outside this tuple
 is rebuilt on resume."""
@@ -420,7 +420,7 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
         return state_tree, []
     paths_leaves, structure = jax.tree_util.tree_flatten_with_path(ema)
     leaves = [leaf for _, leaf in paths_leaves]
-    held = _by_path(state_tree['params'])
+    held = _by_path(state_tree['variables'])
     lives = [held[path] for path, _ in paths_leaves]
     chosen = [index for index, (average, live) in enumerate(zip(leaves, lives, strict=True))
               if _stored_as_delta(average, live)]
@@ -445,7 +445,7 @@ def _ema_deltas(metadata: ocp.metadata.StepMetadata) -> dict[jax.tree_util.KeyPa
     recorded = set(custom.get('ema_deltas', ()))
     if not recorded:
         return {}
-    deltas, lives = {}, _by_path(stored['params'])
+    deltas, lives = {}, _by_path(stored['variables'])
     for path, _ in jax.tree_util.tree_flatten_with_path(dict(stored['ema']))[0]:
         if jax.tree_util.keystr(path) in recorded:
             live = lives[path]
@@ -1153,7 +1153,7 @@ class Checkpoints:
             deltas = _ema_deltas(snapshot)
             if deltas:
                 restored = dict(restored)
-                weights = _by_path(restored['params'])
+                weights = _by_path(restored['variables'])
                 restored['ema'] = jax.tree_util.tree_map_with_path(
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
@@ -1232,12 +1232,12 @@ class Checkpoints:
             # The stored params tree, its containers kept, with every leaf
             # but the ones to read held back by orbax's placeholder.
             weights = {'params': jax.tree_util.tree_map_with_path(
-                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['params'])}
+                lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['variables'])}
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 item=weights, partial_restore=True, restore_args=jax.tree.map(
                     lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, "sharding", None)),
                     weights)))
-            lives.update({path: leaf for path, leaf in _by_path(read['params']).items() if path in unread})
+            lives.update({path: leaf for path, leaf in _by_path(read['variables']).items() if path in unread})
 
         def average(path, planes):
             if path not in targets:

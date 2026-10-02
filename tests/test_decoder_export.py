@@ -564,7 +564,7 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     )
     state = tool.train(CASES["deepseek_v3"], quantized, ids)
     destination = tmp_path / "exported"
-    quantized.save(destination, variables=state.params)
+    quantized.save(destination, variables=state.variables)
     packed_export = load_file(str(destination / "model.safetensors"))
     assert packed_export[scaled].dtype == torch.float8_e4m3fn
     assert json.loads((destination / "config.json").read_text()) == config
@@ -587,10 +587,10 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
                                   tool.logits(decoded, decoded.variables, ids))
     for layout in quantized.weight_layouts:
         if layout.name != scaled:
-            np.testing.assert_array_equal(float_export[layout.name], layout.export(state.params))
+            np.testing.assert_array_equal(float_export[layout.name], layout.export(state.variables))
     without_provenance = dataclasses.replace(quantized, quantized_tensors=())
     with pytest.raises(ValueError, match="recorded no quantized tensors"):
-        without_provenance.save(tmp_path / "refused", variables=state.params)
+        without_provenance.save(tmp_path / "refused", variables=state.variables)
 
 
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
@@ -615,7 +615,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     ids = np.load(source / "input_ids.npy")
     state = tool.train(tool.Case("gpt_oss", "gpt-oss-tiny"), loaded, ids)
     destination = tmp_path / "export"
-    loaded.save(destination, variables=state.params)
+    loaded.save(destination, variables=state.variables)
     emitted = load_file(str(destination / "model.safetensors"))
     assert set(emitted) == set(packed)
     assert json.loads((destination / "config.json").read_text()) == config
@@ -629,7 +629,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
                for layout in loaded.weight_layouts if layout.name in stems)
     for layout in loaded.weight_layouts:
         if layout.name not in stems:
-            np.testing.assert_array_equal(decoded[layout.name], layout.export(state.params))
+            np.testing.assert_array_equal(decoded[layout.name], layout.export(state.variables))
     plain_directory = tmp_path / "decoded"
     plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
     save_hf_layout(decoded, plain_config, plain_directory)
@@ -639,7 +639,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
                                   tool.logits(reloaded, reloaded.variables, ids))
     missing = dataclasses.replace(loaded, quantized_tensors=())
     with pytest.raises(ValueError, match="recorded no quantized tensors"):
-        missing.save(tmp_path / "missing-provenance", variables=state.params)
+        missing.save(tmp_path / "missing-provenance", variables=state.variables)
 
 
 def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):

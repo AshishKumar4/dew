@@ -47,8 +47,8 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
                               beta=.05, behavior_importance=2.)
     info = Step(state.microstep, jax.random.key(4), state.ema)
 
-    ordinary_loss, _ = scalar_loss(trainer.objective, state.params, batch, info)
-    corrected_loss, _ = scalar_loss(corrected, state.params, batch, info)
+    ordinary_loss, _ = scalar_loss(trainer.objective, state.variables, batch, info)
+    corrected_loss, _ = scalar_loss(corrected, state.variables, batch, info)
 
     mask = batch["response_mask"]
     weights = np.minimum(np.exp(np.clip(batch["old_log_probs"] - batch["behavior_log_probs"], -20, 20)), 2.)
@@ -56,7 +56,7 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
     np.testing.assert_allclose(corrected_loss, expected, atol=2e-7)
     assert abs(float(corrected_loss) - float(ordinary_loss)) > 1e-4
     with pytest.raises(ValueError, match="shape"):
-        corrected.loss(state.params, {**batch, "behavior_log_probs": jnp.zeros((1, 1))}, info)
+        corrected.loss(state.variables, {**batch, "behavior_log_probs": jnp.zeros((1, 1))}, info)
 
 
 def test_corrected_objective_changes_a_real_trainer_update():
@@ -81,5 +81,5 @@ def test_corrected_objective_changes_a_real_trainer_update():
                        batch=batch["input_ids"].shape[0])
         final = trainer.fit(data, steps=1, log_every=1)
         assert int(final.updates) == 1
-        copies.append(np.asarray(final.params["params"]["table"]).copy())
+        copies.append(np.asarray(final.variables["params"]["table"]).copy())
     assert np.max(np.abs(copies[0] - copies[1])) > 1e-5

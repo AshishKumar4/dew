@@ -103,10 +103,10 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     states = [Trainer(objective, optax.adamw(1e-3), key=key).fit(
         data, steps=1, log_every=100, checkpoint_every=None) for objective in (explicit, bundled)]
     assert int(states[1].updates) == 1
-    for actual, expected in zip(jax.tree.leaves(states[1].params), jax.tree.leaves(states[0].params), strict=True):
+    for actual, expected in zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(states[0].variables), strict=True):
         np.testing.assert_array_equal(actual, expected)
     assert any(not np.array_equal(actual, initial) for actual, initial in
-               zip(jax.tree.leaves(states[1].params), jax.tree.leaves(source.variables), strict=True))
+               zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(source.variables), strict=True))
 
 
 def test_a_pretrained_bundle_refuses_a_second_initial_tree():
@@ -340,12 +340,12 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
                  "text_positions": np.tile(np.arange(3, dtype=np.int32), (count, 1)),
                  "response_mask": mask, "advantages": mask}
         actor = objective.actor if kind == "ppo" else objective
-        weights = ({collection: value["policy"] for collection, value in before.params.items()}
-                   if kind == "ppo" else before.params)
+        weights = ({collection: value["policy"] for collection, value in before.variables.items()}
+                   if kind == "ppo" else before.variables)
         batch["old_log_probs"] = np.asarray(actor.packed_log_probs(weights, batch))
         batch["behavior_log_probs"] = batch["old_log_probs"]
         if kind == "ppo":
-            values = np.asarray(objective.values(before.params, batch))
+            values = np.asarray(objective.values(before.variables, batch))
             batch.update(old_values=values, returns=values + mask)
     data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
@@ -353,7 +353,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     def draw(weights):
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)
         return task([[1, 2]], 1, key=jax.random.key(3), sampling=sampling).host()
-    expected = draw(state.params)
+    expected = draw(state.variables)
     actual = objective.pipeline(state)([[1, 2]], 1, key=3, sampling=sampling).host()
     reference = draw(state.averaged)
     np.testing.assert_array_equal(actual.tokens, expected.tokens)

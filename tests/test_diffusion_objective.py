@@ -383,8 +383,8 @@ def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
     resumed = trainer().fit(data, steps=2, log_every=100)
 
     assert int(resumed.step) == 2
-    assert set(resumed.params["encoders"]) == set(objective.inputs.conditions)
-    leaves = jax.tree.leaves(resumed.params["params"])
+    assert set(resumed.variables["encoders"]) == set(objective.inputs.conditions)
+    leaves = jax.tree.leaves(resumed.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
@@ -450,9 +450,9 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     assert (3, 3, 3, 8) not in shapes_of_constants(objective.loss)
 
     class Leaky(DiffusionObjective):
-        def loss(self, params, batch, step):
-            params = dict(params, autoencoder=autoencoder.params)
-            return super().loss(params, batch, step)
+        def loss(self, variables, batch, step):
+            variables = dict(variables, autoencoder=autoencoder.params)
+            return super().loss(variables, batch, step)
 
     leaky = Leaky(Zero(), presets.EDM(regime="pixel"), inputs, autoencoder=autoencoder)
     assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
@@ -539,11 +539,11 @@ def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
     state = trainer.fit(data, steps=5, log_every=100)
 
     assert int(state.step) == 5
-    assert tree_fingerprint(state.params["params"]) == pytest.approx(GOLDEN["params"], rel=1e-6)
+    assert tree_fingerprint(state.variables["params"]) == pytest.approx(GOLDEN["params"], rel=1e-6)
     assert tree_fingerprint(state.ema) == pytest.approx(GOLDEN["ema"], rel=1e-6)
     assert tree_magnitude(state.opt_state) == pytest.approx(GOLDEN["opt_state"], rel=1e-6)
     # the frozen encoder came through untouched
-    assert jnp.array_equal(state.params["encoders"]["textcontext"]["table"],
+    assert jnp.array_equal(state.variables["encoders"]["textcontext"]["table"],
                            objective.inputs.conditions["textcontext"].encoder.params["table"])
 
 

@@ -212,8 +212,8 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
     for forward, target in ((model.apply, host), (mapped, device)):
         arguments = jax.tree.map(lambda x: jax.device_put(x, target), (variables, image, cotangent))
 
-        def loss(params, x, cot):
-            return jnp.sum(forward(params, x) * cot)
+        def loss(variables, x, cot):
+            return jnp.sum(forward(variables, x) * cot)
 
         with jax.default_device(target):
             values = jax.jit(forward)(*arguments[:2])

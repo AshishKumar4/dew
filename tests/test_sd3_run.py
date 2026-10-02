@@ -111,14 +111,14 @@ def test_one_trainer_step_and_a_sample(tmp_path):
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         data, steps=2, log_every=100)
     assert int(state.step) == 2
-    leaves = jax.tree.leaves(state.params["params"])
+    leaves = jax.tree.leaves(state.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
     encoder = objective.inputs.conditions["textcontext"].encoder
     batch = {"image": np.zeros((BATCH, RES, RES, 3), np.uint8),
              "text": encoder.tokenize(PROMPTS)}
     artifact = objective.preview(
-        state.params, batch, Step(step=state.step, key=jax.random.PRNGKey(1), ema=None))
+        state.variables, batch, Step(step=state.step, key=jax.random.PRNGKey(1), ema=None))
 
     assert artifact.images.shape == (VALIDATION_SAMPLES, RES, RES, 3)
     assert np.all(np.isfinite(np.asarray(artifact.images)))
@@ -140,7 +140,7 @@ def test_the_frozen_text_tower_is_not_optimized(tmp_path):
     state = Trainer(objective, optax.adam(1e-1), key=jax.random.PRNGKey(0)).fit(
         data, steps=2, log_every=100)
 
-    trained = state.params["encoders"]["textcontext"]["params"]
+    trained = state.variables["encoders"]["textcontext"]["params"]
     for before, after in zip(jax.tree.leaves(loaded), jax.tree.leaves(trained), strict=True):
         np.testing.assert_array_equal(np.asarray(after), np.asarray(before))
 

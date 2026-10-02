@@ -301,15 +301,15 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
         loss, _ = objective.loss(params, batch, fixed)
         return float(loss.total / loss.mass)
 
-    before = value(initial.params)
+    before = value(initial.variables)
     state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
-    assert value(state.params) < before
-    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
-                           initial.params["params"]["proj_out"]["kernel"])
+    assert value(state.variables) < before
+    assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
+                           initial.variables["params"]["proj_out"]["kernel"])
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.params[held]),
-                             jax.tree.leaves(initial.params[held]), strict=True):
+        for got, want in zip(jax.tree.leaves(state.variables[held]),
+                             jax.tree.leaves(initial.variables[held]), strict=True):
             np.testing.assert_array_equal(got, want)
 
     checkpoints.save(1, state, None, {})
@@ -320,7 +320,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
-    loaded.save(export, variables=state.params)
+    loaded.save(export, variables=state.variables)
     again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
@@ -329,7 +329,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
             jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
             guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
     times = jnp.asarray([500.0, 100.0])
-    trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
+    trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
 

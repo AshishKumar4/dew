@@ -153,14 +153,14 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 
     keys = jax.random.split(jax.random.PRNGKey(1), 8)
 
-    def loss(params):
-        return float(np.mean([objective.loss(params, batch, Step(jnp.asarray(0), key, None))[0].total
+    def loss(variables):
+        return float(np.mean([objective.loss(variables, batch, Step(jnp.asarray(0), key, None))[0].total
                               for key in keys]))
 
     before = loss(objective.init(jax.random.PRNGKey(0)))
     state = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0)).fit(
         data.load(batch=8, tokenize=objective.inputs.tokenize), steps=40, log_every=100)
-    after = loss(state.params)
+    after = loss(state.variables)
     assert after < 0.7 * before
 
     pipe = objective.pipeline(state, ema=False)
