@@ -251,23 +251,30 @@ class OllamaCompletion:
                                            fields.pop("sampling", None))
         return _bound(fields, {**fixed, "model": self.model})
 
-    def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                 key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
+    def _generations(self, prompts: str | Sequence[str], max_new_tokens: int, key: int | jax.Array | None,
+                     parameters: Mapping[str, object], *, stream: bool = False) -> list[Mapping[str, object]]:
+        """One generate request per prompt row, row `i` seeded at the root seed plus `i`."""
         seed = key_seed(key)
         rows = _prompts(prompts, max_new_tokens, seed)
+        return [self._request(parameters, {"prompt": prompt, "stream": stream},
+                              None if seed is None else seed + index, max_new_tokens)
+                for index, prompt in enumerate(rows)]
+
+    def _chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, key: int | jax.Array | None,
+              stream: bool, parameters: Mapping[str, object]) -> Mapping[str, object]:
+        seed = key_seed(key)
+        _prompts("", max_new_tokens, seed)
+        return self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+
+    def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
+                 key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
+        requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._sync()
-        responses = []
-        for index, prompt in enumerate(rows):
-            body = self._request(parameters, {"prompt": prompt, "stream": False},
-                                 None if seed is None else seed + index, max_new_tokens)
-            responses.append(_invoke(client.generate, body))
-        return _ollama_result(responses)
+        return _ollama_result([_invoke(client.generate, body) for body in requests])
 
     def stream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                **parameters: RequestField) -> Iterator[OllamaResponse]:
-        seed = key_seed(key)
-        _prompts(prompt, max_new_tokens, seed)
-        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        (body,) = self._generations(prompt, max_new_tokens, key, parameters, stream=True)
         return _invoke(self._sync().generate, body)
 
     def chat(
@@ -279,28 +286,18 @@ class OllamaCompletion:
         stream: bool = False,
         **parameters: RequestField,
     ) -> OllamaChat | Iterator[OllamaChat]:
-        seed = key_seed(key)
-        _prompts("", max_new_tokens, seed)
-        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._chat(messages, max_new_tokens, key, stream, parameters)
         return _invoke(self._sync().chat, body)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
-        seed = key_seed(key)
-        rows = _prompts(prompts, max_new_tokens, seed)
+        requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._async()
-        responses = []
-        for index, prompt in enumerate(rows):
-            body = self._request(parameters, {"prompt": prompt, "stream": False},
-                                 None if seed is None else seed + index, max_new_tokens)
-            responses.append(await _ainvoke(client.generate, body))
-        return _ollama_result(responses)
+        return _ollama_result([await _ainvoke(client.generate, body) for body in requests])
 
     async def astream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
-        seed = key_seed(key)
-        _prompts(prompt, max_new_tokens, seed)
-        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        (body,) = self._generations(prompt, max_new_tokens, key, parameters, stream=True)
         return await _ainvoke(self._async().generate, body)
 
     async def achat(
@@ -312,9 +309,7 @@ class OllamaCompletion:
         stream: bool = False,
         **parameters: RequestField,
     ) -> OllamaChat | AsyncIterator[OllamaChat]:
-        seed = key_seed(key)
-        _prompts("", max_new_tokens, seed)
-        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._chat(messages, max_new_tokens, key, stream, parameters)
         return await _ainvoke(self._async().chat, body)
 
 
@@ -494,9 +489,7 @@ class OpenAICompletion:
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
         if sampling.eos_id is not None:
-            controls["stop_token_ids"] = (
-                list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
-            )
+            controls["stop_token_ids"] = list(sampling.stops)
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(

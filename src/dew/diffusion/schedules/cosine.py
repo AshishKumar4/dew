@@ -1,13 +1,7 @@
-"""Cosine schedules: the DDPM beta table, and its variance-exploding and
-continuous forms."""
+"""The cosine beta table of Nichol and Dhariwal 2021."""
 
-import math
-
-import jax.numpy as jnp
 import numpy as np
 
-from .common import GeneralizedNoiseScheduler
-from .continuous import ContinuousNoiseScheduler
 from .discrete import DiscreteNoiseScheduler
 
 
@@ -31,39 +25,3 @@ class CosineNoiseScheduler(DiscreteNoiseScheduler):
                          p2_loss_weight_k=p2_loss_weight_k,
                          p2_loss_weight_gamma=p2_loss_weight_gamma)
 
-
-class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
-    """Sigmas placed so that log-SNR runs along a cosine in t, on the
-    variance exploding form."""
-
-    def __init__(self, sigma_min: float = 0.02, sigma_max: float = 80.0, kappa: float = 1.0,
-                 sigma_data: float = 0.5):
-        super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data)
-        self.kappa = kappa
-        logsnr_max = 2 * (math.log(self.kappa) - math.log(self.sigma_max))
-        self.theta_max = math.atan(math.exp(-0.5 * logsnr_max))
-        logsnr_min = 2 * (math.log(self.kappa) - math.log(self.sigma_min))
-        self.theta_min = math.atan(math.exp(-0.5 * logsnr_min))
-
-    def sigmas(self, t):
-        return jnp.tan(self.theta_min + t * (self.theta_max - self.theta_min)) / self.kappa
-
-    def t_of_sigma(self, sigma):
-        theta = jnp.arctan(jnp.asarray(sigma, jnp.float32) * self.kappa)
-        return (theta - self.theta_min) / (self.theta_max - self.theta_min)
-
-
-class CosineContinuousNoiseScheduler(ContinuousNoiseScheduler):
-    """alpha = cos(pi t / 2), sigma = sin(pi t / 2), weighted by sigma^2, which
-    is 1 / (1 + SNR)."""
-
-    def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
-        # float32 pi/2 rounds past the root of cosine. The endpoint is
-        # exactly noise-only; its spurious negative alpha invalidates log-SNR.
-        alpha = jnp.where(t == 1, 0.0, jnp.cos(jnp.pi * t / 2))
-        return alpha, jnp.sin(jnp.pi * t / 2)
-
-    def weight(self, t):
-        alpha, sigma = self.rates(t)
-        return 1 / (1 + (alpha ** 2 / sigma ** 2))

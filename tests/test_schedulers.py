@@ -25,11 +25,8 @@ from dew.diffusion import (
     presets,
 )
 from dew.diffusion.schedules import (
-    CosineContinuousNoiseScheduler,
-    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     EDMNoiseScheduler,
-    ExpNoiseScheduler,
     FlowMatchingScheduler,
     KarrasVENoiseScheduler,
     LinearNoiseScheduler,
@@ -48,10 +45,7 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 SCHEDULES = [
     (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
     (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
-    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
     (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
-    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, 've'),
     (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
     (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
     (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
@@ -193,11 +187,11 @@ def test_karras_weights_at_sigma_min():
     assert jnp.allclose(schedule.weight(jnp.array([0.0])), expected, rtol=1e-2)
 
 
-def test_cosine_general_weights_read_its_sigma_data():
+def test_generalized_weights_read_their_sigma_data():
     """The EDM lambda depends on sigma_data, so two values of it are two
     weightings and not one."""
-    wide = CosineGeneralNoiseScheduler(sigma_data=1.0).weight(CONTINUOUS_STEPS)
-    narrow = CosineGeneralNoiseScheduler(sigma_data=0.5).weight(CONTINUOUS_STEPS)
+    wide = KarrasVENoiseScheduler(sigma_data=1.0).weight(CONTINUOUS_STEPS)
+    narrow = KarrasVENoiseScheduler(sigma_data=0.5).weight(CONTINUOUS_STEPS)
     assert jnp.allclose(narrow - wide, 1 / 0.5**2 - 1 / 1.0**2, rtol=1e-5)
 
 
