@@ -34,7 +34,7 @@ objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3)
 trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
 info = Step(step=state.step, key=jax.random.key(1), ema=state.averaged)
-preview = objective.evaluate(state.params, batch, info)
+preview = objective.evaluate(state.variables, batch, info)
 output = np.asarray(preview.images)
 assert output.shape == (8, 8, 8, 3)
 assert np.all(np.isfinite(output))
@@ -102,12 +102,12 @@ key = jax.random.key(0)
 tuned = pipe.lora(rank=16, modules=("to_q", "to_k", "to_v", "to_out.0"), key=key)
 objective = tuned.diffusion_objective()
 state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=1000)
-tuned.adapter.save(state.params, "flux-adapter")
-tuned.save("flux-merged", variables=state.params)
+tuned.adapter.save(state.variables, "flux-adapter")
+tuned.save("flux-merged", variables=state.variables)
 images = objective.pipeline(state)(["a red bird"], key=0).host().images
 ```
 
-`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.params` as it comes back. `LoRA.load(pipe.model, pipe.variables, pipe.layouts, path)` reads such a file back, or one Diffusers or a PEFT trainer wrote.
+`tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as it comes back. `LoRA.load(pipe.model, pipe.variables, pipe.layouts, path)` reads such a file back, or one Diffusers or a PEFT trainer wrote.
 
 <!-- not run: needs torch, diffusers and peft -->
 ```python

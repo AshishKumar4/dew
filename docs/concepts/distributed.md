@@ -35,7 +35,7 @@ trainer = Trainer(LMObjective(model, seq_len=64), optax.adamw(1e-3), key=jax.ran
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 
-kernel = state.params["params"]["layers_0"]["mlp"]["up_proj"]["kernel"]
+kernel = state.variables["params"]["layers_0"]["mlp"]["up_proj"]["kernel"]
 print(kernel.shape, kernel.sharding.spec)
 print(kernel.addressable_shards[0].data.shape)
 ```
