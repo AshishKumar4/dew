@@ -541,6 +541,8 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
     hashed = [np.asarray(loaded.model.language_model.apply(
         language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
-        decode=False, media=mask, method=loaded.model.language_model.engram_hashes)) for mask in (media, None)]
+        decode=False, media_mask=mask,
+        method=lambda module, tokens, valid, positions, *, decode, media_mask: module.engram_hashes(
+            tokens, valid, positions, decode=decode, media_mask=media_mask))) for mask in (media, None)]
     after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
     assert np.any(hashed[0][:, after] != hashed[1][:, after])
