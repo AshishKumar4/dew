@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
@@ -17,8 +18,8 @@ from dew.data import OxfordFlowers
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import models
 from dew.sampling import CFG, Heun
 from dew.training import Checkpoints, MeshSpec, Trainer
 
@@ -53,8 +54,7 @@ def main(config: Config, data=None, inputs=None):
         image_size=config.image_size,
     ).load(batch=config.batch_size, tokenize=inputs.tokenize)
     steps = config.steps or data.epoch_steps(config.epochs)
-    fields = dict(config.model, output_channels=3, dtype="bfloat16")
-    model = models.build("simple_dit", **fields)
+    model = SimpleDiT(**config.model, output_channels=3, dtype=jnp.bfloat16)
     objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
                                    sampler=Heun(), guidance=CFG(3.0), steps=40)
 
@@ -72,7 +72,9 @@ def main(config: Config, data=None, inputs=None):
     config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")
 
-    save_hf_layout(state.averaged["params"], {"architecture": "simple_dit", **fields}, config.out / "export")
+    save_hf_layout(state.averaged["params"],
+                   {"architecture": "simple_dit", **config.model, "output_channels": 3, "dtype": "bfloat16"},
+                   config.out / "export")
     return state
 
 

@@ -470,11 +470,13 @@ class Pretrained:
         Masked generation refines a full response with Unmask, not the source
         family's custom generation recipe. AR sampling overrides are refused.
 
-        Without an override the task runs the source's whole chain, its
-        criteria and the strategy its config names. An explicit `sampling`
-        replaces the basic policy and clears that chain with it, because the
-        chain was built around the policy the caller just replaced; the
-        criteria and `num_return_sequences` still come from the source.
+        Without an override the task runs the source's policy (`task.sampling`
+        holds every common control its config sets), any chain the rarer
+        controls need, and the strategy its config names. An explicit
+        `sampling` replaces the policy and clears that chain with it, because
+        the chain was built around the policy the caller just replaced; the
+        source's EOS and pad ids fill the ones it leaves None, and
+        `num_return_sequences` still comes from the source.
         """
         if self.process is not None:
             raise TypeError("a latent diffusion source generates through text_to_image")
@@ -500,9 +502,8 @@ class Pretrained:
                 max_length=generation_limit(self.config, self.generation_config, "max_length"),
                 n=return_sequences(self.config, self.generation_config))
         rows = return_sequences(self.config, self.generation_config)
-        policy, logits, stopping, strategy = source_decoding(
-            self.config, self.generation_config, self.model, self.processor, rows,
-            sampling)
+        policy, logits, strategy = source_decoding(
+            self.config, self.generation_config, self.model, rows, sampling)
         return TextGeneration(
             self.model,
             self.variables,
@@ -512,7 +513,6 @@ class Pretrained:
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
             n=rows,
             logits=logits,
-            stopping=stopping,
             strategy=strategy,
         )
 

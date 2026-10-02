@@ -177,8 +177,14 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     if sampling is not None:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.eos_id is not None or sampling.pad_id != 0:
+        if sampling.eos_id is not None or sampling.pad != 0:
             raise ValueError("Ollama text completion cannot implement native EOS-token or padding IDs")
+        unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"Ollama text completion cannot implement {unmatched} as Dew does: its "
+                             "penalties read a window of recent tokens, and it strips stop strings "
+                             "from the text")
         native: dict[str, object] = {"temperature": sampling.temperature,
                                      "top_k": 0 if sampling.top_k is None else sampling.top_k,
                                      "top_p": sampling.top_p, "min_p": sampling.min_p,
@@ -245,23 +251,30 @@ class OllamaCompletion:
                                            fields.pop("sampling", None))
         return _bound(fields, {**fixed, "model": self.model})
 
-    def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                 key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
+    def _generations(self, prompts: str | Sequence[str], max_new_tokens: int, key: int | jax.Array | None,
+                     parameters: Mapping[str, object], *, stream: bool = False) -> list[Mapping[str, object]]:
+        """One generate request per prompt row, row `i` seeded at the root seed plus `i`."""
         seed = key_seed(key)
         rows = _prompts(prompts, max_new_tokens, seed)
+        return [self._request(parameters, {"prompt": prompt, "stream": stream},
+                              None if seed is None else seed + index, max_new_tokens)
+                for index, prompt in enumerate(rows)]
+
+    def _chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, key: int | jax.Array | None,
+              stream: bool, parameters: Mapping[str, object]) -> Mapping[str, object]:
+        seed = key_seed(key)
+        _prompts("", max_new_tokens, seed)
+        return self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+
+    def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
+                 key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
+        requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._sync()
-        responses = []
-        for index, prompt in enumerate(rows):
-            body = self._request(parameters, {"prompt": prompt, "stream": False},
-                                 None if seed is None else seed + index, max_new_tokens)
-            responses.append(_invoke(client.generate, body))
-        return _ollama_result(responses)
+        return _ollama_result([_invoke(client.generate, body) for body in requests])
 
     def stream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                **parameters: RequestField) -> Iterator[OllamaResponse]:
-        seed = key_seed(key)
-        _prompts(prompt, max_new_tokens, seed)
-        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        (body,) = self._generations(prompt, max_new_tokens, key, parameters, stream=True)
         return _invoke(self._sync().generate, body)
 
     def chat(
@@ -273,28 +286,18 @@ class OllamaCompletion:
         stream: bool = False,
         **parameters: RequestField,
     ) -> OllamaChat | Iterator[OllamaChat]:
-        seed = key_seed(key)
-        _prompts("", max_new_tokens, seed)
-        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._chat(messages, max_new_tokens, key, stream, parameters)
         return _invoke(self._sync().chat, body)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
-        seed = key_seed(key)
-        rows = _prompts(prompts, max_new_tokens, seed)
+        requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._async()
-        responses = []
-        for index, prompt in enumerate(rows):
-            body = self._request(parameters, {"prompt": prompt, "stream": False},
-                                 None if seed is None else seed + index, max_new_tokens)
-            responses.append(await _ainvoke(client.generate, body))
-        return _ollama_result(responses)
+        return _ollama_result([await _ainvoke(client.generate, body) for body in requests])
 
     async def astream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
-        seed = key_seed(key)
-        _prompts(prompt, max_new_tokens, seed)
-        body = self._request(parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        (body,) = self._generations(prompt, max_new_tokens, key, parameters, stream=True)
         return await _ainvoke(self._async().generate, body)
 
     async def achat(
@@ -306,9 +309,7 @@ class OllamaCompletion:
         stream: bool = False,
         **parameters: RequestField,
     ) -> OllamaChat | AsyncIterator[OllamaChat]:
-        seed = key_seed(key)
-        _prompts("", max_new_tokens, seed)
-        body = self._request(parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        body = self._chat(messages, max_new_tokens, key, stream, parameters)
         return await _ainvoke(self._async().chat, body)
 
 
@@ -468,20 +469,27 @@ class OpenAICompletion:
             return fields
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.pad_id != 0:
+        if sampling.pad != 0:
             raise ValueError("remote text completion does not implement padded token rows")
+        unmatched = sampling.active(("no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "
+                             "an OpenAI-compatible server strips stop strings from the text")
         if self.provider == "openai" and (
             sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None
+            or sampling.repetition_penalty != 1.0
         ):
-            raise ValueError("top-k, min-p and EOS-token controls require provider='vllm' or 'sglang'")
+            raise ValueError("top-k, min-p, repetition-penalty and EOS-token controls require "
+                             "provider='vllm' or 'sglang'")
+        # Presence and frequency penalties are OpenAI's own, which Dew's follow.
         native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
-                                     "frequency_penalty": 0.0, "presence_penalty": 0.0}
+                                     "frequency_penalty": sampling.frequency_penalty,
+                                     "presence_penalty": sampling.presence_penalty}
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
-                                      "min_p": sampling.min_p, "repetition_penalty": 1.0}
+                                      "min_p": sampling.min_p,
+                                      "repetition_penalty": sampling.repetition_penalty}
         if sampling.eos_id is not None:
-            controls["stop_token_ids"] = (
-                list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
-            )
+            controls["stop_token_ids"] = list(sampling.stops)
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(

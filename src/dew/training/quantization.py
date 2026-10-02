@@ -4,8 +4,8 @@ Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
 paths and applies them without editing the model. One call wraps the module,
 and the matmuls in the wrapped methods' extent run quantized.
 
-Dew's version of that call is `apply_quantization`. A caller builds its model
-from the registry as always, then wraps it before the objective ever sees it.
+Dew's version of that call is `Quantization.apply`. A caller builds its model
+as always, then wraps it before the objective ever sees it.
 A run that names `--trainer.quantization` instead hands `RunConfig.train` the
 objective, and `_quantize` wraps the model it holds before anything
 initialises it.
@@ -143,6 +143,19 @@ class Quantization:
             raise ValueError(
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
+
+    def apply(self, model: nn.Module) -> nn.Module:
+        """Wrap `model` so its trunk matmuls train in this spec's dtype.
+
+        The returned module is a copy of the same class with the entry methods
+        it defines of `METHODS` wrapped, so everything the registry, the
+        objective and the checkpoint code read off the model still answers.
+        Construction already refused what the value cannot ask for; without the
+        package the call raises naming it.
+        """
+        rules = _rules(self, training=True)
+        methods = tuple(method for method in METHODS if hasattr(model, method))
+        return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -516,20 +529,6 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
-    """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
-
-    The returned module is a copy of the same class with the entry methods
-    it defines of `METHODS` wrapped, so everything the registry, the
-    objective and the checkpoint code read off the model still answers.
-    Construction already refused what the value cannot ask for; without the
-    package the call raises naming it.
-    """
-    rules = _rules(spec, training=True)
-    methods = tuple(method for method in METHODS if hasattr(model, method))
-    return _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
-
-
 def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
@@ -555,7 +554,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     the float kernel, so the weights take about a quarter of fp32's memory, and the
     returned module computes with them. Unless `spec.weight_only`, its
     activations quantize at each matmul from their own range, as training
-    under `apply_quantization` does, and a matmul of two quantized operands
+    under `Quantization.apply` does, and a matmul of two quantized operands
     runs in the quantized dtype. `args` and `kwargs` are one example call of
     the model, which Qwix traces abstractly to find the kernels its
     matmuls read. `spec`'s backward fields have nothing to do here.
@@ -592,7 +591,7 @@ class ModelObjective(Protocol):
 def _quantize(objective: object, spec: Quantization) -> None:
     """Quantize the trunk matmuls of the module `objective` trains, in place.
 
-    This is `RunConfig.train`'s step, not a user's. `apply_quantization`
+    This is `RunConfig.train`'s step, not a user's. `Quantization.apply`
     wraps a module before an objective is built, which is what a recipe or
     a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
@@ -609,4 +608,4 @@ def _quantize(objective: object, spec: Quantization) -> None:
             f"--trainer.quantization quantizes the module an objective trains, and "
             f"{type(objective).__name__} keeps no `model`; train an objective that "
             f"holds one, or leave the quantization unset")
-    objective.model = apply_quantization(objective.model, spec)
+    objective.model = spec.apply(objective.model)

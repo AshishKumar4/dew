@@ -41,7 +41,7 @@ Every reader returns the same `Dataset` value:
 
 `train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails, and a training step's exception kept after the run does not keep its closed prefetch iterator alive.
 
-The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`), and the built-in readers read only that share.
+The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`DataPartition.of(mesh)`), and the built-in readers read only that share.
 
 A `Dataset` can also be built from the two functions directly, for a stream no reader covers:
 
@@ -127,7 +127,7 @@ Image sources can need network access the first time. Token-window sources read 
 
 ## Image datasets on the Hugging Face Hub
 
-`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and `label_column` is the class index a record carries as `label`. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
+`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and a `label` column, where the dataset has one, is the class index a record carries. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
 
 <!-- not run: downloads CIFAR-10 on first use -->
 ```python

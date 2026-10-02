@@ -21,7 +21,7 @@ import numpy as np
 
 from dew.data import Loading
 from dew.telemetry.records import RECORD_TYPES
-from dew.training.evaluation import evaluate
+from dew.training.evaluation import Evaluation
 
 RES = 8
 BATCH = 8
@@ -179,7 +179,6 @@ def as_numpy(tree):
     process takes the other branch.
     """
     import jax
-
     import jax.numpy as jnp
 
     tree = jax.tree.map(lambda leaf: jax.random.key_data(leaf)
@@ -328,11 +327,11 @@ def mode_topology(args) -> dict:
     import jax
 
     from dew.training import runtime
-    from dew.training.distributed import MeshSpec, build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
     if args.process_id > 0:
         runtime.datetime = YearAhead
-    mesh = build_mesh(MeshSpec(fsdp=args.fsdp_size))
+    mesh = MeshSpec(fsdp=args.fsdp_size).build()
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     sharded = shard_batch(mesh, {"image": local})["image"]
@@ -359,13 +358,13 @@ def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.data import TokenWindows
-    from dew.training import build_mesh, data_partition
+    from dew.data import DataPartition, TokenWindows
+    from dew.training import MeshSpec
 
     data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
                         loading=Loading(workers=args.workers, threads=1,
                                         read_buffer=8, worker_buffer=1)).load(batch=BATCH)
-    partition = data_partition(build_mesh())
+    partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     records, batches = [], 0
     for batch in data.val(partition):
@@ -386,13 +385,13 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.data import PackedTokens
-    from dew.training import build_mesh, data_partition
+    from dew.data import DataPartition, PackedTokens
+    from dew.training import MeshSpec
 
     data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
                         loading=Loading(workers=args.workers,
                                         worker_buffer=1)).load(batch=BATCH)
-    partition = data_partition(build_mesh())
+    partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     documents, windows = set(), 0
     for batch in data.val(partition):
@@ -592,14 +591,13 @@ def mode_fit(args) -> dict:
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
-        from dew.data import PackedTokens
-        from dew.training.distributed import data_partition
+        from dew.data import DataPartition, PackedTokens
 
         data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
         assert val is not None
-        available = sum(1 for _ in val(data_partition(trainer.device_mesh)))
+        available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
     from dew.training import Best
     counter = Batches()
     state = trainer.fit(Data(open_train, val=val, records=args.records),
@@ -712,7 +710,7 @@ def mode_validate(args) -> dict:
 
     from dew.data import Dataset
     from dew.diffusion import presets
-    from dew.eval import clip
+    from dew.eval import CLIPDistance
     from dew.inputs import Condition, Field, InputSpec
     from dew.inputs.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
@@ -737,7 +735,7 @@ def mode_validate(args) -> dict:
     data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
-                        metrics=(clip(modelname=tiny), GlobalMean()), preview=True)
+                        metrics=(CLIPDistance(modelname=tiny), GlobalMean()), preview=True)
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),
@@ -1000,7 +998,7 @@ def mode_evaluation_contract(args) -> dict:
         if failure == "duplicates" and rank == 0:
             scoring = (metric, metric)
         try:
-            result = evaluate(objective, state.params, data.val, metrics=scoring, key=state.key,
+            result = Evaluation.run(objective, state.params, data.val, metrics=scoring, key=state.key,
                               step=state.step, schedule_step=state.microstep,
                               preview=trainer.tracker is not None, mesh=trainer.device_mesh)
             trainer._report_evaluation(result)
@@ -1050,9 +1048,9 @@ def mode_evaluation_replicas(args) -> dict:
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
     data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3)
-    measured = evaluate(trainer.objective, state.params, data.val, metrics=(Count(),),
+    measured = Evaluation.run(trainer.objective, state.params, data.val, metrics=(Count(),),
                         key=state.key, mesh=trainer.device_mesh).scalars
-    unconsumed = evaluate(trainer.objective, state.params, data.val, key=state.key,
+    unconsumed = Evaluation.run(trainer.objective, state.params, data.val, key=state.key,
                           mesh=trainer.device_mesh).scalars
     # Plain host stays usable on root alone for local arrays outside evaluation.
     local = None
@@ -1147,8 +1145,8 @@ def mode_builtin_preview_failures(args) -> dict:
                 else:
                     objective._sample = sample_failure
                 try:
-                    result = evaluate(objective, state.params, data.val, key=state.key,
-                                      preview=trainer.tracker is not None, mesh=trainer.device_mesh)
+                    result = Evaluation.run(objective, state.params, data.val, key=state.key,
+                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
                     trainer._report_evaluation(result)
                 except (AttributeError, ValueError, RuntimeError) as error:
                     reports[case] = {"type": type(error).__name__, "error": str(error),
@@ -1170,7 +1168,7 @@ def mode_builtin_preview_failures(args) -> dict:
                         raise RuntimeError(f"{case}: peer never returned from evaluation")
                     time.sleep(.01)
         case = f"{kind}-healthy"
-        result = evaluate(objective, state.params, data.val, key=state.key,
+        result = Evaluation.run(objective, state.params, data.val, key=state.key,
                           preview=trainer.tracker is not None, mesh=trainer.device_mesh)
         trainer._report_evaluation(result)
         reports[case] = {"scores": result.scalars, "drawn": len(tracker.drawn)}
@@ -1867,7 +1865,7 @@ def mode_host_training(args) -> dict:
 
     from dew.objectives.base import Aux, Objective
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import shard_batch
     from dew.training.host import companion_mesh
 
     class Coupled(Objective):
@@ -1891,7 +1889,7 @@ def mode_host_training(args) -> dict:
     class SeparateLanes(Trainer):
         @functools.cached_property
         def device_mesh(self):
-            return build_mesh(self.mesh, devices=compute_devices)
+            return self.mesh.build(devices=compute_devices)
 
         @functools.cached_property
         def state_mesh(self):
@@ -1922,14 +1920,14 @@ def mode_step_fits(args) -> dict:
 
     import jax
 
-    from dew.training.distributed import MeshSpec, build_mesh
+    from dew.training.distributed import MeshSpec
     from dew.training.trainer import fits_everywhere, step_fits
 
     # A step over a mesh that spans both processes: each may read only its
     # own devices' memory, which a CPU device does not report.
     step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
         output_size_in_bytes=100, alias_size_in_bytes=0, temp_size_in_bytes=100))
-    whole = step_fits(step, build_mesh(MeshSpec(fsdp=jax.device_count())))
+    whole = step_fits(step, MeshSpec(fsdp=jax.device_count()).build())
     tight = [10, -1][args.process_id]
     return {"whole_mesh": whole, "tight": fits_everywhere(tight),
             "roomy": fits_everywhere(abs(tight)),

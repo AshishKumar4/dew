@@ -17,6 +17,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import OxfordFlowers
 from dew.diffusion import broadcast_rates
+from dew.diffusion.presets import Flow
 from dew.inputs import unit_range
 from dew.objectives.base import Step
 from dew.objectives.diffusion import (
@@ -27,8 +28,7 @@ from dew.objectives.diffusion import (
 )
 from dew.objectives.diffusion.guidance_distillation import with_guidance
 from dew.objectives.diffusion.objective import TEACHER
-from dew.registry import presets, samplers
-from dew.sampling import TextToImage
+from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -45,7 +45,7 @@ def runs(tmp_path_factory):
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", FLUX, dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=8), preset=presets.Flow(), sampler=samplers.Euler(), guidance=None,
+        data=OxfordFlowers(image_size=8), preset=Flow(), sampler=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")))
     objective = teacher.build()

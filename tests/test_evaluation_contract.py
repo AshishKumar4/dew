@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 
 from dew.artifacts import ImageGrid, TokenScores, VideoGrid
-from dew.eval import psnr, ssim
+from dew.eval import PSNR, SSIM
 from dew.eval.fid import FID, FIDStats, GaussianStats, frechet_distance
-from dew.objectives.lm.objective import perplexity
+from dew.objectives.lm import Perplexity
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.preference import DPOObjective
 
@@ -39,7 +39,7 @@ def test_fid_refuses_insufficient_or_nonfinite_populations():
 
 
 def test_image_mean_weights_each_image_once_across_unequal_batches():
-    metric = psnr()
+    metric = PSNR()
     targets = np.zeros((5, 4, 4, 1), dtype=np.float32)
     errors = np.array([.1, .2, .4, .8, 1.0], dtype=np.float32)
     generated = targets - 1.0 + errors[:, None, None, None]
@@ -52,7 +52,7 @@ def test_image_mean_weights_each_image_once_across_unequal_batches():
 
 
 def test_perplexity_streams_weighted_targets_and_empty_contributions():
-    metric = perplexity()
+    metric = Perplexity()
     first = metric(TokenScores(np.array([[1., 4.]]), np.array([[1., .5]]), correct=np.zeros_like(np.array([[1., 4.]]), dtype=bool)), {})
     empty = metric(TokenScores(np.array([[9.]]), np.array([[0.]]), correct=np.zeros_like(np.array([[9.]]), dtype=bool)), {})
     last = metric(TokenScores(np.array([[2.]]), np.array([[3.]]), correct=np.zeros_like(np.array([[2.]]), dtype=bool)), {})
@@ -88,7 +88,7 @@ def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objectiv
     np.testing.assert_array_equal(preview.tokens, expected)
 
 
-@pytest.mark.parametrize("factory", [psnr, ssim])
+@pytest.mark.parametrize("factory", [PSNR, SSIM])
 @pytest.mark.parametrize("reference_shape", [(1, 1, 16, 16, 3), (1, 2, 1, 16, 3), (1, 2, 16, 16, 1)])
 def test_paired_video_metrics_refuse_broadcastable_missing_pixels(factory, reference_shape):
     metric = factory(field="video", reads=VideoGrid)

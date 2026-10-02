@@ -2,28 +2,18 @@
 
 A `RolloutServer` takes one prompt of token ids at a time and resolves a
 future `Draw` with the sampled ids, their likelihoods and the policy version
-the request was submitted under. The trainer pushes new weights with
-`load(variables, version)`, and generation keeps running across the push:
-requests already in flight finish on whichever weights are resident when
-each token is drawn. That is why a draw carries its submission version, the
-oldest weights that may have produced any of its tokens.
+the request was submitted under. `load(variables, version)` pushes new
+weights while generation keeps running, so in-flight requests finish on
+whichever weights are resident when each token is drawn, and a draw's version
+is the oldest weights that may have produced any of its tokens.
 
-Two backends fill the interface. `NativeRolloutServer` drives Dew's
-continuous-batching `Server` on a background thread and loads weights in
-process, copying the trainer's tree onto the served device.
-`OpenAIRolloutServer` posts token ids to a vLLM or SGLang completions
-endpoint through `OpenAICompletion` and reloads weights from disk:
-`SafetensorsReload` writes the policy in its Hugging Face layout with
-`Pretrained.save` and asks the engine to reload it. The request, the
-response and the draw are the same for both engines; they differ in the
-field that returns sampled ids, the distribution their log-probabilities
-describe, and the reload calls.
-
-A remote engine reports one log-probability per token, of the distribution it
-was configured to report, in its own numerics. The draw records it as the
-behavior likelihood when that distribution is the sampling one, and records
-no raw-policy likelihood: the trainer rescoring the tokens is the only raw
-policy it has.
+`NativeRolloutServer` drives Dew's continuous-batching `Server` on a
+background thread and loads weights in process. `OpenAIRolloutServer` posts
+token ids to a vLLM or SGLang completions endpoint, and `SafetensorsReload`
+publishes weights to it through disk. A remote engine reports one
+log-probability per token in its own numerics; the draw records it as the
+behavior likelihood when that is the sampling distribution, and no raw-policy
+likelihood, which only the trainer's rescoring has.
 """
 
 from __future__ import annotations
@@ -247,53 +237,30 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
 
 @dataclass(frozen=True)
 class SafetensorsReload:
-    """Publish a policy version to a set of engine replicas through safetensors on disk.
+    """Publish a policy version to engine replicas through safetensors on disk.
 
-    `source` is the `Pretrained` the trainer's model was loaded from; its
-    `save` writes the weights, the config it derives and the tokenizer
-    files, which is the directory every replica was launched on (a shared
-    filesystem when the replicas are on several hosts). Files are staged
-    beside `directory` and moved in with `os.replace`, so no engine reads a
-    half-written file. `engines` are the replicas' roots, not their `/v1`
-    APIs. An engine call fails the push when it answers other than 200, or
-    when a call that reports its outcome carries `success` that is not true:
-    both engines report some failures as a 200 with `{"success": false}`.
+    `source.save` writes the weights, derived config and tokenizer files into
+    `directory`, the one every replica was launched on (shared when replicas
+    span hosts). Files are staged beside it and moved in with `os.replace`, so
+    no engine reads a half-written file. `engines` are the replicas' roots, not
+    their `/v1` APIs. A call fails the push on any answer but 200, or, where it
+    reports its outcome, on a `success` that is not true: both engines report
+    some failures as a 200 with `{"success": false}`.
 
-    One push of version `v` writes the directory once, then runs the
-    replica sequence on every replica concurrently. vLLM (`engine="vllm"`,
-    checked against v0.30.0), through its development endpoints
-    (`VLLM_SERVER_DEV_MODE=1`): `POST /pause?mode=wait`, which lets
-    in-flight requests finish and schedules no new ones; `POST
-    /collective_rpc {"method": "reload_weights"}`, which reloads from the
-    served directory; `POST /reset_prefix_cache`, which must answer
-    `{"success": true}` so no cached prefix outlives the weights that
-    computed it; `POST /update_weight_version {"new_version": "v"}`, which
-    must answer `{"success": true}`; and `POST /resume`. In-flight draws
-    therefore finish wholly on the old weights. A replica that fails after
-    the pause stays paused, so no draw is sampled from weights the push may
-    have half loaded; the next push that succeeds resumes it.
+    vLLM (`engine="vllm"`, v0.30.0, `VLLM_SERVER_DEV_MODE=1`) pauses with
+    `mode=wait`, reloads, resets the prefix cache, sets the weight version and
+    resumes, so in-flight draws finish wholly on the old weights and no cached
+    prefix outlives them. A replica that fails after the pause stays paused
+    until a later push succeeds. SGLang (`engine="sglang"`, v0.5.20) runs one
+    `/update_weights_from_disk`, which waits out in-flight requests, holds new
+    ones and flushes the radix cache; a failed load rolls back by re-reading
+    the same directory.
 
-    SGLang (`engine="sglang"`, checked against v0.5.20) runs one call per
-    replica, `POST /update_weights_from_disk {"model_path": directory,
-    "flush_cache": true, "weight_version": "v"}`. SGLang admits it only once
-    every in-flight request has finished, holds new requests until it
-    returns, and flushes the radix cache before answering, so in-flight
-    draws finish wholly on the old weights and no prefix computed by them
-    survives. A load that fails answers 400 with `success: false`; SGLang's
-    rollback re-reads the same directory, so the replica then serves
-    whatever that directory holds.
-
-    A push with any failed replica raises and names the replicas that did
-    not take `v`. `Publication` wraps a push with the version it serves and
-    the stamp a recording gateway needs.
-
-    A multi-process trainer calls the push on every process. The pool
-    gathers the served tree to process 0's host memory (`collective_host`
-    with `held_by="first"`: every process takes part in the gather, and
-    only process 0 holds the policy), process 0 writes and publishes, and
-    every process learns the outcome at an agreement point, so a failed
-    push raises on all of them instead of leaving the others to hang at the
-    next collective.
+    A push raises naming every replica that did not take the version. Every
+    process of a pool calls it: `collective_host(held_by="first")` gathers the
+    served tree to process 0, which writes and publishes, and an agreement
+    point raises a failure on every process instead of leaving the rest to
+    hang at the next collective.
     """
 
     source: Pretrained
@@ -337,8 +304,6 @@ class SafetensorsReload:
                                + "; ".join(f"{root}: {failure}" for root, failure in failures))
 
     def _replica(self, root: str, version: int) -> None:
-        import httpx
-
         root = root.rstrip("/")
         # (path, JSON body, whether the answer must say {"success": true})
         if self.engine == "vllm":
@@ -354,9 +319,17 @@ class SafetensorsReload:
                                                     "flush_cache": True, "abort_all_requests": False,
                                                     "weight_version": str(version)}, True),)
         for path, body, reports in calls:
-            response = httpx.post(root + path, json=body, timeout=self.timeout)
-            if response.status_code != 200 or (reports and not _succeeded(response)):
-                raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
+            _post(root, path, body, self.timeout, reports=reports)
+
+
+def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> httpx.Response:
+    """POST `body`, refusing any answer but 200 and, when the call `reports`, a `success` that is not true."""
+    import httpx
+
+    response = httpx.post(root + path, json=body, timeout=timeout)
+    if response.status_code != 200 or (reports and not _succeeded(response)):
+        raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
+    return response
 
 
 def _succeeded(response: httpx.Response) -> bool:
@@ -377,18 +350,14 @@ class Publication:
     """An engine fleet's publication as a versioned publisher: `load` pushes, stamps, then moves `version`.
 
     `weights` is the push (`SafetensorsReload`, or any `WeightSync`) and
-    `stamp`, when set, records a version wherever calls are labelled with
-    one, such as a recording gateway (`dew.objectives.rl.harbor.Gateway.stamp`).
-    The stamp runs once every replica serves the new version and never
-    before: a gateway stamps each call when its request arrives, so a stamp
-    ahead of any replica would claim weights the call was not sampled from,
-    while one behind them only overstates its lag. A push or stamp that
-    fails raises and leaves `version` where it was.
-
-    Construction stamps `version`, the version the engines were launched
-    on, so a gateway left at a higher stamp by an earlier run cannot label
-    this run's first calls with weights it has not served. Every process of
-    a multi-process trainer calls `load`; process 0 stamps.
+    `stamp`, when set, labels later calls with a version, as a recording
+    gateway does (`dew.objectives.rl.harbor.Gateway.stamp`). It runs only once
+    every replica serves the new version: a gateway stamps a call when it
+    arrives, so a stamp ahead of a replica would claim weights the call was
+    not sampled from. A failed push or stamp raises and leaves `version` where
+    it was. Construction stamps the launch `version`, so a gateway left higher
+    by an earlier run cannot mislabel this run's first calls. Every process
+    calls `load`; process 0 stamps.
     """
 
     def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
@@ -457,33 +426,22 @@ class _RequestServer:
 class OpenAIRolloutServer(_RequestServer):
     """Serve rollouts from a vLLM or SGLang OpenAI-compatible completions endpoint.
 
-    Each submission is one completion request of token ids, carrying the
-    `Sampling` policy as engine request controls, a seed, one reported
-    log-probability per sampled token and the ids themselves. `workers`
-    requests are in flight at once; the engine batches them. The engine is
+    Each submission is one completion request of token ids carrying the
+    `Sampling` policy, a seed, one log-probability per sampled token and the
+    ids themselves; `workers` requests are in flight at once. The engine is
     `completion.provider`.
 
-    The reported log-probabilities are the behavior likelihoods only for
-    some policies. vLLM reports raw model log-probabilities unless it runs
-    with `--logprobs-mode processed_logprobs`, so a transforming policy
-    (temperature other than one) needs `processed_logprobs=True` to say the
-    engine was started that way. A filtering policy (top-k, top-p or min-p)
-    trains on its recorded support, which only vLLM's token route returns
-    (`VLLMGenerateServer`), so vLLM's completions route refuses one.
+    The reported log-probabilities are behavior likelihoods only for some
+    policies. vLLM reports raw ones unless started with `--logprobs-mode
+    processed_logprobs` (say so with `processed_logprobs=True`), and returns a
+    filtering policy's kept ids only on its token route (`VLLMGenerateServer`).
     SGLang's `/v1/completions` reports the temperature-scaled distribution
-    before its top-k, top-p and min-p filters and has no field for the
-    filtered one, so this server takes any temperature but no filter.
-    (SGLang's native `/generate` reports the filtered likelihood under
-    `return_sampling_mask`, for a finite top-k; that is the route a filtered
-    policy would need.) `SGLANG_RETURN_ORIGINAL_LOGPROB` switches the report
-    to raw log-probabilities and must stay unset.
-
-    SGLang honors a request's seed only under `--enable-deterministic-inference`;
-    otherwise draws are unseeded.
+    before its filters, so it takes any temperature but no filter, and
+    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. SGLang honors a seed only
+    under `--enable-deterministic-inference`.
 
     `routing=True` records vLLM's routed experts on every draw for routing
-    replay (`dew.nn.moe.Routes`); the engine runs with
-    `--enable-return-routed-experts`.
+    replay (`dew.nn.moe.Routes`), under `--enable-return-routed-experts`.
     """
 
     def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
@@ -565,24 +523,25 @@ class VLLMGenerateServer(_RequestServer):
                  workers: int = 64, routing: bool = False, timeout: float = 600.0):
         if sampling.top_k is None:
             raise ValueError("vLLM returns a sampling mask only under a finite top-k")
+        unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
+                                     "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
+        if unmatched:
+            raise ValueError(f"the token route draws under temperature, top-k, top-p and min-p alone; "
+                             f"{unmatched} would not shape its draws")
         super().__init__(sampling, weights, version, workers)
-        self._url = base_url.rstrip("/") + "/inference/v1/generate"
+        self._root = base_url.rstrip("/")
         self._routing = routing
         self._timeout = timeout
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
-        import httpx
-
         sampling = self._sampling
         parameters: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                          "top_k": sampling.top_k, "min_p": sampling.min_p,
                                          "max_tokens": budget, "seed": seed, "logprobs": 0}
         if sampling.eos_id is not None:
             parameters["stop_token_ids"] = list(sampling.stops)
-        response = httpx.post(self._url, json={"token_ids": list(prompt), "sampling_params": parameters},
-                              timeout=self._timeout)
-        if response.status_code != 200:
-            raise RuntimeError(f"/inference/v1/generate answered {response.status_code}: {response.text}")
+        response = _post(self._root, "/inference/v1/generate",
+                         {"token_ids": list(prompt), "sampling_params": parameters}, self._timeout)
         (choice,) = response.json()["choices"]
         tokens = tuple(choice["token_ids"])
         probabilities = tuple(float(entry["logprob"]) for entry in choice["logprobs"]["content"])

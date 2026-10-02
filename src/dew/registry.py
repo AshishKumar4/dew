@@ -1,10 +1,10 @@
 """Name the things a run is made of.
 
 One Registry per kind, including model components such as mixers, towers and
-projectors. A registry is a decorator, a mapping and
-an attribute view over the same table, so `models["simple_dit"]`,
-`models.SimpleDiT` and the class are one object. A name or a field the table
-does not know raises.
+projectors. A registry is the record layer: config files, the CLI and run
+records name a member, and the registry maps that name to its class and back,
+so `models["simple_dit"]` is `SimpleDiT`. Code builds the class itself. A
+name or a field the table does not know raises.
 
 The registries are empty at import. Each member registers itself where it is
 defined, so importing a package fills its table and the registry module
@@ -72,7 +72,7 @@ NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
 class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
-    """Names one kind of thing: a decorator, a mapping and an attribute view."""
+    """Names one kind of thing: a decorator and a mapping from name to member."""
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
@@ -106,17 +106,6 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
             raise KeyError(
                 f"no {self.kind} named {name!r}; known: {', '.join(sorted(self._members))}"
             ) from None
-
-    def __getattr__(self, attr: str) -> T:
-        """Return the member whose class name is `attr`, as `models.SimpleDiT`."""
-        if attr.startswith("_"):
-            raise AttributeError(attr)
-        for member in self._members.values():
-            if _describe(member) == attr:
-                return member
-        raise AttributeError(
-            f"no {self.kind} is called {attr!r}; known: "
-            f"{', '.join(sorted(_describe(m) for m in self._members.values()))}")
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._members)
@@ -194,8 +183,7 @@ class Named(Protocol):
     """Declares the name a registry member carries of its own.
 
     A member is a class or a function -- the decorator takes both -- and each
-    declares `__name__`, which is what the attribute view matches on and what
-    an error names a member by. The registry's table holds members as the
+    declares `__name__`, which is what an error names a member by. The registry's table holds members as the
     concrete type their decorator handed back, so this is the one thing read
     off them without the caller's own type.
     """

@@ -42,10 +42,11 @@ import optax
 
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers
-from dew.objectives.base import Step, scalar_loss
+from dew.diffusion.presets import Flow
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
-from dew.registry import presets, samplers
+from dew.sampling import Euler
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -66,7 +67,7 @@ def run_config(directory):
                           dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
-        preset=presets.Flow(), sampler=samplers.Euler(), sampling_steps=3, guidance=None,
+        preset=Flow(), sampler=Euler(), sampling_steps=3, guidance=None,
         text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=())
@@ -163,7 +164,7 @@ def test_the_compiled_step_carries_no_frozen_weights_as_constants(tmp_path):
                                   encoder.tokenize(PROMPTS))}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
 
-    closed = jax.make_jaxpr(lambda params, data: scalar_loss(objective, params, data, step)[0])(
+    closed = jax.make_jaxpr(lambda params, data: objective.scalar_loss(params, data, step)[0])(
         variables, batch)
     constants = {np.shape(const) for const in closed.consts}
     # Kernels, not biases: a one-dimensional shape collides with the

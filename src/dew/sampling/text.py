@@ -1,8 +1,9 @@
 """Cached text generation with explicit lengths and sampling likelihoods.
 
 `generate` validates a request on the host, prefills the prompt once, and
-hands the decode loop to a `Strategy`. `Sampling` is the default policy:
-temperature, top-k, top-p and min-p with an EOS criterion. `Generation`
+hands the decode loop to a `Strategy`. `Sampling` is the default policy: the
+common generation controls as one value, compiled in Transformers' order,
+with an EOS criterion. `Generation`
 carries the tokens with one length and two log probabilities per row, the
 behaviour policy's and the model's own.
 
@@ -51,14 +52,20 @@ from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
+    FrequencyPenalty,
     Greedy,
     LogitsTransform,
+    MinNewTokens,
     MinP,
+    NoRepeatNGram,
+    PresencePenalty,
+    RepetitionPenalty,
     StepState,
     Stopping,
     Temperature,
     TopK,
     TopP,
+    Typical,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
 
@@ -149,6 +156,19 @@ class BlockDrafting(Protocol):
     def dspark(self) -> DSpark | None: ...
 
 
+# Transformers' `_get_logits_processor` order, by its own control names: the
+# processors, then the sampling warpers. Presence and frequency penalties are
+# vLLM's (and OpenAI's) and sit beside the repetition penalty, where vLLM
+# applies its penalties together. `Sampling` holds the common controls; a
+# source's generation config hands the rest in as built transforms.
+PROCESSORS = ("sequence_bias", "encoder_repetition_penalty", "repetition_penalty", "presence_penalty",
+              "frequency_penalty", "no_repeat_ngram_size", "encoder_no_repeat_ngram_size", "bad_words_ids",
+              "min_length", "min_new_tokens", "forced_bos_token_id", "forced_eos_token_id",
+              "remove_invalid_values", "exponential_decay_length_penalty", "suppress_tokens",
+              "begin_suppress_tokens")
+WARPERS = ("temperature", "top_h", "top_k", "top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff")
+
+
 @dataclass(frozen=True)
 class Sampling:
     """Token selection and termination. Zero temperature is deterministic argmax.
@@ -156,34 +176,83 @@ class Sampling:
     ``top_k=None`` keeps the vocabulary. EOS counts as a sampled action;
     subsequent output slots contain ``pad_id`` and have no likelihood.
 
-    A ``Sampling`` value compiles to temperature, top-k, top-p and min-p
-    transforms when a request has no explicit logits chain. An explicit
-    chain replaces those transforms. The EOS criterion still joins the
+    The penalties, ``no_repeat_ngram_size``, ``min_new_tokens`` and
+    ``typical_p`` are Transformers' controls of the same names, and
+    ``presence_penalty`` and ``frequency_penalty`` vLLM's; each one's
+    default changes nothing. ``stop`` ends a row whose text ends with one
+    of the strings, compiled against a task's processor.
+
+    ``eos_id`` and ``pad_id`` are facts of the model and its tokenizer, so a
+    task fills the ones a policy leaves None with its own, as Transformers'
+    `generate` does; plain `generate` has no task, stops on no EOS unless
+    one is named, and pads with 0.
+
+    A ``Sampling`` value compiles to its transforms in Transformers' order
+    when a request has no explicit logits chain. An explicit chain replaces
+    those transforms. The EOS and stop-string criteria still join the
     request's stopping criteria.
     """
 
     temperature: float = 1.0
     top_k: int | None = None
     eos_id: int | tuple[int, ...] | None = None
-    pad_id: int = 0
+    pad_id: int | None = None
     top_p: float = 1.0
     min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    no_repeat_ngram_size: int = 0
+    min_new_tokens: int = 0
+    typical_p: float = 1.0
+    stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
         if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
             raise ValueError("top_k must be a positive integer or None")
-        for name, value in (("top_p", self.top_p), ("min_p", self.min_p)):
+        for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
             if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be finite and between zero and one")
-        if type(self.pad_id) is not int or self.pad_id < 0:
+        if isinstance(self.repetition_penalty, bool) or not (
+                math.isfinite(self.repetition_penalty) and self.repetition_penalty > 0):
+            raise ValueError("repetition_penalty must be finite and positive")
+        for name, value in (("presence_penalty", self.presence_penalty),
+                            ("frequency_penalty", self.frequency_penalty)):
+            if isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+        for name, value in (("no_repeat_ngram_size", self.no_repeat_ngram_size),
+                            ("min_new_tokens", self.min_new_tokens)):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.pad_id is not None and (type(self.pad_id) is not int or self.pad_id < 0):
             raise ValueError("pad_id must be a non-negative token id")
         if self.eos_id is not None:
             stops = (self.eos_id,) if isinstance(self.eos_id, int) else tuple(self.eos_id)
             if not stops or any(type(token) is not int or token < 0 for token in stops):
                 raise ValueError("eos_id must contain non-negative token ids")
             object.__setattr__(self, "eos_id", stops)
+        if isinstance(self.stop, str):
+            raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
+        if any(not isinstance(string, str) or not string for string in self.stop):
+            raise ValueError("stop must hold non-empty strings")
+        # A record reads a JSON list back; the policy holds a tuple.
+        object.__setattr__(self, "stop", tuple(self.stop))
+
+    @property
+    def pad(self) -> int:
+        """The id output slots after EOS hold: `pad_id`, or 0 when nothing filled it."""
+        return 0 if self.pad_id is None else self.pad_id
+
+    def active(self, names: Sequence[str]) -> list[str]:
+        """Return the named controls this policy sets away from their defaults.
+
+        A remote engine that cannot apply a control the way Dew does refuses
+        the ones this names, rather than drawing without them.
+        """
+        neutral = Sampling()
+        return [name for name in names if getattr(self, name) != getattr(neutral, name)]
 
     @property
     def stops(self) -> tuple[int, ...]:
@@ -196,25 +265,71 @@ class Sampling:
 
         Zero temperature is the argmax, and the sample-only filters are
         inactive there, which is what `generate()` does with `do_sample=False`.
+        A caller that adds a transform of its own writes
+        `logits=policy.transforms() + (mine,)`.
         """
-        if self.temperature == 0:
-            return (Greedy(),)
-        tail: list[LogitsTransform] = []
-        if self.temperature != 1.0:
-            tail.append(Temperature(self.temperature))
-        if self.top_k is not None:
-            tail.append(TopK(self.top_k))
-        if self.top_p < 1.0:
-            tail.append(TopP(self.top_p))
-        if self.min_p > 0.0:
-            tail.append(MinP(self.min_p))
-        return tuple(tail)
+        return ordered_transforms(self)
 
     def criteria(self) -> tuple[Stopping, ...]:
         """The EOS criterion this policy adds after a caller's criteria."""
         if self.eos_id is None:
             return ()
         return (EndOfSequence(jnp.asarray(self.eos_id, jnp.int32)),)
+
+
+def with_ids_of(policy: Sampling, defaults: Sampling) -> Sampling:
+    """Return `policy` with the EOS and pad ids it leaves None taken from `defaults`.
+
+    A task's policy holds its model's and tokenizer's ids, so a call that
+    replaces the policy keeps stopping and padding where the task does.
+    """
+    return replace(policy, eos_id=defaults.eos_id if policy.eos_id is None else policy.eos_id,
+                   pad_id=defaults.pad_id if policy.pad_id is None else policy.pad_id)
+
+
+def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = types.MappingProxyType({}),
+                       *, searching: bool = False) -> tuple[LogitsTransform, ...]:
+    """Build `policy`'s chain, with `extra` beside it, in Transformers' order.
+
+    `extra` holds transforms for the controls a `Sampling` does not carry, by
+    their Transformers names in `PROCESSORS` and `WARPERS`, plus
+    `renormalize_logits`, which runs last; a source's generation config is
+    what names them. Zero temperature ends the processors with the argmax
+    and runs no warper, and a beam search (`searching`) picks its own
+    continuations, so its chain ends after the processors.
+    """
+    eos = None if policy.eos_id is None else jnp.asarray(policy.eos_id, jnp.int32)
+    if policy.min_new_tokens and eos is None:
+        raise ValueError("min_new_tokens holds EOS back, and this policy names no eos_id; "
+                         "set it, or let a task fill it")
+    own: dict[str, LogitsTransform | None] = {
+        "repetition_penalty": (RepetitionPenalty(policy.repetition_penalty)
+                               if policy.repetition_penalty != 1.0 else None),
+        "presence_penalty": PresencePenalty(policy.presence_penalty) if policy.presence_penalty else None,
+        "frequency_penalty": FrequencyPenalty(policy.frequency_penalty) if policy.frequency_penalty else None,
+        "no_repeat_ngram_size": (NoRepeatNGram(policy.no_repeat_ngram_size)
+                                 if policy.no_repeat_ngram_size else None),
+        "min_new_tokens": (MinNewTokens(policy.min_new_tokens, eos)
+                           if eos is not None and policy.min_new_tokens else None),
+        "temperature": Temperature(policy.temperature) if policy.temperature not in (0.0, 1.0) else None,
+        "top_k": None if policy.top_k is None else TopK(policy.top_k),
+        "top_p": TopP(policy.top_p) if policy.top_p < 1.0 else None,
+        "min_p": MinP(policy.min_p) if policy.min_p > 0.0 else None,
+        "typical_p": Typical(policy.typical_p) if policy.typical_p < 1.0 else None,
+    }
+    misplaced = sorted(set(extra) & set(own) | set(extra) - {*PROCESSORS, *WARPERS, "renormalize_logits"})
+    if misplaced:
+        raise ValueError(f"{misplaced} are not controls a chain takes beside a Sampling policy")
+    present = {**extra, **{name: transform for name, transform in own.items() if transform is not None}}
+    chain = [present[name] for name in PROCESSORS if name in present]
+    if not searching:
+        if policy.temperature == 0:
+            chain.append(Greedy())
+        else:
+            chain += [present[name] for name in WARPERS if name in present]
+    if "renormalize_logits" in extra:
+        chain.append(extra["renormalize_logits"])
+    return tuple(chain)
 
 
 @struct.dataclass
@@ -562,7 +677,7 @@ def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarra
     media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
     if vocab is not None and np.any((ids >= vocab) & ~media):
         raise ValueError("text token ids must be inside the vocabulary")
-    if vocab is not None and (sampling.pad_id >= vocab or
+    if vocab is not None and (sampling.pad >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid
@@ -711,7 +826,7 @@ def _request(model: nn.Module, params: Variables,
     _refuse_exchange(model)
     prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
-    controls = (max_new_tokens, n, sampling.pad_id) + ((_digest(components),) if pooled else ())
+    controls = (max_new_tokens, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, random_key, components, controls
 
 
@@ -808,6 +923,10 @@ def generate(model: nn.Module, params: Variables,
     than replacing it. ``strategy`` replaces the per-row draw loop; ``None``
     uses ``Sample``.
     """
+    if sampling.stop:
+        raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
+                         "have; generate through a TextGeneration with a processor, or pass "
+                         "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
 
@@ -825,7 +944,7 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     padded = _padded(plan, prepared)
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
-                                               plan.keys(random_key), max_new_tokens, sampling.pad_id, n,
+                                               plan.keys(random_key), max_new_tokens, sampling.pad, n,
                                                *components)
     failure.throw()
     return replace(output, rows=plan.rows * n)

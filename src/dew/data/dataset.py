@@ -8,8 +8,8 @@ the shuffled training stream, the ordered validation pass, and the slice
 that keeps the two disjoint.
 
 Every stream is opened for a `DataPartition`, the share of each global batch
-its reader reads. The trainer asks the mesh for it
-(`dew.training.distributed.data_partition`), since the processes a pipeline
+its reader reads. The trainer asks the mesh for it (`DataPartition.of`),
+since the processes a pipeline
 or a split sequence spans between them hold the same rows and read the same
 share; a loader reads the share it is handed and nothing else.
 
@@ -41,9 +41,11 @@ import jax
 import numpy as np
 import tyro
 from absl import flags
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from numpy.typing import ArrayLike
 
 from dew import position
+from dew.nn.sharding import BATCH_AXES, LayoutRefused
 
 # `Batch` lives in dew.objectives.base. The data layer imports it from here
 # so a dataset module needs one import for the value and its shape.
@@ -74,10 +76,9 @@ class DataPartition:
     A loader cuts its record order `index :: count`, so the shares of global
     batch k together hold the same records at every count, and a record
     count is a place in the stream whatever the count. The trainer asks the
-    mesh which share a process reads (`dew.training.distributed.
-    data_partition`): processes whose devices hold the same rows read the
-    same share, since the axes between them split a sequence or hold a
-    pipeline's stages rather than rows. `DataPartition()` is one reader of
+    mesh which share a process reads (`DataPartition.of`): processes whose
+    devices hold the same rows read the same share, since the axes between
+    them split a sequence or hold a pipeline's stages rather than rows. `DataPartition()` is one reader of
     every row, what a single process reads.
     """
 
@@ -101,6 +102,25 @@ class DataPartition:
                 f"got index {self.index} of {self.count} read by {self.readers}, reader "
                 f"{self.reader}")
 
+    @classmethod
+    def of(cls, mesh: Mesh) -> DataPartition:
+        """The share of every global batch this process reads on `mesh`.
+
+        A batch's rows split over the batch axes and no others (`BATCH_SPEC`):
+        the sequence axis splits positions, the tensor axis widths, and the stage
+        axis holds a pipeline's stages. So the processes whose devices hold the
+        same row shards need the same rows, and the processes fall into groups by
+        the rows they hold.
+        Each group reads one share, numbered by the first row shard it holds,
+        and every process of the group reads it (`readers`); `reader` is this
+        process's place among them, in process order.
+
+        Groups whose rows overlap without being the same rows, which a device
+        order built by hand can produce, leave no share each could read whole,
+        so they are refused.
+        """
+        return _partition(mesh)
+
     def rows(self, batch: int) -> int:
         """The rows of a `batch`-row global batch one share holds.
 
@@ -112,6 +132,27 @@ class DataPartition:
                 f"batch {batch} does not split into {self.count} equal shares, "
                 f"one for each group of processes that reads its own rows")
         return batch // self.count
+
+
+@functools.cache
+def _partition(mesh: Mesh) -> DataPartition:
+    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+    held: dict[int, set[int]] = {}
+    placement = NamedSharding(mesh, P(BATCH_AXES)).devices_indices_map((shards,))
+    for device, index in placement.items():
+        held.setdefault(device.process_index, set()).add(index[0].start or 0)
+    groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
+    if (sum(len(group) for group in groups) != shards
+            or len({len(group) for group in groups}) != 1):
+        raise LayoutRefused(
+            f"the processes of this mesh hold the row shards "
+            f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
+            f"which overlap without being the same; each group of processes has to "
+            f"hold rows no other group holds, so it can read them as its own share")
+    mine = frozenset(held[jax.process_index()])
+    readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
+    return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
+                         reader=readers.index(jax.process_index()))
 
 
 type Reader = Callable[[DataPartition], Iterator[Batch]]
@@ -556,6 +597,9 @@ class Dataset:
         caller's to keep straight.
         """
         mapped = train if isinstance(train, pygrain.MapDataset) else None
+        for pipeline in (train, validation):
+            if isinstance(pipeline, pygrain.MapDataset):
+                _refuse_filters(pipeline)
         if mapped is not None:
             endless = mapped.repeat(None)
             order = f"{describe(mapped)}, {len(mapped)} records"
@@ -805,11 +849,9 @@ class SourceSlice:
         self.length = stop - start
 
     def __repr__(self) -> str:
-        # The description a saved position compares against (`describe`).
-        # The wrapped source is named by type rather than by its own repr,
-        # which for an arrayrecord source is this process's address and for a
-        # hub source would download the table to answer a length.
-        return (f"SourceSlice({type(self.source).__name__}, "
+        # The description a saved position compares against, so it carries
+        # the wrapped corpus's own (`describe`).
+        return (f"SourceSlice({describe(self.source)}, "
                 f"start={self.start}, length={self.length})")
 
     def __len__(self) -> int:
@@ -849,6 +891,29 @@ def checked_count(count: int, length: int, name: str) -> int:
     return count
 
 
+def _refuse_filters(pipeline: pygrain.MapDataset[Batch]) -> None:
+    """Refuse a pipeline holding a `filter`, as grain's `ElasticIterator` does.
+
+    A filter answers None at the indices it drops, so an index range yields
+    fewer records than it spans: a global record count then no longer says
+    where a resumed run starts, and process shares cut by index fill uneven
+    batches. grain names no public type for the filter, so it is read from
+    where grain's own iterator reads it.
+    """
+    from grain._src.python.dataset.transformations.filter import FilterMapDataset
+
+    pending: list[pygrain.MapDataset[Batch]] = [pipeline]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, FilterMapDataset):
+            raise ValueError(
+                "this MapDataset filters its records, and a filter yields fewer records than "
+                "the indices it reads, so a record count cannot say where a resumed run "
+                "starts; filter the records before the source, or pass a function of the "
+                "partition that builds an IterDataset, whose position is grain's own")
+        pending.extend(node.parents)
+
+
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     """`source`'s own description, or its type when it has none.
 
@@ -857,9 +922,10 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     survives the process that wrote it (`dew/data/sources/text.py` writes
     such a repr). A source without its own is named by type, since the
     default repr is this process's address and two addresses would refuse
-    every resume.
+    every resume. So is a list or tuple of records, whose repr is every
+    record it holds.
     """
-    described = type(source).__repr__ is not object.__repr__
+    described = type(source).__repr__ is not object.__repr__ and not isinstance(source, (list, tuple))
     return repr(source) if described else type(source).__name__
 
 
@@ -1244,9 +1310,11 @@ class PhasedStream:
                 records=self._records - self._start(phase), order=stream.order)))
             self._current = phase
         stream = self._streams[phase]
-        before = stream.get_state()
+        # The stream's own count, which it advances only for a batch it
+        # delivered; its checkpoint envelope is for checkpoints.
+        before = stream._records
         batch = next(stream)
-        read = position.read(stream.get_state()).records - position.read(before).records
+        read = stream._records - before
         self._records += read
         if phase < len(self._ends) and self._records > self._ends[phase]:
             raise ValueError(

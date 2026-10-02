@@ -16,7 +16,9 @@ from test_diffusion_objective import RES, StubText
 from dew.config import RunConfig
 from dew.data import Dataset, OnlineImages, OxfordFlowers, PackedTokens
 from dew.data.dataset import tokenized
-from dew.registry import datasets, encoders, presets, samplers
+from dew.diffusion.presets import Flow
+from dew.registry import datasets, encoders, samplers
+from dew.sampling import Heun
 from dew.training import MeshSpec
 
 # The manifest names the encoder through the registry.
@@ -49,7 +51,7 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_sampler_from_the_registries():
         "--model.architecture", "simple_dit", "--model.config", '{"scan_order": "hilbert"}'])
 
     assert config.data == OxfordFlowers(image_size=64, augmentation="flip_only")
-    assert config.preset == presets.Flow(shift=3.0) and config.sampler == samplers.Heun()
+    assert config.preset == Flow(shift=3.0) and config.sampler == Heun()
     assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.model.fields()["scan_order"] == "hilbert"
 
