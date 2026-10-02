@@ -34,8 +34,20 @@ def main():
             client = BlockingKernelClient(connection_file=str(connection))
             client.load_connection_file()
             client.start_channels()
-            client.wait_for_ready(timeout=30)
-            kernels.append((model["id"], client, time.perf_counter() - start))
+            kernels.append((model["id"], client, 0))
+            try:
+                client.wait_for_ready(timeout=30)
+            except Exception:
+                print('KERNEL_STATUS',request('/api/kernels/'+model['id']),flush=True)
+                for proc in pathlib.Path('/proc').glob('[0-9]*'):
+                    try:
+                        text=(proc/'status').read_text()
+                        if '6100' in text or '6101' in text:
+                            print('PROCESS_STATUS',text[:1600],flush=True)
+                    except OSError:
+                        pass
+                raise
+            kernels[-1]=(model["id"],client,time.perf_counter()-start)
         submitted = time.perf_counter()
 
         def run(kernel, indices):
