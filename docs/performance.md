@@ -989,9 +989,9 @@ The logits' rounding, 2026-10-01. The bf16 product above still kept fp32 logits,
 
 On sm80 and sm89, the trainer compiles without XLA's Triton GEMM fusions unless the run explicitly sets that flag or the model has an SSD mixer (`TRITON_GEMM_OFF_GENERATIONS`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s instead of 47.5 s, with no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5; standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms and a DiT 5.8% faster, while a Mamba-2 step lost 7.7% (127.9 to 138.6 ms), since its SSD scan's small batched dots gain from the fusions. On the RTX 4080, at 2048, 4080 and 16384 tokens the two-layer steps run 56.7 to 53.5, 103.8 to 94.0 and 420.5 to 406.3 ms, and tiled heads 3-6% faster. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936, and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a 4096-token cliff: 286.0 ms per training step with the fusions, 93.4 ms without. At other shapes, the unfused step can use more temporary memory. Before tiling the head or recomputing blocks, a step that does not fit is tried with XLA's default options; at 8192 tokens only that whole-logits step fits (178.7 ms, versus 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
 
-On every GPU the trainer also compiles its step without XLA's dot merger (`--xla_gpu_dot_merger_threshold_mb=0` in the step's own compiler options, `step_compiler_options`), unless the run sets that flag. The merger runs dots that share an input (q, k and v; gate and up) as one GEMM over their weights concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two rounds, one session) Qwen3-0.6B's widths at 1 x 1024 run 97.7-98.0 against 94.1-94.2 ms without it, the 3-layer decoder 50.8-50.9 against 49.1-49.2, SimpleDiT-B 73.1-73.2 against 72.8, and the 176M hybrid DiT 66.7-67.6 against 66.4-66.7, peaks unchanged. Over 2000 steps of wikitext-103, two seeds each, validation loss at the same seed moved by at most 1.5e-3 (a 3-layer decoder from scratch, seeds 1.2e-2 apart on average) and 2.2e-3 (Qwen3-0.6B fine-tuned, seeds 3.0e-3 apart). Serving keeps the merger: decoding Qwen3-0.6B at 32 slots ran 4.6-14.8% slower without it, its 32-token GEMMs losing more to separate launches than the concatenations cost.
+On every GPU the trainer also compiles its step without XLA's dot merger (`--xla_gpu_dot_merger_threshold_mb=0` in the step's own compiler options, `step_compiler_options`), unless the run sets that flag or the step trains beside frozen weights on 128 tokens or fewer a device (below). The merger runs dots that share an input (q, k and v; gate and up) as one GEMM over their weights concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024. On the RTX 4080 (benchmark_step, two rounds, one session) Qwen3-0.6B's widths at 1 x 1024 run 97.7-98.0 against 94.1-94.2 ms without it, the 3-layer decoder 50.8-50.9 against 49.1-49.2, SimpleDiT-B 73.1-73.2 against 72.8, and the 176M hybrid DiT 66.7-67.6 against 66.4-66.7, peaks unchanged. Over 2000 steps of wikitext-103, two seeds each, validation loss at the same seed moved by at most 1.5e-3 (a 3-layer decoder from scratch, seeds 1.2e-2 apart on average) and 2.2e-3 (Qwen3-0.6B fine-tuned, seeds 3.0e-3 apart). Serving keeps the merger: decoding Qwen3-0.6B at 32 slots ran 4.6-14.8% slower without it, its 32-token GEMMs losing more to separate launches than the concatenations cost.
 
-Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, every weight training, is faster apart from 32 tokens up, and a LoRA step (rank 16 on Qwen3-0.6B's seven projections, the base frozen) of 128 tokens or fewer is slower apart by up to 0.6 ms, 1 x 128 excepted (two sessions). The token count alone does not decide it, so the step keeps one rule, apart; the frozen-weight case, as in decoding, would gain from weights packed once rather than a merger that concatenates them every step.
+Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and without the option in one process, five alternating blocks of 20 steps, medians). A full step, every weight training, is faster apart from 32 tokens up, and a LoRA step (rank 16 on Qwen3-0.6B's seven projections, the base frozen) of 128 tokens or fewer is slower apart by up to 0.6 ms, 1 x 128 excepted (two sessions). The token count alone does not decide it, so the rule has two conditions: a step beside frozen weights (an objective's `trainable` split, as LoRA's) on 128 tokens or fewer a device keeps XLA's merger, and every other step runs apart. Only an LM objective names the tokens in its rows, so another objective's frozen step runs apart, unmeasured.
 
 | model | tokens | merged ms | apart ms | change |
 |---|---|---|---|---|
@@ -1014,6 +1014,29 @@ Small training steps, 2026-10-02 (RTX 4080, bf16, `Trainer.compile` with and wit
 | Qwen3-0.6B, LoRA | 1 x 256 | 24.56 | 23.41 | -4.7% |
 | Qwen3-0.6B, LoRA | 1 x 512 | 36.30 | 34.99 | -3.6% |
 | Qwen3-0.6B, LoRA | 1 x 1024 | 60.61 | 59.19 | -2.3% |
+
+With the rule, the same steps against XLA's default (the merger on), measured the same way in a second session at `perf/merger-frozen` (load average 15-27 from other work on the host): no row is slower. The LoRA steps of 128 tokens or fewer compile the same program both ways, so their spread, -0.3% to +0.3%, is the measurement's.
+
+| model | tokens | XLA's default ms | as shipped ms | change |
+|---|---|---|---|---|
+| Qwen3-0.6B, LoRA | 1 x 32 | 16.08 | 16.04 | -0.3% |
+| Qwen3-0.6B, LoRA | 2 x 32 | 16.66 | 16.62 | -0.2% |
+| Qwen3-0.6B, LoRA | 1 x 64 | 16.49 | 16.50 | +0.1% |
+| Qwen3-0.6B, LoRA | 2 x 64 | 18.57 | 18.63 | +0.3% |
+| Qwen3-0.6B, LoRA | 4 x 32 | 18.56 | 18.56 | +0.0% |
+| Qwen3-0.6B, LoRA | 1 x 128 | 20.81 | 20.82 | +0.1% |
+| Qwen3-0.6B, LoRA | 8 x 32 | 24.25 | 23.31 | -3.9% |
+| Qwen3-0.6B, LoRA | 1 x 256 | 24.62 | 23.45 | -4.7% |
+| Qwen3-0.6B, LoRA | 1 x 1024 | 60.62 | 59.38 | -2.0% |
+| Qwen3-0.6B widths, full | 1 x 32 | 46.88 | 44.94 | -4.1% |
+| Qwen3-0.6B widths, full | 1 x 128 | 49.83 | 47.97 | -3.7% |
+| Qwen3-0.6B widths, full | 1 x 512 | 67.38 | 64.80 | -3.8% |
+| 3-layer decoder, full | 1 x 32 | 5.04 | 4.91 | -2.6% |
+| 3-layer decoder, full | 1 x 64 | 5.14 | 5.02 | -2.3% |
+| 3-layer decoder, full | 1 x 128 | 5.33 | 5.23 | -1.8% |
+| 3-layer decoder, full | 4 x 256 | 10.02 | 10.00 | -0.3% |
+
+At 128 tokens the shapes disagree, in two more sessions of merged against apart: 1 x 128 runs 20.65 and 20.65 ms merged against 18.98 and 19.11 apart, where 2 x 64 runs 18.72 and 18.63 against 18.96 and 19.03, and 4 x 32 18.56 and 18.50 against 18.91 and 18.81 (1 x 96: 18.22 and 18.22 against 18.41 and 18.43; 1 x 160: 22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so it includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind apart.
 
 ### Generations below sm80
 
