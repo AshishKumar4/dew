@@ -3,7 +3,8 @@
 import dataclasses
 import json
 import os
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -278,14 +279,14 @@ def test_a_multi_union_leaves_the_selected_opaque_record_for_its_consumer():
 
 @dataclasses.dataclass(frozen=True)
 class Kind:
-    window: Optional[int] = None
+    window: int | None = None
     rope_theta: float = 10_000.0
 
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
     width: int = 8
-    mix: Optional[Kind] = None
+    mix: Kind | None = None
     kinds: Mapping[str, Kind] = dataclasses.field(default_factory=dict)
     layers: tuple[Kind, ...] = ()
     size: tuple[int, int] = (1, 1)

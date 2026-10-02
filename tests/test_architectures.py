@@ -15,7 +15,6 @@ afterwards.
 
 import json
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -106,7 +105,7 @@ class Case:
     config: dict
     frames: int = 0
     """Video architectures take (frames, H, W, C) samples; 0 means images."""
-    predictor: Optional[dict] = None
+    predictor: dict | None = None
     """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
     seq_len: int = 0
     """Set for language models: batches are token windows, not images."""
@@ -295,7 +294,7 @@ def text_condition() -> Condition:
     return Condition(StubText.from_pretrained("stub"), field="text", unconditional="")
 
 
-def batches(case: Case, encoder: Optional[ConditionEncoder]):
+def batches(case: Case, encoder: ConditionEncoder | None):
     """uint8-range samples, as the data pipeline delivers them, with labels for
     the probes and tokenized text for the conditioned models."""
     rng = np.random.default_rng(0)

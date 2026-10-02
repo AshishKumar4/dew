@@ -84,9 +84,8 @@ def test_worker_exit_reports_its_code_and_stderr():
 
 
 def test_malformed_reply_is_refused():
-    with environment("garbage")(IDENTITY) as session:
-        with pytest.raises(ValueError, match="malformed JSON"):
-            session.reset()
+    with environment("garbage")(IDENTITY) as session, pytest.raises(ValueError, match="malformed JSON"):
+        session.reset()
 
 
 def test_parent_death_kills_the_worker(tmp_path):
@@ -146,9 +145,8 @@ def test_cancellation_releases_the_real_worker():
 
     pids: list[int] = []
     cancellation = CancelledError("owner cancelled the tool episode")
-    with pytest.raises(CancelledError) as caught:
-        with environment()(IDENTITY) as session:
-            pids = json.loads(session.reset().detail)
-            raise cancellation
+    with pytest.raises(CancelledError) as caught, environment()(IDENTITY) as session:
+        pids = json.loads(session.reset().detail)
+        raise cancellation
     assert caught.value is cancellation
     assert wait_gone(pids) == []

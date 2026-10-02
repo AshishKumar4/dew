@@ -36,10 +36,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from test_masked_diffusion import flat
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import save_pretrained_decoder
-from test_masked_diffusion import flat
 from tools import masked_diffusion_export_reference as tool
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

@@ -26,7 +26,6 @@ from dew.interop.pretrained import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
-
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -155,7 +154,7 @@ def gemma4_video_batch():
     # window AND (causal OR vision-group), not an unbounded group override.
     image = np.tile(frame, (3, 3, 1))
     images = [[image], [np.roll(image, 3, axis=0)]]
-    video_token, image_token = getattr(processor, 'video_token'), getattr(processor, 'image_token')
+    video_token, image_token = processor.video_token, processor.image_token
     text = [f'{video_token} {image_token} token4',
             f'{image_token} {video_token} token5']
     metadata = [VideoMetadata(total_num_frames=2, fps=2.0, width=side, height=side,

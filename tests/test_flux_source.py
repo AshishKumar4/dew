@@ -431,7 +431,7 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
                    ["shared.weight", "encoder.embed_tokens.weight"]):
         variant = {name: value for name, value in tensors.items()
                    if name not in ("shared.weight", "encoder.embed_tokens.weight")}
-        variant.update({name: embedding for name in stored})
+        variant.update(dict.fromkeys(stored, embedding))
         params, layouts = record_layouts("text_encoder_2", variant, _t5_path, ("encoders",))
         np.testing.assert_array_equal(params["embed_tokens"]["embedding"], embedding)
         bound = [entry.name for entry in layouts

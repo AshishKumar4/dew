@@ -1120,8 +1120,7 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     np.testing.assert_allclose(reports[0]["raw_log_probs"] + reports[1]["raw_log_probs"],
                                single["raw_log_probs"], rtol=1e-5, atol=1e-6)
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
-    assert single["loss"] == pytest.approx(reports[0]["loss"], **{
-        "rel": PARITY["rtol"], "abs": PARITY["atol"]})
+    assert single["loss"] == pytest.approx(reports[0]["loss"], rel=PARITY["rtol"], abs=PARITY["atol"])
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
 

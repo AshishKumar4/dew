@@ -36,6 +36,7 @@ def test_caption_rows_keep_image_and_caption_targets_in_separate_spans():
 
 def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkeypatch):
     from dataclasses import replace
+
     from dew.data import Dataset, Loading
 
     script = example("sft_diffusion_gemma_images")

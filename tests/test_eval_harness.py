@@ -18,10 +18,10 @@ from test_inference import make_lm_run
 
 pytest.importorskip("lm_eval")
 
-from lm_eval.api.instance import Instance  # noqa: E402  the extra has to be there first
+from lm_eval.api.instance import Instance
 
-from dew.eval.harness import DewLM  # noqa: E402
-from dew.inference import TextGeneration  # noqa: E402
+from dew.eval.harness import DewLM
+from dew.inference import TextGeneration
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 

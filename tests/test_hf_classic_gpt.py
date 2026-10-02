@@ -92,8 +92,8 @@ def test_gpt2_reference_detects_a_dropped_classic_term(term):
 
 
 def test_gpt2_export_is_read_by_transformers(tmp_path):
-    from transformers import AutoModelForCausalLM
     import torch
+    from transformers import AutoModelForCausalLM
 
     loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)

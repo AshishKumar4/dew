@@ -304,8 +304,7 @@ KEPT = {
 def test_a_policy_keeps_the_residuals_it_names_in_every_layer(policy, capsys):
     model = model_for("dense", dropout_rate=0.0, num_nextn_predict_layers=0, remat=policy)
     variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
-    assert named(residuals(model, variables, capsys)) == {
-        name: model.num_layers for name in KEPT[policy]}
+    assert named(residuals(model, variables, capsys)) == dict.fromkeys(KEPT[policy], model.num_layers)
 
 
 @pytest.mark.parametrize("policy, kept", [

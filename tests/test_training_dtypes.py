@@ -5,12 +5,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn, struct
+from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
-from dew.objectives import Aux, EMASpec, Ratio, Objective, mean_loss
+from dew.objectives import Aux, EMASpec, Objective, Ratio, mean_loss
 from dew.training import Trainer
-from test_trainer import raw_leaf
 
 
 def test_ratio_keeps_numerator_and_denominator_until_the_reduction():

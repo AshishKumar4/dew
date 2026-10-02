@@ -179,7 +179,6 @@ def as_numpy(tree):
     process takes the other branch.
     """
     import jax
-
     import jax.numpy as jnp
 
     tree = jax.tree.map(lambda leaf: jax.random.key_data(leaf)
@@ -1077,7 +1076,7 @@ def mode_builtin_preview_failures(args) -> dict:
     from dew.objectives.diffusion import DiffusionObjective
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler, text as text_sampling
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     rank = jax.process_index()

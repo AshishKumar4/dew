@@ -1262,7 +1262,7 @@ def test_resizing_interpolates_up_and_averages_down():
     fine = np.zeros((900, 900, 3), np.uint8)
     fine[::2, ::2] = fine[1::2, 1::2] = 255
     down = images.resize_image(fine, 300)
-    assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
+    assert down.min() >= 100 and down.max() <= 160, "area averages the squares it covers"
 
 
 # ---------------------------------------------------------------------------------

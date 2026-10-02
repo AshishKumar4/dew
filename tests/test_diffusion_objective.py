@@ -20,7 +20,7 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables, scalar_loss
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective

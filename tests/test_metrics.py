@@ -80,11 +80,12 @@ def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
 
 
 def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
+    import optax
+
     from dew import Checkpoints, Mean, Trainer, models
     from dew.artifacts import TokenScores
     from dew.data import Dataset, Loading
     from dew.objectives.lm import LMObjective
-    import optax
 
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
     data = Dataset.from_records({"text": tokens}, batch=8, validation={"text": tokens},
@@ -111,10 +112,11 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
 
 def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
+    import optax
+
     from dew import Checkpoints, Mean, Trainer
     from dew.data import Dataset, Loading
     from dew.objectives.base import Aux, Objective
-    import optax
 
     class Pixels(Objective):
         def init(self, key, variables=None):
