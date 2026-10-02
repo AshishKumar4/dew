@@ -33,7 +33,7 @@ state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
 task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
-result = task(["One day", "The dog"], 20, seed=0, n=2)
+result = task(["One day", "The dog"], 20, key=0, n=2)
 for text in result.text:
     print(repr(text))
 print(result.lengths, result.terminated)
@@ -85,7 +85,7 @@ save_pretrained_decoder(model, state.params, "lily-decoder", tokenizer="byte")
 loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype="float32")
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
-print(loaded("One day", 20, seed=0).text)
+print(loaded("One day", 20, key=0).text)
 ```
 
 ```text
@@ -109,7 +109,7 @@ from dew.training.quantization import Quantization
 
 task = dew.pipeline("Qwen/Qwen3-0.6B", dtype="bfloat16")
 served = task.quantized(Quantization(dtype="int8", weight_only=True))
-print(served("The capital of France is", max_new_tokens=20, seed=0).text[0])
+print(served("The capital of France is", max_new_tokens=20, key=0).text[0])
 ```
 
 This example downloads a Hub checkpoint. `dtype="fp8"` selects e4m3 weights; hardware support determines whether quantized operations run natively. The default example used to trace a decoder is one numeric token. For a multimodal model, pass `example=inputs`, a `ModelInputs` prepared by its processor with the media fields its weights need.
@@ -124,7 +124,7 @@ from dew.training.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype="bfloat16")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
-images = served(["a red fox in a snowy forest"], steps=20, seed=0).host().images
+images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
 
 ## Placement
@@ -191,7 +191,7 @@ A separate zero-cache, read-ahead-disabled trace covered one prefill and one dec
 
 ## Calls and results
 
-A call takes exactly one of `seed` and `key`; `seed=n` means `jax.random.key(n)`.
+A call takes `key`, either an integer seed or a JAX key; `key=n` means `jax.random.key(n)`.
 
 | Control | Meaning |
 |---|---|
@@ -215,7 +215,7 @@ Repeated calls with the same shapes and controls reuse the compiled executables.
 
 A pixel mask has shape `[B, H, W, 1]`. Its masked-image conditions go to both guidance branches. `encode_key=None` uses the VAE posterior mean; an explicit key samples from the posterior. Condition encoders accept native prompt records as well as strings. `unconditional=` supplies one row, or one row per prompt, in place of the configured unconditional input.
 
-`initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, seed=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
+`initial=` is a latent state that is already noisy, and Dew never adds noise to it again. Prepared inputs keep their process and concrete time grid. `task(prepared, key=..., decode=False)` skips the VAE and the image checker and returns unclipped `result.latents`, with `result.images` set to `None`. For a base and refiner handoff, pass those latents as another task's `initial` with the matching partial grid. Normal calls return both the decoded images and the latents before decoding. Prepared inputs must belong to the task's mesh. A preparation on the source grid also records its step count; to change the count, prepare a new initial state.
 
 ## Serving
 
@@ -229,8 +229,8 @@ greedy = dataclasses.replace(task, sampling=Sampling(temperature=0.0))
 server = Server.from_task(greedy, slots=4, capacity=128,
                           kv_cache=KVCache(page_size=16, pages=32), prefix_cache=True)
 prompts = ["One day, Lily saw a big dog in", "One day, Lily saw a big dog in the park."]
-served = server(prompts[:1], 20, seed=0) + server(prompts[1:], 20, seed=0)
-alone = greedy(prompts, 20, seed=0)
+served = server(prompts[:1], 20, key=0) + server(prompts[1:], 20, key=0)
+alone = greedy(prompts, 20, key=0)
 print([generation.text[0] for generation in served])
 print("same as TextGeneration:", [g.text[0] for g in served] == list(alone.text))
 print("prompt tokens read from shared pages:", server.prefix_hits)
@@ -244,7 +244,7 @@ prompt tokens read from shared pages: 16
 
 The second call's prompt begins with the first call's, so its first full 16-token page comes from the prefix cache instead of a prefill.
 
-Calling the server with a batch submits every prompt, steps until they finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, seed=...)` queues one request and returns a ticket that resolves to its `Generation`; `step()` runs one device call and `run()` steps until the queue and the rows are empty. The task's `n` must be one and its strategy the row-wise sampler, with or without a grammar. `capacity` rounds up to whole 64-slot tiles, and whole pages of a paged cache, and may not exceed the model's context.
+Calling the server with a batch submits every prompt, steps until they finish and returns one `Generation` per prompt. `server.submit(prompt, max_new_tokens, key=...)` queues one request and returns a ticket that resolves to its `Generation`; `step()` runs one device call and `run()` steps until the queue and the rows are empty. The task's `n` must be one and its strategy the row-wise sampler, with or without a grammar. `capacity` rounds up to whole 64-slot tiles, and whole pages of a paged cache, and may not exceed the model's context.
 
 | Option | Meaning |
 |---|---|

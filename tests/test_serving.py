@@ -60,11 +60,11 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     everything else the generation carries. With four iterations a call,
     rows end inside a call and wait for the next one's admission."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     assert len({generation.text for generation in alone}) == len(alone)
     server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
     served = [ticket.result() for ticket in tickets]
@@ -82,8 +82,8 @@ def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     bound = task().quantized(Quantization(dtype=dtype, weight_only=True))
     server = Server.from_task(bound, slots=2, capacity=128)
     prompts = ["12", "567"]
-    served = server(prompts, 4, seed=3)
-    alone = [bound(prompt, 4, seed=3) for prompt in prompts]
+    served = server(prompts, 4, key=3)
+    alone = [bound(prompt, 4, key=3) for prompt in prompts]
     assert [result.text for result in served] == [result.text for result in alone]
     for result, expected in zip(served, alone, strict=True):
         assert_same_generation(result, expected)
@@ -96,13 +96,13 @@ def test_a_sampled_request_keeps_its_own_draws():
     task call does."""
     bound = task(Sampling(temperature=1.0, top_k=5, eos_id=EOS))
     server = Server.from_task(bound, slots=3, capacity=128)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
     for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
-        assert_same_generation(tickets[index].result(), bound(prompt, budget, seed=index))
-    batched = bound(PROMPTS, 6, seed=3)
-    served = server(PROMPTS, 6, seed=3)
+        assert_same_generation(tickets[index].result(), bound(prompt, budget, key=index))
+    batched = bound(PROMPTS, 6, key=3)
+    served = server(PROMPTS, 6, key=3)
     assert tuple(generation.text[0] for generation in served) == batched.text
     rows = batched.host()
     for index, generation in enumerate(served):
@@ -115,14 +115,14 @@ def test_a_sampled_request_keeps_its_own_draws():
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
     bound = task()
     server = Server.from_task(bound, slots=4, capacity=128, admission=2)
-    first = server.submit(PROMPTS[0], 12, seed=0)
+    first = server.submit(PROMPTS[0], 12, key=0)
     for _ in range(3):
         server.step()
     assert server.occupancy == 1
-    later = server.submit(PROMPTS[3], 12, seed=3)
+    later = server.submit(PROMPTS[3], 12, key=3)
     server.run()
-    assert later.result().text == bound(PROMPTS[3], 12, seed=3).text
-    assert first.result().text == bound(PROMPTS[0], 12, seed=0).text
+    assert later.result().text == bound(PROMPTS[3], 12, key=3).text
+    assert first.result().text == bound(PROMPTS[0], 12, key=0).text
 
 
 def stored(cache):
@@ -144,8 +144,8 @@ def test_a_slot_is_reused_over_the_same_cache():
     assert len(before) == 2
     shapes = [leaf.shape for leaf in jax.tree.leaves(server.cache)]
     assert all(shape[0] == 2 for shape in shapes)
-    short = server.submit("12", 2, seed=0)
-    long = server.submit("5", 9, seed=1)
+    short = server.submit("12", 2, key=0)
+    long = server.submit("5", 9, key=1)
     peak = 0
     seen_drop = False
     while not long.done():
@@ -156,15 +156,15 @@ def test_a_slot_is_reused_over_the_same_cache():
     server.run()
     assert peak == 2 and seen_drop
     assert server.occupancy == 0
-    third = server.submit("98", 3, seed=2)
+    third = server.submit("98", 3, key=2)
     server.run()
-    assert third.result().text == bound("98", 3, seed=2).text
-    fourth = server.submit("1234567", 40, seed=3)
+    assert third.result().text == bound("98", 3, key=2).text
+    fourth = server.submit("1234567", 40, key=3)
     server.run()
-    assert fourth.result().text == bound("1234567", 40, seed=3).text
-    fifth = server.submit("5", 40, seed=4)
+    assert fourth.result().text == bound("1234567", 40, key=3).text
+    fifth = server.submit("5", 40, key=4)
     server.run()
-    assert fifth.result().text == bound("5", 40, seed=4).text
+    assert fifth.result().text == bound("5", 40, key=4).text
     assert stored(server.cache) == before
     assert [leaf.shape for leaf in jax.tree.leaves(server.cache)] == shapes
 
@@ -174,13 +174,13 @@ def test_more_requests_than_slots_queue_and_all_complete():
     server = Server.from_task(bound, slots=2, capacity=128, admission=2)
     prompts = PROMPTS * 2
     budgets = BUDGETS * 2
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True))]
     assert server.queued == len(tickets)
     server.run()
     assert server.queued == 0 and server.occupancy == 0
     for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True)):
-        assert tickets[index].result().text == bound(prompt, budget, seed=index).text
+        assert tickets[index].result().text == bound(prompt, budget, key=index).text
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
 
 
@@ -188,9 +188,9 @@ def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
     bound = task(capacity=64)
     server = Server.from_task(bound, slots=2, capacity=64)
     with pytest.raises(ValueError, match="exceeds max_seq_len") as refused:
-        bound("1234567", 60, seed=0)
+        bound("1234567", 60, key=0)
     with pytest.raises(ValueError, match="exceeds max_seq_len") as served:
-        server.submit("1234567", 60, seed=0)
+        server.submit("1234567", 60, key=0)
     assert str(served.value) == str(refused.value)
     assert server.queued == 0
     with pytest.raises(ValueError, match="max_seq_len"):
@@ -226,19 +226,19 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     bound = task(capacity=512)
     prompt = "".join(str(1 + index % 9) for index in range(300))
     server = Server.from_task(bound, slots=2, capacity=384)
-    ticket = server.submit(prompt, 50, seed=0)
+    ticket = server.submit(prompt, 50, key=0)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt, 50, seed=0))
+    assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
     server = Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options)
-    tickets = [server.submit(prompt, budget, seed=index)
+    tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
-    tickets.append(server.submit(PROMPTS[2], BUDGETS[2], seed=2))
+    tickets.append(server.submit(PROMPTS[2], BUDGETS[2], key=2))
     server.run()
     return server, tickets
 
@@ -256,7 +256,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     prompt starts from the page its first run published. None of it
     changes a greedy draw: every row is the lone task call's."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(bound, **options)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
@@ -278,7 +278,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     chunked prompt included, and the repeated prompt starts from the page the
     first one published in its group."""
     bound = task()
-    alone = [bound(prompt, budget, seed=index)
+    alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     placed = bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0)))
     server, tickets = served_alongside(placed, slots=8, admission=8, **options)
@@ -308,15 +308,15 @@ def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
     alone once the first returns its pages."""
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=16, pages=3))
-    first = server.submit("1234567", 30, seed=0)
-    second = server.submit("98", 30, seed=1)
+    first = server.submit("1234567", 30, key=0)
+    second = server.submit("98", 30, key=1)
     server.step()
     assert server.occupancy == 1 and server.queued == 1
     server.run()
-    assert first.result().text == bound("1234567", 30, seed=0).text
-    assert second.result().text == bound("98", 30, seed=1).text
+    assert first.result().text == bound("1234567", 30, key=0).text
+    assert second.result().text == bound("98", 30, key=1).text
     with pytest.raises(ValueError, match="pool holds 3"):
-        server.submit("1234567", 60, seed=0)
+        server.submit("1234567", 60, key=0)
 
 
 @pytest.mark.mesh(devices=4)
@@ -337,7 +337,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
         return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS))
 
     lone = generation("global", None)
-    alone = [lone(prompt, budget, seed=index)
+    alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     served = generation(dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0)))
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
@@ -346,7 +346,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
         assert_same_generation(ticket.result(), row)
     if dispatch == "exchange":
         with pytest.raises(ValueError, match="dispatch='global'"):
-            served("12", 3, seed=0)
+            served("12", 3, key=0)
 
 
 def test_chunks_and_prefix_sharing_need_a_paged_cache():
@@ -409,12 +409,12 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
     bound = task()
     server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=4, pages=40),
                               prefix_cache=True)
-    server.submit("1234567", 8, seed=0)
+    server.submit("1234567", 8, key=0)
     server.run()
     other = bound.variables.copy({"params": jax.tree.map(lambda leaf: leaf * 1.5, bound.variables["params"])})
     server.reload(other)
     hits = server.prefix_hits
-    ticket = server.submit("1234567", 8, seed=0)
+    ticket = server.submit("1234567", 8, key=0)
     server.run()
     assert server.prefix_hits == hits
-    assert ticket.result().text == bound.bind(other)("1234567", 8, seed=0).text
+    assert ticket.result().text == bound.bind(other)("1234567", 8, key=0).text

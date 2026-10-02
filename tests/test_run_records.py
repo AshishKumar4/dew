@@ -22,7 +22,7 @@ import pytest
 from flax import linen as nn
 
 from dew import registry
-from dew.config import RunConfig, _recorded, _registry_for, _to_json
+from dew.config import RunConfig, TrainerConfig, _FIELD_RENAMES, _recorded, _registry_for, _to_json
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
@@ -33,7 +33,20 @@ DEFAULTS = ROOT / "tests" / "fixtures" / "record_defaults.json"
 
 
 def record(name: str) -> dict:
-    return json.loads((RUNS / name / "run.json").read_text())
+    held = json.loads((RUNS / name / "run.json").read_text())
+    for old, new in _FIELD_RENAMES.get(TrainerConfig, {}).items():
+        if old in held.get("trainer", {}):
+            held["trainer"][new] = held["trainer"].pop(old)
+    return held
+
+
+def test_old_seed_record_reads_as_the_same_integer_root_key():
+    loaded = RunConfig.from_dict({"trainer": {"seed": 23}})
+    assert loaded.trainer.key == 23
+    assert loaded.to_dict()["trainer"]["key"] == 23
+    assert "seed" not in loaded.to_dict()["trainer"]
+    with pytest.raises(ValueError, match="both seed and key"):
+        RunConfig.from_dict({"trainer": {"seed": 23, "key": 23}})
 
 
 def recipe_config(name: str, cls: str) -> type:

@@ -150,12 +150,12 @@ def checkpoint(args):
         try:
             conv._polyphase_depthwise_3x3 = partial(reference, precision=None)
             jax.clear_caches()
-            before = pipeline(prompt, seed=17, steps=20)
+            before = pipeline(prompt, key=17, steps=20)
             jax.block_until_ready(before)
         finally:
             conv._polyphase_depthwise_3x3 = original
         jax.clear_caches()
-        after = pipeline(prompt, seed=17, steps=20)
+        after = pipeline(prompt, key=17, steps=20)
         jax.block_until_ready(after)
         vae = pipeline.autoencoder
         float_vae = StableDiffusionVAE(

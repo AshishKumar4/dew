@@ -164,7 +164,7 @@ def test_pipeline_walk_matches_the_source(pipeline, arrays, record):
     task = pipeline.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == recorded["guidance"] + 1
     initial = arrays["pipeline.x_T"].transpose(0, 2, 3, 1)
-    walked = task(task.prepare(recorded["prompts"], initial=initial, seed=0, steps=recorded["steps"]),
+    walked = task(task.prepare(recorded["prompts"], initial=initial, key=0, steps=recorded["steps"]),
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     latents = np.asarray(walked.latents)

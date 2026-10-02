@@ -73,8 +73,8 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     for expected, actual in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(source.variables), strict=True):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
-    wanted = bundle.block_generation()([[1, 5, 7]], 3, seed=4).host()
-    actual = source([[1, 5, 7]], 3, seed=4).host()
+    wanted = bundle.block_generation()([[1, 5, 7]], 3, key=4).host()
+    actual = source([[1, 5, 7]], 3, key=4).host()
     np.testing.assert_array_equal(actual.tokens, wanted.tokens)
     np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
 
@@ -101,8 +101,8 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     for expected, actual in zip(jax.tree.leaves(expected_vars), jax.tree.leaves(restored.variables), strict=True):
         assert actual.dtype == expected.dtype
         np.testing.assert_array_equal(actual, expected)
-    result = restored([[1, 5, 7]], 3, seed=8).host()
-    expected = expected_task([[1, 5, 7]], 3, seed=8).host()
+    result = restored([[1, 5, 7]], 3, key=8).host()
+    expected = expected_task([[1, 5, 7]], 3, key=8).host()
     np.testing.assert_array_equal(result.tokens, expected.tokens)
     np.testing.assert_array_equal(result.decoder_steps, expected.decoder_steps)
 

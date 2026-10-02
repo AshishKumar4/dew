@@ -800,7 +800,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
 
     # NumPy warns as it casts the NaN to a pixel; nothing else would.
     with pytest.warns(RuntimeWarning, match="invalid value encountered in cast"):
-        pixels, counts = bench.sample(Pipe(), seed=0, decode_batch=4)
+        pixels, counts = bench.sample(Pipe(), key=0, decode_batch=4)
     assert counts == {"latents": 1, "pixels": 2}
     assert pixels.dtype == np.uint8 and pixels.shape == latents.shape
 

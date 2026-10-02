@@ -175,8 +175,8 @@ def test_seed_is_the_key():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     task = TextGeneration(model, params, sampling=SAMPLING)
     prompt = [[1, 2, 4], [5, 6, 7]]
-    assert_same_generation(task(prompt, 3, seed=11), task(prompt, 3, key=jax.random.key(11)))
-    with pytest.raises(ValueError, match="exactly one of key and seed"):
+    assert_same_generation(task(prompt, 3, key=11), task(prompt, 3, key=jax.random.key(11)))
+    with pytest.raises(ValueError, match="key must be"):
         task(prompt, 3)
 
 
@@ -196,12 +196,12 @@ def test_equal_shape_calls_and_rebinding_do_not_request_compilation(tmp_path):
     jax.config.update("jax_compilation_cache_dir", str(tmp_path))
     monitoring.register_event_listener(record)
     try:
-        task(prompt, 3, seed=11).host()
+        task(prompt, 3, key=11).host()
         warmed = len(events)
-        rebound(prompt, 3, seed=11).host()
-        task([[9, 8, 7], [1, 1, 1]], 3, seed=0).host()
+        rebound(prompt, 3, key=11).host()
+        task([[9, 8, 7], [1, 1, 1]], 3, key=0).host()
         assert len(events) == warmed
-        task(prompt, 6, seed=11).host()
+        task(prompt, 6, key=11).host()
         assert len(events) > warmed
     finally:
         monitoring.unregister_event_listener(record)
@@ -229,9 +229,9 @@ def test_text_decodes_lazily_through_the_bound_processor():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
     with pytest.raises(ValueError, match="no processor"):
-        bare([[1, 2]], 3, seed=0).text
+        bare([[1, 2]], 3, key=0).text
     task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3)
-    result = task(["12", "5"], seed=0)
+    result = task(["12", "5"], key=0)
     assert calls == []
     first = result.text
     assert len(calls) == 2
@@ -299,12 +299,12 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     placed = plain.bind(place(loaded.variables, MeshSpec(fsdp=2), Layout(min_shard=2 ** 6)))
     assert any("fsdp" in str(leaf.sharding.spec) for leaf in jax.tree.leaves(placed.variables))
     prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * (jax.device_count() // 2)
-    result = placed(prompts, 7, seed=11)
+    result = placed(prompts, 7, key=11)
     assert result.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
     assert result.rows == len(prompts) and result.prompt_width == 5
     rows = result.host()
-    np.testing.assert_array_equal(rows.tokens, plain(prompts, 7, seed=11).host().tokens)
-    assert result.text == plain.decode(plain(prompts, 7, seed=11))
+    np.testing.assert_array_equal(rows.tokens, plain(prompts, 7, key=11).host().tokens)
+    assert result.text == plain.decode(plain(prompts, 7, key=11))
 
 
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
@@ -354,7 +354,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
         task = objective.policy(weights) if kind == "ppo" else objective.policy(weights, sampling)
         return task([[1, 2]], 1, key=jax.random.key(3), sampling=sampling).host()
     expected = draw(state.params)
-    actual = objective.pipeline(state)([[1, 2]], 1, seed=3, sampling=sampling).host()
+    actual = objective.pipeline(state)([[1, 2]], 1, key=3, sampling=sampling).host()
     reference = draw(state.averaged)
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
@@ -366,7 +366,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
         num_heads=2, mlp_features=32, max_seq_len=8), dtype="float32", attention_impl="xla")
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind, "model": asdict(config),
         "tokenizer": "byte", "sample_tokens": 1, "sampling": asdict(sampling)}))
-    restored = dew.pipeline(str(tmp_path))([[1, 2]], seed=3).host()
+    restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
 
@@ -383,8 +383,8 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     expected_task = replace(baseline, model=baseline.model.clone(dtype=jnp.bfloat16), variables=params)
     converted = dew.pipeline(str(tmp_path), dtype="bfloat16", param_dtype="bfloat16")
     assert isinstance(converted, TextGeneration)
-    wanted = expected_task([[1, 2]], 1, seed=3).host()
-    result = converted([[1, 2]], 1, seed=3).host()
+    wanted = expected_task([[1, 2]], 1, key=3).host()
+    result = converted([[1, 2]], 1, key=3).host()
     np.testing.assert_array_equal(result.tokens, wanted.tokens)
     np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
 

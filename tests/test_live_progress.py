@@ -42,8 +42,8 @@ def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, m
     reports = []
     monkeypatch.setattr(progress, "_show", lambda report, png=None: reports.append(report))
     steps = 4
-    expected = pipe(["a lily"], steps=steps, seed=0, sampler=sampler).host().images
-    images = progress.Reporting(pipe)(["a lily"], steps=steps, seed=0, sampler=sampler).host().images
+    expected = pipe(["a lily"], steps=steps, key=0, sampler=sampler).host().images
+    images = progress.Reporting(pipe)(["a lily"], steps=steps, key=0, sampler=sampler).host().images
     np.testing.assert_array_equal(images, expected)
     # A walk of `steps` points takes steps - 1 solver steps; the model's last call,
     # the clean prediction at the final point, runs with the decode.
@@ -59,11 +59,11 @@ def test_a_text_model_reports_its_load_once_and_each_generation(progress, monkey
 
     def load(name):
         loads.append(name)
-        return lambda prompt, tokens, *, seed: (prompt, tokens, seed)
+        return lambda prompt, tokens, *, key: (prompt, tokens, key)
 
     text_model = progress.ReportingModels(load)
-    assert text_model("small")("a", 24, seed=0) == ("a", 24, 0)
-    assert text_model("small")("b", 8, seed=1) == ("b", 8, 1)
+    assert text_model("small")("a", 24, key=0) == ("a", 24, 0)
+    assert text_model("small")("b", 8, key=1) == ("b", 8, 1)
     assert loads == ["small"]
     assert reports == [{"stage": "load", "model": "small"}, {"stage": "generate", "first": True},
                        {"stage": "generate", "first": False}]
