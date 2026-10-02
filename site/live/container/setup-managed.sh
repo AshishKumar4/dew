@@ -25,9 +25,9 @@ cat > /opt/live/warm-managed.py <<'PY'
 import json, os, pathlib, time
 from huggingface_hub import snapshot_download
 start=time.perf_counter()
-repo, revision=pathlib.Path('/opt/live/text-to-image').read_text().strip().split('@')
-snapshot=pathlib.Path(snapshot_download(repo_id=repo, revision=revision))
-refs=snapshot.parent.parent/'refs'; refs.mkdir(exist_ok=True); (refs/'main').write_text(revision)
+repo, image_revision=pathlib.Path('/opt/live/text-to-image').read_text().strip().split('@')
+snapshot=pathlib.Path(snapshot_download(repo_id=repo, revision=image_revision))
+refs=snapshot.parent.parent/'refs'; refs.mkdir(exist_ok=True); (refs/'main').write_text(image_revision)
 for line in pathlib.Path('/opt/live/text-models').read_text().split():
     name, revision=line.split('@')
     snapshot_download(repo_id=name, revision=revision, local_dir=f'/opt/models/{name}',
@@ -42,6 +42,8 @@ from dew.sampling import Sampling
 import jax
 from jax._src.lib import xla_client
 pipe=TextToImage.from_pretrained(repo)
+if pathlib.Path(snapshot_download(repo_id=repo,local_files_only=True)).name!=image_revision:
+    raise RuntimeError('Hub main moved beyond the pinned revision')
 for steps in (15,30):
     t=time.perf_counter()
     pipe(['a turquoise alpine lake'],key=0,steps=steps,solver=DPMSolverMultistep(),guidance=CFG(5.0)).host()
@@ -63,9 +65,10 @@ runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \
   JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
   JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2 \
   /opt/venv/bin/python /opt/live/warm-managed.py
-# Report namespace feasibility rather than assuming uid alone is isolation.
-bwrap --unshare-user --unshare-pid --unshare-net --ro-bind / / --proc /proc \
-  --tmpfs /tmp --cap-drop ALL /bin/sh -c 'id; grep Cap /proc/self/status' \
-  > /opt/live/namespace-probe.txt 2>&1
+# A real non-root context must fail to open model/cache files for writing and
+# cannot inspect another context's scratch. Cloudflare forbids a new procfs
+# mount, so the namespace inherits the existing read-only /proc instead.
+curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/probe-kernel-boundary.sh" -o /root/probe-kernel-boundary.sh
+sh /root/probe-kernel-boundary.sh > /opt/live/namespace-probe.txt 2>&1
 cat /opt/live/namespace-probe.txt
 rm -rf /var/lib/apt/lists/* /root/.cache
