@@ -377,6 +377,25 @@ def test_rows_without_preprocess_arrive_as_arrays_of_32_bit_fields():
     assert sorted(batch["name"].tolist()) == sorted(f"row {i}" for i in batch["label"].tolist())
 
 
+def test_rows_keep_64_bit_fields_in_a_process_that_enables_x64():
+    """The fields take the dtype JAX places them in, so a float64 run is not
+    narrowed behind its back."""
+    import jax
+
+    from dew.data.providers import fields
+
+    row = {"x": [0.1, 0.2], "id": 2**40, "nested": {"n": 3}}
+    with jax.enable_x64(True):
+        wide = fields(row)
+    narrow = fields({name: value for name, value in row.items() if name != "id"})
+
+    assert wide["x"].dtype == np.float64 and wide["id"].dtype == np.int64
+    assert wide["nested"]["n"].dtype == np.int64
+    assert narrow["x"].dtype == np.float32 and narrow["nested"]["n"].dtype == np.int32
+    with pytest.raises(ValueError, match="field 'id' holds 1099511627776"):
+        fields({"id": 2**40})
+
+
 def test_a_64_bit_value_a_32_bit_field_cannot_hold_is_refused_by_name():
     table = datasets.Dataset.from_dict({"id": [2**40 + i for i in range(4)]})
 

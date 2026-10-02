@@ -342,8 +342,9 @@ class Loading:
     process that trains. Worker processes each import the program again, so
     they cost seconds and a process's memory apiece before the first batch,
     and pay off only once decoding or augmentation outruns the threads. On
-    a sixteen-record pipeline, 32 workers took 18 s and 7 GiB to the first
-    batch, against no measurable time and 0.2 GiB without them.
+    two cores of a shared workstation, the first batch of a 100-record
+    pipeline took 17.8 s and 7.07 GiB resident across 33 processes with 32
+    workers, against under 0.1 s and 0.23 GiB with none.
     """
 
     workers: int = 0
