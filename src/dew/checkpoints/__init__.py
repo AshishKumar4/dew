@@ -924,7 +924,7 @@ class Checkpoints:
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
         if weights_only:
-            state_tree = {name: state_tree[name] for name in ('params', 'ema')}
+            state_tree = {name: state_tree[name] for name in ('variables', 'ema')}
         persistent = self._open()
         self._metadata = None
         if profiles is not None:
@@ -1217,7 +1217,7 @@ class Checkpoints:
         rest are read here, placed as the leaves they undo.
         """
         lives, unread = {}, {}
-        held = _by_path(restored.get('params'))
+        held = _by_path(restored.get('variables'))
         for path, target in targets.items():
             weight = held.get(path)
             if (isinstance(weight, jax.Array) and weight.dtype == deltas[path].dtype
@@ -1231,7 +1231,7 @@ class Checkpoints:
         if unread:
             # The stored params tree, its containers kept, with every leaf
             # but the ones to read held back by orbax's placeholder.
-            weights = {'params': jax.tree_util.tree_map_with_path(
+            weights = {'variables': jax.tree_util.tree_map_with_path(
                 lambda path, _: unread.get(path, ocp.PLACEHOLDER), dict(metadata)['variables'])}
             read = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 item=weights, partial_restore=True, restore_args=jax.tree.map(
