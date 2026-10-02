@@ -2088,6 +2088,30 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+@pytest.mark.parametrize("generation, flags, expected", [
+    ("sm89", "", {"xla_gpu_dot_merger_threshold_mb": 0, "xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", {"xla_gpu_dot_merger_threshold_mb": 0}),
+    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", None),
+    ("v6e", "", None),
+    ("cpu", "", None),
+])
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, expected):
+    """A GPU training step runs dots that share an input apart, where XLA's
+    merger would concatenate their weights every step, and the Triton GEMM
+    fusions go off on the generations measured faster without them; a flag
+    the run named stands. The options are the step's own, so a process that
+    also serves keeps the merger there."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, 'device_generation', lambda: generation)
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    assert trainer_module.step_compiler_options(LMObjective(model, seq_len=4)) == expected
+
+
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     """The first execution requests no compilation after the public compile
     call, including a second program retrieved from the persistent cache.
