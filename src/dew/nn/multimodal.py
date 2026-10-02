@@ -10,7 +10,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.vision import Gemma3nProjectorModule, ProjectorBase, TowerBase
+from dew.nn.vision import Gemma3nProjectorModule, Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
 
 
@@ -30,6 +30,8 @@ class VisionConditioner(nn.Module):
     Pixels have shape [batch, images, channels, height, width]. All images
     in a numeric batch share their processed resolution; the processor keeps
     per-image lengths and does not substitute preprocessing inside the model.
+    `train` reaches the one tower with stochastic layers, Gemma 3n's
+    MobileNet and its drop-path.
     """
 
     vision: TowerBase
@@ -53,6 +55,8 @@ class VisionConditioner(nn.Module):
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
         if grid is not None:
             features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
+        elif isinstance(self.vision, Gemma3nVision):
+            features = self.tower(flat, train=train)
         elif positions is None:
             features = self.tower(flat)
         else:
