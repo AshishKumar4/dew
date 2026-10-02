@@ -1,11 +1,10 @@
 """Fetch a published run or export directory from the Hugging Face Hub.
 
 `pull_from_hub` hands back the snapshot path `huggingface_hub` downloads;
-retries, progress and caching stay the hub client's behaviour. Publishing is
-the hub client's own call: `HfApi().create_repo(repo_id, exist_ok=True)` and
-`HfApi().upload_folder(repo_id=repo_id, folder_path=directory)` on the
-directory `Pretrained.save` or `export_run` wrote, or on a run directory
-itself, which is the form the tasks' `from_pretrained` pull back.
+retries, progress and caching stay the hub client's behaviour. A bundle
+publishes itself with `Pretrained.push_to_hub`. A run directory, the form the
+tasks' `from_pretrained` pull back, goes up as it is through the hub client's
+`HfApi().upload_folder(repo_id=repo_id, folder_path=run_dir)`.
 """
 
 from __future__ import annotations

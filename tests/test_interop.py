@@ -368,6 +368,47 @@ def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
 # ---------------------------------------------------------------------------------
 
 
+class _RecordingApi:
+    """Stands in for HfApi and keeps every call a push makes, with the files
+    the uploaded folder held while the call ran."""
+
+    def __init__(self):
+        self.created = []
+        self.uploaded = []
+        self.files = []
+
+    def create_repo(self, repo_id, **kwargs):
+        self.created.append((repo_id, kwargs))
+
+    def upload_folder(self, **kwargs):
+        self.uploaded.append(kwargs)
+        self.files.append({entry.name for entry in Path(kwargs["folder_path"]).iterdir()})
+
+
+def test_a_bundle_pushes_what_it_saves_to_a_created_repo(tmp_path, monkeypatch):
+    """`push_to_hub` is `save` into a staging directory and that directory
+    uploaded, to a repo created when missing; the privacy flag and the commit
+    message pass through."""
+    import huggingface_hub
+
+    from dew.interop import PretrainedDecoder
+    from dew.nn.backbones import CausalTransformer
+
+    api = _RecordingApi()
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(model, model.init(jax.random.key(0), np.zeros((1, 2), np.int32)),
+                                          tokenizer="byte")
+    bundle.push_to_hub("acme/dew-export", private=True, commit_message="step 1000")
+    bundle.save(tmp_path / "saved")
+
+    assert api.created == [("acme/dew-export", {"private": True, "exist_ok": True})]
+    assert [(call["repo_id"], call["commit_message"]) for call in api.uploaded] == [
+        ("acme/dew-export", "step 1000")]
+    assert api.files == [{entry.name for entry in (tmp_path / "saved").iterdir()}]
+
+
 def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
     calls = []
 
