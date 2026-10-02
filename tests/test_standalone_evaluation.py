@@ -145,9 +145,9 @@ def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
 
     key = jax.device_put(jax.random.key(1), NamedSharding(mesh, P()))
     first = evaluate(objective, params, split(0), key=key, step=2,
-                     metrics=(perplexity(),), loss=True, mesh=mesh)
+                     metrics=(Perplexity(),), loss=True, mesh=mesh)
     with steady_state():
         second = evaluate(objective, params, split(3), key=key, step=3,
-                          metrics=(perplexity(),), loss=True, mesh=mesh)
+                          metrics=(Perplexity(),), loss=True, mesh=mesh)
     assert second.coordinated_batches == first.coordinated_batches == 3
     assert second.scores["val/perplexity"] != first.scores["val/perplexity"]
