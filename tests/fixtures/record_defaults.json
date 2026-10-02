@@ -448,7 +448,6 @@
   ],
   "image_column": "image",
   "image_size": 128,
-  "label_column": "label",
   "loading": {
    "class": "dew.data.dataset.Loading",
    "sets": {}
