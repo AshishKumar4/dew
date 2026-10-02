@@ -344,7 +344,8 @@ class Transaction:
                     update, opt_state = self.optimizer.update(
                         native, current.opt_state, current.variables["params"]
                     )
-                params = {**current.variables, "params": optax.apply_updates(current.variables["params"], update)}
+                params = {
+                    **current.variables, "params": optax.apply_updates(current.variables["params"], update)}
                 if self.aux_shape.effects is not None:
                     params = write_back(params, self.objective.apply_effects(
                         params, self.effects_tree.unflatten(effects)))

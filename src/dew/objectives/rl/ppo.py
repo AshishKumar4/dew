@@ -294,7 +294,8 @@ class PPORollout:
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        values = agreed("PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
+        values = agreed(
+            "PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )
