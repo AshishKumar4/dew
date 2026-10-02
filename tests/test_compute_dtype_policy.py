@@ -97,9 +97,10 @@ _OP_NAME = re.compile(r'op_name="([^"]*)"')
 # multiplies, whatever the operands are stored as.
 _ALGORITHM = re.compile(r"algorithm=(\w+)")
 
-# An operand the machine multiplies at the fp32 rate. f64 is here for
-# completeness; nothing in dew asks for it.
-FP32 = ("f32", "f64")
+# An operand the machine multiplies at the fp32 rate. A complex operand is a
+# pair of them. f64 and c128 are here for completeness; nothing in dew asks
+# for them.
+FP32 = ("f32", "f64", "c64", "c128")
 
 # How much of a family's matmul work may still be fp32. The fp32 boundaries a
 # bf16 run keeps on purpose - the output head, the timestep embedding - are
@@ -124,6 +125,14 @@ LOGITS = ("causal_transformer", "diffusion_gemma", "multimodal_transformer")
 FIXTURES: dict[str, str] = {}
 
 FAMILIES = sorted(models)
+
+# A family whose bf16 compute keeps one module's matmuls in fp32 by that
+# module's own contract, and the op-name scope that holds them. The hybrid
+# DiT's mixer is the S5 layer (`ssm`), which runs its state-space products in
+# at least fp32 whatever dtype its input carries (`dew.nn.ssm.S5Layer`); its
+# complex products read as c64 here and so counted as bf16 until the layer
+# moved to real ones.
+FP32_BY_CONTRACT = {"hybrid_dit": "/ssm/"}
 
 
 @dataclass(frozen=True)
@@ -323,6 +332,11 @@ def test_a_bf16_family_runs_its_matmuls_in_bf16(family, rng):
     loss, params = family_loss(family, rng)
     found = matmuls(matmul_text(jax.value_and_grad(loss), params))
     assert found, f"{family} compiled to no matmul at all"
+    scope = FP32_BY_CONTRACT.get(family)
+    if scope is not None:
+        kept = [matmul for matmul in found if scope not in matmul.module]
+        assert len(kept) < len(found), f"{family} has no matmul under {scope}"
+        found = kept
 
     fp32, total, share = fp32_share(found)
     assert share < BUDGET, (
