@@ -101,8 +101,15 @@ export class SnapshotLab extends DurableObject<Env> {
 	}
 
 	/** Start the prompt-only prototype; no visitor code runs in this process. */
-	async service(kind: string): Promise<unknown> {
+	async service(kind: string, commit?: string): Promise<unknown> {
 		if (kind !== 'text' && kind !== 'image') throw new Error('kind must be text or image');
+		if (commit !== undefined) {
+			if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a full project commit is required');
+			const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${commit}/site/live/container/demo.py`);
+			if (!source.ok || !source.body) throw new Error('could not read the pinned adapter');
+			const copy = await this.container.exec(['sh', '-c', 'cat > /opt/live/demo.py'], { stdin: source.body });
+			if (await copy.exitCode !== 0) throw new Error('could not install the pinned adapter');
+		}
 		const process = await this.container.exec(['sh', '-c',
 			'mkdir -p /run/dew; chown model:model /run/dew; chmod 0750 /run/dew; ' +
 			'nohup runuser -u model -- env HF_HOME=/opt/hf HF_HUB_OFFLINE=1 JAX_PLATFORMS=cpu ' +
