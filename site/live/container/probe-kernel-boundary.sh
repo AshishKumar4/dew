@@ -44,3 +44,47 @@ chown visitor_probe:visitor_probe /sessions/probe/check.py
 # The trusted launcher drops the host capabilities before entering the namespace.
 capsh --drop=all --no-new-privs --user=visitor_probe -- -c \
  'bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/check.py'
+
+# The model-serving process is not subject to these guest limits.
+cat > /sessions/probe/resource.py <<'PYCODE'
+import os, resource, sys, threading, time
+sys.path.insert(0,'/opt/live')
+import guest_limits
+guest_limits.install(cpu_seconds=1)
+mode=sys.argv[1]
+if mode=='memory':
+    try:
+        bytearray(1024*1024*1024)
+        raise AssertionError('guest exceeded its memory allowance')
+    except MemoryError:
+        print('memory allocation refused',flush=True)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS,(resource.RLIM_INFINITY,resource.RLIM_INFINITY))
+        raise AssertionError('guest raised its hard memory limit')
+    except (PermissionError,ValueError):
+        print('hard-limit increase refused',flush=True)
+elif mode=='fork':
+    try:
+        os.fork()
+        raise AssertionError('guest multiplied its memory allowance through fork')
+    except PermissionError:
+        print('fork refused',flush=True)
+    thread=threading.Thread(target=lambda: None);thread.start();thread.join()
+    print('ordinary thread allowed',flush=True)
+elif mode=='cpu':
+    while True: pass
+elif mode=='wall':
+    time.sleep(60)
+PYCODE
+chown visitor_probe:visitor_probe /sessions/probe/resource.py
+for mode in memory fork; do
+  capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/resource.py $mode"
+done
+for mode in cpu wall; do
+  set +e
+  timeout -s KILL 3 capsh --drop=all --no-new-privs --user=visitor_probe -- -c    "bwrap --unshare-user --unshare-net --ro-bind / / --bind /sessions/probe /work --tmpfs /tmp --cap-drop ALL /opt/venv/bin/python /work/resource.py $mode"
+  result=$?
+  set -e
+  echo "limit_probe $mode exit=$result"
+  case "$result" in 137|152) :;; *) echo 'limit not enforced' >&2; exit 1;; esac
+done

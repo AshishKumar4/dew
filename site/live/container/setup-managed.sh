@@ -6,7 +6,7 @@ commit=$1
 case "$commit" in ''|*[!0-9a-f]*) exit 2;; esac
 [ ${#commit} = 40 ]
 apt-get update
-apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl util-linux libcap2-bin bubblewrap
+apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl util-linux libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
 /opt/venv/bin/pip install --no-cache-dir \
   "dewml @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
@@ -20,6 +20,7 @@ chmod 0700 /sessions
 curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/text-to-image" -o /opt/live/text-to-image
 curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/text-models" -o /opt/live/text-models
 curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/demo.py" -o /opt/live/demo.py
+curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/guest_limits.py" -o /opt/live/guest_limits.py
 printf '%s\n' "$commit" > /opt/live/dew-commit
 cat > /opt/live/warm-managed.py <<'PY'
 import json, os, pathlib, time
