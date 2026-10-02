@@ -2186,7 +2186,13 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
 # The family modules stand below the shared readers they call, so reaching one
 # of them first leaves the hub complete before its body runs. Their names are
 # bound here alone: the table below is the one place a family is registered.
-from dew.interop.families.bloom import _bloom_config, _bloom_export, _bloom_export_weights, _bloom_path, _bloom_prepare
+from dew.interop.families.bloom import (
+    _bloom_config,
+    _bloom_export,
+    _bloom_export_weights,
+    _bloom_path,
+    _bloom_prepare,
+)
 from dew.interop.families.deepseek import (
     _deepseek_config,
     _deepseek_v2_mixture,
