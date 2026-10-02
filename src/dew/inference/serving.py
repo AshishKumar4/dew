@@ -433,7 +433,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None) -
     are. The step sets no XLA flag of its own; pass XLA_FLAGS to change the
     backend's defaults. See docs/performance.md for the measurements.
     """
-    return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5, 6),
+    return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
                    out_shardings=(None, (resident, carried, None)))
 
