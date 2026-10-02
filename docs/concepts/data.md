@@ -103,7 +103,7 @@ print(windows["text"][0])
 
 The training stream is shuffled: the first window of the first batch is window 49 of the corpus. `records` is the number of windows, `(1000 - 1) // 8 = 124`.
 
-Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `dew.data.write_tokens` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing).
+Each window starts `seq_len` ids after the previous one, so the last id of one window is the first of the next. `dew tokenize` (or `dew.data.write_tokens` in Python) writes `train.bin`, `val.bin` and `meta.json` from raw text; see [Packing](#packing). Token ids already stored in parquet are read through `dew.data.load("hf/parquet", options=HFOptions(data_files=...))` or a Grain pipeline given to `Dataset.from_grain`.
 
 Other specifications include `PackedTokens`, `OxfordFlowers`, `HFImages`, `ChatMessages` and the video and preference readers; the [API reference](../reference/core-api.md) lists them. Each has its own fields for paths, tokenization, transforms and splits, and two fields every specification shares:
 

@@ -41,7 +41,6 @@ from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFOptions
 from .sources.text import (
     TokenBytes,
-    TokenColumn,
     TokenDocumentSource,
     TokenRecords,
     TokenSource,
@@ -63,7 +62,7 @@ __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "Loading", "LocalVideos", "OnlineImages", "OnlineVideos", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
-           "TFDSOptions", "TokenBytes", "TokenColumn",
+           "TFDSOptions", "TokenBytes",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
            "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "mixture",
            "ramped", "tokenizer_for", "write_tokens"]

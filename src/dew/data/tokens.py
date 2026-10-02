@@ -1,8 +1,8 @@
 """Reads token datasets off a tokenized corpus directory.
 
 The corpus is the `train.bin`, `val.bin` and `meta.json` that
-`dew tokenize` writes, or the same splits as ArrayRecord shards or
-parquet (`dew.data.sources.text`).
+`dew tokenize` writes, or the same splits as ArrayRecord shards
+(`dew.data.sources.text`).
 
 `TokenWindows` reads fixed `seq_len + 1` windows off the token stream.
 `PackedTokens` packs whole documents into windows of that size and carries
@@ -111,8 +111,8 @@ class TokenWindows(DatasetSpec):
     stride: int | None = dataclasses.field(default=None, kw_only=True)
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field or parquet column the ids are in, for a corpus
-    held in one of those; a `.bin` corpus is the stream itself."""
+    """Which arrayrecord field the ids are in, for a corpus held in ArrayRecord
+    shards of dict records; a `.bin` corpus is the stream itself."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .sources.text import TokenWindowSource, token_corpus
@@ -368,8 +368,8 @@ class PackedTokens(DatasetSpec):
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
-    """Which arrayrecord field or parquet column the ids are in, for a
-    corpus held in one of those; a `.bin` corpus is the stream itself."""
+    """Which arrayrecord field the ids are in, for a corpus held in
+    ArrayRecord shards of dict records; a `.bin` corpus is the stream itself."""
     packing_bins: int = 8
     """Windows the plan keeps open at once. More of them leave less padding
     in a window and let documents further apart in the file share one."""
