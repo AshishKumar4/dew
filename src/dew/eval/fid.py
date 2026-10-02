@@ -46,7 +46,8 @@ def _extractor(weights: str | None):
     cache. Its header says which width to build the extractor at, since a Flax
     parameter has to be the shape its module declares.
     """
-    from dew.interop.inception_fid import cached_weights, channel_divisor, load
+    from dew.interop.inception_fid import cached_weights, channel_divisor
+    from dew.interop.safetensors_io import load_params
 
     from .inception import InceptionV3
 
@@ -55,7 +56,7 @@ def _extractor(weights: str | None):
     # the jitted extractor closes over arrays instead of compiling 90 MB of
     # weights into every kernel as constants.
     return (InceptionV3(channel_divisor=channel_divisor(path)),
-            jax.tree.map(jnp.asarray, load(path)))
+            jax.tree.map(jnp.asarray, load_params(path)))
 
 
 def _sqrtm(product):

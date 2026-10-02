@@ -22,9 +22,9 @@ from dew.interop.families.gemma import (
     _gemma3n_path,
     _gemma4_config,
     _gemma4_export,
+    _gemma4_export_path,
     _gemma4_export_weights,
     _gemma4_path,
-    _gemma4_prepare,
     _gemma_config,
 )
 from dew.interop.families.glm import (
@@ -36,13 +36,15 @@ from dew.interop.families.glm import (
     _glm_moe_dsa_config,
 )
 from dew.interop.families.gpt2 import (
+    _GPT2_NAMES,
+    _GPT2_PACKED,
     _gpt2_config,
     _gpt2_export,
-    _gpt2_export_weights,
     _gpt2_path,
     _gpt2_prepare,
 )
 from dew.interop.families.gpt_neox import (
+    _GPT_NEOX_NAMES,
     _gpt_neox_config,
     _gpt_neox_export,
     _gpt_neox_export_weights,
@@ -66,18 +68,18 @@ from dew.interop.families.llama import (
     _mixtral_config,
     _mixtral_path,
 )
-from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
+from dew.interop.families.llama4 import _LLAMA4_PACKED, _llama4_config, _llama4_export, _llama4_path
 from dew.interop.families.masked_diffusion import (
+    _LLADA_NAMES,
     _diffusion_gemma_export,
     _diffusion_gemma_text_config,
     _dream_config,
     _llada_config,
-    _llada_export_path,
     _llada_path,
     _mask_token_export,
 )
 from dew.interop.families.olmo import _olmo3_config
-from dew.interop.families.opt import _opt_config, _opt_export, _opt_export_path, _opt_path
+from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -90,6 +92,7 @@ from dew.interop.families.qwen import (
     _qwen35_path,
 )
 from dew.interop.hf_decoders import (
+    _FUSED_EXPERTS,
     _GEMMA,
     _QWEN35,
     DecoderFamily,
@@ -97,6 +100,8 @@ from dew.interop.hf_decoders import (
     _kind_mixers,
     _mixer_value,
     _mixture_value,
+    _renamed_name,
+    _renamed_path,
 )
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
@@ -120,7 +125,8 @@ ENTRIES = (
         "GPTNeoXForCausalLM",
         _gpt_neox_export,
         weight_path=_gpt_neox_path,
-        prepare_weights=_gpt_neox_prepare,
+        export_path=partial(_renamed_name, _GPT_NEOX_NAMES),
+        prepare=_gpt_neox_prepare,
         export_weights=_gpt_neox_export_weights,
         preserve_source_layout=False,
         tied_head_names=("embed_out.weight", "gpt_neox.embed_in.weight"),
@@ -132,8 +138,8 @@ ENTRIES = (
         "opt",
         "OPTForCausalLM",
         _opt_export,
-        weight_path=_opt_path,
-        export_path=_opt_export_path,
+        weight_path=partial(_renamed_path, _OPT_NAMES),
+        export_path=partial(_renamed_name, _OPT_NAMES),
         preserve_source_layout=False,
         tied_head_names=("lm_head.weight", "model.decoder.embed_tokens.weight"),
     ),
@@ -145,8 +151,9 @@ ENTRIES = (
         "GPT2LMHeadModel",
         _gpt2_export,
         weight_path=_gpt2_path,
-        prepare_weights=_gpt2_prepare,
-        export_weights=_gpt2_export_weights,
+        export_path=partial(_renamed_name, _GPT2_NAMES),
+        prepare=_gpt2_prepare,
+        packed=_GPT2_PACKED,
         preserve_source_layout=False,
         tied_head_names=("lm_head.weight", "transformer.wte.weight"),
     ),
@@ -180,7 +187,8 @@ ENTRIES = (
         _diffusion_gemma_export,
         sandwich_norms=True,
         weight_path=_gemma4_path,
-        prepare_weights=_gemma4_prepare,
+        export_path=_gemma4_export_path,
+        packed=_FUSED_EXPERTS,
         export_weights=_gemma4_export_weights,
         preserve_source_layout=False,
     ),
@@ -216,7 +224,7 @@ ENTRIES = (
         "LLaDAModelLM",
         _mask_token_export,
         weight_path=_llada_path,
-        export_path=_llada_export_path,
+        export_path=partial(_renamed_name, _LLADA_NAMES),
         preserve_source_layout=True,
     ),
     DecoderFamily(
@@ -238,7 +246,7 @@ ENTRIES = (
         "Llama4ForCausalLM",
         _llama4_export,
         weight_path=_llama4_path,
-        prepare_weights=_llama4_prepare,
+        packed=_LLAMA4_PACKED,
         preserve_source_layout=True,
     ),
     DecoderFamily(
@@ -282,7 +290,7 @@ ENTRIES = (
         "DeepseekV4ForCausalLM",
         lambda model: {},
         weight_path=_deepseek_v4_path,
-        prepare_weights=_deepseek_v4_prepare,
+        prepare=_deepseek_v4_prepare,
         preserve_source_layout=True,
         tied_head_names=("head.weight", "embed.weight"),
     ),
@@ -341,7 +349,7 @@ ENTRIES = (
         "KimiLinearForCausalLM",
         lambda model: {},
         weight_path=_kimi_linear_path,
-        prepare_weights=_kimi_linear_prepare,
+        prepare=_kimi_linear_prepare,
         preserve_source_layout=True,
     ),
     # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
@@ -353,7 +361,7 @@ ENTRIES = (
         "KimiK3ForConditionalGeneration",
         lambda model: {},
         weight_path=_kimi_k3_path,
-        prepare_weights=_kimi_k3_prepare,
+        prepare=_kimi_k3_prepare,
         zero_padded=_KDA_ZERO_PADDED,
         preserve_source_layout=True,
         tied_head_names=("language_model.lm_head.weight", "language_model.model.embed_tokens.weight"),
@@ -377,7 +385,7 @@ ENTRIES = (
         "Qwen3NextForCausalLM",
         lambda model: {},
         weight_path=_qwen35_moe_path,
-        prepare_weights=_gemma4_prepare,
+        packed=_FUSED_EXPERTS,
         preserve_source_layout=True,
     ),
     DecoderFamily(
@@ -388,7 +396,7 @@ ENTRIES = (
         "Qwen3_5MoeForCausalLM",
         lambda model: {},
         weight_path=_qwen35_moe_path,
-        prepare_weights=_gemma4_prepare,
+        packed=_FUSED_EXPERTS,
         preserve_source_layout=True,
     ),
     DecoderFamily(
@@ -435,7 +443,8 @@ ENTRIES = (
         _gemma4_export,
         sandwich_norms=True,
         weight_path=_gemma4_path,
-        prepare_weights=_gemma4_prepare,
+        export_path=_gemma4_export_path,
+        packed=_FUSED_EXPERTS,
         export_weights=_gemma4_export_weights,
         preserve_source_layout=True,
     ),

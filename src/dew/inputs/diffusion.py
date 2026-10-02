@@ -168,7 +168,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         attention_impl: str = "auto", params: Variables | None = None):
         from dew.interop.pretrained import load_diffusion_conditioner
 
-        return load_diffusion_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype,
+        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl, params=params)
 
     @property
@@ -386,11 +386,11 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
                         params: Variables | None = None):
-        from dew.interop.pretrained import load_qwen_image_conditioner
+        from dew.interop.pretrained import load_diffusion_conditioner
 
-        return load_qwen_image_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype,
-                                           revision=revision, attention_impl=attention_impl,
-                                           tokens=tokens, params=params)
+        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
+                                          revision=revision, attention_impl=attention_impl,
+                                          tokens=tokens, params=params)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
@@ -487,17 +487,11 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", tokens: int = 512,
                         params: Variables | None = None):
-        from dew.interop.pretrained import load_hidden_states_conditioner
+        from dew.interop.pretrained import load_diffusion_conditioner
 
-        return load_hidden_states_conditioner(
-            checkpoint,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            revision=revision,
-            attention_impl=attention_impl,
-            tokens=tokens,
-            params=params,
-        )
+        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
+                                          revision=revision, attention_impl=attention_impl,
+                                          tokens=tokens, params=params)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows, guidance = [], []

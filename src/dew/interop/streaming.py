@@ -9,12 +9,18 @@ their trailing pair of axes swaps (torch Linear `[out, in]` to Dense
 the leaf is kept in. `read(index)` builds only the part a device asks for,
 and `dew.training.host.place_leaf` puts each part on its device before it
 reads the next, so a process holds one device shard of one leaf at a time.
+
+`WeightLayout` is the way back: which leaves one source tensor is built
+from and how its storage is rebuilt, one tensor at a time.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew.objectives.base import Variables
@@ -91,3 +97,107 @@ def materialize(tree: LazyTree) -> Variables:
     return {name: (materialize(value) if isinstance(value, dict)
                    else value.read() if isinstance(value, SourceLeaf) else value)
             for name, value in tree.items()}
+
+
+@dataclass(frozen=True)
+class WeightLayout:
+    """Holds an existing source tensor's location and reversible storage layout.
+
+    `expert_index` is the expert a per-expert source tensor holds. The
+    loader stacks those tensors onto an expert dimension
+    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
+    expert of a layer and the index says which slice this tensor is.
+
+    `dtype` is the width the source stores this tensor in where that is
+    not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
+    and int32 in the collection, and the export writes back what the
+    checkpoint held.
+
+    `padded` is the length a 1-D source tensor stores past its leaf's, as
+    zeros, for the names its family declares (`DecoderFamily.zero_padded`):
+    Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
+    entries. The family's prepare step checks and trims the tail, and export
+    writes the zeros back.
+    """
+
+    name: str
+    paths: tuple[tuple[str, ...], ...]
+    shape: tuple[int, ...]
+    transpose: tuple[int, ...] | None = None
+    concatenate: int | None = None
+    expert_index: int | None = None
+    dtype: np.dtype | None = None
+    padded: int | None = None
+
+    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
+              scalar_mode: str | None) -> np.ndarray | jax.Array:
+        if path[-1] == "layer_scalar":
+            if scalar_mode not in ("frozen", "trainable"):
+                raise ValueError("layer_scalar export requires an explicit model mode")
+            path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
+        node: object = variables
+        for part in path:
+            if not isinstance(node, Mapping):
+                raise ValueError(f"parameter path {path} does not traverse a mapping")
+            node = node[part]
+        if not isinstance(node, (np.ndarray, jax.Array)):
+            raise ValueError(
+                f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
+            )
+        return node
+
+    def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
+        """The dtype `export` writes, read from the leaf without copying it."""
+        if self.dtype is not None:
+            return np.dtype(self.dtype)
+        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
+
+    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
+        """The source tensor, built from its leaves and brought to the host."""
+        leaves = []
+        for path in self.paths:
+            node = self._leaf(variables, path, scalar_mode)
+            if self.expert_index is not None:
+                # Slice the expert where the leaf lives. One stacked leaf
+                # answers for E source tensors, so copying it to the host
+                # per tensor would move the whole stack E times.
+                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
+                    raise ValueError(
+                        f"{self.name} is expert {self.expert_index} of {path}, which "
+                        f"holds {node.shape}")
+                node = node[self.expert_index]
+            leaves.append(node)
+        if (len(leaves) == 1 and self.transpose is not None
+                and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype):
+            # One leaf is transposed on its device and copied to the host
+            # contiguous: numpy copies a transposed bfloat16 kernel at 0.15
+            # GiB/s on the RTX 3090 box's CPU, where the round trip over PCIe
+            # moves several GiB/s.
+            value = np.asarray(jnp.transpose(jnp.asarray(leaves[0]), self.transpose))
+        else:
+            arrays = [np.asarray(leaf) for leaf in leaves]
+            value = arrays[0] if self.concatenate is None else np.concatenate(arrays, axis=self.concatenate)
+            if self.transpose is not None:
+                value = value.transpose(self.transpose)
+        if self.padded is not None:
+            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
+        if value.size != math.prod(self.shape):
+            raise ValueError(
+                f"{self.name} assembles {value.shape} from {self.paths}, which does not "
+                f"fill the source's {self.shape}")
+        value = np.ascontiguousarray(value).reshape(self.shape)
+        return value if self.dtype is None else value.astype(self.dtype)
+
+    def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+        """Return the leaf of `shape` whose export is `tensor`.
+
+        The inverse of `export` for a layout that binds one whole leaf; a
+        tensor assembled from several leaves has no single leaf to restore.
+        """
+        if len(self.paths) != 1 or self.concatenate is not None or self.expert_index is not None:
+            raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
+        if tensor.shape != self.shape:
+            raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
+        transpose = self.transpose or tuple(range(len(shape)))
+        stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
+        return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
