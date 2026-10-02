@@ -36,7 +36,7 @@ itself (`transfer_arrays_to_host` in orbax's replica_slices.py).
 import contextlib
 import sys
 import traceback
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import jax
 from jax._src import array as jax_array, dispatch
@@ -85,17 +85,23 @@ def _guarded_buffer(array, flags):
 
 
 @contextlib.contextmanager
-def guarded() -> Iterator[None]:
+def guarded(allow: Sequence[str] = ()) -> Iterator[None]:
     """Refuse every implicit host<->device transfer in the block, on any
     backend: `jax.transfer_guard("disallow")`, with CPU arrays' reads to
-    the host held to it too."""
+    the host held to it too. `allow` names the directions, of
+    "host_to_device" and "device_to_device", a block moves by design: a
+    request path whose own inputs are the point of the transfer allows the
+    first and is held to reads."""
     global _guarding
     if _guarding == 0:
         jax_array.ArrayImpl._value = property(_guarded_value)
         jax_array.ArrayImpl.__buffer__ = _guarded_buffer
     _guarding += 1
     try:
-        with jax.transfer_guard("disallow"):
+        with contextlib.ExitStack() as levels:
+            levels.enter_context(jax.transfer_guard("disallow"))
+            for direction in allow:
+                levels.enter_context(getattr(jax, f"transfer_guard_{direction}")("allow"))
             yield
     finally:
         _guarding -= 1
@@ -105,7 +111,7 @@ def guarded() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def steady_state(compiles: int = 0) -> Iterator[None]:
+def steady_state(compiles: int = 0, allow: Sequence[str] = ()) -> Iterator[None]:
     """Run the block as a hot path's steady state: `guarded`, and tracing
     and compiling no program, or exactly `compiles` where the block brings a
     new shape bucket. Fails naming each program and where it was asked for."""
@@ -121,7 +127,7 @@ def steady_state(compiles: int = 0) -> Iterator[None]:
 
     jax.monitoring.register_event_duration_secs_listener(listen)
     try:
-        with guarded():
+        with guarded(allow):
             yield
     finally:
         jax.monitoring.unregister_event_duration_listener(listen)

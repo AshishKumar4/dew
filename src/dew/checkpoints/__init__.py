@@ -147,11 +147,10 @@ class Keep:
     def __post_init__(self):
         if self.latest < 0 or (self.every is not None and self.every < 1):
             raise ValueError("Keep needs latest >= 0 and every >= 1")
-        if isinstance(self.interval, str):
-            object.__setattr__(self, 'interval', duration(self.interval))
         interval = duration(self.interval) if isinstance(self.interval, str) else self.interval
         if interval is not None and interval.total_seconds() <= 0:
             raise ValueError("Keep.interval must be positive")
+        object.__setattr__(self, 'interval', interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -166,9 +165,9 @@ class Ranking:
 
 def _recorded_rank(metrics):
     # Orbax records the metrics file only when best_fn is configured. The
-    # retention policy and named readers use every independently stored rank.
-    return metrics.get('loss', next((value for key, value in metrics.items()
-                                    if key.startswith('checkpoint/rank/')), None))
+    # retention policy and named readers use every independently stored rank;
+    # this hands orbax the first, or None for a save that recorded none.
+    return metrics.get(next((key for key in metrics if key.startswith('checkpoint/rank/')), None))
 
 
 class Metrics(Mapping):
@@ -586,8 +585,6 @@ class _RankedSteps(preservation.PreservationPolicy):
                     groups.setdefault(key.removeprefix("checkpoint/rank/"), []).append(
                         (value, checkpoint.step)
                     )
-            if 'loss' in scores:
-                groups.setdefault('train/loss', []).append((scores['loss'], checkpoint.step))
         for name, scores in groups.items():
             held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
         keep = self.checkpoints.keep
@@ -729,7 +726,6 @@ class Checkpoints:
         return copy.deepcopy(custom.get('control', {}))
 
     def _best_step(self, name: str | None) -> int | None:
-        candidates = []
         retained = self.kept()
         if name is None:
             for checkpoint in reversed(retained):
@@ -737,12 +733,11 @@ class Checkpoints:
                 if custom.get('primary'):
                     name = custom['primary']
                     break
-        key = 'loss' if name is None else f'checkpoint/rank/{name}'
-        for checkpoint in retained:
-            if key in checkpoint.metrics:
-                candidates.append((checkpoint.metrics[key], checkpoint.step))
-            elif name == 'train/loss' and 'loss' in checkpoint.metrics:
-                candidates.append((checkpoint.metrics['loss'], checkpoint.step))
+        if name is None:
+            return None
+        key = f'checkpoint/rank/{name}'
+        candidates = [(checkpoint.metrics[key], checkpoint.step)
+                      for checkpoint in retained if key in checkpoint.metrics]
         return min(candidates)[1] if candidates else None
 
     def resolve(self, step: int | str | None) -> int | None:

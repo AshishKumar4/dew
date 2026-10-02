@@ -204,7 +204,7 @@ class FlowGRPO:
                              "scores each sample with an image metric's per-sample measure")
 
         def reward(images, batch):
-            return np.asarray(metric.measure(ImageGrid(images), batch))
+            return np.asarray(metric.fn(ImageGrid(images), batch))
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
                            train_steps=self.train_steps)
@@ -432,22 +432,22 @@ class DiffusionRunConfig(RunConfig):
     (`DiffusionObjective(uncertainty=...)`; EDM2 uses 128); None keeps the
     preset's fixed weighting."""
     alignment: RepresentationAlignment | None = None
+    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
+    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     mean_flow: MeanFlowTraining | None = None
+    """Train with MeanFlow's loss instead of the denoising loss; the preset
+    is `mean_flow` and sampling is unguided, since the guidance is trained
+    in."""
     shortcut: ShortcutTraining | None = None
+    """Train a shortcut model instead of the denoising loss; the preset is
+    `shortcut`, and sampling is unguided."""
     distill: ConsistencyDistillation | None = None
+    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
+    instead of the denoising loss; sampling is unguided."""
     guidance_distill: GuidanceDistillation | None = None
     """Distill a saved run's classifier-free guidance into this model's
     guidance input; sampling reads the conditioner's guidance value and no
     second branch."""
-    """Distill a saved flow run into a few-step student (rCM, sCM or DMD2)
-    instead of the denoising loss; sampling is unguided."""
-    """Train a shortcut model instead of the denoising loss; the preset is
-    `shortcut`, and sampling is unguided."""
-    """Train with MeanFlow's loss instead of the denoising loss; the preset
-    is `mean_flow` and sampling is unguided, since the guidance is trained
-    in."""
-    """Align the model's hidden tokens with a frozen DINOv2's, REPA or
-    iREPA, and with `end_to_end` tune the autoencoder through it (REPA-E)."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass. The
     registry is the list of what a run can name, so a metric registered

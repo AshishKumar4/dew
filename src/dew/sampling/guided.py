@@ -40,6 +40,7 @@ from dew.sampling.decoding import (
     Tokenizing,
     Vocabulary,
     matching_mode,
+    vocabulary_of,
     vocabulary_pieces,
 )
 
@@ -91,21 +92,6 @@ class Special(Protocol):
     def all_special_ids(self) -> list[int]: ...
 
 
-def _vocabulary(tokenizer: Vocabulary | Referencing | Tokenizing) -> Vocabulary:
-    """The tokenizer beneath a processor, as `stop_strings` finds it."""
-    source = tokenizer
-    for _ in range(3):
-        if isinstance(source, Vocabulary):
-            return source
-        if isinstance(source, Referencing):
-            source = source.reference
-        elif isinstance(source, Tokenizing):
-            source = source.tokenizer
-    if not isinstance(source, Vocabulary):
-        raise TypeError("guided decoding needs a tokenizer that can list its vocabulary")
-    return source
-
-
 def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_id: int | Sequence[int],
           vocab_size: int | None = None) -> Grammar:
     """The automaton of `pattern` over the tokenizer's vocabulary.
@@ -120,7 +106,7 @@ def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_id
     stops = (eos_id,) if isinstance(eos_id, int) else tuple(eos_id)
     if not stops:
         raise ValueError("guided decoding needs an EOS id to end a row on")
-    source = _vocabulary(tokenizer)
+    source = vocabulary_of(tokenizer, "guided decoding")
     pieces, ids = vocabulary_pieces(source, matching_mode(source))
     special = set(source.all_special_ids) if isinstance(source, Special) else set()
     spelled: dict[str | bytes, list[int]] = {}

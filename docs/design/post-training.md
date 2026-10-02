@@ -45,7 +45,7 @@ Packing reuses the existing machinery. `text_roles` joins as one more per-token 
 
 `loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, together with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, as in pretraining.
 
-Correction (2026-09-22): packing now goes through `PackedWindows`, one plan over the whole corpus (`src/dew/data/tokens.py:250`); `FirstFitPackIterDataset` is gone from `src/`. A window also carries `text_roles_segment_ids` and `text_roles_positions`, identical to the text ones (`src/dew/data/chat.py:9-12`). `ChatMessages` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
+Correction (2026-09-22): packing now goes through `PackedWindows`, one plan over the whole corpus (`src/dew/data/tokens.py:250`); `FirstFitPackIterDataset` is gone from `src/`. A window carries one `text_segment_ids`/`text_positions` pair that serves `text` and `text_roles` alike. `ChatMessages` reads a parquet file, a `.jsonl` file or a Hub dataset id; the conversation column defaults to `messages` and falls back to `prompt` (`src/dew/data/chat.py:672-704`). `Role` has a sixth value, `DEVELOPER = 5` (`src/dew/data/chat.py:65-80`).
 
 ### 1.2 Preference pairs
 

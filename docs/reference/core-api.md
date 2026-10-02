@@ -146,7 +146,7 @@ An image specification takes validation from `val_split`, a split of the dataset
 
 `Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines a caller assembled: a `MapDataset` is repeated, cut into the reader's share and saved as one global record count; a pipeline read as it comes arrives as a function of the `DataPartition` that builds the `IterDataset` of that share, which is batched where it is and reports Grain's own iterator state.
 
-A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file, `TokenRecords` over ArrayRecord shards of token arrays, or `TokenColumn` over a parquet column of them. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in all three.
+A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both.
 
 
 ## Checkpoints
@@ -211,7 +211,7 @@ Strategy:        (DecoderState, StepState, DecodeOps, transform, stopping, budge
 StepState(tokens, valid, step, active, keys, prompt_width)
 ```
 
-`StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` and `generated()` the two regions, and `total()` the real token count. A transform never sees model parameters or cache internals.
+`StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` the prompt region, and `total()` the real token count. A transform never sees model parameters or cache internals.
 
 `logits` is the whole transform chain, in the order it runs. Left as `None` it is what `sampling` compiles to, an explicit sequence replaces that entirely, and `()` runs no transform, so a caller who needs an order `Sampling` does not produce writes the order they want. A call's value replaces a task's bound one, and an explicit `sampling=` on a call also clears a bound chain, because that chain was built around the policy the call just replaced. `stopping` composes instead: an explicit sequence runs beside the policy's EOS criterion rather than replacing it, so naming a criterion cannot drop termination. Criteria combine with OR and run after every committed token; the token that fired one is emitted with its likelihoods and later slots hold `pad_id` with zero likelihood.
 
@@ -271,7 +271,7 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `Typical(mass)` | `TypicalLogitsWarper` | |
 | `EpsilonCutoff(epsilon)` | `EpsilonLogitsWarper` | |
 | `EtaCutoff(epsilon)` | `EtaLogitsWarper` | |
-| `TopH(fraction=1.0, candidates=100)` | `TopHLogitsWarper` | `candidates` is the reference's fixed head |
+| `TopH(fraction=1.0)` | `TopHLogitsWarper` | over the reference's fixed head of 100 |
 | `Greedy()` | greedy search | zero on the argmax, `-inf` elsewhere; what `temperature=0` compiles to |
 | `Renormalize()` | `LogitNormalization` | shifts every score by one constant, so no later filter and neither likelihood can see it |
 | `RemoveInvalidValues()` | `InfNanRemoveLogitsProcessor` | the only transform that repairs a broken distribution |

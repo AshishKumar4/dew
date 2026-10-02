@@ -1,29 +1,20 @@
 """Wan 2.1's causal video autoencoder, `AutoencoderKLWan`.
 
-An independent linen port of diffusers 0.34.0
-src/diffusers/models/autoencoders/autoencoder_kl_wan.py (Apache-2.0),
-channels last: videos are `[B, T, H, W, C]`. Every 3-D convolution is causal
-in time, padded with two zero frames in front, so frame t reads only frames
-up to t. Four frames compress into one latent frame after the first, which is
-compressed alone: a video of 1 + 4k frames has 1 + k latent frames, and an
-image is the one-frame video.
+An independent linen port of diffusers 0.34.0 autoencoder_kl_wan.py
+(Apache-2.0), channels last: videos are `[B, T, H, W, C]`. Every 3-D
+convolution is causal in time, two zero frames in front. The first frame
+compresses alone and every four after it into one latent frame, so 1 + 4k
+frames make 1 + k latent frames and an image is the one-frame video.
 
-The source walks a video in chunks (the first frame, then four at a time;
-one latent frame at a time to decode) and carries each convolution's last
-two input frames across chunks. That is the causal convolution over the
-whole video, which is what this module computes in one pass. The resampling
-blocks keep the first frame out of their temporal convolution, as the
-source's first chunk does:
-
-- a temporally downsampling block passes the first frame through and
-  convolves the whole sequence with stride 2 and no padding, so output
-  frame j > 0 reads frames 2j - 2 to 2j;
-- a temporally upsampling block passes the first frame through and turns
-  every later frame into two, by a causal convolution over the frames after
-  the first that doubles the channels, each half one frame.
-
-The decoder clamps its pixels to [-1, 1], as the source's `_decode` does.
-RMS gammas keep the source's stored `[C, 1, 1(, 1)]` shape.
+The source walks a video in chunks and carries each convolution's last two
+input frames across them, which is the causal convolution over the whole
+video this computes in one pass. The resampling blocks keep the first frame
+out of their temporal convolution, as the source's first chunk does: a
+downsampling block convolves with stride 2 and no padding, so output frame
+j > 0 reads frames 2j - 2 to 2j; an upsampling block turns every later frame
+into two by a causal convolution that doubles the channels. The decoder
+clamps pixels to [-1, 1] (`_decode`), and RMS gammas keep the stored
+`[C, 1, 1(, 1)]` shape.
 """
 from __future__ import annotations
 
@@ -50,9 +41,6 @@ from .kl import posterior_latent
 
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
-
-TEMPORAL = 4
-"""Frames per latent frame after the first."""
 
 
 class _RMSNorm(nn.Module):
@@ -107,7 +95,6 @@ class _Attention(nn.Module):
     """Single-head self-attention over each frame's pixels, the projections
     1x1 convolutions."""
 
-    features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -133,7 +120,7 @@ class _MidBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.features, self.dtype, name="attentions_0")(x)
+        x = _Attention(self.dtype, name="attentions_0")(x)
         return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 
@@ -229,7 +216,6 @@ class _UpBlock(nn.Module):
 
 class _Decoder(nn.Module):
     base: int
-    latent: int
     multipliers: tuple[int, ...]
     blocks: int
     temporal: tuple[bool, ...]
@@ -277,11 +263,11 @@ class WanVAE(nn.Module):
         return 2 ** sum(self.temporal)
 
     def setup(self):
-        fields = (self.base, self.latent, self.multipliers, self.blocks, self.temporal, self.dtype)
-        self.encoder = _Encoder(*fields)
+        self.encoder = _Encoder(self.base, self.latent, self.multipliers, self.blocks, self.temporal,
+                                self.dtype)
         self.quant_conv = _causal(2 * self.latent, 1, self.dtype, "quant_conv")
         self.post_quant_conv = _causal(self.latent, 1, self.dtype, "post_quant_conv")
-        self.decoder = _Decoder(*fields)
+        self.decoder = _Decoder(self.base, self.multipliers, self.blocks, self.temporal, self.dtype)
 
     def moments(self, video):
         """The posterior's mean and log-variance, stacked on the channel axis."""

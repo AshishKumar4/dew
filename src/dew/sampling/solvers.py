@@ -1,26 +1,18 @@
 """One reverse step each, from t to t_next, given the model's denoising at t.
 
-A solver is a value. What it needs between steps travels in its state;
-`init` builds it from x_T, a concrete time grid, the process and the walk's
-root key; `step` threads it through
-`sample`'s scan. The rates of the sampling schedule come from `process`; a
-solver that needs another evaluation of the model (Heun's corrector, RK4's
-stages, KDPM2's midpoint) calls `denoise`. A solver that integrates
-dx / dsigma = eps says so by refusing a schedule whose alpha is not one.
+A solver is a value. What it needs between steps travels in its state, which
+`init` builds and `step` threads through `sample`'s scan. The rates come from
+`process`; a solver that needs another model evaluation (Heun's corrector,
+RK4's stages, KDPM2's midpoint) calls `denoise`. A solver that integrates
+dx / dsigma = eps refuses a schedule whose alpha is not one.
 
 The solvers named after Diffusers 0.34.0 schedulers reproduce their
 arithmetic; `tests/test_samplers.py` holds their trajectories and trajectory
-gradients against the fixtures `tools/diffusers_reference.py` records.
-Process supplies the time grid. Initializing with a concrete grid and process
-checks each algorithm's endpoint domain before the compiled scan. Finite
-endpoint limits are verified separately in tools/diffusers_limits_reference.py;
-DEIS history, UniPC epsilon correction, and non-++ SDE noise can survive a
-zero-sigma target. Undefined limits raise rather than substitute an update.
-
-`init`'s `key` is the walk's own key, the one `sample` folds per step. Every
-solver draws its per-step noise from the folded key it is handed, so the root
-key is unused except by `DPMSolverSDE`, whose source noise sampler is one
-Brownian tree over the whole trajectory and needs a state its steps share.
+gradients against the fixtures `tools/diffusers_reference.py` records. `init`
+checks each algorithm's endpoint domain on the concrete grid before the
+compiled scan; finite endpoint limits are verified in
+tools/diffusers_limits_reference.py, and undefined ones raise rather than
+substitute an update.
 """
 
 from __future__ import annotations
@@ -54,22 +46,10 @@ class Solver(Protocol[StateT]):
     """
 
     def init(self, x, times, process, *, key) -> StateT:
-        """Prepare state and check endpoint domains on the concrete time grid.
-
-        sample() materializes this grid at compile time, so validation adds
-        no host callbacks to the compiled step. `key` is the walk's root key;
-        a solver whose source draws one correlated path over the whole
-        trajectory keeps that path's state, and every other solver ignores it
-        and draws from the per-step key `step` is handed.
-
-        Every argument is on every solver because this is the surface
-        `sample` calls. `x` sizes the carried history (`LMS`, `MultiStepDPM`,
-        `DEIS`, `UniPC` and the DPM-Solvers), `times` and `process` check the
-        grid's endpoints and count its steps (`DDPM`, `Consistency`,
-        `DPMSolverSDE`, `DEIS`, `UniPC` and the DPM-Solvers), and `key` seeds
-        the Brownian tree of `DPMSolverSDE` alone. A one-step solver reads
-        none of them and answers `()`.
-        """
+        """The state for a walk from `x` over the concrete grid `times`,
+        checking its endpoint domains at compile time. `key` is the walk's
+        root key, which only `DPMSolverSDE`'s whole-trajectory Brownian tree
+        reads; steps draw from the folded key they are handed."""
         ...
 
     def step(self, x, t, t_next, denoised, eps, state, key, process,
@@ -496,19 +476,13 @@ class DPMSolverSDE:
     sigmas apart. A zero-sigma target has no ancestral step and lands on the
     clean prediction.
 
-    The root interval is the schedule's own positive sigma domain, not the
-    extremes of the grid handed to `init`: the source builds its tree from all
-    the positive sigmas it prepared, so a continuation that walks a suffix of
-    that grid keeps the path the same key gives the whole one. A grid whose
-    only interval lands on sigma zero leaves that domain a single point, which
-    the source also prepares and never queries.
+    The root interval is the schedule's positive sigma domain, not the grid's
+    extremes, as the source builds its tree over every positive sigma it
+    prepared, so a walk over a suffix of the grid keeps the whole grid's path.
 
-    `seed` is the source's `noise_sampler_seed`: with it the tree's entropy is
-    the checkpoint's rather than the caller's, so every walk over the same
-    grid integrates one fixed path however the sampling key changes. It seeds
-    this bridge, not the reference tree, because a Torch seed does not name a
-    JAX stream; what carries over is the contract, a path independent of the
-    walk's key.
+    `seed` is the source's `noise_sampler_seed`: the path is then fixed by
+    the checkpoint, independent of the walk's key. A Torch seed names no JAX
+    stream, so it seeds this bridge rather than reproducing the reference tree.
     """
 
     depth: int = MAX_BROWNIAN_DEPTH
@@ -536,12 +510,8 @@ class DPMSolverSDE:
         return _Brownian(root, jnp.asarray(low, jnp.float32), jnp.asarray(high, jnp.float32))
 
     def _noise(self, state, first, second, shape):
-        """The path's standard normal draw over `[first, second]`.
-
-        The bridge is reached through one method so a reference walk can
-        couple the source's own tree here and leave the rest of the step
-        alone; nothing else in this class reads the path.
-        """
+        """The path's standard normal draw over `[first, second]`, the one
+        place a reference walk couples the source's own tree in."""
         return _brownian_noise(state, first, second, shape, self.depth)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -1136,13 +1106,9 @@ class UniPC:
         return hh if self.solver_type == "bh1" else jnp.expm1(hh)
 
     def _corrected(self, x, state: UniPCState, m_here, alpha_here, sigma_here, lambda_here):
-        """`x` corrected with the UniC of the last predictor's own order.
-
-        The first step has no predictor to correct (the state's order is 0
-        until one runs), and `disable_corrector` names the step indices whose
-        predictor output is left as it is. The corrector reads the history as
-        it stood before this point's output was pushed onto it.
-        """
+        """`x` corrected with the UniC of the last predictor's own order (none
+        before the first predictor or at a `disable_corrector` index), reading
+        the history before this point's output is pushed."""
         history = state.history
         taken, lambdas = history.taken, history.lambdas
 

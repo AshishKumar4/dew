@@ -139,7 +139,6 @@ def _clip(x, bound: float):
 class AudioLinear(nn.Module):
     features: int
     clipped: bool = False
-    use_bias: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
@@ -150,7 +149,7 @@ class AudioLinear(nn.Module):
             lo = self.variable("constants", "input_min", lambda: jnp.array(-jnp.inf)).value
             hi = self.variable("constants", "input_max", lambda: jnp.array(jnp.inf)).value
             x = jnp.clip(x, lo, hi)
-        x = nn.Dense(self.features, use_bias=self.use_bias, dtype=self.dtype,
+        x = nn.Dense(self.features, use_bias=False, dtype=self.dtype,
                      precision=self.precision, kernel_init=nn.initializers.normal(self.initializer_range),
                      name="linear")(x)
         if self.clipped:

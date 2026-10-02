@@ -6,11 +6,12 @@ conditions are the `InputSpec`; every draw comes from the step's key. The
 frozen encoders' weights live in the tree's `encoders` collection, so they
 reach the compiled step as arguments and the optimizer never sees them. The
 unconditional branch is a pure function of those frozen weights and a fixed
-prompt, so the objective encodes it once, when it is built, and the step
-reads that: the tower runs over the batch and nothing else, once a step.
+prompt, so the objective encodes it once, on first use, and the step reads
+that: the tower runs over the batch and nothing else, once a step.
 
-Evaluation samples a few images from the validation batch's conditions with
-the averaged weights, through the same `sample` inference uses.
+Evaluation samples one image per validation row from its conditions, with the
+averaged weights when the run keeps them, through the same `sample` inference
+uses; the preview hook limits itself to the display count.
 """
 
 from __future__ import annotations
