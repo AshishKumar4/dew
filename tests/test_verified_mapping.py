@@ -1,7 +1,7 @@
 """Tier 2 of loading: an unregistered model_type through the verified Llama convention.
 
 The offline cases write a tiny random checkpoint of a transformers class Dew
-registers no family for and load it with `load_pretrained`. CWM is the
+registers no family for and load it with `Pretrained.load`. CWM is the
 Llama block with per-layer sliding windows and a llama3 rope ramp, so it
 loads, and its logits match transformers at the tier-1 fixtures' 1e-4
 (tests/test_hf_decoders.py).
@@ -36,7 +36,7 @@ import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.verify import VerifiedMappingWarning, probe_ids, reference_logits, scatter_weights
 
 TIER2 = "tier 2: verified mapping"
@@ -96,7 +96,7 @@ def test_a_llama_convention_type_loads_with_one_tier2_warning(tmp_path):
     ids, expected = write_tiny(tmp_path, "cwm", sliding_window=4,
                                layer_types=["sliding_attention", "full_attention"] * 2)
     with pytest.warns(VerifiedMappingWarning) as caught:
-        loaded = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+        loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     assert [str(entry.message).startswith(TIER2) for entry in caught] == [True]
     assert "transformers 5.16.1's CwmForCausalLM" in str(caught[0].message)
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
@@ -114,8 +114,8 @@ def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
     import subprocess
 
     write_tiny(tmp_path, "cwm", sliding_window=4)
-    script = ("import sys\nfrom dew.interop import load_pretrained\n"
-              "load_pretrained(sys.argv[1], dtype='float32', attention_impl='reference')")
+    script = ("import sys\nfrom dew.interop import Pretrained.load\n"
+              "Pretrained.load(sys.argv[1], dtype='float32', attention_impl='reference')")
     env = {name: value for name, value in os.environ.items()
            if name not in ("JAX_DEFAULT_MATMUL_PRECISION", "XLA_FLAGS")}
     run = subprocess.run(
@@ -129,11 +129,11 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path):
     source, destination = tmp_path / "source", tmp_path / "export"
     ids, _ = write_tiny(source, "cwm", sliding_window=4)
     with pytest.warns(VerifiedMappingWarning):
-        loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+        loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == loaded.config
     with pytest.warns(VerifiedMappingWarning):
-        restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+        restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
@@ -148,7 +148,7 @@ def test_a_type_that_computes_something_else_is_refused_with_its_error(tmp_path,
     with warnings.catch_warnings():
         warnings.simplefilter("error", VerifiedMappingWarning)
         with pytest.raises(ValueError, match=r"max \|Δlogits\| \S+ in fp32, over the bound") as refused:
-            load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+            Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     assert TORCHAX in str(refused.value)
 
 
@@ -156,7 +156,7 @@ def test_without_torch_the_refusal_names_the_extra_and_the_generic_route(tmp_pat
     write_tiny(tmp_path, "cwm")
     monkeypatch.setitem(sys.modules, "torch", None)
     with pytest.raises(ValueError, match=r"pip install 'dewml\[torch\]'") as refused:
-        load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     assert TORCHAX in str(refused.value)
 
 
@@ -164,9 +164,9 @@ def test_without_torch_the_refusal_names_the_extra_and_the_generic_route(tmp_pat
 def test_a_released_cwm_loads_verified_and_matches_transformers():
     repo, revision = CWM
     with pytest.warns(VerifiedMappingWarning, match=TIER2):
-        fp32 = load_pretrained(repo, revision=revision, dtype="float32", attention_impl="reference")
+        fp32 = Pretrained.load(repo, revision=revision, dtype="float32", attention_impl="reference")
     with pytest.warns(VerifiedMappingWarning, match=TIER2):
-        bf16 = load_pretrained(repo, revision=revision, dtype="bfloat16", param_dtype="bfloat16",
+        bf16 = Pretrained.load(repo, revision=revision, dtype="bfloat16", param_dtype="bfloat16",
                                attention_impl="reference")
     reference = AutoModelForCausalLM.from_pretrained(repo, revision=revision, dtype=torch.float32)
     ids = np.random.RandomState(0).randint(0, reference.config.vocab_size, (2, 64)).astype(np.int32)
@@ -182,5 +182,5 @@ def test_a_released_cwm_loads_verified_and_matches_transformers():
 def test_a_census_repo_that_deviates_is_refused_before_its_weights(model_type):
     repo, revision, reason = REFUSED[model_type]
     with pytest.raises(ValueError, match=reason) as refused:
-        load_pretrained(repo, revision=revision, dtype="float32")
+        Pretrained.load(repo, revision=revision, dtype="float32")
     assert TORCHAX in str(refused.value)

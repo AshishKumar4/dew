@@ -50,7 +50,7 @@ restored = load_params(sys.argv[1])
 np.testing.assert_array_equal(restored['params']['weight'], weights['params']['weight'])
 pipe = TextToImage(Zero(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
                    InputSpec(Field('image', (2, 2, 1))),
-                   {}, steps=1, guidance=None, sampler=Euler())
+                   {}, steps=1, guidance=None, solver=Euler())
 result = pipe('', key=0).host()
 assert result.images.shape == (1, 2, 2, 1)
 np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))

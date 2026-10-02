@@ -266,7 +266,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         **dataclasses.asdict(sparse),
     }
     if mixture is not None:
-        represented = {'experts', 'top_k', 'layers', 'every', 'scaling', 'groups',
+        represented = {'experts', 'top_k', 'layers', 'scaling', 'groups',
                        'groups_per_token', 'expert_features', 'shared_features', 'norm_topk_prob',
                        'implementation', 'dispatch'}
         defaults = Mixture(experts=mixture.experts, score_function='sigmoid', bias=True)

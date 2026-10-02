@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained, pretrained
+from dew.interop import Pretrained, pretrained
 from dew.interop.safetensors_io import read_file, write_file
 
 pytest.importorskip("diffusers", reason="single-file conversion runs diffusers' own key maps")
@@ -49,7 +49,7 @@ def _repo(tmp_path: Path, kind: str) -> Path:
 
 
 def _load(directory: Path, kind: str):
-    return load_pretrained(directory, single_file=f"{kind}.safetensors", dtype="float32", param_dtype="auto")
+    return Pretrained.load(directory, single_file=f"{kind}.safetensors", dtype="float32", param_dtype="auto")
 
 
 def _digest(value: np.ndarray, dtype: str) -> str:
@@ -138,7 +138,7 @@ def test_a_failed_placement_caches_nothing(
 
     monkeypatch.setattr(pretrained, "place", refused)
     with pytest.raises(MemoryError):
-        load_pretrained(
+        Pretrained.load(
             repo, single_file="sd.safetensors", dtype="float32", param_dtype="auto", mesh=MeshSpec()
         )
     assert list(cache.iterdir()) == []
@@ -179,7 +179,7 @@ def test_a_component_with_no_weights_anywhere_is_refused_by_name(tmp_path: Path,
 
 def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit(
         tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """load_pretrained("org/repo", single_file=...) for a repo whose metadata
+    """Pretrained.load("org/repo", single_file=...) for a repo whose metadata
     snapshot holds the configs and a file without its VAE: the VAE comes from
     the repo at the snapshot's commit, fetched and linked by `weight_files`'
     rule, so the fp16 variant beside it stays behind."""
@@ -198,7 +198,7 @@ def test_a_hub_repo_gives_the_missing_weights_by_the_snapshot_rule_at_its_commit
 
     monkeypatch.setattr(sources, "snapshot", snapshot)
     monkeypatch.setattr(sources, "repo_file", lambda name, directory, filename: metadata / filename)
-    loaded = load_pretrained("org/sd-tiny", single_file="sd.safetensors", dtype="float32", param_dtype="auto")
+    loaded = Pretrained.load("org/sd-tiny", single_file="sd.safetensors", dtype="float32", param_dtype="auto")
     assert asked == [("org/sd-tiny", None, False), ("org/sd-tiny", metadata.name, ("vae",))]
     assert loaded.revision == metadata.name
     assert sorted(path.name for path in (loaded.source / "vae").iterdir()) == ["config.json", WEIGHTS["vae"]]
@@ -337,7 +337,7 @@ def test_a_transformer_only_flux_file_converts_as_from_single_file_does_and_load
     digests = {name: hashlib.sha256(value.reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()
                + f":{value.dtype}" for name, value in expected.state_dict().items()}
     del expected
-    loaded = load_pretrained(repo, single_file="flux1.safetensors", dtype="float32", param_dtype="auto")
+    loaded = Pretrained.load(repo, single_file="flux1.safetensors", dtype="float32", param_dtype="auto")
     _assert_converted(loaded.source, {"transformer": digests})
     for component in ("vae", "text_encoder", "text_encoder_2"):
         assert (loaded.source / component / WEIGHTS[component]).read_bytes() == (
@@ -346,7 +346,7 @@ def test_a_transformer_only_flux_file_converts_as_from_single_file_does_and_load
 
 @pytest.mark.network
 def test_the_released_sd15_file_converts_to_the_tensors_diffusers_from_single_file_does(cache: Path) -> None:
-    loaded = load_pretrained("Comfy-Org/stable-diffusion-v1-5-archive",
+    loaded = Pretrained.load("Comfy-Org/stable-diffusion-v1-5-archive",
                              single_file="v1-5-pruned-emaonly-fp16.safetensors",
                              revision="9cfd069101959ca3828bf9c04a4419870832b74f", param_dtype="auto")
     _assert_converted(loaded.source, json.loads((FIXTURE / "sd15_from_single_file.json").read_text()))

@@ -2,7 +2,7 @@
 """The Dew side of a language-model reference run.
 
 The same windows in the same order as `torch_lm.py`, through the trainer's
-own compiled step: `LMObjective` over the checkpoint `load_pretrained`
+own compiled step: `LMObjective` over the checkpoint `Pretrained.load`
 reads (fp32 masters, `--dtype` compute), the solver `OptimConfig.build` makes
 from an `OptimConfig` (global-norm clip, then AdamW on the cosine schedule),
 and the mesh `MeshSpec` describes. One transformation is chained in front of
@@ -130,7 +130,7 @@ def build(args: argparse.Namespace) -> Run:
         jax.config.update("jax_default_matmul_precision", "highest")
 
     from dew.config import OptimConfig
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
@@ -144,7 +144,7 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
-    pretrained = load_pretrained(args.model, dtype=args.dtype, param_dtype="float32",
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention)
     model = pretrained.model
     if args.dispatch is not None:

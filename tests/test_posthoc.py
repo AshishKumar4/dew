@@ -9,7 +9,7 @@ import optax
 import pytest
 from test_trainer import Data, Regression
 
-from dew.checkpoints import Checkpoints
+from dew.checkpoints import Checkpoints, Ranking
 from dew.config import OptimConfig, RunConfig
 from dew.objectives.base import EMASpec
 from dew.training import Layout, Trainer
@@ -140,7 +140,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0))
     state = trainer.fit(Data(), steps=2, log_every=2)
     checkpoints = Checkpoints(directory, keep=1)
-    checkpoints.save(2, state, None, metrics={'loss': 0.2})
+    checkpoints.save(2, state, None, ranking=Ranking('train/loss', 0.2))
     checkpoints.wait()
 
     interrupted = Checkpoints(directory, keep=1)
@@ -156,7 +156,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     interrupted._manager = ocp.CheckpointManager(
         directory, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True),
         item_handlers=handler)
-    interrupted.save(4, state.replace(step=jnp.int32(4)), None, metrics={'loss': 0.1})
+    interrupted.save(4, state.replace(step=jnp.int32(4)), None, ranking=Ranking('train/loss', 0.1))
     with pytest.raises(OSError, match='interrupted before commit'):
         interrupted.wait()
     # The one write failed before its atomic commit. A fresh process must
@@ -177,7 +177,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     for held, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
         np.testing.assert_array_equal(bits(held), bits(expected))
 
-    fresh.save(6, state.replace(step=jnp.int32(6)), None, metrics={'loss': 0.05})
+    fresh.save(6, state.replace(step=jnp.int32(6)), None, ranking=Ranking('train/loss', 0.05))
     fresh.wait()
     assert fresh.latest == fresh.best == 6
     assert fresh.profile_steps() == [2, 6]

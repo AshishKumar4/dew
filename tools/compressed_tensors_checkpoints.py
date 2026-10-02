@@ -69,7 +69,7 @@ def compare(out: Path) -> None:
     from huggingface_hub import snapshot_download
     from transformers import AutoModelForCausalLM
 
-    from dew.interop import codecs, load_pretrained
+    from dew.interop import Pretrained, codecs
     from dew.interop.safetensors_io import read_weights
 
     ids = np.asarray(IDS, np.int32)
@@ -89,11 +89,11 @@ def compare(out: Path) -> None:
         del model
         entry = {"revision": revision, "weights": len(names), "max_abs_vs_library": worst}
         for dtype in ("float32", "bfloat16"):
-            loaded = load_pretrained(source, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+            loaded = Pretrained.load(source, dtype=dtype, param_dtype=dtype, attention_impl="reference")
             ours = np.asarray(loaded.model.apply(loaded.variables, ids), np.float32)
             entry[f"logits_{dtype}_vs_dense_library_fp32"] = float(np.max(np.abs(ours - theirs)))
         with tempfile.TemporaryDirectory() as scratch:
-            loaded = load_pretrained(source, dtype="float32", param_dtype="auto", attention_impl="reference")
+            loaded = Pretrained.load(source, dtype="float32", param_dtype="auto", attention_impl="reference")
             loaded.save(scratch)
             written = read_weights(scratch)
             entry["saved_bytes_differ"] = sorted(

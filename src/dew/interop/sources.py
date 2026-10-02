@@ -60,7 +60,7 @@ def missing_weights(source: str, files: Collection[str]) -> str:
                 f"those, or convert the repo to safetensors at {pickles.CONVERT_SPACE}")
     if gguf:
         return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
-                f"load_pretrained(..., gguf_file={gguf[0]!r})")
+                f"Pretrained.load(..., gguf_file={gguf[0]!r})")
     return f"{source} has no model.safetensors or model.safetensors.index.json"
 
 

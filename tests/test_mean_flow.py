@@ -122,7 +122,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining, TextCondition
     from dew.sampling import TextToImage
     from dew.training import Trainer
@@ -134,9 +134,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
             dtype="float32",
             attention_impl="xla",
         ),
-        data=OxfordFlowers(image_size=4),
+        data=TFDSImages(image_size=4),
         preset=presets.MeanFlow(),
-        sampler=Euler(),
+        solver=Euler(),
         guidance=None,
         sampling_steps=2,
         ema_decay=None,
@@ -190,12 +190,12 @@ def test_the_time_embeddings_take_the_models_time_scale():
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
     from dew.config import ModelConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining
 
     def built(config):
-        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=OxfordFlowers(image_size=8),
-                                  preset=presets.MeanFlow(), sampler=Euler(), guidance=None, text=None,
+        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=TFDSImages(image_size=8),
+                                  preset=presets.MeanFlow(), solver=Euler(), guidance=None, text=None,
                                   val_metrics=(), mean_flow=MeanFlowTraining()).build().model
 
     assert built({"patch_size": 2}).time_scale == 0.002

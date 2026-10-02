@@ -6,7 +6,7 @@ documents: token-id prompts, seeds, EOS controls, the field that returns the
 sampled ids (vLLM's `return_tokens_as_token_ids` renders them into the
 logprob tokens, SGLang's `return_token_ids` lists them on the choice) and one
 reported log-probability per sampled token. The safetensors reload writes a
-real Qwen2 export that `load_pretrained` reads back, and posts the reload
+real Qwen2 export that `Pretrained.load` reads back, and posts the reload
 calls to a real local HTTP endpoint in order.
 """
 
@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 
 from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.sampling import Sampling
 
 openai = pytest.importorskip("openai", reason="optional inference-clients extra")
@@ -361,7 +361,7 @@ def doubled(source):
 
 
 def assert_served(directory, expected):
-    served = load_pretrained(directory, dtype="float32")
+    served = Pretrained.load(directory, dtype="float32")
     for written, pushed in zip(jax.tree.leaves(served.variables), jax.tree.leaves(expected), strict=True):
         # Served in bfloat16: equal to the pushed weights at that precision.
         np.testing.assert_array_equal(np.asarray(written),
@@ -373,7 +373,7 @@ def paths(server):
 
 
 def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_path, replicas):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     changed = doubled(source)
     engines = replicas(3)
     SafetensorsReload(source, tmp_path / "served", tuple(server.url for server in engines), "vllm")(
@@ -391,7 +391,7 @@ def test_a_vllm_push_drains_reloads_resets_stamps_and_resumes_every_replica(tmp_
 
 
 def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_path, replicas, monkeypatch):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     changed = doubled(source)
     monkeypatch.chdir(tmp_path)
     engines = replicas(2)
@@ -409,7 +409,7 @@ def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_p
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_publication_stamps_only_after_every_replica_serves_the_version(tmp_path, replicas, provider):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     first, second = replicas(2)
     stamps = []
     publication = Publication(
@@ -437,7 +437,7 @@ def test_a_publication_stamps_only_after_every_replica_serves_the_version(tmp_pa
     ("sglang", "body", "update_weights_from_disk answered 200.*shape mismatch"),
 ])
 def test_a_refused_reload_fails_the_push(tmp_path, replicas, provider, failure, refusal):
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     (server,) = replicas(1)
     server.failure = failure
     with pytest.raises(RuntimeError, match=refusal):
@@ -492,7 +492,7 @@ def test_a_pool_publishes_its_sharded_policy_once_and_every_process_hears_a_fail
         "/update_weight_version",
         "/resume",
     ]
-    assert_served(tmp_path / "served", doubled(load_pretrained(FIXTURE, dtype="float32")))
+    assert_served(tmp_path / "served", doubled(Pretrained.load(FIXTURE, dtype="float32")))
 
     engine.seen.clear()
     engine.failure = "body"
@@ -631,7 +631,7 @@ def test_a_failed_nccl_push_opens_its_group_again_and_a_close_does_not_wait_for_
     side of the group, which stays open until the engine exits (a sender on
     4x RTX 3090 waited out jax.distributed's 300 s shutdown barrier)."""
     (engine,) = replicas(1)
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     library = tmp_path / "libnccl.so.2"
     library.touch()
     push = NCCLPush(source, (engine.url,), str(library))
@@ -658,7 +658,7 @@ def test_an_nccl_push_holds_no_copy_of_the_policy_on_the_devices_that_do_not_sen
     Replicated over the mesh first, each device held the whole policy:
     gpt-oss-20b is 38.96 GiB in bfloat16, more than a 24 GB GPU."""
     (engine,) = replicas(1)
-    source = load_pretrained(FIXTURE, dtype="float32")
+    source = Pretrained.load(FIXTURE, dtype="float32")
     devices = jax.devices()[:2]
     mesh = jax.sharding.Mesh(np.asarray(devices), ("pool",))
 

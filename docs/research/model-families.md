@@ -37,7 +37,7 @@ code. Checked against the source on 2026-09-22:
   (`causal_transformer.py:1389-1409`). For text-only input, interleaved mRoPE
   reduces to that partial rope (`causal_transformer.py:1344-1352`).
 - Per-layer embeddings (`per_layer_input_dim`), KV sharing
-  (`num_kv_shared_layers`, `kv_shared_layers`), MTP depths
+  (`kv_shared_layers`), MTP depths
   (`num_nextn_predict_layers`, `MTPBlock`) and hyper-connections
   (`hyper_connections`) are fields (`causal_transformer.py:782,1424-1438`;
   `src/dew/nn/hyper_connections.py:56`). The LM objective weights the MTP term

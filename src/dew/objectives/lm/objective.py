@@ -504,7 +504,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     scores the weights that trained.
 
     `pretrained` is a variables dict to start from instead of a fresh
-    init. A `dew.interop.load_pretrained(...)` bundle's `lm_objective`
+    init. A `dew.interop.PretrainedDecoder.load(...)` bundle's `lm_objective`
     builds the objective with its model and variables together. The
     trainer takes its whole initial state from `init`.
 
@@ -683,7 +683,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if "params" not in pretrained:
             raise ValueError(
                 "pretrained is the variables dict ({'params': ...}) that "
-                "load_pretrained and model.init return")
+                "Pretrained.load and model.init return")
         pretrained = thaw(pretrained)
         if not self._warmup:
             return pretrained

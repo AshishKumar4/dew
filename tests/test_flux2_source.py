@@ -27,8 +27,9 @@ import pytest
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
-from dew.nn.autoencoders.flux2 import load_flux2_vae, unfold
+from dew.nn.autoencoders.flux2 import load_flux2_vae
 from dew.nn.backbones.flux2 import Flux2Transformer
+from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
@@ -189,9 +190,9 @@ def test_the_published_autoencoder_matches_the_source():
 
 @pytest.fixture(scope="module")
 def klein(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record):
@@ -211,7 +212,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record
 
 
 def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    """`Pretrained.load().text_to_image()` reproduces the source's own call:
     its defaults (50 steps, two branches guided at 4.0 against the empty
     prompt), and at the recorded step count the sigmas it lays out shifted
     by its empirical mu, the latent it ends on and the image it decodes."""
@@ -223,7 +224,7 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     autoencoder = klein.autoencoder
-    raw = unfold(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
+    raw = pixel_shuffle(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
     for row in range(len(pipeline["prompts"])):
         assert relative_gap(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0]) < FORWARD, row
         assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < FORWARD, row

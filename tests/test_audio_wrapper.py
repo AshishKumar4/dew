@@ -125,14 +125,8 @@ class _Wrapper:
             picked = soft[rows, jnp.maximum(order, 0)]
             embeddings = jnp.where((tokens == audio_id)[..., None], picked, embeddings)
         positions = jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0).astype(jnp.int32)
-        return self.decoder.apply(
-            self.text_variables,
-            safe,
-            input_embeddings=embeddings,
-            embedding_positions=jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape),
-            positions=positions,
-            segment_ids=valid.astype(jnp.int32),
-        )
+        return self.decoder.apply(self.text_variables, safe, input_embeddings=embeddings,
+                                  positions=positions, segment_ids=valid.astype(jnp.int32))
 
 
 @pytest.fixture(params=("gemma-3n-audio-tiny", "gemma-4-audio-tiny"), scope="module")

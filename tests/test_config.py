@@ -27,7 +27,7 @@ from dew.training import Layout, MeshSpec
 def test_to_dict_and_from_dict_round_trip_a_run():
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
-        data=datasets["oxford_flowers102"](image_size=64),
+        data=datasets["tfds_images"](image_size=64),
         optim=OptimConfig(optimizer="muon", learning_rate=1e-3, weight_decay=0.1),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
@@ -41,7 +41,8 @@ def test_a_tuple_field_comes_back_a_tuple_from_a_record():
     """JSON has no tuple, so a record holds a list where the class declares
     one. The class gets its tuple back: with a list in its place the loaded
     config compares unequal to the saved one and its spec is unhashable."""
-    config = RunConfig(data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1))
+    config = RunConfig(data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+                       trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
     assert loaded == config
@@ -369,6 +370,30 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
 
 
+@pytest.mark.mesh(devices=2)
+def test_train_runs_the_trainer_its_config_describes(tmp_path):
+    """Every field a trainer holds, off its default, shows in the run `train`
+    makes of it: the parameters split over fsdp, a dynamic loss scale, an
+    accumulator for two microbatches and the profiler window's trace."""
+    import jax
+
+    from dew.training import ProfileWindow
+
+    trace = tmp_path / "trace"
+    config = TrainerConfig(
+        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, batch_size=8, accumulation=2,
+        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
+
+    state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
+                                            name="built")
+
+    assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.params))
+    assert state.scale is not None
+    assert state.accumulation is not None
+    assert any(path.is_file() for path in trace.rglob("*"))
+
+
 def test_a_pass_over_the_data_needs_a_record_count():
     """A stream with no record count has no epoch, so "epoch" raises a
     ValueError that names the field."""
@@ -535,7 +560,8 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1),
+        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))

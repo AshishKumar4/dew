@@ -153,7 +153,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import OxfordFlowers
+    from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
     from dew.objectives.base import Step
     from dew.objectives.diffusion import (
@@ -170,7 +170,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002},
                           dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=Flow(), sampler=Euler(), guidance=None,
+        data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))
     teacher = teacher_run.build()
@@ -199,7 +199,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     config = dataclasses.replace(teacher_run, distill=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
-        max_simulation_steps=2), sampler=Consistency(), sampling_steps=3)
+        max_simulation_steps=2), solver=Consistency(), sampling_steps=3)
     task = config.build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))

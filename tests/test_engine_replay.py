@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop.pretrained import load_pretrained
+from dew.interop.pretrained import Pretrained
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Session, Status, pack
 
@@ -42,7 +42,7 @@ def engine_batch():
 
 @pytest.fixture(scope="module")
 def objective():
-    pretrained = load_pretrained(
+    pretrained = Pretrained.load(
         str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference"
     )
     grpo = GRPOObjective(pretrained.model, WIDTH - 1, sampling_temperature=RECORD["sampling"]["temperature"])

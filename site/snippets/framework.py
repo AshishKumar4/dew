@@ -25,7 +25,7 @@ from dew.data import ByteTokenizer, Loading, Prompts, TokenWindows
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor
 from dew.inference.serving import Server
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
@@ -83,7 +83,7 @@ def diffusion(out, smoke):
                       num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-        sampler=Euler(), steps=4)
+        solver=Euler(), steps=4)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
     # End snippet: diffusion
@@ -111,7 +111,7 @@ def sample_public(out, smoke):
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
     pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
     result = pipe(["green and purple northern lights over a frozen lake"],
-                  key=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
+                  key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
     # End snippet: sample-public
     assert (out / "sample.png").is_file()
@@ -177,7 +177,7 @@ def pretrained(out, smoke):
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
     # Begin snippet: pretrained
-    bundle = load_pretrained(source, dtype="bfloat16", max_seq_len=128)
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     # End snippet: pretrained
     if smoke:
@@ -204,8 +204,8 @@ def pretrained(out, smoke):
 
 def serving(out, smoke):
     source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
-    bundle = load_pretrained(source, dtype="bfloat16", param_dtype="bfloat16",
-                             max_seq_len=128, mesh=MeshSpec())
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", param_dtype="bfloat16",
+                                    max_seq_len=128, mesh=MeshSpec())
     if smoke:
         bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))
         prompts = ["dew", "jax"]

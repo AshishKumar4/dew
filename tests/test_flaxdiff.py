@@ -6,6 +6,7 @@ fixed inputs and original outputs, with a text mask for Dew's caller.
 """
 
 import json
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -15,7 +16,6 @@ import orbax.checkpoint as ocp
 import pytest
 from flax.traverse_util import unflatten_dict
 
-import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.interop.flaxdiff import (
     fourier_table,
     hybrid_dit_fields,
@@ -26,6 +26,9 @@ from dew.interop.flaxdiff import (
 )
 from dew.nn.dit import TextContext
 from dew.registry import models
+
+import_module("dew.nn.backbones")  # registers the fixture kind
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "flaxdiff"
 

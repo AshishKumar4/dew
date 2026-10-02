@@ -8,6 +8,7 @@ raises a ValueError for a knob a fused kernel cannot honor.
 
 import collections
 import json
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -18,10 +19,6 @@ import pytest
 from jax._src import source_info_util
 from test_architectures import CASES as ARCHITECTURE_CASES
 
-import dew.nn.backbones
-import dew.nn.backbones.jepa
-import dew.nn.diffusion_gemma
-import dew.nn.multimodal  # noqa: F401  (registers the kind)
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.hf_decoders import translate_config
 from dew.nn.attention import local_attention, scaled_dot_product_attention
@@ -35,6 +32,9 @@ from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import dtype_name, float64_twin, models, resolve_dtype, with_precision
+
+import_module("dew.nn.multimodal")  # registers the fixture kind
+
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 

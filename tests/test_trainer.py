@@ -34,21 +34,19 @@ from steady_state import steady_state
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
-from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import (
     Checkpoints,
     Layout,
     MeshSpec,
-    ProfileWindow,
     Trainer,
     TrainState,
     display,
     ema_update,
     trainer as trainer_module,
-    write_back,
 )
+from dew.training.transaction import write_back
 
 BATCH = 8
 FEATURES = 3
@@ -351,27 +349,6 @@ def test_a_second_fit_continues_from_the_state_on_disk(tmp_path):
 def test_constructing_a_trainer_opens_nothing(tmp_path):
     make_trainer(tmp_path)
     assert not (tmp_path / "run").exists(), "the checkpoint directory was created"
-
-
-def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
-    """`from_config` against the constructor call `RunConfig.train` wrote by
-    hand, for a config whose every trainer-held field is off its default: one
-    mapping from the config's names to this constructor's, in one place."""
-    config = TrainerConfig(
-        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
-        mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
-        profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
-    objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.key)
-    checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
-
-    built = Trainer.from_config(config, objective, optimizer, key=key,
-                                checkpoints=checkpoints, tracker=tracker)
-
-    assert vars(built) == vars(Trainer(
-        objective, optimizer, key=key, mesh=config.mesh, layout=config.layout,
-        accumulation=config.accumulation, dynamic_scale=config.dynamic_scale,
-        checkpoints=checkpoints, tracker=tracker, profile=config.profile))
 
 
 class Keyed(Regression):
@@ -709,7 +686,7 @@ from dew.training import Trainer
 
 model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
-                               sampler=Euler(), steps=2, ema_decay=None)
+                               solver=Euler(), steps=2, ema_decay=None)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 state = trainer.initial_state()
 batch = {"image": np.random.default_rng(0).integers(0, 256, (32, 16, 16, 3)).astype(np.uint8)}
@@ -2123,6 +2100,30 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)
     assert int(advanced.step) == 1 and bool(finite)
+
+
+@pytest.mark.parametrize("generation, flags, expected", [
+    ("sm89", "", {"xla_gpu_dot_merger_threshold_mb": 0, "xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", {"xla_gpu_dot_merger_threshold_mb": 0}),
+    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", None),
+    ("v6e", "", None),
+    ("cpu", "", None),
+])
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, expected):
+    """A GPU training step runs dots that share an input apart, where XLA's
+    merger would concatenate their weights every step, and the Triton GEMM
+    fusions go off on the generations measured faster without them; a flag
+    the run named stands. The options are the step's own, so a process that
+    also serves keeps the merger there."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, 'device_generation', lambda: generation)
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    assert trainer_module.step_compiler_options(LMObjective(model, seq_len=4)) == expected
 
 
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):

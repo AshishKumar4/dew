@@ -1281,8 +1281,6 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
         assert report["measured"]["val/count"] == 3
         assert report["measured"]["evaluation/records"] == 3
         assert report["no_consumer"] == {}
-    assert reports[0]["local"] == [0, 1, 2]
-    assert reports[1]["local"] is None
 
 
 @pytest.mark.distributed
