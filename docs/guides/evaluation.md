@@ -70,6 +70,37 @@ Training metrics are named under `train/`, and reduced validation metrics under 
 `key=0` is the same root key as `key=jax.random.key(0)`. The fit record
 also keeps the supplied integer seed.
 
+`Mean` turns per-example values or a `(total, count)` pair into a metric.
+It sums counts across uneven batches, so a small last batch has its own
+weight. Choose `better` and `reads` explicitly: evaluation selects the exact
+artifact type. This LM metric ranks the logits' top-1 accuracy:
+
+```python
+from dew import Checkpoints, Mean
+from dew.artifacts import TokenScores
+
+accuracy = Mean(
+    lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
+    reads=TokenScores, name="accuracy", better="higher",
+)
+language_model = LMObjective(model, seq_len=8, ema_decay=None)
+run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+              checkpoints=Checkpoints("runs/lm-accuracy"))
+state = run.fit(
+    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+)
+run.checkpoints.wait()
+assert run.checkpoints.best is not None
+```
+
+The helper starts a pass from its first contribution and finalizes on the
+host without collectives. A vector counts each example once; a pair can
+carry token counts or fractional weights. A scalar batch mean is refused.
+`TokenScores.correct` comes from the same chunked head as its losses; it
+does not retain a full logits tensor. The unprefixed name `accuracy` is
+reported as `val/accuracy`. Passing `name="val/accuracy"` gives a clear error
+instead of adding the prefix twice.
+
 ## Previews
 
 The trainer calls `Objective.preview` once per evaluation event, only when `fit(preview=True)` is passed, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Without metrics, evaluation skips the scoring work; without a tracker, it skips the preview work.

@@ -72,7 +72,7 @@ Dew's modules name the logical axes of their parameters, such as `embed`, `heads
 An objective implements two methods:
 
 - `init(key, variables=None)` returns the model's variables.
-- `loss(variables, batch, step)` returns the loss as a `Mean(total, mass)` and an `Aux` with metrics to log.
+- `loss(variables, batch, step)` returns the loss as a `Ratio(total, mass)` and an `Aux` with metrics to log.
 
 It can also implement `evaluate` for validation and `preview` for samples, and it names the weights that keep an exponential moving average (EMA) in its `ema` attribute. Its `shown` attribute maps metric names to `Shown` values that tell the training display how to show them: `Shown(better="higher", percent=True)`, for an accuracy, colours a rise as progress and prints the value as a percentage.
 

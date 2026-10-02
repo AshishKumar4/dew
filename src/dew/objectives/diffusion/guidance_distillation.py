@@ -21,7 +21,7 @@ from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
-from dew.objectives.base import Aux, Mean, Step, Variables
+from dew.objectives.base import Aux, Ratio, Step, Variables
 from dew.registry import objectives
 
 from .objective import TEACHER, DiffusionObjective
@@ -113,7 +113,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
-        return Mean(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return Ratio(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
 
 __all__ = ["GuidanceDistillationObjective", "guided_target", "with_guidance"]

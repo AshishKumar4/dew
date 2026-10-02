@@ -1023,11 +1023,13 @@ def test_the_qk_norm_reads_the_model_norm_eps(rng):
     assert not jnp.allclose(q_small, q_large, rtol=1e-2)
 
 
-def test_the_tied_head_multiplies_bf16_into_fp32_under_bf16_compute(rng):
+def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute(rng):
     """Under bf16 compute the head multiplies the bf16 states by the table
-    rounded to bf16 and accumulates in fp32: the products are exact, so the
-    logits are the fp32 sum of the rounded operands, not the fp32 table's
-    product and not a product rounded to bf16 at the end."""
+    rounded to bf16, accumulates in fp32 and rounds the logits to bf16, as
+    torch autocast's bf16 logits are: each logit is a bf16 value within a
+    bf16 rounding (2^-8 relative) of the fp32 sum of the rounded operands,
+    plus that sum's own fp32 rounding. At "highest" the head multiplies the
+    fp32 table, and its logits are that fp32 product."""
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -1037,12 +1039,16 @@ def test_the_tied_head_multiplies_bf16_into_fp32_under_bf16_compute(rng):
     exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
                        table.astype(jnp.bfloat16).astype(jnp.float32),
                        precision=jax.lax.Precision.HIGHEST)
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32)))
+    assert np.all(np.abs(np.asarray(logits - exact)) <= 2 ** -8 * np.abs(np.asarray(exact)) + 1e-6)
+    assert not np.allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
+
+    strict = tiny(dtype=jnp.bfloat16, precision="highest")
+    logits = strict.apply(params, ids)
+    hidden = strict.apply(params, ids, method=CausalTransformer.hidden_states)
     fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table,
                       precision=jax.lax.Precision.HIGHEST)
-    rounded = exact.astype(jnp.bfloat16).astype(jnp.float32)
-    np.testing.assert_allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(rounded), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
