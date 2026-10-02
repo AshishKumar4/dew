@@ -16,6 +16,7 @@ same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 """
 
 import json
+import math
 import shutil
 import tarfile
 from importlib import import_module
@@ -28,7 +29,7 @@ import pytest
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.wan import load_wan_vae, wan_vae_fields, wan_vae_path
+from dew.nn.autoencoders.wan import WanRMSNorm, load_wan_vae, wan_vae_fields, wan_vae_path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -232,8 +233,31 @@ def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
         difference = np.abs(np.asarray(value, np.float64) - expected)
         scale = max(1.0, float(np.abs(expected).max()))
         print(f"{name}: mean gap {difference.mean():.3g}, scaled max {difference.max() / scale:.3g}")
+        # 2^-8 is bfloat16's unit roundoff: within one rounding of the
+        # output's scale on average. 2^-3 is twice the largest scaled gap any
+        # output reached over four other seeds (6.1e-2, the latent gradient),
+        # rounded up to a power of two. Normalizing over another axis, or
+        # dropping the sqrt(C) scale, fails the first at every output.
         assert difference.mean() / scale < 2.0 ** -8, name
         assert difference.max() / scale < 2.0 ** -3, name
+
+
+def test_a_zero_row_normalizes_to_zero_with_a_finite_gradient():
+    """`F.normalize` clamps the norm at 1e-12, so a zero row and one far
+    below the clamp both divide by 1e-12: the zero row stays zero, and either
+    row's gradient is the probe times sqrt(C) * gamma / 1e-12, finite, as
+    torch's is. Clamping the norm after its square root would leave sqrt's
+    derivative at zero, NaN through the clamp, in both."""
+    features = 16
+    rows = jnp.stack([jnp.zeros(features), jnp.full(features, 1e-20)])
+    gamma = jnp.linspace(0.5, 1.5, features)
+    probe = jnp.linspace(-1.0, 1.0, 2 * features).reshape(2, features)
+    output, pullback = jax.vjp(lambda x: WanRMSNorm(features, 1).apply({"params": {"gamma": gamma}}, x), rows)
+    (gradient,) = pullback(probe)
+    clamped = math.sqrt(features) * np.asarray(gamma) / 1e-12
+    np.testing.assert_array_equal(np.asarray(output[0]), 0.0)
+    np.testing.assert_allclose(np.asarray(output[1]), np.asarray(rows[1]) * clamped, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(gradient), np.asarray(probe) * clamped, rtol=1e-6)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
