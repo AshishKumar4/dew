@@ -51,7 +51,6 @@ def phases(args):
 
     pipelines.restore_variables = measured('read_s', pipelines.restore_variables)
     DiffusionRunConfig.build = measured('build_s', DiffusionRunConfig.build)
-    pipelines._with_drawn_tables = measured('build_s', pipelines._with_drawn_tables)
     load = time.perf_counter()
     with jax.default_matmul_precision('highest'):
         pipe = (TextToImage.from_run(args.source) if os.path.isdir(args.source) else
