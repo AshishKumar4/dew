@@ -1,28 +1,16 @@
 """FLUX.2's transformer, as Diffusers 0.40.0's `Flux2Transformer2DModel` runs it.
 
-FLUX.2 keeps Flux's two halves - double-stream blocks that join the image and
-the text only inside attention, then single-stream blocks over the joined
-sequence - and changes what fills them:
-
-- no projection carries a bias, and the feed-forwards are SwiGLU: one map
-  into twice the hidden width, whose first half gates the second through a
-  SiLU, and one map back;
-- the modulation is computed once per call from the time (and distilled
-  guidance) embedding, one set for the double blocks' image stream, one for
-  their text stream and one for the single blocks, and every block reads the
-  same set;
-- a single block projects its queries, keys, values and the feed-forward's
-  input in one map, and its attention output and gated hidden state in one
-  map back;
-- the rotary table has four axes (time, row, column, token), 32 channels
-  each at theta 2000: a text token sits at (0, 0, 0, i) and an image position
-  at (0, row, column, 0);
-- there is no pooled text vector: the text is a sequence of stacked hidden
-  states from the Mistral-3 encoder.
-
-The latent this module reads is the pipeline's: the VAE's 32 channels folded
-2x2 into 128, one token per position, which `dew.nn.autoencoders.flux2`
-produces, so no packing happens here.
+Flux's double-stream blocks (image and text meet only in attention) then
+single-stream blocks, with these changes: no projection carries a bias and
+the feed-forwards are SwiGLU; one modulation per call from the time (and
+guidance) embedding, one set each for the double blocks' two streams and
+the single blocks; a single block's qkv and feed-forward input are one map
+and its attention output and gated state one map back; the rotary table has
+four axes (time, row, column, token) of 32 channels at theta 2000, a text
+token at (0, 0, 0, i) and an image position at (0, row, column, 0); and the
+text is the Mistral-3 encoder's stacked hidden states, with no pooled
+vector. The latent is the pipeline's 32 VAE channels folded 2x2 into 128,
+which `dew.nn.autoencoders.flux2` produces.
 """
 
 from __future__ import annotations

@@ -1,25 +1,16 @@
 """The deep compression autoencoder (DC-AE) of SANA, `AutoencoderDC`.
 
-An independent linen port of diffusers 0.34.0
-src/diffusers/models/autoencoders/autoencoder_dc.py (Apache-2.0), NHWC. The
-encoder is deterministic: `encode` returns the latent and ignores a key.
-
-Each level holds residual blocks (`ResBlock`) or EfficientViT blocks, a
-ReLU linear attention with an optional depthwise multiscale branch followed by
-a gated inverted-bottleneck convolution (`GLUMBConv`). Levels are joined by
-resampling blocks whose shortcuts average channel groups on the way down and
-repeat channels on the way up, around a pixel (un)shuffle. Two facts of the
-source are kept as they are:
-
-- the attention reads its heads from the concatenated `[q | k | v]` channels
-  in runs of `3 * head_dim`, so a "query" is not the query projection's head;
-- an attention over at most `head_dim` positions takes the quadratic path,
-  and over more the linear one, which runs in float32.
-
-A batch norm (the decoder's ResBlocks in the `in-1.0` checkpoints) uses its
-running statistics, as the source's eval mode does. They are held as
-parameters beside its scale and bias, since the autoencoder trains frozen;
-the step count `num_batches_tracked` affects nothing in eval and is not read.
+An independent linen port of diffusers 0.34.0 autoencoder_dc.py
+(Apache-2.0), NHWC; `encode` is deterministic and ignores a key. Levels hold
+`ResBlock`s or EfficientViT blocks (ReLU linear attention with an optional
+depthwise multiscale branch, then a `GLUMBConv`), joined by resampling
+blocks whose shortcuts average channel groups down and repeat channels up
+around a pixel (un)shuffle. Kept as the source has them: the attention reads
+its heads from the concatenated `[q | k | v]` channels in runs of
+`3 * head_dim`, and attends quadratically over at most `head_dim` positions,
+linearly in float32 over more. A batch norm (the `in-1.0` decoder's) uses
+its running statistics as eval mode does, held as parameters; the frozen
+autoencoder never reads `num_batches_tracked`.
 """
 from __future__ import annotations
 

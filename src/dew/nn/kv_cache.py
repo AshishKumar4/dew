@@ -1,47 +1,30 @@
 """How a decode cache stores its keys and values: dense or paged, full or quantized.
 
 `dew.nn.attention.open_kv_cache` owns the cursor and the compact slot
-positions; this module owns the storage behind them. A `KVCache` value names
-the layout, and `KVStore` reads and writes it inside one attention module.
+positions; a `KVCache` value names the storage layout behind them and
+`KVStore` reads and writes it inside one attention module.
 
 Dense storage is one `[rows, capacity, kv_heads, head_dim]` block per row.
-Paged storage is one pool of fixed-size pages shared by every row,
-`[kv_heads, pages, page_size, head_dim]`, the layout the Pallas TPU paged
-attention kernel reads (`jax.experimental.pallas.ops.tpu.paged_attention`),
-and a
-`[rows, capacity // page_size]` page table maps a row's slot `s` to page
-`table[row, s // page_size]`, offset `s % page_size`. A row owns its pages
-only through the table, so a server can hand pages out on demand, share the
-pages of a common prompt prefix between rows, and hold more rows than
-`pages * page_size / capacity` whenever they are shorter than the capacity.
-
-A pool may be split into `groups`: the rows fall into that many equal
-groups in row order, the pool into as many equal parts, and a row's table
-names pages of its own group's part, counted from the start of that part.
-Reads and writes run mapped over the groups, so the group is a batch
-dimension of every gather and scatter into the pool. A server whose mesh
-splits its rows `n` ways splits the pool into `n` groups, and each device
-then reads and writes only the pages it holds. A pool indexed as one table
-into the whole of a split pool would be gathered onto every device first.
+Paged storage is one pool `[kv_heads, pages, page_size, head_dim]` shared by
+every row, the layout the Pallas TPU paged attention kernel reads, with a
+`[rows, capacity // page_size]` page table mapping slot `s` to page
+`table[row, s // page_size]`, offset `s % page_size`. A server can then hand
+pages out on demand, share a common prefix's pages, and hold more rows than
+`pages * page_size / capacity` while they are short. A pool split into
+`groups` gives each equal group of rows its own part, indexed from the
+part's start, so a server whose mesh splits rows `n` ways reads and writes
+only the pages each device holds instead of gathering the whole pool.
 
 A quantized cache stores int8 or float8 (e4m3) values with one float32
-scale per token and head, the absmax over the head's features divided by
-the format's largest value. Reads dequantize to the compute dtype.
-
-An int8 cache stores its keys rotated by the orthonormal Hadamard matrix
-over head_dim, as QuaRot (Ashkboos et al. 2024, arXiv:2404.00456) rotates
-its KV cache. A checkpoint whose keys carry a few outlier channels (Qwen3's
-do) otherwise spends the one per-token scale on those channels, and the rest
-round to a handful of levels; rotated, every channel carries an even share
-of the outlier. The keys stay rotated when read, and the query takes the
-same rotation (`Append.query`), which leaves every logit as it was, since
-`H Hᵀ = I`: one `[rows, heads, head_dim]` product per step, not one over the
-whole cache. Values are not rotated. Float8 keys are not rotated either:
-e4m3 rounds each element relative to itself, so an outlier costs the other
-channels nothing, and spreading it made things worse. On Qwen3-0.6B over
-wikitext-2, against the bf16 cache: int8 unrotated +0.66 perplexity,
-rotated +0.008; float8 unrotated -0.03, rotated +1.03. The full table is in
-docs/concepts/inference.md.
+scale per token and head (absmax over the head's features over the
+format's largest value), dequantized on read. int8 keys are stored rotated
+by the orthonormal Hadamard matrix over head_dim, as QuaRot (arXiv:2404.00456)
+rotates its cache, so a few outlier channels (Qwen3's keys) do not take the
+whole per-token scale; the query takes the same rotation (`Append.query`),
+leaving every logit unchanged since `H Hᵀ = I`. Values and float8 keys are
+not rotated (e4m3 rounds each element relative to itself). On Qwen3-0.6B
+over wikitext-2 against bf16: int8 +0.66 perplexity unrotated, +0.008
+rotated; float8 -0.03 unrotated, +1.03 rotated (docs/concepts/inference.md).
 """
 
 from __future__ import annotations
@@ -92,15 +75,12 @@ def is_paged(cache: Mapping[str, object]) -> bool:
 class KVCache:
     """The storage layout of a decode cache.
 
-    `quantized` stores keys and values in that format with per-token,
-    per-head scales; int8 keys are Hadamard-rotated, which needs a
-    power-of-two head_dim. None keeps the compute dtype. `page_size` pages the cache:
-    `capacity` has to be a multiple of it, and `pages` sizes the shared
-    pool, None allocating one page per slot of every row the cache is
-    opened for (as much memory as the dense layout). A smaller pool is a
-    server's to hand out (`dew.inference.serving.Server`). `groups` splits
-    a paged pool into that many parts, one per equal group of rows (see
-    the module docstring); the row count and `pages` have to divide by it.
+    `quantized` stores keys and values in that format with per-token, per-head
+    scales; int8 keys are Hadamard-rotated, which needs a power-of-two head_dim.
+    `page_size` pages the cache (`capacity` a multiple of it) and `pages` sizes
+    the pool, None giving one page per slot of every row; a smaller pool is a
+    server's to hand out (`dew.inference.serving.Server`). `groups` splits a
+    paged pool by equal groups of rows; the row count and `pages` divide by it.
     """
 
     quantized: KVDtype | None = None
@@ -200,12 +180,10 @@ class Layered(Protocol):
 def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
     """Refuse a paged pool that cannot give each of `rows` rows its whole `capacity`.
 
-    A caller that writes through the default page tables, as generation
-    does, needs a private block of pages for every row. Jax's checkify
-    cannot carry a device check into a model layer's shard_map
-    (jax-ml/jax#40907), so the store checks no write, and the shapes decide
-    it here instead, before any write. A server hands a smaller pool out
-    itself (`dew.inference.serving.Server`).
+    Writing through the default page tables, as generation does, needs a private
+    block of pages per row. checkify cannot carry a device check into a layer's
+    shard_map (jax-ml/jax#40907), so the shapes decide it here, before any
+    write.
     """
     if layout.page_size is None or layout.pages is None:
         return
@@ -219,13 +197,11 @@ def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
 def default_page_table(rows: int, per_row: int, pages: int, groups: int) -> jax.Array:
     """Each row owns a private contiguous block of `per_row` pages in its group's part.
 
-    Row `r` of a group holds pages `r * per_row` onward, counted from the
-    start of the part. That is what a cache opened outside a server reads,
-    over the default pool of one page per slot of every row. A smaller pool
-    cannot give every row a block: the pages past the end of a part read as
-    the part's size, an index no part holds, and a write through one is
-    dropped, so `refuse_unassigned` refuses such a pool before any write. A
-    server writes its rows' tables itself, so it never writes through them.
+    Row `r` of a group holds pages `r * per_row` onward, as a cache opened
+    outside a server reads. In a smaller pool the pages past a part's end read
+    as the part's size, an index no part holds, so a write through one drops;
+    `refuse_unassigned` refuses such a pool first. A server writes its own
+    tables.
     """
     part = pages // groups
     table = jnp.tile(jnp.arange(rows // groups * per_row, dtype=jnp.int32).reshape(rows // groups, per_row),
@@ -343,14 +319,11 @@ class KVStore:
     def kernel(self) -> bool:
         """Whether decode can read a full-precision BF16 page pool natively.
 
-        The kernel reads a bfloat16 pool: it casts any other page dtype to
-        bfloat16 on the way in, and its int8 path broadcasts the scales to
-        the pool's full width first, so a float32 or quantized pool takes
-        the gather. A GPU uses cuDNN's paged forward on supported heads and
-        pages of whole 16-token tiles. A pool split into
-        groups takes the gather as well: the kernel indexes one pool with
-        one table, and the grouped gather is what keeps each group's pages
-        on the device that holds them.
+        The TPU kernel reads bfloat16 and casts other page dtypes (its int8 path
+        broadcasts the scales to full width first), so a float32 or quantized pool
+        takes the gather; a GPU uses cuDNN's paged forward on supported heads and
+        whole 16-token pages. A grouped pool takes the gather, which keeps each
+        group's pages where they are.
         """
         page_size = self.layout.page_size
         if (page_size is None or self.layout.quantized is not None
@@ -483,24 +456,14 @@ class Append:
 def gather_cache_rows(cache, rows):
     """A decode cache reindexed on its batch axis, one gather per leaf.
 
-    Outside the layer stack a cache holds one subtree per layer, and every
-    leaf a decode step writes carries its batch on axis zero: dense keys and
-    values with their cached validity and cursor, a gated delta net's
-    convolution and recurrent state, latent attention's compressed cache,
-    cached image groups, and a multimodal model's next position. The scanned
-    stack's layer axis exists only inside `run_stack`; `StackView` removes it
-    before the cache crosses `apply`, so axis zero is the row here whatever
-    the stack did.
-
-    `rows` is any index array: repeats duplicate a row's whole decode state,
-    a permutation reparents rows, and a shorter or longer array changes the
-    row count. Beam branching and speculative rollback are both this
-    operation. Nothing else in the tree depends on the row order, so the
-    gathered cache decodes exactly as the rows it came from.
-
-    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
-    share through their page tables, so gathered rows would write into each
-    other's pages; it is refused.
+    Every leaf a decode step writes carries its batch on axis zero outside the
+    stack (`StackView` removes a scanned layer axis before the cache crosses
+    `apply`): keys and values with validity and cursor, a delta net's states,
+    latent attention's cache, image groups, a multimodal model's next position.
+    `rows` is any index array: repeats duplicate a row's state, a permutation
+    reparents rows, a different length changes the row count; beam branching
+    and speculative rollback are both this. A paged cache is refused, since
+    gathered rows would write into each other's pages.
     """
     if is_paged(cache):
         raise ValueError("beam search and speculative decoding regroup cache rows, which a "
