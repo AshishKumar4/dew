@@ -67,6 +67,8 @@ class TokenScores:
     with no counted target weighs nothing."""
     losses: jax.Array
     weights: jax.Array
+    correct: jax.Array
+    """Per-token top-1 correctness, from the same logits that produced the losses."""
 
 
 # Scoring and preview hooks each return one artifact or a tuple. Metrics

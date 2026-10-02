@@ -137,8 +137,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         window's padding weighs nothing, so `perplexity` over a validation
         pass is exp of the ELBO bound per token, the number MDLM reports."""
         params = params if step.ema is None else step.ema
-        losses, weights = self._scored(params, batch, step.key)
-        return TokenScores(losses=losses, weights=weights)
+        losses, weights, correct = self._scored(params, batch, step.key)
+        return TokenScores(losses=losses, weights=weights, correct=correct)
 
     @functools.cached_property
     def _scored(self):
@@ -147,8 +147,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         every validation batch from the host, and jax's eager shard_map
         refuses the chunked head's map over the data axis alone."""
         def scored(params, batch, key):
-            _, losses, weights, _, _, real = self._token_losses(params, batch, key, train=False)
-            return losses * weights, real.astype(losses.dtype)
+            tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
+            return losses * weights, real.astype(losses.dtype), predicted == tokens
 
         return jax.jit(scored)
 

@@ -341,10 +341,12 @@ class GRPOObjective(LMObjective):
                                   method=type(self.model).hidden_states)
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
-        losses, _, _ = chunked_cross_entropy(
+        losses, predicted, _ = chunked_cross_entropy(
             hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=False)
+            precision=self.model.precision, predict=True)
+        assert predicted is not None
+        correct, _ = _unpadded(predicted == aligned[:, 1:], padding)
         losses, valid = _unpadded(losses, padding)
-        return TokenScores(losses=losses, weights=valid.astype(losses.dtype))
+        return TokenScores(losses=losses, weights=valid.astype(losses.dtype), correct=correct)
 
