@@ -388,7 +388,8 @@ class DiffusionObjective(Objective[Ratio]):
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
 
         call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
-        losses, aligned = self._denoised(variables, self.trainable(variables), samples, t, noise, call, images)
+        losses, aligned = self._denoised(
+            variables, self.trainable(variables), samples, t, noise, call, images)
         weighted = losses * expand(self.process.weight(t), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
