@@ -120,8 +120,8 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
     np.testing.assert_array_equal(
         drawn.host().tokens,
-        TextGeneration(task.model, state.averaged)([list(b"the ")], 4, key=1,
-                                                   sampling=Sampling(temperature=0)).host().tokens)
+        TextGeneration(task.model, state.params)([list(b"the ")], 4, key=1,
+                                                 sampling=Sampling(temperature=0)).host().tokens)
     objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
     trained = objective.pipeline(state, processor=task.processor)
     actual = task("the ", key=11).host()

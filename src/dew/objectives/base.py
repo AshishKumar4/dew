@@ -388,7 +388,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
-            return value, jnp.asarray(True)
+            return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
@@ -426,18 +426,20 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def _pipeline_weights(self, state: TrainState, ema: bool) -> Variables:
-        if self._ema_is_reference or not ema:
+    def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
+        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.params
         return state.averaged
 
-    def pipeline(self, state: TrainState, *, ema: bool = True) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
         """The trained model as its inference task over `state`'s weights.
 
-        Ordinary generative objectives require `state.averaged` when `ema`
-        is True; False selects live parameters. Reference-policy objectives
-        publish the trained policy, never their frozen loss reference. Arrays
-        retain their placement. Objectives without a generation task raise.
+        `ema` None takes `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, as `dew.pipeline` reads a
+        run; True requires the average and False selects live parameters.
+        Reference-policy objectives publish the trained policy, never their
+        frozen loss reference. Arrays retain their placement. Objectives
+        without a generation task raise.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 

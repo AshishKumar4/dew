@@ -34,7 +34,13 @@ class Best:
             raise ValueError("Best needs integer top >= 1 and mode min or max")
         if threshold is not None and not math.isfinite(threshold):
             raise ValueError("Best.threshold must be finite")
-        name = metric if isinstance(metric, str) else metric.name if isinstance(metric, (Metric, TrainingScalar)) else '<aggregate>'
+        name = (
+            metric
+            if isinstance(metric, str)
+            else metric.name
+            if isinstance(metric, (Metric, TrainingScalar))
+            else "<aggregate>"
+        )
         source = _source if _source is not None else None if isinstance(metric, str) else metric
         for field, value in (('metric', name), ('top', top), ('mode', mode), ('threshold', threshold),
                              ('weights_only', weights_only), ('split', split), ('_source', source)):

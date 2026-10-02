@@ -5,8 +5,9 @@ takes them as adaLN-Zero modulation instead. Both skip each first-half
 block's output into its mirror in the second half.
 """
 
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -154,7 +155,9 @@ class UViT(nn.Module):
         original_img = x
         _, H, W, _ = original_img.shape
         num_patches = (H // self.patch_size) * (W // self.patch_size)
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, (
+            "Image dimensions must be divisible by patch size"
+        )
 
         hilbert_inv_idx = None
         if self.scan_order == "hilbert":
@@ -163,8 +166,10 @@ class UViT(nn.Module):
         else:
             x_patches = self.patch_embed(x)
 
-        assert num_patches <= self.pos_encoding.shape[
-            1], f"Number of patches {num_patches} exceeds max_len {self.pos_encoding.shape[1]} in positional encoding"
+        assert num_patches <= self.pos_encoding.shape[1], (
+            f"Number of patches {num_patches} exceeds max_len {self.pos_encoding.shape[1]} "
+            "in positional encoding"
+        )
         x_patches = x_patches + self.pos_encoding[:, :num_patches, :]
 
         time_token = self.time_embed(temb.astype(at_least_fp32(self.dtype)))
@@ -301,7 +306,9 @@ class SimpleUDiT(nn.Module):
 
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         _, H, W, _ = x.shape
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, (
+            "Image dimensions must be divisible by patch size"
+        )
 
         hilbert_inv_idx = None
         if self.scan_order == "hilbert":

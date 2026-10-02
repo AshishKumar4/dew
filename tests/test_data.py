@@ -907,7 +907,7 @@ class Lingering(Augmenting):
 
 
 @pytest.mark.slow
-def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(capsys):
+def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caplog):
     """grain stops a stream's worker processes one after another, each
     finishing the batch in its hands before it exits, and kills a worker
     that has not exited within 25 s. Four workers taking 2 s each keep a
@@ -928,7 +928,7 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound(caps
     began = time.perf_counter()
     prefetch.close()
     assert time.perf_counter() - began > loading.workers * data.seconds
-    assert "waiting for 4 grain workers to stop" in capsys.readouterr().err
+    assert "waiting for 4 grain workers to stop" in caplog.text
 
 
 def test_a_stop_closes_grain_when_no_thread_can_announce_it(monkeypatch):
@@ -1265,20 +1265,6 @@ def test_resizing_interpolates_up_and_averages_down():
     assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
 
 
-@pytest.mark.network
-def test_an_overlong_caption_is_truncated_to_the_text_context():
-    """The tokenizer pads and truncates to CLIP's context, so one enormous
-    caption cannot change the batch's shape."""
-    tokenizer = dew.data.AutoTextTokenizer(tensor_type="np")
-    context = tokenizer.tokenizer.model_max_length
-
-    out = tokenizer(["short", " ".join(["word"] * 500)])
-
-    assert out["input_ids"].shape == (2, context)
-    assert int(out["attention_mask"][1].sum()) == context
-    assert int(out["attention_mask"][0].sum()) < context
-
-
 # ---------------------------------------------------------------------------------
 # Whose tokenizer: the run's condition, not the dataset
 # ---------------------------------------------------------------------------------
@@ -1568,6 +1554,17 @@ def test_held_out_records_too_few_for_one_batch_are_refused():
         Dataset.from_records(_columns(), batch=4, validation=_columns(3))
 
 
+def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
+    """Token ids of varying length are the usual cause, and grain's own
+    message names the batch structure rather than what to change."""
+    rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
+    stream = Dataset.from_records(rows, batch=2).train(DataPartition())
+
+    with pytest.raises(ValueError, match="cut or pad a variable-length field") as refused:
+        next(stream)
+    assert "same structure" in str(refused.value.__cause__)
+
+
 def test_training_records_too_few_for_one_batch_are_refused():
     """An endless stream would fill a batch by repeating records inside it,
     and an epoch would be zero steps long."""
@@ -1612,3 +1609,32 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.params),
                                 jax.tree.leaves(resumed.params), strict=True):
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+
+
+def test_a_fit_over_a_dataset_that_held_validation_out_says_so_once(capsys):
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Layout, Trainer
+
+    class Regression(Objective):
+        def __init__(self):
+            self.model = nn.Dense(1)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 2)))
+
+        def loss(self, params, batch, step):
+            return jnp.mean(self.model.apply(params, batch["x"]) ** 2), Aux({})
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    data = Dataset.from_records(_columns(16), batch=8)
+
+    trainer.fit(dataclasses.replace(data, held_out=24), steps=2, log_every=1)
+    noted = capsys.readouterr().out
+    trainer.fit(data, steps=2, log_every=1)
+
+    assert noted.count("validation: 24 records held out of train") == 1
+    assert "held out" not in capsys.readouterr().out

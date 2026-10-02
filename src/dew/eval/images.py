@@ -93,8 +93,12 @@ def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DE
     _equal_counts(pixels.shape[0], len(prompts))
     if pixels.shape[0] == 0:
         raise ValueError("clip_score: no images to score")
-    from dew.data.processors import AutoTextTokenizer
-    tokens = AutoTextTokenizer(tensor_type="np", modelname=modelname)(list(prompts))
+    from dew.data.text import load_tokenizer
+    # CLIP's own context bounds a caption, so an overlong one is truncated
+    # to it rather than overrunning the position table.
+    tokenizer = load_tokenizer(modelname)
+    tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
+                       truncation=True, return_tensors="np")
     total = 0.0
     with metric_device():
         for start in range(0, pixels.shape[0], batch_size):

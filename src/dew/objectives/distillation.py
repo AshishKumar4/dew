@@ -36,21 +36,14 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import linen as nn
+from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
-from dew.objectives.base import (
-    Aux,
-    Batch,
-    Effects,
-    EMASpec,
-    Loss,
-    Objective,
-    Prediction,
-    Ratio,
-    Step,
-    Variables,
-)
+from dew.objectives.base import Aux, Batch, EMASpec, Objective, Prediction, Ratio, Step, Variables
 from dew.registry import objectives
+
+Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -230,7 +223,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
                                     scored=scored)
 
-    def pipeline(self, state: TrainState, *, ema: bool = True):
+    def pipeline(self, state: TrainState, *, ema: bool | None = None):
         """The student as its inference task; the teacher stays behind."""
         return self.student.pipeline(
             replace(state, params=self.student_variables(state.params),

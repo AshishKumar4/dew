@@ -1,8 +1,8 @@
 """The convolutional UNet, and the body it shares with the video UNet."""
 
 import dataclasses
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Callable, Sequence
 
 import jax
 import jax.numpy as jnp

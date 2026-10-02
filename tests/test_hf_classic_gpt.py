@@ -65,7 +65,7 @@ def test_gpt2_public_generation_matches_the_reference_continuation():
     loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')[:1, :4]
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
-    generated = task(ids, max_new_tokens=6, seed=0)
+    generated = task(ids, max_new_tokens=6, key=0)
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(FIXTURES / 'gpt2-tiny' / 'generated.npy'))
 
 

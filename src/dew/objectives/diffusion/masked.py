@@ -21,7 +21,8 @@ compilation rather than a constant embedded in the executable.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
 TEXT_KEY = "text"
 
 
+_DEFAULT_SAMPLER = Unmask()
+
+
 @objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective[Ratio]):
     """Train a masked diffusion model on the MDLM negative ELBO.
@@ -54,7 +58,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     """
 
     artifact = TextSamples
-    shown = {"masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
+    shown: Mapping[str, Shown] = {
+        "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 
     def __init__(
         self,
@@ -64,7 +69,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         *,
         head_chunks: int = 4,
         ema_decay: float | None = 0.999,
-        sampler: Unmask = Unmask(),
+        sampler: Unmask = _DEFAULT_SAMPLER,
         steps: int = MDLM_STEPS,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
@@ -96,7 +101,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> MaskedGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> MaskedGeneration:
         """Publish the state's weights as a native full-response MDLM task."""
         from dew.inference.tasks import MaskedGeneration
 
@@ -183,9 +189,15 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(params, masked, train=train, positions=prepared.token_fields.get("positions"),
-                                  segment_ids=segment_ids, rngs={"dropout": dropout_key},
-                                  method=type(self.model).hidden_states)
+        hidden = self.model.apply(
+            params,
+            masked,
+            train=train,
+            positions=prepared.token_fields.get("positions"),
+            segment_ids=segment_ids,
+            rngs={"dropout": dropout_key},
+            method=type(self.model).hidden_states,
+        )
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,

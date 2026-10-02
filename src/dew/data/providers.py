@@ -354,7 +354,7 @@ class ProviderDataset(DatasetSpec):
 class PreparedTFDS(ProviderDataset):
     """Reads splits of a prepared TFDS builder where preparation left them."""
 
-    options: PreparedOptions = TFDSOptions()
+    options: PreparedOptions = dataclasses.field(default_factory=TFDSOptions)
 
     def read(self, name: str, split: str) -> Records:
         return self.options.source(name, split)
@@ -377,7 +377,7 @@ class HubDataset(ProviderDataset):
 
     streaming: bool = False
     shuffle_buffer: int = 0
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
 
     def read(self, name: str, split: str) -> Records:
         from .sources.hf import HFDatasetSource
@@ -455,12 +455,15 @@ _GIVEN = "the dataset load() was given"
 """What a table a caller built is called, in a refusal and in a record count."""
 
 
+_DEFAULT_LOADING = Loading()
+
+
 def load(source: Named, *, batch: int,
          options: HFOptions | TFDSOptions | None = None, split: str = "train",
          val_split: str | None = None, val_batches: int | None = None,
          records: int | None = None, preprocess: Preprocess | None = None,
          seed: int = 0, shuffle_buffer: int = 0, streaming: bool = False,
-         loading: Loading = Loading(),
+         loading: Loading = _DEFAULT_LOADING,
          dataset: ArrowDataset | IterableDataset | None = None) -> Dataset:
     """The `Dataset` behind `source`, read where the provider already holds it.
 

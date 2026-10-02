@@ -680,7 +680,7 @@ class ChatMessages(DatasetSpec):
     """Which split `path` is read at, when it names a Hub dataset."""
     val_split: str | None = None
     """Which split `val_path` is read at; None reads `split`."""
-    options: HubOptions = HFOptions()
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
     """What `datasets.load_dataset` takes beside the id and the split."""
     seq_len: int = 256
     val_batches: int | None = 4

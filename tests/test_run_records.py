@@ -108,9 +108,13 @@ def described(value, annotation):
 
 
 def snapshot_default(field: dataclasses.Field, annotation):
-    """What a record lacking `field` reads as. A factory other than a class
-    or a lambda computes its default where it runs (the compilation cache is
-    under the user's home), so the snapshot names the factory."""
+    """What a record lacking `field` reads as: its `legacy` value when the
+    default moved after runs were recorded, else the default. A factory
+    other than a class or a lambda computes its default where it runs (the
+    compilation cache is under the user's home), so the snapshot names the
+    factory."""
+    if "legacy" in field.metadata:
+        return described(field.metadata["legacy"], annotation)
     factory = field.default_factory
     if factory is not dataclasses.MISSING and not isinstance(factory, type) and factory.__name__ != "<lambda>":
         value = factory()
@@ -236,6 +240,29 @@ def test_a_run_with_a_regime_keeps_it_and_its_autoencoder():
     assert run.autoencoder == PretrainedAutoencoder(modelname="pcuenq/sd-vae-ft-mse-flax", revision="main")
 
 
+def test_an_lm_record_without_ema_decay_keeps_the_average_it_was_written_under():
+    """An LM run keeps no EMA unless it asks for one, and records that
+    choice; a record that lacks `ema_decay` was written when every LM run
+    kept a 0.999 average, and it reads back as one."""
+    for config in (LMRunConfig, recipe_config("lm", "LmRunConfig")):
+        assert config().ema_decay is None
+        written = json.loads(json.dumps(config().to_dict()))
+        assert written["ema_decay"] is None
+        assert config.from_dict(written).ema_decay is None
+        assert config.from_dict({**written, "ema_decay": 0.99}).ema_decay == 0.99
+        del written["ema_decay"]
+        assert config.from_dict(written).ema_decay == 0.999
+
+
+def test_a_changed_legacy_value_fails_the_snapshot(monkeypatch):
+    """A field whose default moved holds what older records meant as its
+    `legacy` value, and the snapshot reads that one."""
+    field = next(field for field in dataclasses.fields(LMRunConfig) if field.name == "ema_decay")
+    monkeypatch.setattr(field, "metadata", {"legacy": 0.99})
+    with pytest.raises(AssertionError, match=r"LMRunConfig.ema_decay: 0.999 -> 0.99"):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
+
+
 def test_an_unknown_field_is_refused():
     published = record("hybrid-dit-176m-dfa94d6")
     with pytest.raises(ValueError, match=r"unknown fields \['epochs'\]"):
@@ -271,3 +298,14 @@ def test_a_task_reads_an_older_record_with_the_spec_at_the_top_level(tmp_path):
     (tmp_path / "run.json").write_text(json.dumps(older))
     assert _saved_quantization(run_record(str(tmp_path))) == Quantization()
 
+
+
+def test_an_image_record_without_augment_validation_keeps_augmenting_its_validation():
+    """Image specs now score validation on unaugmented images; a record that
+    lacks the field was written when validation took the training
+    augmentation, and it reads back that way."""
+    run = DiffusionRunConfig.from_dict(record("hybrid-dit-176m-dfa94d6"))
+    assert run.data.augment_validation is True
+
+    written = json.loads(json.dumps(DiffusionRunConfig().to_dict()))
+    assert DiffusionRunConfig.from_dict(written).data.augment_validation is False

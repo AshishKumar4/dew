@@ -29,8 +29,8 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping as MappingABC, MutableMapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
+from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
 import tyro
@@ -44,16 +44,17 @@ from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.data.dataset import json_list_argument
-from dew.lora import LoRA, attach
+from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
-from dew.training.quantization import Quantization, quantize
+from dew.training.quantization import Quantization, _quantize
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
@@ -183,7 +184,11 @@ def _best_argument():
             return None
         if text.startswith(('{', '[')):
             policies = json.loads(text)
-            return tuple(Best(**policy) for policy in policies) if isinstance(policies, list) else Best(**policies)
+            return (
+                tuple(Best(**policy) for policy in policies)
+                if isinstance(policies, list)
+                else Best(**policies)
+            )
         return Best(text)
 
     def write(policy):
@@ -191,7 +196,13 @@ def _best_argument():
             return ['None']
         if isinstance(policy, str):
             return [policy]
-        return [json.dumps([_to_json(entry, Best) for entry in policy] if isinstance(policy, tuple) else _to_json(policy, Best))]
+        return [
+            json.dumps(
+                [_to_json(entry, Best) for entry in policy]
+                if isinstance(policy, tuple)
+                else _to_json(policy, Best)
+            )
+        ]
 
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1, metavar='METRIC|JSON', instance_from_str=read,
@@ -201,10 +212,16 @@ def _best_argument():
 
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar='LATEST|JSON',
-        instance_from_str=lambda given: Keep(**json.loads(given[0])) if given[0].startswith('{') else int(given[0]),
+        nargs=1,
+        metavar="LATEST|JSON",
+        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        if given[0].startswith("{")
+        else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
-        str_from_instance=lambda keep: [json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)])
+        str_from_instance=lambda keep: [
+            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+        ],
+    )
 
 
 def _cadence_argument():
@@ -216,9 +233,14 @@ def _cadence_argument():
             return value
         return int(value) if value.isdecimal() else duration(value)
     return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar='STEPS|DURATION|epoch', instance_from_str=read,
+        nargs=1,
+        metavar="STEPS|DURATION|epoch",
+        instance_from_str=read,
         is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
-        str_from_instance=lambda value: [recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)])
+        str_from_instance=lambda value: [
+            recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
+        ],
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -256,8 +278,8 @@ class TrainerConfig:
     One optimizer update a step either way, and the compiled step is traced
     once per stage."""
     dynamic_scale: bool = False
-    mesh: MeshSpec = MeshSpec()
-    layout: Layout = Layout()
+    mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
+    layout: Layout = dataclasses.field(default_factory=Layout)
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
@@ -268,7 +290,8 @@ class TrainerConfig:
     wandb: Wandb | None = None
     """Optional W&B sink in addition to the local tracking journal."""
     multi_host: bool | None = None
-    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
+    """Join the JAX process pool. None asks and continues alone only when no
+    cluster is configured; True requires the pool; False never asks."""
     xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
@@ -298,7 +321,9 @@ class TrainerConfig:
                 if not isinstance(choice, Best) or choice._source is not None:
                     raise TypeError("a recorded best selector names metrics; callable scores are code-only")
                 rebuilt.append(choice)
-            object.__setattr__(self, 'best', tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0])
+            object.__setattr__(
+                self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
+            )
 
     def best_policies(self):
         if self.best is None:
@@ -492,7 +517,13 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
     takes its declared default, which says what runs recorded before the
     field existed did (tests/fixtures/record_defaults.json holds every
     default to that); a field `cls` does not declare, or a required one the
-    record lacks, raises."""
+    record lacks, raises.
+
+    A field whose default moved after runs were recorded without it says
+    what those runs meant as `metadata={"legacy": value}`, and a record
+    that lacks it reads as that value. Every record `to_dict` writes
+    carries the field, so code that builds the class takes the new default
+    and a recorded run keeps the old one."""
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
     for old, new in _FIELD_RENAMES.get(cls, {}).items():
@@ -507,8 +538,9 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(values[f.name]))
-            for f in declared if f.name in values}
+    return {f.name: _rebuild(_declared_type(cls, f.name), registry.configured(
+                values[f.name] if f.name in values else f.metadata["legacy"]))
+            for f in declared if f.name in values or "legacy" in f.metadata}
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
@@ -667,9 +699,9 @@ class RunConfig:
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
-            quantize(objective, self.trainer.quantization)
+            _quantize(objective, self.trainer.quantization)
         if self.lora is not None:
-            attach(objective, self.lora)
+            _attach(objective, self.lora)
         self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
@@ -689,8 +721,9 @@ class RunConfig:
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
-                    print("Experiment_Name:", name)
-                    print(f"Local tracking: {local.directory}")
+                    display = TrainingDisplay()
+                    display.note(f"Experiment_Name: {name}")
+                    display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)

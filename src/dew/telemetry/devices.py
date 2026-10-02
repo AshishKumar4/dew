@@ -47,7 +47,8 @@ def deterministic_ops_requested() -> bool:
 
     `--xla_gpu_deterministic_ops` orders the reductions of a GPU step.
     Autotuning, which `--xla_gpu_autotune_level=0` turns off, can pick
-    different kernels in another compilation (docs/guides/checkpoints.md). Kernel selection reads this flag: `dew.nn.attention` keeps
+    different kernels in another compilation (docs/guides/checkpoints.md).
+    Kernel selection reads this flag: `dew.nn.attention` keeps
     cudnn's fused attention away from a run that set it.
     """
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')

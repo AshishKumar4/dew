@@ -106,7 +106,7 @@ class SampledRollout:
     max_new_tokens: int = 32
     estimator: str = "group"
     truncation: str = "score"
-    sampling: Sampling = Sampling()
+    sampling: Sampling = dataclasses.field(default_factory=Sampling)
     metrics: dict[str, float] = dataclasses.field(default_factory=dict, init=False, compare=False)
     shown: ClassVar[Mapping[str, Shown]] = {"reward/mean": Shown(better="higher"),
                                              "status/truncated": Shown(better="lower", percent=True)}
