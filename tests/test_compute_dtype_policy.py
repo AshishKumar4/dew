@@ -331,6 +331,30 @@ def test_a_bf16_family_runs_its_matmuls_in_bf16(family, rng):
         f"they came from:\n{listing(found)}")
 
 
+@pytest.mark.parametrize("family", ["simple_dit", "hybrid_dit"])
+def test_a_bf16_dit_runs_its_gelu_in_fp32(family, rng):
+    """The DiT blocks' MLP GELU runs in fp32 and rounds once, as torch's bf16
+    GELU does: forward and backward, every tanh under a block's `mlp` reads
+    fp32. Computed in bf16, each of its eight elementwise steps keeps a bf16
+    rounding, which a v6e paid 0.93 ms for in the hybrid DiT's batch-16 step
+    (docs/performance.md). The time embedding's GELU, one row per image,
+    stays as it was."""
+    loss, params = family_loss(family, rng)
+    jaxpr = jax.make_jaxpr(jax.value_and_grad(loss))(params)
+
+    def tanh_inputs(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "tanh" and "/mlp" in str(equation.source_info.name_stack):
+                yield equation.invars[0].aval.dtype
+            for parameter in equation.params.values():
+                inner = getattr(parameter, "jaxpr", parameter)
+                if hasattr(inner, "eqns"):
+                    yield from tanh_inputs(inner)
+
+    dtypes = list(tanh_inputs(jaxpr.jaxpr))
+    assert dtypes and all(dtype == jnp.float32 for dtype in dtypes), dtypes
+
+
 def test_the_split_counts_every_flop_dew_counts(rng):
     """The denominator is dew's own step-FLOP number, not a second opinion:
     splitting the module by operand dtype adds back up to `hlo_flops`."""
