@@ -27,11 +27,12 @@ from dew.training import Layout, MeshSpec
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 
 
-def objective(scan: bool = False, dtype=None, every: int | None = None, **fields) -> LMObjective:
+def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
+              **fields) -> LMObjective:
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=LAYERS, num_heads=2, num_kv_heads=1,
         mlp_features=64, max_seq_len=SEQ_LEN, scan_layers=scan, dtype=dtype,
-        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, every=every), **fields)
+        mixture=Mixture(experts=EXPERTS, top_k=TOP_K, layers=layers), **fields)
     return LMObjective(model, SEQ_LEN)
 
 
@@ -90,7 +91,7 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
 def test_the_gate_keeps_its_gradient_under_replay():
     """Only the selection is fixed: the replayed loss is smooth in the router
     kernel, and its gradient matches a central difference along a direction."""
-    obj = objective(every=2)
+    obj = objective(layers=(1, 3))
     params = obj.init(jax.random.key(0))
     tokens = tokens_of(2)
     routed = jax.random.randint(jax.random.key(2), (2, SEQ_LEN + 1, LAYERS, 1), 0, EXPERTS)
@@ -179,7 +180,7 @@ def test_under_replay_the_bias_counts_the_replayed_experts():
 
 
 def test_a_record_that_does_not_fit_the_model_is_refused():
-    obj = objective(every=2)
+    obj = objective(layers=(1, 3))
     params = obj.init(jax.random.key(0))
     tokens = jnp.zeros((1, SEQ_LEN + 1), jnp.int32)
     with pytest.raises(ValueError, match="layers, top_k"):
