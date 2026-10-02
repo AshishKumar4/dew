@@ -135,6 +135,31 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
         np.testing.assert_array_equal(original, saved)
 
 
+@pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
+def test_inference_projection_layout_preserves_special_attention_logits(case):
+    from dew.inference.serving import _inference_projections
+
+    with jax.enable_x64():
+        model = CausalTransformer(
+            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1,
+            head_dim=8, mlp_features=32, max_seq_len=64, dtype=jnp.float64,
+            precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
+            kv_shared_layers=(1,) if case == "kv_shared" else None,
+            attention_k_eq_v=case == "k_eq_v", v_norm=case == "k_eq_v",
+            output_gate=case == "output_gate")
+        tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                                 model.init(jax.random.key(13), tokens))
+        packed = _inference_projections(model, variables)
+        expected = jax.jit(model.apply)(variables, tokens)
+        actual = jax.jit(model.apply)(packed, tokens)
+        # Both run in float64; 64 epsilon covers the tiny decoder's few
+        # reassociated dot sums, well inside the existing FP32 parity bound.
+        eps = 64 * np.finfo(np.float64).eps
+        np.testing.assert_allclose(actual, expected, atol=eps, rtol=eps)
+        np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone(decode_steps):
     """Five prompts of different widths and budgets, greedy, one seed per
