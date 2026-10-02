@@ -33,7 +33,7 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / 'run'))
     trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints)
-    trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
+    state = trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
     checkpoints.wait()
     assert not (tmp_path / 'run' / 'run.json').exists()
     record = Checkpoints(str(tmp_path / 'run')).artifact(2)
@@ -42,3 +42,10 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     rebuilt = ModelConfig.from_dict(record['model']).build()
     assert rebuilt == objective.model.clone(dtype=jnp.float32)
     assert record['tokenizer'] is None
+    from dew.inference import TextGeneration
+    task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
+    assert task.processor is None
+    tokens = jnp.arange(1, 9)[None, :]
+    expected = objective.model.apply(state.params, tokens)
+    actual = task.model.apply(task.variables, tokens)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
