@@ -9,8 +9,9 @@ That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
 slice of logits at a time.
 
-Evaluation generates one token row per input row for custom text metrics.
-The separate preview hook generates and decodes the configured display count.
+Evaluation scores every row's corruption loss as `TokenScores`, so
+perplexity-style metrics read the negative ELBO; the preview hook alone
+generates, and decodes the configured display count.
 
 `pretrained` continues from a released masked-diffusion checkpoint (LLaDA,
 Dream) instead of a fresh init. It reaches the trainer's state JIT as data
