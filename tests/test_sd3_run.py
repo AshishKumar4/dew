@@ -62,8 +62,8 @@ PROMPTS = ["a red bird", "two cats", "a harbour at dawn", "x",
 def run_config(directory):
     """The SD3-shaped run: MMDiT, flow matching, T5 text, the 16-channel VAE."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_mmdit", dict(patch_size=2, emb_features=32, num_layers=1,
-                                               num_heads=2, mlp_ratio=1),
+        model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
+                                               "num_heads": 2, "mlp_ratio": 1},
                           dtype="float32", attention_impl="reference"),
         data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),

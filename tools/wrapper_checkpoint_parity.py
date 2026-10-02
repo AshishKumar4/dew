@@ -42,12 +42,13 @@ def rounding_bound(config, reference, *, image=False):
     return float(2 * (_ROUNDING + recurrent_rounding) * epsilon * text.num_hidden_layers * scale)
 
 
-def check_checkpoint(checkpoint, output, revision=None):
+def measure_checkpoint(checkpoint, output, revision=None, *, reference_device=None):
+    """Return parity measurements and each (Dew logits, reference logits, token ids)."""
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     processor = AutoProcessor.from_pretrained(checkpoint, revision=revision)
-    device = 'cuda' if jax.default_backend() == 'gpu' else 'cpu'
+    device = reference_device or ('cuda' if jax.default_backend() == 'gpu' else 'cpu')
     reference = AutoModelForImageTextToText.from_pretrained(
         checkpoint, dtype=torch.float32, attn_implementation='eager', revision=revision).eval().to(device)
     image = np.random.default_rng(67).integers(0, 256, (32, 32, 3), dtype=np.uint8)
@@ -61,8 +62,8 @@ def check_checkpoint(checkpoint, output, revision=None):
         for batch in batches:
             placed = {name: value.to(device) for name, value in batch.items()}
             expected.append(reference(**placed, use_cache=False).logits.cpu().numpy())
-            continuations.append(reference.generate(**placed, max_new_tokens=3,
-                                                     do_sample=False, eos_token_id=None).cpu().numpy()[:, -3:])
+            continuations.append(reference.generate(
+                **placed, max_new_tokens=3, do_sample=False, eos_token_id=None).cpu().numpy()[:, -3:])
     del reference
     torch.cuda.empty_cache()
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
@@ -71,13 +72,16 @@ def check_checkpoint(checkpoint, output, revision=None):
     model = loaded.model.clone(language_model=language, precision=jax.lax.Precision.HIGHEST)
     loaded = dataclasses.replace(loaded, model=model)
     observations = []
+    logits = []
     for index, batch in enumerate(batches):
         inputs = loaded.processor.from_hf({name: value.numpy() for name, value in batch.items()})
         actual = np.asarray(model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
+        logits.append((actual, expected[index], batch['input_ids'].numpy()))
         error = float(np.max(np.abs(actual - expected[index])))
         bound = rounding_bound(config, expected[index], image=index == 1)
         argmax = bool(np.array_equal(actual.argmax(-1), expected[index].argmax(-1)))
-        generated = loaded.text_generation()(inputs, 3, key=jax.random.key(0), sampling=Sampling(temperature=0))
+        generated = loaded.text_generation()(
+            inputs, 3, key=jax.random.key(0), sampling=Sampling(temperature=0))
         agreement = bool(np.array_equal(np.asarray(generated.tokens)[:, -3:], continuations[index]))
         observations.append({'modality': 'text' if index == 0 else 'image',
                              'max_abs_error': error, 'bound': bound,
@@ -87,17 +91,24 @@ def check_checkpoint(checkpoint, output, revision=None):
                              'max_reference_logit': float(np.max(np.abs(expected[index]))),
                              'argmax_agreement': argmax, 'generation_agreement': agreement})
     metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
-    revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
+    revision = (config._commit_hash or revision
+                or (metadata.read_text().splitlines()[0] if metadata.is_file() else None))
     result = {'checkpoint': checkpoint, 'revision': revision,
               'dtype': 'float32', 'precision': 'highest', 'tf32': False,
               'bound': ('Qwen3.5 fixture calibration, linear token count and gamma_key_dim scaling'
                         if config.model_type in ('qwen3_5', 'qwen3_5_moe') else
-                        'verified-mapping rounding per transformer block, including vision blocks for images'),
+                        'verified-mapping rounding per transformer block, '
+                        'including vision blocks for images'),
               'device': jax.devices()[0].device_kind, 'observations': observations}
     Path(output).write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2), flush=True)
+    return result, logits
+
+
+def check_checkpoint(checkpoint, output, revision=None):
+    result, _ = measure_checkpoint(checkpoint, output, revision)
     assert all(row['max_abs_error'] < row['bound'] and row['argmax_agreement']
-               and row['generation_agreement'] for row in observations), result
+               and row['generation_agreement'] for row in result['observations']), result
 
 
 def main():

@@ -52,10 +52,10 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
-    `layers` names the sparse layers by index, or `every` makes every nth layer
-    sparse counting from the end of the first group (Qwen3-MoE's
-    decoder_sparse_step); neither makes every layer sparse (Mixtral). The
-    routing fields pass straight through to `Router`, which documents them.
+    `layers` names the sparse layers by index (a source's cadence, such as
+    Qwen3-MoE's decoder_sparse_step, translates to them); None makes every
+    layer sparse (Mixtral). The routing fields pass straight through to
+    `Router`, which documents them.
     `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
     beside the dense feed-forward on the same residual, each normed and summed,
     under `Gemma4TextRouter`, which refuses the routing fields.
@@ -74,7 +74,6 @@ class Mixture:
     experts: int
     top_k: int = 2
     layers: tuple[int, ...] | None = None
-    every: int | None = None
     score_function: str = 'softmax'
     norm_topk_prob: bool = True
     scaling: float = 1.0
@@ -108,12 +107,6 @@ class Mixture:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
                 "dense model has no mixture at all")
-        if self.layers is not None and self.every is not None:
-            raise ValueError(
-                f"layers ({self.layers}) and every ({self.every}) both choose the "
-                "sparse layers, so only one of them can be set")
-        if self.every is not None and self.every < 1:
-            raise ValueError(f"every must be positive, got {self.every}")
         if self.expert_features is not None and self.expert_features < 1:
             raise ValueError(
                 f"expert_features is the routed experts' width, got "
@@ -182,10 +175,14 @@ class GatedMLP(nn.Module):
             nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
         if self.activation not in ('gelu', 'gelu_exact', 'relu'):
-            self.gate_proj = dense(self.hidden_features, name='gate_proj')
+            if self.has_variable('params', 'gate_up_proj'):
+                self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
+            else:
+                self.gate_proj = dense(self.hidden_features, name='gate_proj')
         elif self.activation_sparsity or self.swiglu_limit is not None:
             raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
-        self.up_proj = dense(self.hidden_features, name='up_proj')
+        if not self.has_variable('params', 'gate_up_proj'):
+            self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
@@ -204,8 +201,12 @@ class GatedMLP(nn.Module):
             else:
                 hidden = nn.gelu(up)
             return checkpoint_name(self.down_proj(hidden), 'down_proj')
-        gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
-        up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
+        if self.has_variable('params', 'gate_up_proj'):
+            gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        gate = checkpoint_name(constrain(gate, MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
@@ -855,3 +856,6 @@ class MTPBlock(nn.Module):
             predicted = self.hc_head(predicted)
         normalized = self.final_norm(predicted)
         return normalized, normalized if self.hyper_connections is None else streams
+
+
+__all__ = ["BlockWiring", "DecoderBlock", "GatedMLP", "MTPBlock", "Mixture", "RematPolicy", "remat_policy"]

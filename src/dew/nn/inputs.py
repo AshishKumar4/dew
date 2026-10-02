@@ -527,3 +527,6 @@ class RowPlan:
     def host(self, leaf) -> np.ndarray:
         """This process's real rows of a result leaf as a host array."""
         return local_rows(leaf)[:self.rows]
+
+
+__all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "RowPlan"]

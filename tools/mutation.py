@@ -43,7 +43,7 @@ TARGETS = {
         "tests/test_causal_transformer.py", "tests/test_local_attention.py",
         "tests/test_sequence_parallel.py", "tests/test_attention_sinks.py")),
     "sources": Target("src/dew/data/sources", (
-        "tests/test_hf_data.py", "tests/test_online_loader.py",
+        "tests/test_hf_options_contract.py", "tests/test_hf_data.py", "tests/test_online_loader.py",
         "tests/test_text_data.py", "tests/test_tfds_read.py", "tests/test_data_av.py")),
 }
 
@@ -51,7 +51,7 @@ TARGETS = {
 # reference-model suites from neighboring source modules. Directory batches
 # retain the complete target suite above.
 FILE_TESTS = {
-    "src/dew/data/sources/hf.py": ("tests/test_hf_data.py",),
+    "src/dew/data/sources/hf.py": ("tests/test_hf_options_contract.py", "tests/test_hf_data.py"),
     "src/dew/diffusion/schedules/common.py": ("tests/test_schedule_contracts.py", "tests/test_schedulers.py"),
 }
 

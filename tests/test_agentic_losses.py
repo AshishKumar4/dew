@@ -104,7 +104,9 @@ def _run(reference, rollouts=("a", "b", "c", "d"), proximal=True, mask=None, **o
         loss, aux = objective.loss({"current": current}, batch, step)
         return loss.mean()[0], aux.metrics
 
-    (loss, metrics), grad = jax.value_and_grad(scalar, has_aux=True)(jnp.asarray(_place(reference["current"])))
+    (loss, metrics), grad = jax.value_and_grad(scalar, has_aux=True)(
+        jnp.asarray(_place(reference["current"]))
+    )
     return float(loss), _take(grad), {key: float(value) for key, value in metrics.items()}
 
 
@@ -189,7 +191,9 @@ def test_rollout_mean_matches_agent_lightning_per_rollout_mean(reference):
     loss, grad, _ = _run(reference, rollouts=rollouts, aggregation="session-mean")
     factor = len(set(rollouts)) / len(rollouts)
     assert loss * factor == pytest.approx(float(reference["per_rollout_loss"]), abs=TOLERANCE)
-    np.testing.assert_allclose(grad * factor * reference["mask"], reference["per_rollout_grad"], atol=TOLERANCE)
+    np.testing.assert_allclose(
+        grad * factor * reference["mask"], reference["per_rollout_grad"], atol=TOLERANCE
+    )
 
 
 def test_the_fixture_names_its_references(reference):

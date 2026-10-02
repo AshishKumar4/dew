@@ -83,7 +83,7 @@ def test_biased_exchange_preserves_all_gradients_and_idle_experts(dtype, expert,
         for dispatch in ('global', 'exchange'):
             layer = model.clone(dispatch=dispatch)
 
-            def loss(p, x, weights, indices):
+            def loss(p, x, weights, indices, *, layer=layer):
                 y = jnp.asarray(layer.apply(p, x, weights, indices))
                 work = y.astype(jnp.promote_types(y.dtype, jnp.float32))
                 return jnp.mean(jnp.sin(work)), y
@@ -137,7 +137,7 @@ def test_biased_exchange_padding_never_creates_an_expert_contribution(tokens):
     for dispatch in ('global', 'exchange'):
         layer = model.clone(dispatch=dispatch)
 
-        def loss(p, x, weights, indices):
+        def loss(p, x, weights, indices, *, layer=layer):
             output = jnp.asarray(layer.apply(p, x, weights, indices))
             return output.astype(jnp.float32).sum(), output
 
@@ -327,8 +327,8 @@ def test_biased_router_and_bias_parameters_keep_forward_mode(dtype, skewed):
         for dispatch in ('global', 'exchange'):
             layer = model.clone(dispatch=dispatch)
 
-            def run(parameters, x, direction, input_direction):
-                def forward(parameters, x):
+            def run(parameters, x, direction, input_direction, *, layer=layer):
+                def forward(parameters, x, *, layer=layer):
                     return jnp.asarray(layer.apply({'params': parameters}, x))
                 return jax.jvp(forward, (parameters, x), (direction, input_direction))
 

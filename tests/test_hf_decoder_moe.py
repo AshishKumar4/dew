@@ -14,10 +14,9 @@ import numpy as np
 import pytest
 from test_hf_decoders import GEMMA4_MOE, fixture_config, flat_tree, fp32_decoder
 
-from dew.interop import Pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.interop import PretrainedDecoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models, with_precision
 
@@ -108,7 +107,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     tensors = load_file(str(GPT_OSS / "model.safetensors"))
     packed = {}
     for name, tensor in tensors.items():
-        if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
+        if not (name.endswith(("gate_up_proj", "down_proj"))):
             packed[name] = tensor
             continue
         blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
@@ -122,7 +121,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
 
     pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    model, variables = pretrained.model, pretrained.variables
+    _model, variables = pretrained.model, pretrained.variables
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
@@ -513,7 +512,7 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     write_file({**tensors, "language_model.lm_head.weight": embedding + 1.0},
                source / "model.safetensors", {"format": "pt"})
     with pytest.raises(ValueError,
-                       match="language_model.lm_head.weight is not the embedding"):
+                       match=r"language_model.lm_head.weight is not the embedding"):
         Pretrained.load(str(source), dtype="float32", attention_impl="reference")
 
 
@@ -618,7 +617,7 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
     directory.mkdir()
     save_file(tensors, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(fixture_config("glm4-moe-tiny")))
-    with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
+    with pytest.raises(ValueError, match=r"shared_head.head.weight differs from lm_head.weight"):
         fp32_decoder(directory)
 
 
@@ -1025,7 +1024,7 @@ def test_both_spellings_of_one_deepseek_v4_tensor_are_refused():
     tensors = dict(load_shards(DEEPSEEK_V4))
     tensors["model.embed_tokens.weight"] = tensors["embed.weight"] + 1
 
-    with pytest.raises(ValueError, match="model.embed_tokens.weight lands on params/embed_tokens"):
+    with pytest.raises(ValueError, match=r"model.embed_tokens.weight lands on params/embed_tokens"):
         translate_weights(tensors, config)
 
 
@@ -1076,8 +1075,11 @@ def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
     ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
     reference = np.load(DEEPSEEK_V4 / "logits.npy")
     moe = variables["moe"]
-    assert [layer for layer in sorted(moe)
-            if layer.startswith('layers_') and "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
+    assert [
+        layer
+        for layer in sorted(moe)
+        if layer.startswith("layers_") and "tid2eid" in moe[layer]["mlp"]["gate"]
+    ] == ["layers_0", "layers_1", "layers_2"]
 
     rolled = jax.tree.map(lambda value: value, moe)
     for layer in ("layers_0", "layers_1", "layers_2"):
@@ -1201,7 +1203,7 @@ def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
     assert states.shape == (*ids.shape, 2, model.emb_features)
     normalized, expected = model.apply(variables, ids, method=model.hidden_and_mtp_inputs)
     np.testing.assert_array_equal(states, expected)
-    assert jnp.asarray(normalized).shape == ids.shape + (model.emb_features,)
+    assert jnp.asarray(normalized).shape == (*ids.shape, model.emb_features)
     doubled = {**variables, 'params': {**variables['params'], 'norm': {
         **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
     raw, louder = model.apply(doubled, ids, method=model.states_and_logits)
@@ -1292,7 +1294,8 @@ def test_the_real_llama_4_scout_text_config_translates():
     assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (40, 8, 128)
     assert config["mixture"] == {
         "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
-        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
+        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192,
+        "layers": tuple(range(48))}
     assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
     local = config["kinds"]["chunked_attention"]
     assert local["chunk"] == 8192 and local["mixer"]["floor_scale"] == 8192.0
@@ -1405,7 +1408,7 @@ def test_the_real_gemma_4_26b_a4b_text_config_translates():
     assert config["rope_theta"] == 1000000.0
     assert config["final_logit_softcap"] == 30.0
     assert config["v_norm"] and not config["use_double_wide_mlp"]
-    assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
+    assert config["per_layer_input_dim"] is None and config["kv_shared_layers"] is None
 
 
 def test_the_released_diffusiongemma_26b_text_config_derives_what_it_does_not_name():
@@ -1504,7 +1507,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     assert config["num_kv_heads"] == 1
     assert config["kinds"]["full_attention"] == {"head_dim": 512}
     assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
-    assert config["num_kv_shared_layers"] == 20
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 20, config["num_layers"]))
     assert config["per_layer_input_dim"] == 256
     assert config["use_double_wide_mlp"]
     assert config["attention_scale"] == 1.0
@@ -1518,7 +1521,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     shared = [index for index in range(config["num_layers"])
               if set(params[f"layers_{index}"]["self_attn"]) == {"q_proj", "o_proj", "q_norm"}]
     assert shared == sorted(model.kv_sharing)
-    assert len(shared) == config["num_kv_shared_layers"]
+    assert tuple(shared) == config["kv_shared_layers"]
 
 
 @pytest.mark.network
@@ -1585,7 +1588,7 @@ def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
     (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gemma4-moe-tiny"), "attention_k_eq_v": False}))
-    with pytest.raises(ValueError, match="layers_2.self_attn.v_proj.kernel"):
+    with pytest.raises(ValueError, match=r"layers_2.self_attn.v_proj.kernel"):
         fp32_decoder(directory)
 
 

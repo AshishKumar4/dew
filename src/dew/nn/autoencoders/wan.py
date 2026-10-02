@@ -40,12 +40,13 @@ from .api import AutoEncoder
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
-class _RMSNorm(nn.Module):
-    """`WanRMS_norm`: the channel vector scaled to unit L2 norm, times sqrt(C)
-    and a gamma stored `[C]` followed by `rank - 1` unit axes."""
+class WanRMSNorm(nn.Module):
+    """`WanRMS_norm`, which Qwen-Image's VAE keeps: `F.normalize` over the
+    channels times sqrt(C) and a gamma stored `[C]` followed by `rank - 1`
+    unit axes. Half precision computes in float32 and rounds once."""
 
     features: int
     rank: int
@@ -54,18 +55,26 @@ class _RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
-        norm = jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True))
-        return (x / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(
+        wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+        # F.normalize clamps the norm at 1e-12. Clamping its square first
+        # keeps a zero row's gradient finite (sqrt's derivative at zero would
+        # meet the clamp's zero); the second clamp, the same value, keeps the
+        # division off a bare square root, which XLA rewrites to rsqrt.
+        norm = jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(wide), axis=-1, keepdims=True), 1e-24))
+        return (wide / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(
             self.dtype
         )
 
 
-def _causal(features: int, kernel: int, dtype: Dtype, name: str) -> nn.Module:
-    """A cubic causal convolution; the source's parameters sit directly under
-    `name`, so the module is the Flax convolution itself."""
+def causal_conv(features: int, kernel: int, spatial: int, dtype: Dtype, name: str | None) -> nn.Module:
+    """`WanCausalConv3d` over a video's three axes, every frame's padding in
+    front of it, or over a frame's two, the 2-D convolution a single frame
+    reduces it to. The source's parameters sit directly under `name`, so the
+    module is the Flax convolution itself."""
     pad = kernel // 2
-    return Conv(features, (kernel,) * 3, padding=((kernel - 1, 0), (pad, pad), (pad, pad)),
-                dtype=dtype, name=name)
+    time = ((kernel - 1, 0),) if spatial == 3 else ()
+    return Conv(features, (kernel,) * spatial, padding=(*time, (pad, pad), (pad, pad)), dtype=dtype,
+                name=name)
 
 
 def _frames(module: nn.Module, x):
@@ -75,53 +84,53 @@ def _frames(module: nn.Module, x):
     return y.reshape(batch, frames, *y.shape[1:])
 
 
-class _ResidualBlock(nn.Module):
+class WanResidualBlock(nn.Module):
+    """`WanResidualBlock` over a video `[B, T, H, W, C]` or a frame
+    `[B, H, W, C]`: norm, SiLU and a 3-wide convolution twice, the input
+    added back, through a 1-wide convolution where the width changes."""
+
     in_features: int
     features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
+        spatial = x.ndim - 2
         shortcut = x
         if self.in_features != self.features:
-            shortcut = _causal(self.features, 1, self.dtype, "conv_shortcut")(x)
-        x = nn.silu(_RMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
-        x = _causal(self.features, 3, self.dtype, "conv1")(x)
-        x = nn.silu(_RMSNorm(self.features, 4, self.dtype, name="norm2")(x))
-        return _causal(self.features, 3, self.dtype, "conv2")(x) + shortcut
+            shortcut = causal_conv(self.features, 1, spatial, self.dtype, "conv_shortcut")(x)
+        x = nn.silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
+        x = causal_conv(self.features, 3, spatial, self.dtype, "conv1")(x)
+        x = nn.silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
+        return causal_conv(self.features, 3, spatial, self.dtype, "conv2")(x) + shortcut
 
 
-class _Attention(nn.Module):
+class WanAttention(nn.Module):
     """Single-head self-attention over each frame's pixels, the projections
-    1x1 convolutions."""
+    1x1 convolutions, over a video or a frame."""
 
     dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
-        batch, frames, height, width, channels = x.shape
-        normalized = _RMSNorm(channels, 3, self.dtype, name="norm")(x)
-        qkv = Conv(3 * channels, (1, 1), dtype=self.dtype, name="to_qkv")(
-            normalized.reshape(batch * frames, height, width, channels))
-        query, key, value = jnp.split(
-            qkv.reshape(batch * frames, height * width, 1, 3 * channels), 3, axis=-1
-        )
-        attended = jax.nn.dot_product_attention(query, key, value).reshape(
-            batch * frames, height, width, channels
-        )
-        out = Conv(channels, (1, 1), dtype=self.dtype, name="attention_out")(attended)
-        return out.reshape(x.shape) + x
+        *_, height, width, channels = x.shape
+        normalized = WanRMSNorm(channels, 3, self.dtype, name="norm")(x).reshape(-1, height, width, channels)
+        qkv = causal_conv(3 * channels, 1, 2, self.dtype, "to_qkv")(normalized)
+        frames = qkv.shape[0]
+        query, key, value = jnp.split(qkv.reshape(frames, height * width, 1, 3 * channels), 3, axis=-1)
+        attended = jax.nn.dot_product_attention(query, key, value).reshape(frames, height, width, channels)
+        return causal_conv(channels, 1, 2, self.dtype, "attention_out")(attended).reshape(x.shape) + x
 
 
-class _MidBlock(nn.Module):
+class WanMidBlock(nn.Module):
     features: int
     dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
-        x = _ResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
-        x = _Attention(self.dtype, name="attentions_0")(x)
-        return _ResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
+        x = WanResidualBlock(self.features, self.features, self.dtype, name="resnets_0")(x)
+        x = WanAttention(self.dtype, name="attentions_0")(x)
+        return WanResidualBlock(self.features, self.features, self.dtype, name="resnets_1")(x)
 
 
 class _Downsample(nn.Module):
@@ -181,18 +190,18 @@ class _Encoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         dims = [self.base * m for m in (1, *self.multipliers)]
-        x = _causal(dims[0], 3, self.dtype, "conv_in")(x)
+        x = causal_conv(dims[0], 3, 3, self.dtype, "conv_in")(x)
         index = 0
         for level, (in_features, features) in enumerate(pairwise(dims)):
             for _ in range(self.blocks):
-                x = _ResidualBlock(in_features, features, self.dtype, name=f"down_blocks_{index}")(x)
+                x = WanResidualBlock(in_features, features, self.dtype, name=f"down_blocks_{index}")(x)
                 in_features, index = features, index + 1
             if level != len(self.multipliers) - 1:
                 x = _Downsample(features, self.temporal[level], self.dtype, name=f"down_blocks_{index}")(x)
                 index += 1
-        x = _MidBlock(dims[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(_RMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
-        return _causal(2 * self.latent, 3, self.dtype, "conv_out")(x)
+        x = WanMidBlock(dims[-1], self.dtype, name="mid_block")(x)
+        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        return causal_conv(2 * self.latent, 3, 3, self.dtype, "conv_out")(x)
 
 
 class _UpBlock(nn.Module):
@@ -207,7 +216,7 @@ class _UpBlock(nn.Module):
     def __call__(self, x):
         in_features = self.in_features
         for index in range(self.blocks + 1):
-            x = _ResidualBlock(in_features, self.features, self.dtype, name=f"resnets_{index}")(x)
+            x = WanResidualBlock(in_features, self.features, self.dtype, name=f"resnets_{index}")(x)
             in_features = self.features
         if self.upsample:
             x = _Upsample(self.features, self.temporal, self.dtype, name="upsamplers_0")(x)
@@ -224,15 +233,15 @@ class _Decoder(nn.Module):
     @nn.compact
     def __call__(self, z):
         dims = [self.base * m for m in (self.multipliers[-1], *self.multipliers[::-1])]
-        x = _causal(dims[0], 3, self.dtype, "conv_in")(z)
-        x = _MidBlock(dims[0], self.dtype, name="mid_block")(x)
+        x = causal_conv(dims[0], 3, 3, self.dtype, "conv_in")(z)
+        x = WanMidBlock(dims[0], self.dtype, name="mid_block")(x)
         upsampling = self.temporal[::-1]
         for level, (in_features, features) in enumerate(pairwise(dims)):
             upsample = level != len(self.multipliers) - 1
             x = _UpBlock(in_features // 2 if level > 0 else in_features, features, self.blocks, upsample,
                          upsample and upsampling[level], self.dtype, name=f"up_blocks_{level}")(x)
-        x = nn.silu(_RMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
-        return _causal(3, 3, self.dtype, "conv_out")(x)
+        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        return causal_conv(3, 3, 3, self.dtype, "conv_out")(x)
 
 
 class WanVAEFields(TypedDict):
@@ -265,8 +274,8 @@ class WanVAE(nn.Module):
     def setup(self):
         self.encoder = _Encoder(self.base, self.latent, self.multipliers, self.blocks, self.temporal,
                                 self.dtype)
-        self.quant_conv = _causal(2 * self.latent, 1, self.dtype, "quant_conv")
-        self.post_quant_conv = _causal(self.latent, 1, self.dtype, "post_quant_conv")
+        self.quant_conv = causal_conv(2 * self.latent, 1, 3, self.dtype, "quant_conv")
+        self.post_quant_conv = causal_conv(self.latent, 1, 3, self.dtype, "post_quant_conv")
         self.decoder = _Decoder(self.base, self.multipliers, self.blocks, self.temporal, self.dtype)
 
     def moments(self, video):

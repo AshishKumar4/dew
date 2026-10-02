@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 from test_hf_decoders import DEEPSEEK, fixture_config, flat_tree, fp32_decoder, scaled_difference
 
-from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop import PretrainedDecoder
+from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -36,7 +36,7 @@ def test_gemma4_config_translates_field_by_field():
     read by no text path, so it maps to nothing."""
     config = translate_config(gemma4_config("gemma4-ple"))
 
-    assert config["num_kv_shared_layers"] == 0
+    assert config["kv_shared_layers"] is None
     assert config["per_layer_input_dim"] == 8
     assert config["per_layer_input_vocab"] == 64
     assert config["v_norm"] and config["qk_norm"]
@@ -51,7 +51,7 @@ def test_gemma4_config_translates_field_by_field():
     assert config["head_dim"] == 8 and not config["scale_after_cast"]
 
     config = translate_config(gemma4_config("gemma4-kvshare"))
-    assert config["num_kv_shared_layers"] == 2
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 2, config["num_layers"]))
     assert config["per_layer_input_dim"] is None
 
 
@@ -64,7 +64,7 @@ def test_the_e2b_shaped_config_translates_every_gap():
     assert config["partial_rotary_factor"] == 0.25
     assert "attention_logit_cap" not in config
     assert config["use_double_wide_mlp"]
-    assert config["num_kv_shared_layers"] == 2
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 2, config["num_layers"]))
     assert config["per_layer_input_dim"] == 8
     assert config["v_norm"] and config["rope_theta"] == 1000000.0
     # The full layers' own head dim and the sliding kind's window and base
@@ -118,7 +118,8 @@ def test_a_multimodal_wrapper_config_is_refused_by_name(model_type):
     assert "model.language_model" in str(raised.value)
 
     # The decoder underneath it still translates, as the message says.
-    assert translate_config(wrapper["text_config"])["num_kv_shared_layers"] == 2
+    config = translate_config(wrapper["text_config"])
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 2, config["num_layers"]))
 
 
 def test_a_wrapper_shaped_config_of_an_unknown_family_is_refused_as_one():
@@ -187,7 +188,7 @@ def test_a_per_layer_count_equal_to_the_models_still_translates():
     assert translate_config(config)["kinds"]["full_attention"] == {"head_dim": 32}
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
@@ -205,7 +206,7 @@ def test_gemma4_checkpoints_load_through_the_translator(name):
         assert "embed_tokens_per_layer.embedding" in leaves
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_logits_match_the_reference_implementation(name):
     """Full-model parity, fully live on both branches. Largest observed max
     |logit difference| on CPU: gemma4-ple 4.9e-07, gemma4-kvshare 8.6e-07,
@@ -246,9 +247,9 @@ def test_sharing_without_a_provider_and_sharing_everything_are_refused():
     base = with_precision("causal_transformer", config,
                           dtype="float32", attention_impl="xla")
     with pytest.raises(ValueError, match="no earlier full_attention layer"):
-        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 3}).kv_sharing
+        _ = models.build("causal_transformer", **{**base, "kv_shared_layers": (1, 2, 3)}).kv_sharing
     with pytest.raises(ValueError, match="leave a provider"):
-        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 4}).kv_sharing
+        translate_config({**gemma4_config("gemma4-kvshare"), "num_kv_shared_layers": 4})
 
 
 def test_the_features_leave_a_plain_tree_unchanged(rng):
@@ -256,7 +257,7 @@ def test_the_features_leave_a_plain_tree_unchanged(rng):
     config = translate_config(gemma4_config("gemma4-ple"))
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", {**config, "per_layer_input_dim": None,
-                               "num_kv_shared_layers": 0, "v_norm": False},
+                               "kv_shared_layers": None, "v_norm": False},
         dtype="float32", attention_impl="xla"))
     assert model.kv_sharing == {}
     flat = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
@@ -817,7 +818,7 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
         return GatedDeltaNet(emb_features=16, num_k_heads=2, num_v_heads=4, head_k_dim=4,
                              head_v_dim=6, fused_in_proj=fused)
 
-    fused, split = net(True), net(False)
+    fused, split = net(fused=True), net(fused=False)
     x = jax.random.normal(jax.random.key(0), (1, 5, 16))
     variables = fused.init(jax.random.key(1), x)
     params = dict(variables["params"])
@@ -825,11 +826,15 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
     ba_kernel = np.asarray(params.pop("in_proj_ba")["kernel"])
     q, k, v, z = np.split(qkvz_kernel.reshape(16, 2, 2 * 4 + 2 * 2 * 6), [4, 8, 8 + 12], axis=-1)
     ba = ba_kernel.reshape(16, 2, 4)
-    regrouped = {**params,
-                 "in_proj_qkv": {"kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)},
-                 "in_proj_z": {"kernel": z.reshape(16, -1)},
-                 "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
-                 "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)}}
+    regrouped = {
+        **params,
+        "in_proj_qkv": {
+            "kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)
+        },
+        "in_proj_z": {"kernel": z.reshape(16, -1)},
+        "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
+        "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)},
+    }
     whole = {**regrouped,
              "in_proj_qkv": {"kernel": qkvz_kernel[:, :2 * 8 + 24]},
              "in_proj_z": {"kernel": qkvz_kernel[:, 2 * 8 + 24:]}}
@@ -920,7 +925,7 @@ def test_gemma3n_config_translates_field_by_field():
     assert config["activation_sparsity_pattern"] == (0.95, 0.95, 0.0, 0.0)
     assert config["mlp_features"] == (48, 48, 64, 64) and config["mlp"] == "geglu"
     assert config["per_layer_input_dim"] == 8 and config["per_layer_input_vocab"] == 64
-    assert config["num_kv_shared_layers"] == 1
+    assert config["kv_shared_layers"] == (3,)
     assert config["layer_types"] == ("sliding_attention", "sliding_attention",
                                      "full_attention", "sliding_attention")
     assert config["kinds"] == {"sliding_attention": {"window": 4, "rope_theta": 10000.0}}
@@ -951,7 +956,7 @@ def test_the_real_gemma_3n_e2b_text_config_translates():
                                "correct_scale": True}
     assert config["laurel_rank"] == 64
     assert config["per_layer_input_dim"] == 256 and config["per_layer_input_vocab"] == 262144
-    assert config["num_kv_shared_layers"] == 10
+    assert config["kv_shared_layers"] == tuple(range(config["num_layers"] - 10, config["num_layers"]))
     assert config["kinds"] == {"sliding_attention": {"window": 512, "rope_theta": 10000.0}}
     assert config["rope_theta"] == 1000000.0
     assert config["final_logit_softcap"] == 30.0

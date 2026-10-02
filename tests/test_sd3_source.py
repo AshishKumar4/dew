@@ -85,9 +85,12 @@ def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
         # The stored buffer is the source's, perturbed away from its own
         # sin/cos initializer, so a model that rebuilt it would not match.
         assert relative_gap(buffers["pos_embed"], arrays[f"{name}.position_buffer"]) == 0.0
-        gradients = jax.jit(jax.grad(
-            lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
-                params, latent, condition.context, condition.pooled)
+        gradients = jax.jit(
+            jax.grad(
+                lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe),
+                argnums=(0, 1, 2, 3),
+            )
+        )(params, latent, condition.context, condition.pooled)
         assert relative_gap(gradients[1].transpose(0, 3, 1, 2), arrays[f"{name}.grad_latent"]) < 1e-5
         assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
         assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
@@ -125,10 +128,10 @@ def test_every_declared_sd3_tensor_is_mapped_or_a_named_buffer(source):
 def test_unsupported_sd3_controls_are_refused():
     """A geometry control whose active meaning this model does not carry fails
     at load rather than being dropped."""
-    config = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2,
-                  attention_head_dim=8, num_attention_heads=2, joint_attention_dim=12,
-                  caption_projection_dim=16, pooled_projection_dim=10, out_channels=4,
-                  pos_embed_max_size=8)
+    config = {"sample_size": 16, "patch_size": 2, "in_channels": 4, "num_layers": 2,
+                  "attention_head_dim": 8, "num_attention_heads": 2, "joint_attention_dim": 12,
+                  "caption_projection_dim": 16, "pooled_projection_dim": 10, "out_channels": 4,
+                  "pos_embed_max_size": 8}
     assert sd3_fields(config)["qk_norm"] is None
     with pytest.raises(ValueError, match="qk_norm"):
         sd3_fields({**config, "qk_norm": "layer_norm"})
@@ -195,9 +198,9 @@ def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, sour
                 assert relative_gap(process.sampler_schedule.model_time(times[:-1]),
                                     arrays[f"{tag}.times"]) < 1e-5
                 denoise = process.denoiser(model, params, {})
-                run = lambda value: sample(  # noqa: E731
-                    denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
-                    times=times, final_denoise=False)
+                def run(value, *, denoise=denoise, times=times):
+                    return sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
+                                  times=times, final_denoise=False)
                 x_T = jnp.asarray(arrays[f"{tag}.x_T"])
                 assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
                 (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))
@@ -286,7 +289,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     whole, split = run(MeshSpec(fsdp=4)), run(MeshSpec(fsdp=2, sequence=2))
     assert relative_gap(split[0], whole[0]) < 1e-5
     gaps = [relative_gap(a, b) for a, b in zip(jax.tree.leaves(split[1]),
-                                               jax.tree.leaves(whole[1]))]
+                                               jax.tree.leaves(whole[1]), strict=True)]
     assert max(gaps) < 1e-5, max(gaps)
 
 
@@ -392,7 +395,7 @@ def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path)
     index = json.loads((directory / "model_index.json").read_text())
     index["_class_name"] = "FluxPipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
-    with pytest.raises(ValueError, match="FluxPipeline.*StableDiffusion3Pipeline"):
+    with pytest.raises(ValueError, match=r"FluxPipeline.*StableDiffusion3Pipeline"):
         Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 

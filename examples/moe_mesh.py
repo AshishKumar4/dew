@@ -221,7 +221,7 @@ def main(config: Config) -> None:
     model = CausalTransformer(
         vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
-        mixture=Mixture(experts=config.experts, top_k=config.top_k, every=1, dispatch=config.dispatch))
+        mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
     objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
     trainer = Trainer(objective, optax.adam(config.learning_rate), key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))

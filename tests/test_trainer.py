@@ -13,6 +13,7 @@ import gc
 import io
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -34,14 +35,12 @@ from steady_state import steady_state
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
-from dew.config import TrainerConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import (
     Checkpoints,
     Layout,
     MeshSpec,
-    ProfileWindow,
     Trainer,
     TrainState,
     display,
@@ -539,13 +538,21 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert jax.tree.structure(restored) == jax.tree.structure(prefix)
     for left, right in zip(jax.tree.leaves(restored), jax.tree.leaves(prefix), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     resumed = fresh.fit(dataset(resumed_seen), steps=4, checkpoint_every=1)
     assert resumed_seen[0].tobytes() == whole_seen[2].tobytes(), "the first batch after resume"
     assert jax.tree.structure(resumed) == jax.tree.structure(whole)
     for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(whole), strict=True):
         actual, expected = np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right))
-        assert (actual.dtype, actual.shape, actual.tobytes()) == (expected.dtype, expected.shape, expected.tobytes())
+        assert (actual.dtype, actual.shape, actual.tobytes()) == (
+            expected.dtype,
+            expected.shape,
+            expected.tobytes(),
+        )
     _, resumed_place = Checkpoints(str(tmp_path / "split/run")).restore(share=DataPartition())
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
@@ -688,7 +695,8 @@ step = trainer.compile(state, batch)
 for _ in range(2):
     state, *_ = step(state, batch)
 leaves = jax.tree.leaves(jax.tree.map(lambda leaf: jax.random.key_data(leaf)
-                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf, state))
+                                      if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                                      else leaf, state))
 np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
@@ -699,7 +707,7 @@ def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(
     a second process shows whether it agrees. Two fresh processes, without a
     compilation cache, train a DiT (a convolution embeds its patches) two
     Adam steps under the cuda lane's flags; every state leaf agrees."""
-    from conftest import REPEATABLE_GPU_FLAGS
+    from lane_environment import REPEATABLE_GPU_FLAGS
 
     root = Path(__file__).resolve().parents[1]
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
@@ -775,7 +783,7 @@ def test_the_compiled_step_consumes_the_state_it_is_given():
     batch = next(Counting())
     step = trainer.compile(state, batch)
     stale = jax.tree.leaves(state.params)[0]
-    advanced, loss, _, finite, _ = step(state, batch)
+    advanced, _loss, _, finite, _ = step(state, batch)
     assert bool(finite) and int(advanced.step) == 1
     assert stale.is_deleted()
     again, _, _, _, _ = step(advanced, batch)
@@ -1388,7 +1396,7 @@ def test_a_failing_validation_loader_fails_the_pass():
         def __next__(self):
             raise OSError("val.bin: Input/output error")
 
-    with pytest.raises(OSError, match="val.bin"):
+    with pytest.raises(OSError, match=r"val.bin"):
         make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
                                                log_every=1, eval_every=1, metrics=(Spread([]),))
 
@@ -1772,7 +1780,12 @@ def alternating(gen, disc):
                 return params, {**state.opt_state, "disc": disc_state}, loss
 
             params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
-            new_state = state.replace(microstep=state.microstep + 1, updates=state.updates + 1, opt_state=opt_state, params={**state.params, "params": params})
+            new_state = state.replace(
+                microstep=state.microstep + 1,
+                updates=state.updates + 1,
+                opt_state=opt_state,
+                params={**state.params, "params": params},
+            )
             return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step
     return make_step
@@ -2007,7 +2020,9 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     samples = ([], [])
     for index, reference in enumerate((False, True, True, False)):
         objective = {"head_tile": [4096, 8192] if tokens == 16384 else "whole"} if reference else {}
-        options = f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        options = (
+            f" --xla_gpu_enable_triton_gemm={'true' if tokens == 8192 else 'false'}" if reference else ""
+        )
         record = tmp_path / f"step-{index}.json"
         done = subprocess.run(
             [sys.executable, "tools/benchmark_step.py", "--cases",
@@ -2045,7 +2060,7 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
         return out
 
     monkeypatch.setattr(jax, "device_put", recorded)
-    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    trainer, _objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
     sharded = 0
@@ -2088,6 +2103,70 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
 
+APART = {"xla_gpu_dot_merger_threshold_mb": 0}
+
+
+@pytest.mark.parametrize("generation, flags, tokens, frozen, expected", [
+    ("sm89", "", 4, False, {**APART, "xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", 4, False, APART),
+    ("sm86", "", 128, True, None),
+    ("sm89", "", 128, True, {"xla_gpu_enable_triton_gemm": False}),
+    ("sm86", "", 132, True, APART),
+    ("sm86", "", 1024, False, APART),
+    ("sm86", "", math.inf, True, APART),
+    ("sm89", "--xla_gpu_dot_merger_threshold_mb=64 --xla_gpu_enable_triton_gemm=true", 4, False, None),
+    ("v6e", "", 4, False, None),
+    ("cpu", "", 4, True, None),
+])
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, tokens, frozen,
+                                                       expected):
+    """A GPU training step runs dots that share an input apart, where XLA's
+    merger would concatenate their weights every step, except a step beside
+    frozen weights on 128 tokens or fewer a device (32 rows of 4 at most), which
+    keeps the merger as decoding does; the Triton GEMM fusions go off on the
+    generations measured faster without them; a flag the run named stands.
+    The options are the step's own, so a process that also serves keeps the
+    merger there."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, 'device_generation', lambda: generation)
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    objective = LMObjective(model, seq_len=4)
+    assert trainer_module.step_compiler_options(objective, tokens, frozen) == expected
+
+
+def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
+    """The trainer hands the options the tokens one device steps and whether
+    the state holds frozen weights, as a LoRA objective's does."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import trainer as trainer_module
+
+    seen = []
+    monkeypatch.setattr(trainer_module, 'step_compiler_options',
+                        lambda objective, tokens, frozen: seen.append((tokens, frozen)))
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    for trainable, frozen in ((None, False), (lambda path: path[-2:] == ("q_proj", "kernel"), True)):
+        trainer = Trainer(LMObjective(model, seq_len=4, trainable=trainable), optax.sgd(1e-3),
+                          key=jax.random.key(0), checkpoints=None, tracker=None)
+        state, _, _ = trainer.place()
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
+        assert seen[-1] == (8 // len(jax.devices()) * 4, frozen)
+
+
+def test_a_step_without_tokens_compiles_whatever_its_batch_holds():
+    """Only an objective that names its row tokens has rows counted for the
+    options; another's batch may hold no rows at all, a scalar per field."""
+    from dew.training import trainer as trainer_module
+
+    assert trainer_module._device_tokens(object(), {"weight": jnp.asarray(.5)}, 1) == math.inf
+
+
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     """The first execution requests no compilation after the public compile
     call, including a second program retrieved from the persistent cache.
@@ -2097,7 +2176,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     from dew.training import trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, 'step_compiler_options',
-                        lambda objective: {'xla_embed_ir_in_executable': False})
+                        lambda objective, tokens, frozen: {'xla_embed_ir_in_executable': False})
     trainer, _, _ = held_lm_trainer()
     state, _, _ = trainer.place()
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
@@ -2112,7 +2191,7 @@ def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):
     monitoring.register_event_listener(record)
     try:
         jax.config.update("jax_compilation_cache_dir", str(tmp_path))
-        jax.config.update("jax_enable_compilation_cache", True)
+        jax.config.update("jax_enable_compilation_cache", val=True)
         step = trainer.compile(state, batch)
         assert events, "the public compile must reach the compilation event listener"
         # Input placement is separate from executing the compiled transaction.

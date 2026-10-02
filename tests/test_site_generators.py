@@ -19,7 +19,7 @@ def models_generator():
 def test_wrapper_generator_reads_constructed_runtime_registry(models_generator, monkeypatch):
     from dew.interop import hf_decoders
 
-    wrappers = {name: reader for name, reader in hf_decoders._WRAPPERS.items()}
+    wrappers = dict(hf_decoders._WRAPPERS.items())
     wrappers.update(dict.fromkeys(("site_probe",), wrappers["gemma3"]))
     monkeypatch.setattr(hf_decoders, "_WRAPPERS", wrappers)
 

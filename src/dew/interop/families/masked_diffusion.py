@@ -11,15 +11,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.families.gemma import _gemma4_config
+from dew.interop.families.gemma import _gemma4_config, _parallel_experts
 from dew.interop.families.qwen import _qwen2_config
 from dew.interop.hf_decoders import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
+    Renames,
     _base_config,
-    _dew_path,
-    _hf_name,
     _refuse,
+    _renamed_path,
     _Ropes,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -53,12 +53,9 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     """
     std = _llada_geometry(hf_config)
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
-    inner: set[str] = set()
-    config = _base_config(std, inner, layer_types=('full_attention',) * layers,
+    config = _base_config(std, set(), layer_types=('full_attention',) * layers,
                           rope=_Ropes(records.number(std['rope_theta'], 'rope_theta')))
-    for key in _LLADA_READ:
-        if key in hf_config:
-            used.add(key)
+    used.update(key for key in _LLADA_READ if key in hf_config)
     mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
     config.update(causal=False, mask_token_id=mask)
@@ -261,12 +258,7 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]
         # DiffusionGemma names no enable_moe_block flag; a config carrying the
         # three routed widths routes every layer beside its dense MLP, which
         # is what its encoder and decoder layers both build.
-        config["mixture"] = {
-            "experts": records.integer(hf_config["num_experts"], 'num_experts'),
-            "top_k": records.integer(hf_config["top_k_experts"], 'top_k_experts'),
-            "expert_features": records.integer(hf_config["moe_intermediate_size"], 'moe_intermediate_size'),
-            "parallel": True,
-        }
+        config["mixture"] = _parallel_experts(hf_config)
     # final_logit_softcapping is a class attribute of the reference text
     # config, not an instance field a config.json carries; the head always
     # divides by 30 under tanh.
@@ -275,64 +267,24 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]
     return config
 
 
-# LLaDA's own block tensor names beside the llama-layout spellings the
-# shared map reads. The load renames one way and the export the other from
-# this one table, so the two directions cannot drift apart.
-_LLADA_BLOCK_NAMES = {
-    'attn_norm': 'input_layernorm', 'attn_out': 'self_attn.o_proj',
-    'ff_norm': 'post_attention_layernorm', 'ff_proj': 'mlp.gate_proj',
-    'up_proj': 'mlp.up_proj', 'ff_out': 'mlp.down_proj',
-    'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
-    'v_proj': 'self_attn.v_proj',
-}
-_LLADA_TRUNK_NAMES = {
-    'model.transformer.wte.weight': 'model.embed_tokens.weight',
-    'model.transformer.ln_f.weight': 'model.norm.weight',
-    'model.transformer.ff_out.weight': 'lm_head.weight',
-}
+# LLaDA's own names beside the llama-layout spellings the shared map reads.
+# The computation matches the llama block (pre-norm RMS, rotate-half rope,
+# SwiGLU, untied head) and only the names differ.
+_LLADA_NAMES: Renames = (
+    ('model.transformer.wte', 'model.embed_tokens'), ('model.transformer.ln_f', 'model.norm'),
+    ('model.transformer.ff_out', 'lm_head'), ('model.transformer.blocks', 'model.layers'),
+    ('attn_norm', 'input_layernorm'), ('attn_out', 'self_attn.o_proj'),
+    ('ff_norm', 'post_attention_layernorm'), ('ff_proj', 'mlp.gate_proj'), ('up_proj', 'mlp.up_proj'),
+    ('ff_out', 'mlp.down_proj'), ('q_proj', 'self_attn.q_proj'), ('k_proj', 'self_attn.k_proj'),
+    ('v_proj', 'self_attn.v_proj'))
 
 
 def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the variables-tree path for one LLaDA tensor name.
-
-    The computation matches the llama block (pre-norm RMS, rotate-half rope,
-    SwiGLU, untied head) and only the names differ, so each name is respelled
-    and `_dew_path` does the rest. There is no second table.
-    """
-    renamed = _LLADA_TRUNK_NAMES.get(name)
-    if renamed is None:
-        parts = name.split('.')
-        tail = (_LLADA_BLOCK_NAMES.get(parts[4])
-                if len(parts) == 6 and parts[:3] == ['model', 'transformer', 'blocks']
-                and parts[3].isdigit() and parts[5] == 'weight' else None)
-        if tail is None:
-            raise ValueError(f'unknown tensor name {name!r}')
-        renamed = f'model.layers.{parts[3]}.{tail}.weight'
-    return _dew_path(renamed, config)
-
-
-def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    """Return LLaDA's own tensor name for one dew leaf, inverting `_llada_path`.
-
-    The llama spelling is what the shared map produced, not what the release
-    stores. Writing it under a config that declares model_type llada would
-    leave a checkpoint neither `modeling_llada.py` nor `_llada_path` reads
-    back. None stays None: the tied head's copy is the embedding.
-    """
-    llama = _hf_name(name, config)
-    if llama is None:
-        return None
-    for theirs, ours in _LLADA_TRUNK_NAMES.items():
-        if llama == ours:
-            return theirs
-    parts = llama.split('.')
-    if (len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and parts[-1] == 'weight'):
-        module = '.'.join(parts[3:-1])
-        for theirs, ours in _LLADA_BLOCK_NAMES.items():
-            if module == ours:
-                return f'model.transformer.blocks.{parts[2]}.{theirs}.weight'
-    raise ValueError(f"unknown parameter path {name!r}")
+    """Return the variables-tree path for one LLaDA tensor name, every one of
+    which the release nests under `model.transformer.`."""
+    if not name.startswith('model.transformer.'):
+        raise ValueError(f'unknown tensor name {name!r}')
+    return _renamed_path(_LLADA_NAMES, name, config)
 
 
 def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:

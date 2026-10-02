@@ -334,6 +334,8 @@ def test_gemma4_clipping_matches_reference_forward_and_backward():
     weights, pixels = jax.grad(lambda weight, x: value(weight, x).sum(), argnums=(0, 1))(kernel, inputs)
     np.testing.assert_allclose(pixels, [[0, -0.1, 0]], atol=1e-7, rtol=0)
     np.testing.assert_allclose(weights, [[0, -1], [0, 0.4], [0, 1]], atol=1e-7, rtol=0)
-    unclipped = jnp.asarray(linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs))
+    unclipped = jnp.asarray(
+        linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs)
+    )
     assert np.max(np.abs(unclipped - value(kernel, inputs))) > 0.25
 
