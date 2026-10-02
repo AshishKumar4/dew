@@ -559,6 +559,29 @@ def _capture_env(monkeypatch):
                         lambda name: "0.0" if name == "xprof" else real_version(name))
 
 
+def test_a_tracker_can_capture_after_each_training_update(tmp_path, monkeypatch):
+    """A log tick observes the updated run, with no consumed state left for
+    the capture boundary to synchronize."""
+    _capture_env(monkeypatch)
+    captured = []
+
+    class CapturingTracker(RecordingTracker):
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if "train/loss" in scalars:
+                with dew.profile(tmp_path / f"step-{step}"):
+                    jnp.square(jnp.asarray(step)).block_until_ready()
+                captured.append(step)
+
+    state = make_trainer(tracker=CapturingTracker()).fit(
+        Data(batches), steps=2, log_every=1)
+
+    assert int(state.step) == 2
+    assert captured == [1, 2]
+    assert all(list((tmp_path / f"step-{step}").glob("**/*.xplane.pb"))
+               for step in captured), "a training tick left no native trace"
+
+
 def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     """The window has to open after the warmup: a trace that starts at step 0
     is mostly compilation, and reports its occupancy instead of the loop's."""
