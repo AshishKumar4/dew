@@ -47,6 +47,7 @@ from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
+from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
 _HF_ACTIVATIONS['swigluoai'] = 'silu'
+_HF_ACTIVATIONS.update({'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'})
 
 
 def _hf_activation(activation: GatedActivation) -> str:
@@ -356,8 +358,12 @@ class DecoderFields(TypedDict, total=False):
     num_kv_heads: int | None
     head_dim: int | None
     mlp: str | SituFields
+    mlp_bias: bool
     mlp_features: int | tuple[int, ...] | None
     max_seq_len: int
+    position_embedding: Literal['rotary', 'learned']
+    position_embedding_size: int | None
+    position_embedding_offset: int
     rope_theta: float
     rope_scaling: Ramp | None
     partial_rotary_factor: float | None
@@ -365,10 +371,13 @@ class DecoderFields(TypedDict, total=False):
     layer_types: tuple[str, ...] | None
     kinds: dict[str, KindFields]
     norm_eps: float
+    norm_type: Literal['rms', 'layer']
+    norm_bias: bool
     scale_offset: bool
     scale_after_cast: bool
     sandwich_norms: bool
     pre_norms: bool
+    parallel_residual: bool
     qk_norm: bool
     qk_norm_scope: str
     v_norm: bool
@@ -391,6 +400,8 @@ class DecoderFields(TypedDict, total=False):
     tie_embeddings: bool
     embedding_zero_ids: tuple[int, ...]
     dropout_rate: float
+    embedding_dropout_rate: float
+    attention_dropout_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
     force_fp32_for_softmax: bool
@@ -929,7 +940,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") != "qwen3_5"
+        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1097,8 +1108,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     return {
-        "model_type": "qwen3_5",
-        "text_model_type": "qwen3_5_text",
+        "model_type": records.text(hf_config['model_type'], 'model_type'),
+        "text_model_type": f"{hf_config['model_type']}_text",
         "text": text,
         "tower": tower,
         "projector": projector,
@@ -1128,14 +1139,14 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    "qwen3_5": _qwen35_wrapper, "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
-    retain the decoder, tower, projector, image token ID and token count, and
+    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -1185,7 +1196,8 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
+    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+            or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
         return ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
@@ -1438,8 +1450,8 @@ def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
-    if parts == ['model', 'norm', 'weight']:
-        return ('norm', 'scale')
+    if parts in (['model', 'norm', 'weight'], ['model', 'norm', 'bias']):
+        return ('norm', 'scale' if parts[-1] == 'weight' else 'bias')
     if parts == ['model', 'embed_tokens', 'weight']:
         return ('embed_tokens', 'embedding')
     if parts == ['model', 'embed_tokens_per_layer', 'weight']:
@@ -1535,8 +1547,8 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
             if module == 'post_per_layer_input_norm':
                 return (layer, module, 'scale')
         norms = _norm_names(bool(config.get('sandwich_norms')))
-        if len(parts) == 5 and module in norms and leaf == 'weight':
-            return (layer, norms[module], 'scale')
+        if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
+            return (layer, norms[module], 'scale' if leaf == 'weight' else 'bias')
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
@@ -1657,7 +1669,7 @@ def translate_weights(
     # whose every tensor maps to nothing is an empty tree.
     params: LazyTree = {}
     variables: LazyTree = {'params': params}
-    for name, tensor in family.prepare_weights(hf_tensors).items():
+    for name, tensor in family.prepare_weights(hf_tensors, config).items():
         path = family.weight_path(name, config)
         if path is None or name in copies:
             continue
@@ -1974,7 +1986,8 @@ def _export_config(model) -> Mapping[str, object]:
 
 _RUNTIME_FIELDS = frozenset({
     'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
-    'bank_layers', 'dropout_rate', 'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+    'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
+    'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
 """CausalTransformer fields that say how a model runs or trains, not what it
 computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
 forward multiplies by them. `scale_after_cast` orders a norm's scale and its
@@ -1987,6 +2000,8 @@ _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
     'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
     'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
+    'position_embedding_size': lambda model: (
+        model.position_embedding_size or model.max_seq_len if model.position_embedding == 'learned' else None),
 }
 """Fields whose None stands for a value the forward derives, spelled out."""
 
@@ -2031,8 +2046,8 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
     None is the tied lm_head, whose embedding copy is written instead.
     """
     parts = dew_name.split('.')
-    if parts == ['norm', 'scale']:
-        return 'model.norm.weight'
+    if parts in (['norm', 'scale'], ['norm', 'bias']):
+        return 'model.norm.' + ('weight' if parts[-1] == 'scale' else 'bias')
     if parts == ['embed_tokens', 'embedding']:
         return 'model.embed_tokens.weight'
     if parts == ['lm_head', 'kernel']:
@@ -2050,9 +2065,16 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
         theirs = {ours: hf for hf, ours in
                   _norm_names(families()[records.text(config['model_type'],
                                              'model_type')].sandwich_norms).items()}
-        if len(parts) == 3 and module in theirs and leaf == 'scale':
-            return f'model.layers.{index}.{theirs[module]}.weight'
+        if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
+            return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
     raise ValueError(f"unknown parameter path {dew_name!r}")
+
+
+class WeightPreparer(Protocol):
+    """Checkpoint storage transforms, with translated geometry where layout needs it."""
+
+    def __call__(self, tensors: Mapping[str, np.ndarray],
+                 config: Mapping[str, object] | None = None, /) -> Mapping[str, np.ndarray]: ...
 
 
 @dataclass(frozen=True)
@@ -2081,7 +2103,7 @@ class DecoderFamily:
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
     """Whole-variable encoder; dense families retain their export_path loop."""
     sandwich_norms: bool = False
-    prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
+    prepare_weights: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
     split their fused expert kernels. A quantized format is undone before this,
     by `load_pretrained`, which records what it undid for the export."""

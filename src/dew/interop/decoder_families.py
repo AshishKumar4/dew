@@ -35,6 +35,20 @@ from dew.interop.families.glm import (
     _glm5_next_export_weights,
     _glm_moe_dsa_config,
 )
+from dew.interop.families.gpt2 import (
+    _gpt2_config,
+    _gpt2_export,
+    _gpt2_export_weights,
+    _gpt2_path,
+    _gpt2_prepare,
+)
+from dew.interop.families.gpt_neox import (
+    _gpt_neox_config,
+    _gpt_neox_export,
+    _gpt_neox_export_weights,
+    _gpt_neox_path,
+    _gpt_neox_prepare,
+)
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
 from dew.interop.families.kimi import (
     _KDA_ZERO_PADDED,
@@ -63,6 +77,7 @@ from dew.interop.families.masked_diffusion import (
     _mask_token_export,
 )
 from dew.interop.families.olmo import _olmo3_config
+from dew.interop.families.opt import _opt_config, _opt_export, _opt_export_path, _opt_path
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -92,6 +107,49 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ("gpt_neox",),
+        _gpt_neox_config,
+        lambda fields: bool(
+            fields.get("norm_type") == "layer"
+            and fields.get("norm_bias")
+            and fields.get("mlp_bias")
+            and fields.get("position_embedding") == "rotary"
+        ),
+        "gpt_neox",
+        "GPTNeoXForCausalLM",
+        _gpt_neox_export,
+        weight_path=_gpt_neox_path,
+        prepare_weights=_gpt_neox_prepare,
+        export_weights=_gpt_neox_export_weights,
+        preserve_source_layout=False,
+        tied_head_names=("embed_out.weight", "gpt_neox.embed_in.weight"),
+    ),
+    DecoderFamily(
+        ("opt",),
+        _opt_config,
+        lambda fields: fields.get("position_embedding_offset") == 2,
+        "opt",
+        "OPTForCausalLM",
+        _opt_export,
+        weight_path=_opt_path,
+        export_path=_opt_export_path,
+        preserve_source_layout=False,
+        tied_head_names=("lm_head.weight", "model.decoder.embed_tokens.weight"),
+    ),
+    DecoderFamily(
+        ("gpt2",),
+        _gpt2_config,
+        lambda fields: fields.get("position_embedding") == "learned",
+        "gpt2",
+        "GPT2LMHeadModel",
+        _gpt2_export,
+        weight_path=_gpt2_path,
+        prepare_weights=_gpt2_prepare,
+        export_weights=_gpt2_export_weights,
+        preserve_source_layout=False,
+        tied_head_names=("lm_head.weight", "transformer.wte.weight"),
+    ),
     DecoderFamily(
         ("glm5_next_text",),
         _glm5_next_config,

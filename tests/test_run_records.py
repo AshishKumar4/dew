@@ -19,6 +19,7 @@ import typing
 from pathlib import Path
 
 import pytest
+from flax import linen as nn
 
 from dew import registry
 from dew.config import RunConfig, _recorded, _registry_for, _to_json
@@ -73,9 +74,19 @@ def default_of(field: dataclasses.Field):
 def described(value, annotation):
     """A default as the snapshot holds it. A dataclass is its class and the
     fields it sets away from that class's own defaults, which the class's
-    own entry holds; anything else is what the record writes."""
+    own entry holds; anything else is what the record writes. A model's
+    dtype or activation, which no record writes, is named by its qualified
+    name, inside a sequence too. Such a name can sit under a library's
+    private path (`jax._src...`), which a release may move without the
+    default changing; the snapshot then fails, and the fix is the new name."""
     if not (dataclasses.is_dataclass(value) and not isinstance(value, type)):
-        return json.loads(json.dumps(_to_json(value, annotation)))
+        try:
+            return json.loads(json.dumps(_to_json(value, annotation)))
+        except TypeError:
+            if isinstance(value, (list, tuple)):
+                return [described(entry, kind) for entry, kind in
+                        zip(value, registry.entry_types(annotation, len(value)), strict=True)]
+            return {"value": f"{value.__module__}.{value.__qualname__}"}
     cls = type(value)
     return {"class": name_of(cls), "sets": {
         field.name: described(getattr(value, field.name), registry._declared_type(cls, field.name))
@@ -98,10 +109,15 @@ def snapshot_default(field: dataclasses.Field, annotation):
 
 def recorded_defaults() -> dict[str, dict[str, object]]:
     """Every config class a run record reaches, from each run config Dew and
-    its recipes declare, by module path: each recorded field's default as
-    `snapshot_default` holds it."""
+    its recipes declare, and every registered model, whose fields a record
+    holds only where the run set them (`ModelConfig.config`), by module path:
+    each recorded field's default as `snapshot_default` holds it. Flax's own
+    `parent` and `name` are not a model's configuration."""
+    import dew.nn.backbones  # noqa: F401  registers every model
+
     roots = [RunConfig, DiffusionRunConfig, LMRunConfig,
-             recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig")]
+             recipe_config("lm", "LmRunConfig"), recipe_config("jepa", "JepaRunConfig"),
+             *(model for model in registry.models.values() if isinstance(model, type))]
     found: dict[str, dict[str, object]] = {}
     pending = list(roots)
     while pending:
@@ -109,8 +125,9 @@ def recorded_defaults() -> dict[str, dict[str, object]]:
         if name_of(cls) in found:
             continue
         fields = {}
+        flax_own = ("parent", "name") if issubclass(cls, nn.Module) else ()
         for field in dataclasses.fields(cls):
-            if _recorded(field):
+            if _recorded(field) and field.name not in flax_own:
                 annotation = registry._declared_type(cls, field.name)
                 pending.extend(recorded_classes(annotation))
                 fields[field.name] = snapshot_default(field, annotation)
@@ -146,6 +163,17 @@ def test_a_changed_default_fails_the_snapshot(monkeypatch):
     field = next(field for field in dataclasses.fields(presets.EDM) if field.name == "rho")
     monkeypatch.setattr(field, "default", 5.0)
     with pytest.raises(AssertionError, match=r"EDM.rho: 7.0 -> 5.0"):
+        test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
+
+
+def test_a_changed_model_default_fails_the_snapshot(monkeypatch):
+    """A run records only the model fields it set (`ModelConfig.config`), so
+    the rest are the class's defaults and are held the same way."""
+    from dew.nn.backbones.dit import SimpleDiT
+
+    field = next(field for field in dataclasses.fields(SimpleDiT) if field.name == "mlp_ratio")
+    monkeypatch.setattr(field, "default", field.default + 1)
+    with pytest.raises(AssertionError, match=r"SimpleDiT.mlp_ratio"):
         test_every_recorded_default_is_the_one_older_runs_were_recorded_under()
 
 
