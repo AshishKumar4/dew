@@ -4,7 +4,9 @@ Each name below is imported from its own module when it is first read, not at
 `import dew`, so `import dew.training` stays inside the training layer and
 pulls in no modality, no encoder and no tracker backend. Nothing here opens a
 JAX backend or loads an optional dependency; encoders, decoders and datasets
-fetch what they need when they are built.
+fetch what they need when they are built. The declared narrow-dtype
+rounding policy is set here before backend initialization; an explicit
+XLA override remains the caller's choice.
 """
 
 from collections.abc import Callable
@@ -12,8 +14,10 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from dew.logging import configure as _configure_logging
+from dew.telemetry.devices import keep_roundings as _keep_roundings
 
 _configure_logging()
+_keep_roundings()
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
