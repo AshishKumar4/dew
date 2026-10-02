@@ -592,10 +592,10 @@ def test_one_interval_crosses_both_endpoints_with_the_first_order_limit(solver):
     np.testing.assert_allclose(jax.grad(lambda initial: run(initial).sum())(x), expected_gradient, atol=1e-6)
 
 
-def test_continuous_cosine_noise_endpoint_has_exact_signal_zero():
-    from dew.diffusion import CosineContinuousNoiseScheduler, VPredictionTransform
+def test_a_noise_only_vp_endpoint_walks_finitely():
+    from dew.diffusion import SqrtContinuousNoiseScheduler, VPredictionTransform
 
-    schedule = CosineContinuousNoiseScheduler()
+    schedule = SqrtContinuousNoiseScheduler()
     process = Process(schedule, VPredictionTransform())
     x = jnp.asarray([[1.2, -0.7]])
     alpha, sigma = schedule.rates(jnp.asarray([1.0]))
