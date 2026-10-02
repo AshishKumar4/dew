@@ -237,7 +237,7 @@ class TrainingDisplay:
         self.header = [("", f"{count(started.parameters)} parameters"), ("on", where)]
         if mesh:
             splits = any(started.mesh.get(axis, 1) > 1 for axis in (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS))
-            if splits and started.sharded is not None:
+            if splits:
                 mesh += f", {started.sharded:.0%} of the parameters' bytes split"
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
