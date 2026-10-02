@@ -607,7 +607,7 @@ class MaskedGeneration:
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    sampler: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
@@ -670,7 +670,7 @@ class MaskedGeneration:
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key)
             generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
-                sampler=self.sampler, steps=self.steps if steps is None else steps,
+                solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)

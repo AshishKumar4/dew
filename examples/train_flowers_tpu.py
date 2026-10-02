@@ -110,7 +110,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),
         preset=EDM(regime="pixel"),
-        sampler=Heun(),
+        solver=Heun(),
         guidance=CFG(2.0),
         sampling_steps=2,
         ema_decay=0.9,
@@ -137,7 +137,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         model=ModelConfig("simple_dit", dict(config.model), dtype="bfloat16"),
         data=replace(prepared, image_size=config.image_size, val_batches=4),
         preset=EDM(regime="pixel"),
-        sampler=Heun(),
+        solver=Heun(),
         guidance=CFG(config.guidance),
         sampling_steps=config.sampling_steps,
         ema_decay=0.9999,
@@ -192,7 +192,7 @@ def main(config: Config) -> Path:
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
     drawn = pipe(list(PROMPTS), steps=run.sampling_steps, guidance=config.guidance,
-                 sampler=Heun(), key=1).host().images
+                 solver=Heun(), key=1).host().images
     grid(drawn, config.out / "samples.png")
 
     generated = uint8_pixels(drawn)

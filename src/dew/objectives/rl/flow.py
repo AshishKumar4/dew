@@ -60,7 +60,7 @@ def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
 
 _DEFAULT_SDE = FlowSDE()
 _DEFAULT_GUIDANCE = CFG(3.0)
-_DEFAULT_SAMPLER = Euler()
+_DEFAULT_SOLVER = Euler()
 
 
 @objectives("flow_grpo")
@@ -77,7 +77,7 @@ class FlowGRPOObjective(DiffusionObjective):
     beta > 0 freezes the initial denoiser in the existing EMA slot, which is
     then a reference rather than an average (`_ema_is_reference`): the
     task a run publishes and restores, its evaluation and its previews are
-    the live policy. sampler and steps configure evaluation; sde specifies
+    the live policy. solver and steps configure evaluation; sde specifies
     both rollout and rescoring. pretrained is the whole variables tree the
     policy starts from, as `DiffusionObjective` takes it: the model's
     collections, `encoders` and any `autoencoder`.
@@ -91,7 +91,7 @@ class FlowGRPOObjective(DiffusionObjective):
                  sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
-                 guidance: CFG | None = _DEFAULT_GUIDANCE, sampler: Solver = _DEFAULT_SAMPLER,
+                 guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
                  steps: int = 41, pretrained: Variables | None = None):
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
@@ -104,7 +104,7 @@ class FlowGRPOObjective(DiffusionObjective):
         if pretrained is not None and "params" not in pretrained:
             raise ValueError("pretrained must be a variables tree with a params collection")
         super().__init__(model, process, inputs, autoencoder=autoencoder,
-                         unconditional_prob=0, ema_decay=1.0, sampler=sampler,
+                         unconditional_prob=0, ema_decay=1.0, solver=solver,
                          guidance=guidance, steps=steps, pretrained=pretrained)
         sde.validate(self.process)
         if beta == 0:

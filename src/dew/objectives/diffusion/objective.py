@@ -76,18 +76,20 @@ def _without_loss_heads(variables: Variables) -> Variables:
             for name, tree in variables.items() if name not in (REPRESENTATION, LATENT_STATS, TEACHER)}
 
 
-def check_solver(process, sampler, steps: int) -> None:
+def check_solver(process, solver, steps: int) -> None:
     """Trace a solver step on the objective's actual sampling grid."""
+    if isinstance(solver, str):
+        raise TypeError(f"solver={solver!r} names a solver; pass the solver itself, as Euler()")
     x = jnp.zeros((1, 1), jnp.float32)
     with jax.ensure_compile_time_eval():
         times = process.times(steps)
-    state = sampler.init(x, times, process, key=jax.random.PRNGKey(0))
+    state = solver.init(x, times, process, key=jax.random.PRNGKey(0))
     if times.shape[0] < 2:
         return
     t, t_next = times[:1], times[1:2]
     key = jax.ShapeDtypeStruct((2,), jnp.uint32)
     jax.eval_shape(
-        lambda x, key: sampler.step(x, t, t_next, x, x, state, key, process,
+        lambda x, key: solver.step(x, t, t_next, x, x, state, key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
 
@@ -104,7 +106,7 @@ class TunedLatents(NamedTuple):
     terms: dict[str, jax.Array]
 
 
-_DEFAULT_SAMPLER = DDIM()
+_DEFAULT_SOLVER = DDIM()
 _DEFAULT_GUIDANCE = CFG(3.0)
 
 
@@ -121,7 +123,7 @@ class DiffusionObjective(Objective[Ratio]):
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
-        sampler: Solver = _DEFAULT_SAMPLER,
+        solver: Solver = _DEFAULT_SOLVER,
         guidance: Guidance | None = _DEFAULT_GUIDANCE,
         steps: int = 200,
         pretrained: Variables | None = None,
@@ -132,7 +134,7 @@ class DiffusionObjective(Objective[Ratio]):
         """Build a denoising objective over `model` for the `inputs` field.
 
         `process` is a preset or a custom `Process`; presets build once here.
-        `sampler`, `guidance` and `steps` are how evaluation samples;
+        `solver`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction.
 
         `uncertainty` learns EDM2's loss weighting (Karras et al. 2024,
@@ -174,13 +176,13 @@ class DiffusionObjective(Objective[Ratio]):
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
         self.unconditional_prob = unconditional_prob
-        self.sampler = sampler
+        self.solver = solver
         self.guidance = guidance
         self.steps = steps
         self.ema = (None if ema_decay is None else
                     EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(self.process, sampler, steps)
+        check_solver(self.process, solver, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
@@ -335,7 +337,7 @@ class DiffusionObjective(Objective[Ratio]):
         """Build the process's denoiser over the model's own collections.
 
         The unconditional branch is passed only when this objective is
-        guided; without guidance the sampler never evaluates it.
+        guided; without guidance the solver never evaluates it.
         """
         return self.process.denoiser(self.model, self.trainable(params), given,
                                      None if self.guidance is None else unconditional)
@@ -468,7 +470,7 @@ class DiffusionObjective(Objective[Ratio]):
         denoise = self.denoiser(params, given, unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
-        samples = sample(denoise, x_T, self.steps, solver=self.sampler,
+        samples = sample(denoise, x_T, self.steps, solver=self.solver,
                          guidance=self.guidance, key=sample_key)
         autoencoder, params = self.published_autoencoder(params)
         if autoencoder is not None:

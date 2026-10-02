@@ -82,7 +82,7 @@ class Process:
     `interval` says the model predicts over an interval rather than at an
     instant, as MeanFlow's average velocity and a shortcut model's step do:
     it reads the interval's length in model time as `duration`, and a
-    sampler's step hands it the interval to the next grid point
+    solver's step hands it the interval to the next grid point
     (`Denoiser.spanning`), so a single-evaluation solver such as `Euler`
     takes the whole interval in one step. A zero duration is the
     instantaneous prediction.
@@ -101,8 +101,13 @@ class Process:
     def weight(self, t) -> jax.Array:
         return self.weighting(self.schedule, self.prediction, t)
 
+    def rates(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """`(alpha, sigma)` of the schedule a solver walks at `t`, shaped to
+        broadcast against `like`, a `[B, ...]` state."""
+        return broadcast_rates(self.sampler_schedule, t, like)
+
     def times(self, steps: int) -> jax.Array:
-        """The descending time grid of `steps` points a sampler walks, from T to 0.
+        """The descending time grid of `steps` points a solver walks, from T to 0.
 
         A tabulated schedule cannot take more steps than it has entries, so
         `steps` is capped at T there.
@@ -155,7 +160,7 @@ class Denoiser:
         """The model's own output at `(x_t, t)`, on the input scale and model
         time the process's parameterization asks for."""
         process = self.process
-        rates = broadcast_rates(process.sampler_schedule, t, x_t)
+        rates = process.rates(t, like=x_t)
         c_in = process.prediction.get_input_scale(rates)
         output = self.model.apply(
             self.params, x_t * c_in, process.sampler_schedule.model_time(t), **conditions)
@@ -166,7 +171,7 @@ class Denoiser:
     def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
         """`(x_0, epsilon)` read out of a raw model output at `(x_t, t)`."""
         process = self.process
-        rates = broadcast_rates(process.sampler_schedule, t, x_t)
+        rates = process.rates(t, like=x_t)
         preds = process.prediction.pred_transform(x_t, output, rates, t)
         return process.prediction.backward_diffusion(x_t, preds, rates)
 

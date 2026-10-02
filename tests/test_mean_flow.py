@@ -119,7 +119,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
                           dtype="float32", attention_impl="xla"),
-        data=OxfordFlowers(image_size=4), preset=presets.MeanFlow(), sampler=Euler(), guidance=None,
+        data=OxfordFlowers(image_size=4), preset=presets.MeanFlow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         mean_flow=MeanFlowTraining(omega=2.0, kappa=0.5))
@@ -171,7 +171,7 @@ def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_on
 
     def built(config):
         return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=OxfordFlowers(image_size=8),
-                                  preset=presets.MeanFlow(), sampler=Euler(), guidance=None, text=None,
+                                  preset=presets.MeanFlow(), solver=Euler(), guidance=None, text=None,
                                   val_metrics=(), mean_flow=MeanFlowTraining()).build().model
 
     assert built({"patch_size": 2}).time_scale == 0.002

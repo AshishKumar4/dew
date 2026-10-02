@@ -82,7 +82,8 @@
     },
     "name": "edm"
   },
-  "sampler": {
+  "sampling_steps": 20,
+  "solver": {
     "fields": {
       "algorithm": "dpmsolver++",
       "euler_at_final": false,
@@ -92,7 +93,6 @@
     },
     "name": "dpmsolver_multistep"
   },
-  "sampling_steps": 20,
   "text": {
     "checkpoint": "openai/clip-vit-large-patch14",
     "dtype": "bfloat16",
