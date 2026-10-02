@@ -75,6 +75,60 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
+@pytest.mark.parametrize("installed, call, chosen", [
+    (True, {}, "triton"),
+    (True, {"causal": True}, "triton"),
+    (True, {"sliding_window": 64}, "cudnn"),
+    (True, {"bias": jnp.zeros((1, 1, 128, 128), jnp.bfloat16)}, "cudnn"),
+    (True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
+    (False, {}, "cudnn"),
+    (True, {"head_dim": 128}, "cudnn"),
+])
+def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypatch, installed, call,
+                                                                        chosen, without_deterministic_ops):
+    """Where cudnn's kernel runs, 'auto' takes tokamax's Pallas-Triton kernel
+    for heads up to 64 wide and a call with no window, mask or bias, if
+    tokamax is installed: the calls it measured faster on
+    (`triton_runs`). Anything else stays on cudnn."""
+    from importlib import util
+
+    from dew.nn import attention
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
+    monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
+    found = util.find_spec
+    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' and installed
+                        else None if name == 'tokamax' else found(name))
+    query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
+    assert attention.resolve_implementation('auto', query, query, **call) == chosen
+
+
+@on_gpu
+@pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
+    (256, 256, 12, 12, 64, False),   # SimpleDiT-B's image tokens
+    (512, 512, 12, 12, 64, True),    # the small decoder
+    (1024, 1024, 16, 8, 128, True),  # Qwen3-0.6B's grouped heads
+    (333, 333, 4, 4, 64, True),      # an odd length, which cudnn pads
+    (1024, 77, 4, 4, 64, False),     # cross-attention over CLIP's 77 tokens
+    (256, 256, 8, 8, 80, True),      # a head width that is no power of two
+])
+def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal):
+    """tokamax's kernel at its heuristic config, the one 'auto' runs, at the
+    shapes it is sent: within two bf16 ulps of the output scale of the xla
+    kernel, forward and backward, as cudnn is. One of its VJP configs returns
+    gradients off by orders of magnitude (64/32/32/64 blocks at 1024 causal
+    tokens), so each shape's gradients are checked, not its forward alone."""
+    pytest.importorskip("tokamax")
+    query, _, _ = qkv((2, q_len, heads, head_dim))
+    _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
+
+    fused = value_and_grads('triton', query, key, value, causal=causal)
+    reference = value_and_grads('xla', query, key, value, causal=causal)
+
+    for got, want in zip(fused, reference, strict=True):
+        assert got.shape == want.shape
+        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
     """The output and the three input gradients of one call that ends each
     row's keys at `lengths`, either as lengths or as the mask they mean."""

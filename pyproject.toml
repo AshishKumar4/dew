@@ -74,6 +74,12 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # dew.training.quantization: quantized training and serving. Qwix declares
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
 quantization = ["qwix==0.1.8"]
+# tokamax's Pallas-Triton attention, which 'auto' runs on sm80 and later where
+# cudnn's would (dew.nn.attention.triton_runs). Install it with -c
+# constraints.txt: tokamax 0.0.14, its latest release, pins typeguard==2.13.3
+# where tyro needs >=4, and constraints.txt pins the main commit that dropped
+# typeguard (still versioned 0.0.14) until a release carries it.
+kernels = ["tokamax"]
 test = [
     "pytest",
     # The gate's behavior tests run the same linter and rule set as CI.

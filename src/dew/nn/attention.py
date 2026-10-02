@@ -9,6 +9,8 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import importlib
+import importlib.util
 import math
 from typing import Literal
 
@@ -43,7 +45,7 @@ from .sharding import (
     split_positions,
 )
 
-AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "tpu"]
 """Names which kernel an attention call runs.
 
 Every layer that carries the choice spells it the same way: a `ModelConfig`
@@ -52,12 +54,15 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 
 'reference' is the portable einsum and softmax, and the only path that reads
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
-`jax.nn.dot_product_attention`'s own two. 'tpu' is the pallas splash kernel,
-with the older pallas flash kernel behind it for the calls splash's mask
-descriptor cannot carry. 'auto', every module's default, resolves per trace
-(`resolve_implementation`): cudnn where its kernel runs, tpu where splash's
-does, the reference path where the call asks for arithmetic only it
-honours, and xla anywhere else.
+`jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
+flash kernel (`triton_attention`), which needs tokamax installed
+(`dewml[kernels]`). 'tpu' is the pallas splash kernel, with the older pallas
+flash kernel behind it for the calls splash's mask descriptor cannot carry.
+'auto', every module's default, resolves per trace (`resolve_implementation`):
+triton where cudnn's kernel runs and `triton_runs`; cudnn where its kernel
+runs; tpu where splash's does;
+the reference path where the call asks for arithmetic only it honours; and
+xla anywhere else.
 """
 
 
@@ -753,6 +758,52 @@ def cudnn_runs(query, softcap=None) -> bool:
             and softcap is None and not deterministic_ops_requested())
 
 
+def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
+    """Report whether 'auto' sends a call cudnn would take to tokamax's
+    Pallas-Triton kernel instead: tokamax is installed, the heads are at most
+    64 wide, and the call has no window, mask (key lengths included) or bias.
+
+    Those are the calls it measured faster on. On an RTX 4080, bf16, in the
+    training step: SimpleDiT-B's attention (32 x 256 tokens, 12 heads of 64)
+    5.62 to 4.33 ms and the step 73.1 to 71.5 ms; the 3-layer decoder's (16 x
+    512 causal) 1.82 to 1.24 and the step 50.8 to 50.2. At 128-wide heads it
+    is not: Qwen3-0.6B's (1 x 1024, 16 query and 8 key heads) 9.13 to 9.24 ms,
+    and a 2048-token call with 8 heads over one key head 0.63 against 0.67
+    ms. A window gains nothing (0.58 against 0.59 ms at 256 of 1024), so it
+    stays on cuDNN with the masks.
+    """
+    return (query.shape[-1] <= 64 and sliding_window is None and mask is None and bias is None
+            and importlib.util.find_spec('tokamax') is not None)
+
+
+def triton_attention(query, key, value, causal: bool):
+    """tokamax's Pallas-Triton flash kernel over `[B, S, H, D]` arrays, at
+    tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
+
+    It takes grouped key heads and any length itself. A Pallas call has no
+    partitioning rule, so on a mesh it runs inside `manual_map` on each
+    shard's rows and heads, with the key heads repeated until the tensor
+    axes split them as they split the query's. tokamax is not a dependency
+    of Dew (`dewml[kernels]` installs it), so it is imported here.
+    """
+    try:
+        tokamax = importlib.import_module('tokamax')
+    except ImportError as e:
+        raise ValueError("attention implementation 'triton' needs tokamax: "
+                         "pip install 'dewml[kernels]'") from e
+
+    def local(query, key, value):
+        return tokamax.dot_product_attention(query, key, value, is_causal=causal,
+                                             implementation='triton')
+
+    if jax.sharding.get_abstract_mesh().empty:
+        return local(query, key, value)
+    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+
+
 def weighted_values(equation, weights, value, *, precision=None):
     """The probability-value product, with the probabilities in the value's dtype.
 
@@ -992,6 +1043,12 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "'xla' for this shape.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
+    elif implementation == 'triton':
+        if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
+            raise ValueError(
+                "attention implementation 'triton' takes no sinks, softcap, bias, mask, "
+                "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
+        out = triton_attention(query, key, value, causal)
     elif implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
@@ -1060,7 +1117,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         mask=mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3]),
         bias=bias,
     )
-    if resolved not in ('cudnn', 'tpu'):
+    if resolved not in ('cudnn', 'triton', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
     def fused(query, key, value, bias, sinks):
@@ -1120,8 +1177,9 @@ def _attention_kernel(query, key, value, dtype=None, precision=None,
         mask = with_documents(mask, segment_ids)
         masked = with_documents(masked, segment_ids)
         # cuDNN would take the document mask as an additive bias
-        # (`kernel_for_materialized_mask`), so a packed call runs on xla.
-        if implementation == 'cudnn':
+        # (`kernel_for_materialized_mask`), and the triton route takes no
+        # mask, so a packed call runs on xla.
+        if implementation in ('cudnn', 'triton'):
             implementation = 'xla'
     if sinks is not None and implementation in ('reference', 'xla'):
         mask = combined_attention_mask(
@@ -1195,11 +1253,11 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
     path when the call asks for arithmetic no fused kernel performs
     (`reference_only`), else cudnn where `cudnn_runs` and the call has no
-    sinks, the tpu kernel where `tpu_runs`, and xla anywhere else. Any other
-    name is returned as it is, so an explicit kernel still refuses what it
-    cannot honour by name.
+    sinks (triton in its place where `triton_runs`), the tpu kernel where
+    `tpu_runs`, and xla anywhere else. Any other name is returned as it is,
+    so an explicit kernel still refuses what it cannot honour by name.
     """
-    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
+    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
     if implementation in ('auto', 'xla') and _xla_kernel_narrows(query):
         return 'reference'
@@ -1208,7 +1266,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
     if sinks is None and cudnn_runs(query, softcap):
-        return 'cudnn'
+        return 'triton' if triton_runs(query, sliding_window, mask, bias) else 'cudnn'
     if tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
         return 'tpu'
     return 'xla'
