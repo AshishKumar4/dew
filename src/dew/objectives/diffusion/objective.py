@@ -183,7 +183,7 @@ class DiffusionObjective(Objective[Ratio]):
         check_solver(self.process, sampler, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`
         task, sampling the way this objective's evaluation does."""
         from dew.sampling.pipelines import TextToImage

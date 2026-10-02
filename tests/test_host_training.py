@@ -387,7 +387,7 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
         return "layers_1" not in path and path[-2:] != ("gate_proj", "kernel")
 
     def objective():
-        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable)
+        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable, ema_decay=0.999)
 
     batch = tokens()
     resident = updated(objective(), batch, DEVICE)

@@ -33,9 +33,13 @@ the newest checkpoint every process can read wins.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import datetime
+import math
 import os
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -48,7 +52,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position
 from dew.objectives.base import Variables
-from dew.records import JSON, json_value
+from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -128,8 +132,83 @@ def _processes(count: int) -> str:
     return f"{count} process" + ("es" if count != 1 else "")
 
 
-def _loss(metrics):
-    return metrics['loss']
+@dataclasses.dataclass(frozen=True)
+class Keep:
+    """Union of latest steps, periodic steps, wall-time-spaced checkpoints and a predicate.
+
+    `interval` keeps checkpoints at least this wall time apart, not all old
+    checkpoints. `where` receives a retained-step record with its metrics.
+    """
+    latest: int = 2
+    every: int | None = None
+    interval: datetime.timedelta | str | None = None
+    where: Callable[[Kept], bool] | None = dataclasses.field(default=None, metadata={'record': False})
+
+    def __post_init__(self):
+        if self.latest < 0 or (self.every is not None and self.every < 1):
+            raise ValueError("Keep needs latest >= 0 and every >= 1")
+        if isinstance(self.interval, str):
+            object.__setattr__(self, 'interval', duration(self.interval))
+        interval = duration(self.interval) if isinstance(self.interval, str) else self.interval
+        if interval is not None and interval.total_seconds() <= 0:
+            raise ValueError("Keep.interval must be positive")
+
+
+@dataclasses.dataclass(frozen=True)
+class Ranking:
+    """Evaluation's ranking of these weights; storage only retains it."""
+    metric: str
+    value: float
+    mode: Literal['min', 'max'] = 'min'
+    top: int = 1
+    weights_only: bool = False
+
+
+def _recorded_rank(metrics):
+    # Orbax records the metrics file only when best_fn is configured. The
+    # retention policy and named readers use every independently stored rank.
+    return metrics.get('loss', next((value for key, value in metrics.items()
+                                    if key.startswith('checkpoint/rank/')), None))
+
+
+class Metrics(Mapping):
+    """Recorded scalars indexed by their names or by the objects that produced them."""
+    def __init__(self, values: Mapping[str, float]):
+        self._values = values
+
+    def __getitem__(self, key):
+        from dew.objectives.base import Metric, TrainingScalar
+        if isinstance(key, str):
+            return self._values[key]
+        if isinstance(key, TrainingScalar):
+            return self._values[f'train/{key.name}']
+        if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], Metric):
+            return self._values[f'{key[0]}/{key[1].name}']
+        if isinstance(key, Metric):
+            names = [name for name in self._values if not name.startswith('checkpoint/')
+                     and (name == key.name or name.endswith('/' + key.name))]
+            if len(names) != 1:
+                raise KeyError(
+                    f"metric {key.name!r} is absent or belongs to several splits; use (split, metric)"
+                )
+            return self._values[names[0]]
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    step: int
+    metrics: Metrics
+    ranked_by: str | None
+    mode: str | None
+    kind: str = 'state'
+    rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
 
 
 def _check_shared(directory: str) -> None:
@@ -479,6 +558,59 @@ def absent(expected, held) -> list[jax.tree_util.KeyPath]:
             if jax.tree_util.keystr(path) not in have]
 
 
+class _RankedSteps(preservation.PreservationPolicy):
+    def __init__(self, checkpoints):
+        self.checkpoints = checkpoints
+
+    def should_preserve(self, checkpoints: Sequence[preservation.PolicyCheckpointInfo], *,
+                        context: preservation.PreservationContext) -> Sequence[bool]:
+        held: set[int] = set()
+        full = [
+            checkpoint
+            for checkpoint in checkpoints
+            if not (checkpoint.metrics or {}).get("checkpoint/weights_only", 0)
+        ]
+        held.update(
+            checkpoint.step
+            for checkpoint in sorted(full, key=lambda checkpoint: checkpoint.step)[
+                -self.checkpoints.keep.latest :
+            ]
+            if self.checkpoints.keep.latest
+        )
+        groups: dict[str, list[tuple[float, int]]] = {}
+        limits = self.checkpoints._rank_limits
+        for checkpoint in checkpoints:
+            scores = checkpoint.metrics or {}
+            for key, value in scores.items():
+                if key.startswith('checkpoint/rank/'):
+                    groups.setdefault(key.removeprefix("checkpoint/rank/"), []).append(
+                        (value, checkpoint.step)
+                    )
+            if 'loss' in scores:
+                groups.setdefault('train/loss', []).append((scores['loss'], checkpoint.step))
+        for name, scores in groups.items():
+            held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
+        keep = self.checkpoints.keep
+        previous = None
+        interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
+        for checkpoint in sorted(checkpoints, key=lambda checkpoint: checkpoint.step):
+            if keep.every and checkpoint.step % keep.every == 0:
+                held.add(checkpoint.step)
+            if interval and (previous is None or checkpoint.time - previous >= interval):
+                held.add(checkpoint.step)
+                previous = checkpoint.time
+            if keep.where:
+                try:
+                    selected = keep.where(
+                        Kept(checkpoint.step, Metrics(checkpoint.metrics or {}), None, None)
+                    )
+                except KeyError:
+                    selected = False
+                if selected:
+                    held.add(checkpoint.step)
+        return [checkpoint.step in held for checkpoint in checkpoints]
+
+
 class _ProfileSteps(preservation.PreservationPolicy):
     """Keep ordinary checkpoints that also serve as post-hoc EMA snapshots."""
     def __init__(self, steps: set[int]):
@@ -508,7 +640,7 @@ class Checkpoints:
     restores onto any mesh.
     """
 
-    def __init__(self, directory: str, *, keep: int = 2,
+    def __init__(self, directory: str, *, keep: int | Keep = 2,
                  local_directory: str | None = None, local_every: int | None = None):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
@@ -517,7 +649,12 @@ class Checkpoints:
         if local_every is not None and local_every < 1:
             raise ValueError(f"local_every must be at least 1, got {local_every}")
         self.directory = str(location(directory))
-        self.keep = keep
+        self.keep = Keep(latest=keep) if isinstance(keep, int) else keep
+        self._rank_limits: dict[str, int] = {}
+        self._rank_modes: dict[str, str] = {}
+        self._pending: tuple[int, dict[str, float]] | None = None
+        self._step_cache: dict[int, Kept] = {}
+        self._custom_cache: dict[int, dict] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
         self._manager = None
@@ -525,26 +662,123 @@ class Checkpoints:
         self._profile_snapshots: set[int] = set()
         self._metadata: tuple[bool, int, ocp.metadata.StepMetadata] | None = None
 
+    def _candidates(self, rankings: Sequence[Ranking]) -> tuple[Ranking, ...]:
+        eligible = [rank for rank in rankings if math.isfinite(rank.value)]
+        if not eligible:
+            return ()
+        self._open().check_for_errors()
+        retained = {checkpoint.step: checkpoint.metrics for checkpoint in self.kept()}
+        if self._pending is not None and self._open().is_saving_in_progress():
+            step, scores = self._pending
+            retained[step] = Metrics(scores)
+        else:
+            self._pending = None
+        candidates = []
+        for rank in eligible:
+            score = rank.value if rank.mode == 'min' else -rank.value
+            key = f'checkpoint/rank/{rank.metric}'
+            held = sorted(scores[key] for scores in retained.values() if key in scores)
+            if len(held) < rank.top or score < held[rank.top - 1]:
+                candidates.append(rank)
+        return tuple(candidates)
+
+    def would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool:
+        """Whether an evaluation would enter any of its trackers' best-K sets."""
+        return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
+
+    def _cache_step(self, step: int, metadata) -> Kept:
+        custom = metadata.custom_metadata or {}
+        rules = custom.get('rankings') or {}
+        selection = next(iter(rules.values()), {})
+        checkpoint = Kept(
+            step=step,
+            metrics=Metrics(metadata.metrics or {}),
+            ranked_by=custom.get('primary') or next(iter(rules), None),
+            mode=selection.get('mode'),
+            kind='weights' if custom.get('weights_only') else 'state',
+            rankings=copy.deepcopy(rules))
+        self._step_cache[step] = checkpoint
+        self._custom_cache[step] = copy.deepcopy(custom)
+        return checkpoint
+
+    def kept(self) -> list[Kept]:
+        """Committed retained steps, oldest first; immutable metadata is cached."""
+        persistent = self._open()
+        active = set(persistent.all_steps())
+        for step in set(self._step_cache) - active:
+            del self._step_cache[step]
+            self._custom_cache.pop(step, None)
+        retained = []
+        for step in sorted(active):
+            checkpoint = self._step_cache.get(step)
+            if checkpoint is None:
+                if not self._complete(step):
+                    continue
+                checkpoint = self._cache_step(step, persistent.metadata(step))
+            # Callers own the returned nested rules; changing them must not
+            # mutate the committed metadata cached for later queries.
+            retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
+        return retained
+
+    def control(self, step: int) -> dict:
+        if step == self._local_latest():
+            custom = self._open_local().metadata(step).custom_metadata or {}
+        else:
+            self.kept()
+            custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
+        return copy.deepcopy(custom.get('control', {}))
+
+    def _best_step(self, name: str | None) -> int | None:
+        candidates = []
+        retained = self.kept()
+        if name is None:
+            for checkpoint in reversed(retained):
+                custom = self._custom_cache[checkpoint.step]
+                if custom.get('primary'):
+                    name = custom['primary']
+                    break
+        key = 'loss' if name is None else f'checkpoint/rank/{name}'
+        for checkpoint in retained:
+            if key in checkpoint.metrics:
+                candidates.append((checkpoint.metrics[key], checkpoint.step))
+            elif name == 'train/loss' and 'loss' in checkpoint.metrics:
+                candidates.append((checkpoint.metrics['loss'], checkpoint.step))
+        return min(candidates)[1] if candidates else None
+
+    def resolve(self, step: int | str | None) -> int | None:
+        if not isinstance(step, str):
+            return step
+        if step != 'best' and not step.startswith('best:'):
+            raise ValueError(f"unknown checkpoint selector {step!r}")
+        best = self._best_step(None if step == 'best' else step.removeprefix('best:'))
+        if best is None:
+            raise FileNotFoundError(f"{self.directory} holds no ranked checkpoint for {step}")
+        return best
+
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
             _check_shared(self.directory)
             options = ocp.CheckpointManagerOptions(
                 preservation_policy=preservation.AnyPreservationPolicy([
-                    preservation.LatestN(n=self.keep),
                     _ProfileSteps(self._profile_snapshots),
-                    preservation.BestN(get_metric_fn=_loss, n=1,
-                                       keep_checkpoints_without_metrics=False,
-                                       reverse=True),
+                    _RankedSteps(self),
                 ]),
-                best_fn=_loss, best_mode='min',
+                best_fn=_recorded_rank, best_mode='min',
                 create=True, enable_async_checkpointing=True)
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler())
             for step in self._manager.all_steps():
-                custom = self._step_metadata(step).custom_metadata or {}
+                if not self._complete(step):
+                    continue
+                metadata = self._step_metadata(step)
+                self._cache_step(step, metadata)
+                custom = metadata.custom_metadata or {}
                 if custom.get('profiles') is not None:
                     self._profile_snapshots.add(step)
+                for name, rule in (custom.get('rankings') or {}).items():
+                    self._rank_limits[name] = rule['top']
+                    self._rank_modes[name] = rule['mode']
         return self._manager
 
     def _step_metadata(self, step: int, *, local: bool = False) -> ocp.metadata.StepMetadata:
@@ -612,6 +846,8 @@ class Checkpoints:
         return held if held >= 0 and bool(np.all(steps == held)) else None
 
     def _complete(self, step: int) -> bool:
+        if step in self._step_cache:
+            return step in self._open().all_steps()
         path = epath.Path(self.path(step))
         return path.exists() and ocp.utils.is_checkpoint_finalized(path)
 
@@ -619,9 +855,16 @@ class Checkpoints:
     def latest(self) -> int | None:
         """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
-        if persistent is not None and not self._complete(persistent):
+        if persistent is not None and (not self._complete(persistent) or
+                (self._open().metadata(persistent).custom_metadata or {}).get('weights_only', False)):
             persistent = max(
-                (step for step in self._open().all_steps() if self._complete(step)), default=None
+                (
+                    step
+                    for step in self._open().all_steps()
+                    if self._complete(step)
+                    and not (self._open().metadata(step).custom_metadata or {}).get("weights_only", False)
+                ),
+                default=None,
             )
         local = self._local_latest()
         if persistent is None or local is None:
@@ -630,17 +873,7 @@ class Checkpoints:
 
     @property
     def best(self) -> int | None:
-        """Return the committed step with the lowest reported loss, or None."""
-        best = self._open().best_step()
-        if best is None or self._complete(best):
-            return best
-        scored = []
-        for step in self._open().all_steps():
-            if self._complete(step):
-                metrics = self._open().metadata(step).metrics
-                if metrics and 'loss' in metrics:
-                    scored.append((_loss(metrics), step))
-        return min(scored)[1] if scored else None
+        return self._best_step(None)
 
     def path(self, step: int) -> str:
         return str(epath.Path(self.directory) / str(step))
@@ -651,11 +884,21 @@ class Checkpoints:
         persistent one."""
         return self.local_path if step == self._local_latest() else self.directory
 
-    def save(self, step: int, state: TrainState, saved: bytes | None,
-             metrics: Mapping[str, float] | None = None, *,
-             share: DataPartition | None = None, rung: JSON = None) -> None:
-        """Write `state` under `step`, asynchronously, and `rung`, the fit
-        ladder's rung the state trained on, for a resume to compile (`rung`).
+    def save(
+        self,
+        step: int,
+        state: TrainState,
+        saved: bytes | None,
+        metrics: Mapping[str, float] | None = None,
+        *,
+        share: DataPartition | None = None,
+        ranking: Ranking | Sequence[Ranking] | None = None,
+        control: dict | None = None,
+        weights_only: bool = False,
+        primary: str | None = None,
+        rung: JSON = None,
+    ) -> None:
+        """Write `state` under `step`, asynchronously.
 
         Sharded arrays go straight to orbax: gathering them onto the host
         first would serialise the whole state through one process and undo
@@ -676,22 +919,47 @@ class Checkpoints:
         lands: 12 bytes a parameter for fp32 Adam moments and EMA, 84 GB at
         7B parameters, on hosts that keep the state there for want of room.
         """
-        profiles = _power_profiles(state.opt_state)
+        profiles = None if weights_only else _power_profiles(state.opt_state)
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
         state_tree, deltas = _with_ema_deltas(self._item(state, saved, share))
+        if weights_only:
+            state_tree = {name: state_tree[name] for name in ('params', 'ema')}
         persistent = self._open()
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
+        scores = dict(metrics or {})
+        if weights_only:
+            scores['checkpoint/weights_only'] = 1.0
+        rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
+        rules = {}
+        for rank in rankings:
+            previous = self._rank_modes.get(rank.metric)
+            if previous is not None and previous != rank.mode:
+                raise ValueError(f"ranking direction for {rank.metric!r} differs from this run's checkpoints")
+            self._rank_modes[rank.metric] = rank.mode
+            self._rank_limits[rank.metric] = rank.top
+            if math.isfinite(rank.value):
+                scores[f'checkpoint/rank/{rank.metric}'] = rank.value if rank.mode == 'min' else -rank.value
+                rules[rank.metric] = dataclasses.asdict(rank)
         with region("checkpoint.submit"):
             persistent.save(
                 step,
                 args=ocp.args.PyTreeSave(state_tree),
-                metrics=metrics,
+                metrics=scores,
                 force=True,
-                custom_metadata={"ema_deltas": deltas, "profiles": profile_metadata, "rung": rung},
+                custom_metadata={
+                    "ema_deltas": deltas,
+                    "profiles": profile_metadata,
+                    "rankings": rules,
+                    "primary": primary or (rankings[0].metric if rankings else None),
+                    "control": copy.deepcopy(control or {}),
+                    "weights_only": weights_only,
+                    "rung": rung,
+                },
             )
+        self._pending = (step, scores)
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 persistent.wait_until_finished()
@@ -705,7 +973,8 @@ class Checkpoints:
 
     def profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]:
         """The updates and relative standard deviations of a snapshot, without reading its averages."""
-        custom = self._open().metadata(step).custom_metadata or {}
+        self.kept()
+        custom = self._custom_cache.get(step) or self._open().metadata(step).custom_metadata or {}
         profiles = custom.get('profiles')
         if profiles is None:
             raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA snapshot")
@@ -725,8 +994,16 @@ class Checkpoints:
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
 
-    def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
-                   share: DataPartition | None = None, rung: JSON = None) -> None:
+    def save_local(
+        self,
+        step: int,
+        state: TrainState,
+        saved: bytes | None,
+        *,
+        share: DataPartition | None = None,
+        control: dict | None = None,
+        rung: JSON = None,
+    ) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
         does, a state with arrays in pinned host memory before it returns.
@@ -741,9 +1018,18 @@ class Checkpoints:
         local = self._open_local()
         self._metadata = None
         with region("checkpoint.submit_local"):
-            local.save(step, args=ocp.args.PyTreeSave(state_tree), force=True,
-                       custom_metadata={'processes': jax.process_count(), 'placement': written,
-                                        'ema_deltas': deltas, 'rung': rung})
+            local.save(
+                step,
+                args=ocp.args.PyTreeSave(state_tree),
+                force=True,
+                custom_metadata={
+                    "processes": jax.process_count(),
+                    "placement": written,
+                    "ema_deltas": deltas,
+                    "control": copy.deepcopy(control or {}),
+                    "rung": rung,
+                },
+            )
         if _written_in_place(state_tree):
             with region("checkpoint.write_in_place"):
                 local.wait_until_finished()
@@ -767,12 +1053,13 @@ class Checkpoints:
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
-    def stored(self, step: int | None = None) -> Variables:
+    def stored(self, step: int | str | None = None) -> Variables:
         """Return what the checkpoint at `step` holds, without reading its values.
 
         `step` defaults to the latest. Each state field comes back as a
         shape/dtype tree, and an unset field as None.
         """
+        step = self.resolve(step)
         if step is None:
             step = self.latest
             if step is None:
@@ -804,14 +1091,14 @@ class Checkpoints:
         return Accumulation(**arrays)
 
     @overload
-    def restore[StateT](self, template: StateT, step: int | None = None, *,
+    def restore[StateT](self, template: StateT, step: int | str | None = None, *,
                         share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
 
     @overload
-    def restore(self, template: None = None, step: int | None = None, *,
+    def restore(self, template: None = None, step: int | str | None = None, *,
                 share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
 
-    def restore(self, template=None, step: int | None = None, *,
+    def restore(self, template=None, step: int | str | None = None, *,
                 share: DataPartition | None = None):
         """Restore the state at `step` and the data position of `share`.
 
@@ -830,6 +1117,7 @@ class Checkpoints:
         bytes the reader of `share` resumes from (`read_position`); without a
         share, as for a caller that reads weights and no data, it is None.
         """
+        step = self.resolve(step)
         local = self._local_latest()
         if step is None:
             step = self.latest
@@ -845,6 +1133,9 @@ class Checkpoints:
                 f"the template of a run placed as it was written, or read the "
                 f"persistent checkpoint at {self.path(step)}")
         snapshot = self._step_metadata(step, local=from_local)
+        if template is not None and not isinstance(template, Mapping) and (
+                snapshot.custom_metadata or {}).get('weights_only', False):
+            raise ValueError("inference-only weights snapshot; resume a full checkpoint")
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored)
@@ -999,3 +1290,4 @@ class Checkpoints:
                             error.add_note(f"Checkpoint wait also failed: {failure!r}")
             if error is not None:
                 raise error
+            self._pending = None

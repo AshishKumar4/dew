@@ -62,7 +62,7 @@ from flax.linen.module import Interceptor
 from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.layer_plan import group_layers
-from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select
+from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select, thaw
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -211,9 +211,12 @@ class LoRA:
     def merge(self, variables: Variables) -> Variables:
         """Return `variables` with every delta added into its kernel and the factors removed.
 
-        The sum runs in at least fp32 at full precision and lands in the
-        kernel's dtype, PEFT's `merge_and_unload`.
+        `variables` is the adapted tree, or a trainer's split of it, the
+        factors under `params` and the base under `frozen`. The sum runs in
+        at least fp32 at full precision and lands in the kernel's dtype,
+        PEFT's `merge_and_unload`.
         """
+        variables = thaw(variables)
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
@@ -285,7 +288,8 @@ class LoRA:
         """Write the adapter's factors from `variables` under its own module names.
 
         The names are the ones this adapter bound at construction, so a run
-        saves what it trained with the tree it trained it in. One unnamed
+        saves what it trained with the tree it trained it in, split or
+        whole (`merge` reads both). One unnamed
         component writes PEFT's directory, which is a decoder source and a
         registry-built model; a pipeline source, whose weights are named
         under several components, writes the Diffusers file with each
@@ -295,6 +299,7 @@ class LoRA:
             raise ValueError(
                 "this adapter binds no source names to write its factors under; "
                 "LoRA.fresh and LoRA.load bind them, a declared target set does not")
+        variables = thaw(variables)
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}
@@ -711,13 +716,15 @@ class Adaptable(Protocol):
     trainable: PathFilter | None
 
 
-def attach(objective: object, adapter: LoRA) -> None:
-    """Adapt the module `objective` trains and freeze all but the factors.
+def _attach(objective: object, adapter: LoRA) -> None:
+    """Adapt the module `objective` trains, in place, and freeze all but the factors.
 
-    `RunConfig.train` calls this once, after a recipe has built the
-    objective and before anything initialises it, so the adapted module is
-    what the run traces and the adapter's own leaves are the only ones the
-    optimizer moves. The adapted module is a subclass of the same class with
+    This is `RunConfig.train`'s step, not a user's: the recipe hands the run
+    its objective, and the run adapts it once, before anything initialises
+    it, so the adapted module is what the run traces and the adapter's own
+    leaves are the only ones the optimizer moves. Code that builds its own
+    run adapts a source with `Pretrained.lora` instead, which returns a
+    new bundle. The adapted module is a subclass of the same class with
     the same fields, so what the objective read off the model at
     construction still holds.
     """

@@ -516,6 +516,25 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
+def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
+    """An LM keeps no EMA unless asked, so each reader's default takes the
+    live weights of such a run: the objective's pipeline, `dew.pipeline`
+    and `export_run`."""
+    from dew.interop import export_run, load_pretrained
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    published = objective.pipeline(state)
+    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(published.variables), strict=True):
+        assert bound is expected
+    export_run(str(run), tmp_path / "export")
+    reloaded = load_pretrained(tmp_path / "export", dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(published.model.apply(published.variables, ids)))
+
+
 def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     """The quantization knob is the trainer's, so `RunConfig.train` writes it
     under `trainer` in run.json and `dew.pipeline` reads it back there: the

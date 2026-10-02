@@ -1,13 +1,12 @@
-"""Turns raw text and audio into the arrays a batch carries.
+"""Turns raw audio into the arrays a batch carries.
 
-These run inside grain's workers, so the device only ever sees ready tensors.
-`transformers` is imported on construction, not on import.
+This runs inside grain's workers, so the device only ever sees ready tensors.
+`transformers` is imported on construction, not on import. Captions are
+tokenized by the condition encoder that reads them (`dew.inputs`).
 """
 
 import inspect
 from typing import Protocol, runtime_checkable
-
-from .text import load_tokenizer
 
 
 @runtime_checkable
@@ -19,30 +18,6 @@ class Sampled(Protocol):
     """
 
     sampling_rate: int
-
-
-class AutoTextTokenizer:
-    """Tokenizes captions, padded and truncated to the text model's context.
-
-    `tensor_type` is what the tokenizer returns its arrays as; "np" is what
-    every caller here asks for, since nothing downstream reads torch.
-    """
-
-    def __init__(self, tensor_type="np", modelname="openai/clip-vit-large-patch14"):
-        self.tokenizer = load_tokenizer(modelname)
-        self.tensor_type = tensor_type
-
-    def __call__(self, inputs):
-        tokens = self.tokenizer(inputs, padding="max_length", max_length=self.tokenizer.model_max_length,
-                                truncation=True, return_tensors=self.tensor_type)
-        return {
-            "input_ids": tokens["input_ids"],
-            "attention_mask": tokens["attention_mask"],
-            "caption": inputs,
-        }
-
-    def __repr__(self):
-        return self.__class__.__name__ + '()'
 
 
 class AutoAudioProcessor:

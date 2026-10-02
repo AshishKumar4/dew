@@ -144,13 +144,14 @@ def test_hf_tokenizer_imports_lazily():
 
 
 def test_every_reader_of_a_tokenizer_shares_one_load():
-    """HFTokenizer and the caption tokenizer load a name through one cache."""
-    from dew.data import AutoTextTokenizer, HFTokenizer
+    """HFTokenizer and the caption tokenizers load a name through one cache."""
+    from dew.data import HFTokenizer
+    from dew.data.text import load_tokenizer
 
     path = str(REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-chat")
     first = HFTokenizer(path).tokenizer
     assert HFTokenizer(path).tokenizer is first
-    assert AutoTextTokenizer(modelname=path).tokenizer is first
+    assert load_tokenizer(path) is first
 
 
 def test_readers_that_miss_the_cache_together_share_one_load(tmp_path):

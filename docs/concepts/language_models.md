@@ -64,18 +64,18 @@ print(tokenizer.decode(continuation.tokens[0]))
 
 ```text
 Training CausalTransformer from step 0 to 300: 147,904 parameters, on 1 × cpu, batch 16, float32
-step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 62.10  samples_per_sec 257.6  accepted 100.0%  0:00:11 left
-step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 52.80  samples_per_sec 303.0  accepted 100.0%  0:00:06 left
-step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 49.44  samples_per_sec 323.6  accepted 100.0%
-eval val at step 300: perplexity 16.68 (32 records in 0.68 s)
-Trained 300 steps in 0:00:19: first step after 2.14 s, then 18.4 step/s
-85.2% of the wall time in steps, final loss 0.06941
+step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 29.97  samples_per_sec 533.9  accepted 100.0%  0:00:05 left
+step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 34.53  samples_per_sec 463.4  accepted 100.0%  0:00:03 left
+step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 36.10  samples_per_sec 443.3  accepted 100.0%
+eval val at step 300: perplexity 1.065 (32 records in 0.93 s)
+Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
+72.9% of the wall time in steps, final loss 0.06941
 One day, Lily saw a big dog in the park. The dog want
 ```
 
 `TokenWindows(seq_len=64)` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
-The training loss is near zero because four sentences repeat. Validation reads the EMA copy of the weights (decay 0.999 by default), which after 300 steps still lags the live parameters, so its perplexity is much higher than the training loss. Generation above reads the live `lm_state.params`.
+The training loss is near zero because four sentences repeat, and the held-out head of the same stream scores as low. Validation and the generation above both read the trained `lm_state.params`, since the objective keeps no moving average unless `ema_decay` is set.
 
 ## TinyStories
 
@@ -96,6 +96,7 @@ The measured run changes these settings from the example:
 | Data | `TokenWindows(path="data/tinystories", seq_len=256).load(batch=32)` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `optax.adamw(1e-3)` |
+| Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
 | Run | `steps=2000, log_every=500, eval_every=1000` |
 | Prompt | `"Once upon a time"`, 40 new tokens, `temperature=0.0` |
 
@@ -108,6 +109,8 @@ GPU reductions are not bitwise repeatable by default, so a second run can contin
 ## Tokenizers and token files
 
 Use one tokenizer everywhere: data preparation, model construction, decoding and checkpoint export. `ByteTokenizer` has a vocabulary of 256 and uses ID 255 as its EOS. `HFTokenizer(name)` wraps a Hugging Face tokenizer with that model's vocabulary and chat template, and downloads its files on first use.
+
+`ByteTokenizer` and `HFTokenizer` have `encode` and `decode`, and `tokenizer_for(name)` returns the first for `"byte"` and the second for any other name. A source loaded with `load_pretrained` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
 `tools/tokenize_text.py` (in a repository checkout) tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
 
@@ -135,7 +138,7 @@ The binary files use the smallest unsigned dtype that holds the vocabulary. Two 
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `ema_decay` | `0.999` | Decay of the EMA copy. `None` keeps no copy. |
+| `ema_decay` | `None` | Decay of an EMA copy, which evaluation and previews then read. `None` keeps no copy. |
 | `pad_id` | `None` | Token ID whose targets carry no loss. |
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
 | `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
@@ -173,7 +176,7 @@ Plain `torch.autocast` with FlashAttention 2 sits at +4.9e-4. Over 256 steps of 
 
 ### EMA weights
 
-`state.params` holds the live variables and `state.averaged` the EMA copy merged into them. Evaluation reads the averaged variables when the objective keeps them. With `ema_decay=None`, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. A checkpoint written with one setting does not restore into the other.
+`LMObjective` keeps no moving average unless `ema_decay` is set. Without one, `state.ema` is `None`, `state.averaged` raises `ValueError`, and previews and evaluation read the live variables. With `ema_decay=0.999`, `state.averaged` holds the EMA copy merged into the live variables, evaluation and previews read it, and the console labels the split `val (ema)`. The copy costs one more set of trained parameters. A checkpoint written with one setting does not restore into the other. An `LMRunConfig` record written before this default, which has no `ema_decay` field, reads back as 0.999, the average that run kept.
 
 To measure validation perplexity, give the dataset a validation split and set `eval_every`, as in the example ([Evaluation and tracking](../guides/evaluation.md)). With a tracker and `fit(preview=True)`, `Samples` adds one generated preview per evaluation event, separate from the teacher-forced scoring of the batch.
 
@@ -192,11 +195,25 @@ from dew.interop import load_pretrained
 
 data = TokenWindows(path="data/qwen3-tokens", seq_len=512).load(batch=4)
 bundle = load_pretrained("Qwen/Qwen3-0.6B", max_seq_len=512)
-objective = bundle.lm_objective(seq_len=512, ema_decay=None)
+objective = bundle.lm_objective(seq_len=512)
 state = Trainer(objective, optax.adamw(1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
-This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. A separately built model can still start from an explicit variables tree, for example after adding an adapter.
+This downloads the Hub weights and needs memory for the model, gradients and optimizer. A bundle already supplies the initial variables, so passing `pretrained=` as well is refused. It also hands the objective its processor, so `objective.pipeline(state)` takes text prompts; `processor=` overrides it.
+
+`bundle.lora(rank=, modules=, key=)` returns the same kind of bundle with a fresh low-rank adapter (LoRA) on the projections `modules` names, PEFT's `target_modules`. Its `lm_objective` trains the adapter's factors and leaves every other weight frozen. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both read the trainer's `state.params` as it comes back:
+
+```python
+key = jax.random.key(0)
+tuned = bundle.lora(rank=8, modules=("q_proj", "v_proj"), key=key)
+objective = tuned.lm_objective(seq_len=512)
+state = Trainer(objective, optax.adamw(1e-4), key=key).fit(data, steps=100)
+tuned.adapter.save(state.params, "qwen3-adapter")
+tuned.save("qwen3-merged", variables=state.params)
+print(objective.pipeline(state)("The capital of France is", 8, key=key).text[0])
+```
+
+`bundle` itself is unchanged; `lora` returns a new value. Calling `lora` on an adapted bundle is refused, as is `trainable=` beside an adapter. `dew.lora.LoRA.fresh` and `LoRA.load` build the same adapter over any model and variables, for a model built from the registry or a pipeline component.
 
 `save_pretrained_decoder` writes a trained `CausalTransformer` in the Hugging Face layout. This exports the decoder from the example and loads it back:
 
@@ -298,7 +315,7 @@ import optax
 from dew.data.dataset import Dataset
 from dew.training import Layout, MeshSpec
 
-mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
+mm_objective = bundle.lm_objective(inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None,

@@ -7,7 +7,7 @@ and the matmuls in the wrapped methods' extent run quantized.
 Dew's version of that call is `apply_quantization`. A caller builds its model
 from the registry as always, then wraps it before the objective ever sees it.
 A run that names `--trainer.quantization` instead hands `RunConfig.train` the
-objective, and `quantize` wraps the model it holds before anything
+objective, and `_quantize` wraps the model it holds before anything
 initialises it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
@@ -589,11 +589,12 @@ class ModelObjective(Protocol):
     model: nn.Module
 
 
-def quantize(objective: object, spec: Quantization) -> None:
-    """Quantize the trunk matmuls of the module `objective` trains.
+def _quantize(objective: object, spec: Quantization) -> None:
+    """Quantize the trunk matmuls of the module `objective` trains, in place.
 
-    `apply_quantization` wraps a module before an objective is built, which
-    is what a recipe that builds its own model does. A run that names
+    This is `RunConfig.train`'s step, not a user's. `apply_quantization`
+    wraps a module before an objective is built, which is what a recipe or
+    a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
     already, so the wrap lands on the objective's own model instead, before
     anything has initialised or traced it; the wrapped module is a copy of
