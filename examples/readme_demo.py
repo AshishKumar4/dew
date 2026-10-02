@@ -17,13 +17,14 @@ import numpy as np
 import optax
 import tyro
 
-from dew import Checkpoints, Field, InputSpec, Trainer, metrics, models
+from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
 from dew.data import Dataset, Loading, PreferencePairs, TokenWindows
 from dew.diffusion.presets import Flow
+from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.lm import LMObjective
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.objectives.rl import DPOObjective
 from dew.sampling import Euler, Sampling, generate
 
@@ -49,8 +50,8 @@ def language_model(out: Path):
         path=str(tokens), seq_len=8, val_batches=1,
         loading=Loading(workers=0, threads=1, read_buffer=2),
     ).load(batch=8)
-    model = models.build(
-        "causal_transformer", vocab_size=8, emb_features=16, num_layers=1,
+    model = CausalTransformer(
+        vocab_size=8, emb_features=16, num_layers=1,
         num_heads=2, mlp_features=32, max_seq_len=16,
         dtype=jnp.float32, attention_impl="xla",
     )
@@ -61,14 +62,14 @@ def language_model(out: Path):
                       checkpoints=checkpoints)
     first = trainer.fit(data, steps=20, log_every=10,
                         eval_every=20, checkpoint_every=20,
-                        metrics=(metrics.perplexity(),))
+                        metrics=(Perplexity(),))
     first_step = int(first.step)
     # A new Trainer restores model, optimizer, random key, and read position.
     resumed = Trainer(objective, optimizer, key=jax.random.key(0),
                       checkpoints=checkpoints)
     state = resumed.fit(data, steps=24, log_every=4,
                         eval_every=4, checkpoint_every=4,
-                        metrics=(metrics.perplexity(),))
+                        metrics=(Perplexity(),))
     prompt = jnp.array([[1, 2]], dtype=jnp.int32)
     generation = generate(
         model, state.averaged, prompt, max_new_tokens=8,
@@ -109,13 +110,13 @@ def flow_images(out: Path):
     batch = {"image": images}
     data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
                    records=8, batch=8)
-    model = models.build(
-        "simple_dit", patch_size=4, emb_features=16, num_layers=1,
+    model = SimpleDiT(
+        patch_size=4, emb_features=16, num_layers=1,
         num_heads=2, mlp_ratio=2, dtype=jnp.float32, attention_impl="xla",
     )
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-        sampler=Euler(), guidance=None, steps=4,
+        solver=Euler(), guidance=None, steps=4,
     )
     trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(3))
     state = trainer.fit(data, steps=3, log_every=1)

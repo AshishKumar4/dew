@@ -19,10 +19,10 @@ from safetensors.numpy import load_file
 
 from dew import Dataset, Trainer
 from dew.checkpoints import Checkpoints
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Step, scalar_loss
+from dew.objectives.base import FROZEN, Step
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -31,7 +31,7 @@ REFERENCES = FIXTURE / "reference"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
@@ -69,7 +69,7 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
     obj = objective(loaded)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     (loss, aux), gradient = jax.value_and_grad(
-        lambda values: scalar_loss(obj, values, batch, step), has_aux=True)(variables)
+        lambda values: obj.scalar_loss(values, batch, step), has_aux=True)(variables)
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
     np.testing.assert_allclose(aux.metrics["canvas_ce"], reference["canvas_loss"].mean(), atol=1e-5, rtol=0)
     np.testing.assert_allclose(aux.metrics["encoder_ce"], reference["encoder_loss"].mean(), atol=1e-5, rtol=0)
@@ -83,7 +83,7 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
 def test_disabling_encoder_gradient_matches_the_reference_control(source):
     loaded, batch, step, _ = source
     obj = objective(loaded, stop_gradient_from_denoiser_to_encoder=True)
-    gradient = jax.grad(lambda values: scalar_loss(obj, values, batch, step)[0])(
+    gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(
         jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))))
     expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
@@ -95,14 +95,14 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
 def test_both_self_conditioning_branches_match_the_official_adapter(source, probability, reference_key):
     loaded, batch, step, reference = source
     obj = objective(loaded, self_cond_prob=probability)
-    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
 
 def test_loss_weights_apply_after_independent_row_normalization(source):
     loaded, batch, step, reference = source
     obj = objective(loaded, encoder_loss_weight=0.3, decoder_loss_weight=2.7)
-    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     expected = 0.3 * reference["encoder_loss"].mean() + 2.7 * reference["canvas_loss"].mean()
     np.testing.assert_allclose(loss, expected, atol=1e-5, rtol=0)
     canvas_mass = reference["selected_mask"].sum(axis=(1, 2))
@@ -141,13 +141,13 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    gradient = jax.grad(lambda values: scalar_loss(obj, values, batch, step)[0])(variables)
+    gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     assert_tree_close(updated.params, expected, 2e-6)
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     assert_tree_close(objective(readback).init(jax.random.key(0)), updated.params, 0)
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
@@ -160,7 +160,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters():
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    source = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=8, pad_token_id=0)
     parameters = jax.jit(objective.init)(jax.random.key(0))
     with np.load(directory / "reference.npz") as reference:
@@ -169,8 +169,8 @@ def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters(
     inputs = ModelInputs(tokens, {"image_indices": jnp.where(tokens == 60, 0, -1)},
                          {"pixel_values": jnp.asarray(pixels)})
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    loss, gradient = jax.jit(jax.value_and_grad(lambda params: scalar_loss(
-        objective, params, {"text": inputs}, step)[0]))(parameters)
+    loss, gradient = jax.jit(jax.value_and_grad(lambda params: objective.scalar_loss(
+        params, {"text": inputs}, step)[0]))(parameters)
     assert np.isfinite(loss)
     assert all(np.isfinite(value).all() for value in jax.tree.leaves(gradient))
     assert max(float(jnp.linalg.norm(leaf)) for leaf in jax.tree.leaves(
@@ -181,7 +181,7 @@ def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters(
 def image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(directory / "reference.npz") as reference:
         pixels = jnp.asarray(reference["pixels"])
     pixels = jnp.concatenate([pixels, pixels[..., ::-1]], axis=-1)
@@ -207,7 +207,7 @@ def test_model_inputs_text_matches_raw_loss_and_gradients(source):
     loaded, batch, step, _ = source
     obj = objective(loaded)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    evaluate = jax.jit(jax.value_and_grad(lambda values, data: scalar_loss(obj, values, data, step)[0]))
+    evaluate = jax.jit(jax.value_and_grad(lambda values, data: obj.scalar_loss(values, data, step)[0]))
     raw = evaluate(variables, batch)
     prepared = evaluate(variables, {**batch, "text": ModelInputs(jnp.asarray(batch["text"]))})
     assert_tree_close(prepared, raw, 0)
@@ -216,7 +216,7 @@ def test_model_inputs_text_matches_raw_loss_and_gradients(source):
 def test_image_sft_uses_media_validity_groups_and_positions(image_source):
     _, inputs, obj, variables, step = image_source
     evaluate = jax.jit(jax.value_and_grad(
-        lambda values, data: scalar_loss(obj, values, {"text": data}, step)[0], argnums=(0, 1),
+        lambda values, data: obj.scalar_loss(values, {"text": data}, step)[0], argnums=(0, 1),
         allow_int=True))
     loss, (gradient, input_gradient) = evaluate(variables, inputs)
     assert np.isfinite(loss)
@@ -243,8 +243,8 @@ def test_media_placeholders_never_become_text_targets(image_source):
     inputs = inputs.replace(token_fields={**inputs.token_fields, "image_indices": indices})
     media = indices >= 0
     weights = jnp.linspace(0.25, 1.25, 12)[None, :] * jnp.ones_like(inputs.tokens)
-    evaluate = jax.jit(jax.value_and_grad(lambda values, data: scalar_loss(
-        obj, values, {"text": data, "encoder_target_mask": weights}, step)[0]))
+    evaluate = jax.jit(jax.value_and_grad(lambda values, data: obj.scalar_loss(
+        values, {"text": data, "encoder_target_mask": weights}, step)[0]))
     in_vocab = inputs.replace(tokens=jnp.where(media, 60, inputs.tokens))
     out_of_vocab = inputs.replace(tokens=jnp.where(media, obj.model.vocab_size + 100, inputs.tokens))
     expected = evaluate(variables, in_vocab)
@@ -263,7 +263,7 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
                                       stop_gradient_from_denoiser_to_encoder=detach)
         def loss(pixels):
             conditioned = inputs.replace(conditioning={**inputs.conditioning, "pixel_values": pixels})
-            return scalar_loss(obj, variables, {"text": conditioned}, step)[0]
+            return obj.scalar_loss(variables, {"text": conditioned}, step)[0]
         gradient = jax.jit(jax.grad(loss))(inputs.conditioning["pixel_values"])
         norms.append(float(jnp.linalg.norm(gradient)))
     assert norms[0] > 1e-6
@@ -279,8 +279,8 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     run_key = jax.random.key(2)
     step = Step(step=jnp.asarray(0, jnp.int32),
                 key=jax.random.fold_in(jax.random.split(run_key)[1], 0), ema=None)
-    gradient = jax.jit(jax.grad(lambda trainable: scalar_loss(
-        obj, {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
+    gradient = jax.jit(jax.grad(lambda trainable: obj.scalar_loss(
+        {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
     expected = {**variables, "params": jax.tree.map(
         lambda value, grad: value - 0.001 * grad, variables["params"], gradient)}
     checkpoints = Checkpoints(str(tmp_path / "run"))
@@ -299,11 +299,11 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert int(resumed.updates) == 2
 
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, pretrained=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.params, 0)
-    original_loss = scalar_loss(obj, resumed.params, {"text": inputs}, step)[0]
-    restored_loss = scalar_loss(restored, restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
+    original_loss = obj.scalar_loss(resumed.params, {"text": inputs}, step)[0]
+    restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
     np.testing.assert_array_equal(restored_loss, original_loss)
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
     key = jax.random.key(11)
@@ -334,7 +334,7 @@ def test_trainable_filter_freezes_the_rest_and_moves_only_what_it_keeps(source):
     assert not any("self_attn" in jax.tree_util.keystr(path)
                    for path, _ in jax.tree_util.tree_leaves_with_path(variables[FROZEN]))
     (loss, _), gradient = jax.value_and_grad(
-        lambda moving: scalar_loss(obj, {**variables, "params": moving}, batch, step), has_aux=True)(
+        lambda moving: obj.scalar_loss({**variables, "params": moving}, batch, step), has_aux=True)(
             variables["params"])
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
     whole = reference_variables(loaded, "gradient.safetensors")

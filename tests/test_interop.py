@@ -20,7 +20,8 @@ import numpy as np
 import pytest
 
 import dew
-from dew.interop import hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params
+from dew.interop import hub, load_params, save_hf_layout, save_params
+from dew.interop.hub import pull_from_hub
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
@@ -284,7 +285,7 @@ def test_a_metadata_only_file_reads_empty(tmp_path):
 def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     """A bfloat16 checkpoint reads in its stored dtype and widens exactly,
     so the public fp32 default is unchanged."""
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     tensors, _ = read_file(source / "model.safetensors")
@@ -297,7 +298,7 @@ def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     (directory / "config.json").write_text((source / "config.json").read_text())
     write_file(bf16, directory / "model.safetensors", {"format": "pt"})
 
-    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
     leaves, _ = jax.tree_util.tree_flatten(loaded.variables)
     assert all(np.asarray(leaf).dtype == np.float32 for leaf in leaves)
@@ -326,12 +327,12 @@ def assert_parameter_storage(reference, actual, is_parameter):
     "llama-tiny", "gemma4-tiny-mm", "gemma-4-audio-tiny", "diffusion-gemma-workflow",
 ])
 def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_path, family):
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
 
     directory = Path(__file__).resolve().parent / "fixtures" / "hf" / family
-    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
-    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    masters = Pretrained.load(directory, dtype="bfloat16", attention_impl="xla")
+    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     master_model = masters.model.text if isinstance(masters.model, DiffusionGemma) else masters.model
     native_model = native.model.text if isinstance(native.model, DiffusionGemma) else native.model
     assert jnp.dtype(master_model.dtype) == jnp.dtype(jnp.bfloat16)
@@ -339,7 +340,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
     destination = tmp_path / "export"
     native.save(destination)
-    restored = load_pretrained(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    restored = Pretrained.load(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
     for before, after in zip(jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True):
         assert np.asarray(before).dtype == np.asarray(after).dtype
@@ -347,7 +348,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
 
 
 def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     tensors, _ = read_file(source / "model.safetensors")
@@ -359,16 +360,17 @@ def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
     directory = tmp_path / "different-aliases"
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="tie_word_embeddings"):
-        load_pretrained(directory, param_dtype="bfloat16")
+        Pretrained.load(directory, param_dtype="bfloat16")
 
 
 # ---------------------------------------------------------------------------------
-# Hub push and pull
+# Hub pull
 # ---------------------------------------------------------------------------------
 
 
 class _RecordingApi:
-    """Stands in for HfApi and keeps every call push_to_hub makes."""
+    """Stands in for HfApi and keeps every call a push makes, with the files
+    the uploaded folder held while the call ran."""
 
     def __init__(self):
         self.created = []
@@ -379,51 +381,32 @@ class _RecordingApi:
         self.created.append((repo_id, kwargs))
 
     def upload_folder(self, **kwargs):
-        # The real client reads the folder during the call, and a staged
-        # export is gone by the time the test looks, so the listing is taken
-        # here, where the client would take it.
         self.uploaded.append(kwargs)
         self.files.append({entry.name for entry in Path(kwargs["folder_path"]).iterdir()})
 
 
-@pytest.fixture
-def api(monkeypatch):
-    recording = _RecordingApi()
-    monkeypatch.setattr(hub, "HfApi", lambda: recording)
-    return recording
+def test_a_bundle_pushes_what_it_saves_to_a_created_repo(tmp_path, monkeypatch):
+    """`push_to_hub` is `save` into a staging directory and that directory
+    uploaded, to a repo created when missing; the privacy flag and the commit
+    message pass through."""
+    import huggingface_hub
 
+    from dew.interop import PretrainedDecoder
+    from dew.nn.backbones import CausalTransformer
 
-def test_push_creates_the_repo_and_uploads_the_export_directory(params, tmp_path, api):
-    export = tmp_path / "export"
-    save_hf_layout(params, {"architecture": "simple_dit"}, export)
+    api = _RecordingApi()
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: api)
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="reference")
+    bundle = PretrainedDecoder.from_model(model, model.init(jax.random.key(0), np.zeros((1, 2), np.int32)),
+                                          tokenizer="byte")
+    bundle.push_to_hub("acme/dew-export", private=True, commit_message="step 1000")
+    bundle.save(tmp_path / "saved")
 
-    push_to_hub(export, "acme/dew-export")
-
-    assert api.created == [("acme/dew-export", {"private": False, "exist_ok": True})]
-    assert api.uploaded == [
-        {
-            "repo_id": "acme/dew-export",
-            "folder_path": str(export),
-            "commit_message": "Upload dew export",
-        }
-    ]
-    uploaded = Path(api.uploaded[0]["folder_path"])
-    assert {entry.name for entry in uploaded.iterdir()} == {
-        "model.safetensors",
-        "config.json",
-    }
-
-
-def test_push_passes_the_private_flag_and_the_commit_message_through(
-    params, tmp_path, api
-):
-    export = tmp_path / "export"
-    save_hf_layout(params, {"architecture": "simple_dit"}, export)
-
-    push_to_hub(export, "acme/held-back", private=True, commit_message="step 1000")
-
-    assert api.created == [("acme/held-back", {"private": True, "exist_ok": True})]
-    assert api.uploaded[0]["commit_message"] == "step 1000"
+    assert api.created == [("acme/dew-export", {"private": True, "exist_ok": True})]
+    assert [(call["repo_id"], call["commit_message"]) for call in api.uploaded] == [
+        ("acme/dew-export", "step 1000")]
+    assert api.files == [{entry.name for entry in (tmp_path / "saved").iterdir()}]
 
 
 def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
@@ -450,12 +433,12 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
 
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
-    a Hugging Face directory out, and `load_pretrained` reads it back at the
+    a Hugging Face directory out, and `Pretrained.load` reads it back at the
     logits the run's own task computes."""
     from test_inference import make_lm_run
 
     import dew
-    from dew.interop import export_run, load_pretrained
+    from dew.interop import Pretrained, export_run
 
     run = tmp_path / "run"
     run.mkdir()
@@ -468,7 +451,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "generation_config.json", "model.safetensors"}
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
@@ -505,31 +488,12 @@ def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path,
         main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
 
 
-def test_push_exports_a_run_directory_and_uploads_that(tmp_path, api):
-    """A run directory is Dew's format and nothing on the Hub reads it, so
-    the push uploads what `export_run` writes; `raw` uploads the run itself,
-    which is the form `from_pretrained` pulls back."""
-    from test_inference import make_lm_run
-
-    run = tmp_path / "run"
-    run.mkdir()
-    make_lm_run(run)
-
-    push_to_hub(run, "acme/lm")
-
-    assert Path(api.uploaded[0]["folder_path"]) != run
-    assert api.files[0] == {"config.json", "generation_config.json", "model.safetensors"}
-
-    push_to_hub(run, "acme/lm-raw", raw=True)
-    assert api.uploaded[1]["folder_path"] == str(run)
-
-
 def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     """DiffusionGemma writes the reference's own encoder/decoder names, over
     the published config the run recorded rather than a derived one."""
     from test_inference import make_block_run
 
-    from dew.interop import export_run, load_pretrained
+    from dew.interop import Pretrained, export_run
 
     run = tmp_path / "run"
     run.mkdir()
@@ -538,7 +502,7 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
 
     export_run(str(run), destination, ema=False)
 
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
     task = dew.pipeline(str(run), ema=False)
     # The export writes the layer scalars into the reference's buffers, so
     # the reloaded tree is the source's shape, not the run's; what has to

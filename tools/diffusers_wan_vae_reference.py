@@ -95,17 +95,6 @@ def build(root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-def bundle(directory: str, destination: str) -> None:
-    """Pack the saved VAE and the recorded arrays for the suite."""
-    import tarfile
-
-    root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in sorted(root.iterdir()):
-            archive.add(path, arcname=path.name)
-    print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
-
-
 def main(destination: str) -> None:
     import diffusers
 
@@ -124,6 +113,8 @@ def main(destination: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
+        from diffusers_dc_ae_reference import bundle
+
         bundle(sys.argv[2], sys.argv[3])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-wan-vae-reference")

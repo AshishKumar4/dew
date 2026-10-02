@@ -17,7 +17,7 @@ import pytest
 from safetensors.numpy import load_file, save_file
 
 from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, translate, weight_path
-from dew.interop.pretrained import load_pretrained
+from dew.interop.pretrained import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -124,9 +124,9 @@ def test_export_path_inverts_weight_path(hf_config, tensors):
 
 
 def test_the_public_loader_reads_the_fixture(tensors):
-    """`load_pretrained` dispatches the `mamba2` model type through the
+    """`Pretrained.load` dispatches the `mamba2` model type through the
     decoder family table and reproduces the reference logits."""
-    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     logits = source.model.apply(source.variables, ids)
     reference = np.load(FIXTURE / "logits.npy")
@@ -168,7 +168,7 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     save_file({name.replace("backbone.embeddings.", "backbone.embedding."): array
                for name, array in tensors.items()}, source / "model.safetensors")
 
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "saved")
 
     logits = loaded.model.apply(loaded.variables, jnp.asarray(np.load(FIXTURE / "input_ids.npy")))
@@ -217,8 +217,8 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     with torch.no_grad():
         reference = port(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
 
-    fp32 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
-    bf16 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M,
+    fp32 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
+    bf16 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M,
                            dtype="bfloat16", param_dtype="bfloat16")
 
     logits = np.asarray(fp32.model.apply(fp32.variables, ids), np.float32)

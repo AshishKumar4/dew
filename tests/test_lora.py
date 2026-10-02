@@ -33,7 +33,7 @@ from dew import lora
 from dew.data import Dataset
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.diffusion import _text_features
-from dew.interop.pretrained import load_pretrained
+from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import LoRA
 from dew.objectives.base import FROZEN, Step, freeze, merge, thaw
@@ -48,7 +48,7 @@ ADAPTER = FIXTURES / "llama-tiny" / "adapter"
 
 @pytest.fixture(scope="module")
 def decoder():
-    return load_pretrained(LLAMA, dtype="float32", attention_impl="reference")
+    return Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
 
 
 @pytest.fixture(scope="module")
@@ -193,7 +193,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
             np.testing.assert_allclose(exported[key.removeprefix("updated/")], reference[key], atol=1e-4, rtol=0)
     # The merged full export reloads as a plain source at the stepped logits.
     decoder.save(tmp_path / "merged", variables=adapter.merge(trained))
-    reloaded = load_pretrained(tmp_path / "merged", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
     np.testing.assert_allclose(np.asarray(reloaded.model.apply(reloaded.variables, jnp.asarray(tokens))),
                                reference["updated_logits"], atol=1e-4, rtol=0)
 
@@ -230,11 +230,14 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     _, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
     for name, leaf in _flat(read).items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
+    # The export is the merged weights in the source's layout, so the reload
+    # computes exactly what the source model computes on them; how close the
+    # merge is to the adapted forward is the PEFT parity test's to bound.
     tuned.save(tmp_path / "merged", variables=state.params)
-    reloaded = load_pretrained(tmp_path / "merged", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
     ids = jnp.asarray(tokens)
-    np.testing.assert_allclose(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                               np.asarray(tuned.model.apply(trained, ids)), atol=1e-5, rtol=0)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(source.model.apply(tuned.adapter.merge(state.params), ids)))
 
     # A source that ships a tokenizer hands its processor to the objective.
     processor = RunProcessor(ByteTokenizer())
@@ -383,7 +386,7 @@ def test_refusals_name_the_reason(decoder, tmp_path):
 def test_a_per_expert_source_tensor_takes_no_adapter():
     """A stacked expert leaf answers for every expert's tensor, so one
     expert's delta has no leaf of its own."""
-    mixtral = load_pretrained(ROOT / "tests" / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
+    mixtral = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
                               attention_impl="reference")
     with pytest.raises(ValueError, match="experts.0.w1 is assembled from several leaves"):
         LoRA.fresh(mixtral.model, mixtral.variables, mixtral.layouts, rank=2, alpha=2.0,
@@ -480,7 +483,7 @@ def pipeline(tmp_path_factory):
     with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
         archive.extractall(destination, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],
                            filter="data")
-    source = load_pretrained(destination / "sd", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(destination / "sd", dtype="float32", attention_impl="reference")
     # The torch reference computes the GELU the Flax class approximates.
     return dataclasses.replace(source, model=dataclasses.replace(source.model, approximate_gelu=False))
 

@@ -28,7 +28,7 @@ from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
-from dew.telemetry.profile import active_profile
+from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -126,15 +126,15 @@ class Images(Generic[ArrayT]):
 
 @dataclass(frozen=True, eq=False)
 class TextToImage:
-    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)`.
+    """`pipe(prompts, key=0)` or `pipe(prompts, steps=40, guidance=4.0, solver=Heun(), key=key)`.
 
     `params` is the objective's whole tree, the EMA copy merged over the live
     weights when the run kept one, so a sample comes from the weights a run
-    publishes. `steps`, `guidance` and `sampler` are the defaults a call
+    publishes. `steps`, `guidance` and `solver` are the defaults a call
     omits; an objective or a loaded source sets them. `grid` prepares the
     process and its explicit time grid for a step count, for a source whose
-    sampler pairs its own sigma and model-time tables; `final_denoise`
-    False ends a trajectory the way those samplers do. `finish` runs on the
+    solver pairs its own sigma and model-time tables; `final_denoise`
+    False ends a trajectory the way those solvers do. `finish` runs on the
     decoded images under the same placement, for a source that ships a
     checker or an output transform.
 
@@ -151,7 +151,7 @@ class TextToImage:
     autoencoder: AutoEncoder | None = None
     steps: int = 50
     guidance: Guidance | None = None
-    sampler: Solver[object] = field(default_factory=DDIM)
+    solver: Solver[object] = field(default_factory=DDIM)
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
@@ -191,7 +191,7 @@ class TextToImage:
         autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
                    _without_loss_heads(variables), autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler,
+                   steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
                    blank=objective.blank_conditions)
 
     @classmethod
@@ -243,11 +243,27 @@ class TextToImage:
                         layout: Layout | None = None, dtype: str | None = None,
                         param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
+        `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
+
+    @classmethod
+    def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
+                      ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
+        """A FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the
+        SD VAE) over Dew's own model.
+
+        `directory` is one checkpoint step, `config` the run config FlaxDiff's
+        trainer logged, and `jax_version` the jax the run trained under, from
+        its `requirements.txt`. `ema` and `best` pick the weights; `dtype` is
+        the model's compute dtype. `dew.interop.flaxdiff` reads the format.
+        """
+        from dew.interop import flaxdiff
+
+        return flaxdiff.text_to_image(directory, config, jax_version=jax_version, ema=ema, best=best,
+                                      dtype=dtype)
 
     def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
         """The process and explicit time grid a `steps` call walks; the grid
@@ -319,21 +335,14 @@ class TextToImage:
         if plan.processes > 1:
             multihost_utils.assert_equal(settled.signature,
                                          "image input shapes and sampling must agree across processes")
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.image.prepare")
-            annotation.__enter__()
-        try:
+        with region("inference.image.prepare"):
             given, null, initial_state = self._encoded(settled, configured=unconditional is None)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
         owns_grid = self.grid is not None or times is not None
         return DenoisingInputs(initial_state, given, null, rows=plan.rows,
                                grid_steps=count if owns_grid else None,
                                process=process if owns_grid else None, times=selected)
 
-    def _settings(self, mesh, prompts, *, steps, guidance, sampler, key, decode):
+    def _settings(self, mesh, prompts, *, steps, guidance, solver, key, decode):
         """Everything one call settles on the host before it runs the model.
 
         A caller who hands over `DenoisingInputs` gets them checked against
@@ -358,11 +367,11 @@ class TextToImage:
             process, times = self.prepared_process(count)
         if type(decode) is not bool:
             raise ValueError("decode must be a boolean")
-        solver = self.sampler if sampler is None else sampler
+        solver = self.solver if solver is None else solver
         if prepared is not None:
             prepared = self._checked_inputs(prepared, mesh, count)
         controls = (count, times, solver, chosen, self.final_denoise, decode,
-                    tuple(np.asarray(jax.random.key_data(request))), prepared is not None,
+                    tuple(jax.device_get(jax.random.key_data(request))), prepared is not None,
                     None if prepared is None else prepared.rows)
         arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
         signature = generation_signature(arrays, controls)
@@ -427,7 +436,7 @@ class TextToImage:
         samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
                                  mask=mask, noise=noise, initial=initial)
         controls = (plan.rows, count, selected, shape,
-                    tuple(np.asarray(jax.random.key_data(request))),
+                    tuple(jax.device_get(jax.random.key_data(request))),
                     None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
         signature = generation_signature((tokens, null_tokens, samples), controls)
         return _Resolved(plan, process, request, tokens, null_tokens, shape, count,
@@ -516,7 +525,7 @@ class TextToImage:
         *,
         steps: int | None = None,
         guidance: Guidance | float | None | _Default = _Default.GUIDANCE,
-        sampler: Solver | None = None,
+        solver: Solver | None = None,
         key: int | jax.Array | None = None,
         decode: bool = True,
     ) -> Images:
@@ -527,7 +536,7 @@ class TextToImage:
 
         def resolve():
             return self._settings(mesh, prompts, steps=steps, guidance=guidance,
-                                  sampler=sampler, key=key, decode=decode)
+                                  solver=solver, key=key, decode=decode)
 
         settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
@@ -536,20 +545,13 @@ class TextToImage:
         if prepared is None:
             assert not isinstance(prompts, DenoisingInputs)
             prepared = self.prepare(prompts, key=request, steps=count)
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.image")
-            annotation.__enter__()
-        try:
+        with region("inference.image"):
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
             generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
                                          solver, chosen, self.final_denoise, times, decode, self.params,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
         return replace(generated, rows=plan.rows)
 
 
@@ -628,17 +630,17 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 @functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity.
-    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times, decode,
+    def run(model, process, autoencoder, finish, steps, solver, guidance, final_denoise, times, decode,
             params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
         with jax.ensure_compile_time_eval():
             grid = None if times is None else jnp.asarray(times, jnp.float32)
         if grid is None:
-            latents = sample(denoise, x_T, steps, solver=sampler, guidance=guidance,
+            latents = sample(denoise, x_T, steps, solver=solver, guidance=guidance,
                              key=key, final_denoise=final_denoise)
         else:
-            latents = sample(denoise, x_T, solver=sampler, guidance=guidance,
+            latents = sample(denoise, x_T, solver=solver, guidance=guidance,
                              key=key, times=grid, final_denoise=final_denoise)
         if not decode:
             return Images(None, latents=latents)

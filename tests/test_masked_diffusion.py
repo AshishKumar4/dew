@@ -24,7 +24,7 @@ from dew.config import ModelConfig
 from dew.data import Dataset
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import pipeline
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
 from dew.objectives.base import Step
@@ -32,7 +32,6 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
 from dew.sampling import Sampling, sample
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import build_mesh
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -137,7 +136,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
 
 @pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
 def masked_source(request):
-    source = load_pretrained(FIXTURES / request.param, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     fields = {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool),
               "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])}
@@ -203,7 +202,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
 def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
-    mesh = build_mesh(MeshSpec())
+    mesh = MeshSpec().build()
     variables = jax.device_put(source.variables, Layout().shardings(mesh, source.variables))
     expected = task(inputs, 8, key=7, steps=5, n=2).host()
     placed = task.bind(variables)(inputs, 8, key=7, steps=5, n=2)
@@ -261,7 +260,7 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
 
     source.save(tmp_path / "published", variables=resumed.params)
-    reloaded = load_pretrained(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
+    reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
     expected = live(prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)
     np.testing.assert_array_equal(pipeline(str(tmp_path / "published"), dtype="bfloat16")(

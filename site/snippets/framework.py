@@ -20,18 +20,18 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Checkpoints, Dataset, Field, InputSpec, MeshSpec, Trainer, models
+from dew import Checkpoints, Dataset, Field, InputSpec, MeshSpec, Trainer
 from dew.data import ByteTokenizer, Loading, Prompts, TokenWindows
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor
 from dew.inference.serving import Server
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
+from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Euler, Heun, Sampling
-from dew.training.distributed import build_mesh
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = True
@@ -58,16 +58,16 @@ def image_fixture(size):
 
 
 def decoder():
-    return models.build("causal_transformer", vocab_size=256, emb_features=32,
-                        num_layers=1, num_heads=2, mlp_features=64, max_seq_len=128)
+    return CausalTransformer(vocab_size=256, emb_features=32,
+                             num_layers=1, num_heads=2, mlp_features=64, max_seq_len=128)
 
 
 def lm(out, smoke):
     _, data = text_fixture(out)
     # Begin snippet: lm
-    model = models.build("causal_transformer", vocab_size=256,
-                         emb_features=32, num_layers=1, num_heads=2,
-                         mlp_features=64, max_seq_len=128)
+    model = CausalTransformer(vocab_size=256,
+                              emb_features=32, num_layers=1, num_heads=2,
+                              mlp_features=64, max_seq_len=128)
     objective = LMObjective(model, seq_len=64, ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
@@ -79,11 +79,11 @@ def lm(out, smoke):
 def diffusion(out, smoke):
     data = image_fixture(8)
     # Begin snippet: diffusion
-    model = models.build("simple_dit", patch_size=4, emb_features=16,
-                         num_layers=1, num_heads=2, mlp_ratio=2)
+    model = SimpleDiT(patch_size=4, emb_features=16,
+                      num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-        sampler=Euler(), steps=4)
+        solver=Euler(), steps=4)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
     # End snippet: diffusion
@@ -111,7 +111,7 @@ def sample_public(out, smoke):
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
     pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
     result = pipe(["green and purple northern lights over a frozen lake"],
-                  seed=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
+                  key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
     # End snippet: sample-public
     assert (out / "sample.png").is_file()
@@ -121,12 +121,12 @@ def sample_public(out, smoke):
 def jepa(out, smoke):
     data = image_fixture(32)
     # Begin snippet: jepa
-    encoder = models.build("jepa_encoder", patch_size=4, emb_features=32,
-                           num_layers=1, num_heads=2)
-    predictor = models.build("jepa_predictor", grid=(8, 8), emb_features=32,
-                             predictor_features=16, num_layers=1, num_heads=2)
+    encoder = JepaEncoder(patch_size=4, emb_features=32,
+                          num_layers=1, num_heads=2)
+    predictor = JepaPredictor(grid=(8, 8), emb_features=32,
+                              predictor_features=16, num_layers=1, num_heads=2)
     objective = JepaObjective(
-        encoder, predictor, mask=multi_block_mask((8, 8)),
+        encoder, predictor, mask=MultiBlockMask.for_grid((8, 8)),
         sample=Field("image", (32, 32, 3)), momentum_steps=3)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
@@ -142,9 +142,9 @@ def grpo(out, smoke):
     rng = np.random.default_rng(0)
     records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
     # Begin snippet: grpo
-    model = models.build("causal_transformer", vocab_size=13, emb_features=64,
-                         num_layers=2, num_heads=4, head_dim=16,
-                         mlp_features=128, max_seq_len=16)
+    model = CausalTransformer(vocab_size=13, emb_features=64,
+                              num_layers=2, num_heads=4, head_dim=16,
+                              mlp_features=128, max_seq_len=16)
 
     def reward(data_source, completion, ground_truth, extra_info):
         tokens = [int(token) for token in completion.split()]
@@ -177,7 +177,7 @@ def pretrained(out, smoke):
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
     # Begin snippet: pretrained
-    bundle = load_pretrained(source, dtype="bfloat16", max_seq_len=128)
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     # End snippet: pretrained
     if smoke:
@@ -189,7 +189,7 @@ def pretrained(out, smoke):
         training_tokens = np.asarray(bundle.processor("The capital of France is Paris.").tokens[:, :9], np.int32)
     data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}), val=None, records=1, batch=1)
     # Begin snippet: finetune
-    text = task(prompt, 12, seed=0).text
+    text = task(prompt, 12, key=0).text
     objective = bundle.lm_objective(seq_len=training_tokens.shape[1] - 1, ema_decay=None)
     trainer = Trainer(objective, optax.sgd(1e-5), key=jax.random.key(0))
     state = trainer.fit(data, steps=1)
@@ -204,8 +204,8 @@ def pretrained(out, smoke):
 
 def serving(out, smoke):
     source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
-    bundle = load_pretrained(source, dtype="bfloat16", param_dtype="bfloat16",
-                             max_seq_len=128, mesh=MeshSpec())
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", param_dtype="bfloat16",
+                                    max_seq_len=128, mesh=MeshSpec())
     if smoke:
         bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))
         prompts = ["dew", "jax"]
@@ -214,7 +214,7 @@ def serving(out, smoke):
     # Begin snippet: serving
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     server = Server.from_task(task, slots=4, capacity=128)
-    results = server(prompts, 24, seed=0)
+    results = server(prompts, 24, key=0)
     print([result.text[0] for result in results])
     # End snippet: serving
     # Begin snippet: int8
@@ -226,7 +226,7 @@ def serving(out, smoke):
     # End snippet: fp8
     for variant in (int8, fp8):
         quantized = Server.from_task(variant, slots=4, capacity=128)
-        assert len(quantized(["dew"], 2, seed=0)) == 1
+        assert len(quantized(["dew"], 2, key=0)) == 1
     return {"source": source, "prompts": prompts, "text": [result.text[0] for result in results],
             "weight_formats": ["int8", "fp8"]}
 
@@ -241,7 +241,7 @@ def mesh(out, smoke):
     state = trainer.fit(data, steps=3)
     # End snippet: mesh
     assert int(state.step) == 3 and int(state.updates) == 3
-    return {"devices": jax.device_count(), "axes": dict(build_mesh(trainer.mesh).shape), "steps": int(state.step)}
+    return {"devices": jax.device_count(), "axes": dict(trainer.mesh.build().shape), "steps": int(state.step)}
 
 
 def reliability(out, smoke):
@@ -275,7 +275,7 @@ def reliability(out, smoke):
     if PROFILE:
         # Begin snippet: profile
         import dew
-        with dew.profile(out / "profile"):
+        with dew.Profiler(out / "profile"):
             logits = objective.model.apply(resumed.params, jnp.zeros((1, 8), jnp.int32))
             logits.block_until_ready()
         # End snippet: profile
@@ -304,7 +304,7 @@ def main():
     if options.section == "mesh":
         jax.config.update("jax_num_cpu_devices", 4)
     if options.topology_only:
-        mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+        mesh = MeshSpec(fsdp=2, tensor=2).build()
         result = {"axes": dict(mesh.shape), "devices": [device.id for device in mesh.devices.flat],
                   "backend": jax.default_backend(), "training": False}
     else:

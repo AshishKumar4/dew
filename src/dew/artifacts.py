@@ -89,28 +89,6 @@ def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
     return np.clip(levels, 0, 255).astype(np.uint8)
 
 
-def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
-    """`leaf` as numpy, gathering it across the pool when it is a global
-    array this process holds only a shard of."""
-    if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
-        return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
-    return np.asarray(leaf)
-
-
-def host[T](value: T) -> T:
-    """An artifact whose arrays are host-local numpy.
-
-    Scoring and drawing happen on the host: a metric reads the arrays with
-    numpy, a tracker draws them. On one process that is a device transfer. On
-    a pool the arrays are shards of a global array, which numpy cannot read at
-    all, and the gather that completes them is a collective, so every process
-    has to make the same call. That is why the trainer brings an artifact home
-    once for the whole pool before any metric or tracker, which run on one
-    process, sees it.
-    """
-    return jax.tree.map(_addressable, value)
-
-
 GATHER_BYTES = 256 * 2 ** 20
 """The bytes of global leaves `collective_host` gathers in one computation.
 
@@ -177,20 +155,15 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["first"]) -> T 
 def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first"] = "every") -> T | None:
     """Materialize an evaluation tree on every rank with transfer consensus.
 
-    All ranks must call this, even for entirely local trees. Every array leaf
-    is waited on before any data gather, so a computation that failed on a
-    rank reports at the preflight rather than inside a gather collective;
-    a wait raises what a host copy would, and moves nothing.
-    Ranks then agree the ordered global gather plan and each transfer outcome.
-    Local-only trees may differ, as with root-only decoded previews. A device
-    failure inside an in-flight collective still needs runtime termination.
-
-    Global leaves are gathered in groups (`GATHER_BYTES`), one computation
-    and one agreement a group, and a rank that fails in a group reports at
-    that group's agreement, before any rank starts the next. With `held_by`
-    "first", only process 0 of the pool, `jax.process_index() == 0`, copies
-    the gathered tree to its host and returns it; the others take part in
-    every computation and agreement and return None.
+    All ranks must call this, even for entirely local trees. Every leaf is
+    waited on first, so a computation that failed on a rank reports at the
+    preflight rather than inside a gather collective. Ranks then agree the
+    ordered global gather plan, and gather global leaves in groups
+    (`GATHER_BYTES`), agreeing each group's outcome before the next starts.
+    Local-only leaves may differ across ranks. A device failure inside an
+    in-flight collective still needs runtime termination. With `held_by`
+    "first" only process 0 copies the tree home and returns it; the others
+    take part in every computation and agreement and return None.
     """
     held = held_by == "every" or jax.process_index() == 0
     leaves = []
@@ -200,14 +173,19 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     error = None
     try:
         paths, tree = jax.tree_util.tree_flatten_with_path(value)
+        local = []
         for path, leaf in paths:
             if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
                 global_indices.append(len(leaves))
                 plan.append([jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype),
                              str(leaf.sharding)])
-                leaves.append(leaf)
             else:
-                leaves.append(np.asarray(leaf) if held else leaf)
+                local.append(len(leaves))
+            leaves.append(leaf)
+        if held:
+            # One read for every local leaf: their copies run together.
+            for index, home in zip(local, jax.device_get([leaves[index] for index in local]), strict=True):
+                leaves[index] = np.asarray(home)
         jax.block_until_ready(leaves)
     except BaseException as failure:
         error = failure
@@ -381,15 +359,11 @@ def withdraw_failure() -> None:
 def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *, timeout: float) -> Callable[[], None]:
     """End `thread` before Python finalizes, and return what withdraws that.
 
-    A thread still inside jaxlib when Python finalizes, its GIL released,
-    comes back to a runtime that ends it with pthread_exit (CPython before
-    3.14), and the unwind through jaxlib's C++ GIL guard aborts a process
-    whose program ran to its end: SIGABRT, "terminate called ...". The exit
-    handler registered here calls `stop`, then waits up to `timeout` seconds
-    for the thread. jax registered its own exit handler when it was
-    imported, and atexit runs the last registered first, so this one runs
-    while jax's clients are still open. An owner that stops the thread
-    itself calls the returned function, so the handler no longer holds it.
+    A thread still inside jaxlib when Python finalizes is ended with
+    pthread_exit (CPython before 3.14), and the unwind through jaxlib's C++
+    GIL guard aborts a finished program with SIGABRT. The handler calls
+    `stop` and waits up to `timeout` seconds; atexit runs it before jax's own,
+    registered earlier, so jax's clients are still open.
     """
 
     def finish() -> None:
@@ -405,22 +379,15 @@ def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *, timeout:
 def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     """End this process when a failure goes unheard, or when it fails itself.
 
-    A process of a pool that raises past its program, or meets a peer's
-    failure it cannot hear, would otherwise hang: its peers wait for it in a
-    collective no GPU backend times out, and jax.distributed's shutdown
-    barrier holds an exiting process up to shutdown_timeout_seconds (300 s)
-    for them. So an uncaught exception prints, publishes and leaves at once,
-    and a watch thread ends the process `grace` seconds after any published
-    failure that no agreement withdrew. `dew launch`, srun and a pod's
-    scheduler then see the failure and stop the rest.
+    A process that raises past its program, or meets a peer's failure it
+    cannot hear, would otherwise hang in a collective no GPU backend times
+    out, or in jax.distributed's 300 s shutdown barrier. So an uncaught
+    exception prints, publishes and leaves at once, and a watch thread ends
+    the process `grace` seconds after any published failure no agreement
+    withdrew; `dew launch`, srun and a pod's scheduler then stop the rest.
 
-    It needs only the pool's coordination service, not the backend, so it
-    goes in before the backend opens: a process whose devices fail to open
-    after the pool has formed would otherwise wait in that barrier for peers
-    that wait for its devices.
-
-    The watch ends with the program (`stop_at_exit`), so it is not reading
-    the coordination service through jaxlib when Python finalizes.
+    It needs only the coordination service, so it goes in before the backend
+    opens, and its watch ends with the program (`stop_at_exit`).
     """
     previous = sys.excepthook
     client = _client()

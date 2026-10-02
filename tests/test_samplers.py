@@ -592,10 +592,10 @@ def test_one_interval_crosses_both_endpoints_with_the_first_order_limit(solver):
     np.testing.assert_allclose(jax.grad(lambda initial: run(initial).sum())(x), expected_gradient, atol=1e-6)
 
 
-def test_continuous_cosine_noise_endpoint_has_exact_signal_zero():
-    from dew.diffusion import CosineContinuousNoiseScheduler, VPredictionTransform
+def test_a_noise_only_vp_endpoint_walks_finitely():
+    from dew.diffusion import SqrtContinuousNoiseScheduler, VPredictionTransform
 
-    schedule = CosineContinuousNoiseScheduler()
+    schedule = SqrtContinuousNoiseScheduler()
     process = Process(schedule, VPredictionTransform())
     x = jnp.asarray([[1.2, -0.7]])
     alpha, sigma = schedule.rates(jnp.asarray([1.0]))
@@ -857,7 +857,7 @@ class RecordedPath(DPMSolverSDE):
 def source_solver(name: str, schedule):
     """The case's solver, with the reference's recorded Brownian path where the
     source drew one."""
-    solver = schedule.solver()
+    solver = schedule.solver
     if f"{name}.noise" not in SOURCE_ARRAYS:
         return solver
     intervals = tuple((float(a), float(b)) for a, b in SOURCE_ARRAYS[f"{name}.intervals"])
@@ -964,7 +964,7 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
     model = SourceOracle()
     x_T = jax.random.normal(jax.random.PRNGKey(3), (2, 3, 4))
     denoise = process.denoiser(model, model.init(jax.random.PRNGKey(1), x_T[:1], jnp.ones((1,))), {})
-    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
+    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
                                        times=times, final_denoise=False))
     batch = run(x_T)
     for row in range(2):

@@ -13,7 +13,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.diffusion import FlowMatchingScheduler, Process, VelocityLoss, expand, presets
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.dit import PatchEmbedding
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import Euler
 
@@ -35,11 +35,11 @@ def test_the_loss_is_the_references_velocity_error():
     Dew's L2 is half of that."""
     process = presets.JiT()()
     objective = DiffusionObjective(Clean(), process, InputSpec(Field("image", (4, 4, 3))), guidance=None,
-                                   sampler=Euler(), steps=2, ema_decay=None)
+                                   solver=Euler(), steps=2, ema_decay=None)
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (6, 4, 4, 3), 0, 256), np.uint8)}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    loss, _ = scalar_loss(objective, params, batch, step)
+    loss, _ = objective.scalar_loss(params, batch, step)
 
     _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
     x = np.asarray(unit_range(batch["image"]), np.float64)

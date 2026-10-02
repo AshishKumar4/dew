@@ -1,14 +1,6 @@
 """The decoder block and what it is built from: the gated MLP, the mixture
 of experts, the block's wiring and remat policies, and the multi-token
-prediction depth.
-
-`CausalTransformer` (`dew.nn.backbones.causal_transformer`) stacks these.
-A block holds its token mixer in a slot: any module with the
-(x, decode=..., positions=..., segment_ids=...) -> x signature of
-CausalSelfAttention becomes self_attn without the block changing. Its
-residual runs in one of four forms (the plain stream, Gemma 3n's AltUp
-copies, mHC's streams, Kimi K3's depth state) through one forward
-(`DecoderBlock._forward`).
+prediction depth. `CausalTransformer` stacks these.
 """
 
 import dataclasses
@@ -60,60 +52,23 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
-    `experts` is what the rest depends on, so they live together: a top_k, a
-    cadence or a balancing bias says nothing about a model with no experts.
-    `layers` names the sparse layers by index, or `every` makes every nth
-    layer sparse counting from the end of the first group, the meaning of
-    Qwen3-MoE's decoder_sparse_step; neither makes every layer sparse, which
-    is Mixtral.
+    `layers` names the sparse layers by index, or `every` makes every nth layer
+    sparse counting from the end of the first group (Qwen3-MoE's
+    decoder_sparse_step); neither makes every layer sparse (Mixtral). The
+    routing fields pass straight through to `Router`, which documents them.
+    `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
+    beside the dense feed-forward on the same residual, each normed and summed,
+    under `Gemma4TextRouter`, which refuses the routing fields.
 
-    The routing fields pass straight through to `Router`; that class
-    documents each one.
-
-    `parallel` is Gemma 4's placement (`enable_moe_block`). The experts run
-    beside the dense feed-forward on the same residual, and the two are
-    summed after a norm each, under `Gemma4TextRouter`. That router replaces
-    the routing fields above, which are refused with it.
-
-    `expert_features` is the routed experts' width, None for the model's
-    `mlp_features`; DeepSeek sizes its experts apart from its dense layers.
-    `shared_features` is the width of the one dense gated MLP every token
-    takes beside the routed experts, 0 for none. `DeepseekV3MoE` builds its
-    `n_shared_experts` as a single MLP of that many times its expert width,
-    so the product is the whole record of them. `shared_gate` multiplies
-    that branch's output by a learned scalar sigmoid per token, as Qwen3.5
-    MoE does.
-
-    `implementation` is the grouped matmul the experts run on, one of
-    `moe.grouped_matmul`'s, the way `attention_impl` names an attention
-    kernel. It changes which kernel computes the same contraction and
-    nothing about the routing.
-
-    `dispatch='exchange'` is expert parallelism: each device trades its
-    selected tokens with the expert shards that own them, in bounded
-    all-to-all rounds, on an expert mesh axis larger than one that divides
-    the expert count. The default `'global'` sorts and gathers where the
-    tokens are. Both share the projection precision and the differentiation
-    contract.
-
-    `capacity_factor` drops slots past each sequence's per-expert capacity,
-    GShard's and MaxText's token dropping (`moe.capacity_positions`); None,
-    the default, keeps every selected slot. Both dispatches drop the same
-    slots on any placement, and the exchange then runs one round.
-
-    `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
-    token table instead of the scores (`DeepseekV4HashRouter`). Their router
-    holds `tid2eid` over the vocabulary in place of the balancing bias, and
-    the block hands it the token ids.
-
-    `latent_features` is Kimi K3's latent MoE: the routed experts run at that
-    width between a down and an up projection, with the model's RMSNorm on
-    their weighted sum when `latent_norm` is set (`SparseMLP`). None runs
-    them at the model width.
-
-    `media_bias` gives every router DeepSeek-V4.1's second balancing bias,
-    which selects for an image span's tokens (`Router`); the block hands it
-    the media mask.
+    `expert_features` is the experts' width, None for `mlp_features`.
+    `shared_features` is the one dense gated MLP every token takes, 0 for none
+    (`DeepseekV3MoE`'s `n_shared_experts` times its expert width), and
+    `shared_gate` its learned per-token sigmoid (Qwen3.5 MoE). `implementation`
+    names `moe.grouped_matmul`'s kernel. `dispatch` and `capacity_factor` are
+    `moe.expert_dispatch`'s: `'exchange'` is expert parallelism over an expert
+    mesh axis that divides the expert count. `hash_layers` route by DeepSeek
+    V4's token table, `latent_features` is Kimi K3's latent MoE and
+    `media_bias` DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
     """
 
     experts: int
@@ -199,24 +154,17 @@ class Mixture:
 class GatedMLP(nn.Module):
     """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
     the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
-    the erf form (HF's gelu, which Gemma's released config names). A `Situ`
-    in place of the name is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`).
+    the erf form (HF's gelu); a `Situ` is Kimi K3's SiTU, which transforms both
+    halves (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact` and `relu` build
+    the ungated two-projection MLP; ungated `gelu_exact` follows Torch's
+    `1 + erf` arithmetic, which converted checkpoints trained with, where
+    `jax.nn.gelu(approximate=False)` goes through erfc and rounds the negative
+    tail differently.
 
-    `gelu`, `gelu_exact` and `relu` build the ungated two-projection MLP.
-    The other activations keep the gated product and its parameter layout.
-    Ungated `gelu_exact` follows Torch's `1 + erf` arithmetic because
-    converted checkpoints were trained with it. `jax.nn.gelu` with
-    approximate=False evaluates through erfc, which is more accurate in the
-    negative tail but rounds it differently. Gated activations keep their
-    existing arithmetic.
-
-    activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
-    nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
-    swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
-    activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
-    gate capped at the limit from above and the up projection on both sides.
-    None is the plain gated MLP.
+    activation_sparsity is Gemma 3n's gaussian top-k on the gate
+    (`dew.nn.gemma3n.gaussian_topk`). swiglu_limit is GLM-5.3-Flash's and
+    DeepSeek V4's clamp before the activation (modeling_glm5_next.py:98-104):
+    the gate capped from above, the up projection on both sides.
     """
     hidden_features: int
     out_features: int
@@ -270,14 +218,11 @@ class GatedMLP(nn.Module):
 class BlockWiring:
     """How a block norms its two residuals, and whether it scales its output.
 
-    `pre_norms` norms each sublayer's input and `output_norms` its output.
-    The input pair alone is the plain pre-norm block, both pairs Gemma's
-    sandwich block, and the output pair alone OLMo 3's post-norm block
-    (modeling_olmo3.py:249-266), where each sublayer reads the residual
-    stream as it is and its output is normed before it is added. The output
-    pair norms the sublayer outputs and not their inputs, so the input norms
-    keep their names and their places, and a checkpoint without the output
-    pair loads into the same tree minus two leaves per layer. `layer_scalar`
+    `pre_norms` norms each sublayer's input and `output_norms` its output: the
+    input pair alone is the plain pre-norm block, both Gemma's sandwich block,
+    the output pair alone OLMo 3's post-norm block (modeling_olmo3.py:249-266).
+    The output pair norms sublayer outputs, so the input norms keep their names
+    and a checkpoint without it loads minus two leaves per layer. `layer_scalar`
     selects the reference's frozen or trainable output scalar. One wiring serves
     every layer, so it stays off the per-layer specs the scan groups by.
     """
@@ -307,18 +252,13 @@ name off the list is a typo that would otherwise recompute silently."""
 class RematPolicy:
     """What a recomputed block keeps for its backward pass, and where.
 
-    A block under remat saves its inputs and recomputes its forward when the
-    backward pass asks. `save` names the residuals (`RESIDUALS`) it keeps in
-    device memory instead, `offload` the ones it moves to pinned host memory
-    after the forward pass and fetches back for the backward; everything
-    else is recomputed. Both empty is MaxText's `full`, which recomputes the
-    whole block. `REMAT_POLICIES` holds MaxText's named recipes under this
-    decoder's names: MaxText's `query_proj`/`key_proj`/`value_proj`/
-    `out_proj` are `q_proj`/`k_proj`/`v_proj`/`o_proj` and its `mlpwi_0`/
-    `mlpwi_1`/`mlpwo` are `gate_proj`/`up_proj`/`down_proj`. Its fused
-    `qkv_proj`/`mlpwi` name projections this decoder does not fuse, and its
-    `quantization` names AQT intermediates Qwix does not produce. A config
-    gives a policy by name or as a record of the two lists.
+    A block under remat saves its inputs and recomputes its forward; `save`
+    names the residuals (`RESIDUALS`) kept in device memory and `offload` those
+    moved to pinned host memory, both empty being MaxText's `full`.
+    `REMAT_POLICIES` holds MaxText's recipes under this decoder's names
+    (`q_proj`... for its `query_proj`..., `gate_proj`/`up_proj`/`down_proj` for
+    `mlpwi_0`/`mlpwi_1`/`mlpwo`); its fused `qkv_proj`/`mlpwi` and AQT
+    `quantization` name nothing here. A config gives a name or the two lists.
     """
     save: tuple[str, ...] = ()
     offload: tuple[str, ...] = ()
@@ -427,66 +367,32 @@ _BlockState = _Plain | _Streams | _Depth
 class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
-    `mixer` and `feedforward` are factories taking only a name. What `mixer`
-    builds lands in the tree as self_attn and has to accept (x, decode=...,
-    positions=..., segment_ids=...), the last two None outside a packed batch.
-    What `feedforward` builds lands there as mlp and takes the normalized
-    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share;
-    a `hash_routed` block hands it the token ids too, which the metadata
-    carries down the stack for DeepSeek V4's hash router. A `feedforward` of
-    None is a block of the mixer alone, norm, mixer, residual, which is
-    Mamba-2's (`Mamba2Block`, modeling_mamba2.py:608-632): no
-    post_attention_layernorm, no mlp, no output norm for either.
+    `mixer` and `feedforward` are factories taking only a name. The mixer lands
+    as self_attn and accepts (x, decode=..., positions=..., segment_ids=...);
+    the feed-forward lands as mlp and takes the normalized states (plus the
+    token ids on a `hash_routed` block). A `feedforward` of None is Mamba-2's
+    block of the mixer alone (modeling_mamba2.py:608-632). `wiring` places the
+    norms (`BlockWiring`).
 
-    `wiring` places the block's norms: the input pair alone is the plain
-    pre-norm block, both pairs Gemma's sandwich block, and the output pair
-    alone OLMo 3's post-norm block (modeling_olmo3.py:249-266), where each
-    sublayer reads the residual stream as it is and its output is normed
-    before it is added. The output pair norms the sublayer outputs and not
-    their inputs, so the input norms keep their names and their places, and
-    a checkpoint without the output pair loads into the same tree minus two
-    leaves per layer.
+    kv_store threads one dict down the stack for KV-sharing mixers.
+    per_layer_input is the layer's slice of `LayerInputs`: its per-layer
+    residual signal and, on a `routed` block, the replayed experts
+    (`dew.nn.moe.Routes`).
 
-    kv_store threads one dict down the layer stack so a KV-sharing mixer
-    reads its provider's keys and values; a mixer without a kv_store keyword
-    fails loudly when a run shares. per_layer_input is the layer's slice of
-    `LayerInputs`: its input signal for the per-layer residual, and on a
-    `routed` block the replayed experts its router uses (`dew.nn.moe.Routes`),
-    None when the model reads neither.
+    The residual takes one of four forms, all through `_forward`: the plain
+    stream; altup, Gemma 3n's `[num_inputs, B, S, D]` copies, predicted,
+    run on the active one and corrected, the per-layer residual added past the
+    first (Gemma3nTextDecoderLayer.forward); hyper_connections, mHC's
+    `[B, S, hc_mult, D]` streams with Sinkhorn-mixed residuals
+    (modeling_glm5_next.py:1293-1327), `Carried(streams, pre)` under
+    Single-Pass; and residual_site, Kimi K3's `[B, S, blocks + 1, D]` depth
+    state. laurel_rank adds LAuReL over the attention's normed input, averaged
+    with the attention residual over sqrt(2).
 
-    altup makes the block take and return Gemma 3n's stack of residual
-    copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
-    active prediction, corrects every copy by what it computed, and adds the
-    per-layer residual to the copies past the first and not to its own
-    output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
-    adds the LAuReL block over the attention's normed input, averaged with
-    the attention residual over sqrt(2).
-
-    hyper_connections makes the block take and return the mHC stack of
-    residual streams, `[B, S, hc_mult, D]`: each sublayer reads the collapse
-    its site's mapping chooses and writes back into every stream over the
-    Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
-    block otherwise (modeling_glm5_next.py:1293-1327). Under the Single-Pass
-    schedule the block takes and returns `Carried(streams, pre)`, each
-    sublayer collapsing by the `pre` the site before it computed.
-
-    residual_site makes the block take and return Kimi K3's depth state,
-    `[B, S, blocks + 1, D]`: the finished blocks and the partial sum
-    (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
-    of the finished blocks and the partial its site holds, as a plain
-    pre-norm block reads the residual, and adds its output to the partial.
-
-    Every form runs one forward (`_forward`): `_enter` turns the residual
-    the block receives into its state, each sublayer `_read`s its input
-    from that state and `_write`s its output back, and `_leave` hands the
-    next block its residual. The model's `_expand` and `_collapse` turn the
-    embeddings into the first block's residual and the last block's back.
-
-    engram writes the layer's n-gram lookup into the streams before anything
-    else reads them (V4.1 inference/model.py:1261-1263); `engram_index` is
-    which of the metadata's `engram_ids` it reads. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads as
-    `prediction_inputs/draft_context` (:1264-1266).
+    engram writes the layer's n-gram lookup into the streams first (V4.1
+    inference/model.py:1261-1263), reading the metadata's `engram_ids` at
+    `engram_index`. A DSpark target layer (`prediction_slot`) sows the mean of
+    the streams its attention reads as `prediction_inputs/draft_context`.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None
@@ -656,12 +562,10 @@ class DecoderBlock(nn.Module):
     ):
         """The block's one forward over whichever residual form it runs.
 
-        The form (`_enter`, `_read`, `_write`, `_leave`) decides what the
-        residual is and how each sublayer reads it and writes back into it:
-        the plain `[B, S, D]` stream, Gemma 3n's AltUp copies, mHC's streams
-        with or without the Single-Pass schedule, or Kimi K3's depth state.
-        The sublayers themselves, their norms and their branches run the same
-        for every form.
+        `_enter` turns the received residual into the form's state, each sublayer
+        `_read`s its input and `_write`s its output back, and `_leave` hands the
+        next block its residual; the sublayers, norms and branches are the same for
+        every form.
         """
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
@@ -874,13 +778,11 @@ class DecoderBlock(nn.Module):
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
 
-    The depth norms the token embeddings with `enorm` and the previous
-    hidden states with `hnorm`, projects the pair concatenated in that
-    order back to the model width, and runs one decoder block over it. That
-    composition is what the released MTP weights were trained for, which
-    the engines state (vLLM deepseek_mtp.py, glm4_moe_mtp.py and
-    qwen3_5_mtp.py). Training shifts complete sequences through this block;
-    prediction steps may use an independently allocated KV cache.
+    `enorm` norms the token embeddings and `hnorm` the previous hidden states;
+    the pair, concatenated in that order, projects back to the model width and
+    runs one decoder block, the composition the released MTP weights trained
+    for (vLLM deepseek_mtp.py, glm4_moe_mtp.py, qwen3_5_mtp.py). Prediction
+    steps may use an independently allocated KV cache.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None

@@ -215,10 +215,10 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
     `prompt_2` to T5. The two slots carry different words, so a native
     encoder that crossed them or projected the pooled row would not land here.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
                                  attention_impl="xla")
         encoder = loaded.inputs.conditions["conditioning"].encoder
         params = loaded.variables["encoders"]["conditioning"]
@@ -237,16 +237,16 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
 
 
 def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record):
-    """`load_pretrained().text_to_image()` reproduces the source's own call.
+    """`Pretrained.load().text_to_image()` reproduces the source's own call.
 
     Nothing is passed in: the directory's declared pipeline carries the step
     count, the guidance the transformer embeds and the sigma seed its call
     lays out, and its own mu for this latent's packed token count.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     with np.load(source / "flux_transformer.npz") as arrays:
-        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+        loaded = Pretrained.load(str(source / "pipeline"), dtype="float32",
                                  attention_impl="xla")
         task = loaded.text_to_image()
         assert task.steps == pipeline_record["default_steps"]
@@ -273,12 +273,12 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     height, width = loaded.inputs.sample.shape[:2]
     objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
                                    autoencoder=loaded.autoencoder, pretrained=loaded.variables,
@@ -321,7 +321,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)
-    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     with np.load(source / "flux_transformer.npz") as arrays:
         grid = pipeline_record["size"] // 4
         latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
@@ -344,11 +344,11 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     a caption changes what the model reads about the text and not the scale
     the checkpoint was distilled to walk at.
     """
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
 
-    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
     encoder = loaded.inputs.conditions["conditioning"].encoder
     params = loaded.variables["encoders"]["conditioning"]
     rows = [dict(pipeline_record["prompts"][0], guidance=2.0),
@@ -453,7 +453,7 @@ def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path)
     """A declared class another family's denoiser drives is refused: the
     shared unet/transformer check cannot tell SD3's transformer from Flux's,
     so the gate reads the pipeline family."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = tmp_path / "pipeline"
     shutil.copytree(source / "pipeline", directory)
@@ -461,4 +461,4 @@ def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path)
     index["_class_name"] = "StableDiffusion3Pipeline"
     (directory / "model_index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match="StableDiffusion3Pipeline.*FluxPipeline"):
-        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")

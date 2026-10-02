@@ -1,8 +1,8 @@
 """Measure CLIP metrics on generated images.
 
-`clip_score(images, prompts)` scores a set of images against the prompts they
-were sampled from, and the registered metrics take the same cosine over a
-validation pass.
+`CLIPScore().score(images, prompts)` scores a set of images against the
+prompts they were sampled from, and the registered metrics take the same
+cosine over a validation pass.
 
 Both metrics run the vendored towers in `dew.nn.text_encoders`, since
 transformers 5 ships no `FlaxCLIPModel`, and preprocess with the checkpoint's
@@ -21,7 +21,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
-from dew.objectives.base import Batch, Shown
+from dew.objectives.base import Batch
 from dew.registry import metrics
 
 from .common import ImageMetric, metric_device
@@ -75,43 +75,6 @@ def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_ma
     return jnp.einsum('nd,nd->n', image_embeds, text_embeds)
 
 
-def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DEFAULT_MODEL,
-               batch_size: int = 64) -> float:
-    """Score CLIPScore of uint8 [N, H, W, 3] images against one prompt each.
-
-    100 * mean(max(cos(image, prompt), 0)), higher is better; typical T2I
-    models score around 25-35 on natural prompts. The images are scored
-    `batch_size` rows at a time, and the prompts are tokenized the way a run's
-    batch carries them.
-    """
-    if batch_size < 1:
-        raise ValueError(f"clip_score: a batch holds at least one image, got batch_size={batch_size}")
-    pixels = np.asarray(images)
-    if pixels.dtype != np.uint8 or pixels.ndim != 4 or pixels.shape[-1] != 3:
-        raise ValueError(f"clip_score: expected uint8 [N, H, W, 3] images, got "
-                         f"{pixels.dtype} {list(pixels.shape)}")
-    _equal_counts(pixels.shape[0], len(prompts))
-    if pixels.shape[0] == 0:
-        raise ValueError("clip_score: no images to score")
-    from dew.data.text import load_tokenizer
-    # CLIP's own context bounds a caption, so an overlong one is truncated
-    # to it rather than overrunning the position table.
-    tokenizer = load_tokenizer(modelname)
-    tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
-                       truncation=True, return_tensors="np")
-    total = 0.0
-    with metric_device():
-        for start in range(0, pixels.shape[0], batch_size):
-            stop = start + batch_size
-            cosine = clip_image_text_cosine(pixels[start:stop], tokens["input_ids"][start:stop],
-                                            tokens["attention_mask"][start:stop],
-                                            modelname=modelname)
-            # Summed the way a pass sums it, so a whole set in one batch is
-            # the number the metric reports for the same images.
-            total += float(np.asarray(100.0 * jnp.maximum(cosine, 0.0), dtype=np.float64).sum())
-    return total / pixels.shape[0]
-
-
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
     """Return the per-image cosine for one sampled grid and its batch's prompts."""
     text = batch[field]
@@ -120,31 +83,61 @@ def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: s
 
 
 @metrics("clip")
-def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
+class CLIPDistance(ImageMetric):
     """Score CLIP distance, mean(1 - cos(image, text)); lower is better. It logs as
-    val/clip_similarity; `clip_score` is the standard number for a new run.
+    val/clip_similarity; `CLIPScore` is the standard number for a new run.
     """
 
-    def measure(artifact, batch):
-        return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
+    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = "text"):
+        def measure(artifact, batch):
+            return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
-    return ImageMetric(name="clip_similarity", measure=measure)
+        super().__init__(name="clip_similarity", measure=measure, better="lower")
 
 
 @metrics("clip_score")
 class CLIPScore(ImageMetric):
-    """Mean CLIPScore of the sampled images and the validation batch's prompts."""
-    shown = Shown(better='higher')
+    """CLIPScore, of an image set against its prompts (`score`) or as the mean
+    over the sampled images and the validation batch's prompts."""
 
     def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
         def measure(artifact, batch):
             return 100.0 * jnp.maximum(_artifact_cosine(artifact, batch, field, modelname), 0.0)
         super().__init__(name='clip_score', measure=measure)
+        self.modelname = modelname
 
+    def score(self, images: ArrayLike, prompts: Sequence[str], *, batch_size: int = 64) -> float:
+        """Score CLIPScore of uint8 [N, H, W, 3] images against one prompt each.
 
-def clip_score_metric(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
-    """Score standard CLIPScore over a validation pass, the same number `clip_score`
-    reports for the images and prompts the pass consumed.
-    """
+        100 * mean(max(cos(image, prompt), 0)), higher is better; typical T2I
+        models score around 25-35 on natural prompts. The images are scored
+        `batch_size` rows at a time, and the prompts are tokenized the way a run's
+        batch carries them.
+        """
+        if batch_size < 1:
+            raise ValueError(f"clip_score: a batch holds at least one image, got batch_size={batch_size}")
+        pixels = np.asarray(images)
+        if pixels.dtype != np.uint8 or pixels.ndim != 4 or pixels.shape[-1] != 3:
+            raise ValueError(f"clip_score: expected uint8 [N, H, W, 3] images, got "
+                             f"{pixels.dtype} {list(pixels.shape)}")
+        _equal_counts(pixels.shape[0], len(prompts))
+        if pixels.shape[0] == 0:
+            raise ValueError("clip_score: no images to score")
+        from dew.data.text import load_tokenizer
+        # CLIP's own context bounds a caption, so an overlong one is truncated
+        # to it rather than overrunning the position table.
+        tokenizer = load_tokenizer(self.modelname)
+        tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
+                           truncation=True, return_tensors="np")
+        total = 0.0
+        with metric_device():
+            for start in range(0, pixels.shape[0], batch_size):
+                stop = start + batch_size
+                cosine = clip_image_text_cosine(pixels[start:stop], tokens["input_ids"][start:stop],
+                                                tokens["attention_mask"][start:stop],
+                                                modelname=self.modelname)
+                # Summed the way a pass sums it, so a whole set in one batch is
+                # the number the metric reports for the same images.
+                total += float(np.asarray(100.0 * jnp.maximum(cosine, 0.0), dtype=np.float64).sum())
+        return total / pixels.shape[0]
 
-    return CLIPScore(modelname, field)

@@ -37,7 +37,7 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
@@ -77,7 +77,7 @@ def fp32_matmuls():
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
 
 
@@ -292,14 +292,18 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
 def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released):
     """No decoder weight of two or more axes is left to the shape heuristic
     unasked: the engram tables alone hold 384M rows a layer, which shard as
-    a vocabulary's do. The ViT's, like every tower's, are the heuristic's."""
-    from dew.nn.sharding import declared_axes, is_heuristic
+    a vocabulary's do. The hyper-connection mixes and DSpark's Markov tables
+    have no side worth naming, and the ViT's, like every tower's, are the
+    heuristic's."""
+    from dew.nn.sharding import declared_axes, parameter_path
 
+    heuristic = {"attn_hc", "ffn_hc", "markov_embed", "markov_head"}
     *_, shapes = released
     leaves = [(jax.tree_util.keystr(path), path, leaf)
               for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]]
     uncovered = [name for name, path, leaf in leaves if "['language_model']" in name and leaf.ndim >= 2
-                 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
+                 and declared_axes(path, leaf.ndim) is None
+                 and not heuristic.intersection(parameter_path(path))]
     assert uncovered == []
     engram = [declared_axes(path, leaf.ndim) for name, path, leaf in leaves
               if name.endswith("['engram']['embed']['embedding']")]
@@ -362,7 +366,7 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     loaded.save(tmp_path, variables=variables)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     held, again = flatten_dict(variables, sep="."), flatten_dict(dict(restored.variables), sep=".")
     assert held.keys() == again.keys()
     for name, leaf in again.items():
@@ -514,7 +518,7 @@ def test_the_vision_half_matches_the_reference(tmp_path):
     through a prefill with the image and text steps after it, against the
     release's Transformer.forward with the quantizers off."""
     reference = np.load(TINY / "vision.npz")
-    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     (span, prompt_logits, steps), twin, _ = decided(
         lambda model, variables: vision_run(model, variables, reference), loaded.model, loaded.variables)
     assert_as_exact_as_the_reference(span, reference["vision_span"], TRUTH["vision_span"], "vision_span")
@@ -530,7 +534,7 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     positions change the n-gram ids of the text after them, so the fixture
     exercises both."""
     reference = np.load(TINY / "vision.npz")
-    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})

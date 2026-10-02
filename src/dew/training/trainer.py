@@ -23,7 +23,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +37,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints, Ranking
-from dew.data.dataset import Checkpointable, Closeable, Dataset, RampedStream, Reader, rows_of
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
@@ -91,12 +91,10 @@ from dew.training.distributed import (
     Placement,
     batch_divisor,
     batch_shardings,
-    build_mesh,
-    data_partition,
     link_bandwidth,
     shard_batch,
 )
-from dew.training.evaluation import Evaluation, evaluate
+from dew.training.evaluation import Evaluation
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
@@ -106,7 +104,6 @@ from dew.training.transaction import Transaction, compact_qk, with_ema
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import TrainerConfig
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -125,14 +122,6 @@ microbatch was accepted."""
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-ObjectiveLoss = TypeVar("ObjectiveLoss")
-ObjectiveEffects = TypeVar("ObjectiveEffects")
-"""The two parameters of the objective `Trainer.from_config` is handed.
-
-A classmethod cannot solve the class's own `Loss` and `Effects` from an
-argument, since an unparameterized `Trainer.from_config` binds them to their
-defaults. So the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -168,7 +157,7 @@ class ProfileWindow:
     `directory` after `warmup` steps have run, so the trace holds the loop
     and not the compile.
 
-    `dew.profile` is the other way to capture one, a context manager around
+    `dew.Profiler` is the other way to capture one, a context manager around
     any code at all; a fit refuses to schedule a window inside one. The
     window the loop wrote is reported as the `ProfileWindow` record of
     `dew.telemetry.records`."""
@@ -182,37 +171,35 @@ Book = tuple[jax.Array, jax.Array, jax.Array]
 streak of non-finite losses, and the longest streak since the last check."""
 
 
-def fresh_book() -> Book:
-    """Return the counters a fresh logging interval starts from."""
-    return jnp.zeros((), jnp.float32), jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32)
+def fresh_book(loss: jax.Array) -> Book:
+    """Return the counters a fresh logging interval starts from, placed where
+    the step returns `loss`. Counters on any other device would move to the
+    step's devices at every count, and `bookkeep` would compile once more."""
+    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32))
+    return jax.device_put(zeros, loss.sharding)
 
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
-    """Advance the loop's counters for one step, in one dispatch.
-
-    The same work as five eager ops, the cast, the add, the where, the add
-    and the maximum, each dispatching an executable of its own. Those cost
-    176 us a step on an i9-12900K against 37 us for this one call, measured
-    over 2000 steps on the CPU backend with the result blocked on at the end.
-    """
+    """Advance the loop's counters for one step, in one dispatch instead of
+    five eager ops' (176 against 37 us a step on a CPU)."""
     interval_loss, bad_run, worst_bad_run = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     return interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run)
 
 
-def learning_rate(opt_state: optax.OptState) -> float | None:
+def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """The learning rate in `opt_state`, where the optimizer carries one:
     under `optax.inject_hyperparams`, the way optax exposes a schedule's
-    value. None for a rate the optimizer closes over, or for parameter
-    groups that carry several."""
+    value, as the state holds it, a scalar the caller reads. None for a rate
+    the optimizer closes over, or for parameter groups that carry several."""
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
     rates = [node.hyperparams["learning_rate"]
              for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
              if isinstance(node, injected) and "learning_rate" in node.hyperparams]
-    # optax types a hyperparameter as any ArrayLike; a learning rate is a real scalar.
-    return float(jnp.asarray(rates[0])) if len(rates) == 1 else None
+    return rates[0] if len(rates) == 1 else None
 
 
 # How the display shows the metrics the trainer itself logs; an objective,
@@ -265,12 +252,8 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
-
-    The Triton GEMM fusions can hold fewer temporaries: on an RTX 4080
-    (sm89, jax 0.11.2), Qwen3-0.6B's widths at 2 layers and 8 x 1024 tokens
-    keep their whole logits in 13.1 GiB with them, inside the 13.24 GiB of an
-    0.85 pool, while without them the step does not fit and tiles its head.
-    So the fusions come back before the ladder's first rung."""
+    The Triton GEMM fusions can hold fewer temporaries, so they come back
+    before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
@@ -371,13 +354,9 @@ def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
 
 
 # What a model recomputes in its backward pass when its step does not fit,
-# weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
-# jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
-# 334.7, 356.4 and 401.3 ms at 9.93, 8.00 and 6.29 GiB, and at 16 x 1024
-# only 'full' fits; DiT-L/2 on 64x64 inputs at 16 fits only under 'full'
-# (docs/performance.md). A model's own remat is where it starts: the
-# trainer moves it up one rung at a time until the compiled step fits the
-# devices, and never past a policy the ladder does not name.
+# weakest first; each rung is slower and holds less (docs/performance.md).
+# A model's own remat is where it starts: the trainer moves it up one rung at
+# a time until the compiled step fits, never past a policy the ladder names.
 DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
 DIFFUSION_REMAT = (False, 'dots', 'full')
 
@@ -391,11 +370,8 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     the outputs that alias them.
 
     XLA's GPU step takes all its temporaries in one allocation, so it needs
-    one free block that large, not that many free bytes: on an A100 the
-    'minimal' rung of a Qwen3-1.7B fine-tune ran out of memory placing its
-    11.68 GiB of temporaries with 16.3 GiB free, split 5.9 GiB below the
-    state and 10.4 GiB above it. `placeable` reads the block from the
-    allocator. Where it `strands_temporaries`, they need room twice."""
+    one free block that large, not that many free bytes (`placeable`). Where
+    the allocator `strands_temporaries`, they need room twice."""
     stats = executable.memory_analysis()
     memory = [device.memory_stats() or {} for device in devices]
     if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
@@ -438,22 +414,13 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     `memory`, can leave a step's temporaries no block to return to, so that
     the next step needs a second block as large.
 
-    XLA's spatially partitioned BFC pool can: a preallocated pool with
-    --xla_gpu_enable_allocator_spatial_partitioning left on, its default.
-    There a free block below a buffer serves every small allocation before
-    the open space past it. A batch prefetched while the temporaries are
-    placed lands past them; once they are freed the next step's outputs take
-    a few bytes of their block. On an RTX 4080 a step with 6.5 GiB of
-    temporaries and 3.9 GiB more of its pool to spare failed so in 5 of 16
-    runs. With the partitioning off, which `prepare_process` sets, the
-    smallest block that fits serves them instead: 4 of 4 runs placed a batch
-    past the temporaries 20 to 45 times each and finished.
-
-    cuda_async can too, and reports neither its blocks nor its pool: the
-    8192-token step there, 10.3 GiB of temporaries with 10.45 GiB free,
-    failed in 1 of 8 runs at a 0.85 pool, 1 of 8 at 0.87 and 1 of 16 at 0.91.
-    At the failure its pool held 14.2 GB with 3.0 GB in use, the device had
-    1.9 GB free, and neither gave the 11.1 GB the step asked for again."""
+    XLA's spatially partitioned BFC pool can (a preallocated pool with
+    --xla_gpu_enable_allocator_spatial_partitioning left on, its default):
+    a free block below a buffer serves every small allocation before the
+    open space past it, so a batch prefetched past the temporaries lets the
+    next step's outputs take a few bytes of their block. `prepare_process`
+    turns the partitioning off. cuda_async can too, inside a pool it does not
+    report."""
     if 'pool_bytes' not in memory:
         return platform == 'gpu'
     partitioning = xla_flag('xla_gpu_enable_allocator_spatial_partitioning') or 'true'
@@ -633,7 +600,6 @@ class _FitPlan:
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     validation_splits: Mapping[str, Reader] | None = None
-    restore_best: bool = False
     validation: bool = False
 
 
@@ -667,15 +633,18 @@ class _Interval:
     `book` is the loss summed since the last checkpoint and both bad-loss
     counters, on device, so the loop never blocks on a result, and they move
     together in one dispatch; the host reads them at the logging cadence.
+    The first step places them where its loss is, and `fresh` keeps them at
+    zero there, for a counter's restart to reuse rather than build again.
     `steps` counts since the last checkpoint, the rest since the last log.
     The records and FLOPs are summed per step rather than taken off the
     dataset's batch, so a ramped interval reports the records it read and
     their FLOPs. `rollout_seconds` is the time spent sampling, logged under
     train/rollout_seconds when a rollout is set."""
 
-    book: Book
     last_log_time: float
     last_saved: int | None
+    book: Book | None = None
+    fresh: Book | None = None
     steps: int = 0
     since_log: int = 0
     samples: int = 0
@@ -688,6 +657,8 @@ class _Interval:
         self.steps += 1
         self.samples += rows_of(batch)
         self.flops = None if self.flops is None or flops is None else self.flops + flops
+        if self.book is None:
+            self.book = self.fresh = fresh_book(loss)
         self.book = bookkeep(self.book, loss, finite)
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
@@ -697,15 +668,17 @@ class _Interval:
         Deferred to the logging cadence so the step loop never synchronises;
         detection is late by at most that many steps, never missed.
         """
+        if self.book is None or self.fresh is None:
+            return
         loss, bad_run, worst_bad_run = self.book
-        streak = int(worst_bad_run)
+        streak = int(jax.device_get(worst_bad_run))
         if streak >= BAD_LOSS_STEPS:
             raise RuntimeError(
                 f"Loss has been non-finite for {streak} consecutive steps "
                 f"ending near step {step}, stopping")
         if streak:
             display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
-        self.book = (loss, bad_run, jnp.zeros((), jnp.int32))
+        self.book = (loss, bad_run, self.fresh[2])
 
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
@@ -714,9 +687,10 @@ class _Interval:
 
     def saved(self, step: int) -> None:
         """Start the next checkpoint interval after the one saved at `step`."""
-        loss, bad_run, worst_bad_run = self.book
         self.last_saved, self.steps = step, 0
-        self.book = (jnp.zeros_like(loss), bad_run, worst_bad_run)
+        if self.book is not None and self.fresh is not None:
+            _, bad_run, worst_bad_run = self.book
+            self.book = (self.fresh[0], bad_run, worst_bad_run)
 
 
 _DEFAULT_MESH = MeshSpec()
@@ -796,51 +770,6 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults = False
         self._resumed_rung: JSON = None
 
-    @classmethod
-    def from_config(
-        cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
-        checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
-        step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
-                        optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-    ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
-        """Build the trainer a `TrainerConfig` describes.
-
-        The mapping from the config's field names to this constructor's is
-        written once, here. `mesh`, `layout`, `accumulation`,
-        `dynamic_scale` and `profile` are the config fields a trainer holds.
-        `key` is the run key, which `RunConfig.train` draws from
-        `config.key`.
-
-        The rest of the config belongs to the capabilities and to the loop,
-        and reaches them from their own owners. `checkpoint_dir` and `keep`
-        build the `Checkpoints` passed in here, and `wandb` the tracker.
-        `xla_flags`, `multi_host` and `compilation_cache_dir` are read by
-        `prepare_process` before JAX opens a backend. `batch_ramp` wraps the
-        dataset with `dew.data.ramped`. `steps`, `epochs`, `log_every`,
-        `eval_every` and `checkpoint_every` are arguments of `fit`. `step`
-        and `rollout` are not configurable: they are code a caller hands
-        over.
-
-        It builds a `Trainer`, whatever it is called on. The objective's two
-        parameters are the factory's own, so a subclass that wants one of
-        itself constructs it.
-        """
-        return Trainer(
-            objective, optimizer,
-            key=key,
-            mesh=config.mesh,
-            layout=config.layout,
-            accumulation=config.accumulation,
-            dynamic_scale=config.dynamic_scale,
-            checkpoints=checkpoints,
-            tracker=tracker,
-            step=step,
-            rollout=rollout,
-            profile=config.profile,
-        )
-
     # ------------------------------------------------------------------
     # The state
     # ------------------------------------------------------------------
@@ -890,7 +819,7 @@ class Trainer(Generic[Loss, Effects]):
     def device_mesh(self) -> Mesh:
         """Build the mesh `MeshSpec` describes over this process pool's devices,
         on first use."""
-        return build_mesh(self.mesh)
+        return self.mesh.build()
 
     @property
     def host_master(self) -> bool:
@@ -915,8 +844,6 @@ class Trainer(Generic[Loss, Effects]):
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
-        # A root key is one value; a legacy key's uint32 words are not parameter axes.
-        placed = dataclasses.replace(placed, key=NamedSharding(mesh, P()))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
@@ -987,10 +914,8 @@ class Trainer(Generic[Loss, Effects]):
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
-        template = self._with_drawn_tables(template, shardings, checkpoints.stored(resume),
-                                           initializer, key)
         state, position = checkpoints.restore(template, resume,
-                                              share=data_partition(self.device_mesh))
+                                              share=DataPartition.of(self.device_mesh))
         self._climb_to(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -1014,10 +939,8 @@ class Trainer(Generic[Loss, Effects]):
         it is above where the objective stands, never below it.
 
         The fit check reads the free memory its own process finds, and one
-        that restores a state finds other memory than the one that built it:
-        on an A100 a Qwen3-1.7B run trained under remat 'full', and its
-        resumed process took 'minimal', ran another program and parted from
-        the uninterrupted run at step 70. So the resumed run compiles the
+        that restores a state can find more than the one that built it and
+        pick a lighter rung, another program. So the resumed run compiles the
         rung its checkpoint trained on, and climbs further only where that
         does not fit."""
         if rung is None:
@@ -1036,16 +959,12 @@ class Trainer(Generic[Loss, Effects]):
         (`Objective.held_variables`), for the state's JIT to take over, the
         rest replicated.
 
-        Handed to the JIT as they are, a loaded checkpoint's arrays were placed
-        below the state it built and freed once it was: a hole as large as the
-        checkpoint under the state, 5.9 GiB on an A100 for Qwen3-1.7B, whose
-        'minimal' rung then found no free block for its temporaries
+        Handed to the JIT as they are, the arrays land below the state it
+        builds and leave a hole the checkpoint's size once freed, which splits
+        the free memory a step's temporaries need in one block
         (`step_headroom`). Placed where the state keeps them and donated, they
-        become the state's buffers, of the variable or of an optimizer moment
-        laid out like it. The copy leaves the objective's own arrays alone: a
-        checkpoint loaded to the host (`load_pretrained`) leaves no hole, while
-        arrays the objective already holds on the devices stay wherever they
-        were placed for as long as it holds them."""
+        become the state's buffers. The copy leaves the objective's own
+        arrays alone."""
         variables = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
             jax.tree_util.tree_leaves_with_path(abstract.params), jax.tree.leaves(shardings.params),
             strict=True)}
@@ -1064,42 +983,6 @@ class Trainer(Generic[Loss, Effects]):
         # buffer the target shares with the source, which donation would free.
         owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, initializer)
         return jax.device_put(owned, jax.tree_util.tree_map_with_path(placement, initializer))
-
-    def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
-                           stored: Variables, initializer, key) -> TrainState:
-        """`template` with every Fourier table the checkpoint lacks drawn by
-        the fresh init, where `restore` keeps it (`is_fourier_table`).
-
-        A checkpoint written before the table became a variable trained
-        against the table init draws. Only those leaves are computed: the
-        rest of the initial state is dead code to the compiler.
-        """
-        from dew.checkpoints import absent
-        from dew.nn.blocks import is_fourier_table
-
-        drawn = [(field, path) for field in ("params", "ema")
-                 if getattr(template, field) is not None and stored.get(field) is not None
-                 for path in absent(getattr(template, field), stored[field]) if is_fourier_table(path)]
-        if not drawn:
-            return template
-
-        def leaf(tree, path):
-            for entry in path:
-                tree = tree[entry.key]
-            return tree
-
-        values = jax.jit(
-            lambda initializer, key: [leaf(getattr(self.initial_state(initializer, key), field), path)
-                                      for field, path in drawn],
-            out_shardings=[leaf(getattr(shardings, field), path) for field, path in drawn],
-        )(initializer, key)
-        filled = {(field, jax.tree_util.keystr(path)): value
-                  for (field, path), value in zip(drawn, values, strict=True)}
-        return dataclasses.replace(template, **{
-            field: jax.tree_util.tree_map_with_path(
-                lambda path, stub, field=field: filled.get((field, jax.tree_util.keystr(path)), stub),
-                getattr(template, field))
-            for field in {field for field, _ in drawn}})
 
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.
@@ -1459,23 +1342,17 @@ class Trainer(Generic[Loss, Effects]):
                 best=selection,
                 stop=stop,
                 validation_splits=validation,
-                restore_best=restore_best,
                 validation=validation is not None
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
-            state, shardings, position = self.place()
-            run.last_checkpoint = time.perf_counter()
-            if checkpoints is not None and checkpoints.latest is not None:
-                run.stop_control = checkpoints.control(checkpoints.latest)
-            if self._opened(plan, run, state, position):
-                return state
-            state = self._training_loop(plan, run, state, shardings, position, profiler, tracer,
-                                        profile, checkpoints)
+            state, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
+        if complete:
+            return state
         if run.preempted is not None:
             raise Preempted(run.preempted)
         if restore_best and checkpoints is not None:
@@ -1487,12 +1364,24 @@ class Trainer(Generic[Loss, Effects]):
             )
         return state
 
-    def _training_loop(self, plan: _FitPlan, run: _FitRun, state: TrainState,
-                       shardings, position, profiler: Profiler | None, tracer: Profiler | None,
-                       profile: ProfileWindow | None, checkpoints: Checkpoints | None) -> TrainState:
-        """Dispatch the numerical steps and finish their loop before resource cleanup."""
+    def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
+                       tracer: Profiler | None, profile: ProfileWindow | None,
+                       checkpoints: Checkpoints | None) -> tuple[TrainState, bool]:
+        """Place the state, dispatch the numerical steps and finish their loop
+        before resource cleanup. Returns the final state and whether the run
+        was already complete, its last checkpoint written, so nothing ran.
+
+        The loop is the state's one holder: each step donates the state it is
+        handed, and a reference kept past that, as fit's own once was, holds
+        an array whose buffers the step consumed."""
+        state, shardings, position = self.place()
+        run.last_checkpoint = time.perf_counter()
+        if checkpoints is not None and checkpoints.latest is not None:
+            run.stop_control = checkpoints.control(checkpoints.latest)
+        if self._opened(plan, run, state, position):
+            return state, True
         compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-        interval = _Interval(fresh_book(), time.time(), last_saved=(
+        interval = _Interval(time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
         run.notice = PreemptionNotice()
@@ -1546,7 +1435,7 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         self._wind_down(plan, run, interval, state, shardings, position, profiler)
-        return state
+        return state, False
 
     def _closed(self, run: _FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1620,7 +1509,7 @@ class Trainer(Generic[Loss, Effects]):
         if current == steps and checkpoints is not None and checkpoints.latest is not None:
             return True
         if current < steps:
-            run.source = plan.dataset.train(data_partition(mesh))
+            run.source = plan.dataset.train(DataPartition.of(mesh))
             self._check_stream(run.source, mesh, plan.dataset.batch,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
                                    checkpoints is not None and plan.eval_every and plan.best and
@@ -2014,10 +1903,10 @@ class Trainer(Generic[Loss, Effects]):
             if telemetry_profile.active_profile() is not None:
                 raise ValueError(
                     "Trainer.profile cannot schedule a window while an explicit "
-                    "dew.profile capture is active; drop one or stop the outer "
+                    "dew.Profiler capture is active; drop one or stop the outer "
                     "profiler before fitting")
             telemetry_profile.require_profile_support()
-            return telemetry_profile.profile(profile.directory)
+            return telemetry_profile.Profiler(profile.directory)
 
         return agreed("profiling window setup", own_window)
 
@@ -2167,13 +2056,12 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
-        if interval.steps:
-            metadata.setdefault('train/loss', float(interval.book[0] / interval.steps))
+        if interval.steps and interval.book is not None:
+            metadata.setdefault('train/loss', float(jax.device_get(interval.book[0]) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
-        checkpoints.save(step, state, position, metadata, share=data_partition(self.device_mesh),
-                         ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self.objective.inference_record())
+        checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
+                         ranking=ranking, control=control, weights_only=weights_only, rung=self._rung(), artifact=self.objective.inference_record())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2194,21 +2082,8 @@ class Trainer(Generic[Loss, Effects]):
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        if control:
-            checkpoints.save_local(
-                step,
-                state,
-                position,
-                share=data_partition(self.device_mesh),
-                control=control,
-                rung=self._rung(),
-                artifact=self.objective.inference_record(),
-            )
-        else:
-            checkpoints.save_local(
-                step, state, position, share=data_partition(self.device_mesh), rung=self._rung(),
-                artifact=self.objective.inference_record(),
-            )
+        checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
+                               control=control, rung=self._rung(), artifact=self.objective.inference_record())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2228,19 +2103,24 @@ class Trainer(Generic[Loss, Effects]):
             # where the loop waits on the device.
             loss.block_until_ready()
             now = time.time()
-            scalars = {"train/loss": float(loss),
-                       **{f"train/{k}": float(v) for k, v in aux.items()},
+            # One read for every number, since each float() of a device
+            # array is a copy of its own.
+            read = jax.device_get({
+                "loss": loss, "aux": aux, "accepted": accepted, "rate": learning_rate(state.opt_state),
+                "scale": None if state.scale is None else state.scale.scale,
+                "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
+            scalars = {"train/loss": float(read["loss"]),
+                       **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
                                           interval.samples, interval.flops)}
-            scalars["train/accepted"] = float(accepted)
-            if (rate := learning_rate(state.opt_state)) is not None:
-                scalars["train/learning_rate"] = rate
-            if state.scale is not None:
-                scalars["train/loss_scale"] = float(state.scale.scale)
+            scalars["train/accepted"] = float(read["accepted"])
+            if read["rate"] is not None:
+                scalars["train/learning_rate"] = float(read["rate"])
+            if read["scale"] is not None:
+                scalars["train/loss_scale"] = float(read["scale"])
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
-                scalars.update({f"rollout/{name}": float(value)
-                                for name, value in _rollout_metrics(self.rollout).items()})
+                scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)
@@ -2267,7 +2147,7 @@ class Trainer(Generic[Loss, Effects]):
                     wall = time.perf_counter() - run.started
                     scalars = goodput(wall, run.first_step, run.other)
                     self._display.summary(run.current, wall, scalars,
-                                          None if run.loss is None else float(run.loss))
+                                          None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:
                         self.tracker.log(scalars, run.current)
 
@@ -2334,15 +2214,18 @@ class Trainer(Generic[Loss, Effects]):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `evaluate` scores under the
+        # The rules and the microbatch count; `Evaluation.run` scores under the
         # mesh itself, and previews decode outside it.
         with (pipeline_microbatches(self.mesh.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
-            evaluation = evaluate(
+            evaluation = Evaluation.run(
                 self.objective, params, dataset.val if reader is None else reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training)
-        self._report_evaluation(evaluation)
+        # The training values ride along for ranking (`_ranking`); the log
+        # interval reports them, so the evaluation's own report leaves them out.
+        self._report_evaluation(dataclasses.replace(evaluation, scores={
+            name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:

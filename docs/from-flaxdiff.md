@@ -6,7 +6,7 @@ FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew se
 
 | FlaxDiff area | Dew area | Change to account for |
 | --- | --- | --- |
-| `flaxdiff.models` | `dew.nn` and the `dew.models` registry | Build a registered model from its current fields; old constructor fields need review. |
+| `flaxdiff.models` | `dew.nn.backbones` | Build the model from its class with its current fields; old constructor fields need review. |
 | `flaxdiff.schedulers` and `flaxdiff.predictors` | `dew.diffusion.schedules` and `dew.diffusion.transforms` | A diffusion preset composes schedule, target, weighting, and preconditioning choices. A schedule alone does not describe the whole training convention. |
 | The diffusion trainer in `flaxdiff.trainer` | `dew.Trainer` plus `dew.objectives.diffusion.DiffusionObjective` | The objective owns diffusion-specific computation; the trainer owns updates, state placement, logging, and checkpoint orchestration. |
 | `flaxdiff.jepa` | `dew.objectives.jepa` and `dew.nn.backbones.jepa` | Encoder/predictor/target behavior belongs to the objective and its modules. |
@@ -18,7 +18,7 @@ FlaxDiff was an earlier name for Dew, when it was built around diffusion. Dew se
 
 ## Loading an older text-to-image checkpoint
 
-`dew.interop.flaxdiff.load_flaxdiff` loads `simple_udit` and `hybrid_dit` latent text-to-image models from the older checkpoint format, trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task `dew.pipeline` returns for a Dew run.
+`TextToImage.from_flaxdiff` loads `simple_udit` and `hybrid_dit` latent text-to-image models from the older checkpoint format, trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task `dew.pipeline` returns for a Dew run.
 
 It takes three things from the old run:
 
@@ -32,12 +32,11 @@ It takes three things from the old run:
 ```python
 import json
 
-from dew.interop.flaxdiff import load_flaxdiff
-from dew.sampling import Heun
+from dew.sampling import Heun, TextToImage
 
 config = json.load(open("run_config.json"))  # the run's saved training config
-pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
-images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, sampler=Heun()).host().images
+pipe = TextToImage.from_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
+images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun()).host().images
 ```
 
 `images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.

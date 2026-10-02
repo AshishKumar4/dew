@@ -429,7 +429,7 @@ def multimodal(**overrides):
         decoder(emb_features=16, max_seq_len=16, **overrides), SiglipVision(
             hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
             image_size=8, patch_size=4),
-        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
         family="gemma3", image_token_id=1, dtype=jnp.float32)
 
 
@@ -515,12 +515,12 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     """
     from pathlib import Path
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
-    loaded = load_pretrained(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
     source = loaded.model
     assert isinstance(source, DiffusionGemma)
     scanned = source.clone(text=source.text.clone(scan_layers=True))

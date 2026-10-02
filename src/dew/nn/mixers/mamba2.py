@@ -24,12 +24,9 @@ fp32 as the reference casts. The decode step is `mamba2_selective_state_update`
 (192-251). Both live here beside their gated-delta-rule counterparts'
 shapes so tests/test_mamba2.py can hold them to the reference's numbers.
 
-The scan over the chunks is `xla_chunk_scan` here, and on a GPU or a TPU
-whose tiling covers the geometry it is `dew.nn.kernels.ssd`'s Pallas kernel,
-chosen at trace time from the backend the way attention's 'auto' chooses
-cudnn. The two compute the same scan: the XLA form is the oracle the kernel's
-tests hold it to and the path every other backend and shape takes. Decoding
-stays on the recurrent form either way.
+The scan over the chunks is `xla_chunk_scan`, the oracle, and on a TPU whose
+tiling covers the geometry `dew.nn.kernels.ssd`'s Pallas kernel, chosen at
+trace time. Decoding stays on the recurrent form either way.
 
 Around the scan: `in_proj` yields `[z, x, B, C, dt]` in that order
 (`projected_states.split([intermediate, conv_dim, num_heads])`, 484-486,
@@ -155,21 +152,14 @@ def _entering_state(decay, write, axis: str):
     """The state entering this shard of a sequence the mesh axis `axis`
     splits, inside a `shard_map` that holds it manual.
 
-    Shard r's span of the recurrence is affine in the state entering it:
-    it leaves `exp(A_r) h + B_r`, with `decay` the span's total log decay
-    `A_r` `[B, H]` and `write` the state `B_r` `[B, H, P, N]` it leaves from
-    zero. Two spans in order compose to one, `(A_1, B_1)` then `(A_2, B_2)`
-    being `(A_1 + A_2, exp(A_2) B_1 + B_2)`, an associative operation whose
-    identity `(0, 0)` is what `ppermute` hands a shard with no source. So
-    the prefix over shards is a Kogge-Stone scan: at shift 1, 2, 4, ...
-    each shard receives the pair `shift` shards back and composes it in
-    front of its own, which leaves every shard the composition of itself
-    and all shards before it after `ceil(log2 n)` rounds; one more shift by
-    a single shard makes it exclusive, the state entering this shard, zero
-    on the first. Each round moves one pair per shard, where gathering all
-    of them moves n; lm-engine's `_SerialPrefixScan`
-    (`sequence_mixer_blocks/mamba2/op.py`) folds the gathered pairs
-    serially. Autodiff transposes each `ppermute` into the reverse one."""
+    Shard r's span is affine in its entering state: it leaves `exp(A_r) h +
+    B_r`, with `decay` `A_r` `[B, H]` and `write` `B_r` `[B, H, P, N]`. Spans
+    compose as `(A_1 + A_2, exp(A_2) B_1 + B_2)`, associative with identity
+    `(0, 0)`, what `ppermute` hands a shard with no source. So the prefix is a
+    Kogge-Stone scan, shifts 1, 2, 4, ... for `ceil(log2 n)` rounds and one more
+    to make it exclusive (zero on the first shard), one pair per shard per
+    round where lm-engine's `_SerialPrefixScan` gathers all n. Autodiff
+    transposes each `ppermute`."""
     shards = jax.lax.axis_size(axis)
 
     def shifted(value, shift: int):
@@ -187,18 +177,12 @@ def _entering_state(decay, write, axis: str):
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
 
-    `x` `[B, S, H, P]`, `dt` `[B, S, H]` already through softplus and the
-    limit, `A` `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns
-    `(output [B, S, H, P], state [B, H, P, N])`, fp32 throughout as the
-    reference (the input's own dtype where it is wider, `at_least_fp32`),
-    cast back to the input's dtype.
-
-    `starts` `[B, S]` marks the tokens that open a packed document: the
-    state entering such a token is dropped, so no document reads another's.
-
-    The scan over chunks runs on the Pallas kernel where `ssd_kernel_platform`
-    takes the backend and the geometry, and on `xla_chunk_scan` everywhere
-    else. The two agree to fp32 tolerance (tests/test_ssd_kernel.py).
+    `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
+    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
+    state [B, H, P, N])` computed in `at_least_fp32` and cast back. `starts`
+    `[B, S]` marks packed documents' first tokens, whose entering state drops.
+    The chunk scan runs on the Pallas kernel where `ssd_kernel_platform` takes
+    the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
@@ -277,41 +261,25 @@ class MambaRMSNormGated(nn.Module):
 @logical_axes({
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
-}, heuristic=(("conv1d",),))
+})
 class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 
-    `intermediate = num_heads * head_dim` is the layer's own width (the
-    config's `expand * hidden_size`), `state_size` the `N` of each head's
-    `[head_dim, N]` state and `n_groups` how many distinct B and C the heads
-    share. `time_step_limit` clamps the softplus'd step, the reference's
-    `dt_limit`; its default is no clamp.
+    `intermediate = num_heads * head_dim` (the config's `expand *
+    hidden_size`), `state_size` each head's `N`, `n_groups` the distinct B and
+    C. `time_step_limit` is the reference's `dt_limit`, by default no clamp.
 
-    The decode state is two leaves in the flax `cache` collection,
-    `ssm_state` `[B, H, P, N]` and `conv_state` `[B, conv_dim, K-1]`,
-    allocated at the batch the first decode-mode call sees and advanced by
-    every later one, as the gated delta net holds its own. Prefill and
-    decode share one path: a call of one token runs the recurrent step, a
-    longer one the chunked scan with the held state as its initial state.
+    The decode state is `ssm_state` `[B, H, P, N]` and `conv_state`
+    `[B, conv_dim, K-1]` in the `cache` collection; a one-token call runs the
+    recurrent step and a longer one the chunked scan from the held state.
+    Padded rows (`attention_metadata.valid`) are zeroed before the projection
+    (`apply_mask_to_padding_states`) and take a zero step. Packed documents
+    (`segment_ids`) run as if alone, as mamba_ssm's `seq_idx` does.
 
-    Padded rows (`attention_metadata.valid`) are zeroed before the
-    projection as the reference's `apply_mask_to_padding_states` does; the
-    conv reads a row's real tokens as a stream across them, and a padded
-    slot takes a zero step (`dt = 0`), which leaves the state as it was.
-
-    Packed documents (`segment_ids`) run as if each ran alone: the conv
-    reads nothing across a segment change and the scan drops the state at
-    it, as mamba_ssm does for its `seq_idx`. Without segment ids the state
-    and the conv run across the whole row.
-
-    Under a mesh whose sequence axis is above one, a training or scoring
-    call runs the conv and the scan inside a `shard_map` over that axis
-    (`_sequence_mix`): each shard's conv reads the previous shard's last
-    `K-1` tokens through a `ppermute`, and its scan runs from zero and
-    then adds what the state the earlier shards leave (`_entering_state`)
-    contributes to each output, packed documents resetting both across
-    shard boundaries as within one. Decoding and rows with
-    padding slots hold one state per row and are refused there.
+    Under a mesh sequence axis above one, training and scoring run the conv and
+    scan in a `shard_map` (`_sequence_mix`): the conv reads the previous shard's
+    last `K-1` tokens by `ppermute` and the scan adds the earlier shards' state
+    (`_entering_state`); decoding and padded rows are refused there.
     """
 
     emb_features: int
@@ -462,17 +430,12 @@ def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_group
     """The scan after the conv: `convolved` `[B, conv_dim, S]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
-    Returns the output `[B, S, H * P]` and the state leaving it.
+    Returns the output `[B, S, H * P]` and the zero-start state leaving it.
 
-    Under `axis`, this shard's slice of a sequence inside a `shard_map`,
-    the scan runs from zero and the output is then corrected for the state
-    `h` the earlier shards leave, which the recurrence carries linearly: the
-    state at token t is its zero-start value plus `exp(acs_t) h`, with
-    `acs_t` the inclusive sum of this shard's `A dt` (a document start's
-    `RESET_DECAY` in it takes the term to 0), so the output gains
-    `C_t . exp(acs_t) h`. The zero-start scan's final state is the shard's
-    own write `B_r` the exchange needs (`_entering_state`); the state
-    returned is that zero-start one."""
+    Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
+    h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
+    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
+    final state is the shard's write `B_r` (`_entering_state`)."""
     batch, _, length = convolved.shape
     mixed = jnp.moveaxis(convolved, 2, 1)
     intermediate = num_heads * head_dim
@@ -505,15 +468,12 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     """The conv and the scan over whole training sequences, or over this
     shard's slice of them inside a `shard_map` that holds `axis` manual.
 
-    `mixed` `[B, S, conv_dim]` and `dt` `[B, S, H]` in fp32, `segments`
-    `[B, S]` the packed documents or None, `weights` the conv's taps and
-    bias and the heads' `dt_bias`, `A` and `D`. Under `axis` the conv reads
-    the previous shard's last `K-1` tokens, and their segments, through one
-    `ppermute` (the first shard receives zeros, the history a sequence
-    starts from), and the scan's output is corrected for the state the
-    earlier shards leave (`_ssd`). A packed document resets both: the conv reads nothing across a
-    segment change and the scan drops the state at it, wherever the change
-    falls, a shard boundary included."""
+    `mixed` `[B, S, conv_dim]` and `dt` `[B, S, H]` in fp32, `segments` `[B, S]`
+    or None, `weights` the conv's taps and bias and the heads' `dt_bias`, `A`
+    and `D`. Under `axis` the conv reads the previous shard's last `K-1` tokens
+    and segments by one `ppermute` (zeros on the first) and the scan is
+    corrected for the earlier shards' state (`_ssd`). A segment change resets
+    both wherever it falls."""
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
@@ -578,14 +538,9 @@ def _inverse_softplus_step(key, shape):
 @dataclasses.dataclass(frozen=True)
 class Mamba2Mixer(MixerBase):
     """The `mamba2` kind, by the reference config's field names
-    (configuration_mamba2.py): `num_heads` heads of `head_dim`, a state of
-    `state_size` per head, `n_groups` distinct B/C, the conv's `conv_kernel`,
-    the scan's `chunk_size`, the biases and the step's `time_step_limit`.
-
-    The kind ignores the context's attention geometry (num_kv_heads,
-    head_dim, the window, rope, KV sharing): an SSM has no keys to cache and
-    no positions to rotate. Its own `num_heads` and `head_dim` are the
-    checkpoint's, which need not match the model's attention heads.
+    (configuration_mamba2.py). It ignores the context's attention geometry: an
+    SSM has no keys to cache or positions to rotate, and its `num_heads` and
+    `head_dim` are the checkpoint's own.
     """
 
     # Its SSD scan's small batched dots gain from the fusions: 7.7% on an A100.

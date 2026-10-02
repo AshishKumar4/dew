@@ -69,18 +69,18 @@ def main() -> None:
 
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     scaffold = Path(f"{args.out}-scaffold")
     Qwen3MoeForCausalLM(Qwen3MoeConfig.from_dict(CONFIG)).save_pretrained(scaffold, safe_serialization=True)
-    source = load_pretrained(str(scaffold), dtype="float32", param_dtype="float32", attention_impl="xla")
+    source = Pretrained.load(str(scaffold), dtype="float32", param_dtype="float32", attention_impl="xla")
     variables = source.model.init(jax.random.key(args.seed), jnp.zeros((1, 8), jnp.int32))
     if jax.tree.structure(variables) != jax.tree.structure(source.variables):
         raise ValueError("Dew's init and the scaffold's variables are different trees")
     source.save(args.out, variables=variables)
     shutil.rmtree(scaffold)
 
-    written = load_pretrained(args.out, dtype="float32", param_dtype="float32", attention_impl="xla")
+    written = Pretrained.load(args.out, dtype="float32", param_dtype="float32", attention_impl="xla")
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(variables),
                                     jax.tree.leaves(written.variables), strict=True):
         if not np.array_equal(np.asarray(mine), np.asarray(theirs)):

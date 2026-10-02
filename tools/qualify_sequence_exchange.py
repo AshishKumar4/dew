@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.attention import attention_kernel, exchanged_heads_attention
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 
 def timed(fn, *args, repeats: int = 10) -> float:
@@ -57,7 +57,7 @@ def case(batch: int, seq: int, heads: int, kv_heads: int, head_dim: int, dtype) 
     def loss(fn):
         return lambda q, k, v: jnp.sum(fn(q, k, v).astype(jnp.float32) ** 2)
 
-    mesh = build_mesh(MeshSpec(sequence=shards))
+    mesh = MeshSpec(sequence=shards).build()
     with jax.set_mesh(mesh):
         forward = jax.jit(exchanged)
         backward = jax.jit(jax.grad(loss(exchanged), argnums=(0, 1, 2)))

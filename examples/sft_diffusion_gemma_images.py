@@ -25,12 +25,12 @@ import numpy as np
 import optax
 import tyro
 
-from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, OxfordFlowers
+from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, TFDSImages
 from dew.data.dataset import mapped, tokenized, train_stream
 from dew.data.images import ImageTransform, class_names
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import Checkpoints, Trainer
 
@@ -104,7 +104,7 @@ def caption_batch(batch, config: Config, labels):
 
 
 def flowers_data(config: Config):
-    spec = OxfordFlowers(path=config.flowers, split="train", image_size=config.image_size,
+    spec = TFDSImages(path=config.flowers, split="train", image_size=config.image_size,
                          augmentation="none", val_batches=0,
                          loading=Loading(workers=0, threads=2, read_buffer=16))
     source = spec.source()
@@ -137,7 +137,7 @@ def main(config: Config):
         stream.close()
     initial = trainer.initial_state()
     vision_before = jax.tree.map(np.asarray, initial.params["params"]["conditioner"])
-    score = jax.jit(lambda params, inputs: scalar_loss(objective, params, {"text": inputs},
+    score = jax.jit(lambda params, inputs: objective.scalar_loss(params, {"text": inputs},
                    Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
     before = float(score(initial.params, probe["text"]))
     del initial

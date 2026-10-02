@@ -4,7 +4,7 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
+Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation.
 
 | Member | Contract |
 |---|---|
@@ -19,7 +19,7 @@ Import `Objective`, `Aux`, `Step`, `Ratio`, `mean_loss`, and `scalar_loss` from 
 
 `Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 
-`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `scalar_loss(objective, variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
+`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
 ### Collections and EMA selection
 
@@ -46,10 +46,10 @@ Import these from `dew.training`:
 ```text
 MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None, replicas=1)
 Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=(), host_parameters=())
-build_mesh(spec, devices=None)
+MeshSpec(...).build(devices=None)
 ```
 
-`build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count. `replicas` above 1 builds a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes where every device shares one slice), with every other axis inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call picks the all-to-all or the gather exchange from its shape.
 
 `Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `host` names train-state fields out of `params`, `opt_state` and `ema`. The named `opt_state` and `ema` stay in pinned host memory between steps and the step fetches them to the device. Naming `params` instead makes the CPU own the whole `TrainState`, including optimizer, EMA and accumulation: the optimizer transaction runs on a CPU companion of the mesh, and the runtime CPU device count must match the accelerator count on every process before JAX initializes. `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory; only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
 
@@ -128,7 +128,7 @@ Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 
 `from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position; `validation` is one ordered pass of whole batches, and fewer records than one batch are refused. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
 
-`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
+`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike; `reader` is which of them this process is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
 Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
 
@@ -146,7 +146,7 @@ An image specification takes validation from `val_split`, a split of the dataset
 
 `Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines a caller assembled: a `MapDataset` is repeated, cut into the reader's share and saved as one global record count; a pipeline read as it comes arrives as a function of the `DataPartition` that builds the `IterDataset` of that share, which is batched where it is and reports Grain's own iterator state.
 
-A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file, `TokenRecords` over ArrayRecord shards of token arrays, or `TokenColumn` over a parquet column of them. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in all three.
+A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both.
 
 
 ## Checkpoints
@@ -172,7 +172,7 @@ LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_
 IndexerTraining(phase, weight=1.0)
 ```
 
-`load_pretrained` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model, initial variables and processor, which `pipeline` then decodes with. It refuses `pretrained=` because the bundle supplies those weights. `bundle.lora(...)` returns a bundle with a fresh adapter whose `lm_objective` trains the factors alone, and whose `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`Pretrained.load` returns a bundle whose `lm_objective(seq_len, **options)` builds this objective with its model, initial variables and processor, which `pipeline` then decodes with. It refuses `pretrained=` because the bundle supplies those weights. `bundle.lora(...)` returns a bundle with a fresh adapter whose `lm_objective` trains the factors alone, and whose `save` and `export` merge them. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
 `pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs. `trainable` is a path filter over the parameter leaves the optimizer moves; the rest of the tree is kept under `frozen`. An adapter's filter, `dew.lora.LoRA.trainable`, goes here. `None` trains every leaf, and `trainable` cannot be combined with `indexer`.
 
@@ -183,7 +183,9 @@ Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 ```text
 generate(model, params, inputs, max_new_tokens, *, key=None,
          sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
-Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
+Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=None, top_p=1.0, min_p=0.0,
+         repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
+         no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
 ```
 
 `params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. `key` is an integer seed or a JAX key; `key=n` is `jax.random.key(n)`.
@@ -192,7 +194,7 @@ The compiled decoder uses one padded input shape with per-row cache cursors and 
 
 `n` is the number of continuations drawn per prompt and must be a positive integer. The continuations of a prompt share its prefill and then run one after another on the device, with the prompts of each continuation batched as before: decode time grows with `n`, one continuation's cache working memory is reused by the next, and only the output storage grows with `n`. A prompt's key is its global row key: continuation zero draws with that key, so `n=1` and continuation zero of a larger request are the same draw, and continuation `j` folds `j` into it, so raising `n` leaves the continuations already drawn unchanged. Row padding on a mesh pads prompts before the continuations exist, so a prompt's `n` rows stay together on the process that asked for them and `host()` drops only padded prompts' rows.
 
-`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering. A `Sampling` value is a convenience over the components below: it compiles to those four transforms, in that order, plus an EOS criterion, and `generate` appends them after whatever `logits` and `stopping` hold.
+`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. `Sampling` holds the common generation controls as one value, each at a default that changes nothing: the repetition penalty (Transformers' `RepetitionPenalty`, over the prompt and the draw), vLLM's presence and frequency penalties (over the drawn tokens), `no_repeat_ngram_size`, `min_new_tokens` (EOS held back, which needs an `eos_id`), and then temperature, top-k, nucleus top-p, relative min-p and typical-p filtering. `transforms()` compiles them in Transformers' `_get_logits_processor` order, which `dew.sampling.text.ordered_transforms` owns, with the penalties beside the repetition penalty where vLLM applies them; at least one token survives the filters. Zero temperature selects argmax and runs no filter. `stop` holds strings that end a row; they compile against a tokenizer's vocabulary, so `generate` refuses them and a `TextGeneration` compiles them through its processor. A `Sampling` value is a convenience over the components below: it compiles to those transforms plus the EOS criterion. `eos_id` and `pad_id` left `None` are a task's own when a task runs the policy; `generate` alone stops on no EOS unless one is named, and pads with 0.
 
 `Generation.tokens` includes the original prompt and has shape `(B * n, P + max_new_tokens)` with `B` the placed prompt rows, prompt zero's `n` continuations first and the prompts in request order. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B * n, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. Each row carries its own length, termination and likelihoods. `rows` counts this process's real prompts times `n`; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound, one string per row.
 
@@ -209,7 +211,7 @@ Strategy:        (DecoderState, StepState, DecodeOps, transform, stopping, budge
 StepState(tokens, valid, step, active, keys, prompt_width)
 ```
 
-`StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` and `generated()` the two regions, and `total()` the real token count. A transform never sees model parameters or cache internals.
+`StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` the prompt region, and `total()` the real token count. A transform never sees model parameters or cache internals.
 
 `logits` is the whole transform chain, in the order it runs. Left as `None` it is what `sampling` compiles to, an explicit sequence replaces that entirely, and `()` runs no transform, so a caller who needs an order `Sampling` does not produce writes the order they want. A call's value replaces a task's bound one, and an explicit `sampling=` on a call also clears a bound chain, because that chain was built around the policy the call just replaced. `stopping` composes instead: an explicit sequence runs beside the policy's EOS criterion rather than replacing it, so naming a criterion cannot drop termination. Criteria combine with OR and run after every committed token; the token that fired one is emitted with its likelihoods and later slots hold `pad_id` with zero likelihood.
 
@@ -233,17 +235,15 @@ def favor_short(state, logits):
     return logits.at[:, 2].add(jnp.where(state.step >= 8, 3.0, 0.0))
 
 
-# The chain is complete, so the policy's own filters are written into it.
-drawn = generate(
-    model, variables, prompts, 32, key=0,
-    sampling=Sampling(eos_id=2, pad_id=0),
-    logits=(decoding.RepetitionPenalty(1.1),
-            decoding.NoRepeatNGram(3),
-            decoding.FrequencyPenalty(0.4),
-            favor_short,
-            decoding.Temperature(0.8),
-            decoding.TopP(0.9)),
-    stopping=(decoding.MaxNewTokens(24),))
+# The common controls are one value, compiled in Transformers' order.
+policy = Sampling(temperature=0.8, top_p=0.9, repetition_penalty=1.1, frequency_penalty=0.4,
+                  no_repeat_ngram_size=3, eos_id=2, pad_id=0)
+drawn = generate(model, variables, prompts, 32, key=0, sampling=policy,
+                 stopping=(decoding.MaxNewTokens(24),))
+
+# An explicit chain is complete: a transform of your own joins the policy's.
+nudged = generate(model, variables, prompts, 32, key=0, sampling=policy,
+                  logits=(favor_short, *policy.transforms()))
 
 # The same request as a deterministic search over four beams, returning two.
 searched = generate(model, variables, prompts, 32, key=0,
@@ -257,7 +257,7 @@ searched = generate(model, variables, prompts, 32, key=0,
 drafted = generate(model, variables, prompts, 32, key=0,
                    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
                    strategy=Speculative(block=4))
-print(drawn.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
+print(drawn.tokens.shape, nudged.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
 
 The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
@@ -271,7 +271,7 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `Typical(mass)` | `TypicalLogitsWarper` | |
 | `EpsilonCutoff(epsilon)` | `EpsilonLogitsWarper` | |
 | `EtaCutoff(epsilon)` | `EtaLogitsWarper` | |
-| `TopH(fraction=1.0, candidates=100)` | `TopHLogitsWarper` | `candidates` is the reference's fixed head |
+| `TopH(fraction=1.0)` | `TopHLogitsWarper` | over the reference's fixed head of 100 |
 | `Greedy()` | greedy search | zero on the argmax, `-inf` elsewhere; what `temperature=0` compiles to |
 | `Renormalize()` | `LogitNormalization` | shifts every score by one constant, so no later filter and neither likelihood can see it |
 | `RemoveInvalidValues()` | `InfNanRemoveLogitsProcessor` | the only transform that repairs a broken distribution |
@@ -341,32 +341,29 @@ Dew uses T5X as a reference and a test oracle, and adapts some of its state and 
 
 #### Source generation controls
 
-A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The transforms a source binds are the complete chain, built in `_get_logits_processor`'s order, so the policy tail lands where the reference puts it; a source running beam search ends its chain after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
+A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `PretrainedDecoder.text_generation()` refuses it and says why. The common controls become the task's `Sampling` value, `task.sampling`, so a caller changes one with `dataclasses.replace(task.sampling, ...)`. A source that also sets a control `Sampling` does not carry binds `task.logits`, the complete chain, which the same compiler (`ordered_transforms`) builds in `_get_logits_processor`'s order with the policy's transforms in it; a source running beam search always binds its chain and ends it after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
 
 Each source control has one rule for its consumer, neutral value, mode and refusal. Source value precedence remains `generation_config.json`, wrapper config, then text config. The source resolver selects the actual policy once. `Sampling` supplies convenience defaults at the request boundary; only resolved transforms, criteria, strategy and padding reach the compiled decoder. An explicit chain therefore has no unused sampling settings in its compilation or process-agreement identity.
 
 | Control | Native mapping | Refused because |
 | --- | --- | --- |
-| `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `eos_token_id`, `pad_token_id` | `Sampling` | |
+| `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `repetition_penalty`, `no_repeat_ngram_size`, `min_new_tokens`, `stop_strings`, `eos_token_id`, `pad_token_id` | `Sampling` (`stop_strings` as `stop`, compiled through the task's processor) | |
 | `max_length`, `max_new_tokens` | the task's token budget | |
 | `num_return_sequences` | the task's `n`, independent of any `sampling=` override | |
 | `bos_token_id`, `decoder_start_token_id` | inapplicable to supplied-input causal decoding; the tokenizer prepares special tokens | |
 | `max_cache_len` | capacity assertion only; it does not resize the cache or limit the request | a length above the model's `max_seq_len` |
-| `repetition_penalty` | `RepetitionPenalty` | |
 | `encoder_repetition_penalty` | `PromptRepetitionPenalty` | |
-| `no_repeat_ngram_size` | `NoRepeatNGram` | |
 | `encoder_no_repeat_ngram_size` | `PromptNoRepeatNGram` | |
 | `sequence_bias` | `sequence_bias` | |
 | `bad_words_ids` | `bad_words` | |
-| `min_length`, `min_new_tokens` | `MinLength`, `MinNewTokens` | |
+| `min_length` | `MinLength` | |
 | `forced_bos_token_id` | `ForcedBOS` | |
 | `forced_eos_token_id` | `ForcedEOS` at the request's own end, so a per-call budget moves it | |
 | `suppress_tokens`, `begin_suppress_tokens` | `SuppressTokens`, `BeginSuppressTokens` | |
 | `exponential_decay_length_penalty` | `ExponentialDecayLengthPenalty` | |
 | `remove_invalid_values` | `RemoveInvalidValues` | |
 | `renormalize_logits` | `Renormalize` | |
-| `typical_p`, `epsilon_cutoff`, `eta_cutoff`, `top_h` | `Typical`, `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
-| `stop_strings` | `stop_strings` | without the source's processor or the model's `vocab_size` there is no vocabulary to compile |
+| `epsilon_cutoff`, `eta_cutoff`, `top_h` | `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
 | `use_cache` | native decoding always runs through its own cache | `use_cache=False` |
 | `cache_implementation` | the fixed-capacity static cache | any other implementation |
 | `cache_config` | | quantized and offloaded caches are not implemented |
@@ -422,14 +419,21 @@ BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad
                 max_new_tokens=None, max_length=None, n=1)
 task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
-Pretrained.text_generation(*, sampling=None) -> TextGeneration | MaskedGeneration
-Pretrained.lm_objective(seq_len, **options) -> LMObjective
-Pretrained.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> Pretrained
-Pretrained.block_generation() -> BlockGeneration
-Pretrained.text_to_image() -> TextToImage
+Pretrained.load(name_or_dir, *, dtype="bfloat16", param_dtype="float32", attention_impl="auto",
+                max_seq_len=None, revision=None, gguf_file=None, single_file=None, mesh=None,
+                layout=None, fallback=None) -> the kind it is called on, or the kind the source is
+PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
+PretrainedDecoder.lm_objective(seq_len, **options) -> LMObjective
+PretrainedDecoder.lora(*, rank, modules, key, alpha=None, rslora=False, dropout=0.0) -> PretrainedDecoder
+PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
+PretrainedBlockDecoder.block_generation() -> BlockGeneration
+PretrainedPipeline.text_to_image() -> TextToImage
+PretrainedFallback.lm_objective(seq_len, **options) -> LMObjective
+Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
+Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
 PPOObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
-            sampler=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
+            solver=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
 TextToImage.from_run(directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
                      param_dtype=None)
@@ -441,7 +445,7 @@ image_task.quantized(spec) -> TextToImage
 image_task.prepare(prompts, *, key=None, steps=None, unconditional=None,
                    image=None, image_latents=None, mask=None, noise=None, initial=None,
                    times=None, encode_key=None) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, decode=True) -> Images
+image_task(prompts_or_prepared, *, steps=None, guidance=<default>, solver=None, key=None, decode=True) -> Images
 RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 Server.from_task(task, *, slots, capacity, admission=None, kv_cache=None, chunk=None,
                  prefix_cache=False, decode_steps=1) -> Server
@@ -455,7 +459,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and take their return count from `num_return_sequences`. An explicit `sampling=` replaces the policy and the chain, and the controls behind them are then neither built nor judged, so a distribution control the caller just replaced cannot block the call; the criteria, the strategy and the return count still come from the source, and every control the task keeps is judged as always. An unknown control name is always refused, because no consumer is defined for it. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
 
-`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()`, `text` and continuation rows. Its continuations refine the shared encoded prompt independently, each over the original prompt rows, so the batch-wide canvas draw a row sees is the one a single continuation sees. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose sampler pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; exactly one of `steps` and `times` is passed, and an explicit grid decides the trajectory's length. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. `blank` is the task's unconditional branch, encoded once by whoever built the task (`DiffusionObjective.blank_conditions`); `None` encodes it on every call. Rebinding preserves the compilation identity of every task.
+`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()`, `text` and continuation rows. Its continuations refine the shared encoded prompt independently, each over the original prompt rows, so the batch-wide canvas draw a row sees is the one a single continuation sees. `TextToImage` carries the objective's or source's `steps`, `guidance` and `solver` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose solver pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; exactly one of `steps` and `times` is passed, and an explicit grid decides the trajectory's length. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. `blank` is the task's unconditional branch, encoded once by whoever built the task (`DiffusionObjective.blank_conditions`); `None` encodes it on every call. Rebinding preserves the compilation identity of every task.
 
 `Server.from_task(task, slots=, capacity=)` serves a `TextGeneration` task with continuous batching over one resident KV cache. It holds `slots` rows of `capacity` cache slots each, admits queued requests into free rows, and runs one compiled step per iteration over every row. Every request runs the task's bound policy, and a request draws with the key it was submitted with, so a served request draws the same tokens as the same request run alone. `submit` returns a ticket that resolves to the request's `Generation`, `step` runs one iteration, `run` steps until the queue and rows are empty, and calling the server with a batch of prompts does both.
 
@@ -487,27 +491,27 @@ An explicit `sampling=Sampling(...)` sets the native policy controls supported b
 
 `stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama requests go through the SDK's public `generate` and `chat` methods, which own request conversion, HTTP behavior, error handling and line-stream framing; the adapter rejects request fields the installed SDK does not accept and negative token counts, and the SDK's own parsing rejects unparsable values. OpenAI completions use the SDK's public `with_raw_response` hook, so choice and usage fields are checked on the wire before parsing. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget, requested choice count and an explicit `Sampling` policy cannot be overridden through provider extensions; the SDK writes `extra_body` over the named parameters, so a policy field there must equal the policy or the request is refused before any network call.
 
-`export_run(run_dir, destination, *, ema=None, step=None)` writes a saved run into that same layout: it loads the run the way `dew.pipeline` does and hands the rebuilt model to its family's writer, refusing a model with no published layout by name. `dew export <run> <dest>` is the command over it, and `push_to_hub` exports a run directory before uploading unless `raw=True`, which uploads the run itself for `from_pretrained` to pull back.
+`export_run(run_dir, destination, *, ema=None, step=None)` writes a saved run into that same layout: it loads the run the way `dew.pipeline` does and hands the rebuilt model to its family's writer, refusing a model with no published layout by name. `dew export <run> <dest>` is the command over it. A bundle publishes what `save` writes with `bundle.push_to_hub(repo_id, private=, commit_message=)`; uploading the run directory itself with `huggingface_hub.HfApi().upload_folder` is the form `from_pretrained` pulls back.
 
-A decoder trained through the LM recipe, exported with `save_pretrained_decoder` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. `Pretrained.save` and `save_pretrained_decoder` leave the same files, so either export converts.
+A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_model(...).save` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. A loaded source's `save` and a `from_model` bundle's leave the same files, so either export converts.
 
 ## Diffusion and JEPA objectives
 
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
-                   unconditional_prob=0.12, ema_decay=0.999, sampler=DDIM(),
+                   unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
                    guidance=CFG(3.0), steps=200, pretrained=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
 
-Import `DiffusionObjective` from `dew.objectives.diffusion`. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
+Import `DiffusionObjective` from `dew.objectives.diffusion`. `process` takes a preset such as `Flow()` or `EDM(regime="pixel")`, or a custom `Process`. A preset builds once and `objective.process` holds the resulting Gaussian process; masked-token presets are refused. `FlowGRPOObjective` accepts the same values. `TextToImage.from_objective` keeps the objective's built process, and a manually built image task takes a `Process`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `solver`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
 Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normalized images/video and optional token indices plus `train` and RNG settings. It returns token features with the feature dimension last. The predictor consumes context features and context/target position indices and returns target features of the encoder width. Mask grid, patch geometry, and predictor dimensions must agree. `momentum` specifies the EMA schedule endpoints over `momentum_steps` optimizer updates; `label_key` identifies labels for representation evaluation. See the [JEPA example](../guides/representation-learning.md).
 
 ### Pretrained latent diffusion
 
-The same `dew.interop.load_pretrained` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. Six denoisers load: a `UNet2DCondition` reading one or two CLIP towers through cross attention, an `SD3Transformer` reading both jointly beside a T5 tower, a `FluxTransformer` reading a T5 sequence with a pooled CLIP vector, Qwen-Image 2.1's `QwenImageTransformer` reading its Qwen3-VL encoder's prompt states, FLUX.2's `Flux2Transformer` reading stacked hidden states of a Mistral-3 ([dev]) or Qwen3 ([klein]) encoder, and Z-Image's `ZImageTransformer` reading its Qwen3 encoder's second-to-last layer, the last five on flow-matching schedules. The denoiser component the directory holds selects the family, and the class it declares selects the model. The returned `Pretrained` holds the native model, its autoencoder behind the existing autoencoder seam (an `AutoencoderKL`, or Qwen-Image 2.1's one-frame `QwenImageVAE`), native text conditioning, a `Process`, the native solver policy and the published pipeline's own call policy. Model and scheduler implementations from other libraries run only in the reference tools.
+The same `dew.interop.Pretrained.load` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. Six denoisers load: a `UNet2DCondition` reading one or two CLIP towers through cross attention, an `SD3Transformer` reading both jointly beside a T5 tower, a `FluxTransformer` reading a T5 sequence with a pooled CLIP vector, Qwen-Image 2.1's `QwenImageTransformer` reading its Qwen3-VL encoder's prompt states, FLUX.2's `Flux2Transformer` reading stacked hidden states of a Mistral-3 ([dev]) or Qwen3 ([klein]) encoder, and Z-Image's `ZImageTransformer` reading its Qwen3 encoder's second-to-last layer, the last five on flow-matching schedules. The denoiser component the directory holds selects the family, and the class it declares selects the model. The returned `Pretrained` holds the native model, its autoencoder behind the existing autoencoder seam (an `AutoencoderKL`, or Qwen-Image 2.1's one-frame `QwenImageVAE`), native text conditioning, a `Process`, the native solver policy and the published pipeline's own call policy. Model and scheduler implementations from other libraries run only in the reference tools.
 
 `source.text_to_image()` builds the native image task. `source.save(directory, variables=updated)` writes the updated component weights back to their published layouts, retaining tokenizer files, image geometry and any safety-head parameters. Flax-declared components retain their source class and receive Flax msgpack files alongside the safetensors used by Dew; export does not relabel them as PyTorch models.
 
@@ -533,10 +537,10 @@ The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers s
 
 <!-- not run: needs a local diffusion checkpoint directory -->
 ```python
-from dew.interop import load_pretrained
+from dew.interop import PretrainedPipeline
 from dew.objectives.diffusion import DiffusionObjective
 
-source = load_pretrained("./image-checkpoint", dtype="float32")
+source = PretrainedPipeline.load("./image-checkpoint", dtype="float32")
 images = source.text_to_image()(["a flower"], steps=20, key=0).host().images
 objective = DiffusionObjective(
     source.model, source.process, source.inputs,
@@ -550,7 +554,7 @@ Prepared `DenoisingInputs` can supply encoded native conditions and initial late
 
 ## Configuration and registries
 
-A registry maps names to known classes or factories. For example, `models.build(name, **fields)` validates model fields and reconstructs supported configuration records. Ordinary Python constructors provide a clearer typed interface when the class is known. Dynamic lookup cannot provide the same static type information as a specific constructor.
+Code builds every model, preset, solver, dataset and metric from its class. `dew.registry` maps the names that configuration files, the command line and run records use to those classes and back; `RunConfig.from_dict` and `ModelConfig.build` read a record through it.
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 

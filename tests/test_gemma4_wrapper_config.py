@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 
 SOURCE = Path(__file__).parent / 'fixtures' / 'hf' / 'gemma4-native-tiny'
 
@@ -19,8 +19,8 @@ def test_gemma4_wrapper_supplies_the_missing_nested_text_type(tmp_path):
     config = json.loads((checkpoint / 'config.json').read_text())
     del config['text_config']['model_type']
     (checkpoint / 'config.json').write_text(json.dumps(config))
-    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference')
-    original = load_pretrained(SOURCE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
+    original = Pretrained.load(SOURCE, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(SOURCE / 'input_ids.npy'))
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   original.model.apply(original.variables, ids))
@@ -33,8 +33,8 @@ def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
     assert config['text_config']['num_kv_shared_layers'] == 0
     config['text_config']['use_double_wide_mlp'] = True
     (checkpoint / 'config.json').write_text(json.dumps(config))
-    loaded = load_pretrained(checkpoint, dtype='float32', attention_impl='reference')
-    original = load_pretrained(SOURCE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
+    original = Pretrained.load(SOURCE, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(SOURCE / 'input_ids.npy'))
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   original.model.apply(original.variables, ids))

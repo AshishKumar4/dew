@@ -40,9 +40,6 @@ class AutoEncoder(ABC):
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
         """Rebuild maintained autoencoders around the checkpoint's own parameters."""
         from .sd_vae import StableDiffusionVAE
-        from .simple import SimpleAutoEncoder
-        if record['name'] == 'simple':
-            return SimpleAutoEncoder(**record['fields'], params=params)
         if record['name'] == 'sd_vae':
             from dew.registry import resolve_dtype
 

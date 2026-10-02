@@ -59,6 +59,20 @@ CLIP = dict(epsilon_low=float(REFERENCE["epsilon_low"]),
             dual_clip=float(REFERENCE["dual_clip"]))
 
 
+def token_mean(x, mask):
+    """verl's token-mean aggregation, `agg_loss(loss_agg_mode="token-mean")`,
+    which is how GRPO reduces these terms: masked values out before the
+    multiply, so a nan behind the mask stays out, over the exact token count."""
+    weights = mask.astype(x.dtype)
+    return jnp.sum(jnp.where(weights != 0, x, 0) * weights) / jnp.sum(weights)
+
+
+def clipped_surrogate(log_ratio, advantages, mask, module=surrogate, **clip):
+    """The token-mean reduction of the dual-clipped policy terms."""
+    terms, aux = module.clipped_surrogate_terms(log_ratio, advantages, mask, **clip)
+    return token_mean(terms, mask), aux
+
+
 def difference(computed, name):
     return float(np.max(np.abs(np.asarray(computed, np.float64)
                                - np.asarray(REFERENCE[name], np.float64))))
@@ -72,9 +86,9 @@ def assert_matches(computed, name):
 def check_clip(module):
     """verl's clipped loss, its gradient and its three clip metrics."""
     def objective(log_probs):
-        return module.clipped_surrogate(
+        return clipped_surrogate(
             module.token_log_ratio(log_probs, OLD_LOG_PROBS),
-            ADVANTAGES, MASK, **CLIP)
+            ADVANTAGES, MASK, module, **CLIP)
 
     loss, aux = objective(LOG_PROBS)
     gradient = jax.grad(lambda log_probs: objective(log_probs)[0])(LOG_PROBS)
@@ -89,12 +103,12 @@ def check_clip(module):
 def check_k3(module):
     """verl's k3 KL per token, its token-mean penalty and its gradient."""
     kl = module.k3_kl(LOG_PROBS, REF_LOG_PROBS)
-    gradient = jax.grad(lambda log_probs: module.token_mean(
+    gradient = jax.grad(lambda log_probs: token_mean(
         module.k3_kl(log_probs, REF_LOG_PROBS), MASK))(LOG_PROBS)
 
     assert_matches(kl, "verl_k3_kl")
     assert_matches(kl, "tunix_k3_kl")
-    assert_matches(module.token_mean(kl, MASK), "verl_k3_penalty")
+    assert_matches(token_mean(kl, MASK), "verl_k3_penalty")
     assert_matches(gradient, "verl_k3_grad")
 
 
@@ -148,11 +162,11 @@ def test_token_mean_divides_by_the_number_of_tokens_it_kept():
     x = jnp.array([[1.0, jnp.nan], [3.0, 4.0]])
     mask = jnp.array([[1.0, 0.0], [1.0, 1.0]])
 
-    assert float(surrogate.token_mean(x, mask)) == pytest.approx(8 / 3, abs=1e-6)
+    assert float(token_mean(x, mask)) == pytest.approx(8 / 3, abs=1e-6)
 
 
 def test_token_mean_matches_verls_aggregation():
-    assert_matches(surrogate.token_mean(LOG_PROBS, MASK), "verl_token_mean_log_probs")
+    assert_matches(token_mean(LOG_PROBS, MASK), "verl_token_mean_log_probs")
 
 
 def test_token_log_ratio_clamps_what_it_is_about_to_exponentiate():
@@ -184,7 +198,7 @@ def test_the_clipped_loss_and_its_metrics_match_a_hand_computation():
     log_ratio = jnp.array([[0.0, 0.5, -0.4], [0.0, 1.5, -0.4]])
     mask = jnp.array([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]])
 
-    loss, aux = surrogate.clipped_surrogate(
+    loss, aux = clipped_surrogate(
         log_ratio, jnp.array([1.0, -1.0]), mask,
         epsilon_low=0.2, epsilon_high=0.5, dual_clip=3.0)
 
@@ -203,8 +217,8 @@ def test_a_dual_clip_that_cannot_bind_is_refused():
     """verl asserts the same bound. Below 1 the cap would sit inside the
     clipping band and replace the surrogate with a constant."""
     with pytest.raises(ValueError, match="dual_clip > 1"):
-        surrogate.clipped_surrogate(jnp.zeros((1, 2)), jnp.zeros(1),
-                                    jnp.ones((1, 2)), dual_clip=1.0)
+        surrogate.clipped_surrogate_terms(jnp.zeros((1, 2)), jnp.zeros(1),
+                                          jnp.ones((1, 2)), dual_clip=1.0)
 
 
 def test_the_k3_estimator_matches_a_hand_computation():
@@ -240,7 +254,7 @@ def test_the_gspo_loss_and_its_gradient_match_verl():
     """The same clip, fed the sequence ratio instead of the token ratio, is
     verl's `compute_policy_loss_gspo` aggregated token-mean."""
     def objective(log_probs):
-        return surrogate.clipped_surrogate(
+        return clipped_surrogate(
             surrogate.sequence_log_ratio(log_probs, OLD_LOG_PROBS, MASK),
             ADVANTAGES, MASK, **CLIP)
 
@@ -313,7 +327,6 @@ def test_token_mean_divides_by_the_exact_token_count():
     a 1e-8 denominator shift rounds away, so the check runs in float64, where
     the arithmetic is what the docstring claims."""
     from dew.rl.advantage import masked_mean
-    from dew.rl.surrogate import token_mean
 
     with jax.enable_x64():
         x = jnp.asarray([[2.0, 5.0, 7.0]], jnp.float64)

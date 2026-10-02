@@ -236,13 +236,13 @@ def test_flaxdiff_fixture_is_what_the_generator_writes(tmp_path, architecture, c
 
 def token_directory(tmp_path: Path) -> Path:
     """A byte-tokenized corpus, in the directory the curve reads from."""
-    from dew.data import write_tokens
+    from dew.data import TokenCorpus
 
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
                               for i in range(60)))
     out = tmp_path / "tokens"
-    write_tokens(corpus, out, tokenizer="byte", val_fraction=0.1)
+    TokenCorpus.write(corpus, out, tokenizer="byte", val_fraction=0.1)
     return out
 
 
@@ -297,6 +297,30 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 # ---------------------------------------------------------------------------
 # tools/benchmark_lm_head.py
 # ---------------------------------------------------------------------------
+
+def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch, tmp_path):
+    import argparse
+
+    import dew
+    from dew.sampling import Sampling
+    from test_serving import task
+
+    tool = load("benchmark_lm_serving")
+    bound = task(Sampling(temperature=0, eos_id=None))
+    prompts = np.asarray([[1, 2], [3, 4]], np.int32)
+    monkeypatch.setattr(dew, "pipeline", lambda *args, **kwargs: bound)
+    monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
+    args = argparse.Namespace(model="tiny", vocab_limit=13, prompt=2, output=4, slots=[2],
+                              requests=2, repeats=1, admission=2, decode_steps=1, kv="dense",
+                              profile=False, profile_steps=20, generations=True, out=tmp_path / "serve.json")
+    _, points = tool.dew_points(args)
+    assert points[0]["repeats"][0]["output_tokens"] == 8
+    saved = np.load(tmp_path / "serve-slots2.npz")
+    expected = [bound(prompt[None], 4, key=index).host() for index, prompt in enumerate(prompts)]
+    np.testing.assert_array_equal(saved["tokens"], np.concatenate([row.tokens[:, -4:] for row in expected]))
+    np.testing.assert_allclose(saved["raw"], np.concatenate([row.raw_log_probs for row in expected]),
+                               atol=2e-6, rtol=2e-6)
+
 
 def test_lm_head_variant_names_parse_as_documented():
     """A name is the head, an optional chunk count and optional suffixes:
@@ -402,6 +426,39 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
     errors = tool.leaf_errors(gradient, reference.gradient, "float32")
     assert max(errors.values()) <= tool.rounding_limit("float32"), max(
         errors.items(), key=lambda item: item[1])
+
+
+def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros():
+    """A DiT zero-initializes its output projection and its modulations, so
+    its first step's gradient reached 2 of the zoo DiT's 70 leaves, and every
+    DiT, UNet and MMDiT layout was judged on its output layer alone. The
+    tool draws every all-zero leaf, so each one carries a gradient."""
+    tool = load("layout_parity")
+    import benchmark_step
+
+    case = dataclasses.replace(tool.zoo()["dit"], dtype="float32")
+    _, gradient, _ = tool.trained(case, {}, benchmark_step.global_batch(case), steps=1, one_device=True)
+
+    silent = [leaf for leaf, values in gradient.items() if not np.any(values)]
+    assert not silent, f"{len(silent)} of {len(gradient)} leaves get no gradient: {silent[:4]}"
+
+
+def test_layout_parity_bounds_a_split_losss_sum_by_its_contraction():
+    """A sequence or tensor axis over the output splits the loss's own sum
+    over a row's elements, which reordering the rows never moves: the MMDiT's
+    loss of 1.2114 landed 5 fp32 ulps (5.96e-7) from one device's on tensor4,
+    past the 5.78e-7 its reorderings allowed, every gradient leaf within 0.09
+    of its bound. The loss is also held to twice gamma_N of its magnitude,
+    the most two orders of a sum of N terms may differ."""
+    tool = load("layout_parity")
+    u = float(np.finfo(np.float32).eps) / 2
+
+    assert tool.contraction_floor(4, 1.0) == pytest.approx(2 * 4 * u / (1 - 4 * u))
+    assert tool.contracted_terms({"image": np.zeros((8, 32, 32, 4)), "label": np.zeros(8)}) == 32768
+    judged = tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 5.96e-7, 1.4e-7, 1.2114, terms=32768)
+    assert judged["status"] == "works"
+    assert judged["loss_bound"] == pytest.approx(tool.contraction_floor(32768, 1.2114))
+    assert tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 1e-2, 1.4e-7, 1.2114, terms=32768)["status"] == "MISMATCH"
 
 
 def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
@@ -609,7 +666,11 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     through the registry inside their objective, so their rows are its rows.
     An architecture named as covered without a case measuring it would leave
     the difference here nonempty."""
-    from dew import models
+    import dew.nn.backbones  # noqa: F401  (registers the kind)
+    import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+    import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
+    import dew.nn.multimodal  # noqa: F401  (registers the kind)
+    from dew.registry import models
 
     tool = load("benchmark_step")
     cases = tool.small_cases("bfloat16")
