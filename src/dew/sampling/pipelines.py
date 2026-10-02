@@ -24,7 +24,7 @@ from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.objectives.base import FROZEN, Variables
+from dew.objectives.base import Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
@@ -212,6 +212,7 @@ class TextToImage:
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
+        from dew.checkpoints import Checkpoints
         from dew.objectives.diffusion import DiffusionRunConfig
         from dew.registry import objectives
 
@@ -225,7 +226,7 @@ class TextToImage:
                              autoencoder=None if config.autoencoder is None else
                              replace(config.autoencoder, dtype=compute))
         averaged = False if objectives[config.objective]._ema_is_reference else ema
-        params = restore_variables(directory, ema=averaged, step=step, mesh=mesh, layout=layout,
+        params = Checkpoints(directory).variables( ema=averaged, step=step, mesh=mesh, layout=layout,
                                    param_dtype=param_dtype, parameter_roots=config.parameter_roots)
         objective = config.build(variables=params)
         return cls.from_objective(objective, _with_drawn_tables(objective, params))
@@ -598,51 +599,6 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
     return jax.jit(prepare, static_argnums=(0, 1, 2),
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
-
-def restore_variables(directory: str, *, ema: bool | None, step: int | str | None, mesh: MeshSpec | None,
-                      layout: Layout | None, param_dtype: str | None,
-                      parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
-    """A run's published variables, restored onto the current mesh under a layout.
-
-    The checkpoint is its own template. Owner-declared parameter roots select
-    floating weights for param_dtype; other leaves keep their stored dtype.
-    EMA uses the live tree's selection, restricted to the leaves it contains.
-    `ema` None takes the averaged weights when the run kept them; True
-    requires them.
-    """
-    from dew.checkpoints import Checkpoints
-    from dew.objectives.base import merge
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
-
-    target = resolve_dtype(param_dtype)
-    checkpoints = Checkpoints(directory)
-    stored = checkpoints.stored(step)
-    template = {"params": stored["params"]}
-    if ema and stored.get("ema") is None:
-        raise ValueError("the run keeps no EMA; request the live policy with ema=False")
-    averaged = stored.get("ema") is not None if ema is None else ema
-    if averaged:
-        template["ema"] = stored["ema"]
-    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
-    chosen_layout = DefaultLayout() if layout is None else layout
-    placement = chosen_layout.shardings(device_mesh, template)
-    chosen_layout.check(template["params"], placement["params"], device_mesh)
-    selected = set()
-    if target is not None:
-        roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
-        selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["params"])[0]
-                    if jnp.issubdtype(leaf.dtype, jnp.floating) and
-                    any(path[:len(root)] == root for root in roots)}
-    template = jax.tree_util.tree_map_with_path(
-        lambda path, leaf, sharding: jax.ShapeDtypeStruct(
-            leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
-        template, placement)
-    values, _ = checkpoints.restore(template, step=step)
-    params = values["params"]
-    if averaged:
-        params = merge(params, values["ema"])
-
-    return params
 
 
 def _with_drawn_tables(objective: DiffusionObjective, variables: Variables) -> Variables:
