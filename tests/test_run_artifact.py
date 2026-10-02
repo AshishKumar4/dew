@@ -49,3 +49,29 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     expected = objective.model.apply(state.params, tokens)
     actual = task.model.apply(task.variables, tokens)
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_builtin_process_records_preserve_noise_prediction_and_weights():
+    from dew import presets
+    from dew.diffusion.process import Process
+    for name in ('edm', 'flow_match', 'vp'):
+        original = presets[name]()()
+        rebuilt = Process.from_json(original.to_json())
+        time = jnp.linspace(.01, .99, 16)
+        for first, second in ((original, rebuilt),):
+            np.testing.assert_array_equal(first.rates(time).signal, second.rates(time).signal)
+            np.testing.assert_array_equal(first.rates(time).noise, second.rates(time).noise)
+            np.testing.assert_array_equal(first.loss_weight(time), second.loss_weight(time))
+        assert rebuilt.prediction == original.prediction
+
+
+def test_builtin_autoencoder_record_uses_the_saved_parameters():
+    from dew.nn.autoencoders import AutoEncoder, SimpleAutoEncoder
+    image = jnp.ones((1, 8, 8, 3))
+    original = SimpleAutoEncoder(feature_depths=(4,), latent_channels=2, out_channels=3,
+                                 norm_groups=1, key=jax.random.key(0), sample_shape=image.shape,
+                                 dtype=jnp.float32)
+    rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
+    np.testing.assert_array_equal(original.encode(image), rebuilt.encode(image))
+    latent = original.encode(image)
+    np.testing.assert_array_equal(original.decode(latent), rebuilt.decode(latent))
