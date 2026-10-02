@@ -158,6 +158,8 @@ def jepa_objective():
 class Data:
     """The `Dataset` contract the trainer reads, over readers of a partition."""
 
+    held_out = 0
+
     def __init__(self, train, val=None, batch=BATCH, records=None):
         self._train, self.val, self.batch, self.records = train, val, batch, records
 

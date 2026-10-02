@@ -400,6 +400,7 @@ def run_case(case: Case, tmp_path, fsdp):
         train = staticmethod(lambda partition: source())
         val = staticmethod(lambda partition: (batch for batch in [next(source())]))
         batch = BATCH
+        held_out = 0
 
     state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True)

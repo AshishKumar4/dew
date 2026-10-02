@@ -896,6 +896,8 @@ def token_batches():
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, train):
         self._train, self.val, self.batch, self.records = train, None, BATCH, None
 

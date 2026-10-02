@@ -79,6 +79,8 @@ class Counting:
 class Data:
     """The `Dataset` contract the trainer reads: train, val, batch, records."""
 
+    held_out = 0
+
     def __init__(self, train=Counting, val=None, batch=8, records=None):
         self._train, self._val = train, val
         self.batch, self.records = batch, records

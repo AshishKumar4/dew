@@ -144,6 +144,8 @@ class Stream:
 
 
 class Data:
+    held_out = 0
+
     batch = 2 * jax.device_count()
     def train(self, partition):
         return Stream()

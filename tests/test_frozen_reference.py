@@ -74,6 +74,8 @@ class Counting:
 class Data:
     """The `Dataset` contract the trainer reads: a train stream and its batch."""
 
+    held_out = 0
+
     batch = 8
 
     def train(self, partition):

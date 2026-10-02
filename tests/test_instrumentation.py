@@ -54,6 +54,8 @@ class Regression(Objective):
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, train, batch=BATCH):
         self._train, self.val, self.batch, self.records = train, None, batch, None
 

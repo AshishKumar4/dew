@@ -402,6 +402,8 @@ def token_batches():
 
 
 class Data:
+    held_out = 0
+
     train = staticmethod(lambda partition: token_batches())
     val, batch, records, steps_per_epoch = None, 8, None, None
 

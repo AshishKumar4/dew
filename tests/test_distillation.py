@@ -260,6 +260,8 @@ def test_a_student_with_the_router_balance_loss_is_refused():
 class Data:
     """The one fixed batch, endlessly, as the trainer's dataset contract."""
 
+    held_out = 0
+
     def __init__(self, batch):
         self.batch = batch["text"].shape[0]
         self._batch = batch

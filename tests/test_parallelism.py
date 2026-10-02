@@ -76,6 +76,8 @@ class DeterministicObjective(Objective):
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, train, val=None, batch=BATCH, records=None):
         self._train = train
         self.val = None if val is None else lambda partition: val()

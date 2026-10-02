@@ -481,6 +481,8 @@ class RecordingTracker:
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, batches):
         self._batches = batches
 

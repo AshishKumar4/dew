@@ -56,6 +56,8 @@ def step_with(params, key=7, index=0):
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, train, val=None, batch=4):
         self._train, self.batch, self.records = train, batch, None
         self.val = None if val is None else lambda partition: val()

@@ -128,6 +128,8 @@ def cycle_batches(batch=BATCH, seq=SEQ, seed=0):
 
 
 class Data:
+    held_out = 0
+
     def __init__(self, train, val=None, batch=BATCH):
         self._train, self.batch, self.records = train, batch, None
         self.val = None if val is None else lambda partition: val()
