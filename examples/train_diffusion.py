@@ -56,7 +56,7 @@ def main(config: Config, data=None, inputs=None):
     steps = config.steps or data.epoch_steps(config.epochs)
     model = SimpleDiT(**config.model, output_channels=3, dtype=jnp.bfloat16)
     objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
-                                   sampler=Heun(), guidance=CFG(3.0), steps=40)
+                                   solver=Heun(), guidance=CFG(3.0), steps=40)
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),
@@ -66,7 +66,7 @@ def main(config: Config, data=None, inputs=None):
     # The averaged weights stay on
     # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
-    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), key=1).host().images
+    images = pipe(list(config.prompts), steps=50, guidance=3.0, solver=Heun(), key=1).host().images
     pixels = uint8_pixels(images)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)

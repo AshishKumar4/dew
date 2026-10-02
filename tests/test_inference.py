@@ -9,8 +9,6 @@ trainer has just written.
 
 import dataclasses
 import json
-import shutil
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +30,7 @@ from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.sampling import CFG, Euler, Heun, TextToImage
-from dew.sampling.pipelines import Images, _with_drawn_tables
+from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -46,7 +44,7 @@ def run_config(directory, preset=EDM(), encoder="stub_text", checkpoint="stub-cl
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
-        preset=preset, sampler=Euler(), sampling_steps=3,
+        preset=preset, solver=Euler(), sampling_steps=3,
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
@@ -199,71 +197,6 @@ def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
     assert pipe.process.sampling is None
 
 
-def test_legacy_fourier_restore_applies_saved_weights_without_initializing_them(monkeypatch):
-    """Only the missing deterministic table is drawn; saved weights are authoritative."""
-    config = run_config("unused")
-    objective = config.build()
-    original = objective.init(jax.random.key(0))
-    stored = {name: tree for name, tree in original.items() if name != "constants"}
-
-    def forbidden_init(*args, **kwargs):
-        raise AssertionError("a restored model must not initialize a second set of weights")
-
-    monkeypatch.setattr(type(objective.model), "init", forbidden_init)
-    restored = _with_drawn_tables(objective, stored)
-    for got, want in zip(jax.tree.leaves(restored["constants"]),
-                         jax.tree.leaves(original["constants"]), strict=True):
-        np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
-                                      np.ascontiguousarray(want).view(np.uint8))
-    assert all(got is want for got, want in zip(jax.tree.leaves(restored["params"]),
-                                               jax.tree.leaves(stored["params"]), strict=True))
-    given = objective.encode(stored["encoders"])
-    x, t = jnp.ones((1, *objective.latent_shape)), jnp.ones((1,))
-    with jax.default_matmul_precision("highest"):
-        expected = jax.jit(objective.model.apply)(original, x, t, **given)
-        actual = jax.jit(objective.model.apply)(restored, x, t, **given)
-    np.testing.assert_array_equal(actual, expected)
-
-
-def test_a_run_saved_before_the_fourier_table_was_stored_samples_and_resumes_as_it_did(
-        tmp_path, monkeypatch):
-    """A checkpoint written before FourierEmbedding's table became a variable
-    lacks it. Loading or resuming the run takes the table from the model's
-    init, which draws the one the run trained against, so the run samples
-    and trains on bit for bit as it did, on the suite's 8-device mesh too,
-    where each device's batch is smaller than the table."""
-    from dew.nn.blocks import FourierEmbedding
-
-    tables = []
-
-    def drawn_in_setup(self):  # FourierEmbedding.setup before the table was a variable
-        drawn = np.random.RandomState(42).normal(size=(self.features // 2,))
-        tables.append(drawn.astype(np.float32) * self.scale)
-        self.frequencies = SimpleNamespace(value=jnp.asarray(drawn, dtype=jnp.float32) * self.scale)
-
-    old, resumed_before = tmp_path / "old", tmp_path / "resumed-before"
-    with monkeypatch.context() as before:
-        before.setattr(FourierEmbedding, "setup", drawn_in_setup)
-        make_run(old)
-        shutil.copytree(old, resumed_before)
-        sampled = TextToImage.from_run(str(old))(["a", "b"], key=4).host().images
-        _, trained = make_run(resumed_before, steps=3)
-    assert "constants" not in Checkpoints(str(old)).stored()["params"]
-
-    pipe = TextToImage.from_run(str(old))
-    table = pipe.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]
-    np.testing.assert_array_equal(np.asarray(table), tables[0])
-    np.testing.assert_array_equal(pipe(["a", "b"], key=4).host().images, sampled)
-
-    _, resumed = make_run(old, steps=3)
-    np.testing.assert_array_equal(
-        np.asarray(resumed.params["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]),
-        tables[0])
-    for expected, actual in zip(jax.tree.leaves(trained.params["params"]),
-                                jax.tree.leaves(resumed.params["params"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
-
 def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatch):
     make_run(tmp_path)
     import dew.interop.hub as hub
@@ -280,13 +213,13 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     loaded = TextToImage.from_run(str(tmp_path))
     pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
     key = jax.random.PRNGKey(1)
-    plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images
-    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key).host().images
+    plain = pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images
+    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), solver=Heun(), key=key).host().images
     assert plain.shape == guided.shape == (1, RES, RES, 3)
     assert not np.allclose(plain, guided)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images, plain)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, sampler=Heun(), key=key).host().images,
-                          pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key).host().images)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=None, solver=Heun(), key=key).host().images, plain)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, solver=Heun(), key=key).host().images,
+                          pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
@@ -475,7 +408,7 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     objective, state = make_run(tmp_path)
     pipe = objective.pipeline(state)
     assert isinstance(pipe, TextToImage)
-    assert (pipe.steps, pipe.guidance, pipe.sampler) == (objective.steps, objective.guidance, objective.sampler)
+    assert (pipe.steps, pipe.guidance, pipe.solver) == (objective.steps, objective.guidance, objective.solver)
     for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
         assert bound is expected
     live = objective.pipeline(state, ema=False)
@@ -645,19 +578,19 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     plain = TextToImage.from_objective(objective, state.params)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
     key = jax.random.key(3)
-    reference = plain(["a"], steps=4, sampler=Heun(), key=key).host().images
-    np.testing.assert_array_equal(same(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    reference = plain(["a"], steps=4, solver=Heun(), key=key).host().images
+    np.testing.assert_array_equal(same(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     warped = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps) ** 2))
-    assert not np.allclose(warped(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    assert not np.allclose(warped(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     open_ended = dataclasses.replace(plain, final_denoise=False)
-    assert not np.allclose(open_ended(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    assert not np.allclose(open_ended(["a"], steps=4, solver=Heun(), key=key).host().images, reference)
     longer = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps + 1)))
-    np.testing.assert_array_equal(longer(["a"], steps=3, sampler=Heun(), key=key).host().images,
-                                  plain(["a"], steps=4, sampler=Heun(), key=key).host().images)
+    np.testing.assert_array_equal(longer(["a"], steps=3, solver=Heun(), key=key).host().images,
+                                  plain(["a"], steps=4, solver=Heun(), key=key).host().images)
     start = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)[:1]),
                                 final_denoise=False)
     prepared = start.prepare(["a"], key=key, steps=4)
-    np.testing.assert_array_equal(start(prepared, steps=4, sampler=Heun(), key=key).images,
+    np.testing.assert_array_equal(start(prepared, steps=4, solver=Heun(), key=key).images,
                                   np.clip(np.asarray(prepared.noise), -1.0, 1.0))
     with pytest.raises(ValueError, match="different source grid"):
         start(prepared, steps=3, key=3)

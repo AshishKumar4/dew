@@ -83,7 +83,7 @@ def diffusion(out, smoke):
                       num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-        sampler=Euler(), steps=4)
+        solver=Euler(), steps=4)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state = trainer.fit(data, steps=3)
     # End snippet: diffusion
@@ -111,7 +111,7 @@ def sample_public(out, smoke):
     from dew.sampling import CFG, DPMSolverMultistep, TextToImage
     pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m")
     result = pipe(["green and purple northern lights over a frozen lake"],
-                  key=5, steps=20, sampler=DPMSolverMultistep(), guidance=CFG(5))
+                  key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
     result.pil()[0].save(out / "sample.png")
     # End snippet: sample-public
     assert (out / "sample.png").is_file()

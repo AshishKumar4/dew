@@ -51,17 +51,13 @@ Request = str | Sequence[str] | Rows
 SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
 """The shapes a text request is rounded up to: powers of two.
 
-Every distinct prompt width, batch, budget and continuation count is its
-own several-second XLA compile, and served requests are rarely the same
-length twice. So a prompt pads left to the smallest bucket of 64 or more,
-where the attention mask hides the filler as it already hides the padding
-a ragged batch needs; a budget rounds up to the next power of two, so a
-one-token request scans one trip and a scoring probe pays no decode it did
-not ask for, and the trips past the request come off the result; the cache for
-the call is the two together, rounded up again, in place of the model's
-whole `max_seq_len`. Rows are the caller's and are not bucketed. A request
-whose buckets would need more capacity than the model's `max_seq_len`
-keeps its own shapes, so the ceiling refuses what it refuses today.
+Every distinct prompt width, budget and continuation count is its own
+several-second XLA compile. So a prompt pads left to the smallest bucket of 64
+or more, behind the attention mask; a budget rounds up to the next power of
+two and the extra trips come off the result; and the call's cache is the two
+together, rounded up again, in place of the model's whole `max_seq_len`. Rows
+are not bucketed, and a request whose buckets would exceed `max_seq_len`
+keeps its own shapes, so the ceiling refuses what it would refuse anyway.
 """
 
 
@@ -457,9 +453,8 @@ class TextGeneration:
 
         `ema` reads the averaged weights (None: when the run kept them), except
         under an objective whose average is a reference policy rather than the
-        trained one. With
-        `mesh` the weights restore straight onto that mesh under `layout`,
-        the way the trainer places them. dtype overrides computation;
+        trained one. With `mesh` the weights restore straight onto that mesh
+        under `layout`, the way the trainer places them. dtype overrides computation;
         param_dtype overrides parameter storage, and None preserves what the
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
@@ -627,7 +622,7 @@ class MaskedGeneration:
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    sampler: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
@@ -690,7 +685,7 @@ class MaskedGeneration:
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key)
             generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
-                sampler=self.sampler, steps=self.steps if steps is None else steps,
+                solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)

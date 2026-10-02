@@ -206,7 +206,7 @@ def indexed_loader(records: int, batch: int = BATCH):
 
     return pygrain.DataLoader(
         data_source=pygrain.RangeDataSource(0, records, 1),
-        sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
+        solver=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
                                      num_epochs=1,
                                      shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
@@ -1096,7 +1096,7 @@ def mode_builtin_preview_failures(args) -> dict:
             objective = DiffusionObjective(
                 SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
                 presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
-                steps=2, sampler=Euler(), guidance=None)
+                steps=2, solver=Euler(), guidance=None)
             batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
         tracker = ScoreRecorder()
         trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),

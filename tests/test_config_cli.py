@@ -17,7 +17,7 @@ from dew.config import RunConfig
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import tokenized
 from dew.diffusion.presets import Flow
-from dew.registry import datasets, encoders, samplers
+from dew.registry import datasets, encoders
 from dew.sampling import Heun
 from dew.training import MeshSpec
 
@@ -46,16 +46,16 @@ def parse(cls, args):
     return tyro.cli(tyro.conf.CascadeSubcommandArgs[cls], args=args)
 
 
-def test_the_flags_pick_a_dataset_a_preset_and_a_sampler_from_the_registries():
+def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
     recipe = load_recipe("diffusion")
     config = parse(recipe.DiffusionRunConfig, [
         "--data.image-size", "64", "--data.augmentation", "flip_only",
-        "preset:flow", "--preset.shift", "3.0", "sampler:heun",
+        "preset:flow", "--preset.shift", "3.0", "solver:heun",
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model.architecture", "simple_dit", "--model.config", '{"scan_order": "hilbert"}'])
 
     assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
-    assert config.preset == Flow(shift=3.0) and config.sampler == Heun()
+    assert config.preset == Flow(shift=3.0) and config.solver == Heun()
     assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.model.fields()["scan_order"] == "hilbert"
 
@@ -96,7 +96,7 @@ def test_a_recipe_config_round_trips_through_its_json_record(name):
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
-    name the sources, so the run and its samplers rebuild from run.json."""
+    name the sources, so the run and its solvers rebuild from run.json."""
     recipe = load_recipe("diffusion")
     config = recipe.DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
 

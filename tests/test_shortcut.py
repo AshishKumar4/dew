@@ -58,7 +58,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
                           dtype="float32", attention_impl="xla"),
-        data=TFDSImages(image_size=4), preset=presets.Shortcut(), sampler=Euler(), guidance=None,
+        data=TFDSImages(image_size=4), preset=presets.Shortcut(), solver=Euler(), guidance=None,
         sampling_steps=3, val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
         shortcut=ShortcutTraining(sections=4, bootstrap_every=2))
     task = config.build()

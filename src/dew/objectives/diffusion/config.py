@@ -24,7 +24,7 @@ from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import FROZEN, Variables
-from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
+from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import EulerAncestral
 
@@ -43,13 +43,13 @@ if TYPE_CHECKING:
     # only the run sees it. Statically the fields are typed as every member
     # of those tables, which a reader and a checker need.
     PresetSpec = Preset
-    SamplerSpec = Solver
+    SolverSpec = Solver
     # The run reads captions through `load(tokenize=)`, which the token
     # datasets do not take; `sample_field` refuses those at runtime.
     CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
 else:
     PresetSpec = presets.union
-    SamplerSpec = samplers.union
+    SolverSpec = solvers.union
     CaptionedSpec = datasets.union
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
@@ -401,7 +401,7 @@ class DiffusionRunConfig(RunConfig):
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with. None is the one
     the `pretrained` pipeline's scheduler reads, which a preset may restate."""
-    sampler: SamplerSpec = dataclasses.field(default_factory=EulerAncestral)
+    solver: SolverSpec = dataclasses.field(default_factory=EulerAncestral)
     """The solver validation samples with."""
     guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
     """How validation samples are guided, scale and interval; None samples
@@ -628,7 +628,7 @@ class DiffusionRunConfig(RunConfig):
             return FlowGRPOObjective(
                 model, process, inputs, sde=FlowSDE(self.rl.noise_level), beta=self.rl.beta,
                 clip_range=self.rl.clip_range, adv_clip_max=self.rl.adv_clip_max,
-                autoencoder=autoencoder, guidance=self.guidance, sampler=self.sampler,
+                autoencoder=autoencoder, guidance=self.guidance, solver=self.solver,
                 steps=self.sampling_steps, pretrained=variables)
         if self.mean_flow is not None:
             from .few_step import MeanFlowObjective
@@ -636,7 +636,7 @@ class DiffusionRunConfig(RunConfig):
             return MeanFlowObjective(
                 model, process, inputs, **dataclasses.asdict(self.mean_flow),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.guidance_distill is not None:
             from .guidance_distillation import GuidanceDistillationObjective
 
@@ -644,7 +644,7 @@ class DiffusionRunConfig(RunConfig):
             return GuidanceDistillationObjective(
                 model, process, inputs, teacher=teacher, teacher_variables=held,
                 scales=self.guidance_distill.scales, autoencoder=autoencoder, pretrained=variables,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         if self.distill is not None:
             from .consistency import ConsistencyDistillationObjective
 
@@ -657,7 +657,7 @@ class DiffusionRunConfig(RunConfig):
             }
             return ConsistencyDistillationObjective(
                 model, process, inputs, teacher=self.distill.teacher_variables(variables), **fields,
-                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, sampler=self.sampler,
+                autoencoder=autoencoder, pretrained=variables, ema_decay=self.ema_decay, solver=self.solver,
                 guidance=None, steps=self.sampling_steps)
         if self.shortcut is not None:
             from .few_step import ShortcutObjective
@@ -665,13 +665,13 @@ class DiffusionRunConfig(RunConfig):
             return ShortcutObjective(
                 model, process, inputs, **dataclasses.asdict(self.shortcut),
                 autoencoder=autoencoder, pretrained=variables, unconditional_prob=self.unconditional_prob,
-                ema_decay=self.ema_decay, sampler=self.sampler, guidance=None, steps=self.sampling_steps)
+                ema_decay=self.ema_decay, solver=self.solver, guidance=None, steps=self.sampling_steps)
         return DiffusionObjective(
             model, process, inputs,
             autoencoder=autoencoder, pretrained=variables,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
-            sampler=self.sampler,
+            solver=self.solver,
             guidance=self.guidance,
             steps=self.sampling_steps,
             uncertainty=self.uncertainty,

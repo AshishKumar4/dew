@@ -79,7 +79,7 @@ def trajectory(source, reference, meta, key):
         spatial = latent_image_conditions(source.autoencoder, source.variables["autoencoder"], pixels, mask, encode_key)
         given, null = {**given, **spatial}, {**null, **spatial}
     denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, initial, solver=source.schedule.solver(), guidance=CFG(3.0), key=key,
+    latents = sample(denoise, initial, solver=source.schedule.solver, guidance=CFG(3.0), key=key,
                      times=times, final_denoise=False)
     images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
     if source.finish is not None:
@@ -167,7 +167,7 @@ def check_grids(directory, grids, case=None):
         schedule = SourceSchedule.from_config(json.loads(str(oracle[name + ".config"])))
         process, times = schedule.sampling(4)
         noise = jnp.asarray(oracle["noise"]) * process.sampler_schedule.prior_scale()
-        task = replace(source.text_to_image(), grid=lambda count: (process, times), sampler=schedule.solver())
+        task = replace(source.text_to_image(), grid=lambda count: (process, times), solver=schedule.solver)
         output = task(DenoisingInputs(noise, given, null, rows=1), steps=4, guidance=3.0, key=jax.random.PRNGKey(0))
         expected = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(oracle[name + ".latents"])), -1, 1)
         compare(errors, name, output.host().images, expected, 1e-4)
