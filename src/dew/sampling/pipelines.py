@@ -208,6 +208,11 @@ class TextToImage:
         policy. With `mesh` the weights restore straight onto that mesh under
         `layout`, the way the trainer places them; without one the default
         mesh uses the current pool.
+        The configured unconditional prompt uses the same eager encoding as
+        an objective's pipeline, at the matmul precision in force here. A
+        training objective captures that default at its construction; when
+        it was built under a different `jax.default_matmul_precision`
+        context, restore under the same context to preserve its blank's bits.
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
