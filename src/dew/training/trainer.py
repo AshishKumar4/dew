@@ -1974,7 +1974,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _check_inputs(self, batch: Batch) -> None:
         """Check the first real batch against the objective's declared sample and mask."""
-        inputs = getattr(self.objective, 'inputs', None)
+        inputs = self.objective.inputs
         if inputs is None:
             return
         for condition in inputs.conditions.values():

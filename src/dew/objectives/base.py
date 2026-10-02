@@ -126,8 +126,8 @@ class Aux(Generic[Effects]):
     """Additive observations applied once on a supported optimizer commit."""
 
 
-def _has_aux(result: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
-    return isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], Aux)
+def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
+    return isinstance(loss, tuple) and len(loss) == 2 and isinstance(loss[1], Aux)
 
 
 @dataclass(frozen=True)
@@ -280,8 +280,17 @@ class EMASpec:
 class Objective(ABC, Generic[Loss, Effects]):
     """Define what is being learned: the parameters, the loss, what evaluation produces."""
 
-    inputs: InputSpec
-    """Per-example shapes and dtypes the parameter tree is initialised from."""
+    _inputs: InputSpec | None = None
+
+    @property
+    def inputs(self) -> InputSpec | None:
+        """Declared input shapes, or None for a custom initializer without an InputSpec."""
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, inputs: InputSpec | None) -> None:
+        self._inputs = inputs
+
     ema: EMASpec | None = None
     _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
@@ -382,10 +391,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
 
     def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
-        result = self.loss(variables, batch, step)
-        if _has_aux(result):
-            return result
-        return result, Aux(metrics={})
+        loss = self.loss(variables, batch, step)
+        if _has_aux(loss):
+            return loss
+        return loss, Aux(metrics={})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value and whether its statistical support is active."""
