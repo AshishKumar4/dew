@@ -284,7 +284,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @property
     def inputs(self) -> InputSpec | None:
-        """Declared input shapes, or None for a custom initializer without an InputSpec."""
+        """Declared input shapes, or None for a custom initializer without an InputSpec.
+
+        A property lets built-in objectives narrow this optional research contract.
+        """
         return self._inputs
 
     @inputs.setter
