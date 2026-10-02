@@ -75,7 +75,7 @@ state = trainer.fit(data, steps=100, log_every=50)
 ## Result
 
 ```python
-prediction = model.apply(state.params, x)
+prediction = model.apply(state.variables, x)
 mse = float(jnp.mean((prediction - y) ** 2))
 print(f"Final mean squared error: {mse:.6f}")
 assert mse < 1e-4
@@ -96,7 +96,7 @@ Final mean squared error: 0.000000
 
 The first line names the model, its parameter count, the devices, the global batch and the precision. Each `step` line reports the loss and the objective's metrics of that step, the step time and throughput averaged over the interval since the previous line, and whether the step was accepted (a step with non-finite values is rejected under dynamic loss scaling). The last two lines report when the first step finished, which includes compilation, and the share of wall time spent in steps. This is `fit`'s output when stdout is not a terminal, as in a pipe, a log file or CI; on a terminal it draws one live panel with the same numbers, a progress bar and a sparkline per metric. Only process 0 prints. The output above came from two cores of a shared workstation CPU, where reading the batch through Grain's threads takes most of each 10 ms step; other machines, backends and library versions print different timings.
 
-`fit` returns a `TrainState`. `state.params` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
+`fit` returns a `TrainState`. `state.variables` holds the trained variables, the tree `model.apply` takes. The state also holds the optimizer state, the root key and three counters: `step` counts attempts, `microstep` counts accepted microbatches, and `updates` counts optimizer updates. They differ when gradients are accumulated, or when dynamic loss scaling rejects a step with non-finite values. This objective keeps no moving average, so `state.averaged` raises an error.
 
 ## Changing the example
 

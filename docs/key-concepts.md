@@ -41,7 +41,7 @@ trainer = Trainer(objective, optax.adamw(3e-3),
 state = trainer.fit(data, steps=100, log_every=25)
 
 prompt = [tokenizer.encode("dew")]
-out = generate(model, state.params, prompt, max_new_tokens=40,
+out = generate(model, state.variables, prompt, max_new_tokens=40,
                key=jax.random.key(1),
                sampling=Sampling(temperature=0))
 print(tokenizer.decode(out.tokens[0]))
@@ -99,6 +99,6 @@ The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` 
 
 ## Training state
 
-`TrainState` keeps three counters. `step` counts attempts, and together with the root key it determines the next random draw. `microstep` counts accepted microbatches. `updates` counts optimizer updates, which differs from `microstep` when gradients are accumulated. `state.params` holds the live variables, and `state.averaged` holds the same tree with the EMA weights in place.
+`TrainState` keeps three counters. `step` counts attempts, and together with the root key it determines the next random draw. `microstep` counts accepted microbatches. `updates` counts optimizer updates, which differs from `microstep` when gradients are accumulated. `state.variables` holds the live variables, and `state.averaged` holds the same tree with the EMA weights in place.
 
 After training, `objective.pipeline(state)` wraps the weights in an inference task, such as text generation or text-to-image, and `Pretrained.save` writes a checkpoint in its source's own format. [Checkpoints](guides/checkpoints.md) lists which artifact continues what.

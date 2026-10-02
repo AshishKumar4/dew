@@ -104,7 +104,7 @@ Import `TrainState` from `dew.training`.
 | `step` | Completed attempted batches, including rejected work |
 | `microstep` | Accepted microbatches, including finite zero-support slots |
 | `updates` | Committed supported optimizer updates |
-| `params` | Complete Flax variables, including the inner `params` collection |
+| `variables` | Complete Flax variables, including the inner `params` collection |
 | `opt_state` | Underlying optimizer state, advanced only on commits |
 | `ema` | Selected moving-average variables or `None` |
 | `key` | Immutable root training key |
@@ -112,7 +112,7 @@ Import `TrainState` from `dew.training`.
 | `window_size` | Persisted accumulation length, checked on restore |
 | `accumulation` | Actual partial gradient/statistic/effect/replay state, or `None` |
 
-`state.averaged` overlays EMA leaves onto `state.params` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
+`state.averaged` overlays EMA leaves onto `state.variables` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
 ## Dataset and Loading
 
@@ -403,7 +403,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 ```text
 pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
          revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
-Objective.pipeline(state, *, ema=None) -> the objective's task over state.averaged or state.params
+Objective.pipeline(state, *, ema=None) -> the objective's task over state.averaged or state.variables
 LMObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
                max_length=None, n=1, logits=None, stopping=(), strategy=None)

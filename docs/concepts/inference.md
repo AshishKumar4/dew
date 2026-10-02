@@ -84,7 +84,7 @@ import dew
 from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
+PretrainedDecoder.from_model(model, state.variables, tokenizer="byte").save("lily-decoder")
 loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype=jnp.float32)
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
