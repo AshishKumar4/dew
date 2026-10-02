@@ -1603,8 +1603,8 @@ class Trainer(Generic[Loss, Effects]):
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed,
-            sharded=_split_share(state.params))
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), _split_share(state.params),
+            seed=self.seed)
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
         # Dataset's readers, and a held-out count is not one of them.
