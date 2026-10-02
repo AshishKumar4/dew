@@ -391,7 +391,7 @@ class Router(nn.Module):
 # v5e and v6e it is XLA's ragged_dot; the one kernel that beats it at 8
 # experts (tokamax's mosaic_tpu_v2, 1.11x-1.38x) is not a dependency:
 # tokamax 0.0.14 pins typeguard==2.13.3 where tyro needs >=4, and only the
-# `kernels` extra, under constraints.txt, installs a tokamax without it. Every
+# main commit constraints.txt pins installs without it. Every
 # generation not listed runs 'xla': sm75 cannot compile the kernels, and
 # sm90 and sm120 are unmeasured.
 GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas',
