@@ -129,7 +129,7 @@ export class SnapshotLab extends DurableObject<Env> {
 	async serviceStatus(): Promise<unknown> {
 		const process = await this.container.exec(['sh', '-c',
 			'tail -c 8000 /run/dew/service.log 2>/dev/null; echo; ls -ld /run/dew; ' +
-			'ls -l /opt/live/demo.py; ps -eo user,pid,rss,args']);
+			'ls -l /opt/live/demo.py; tail -c 4000 /run/dew/gateway.log 2>/dev/null']);
 		const output = await process.output();
 		const log = new TextDecoder().decode(output.stdout) + new TextDecoder().decode(output.stderr);
 		try {
@@ -156,6 +156,28 @@ export class SnapshotLab extends DurableObject<Env> {
 			}
 		}));
 		return { count, totalSeconds: (Date.now() - started) / 1000, rows };
+	}
+
+	async gateway(commit: string): Promise<unknown> {
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a full project commit is required');
+		for (const name of ['guest_limits.py', 'guest_entry.py', 'gateway_manager.py', 'start-gateway.sh', 'benchmark_gateway.py']) {
+			const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${commit}/site/live/container/${name}`);
+			if (!source.ok || !source.body) throw new Error(`could not read ${name}`);
+			const copy = await this.container.exec(['sh', '-c', 'cat > "$1"', 'copy', `/opt/live/${name}`], { stdin: source.body });
+			if (await copy.exitCode !== 0) throw new Error(`could not install ${name}`);
+		}
+		const process = await this.container.exec(['sh', '/opt/live/start-gateway.sh']);
+		const result = await process.output();
+		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
+			stderr: new TextDecoder().decode(result.stderr) };
+	}
+
+	async gatewayMeasure(count: number): Promise<unknown> {
+		if (![1, 10, 50].includes(count)) throw new Error('count must be 1, 10 or 50');
+		const process = await this.container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', String(count)]);
+		const result = await process.output();
+		return { exitCode: result.exitCode, stdout: new TextDecoder().decode(result.stdout),
+			stderr: new TextDecoder().decode(result.stderr) };
 	}
 
 	async snapshot(): Promise<unknown> {
