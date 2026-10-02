@@ -49,6 +49,7 @@ from dew.nn.sharding import (
     Link,
     Schedule,
     measured_links,
+    mesh_axes,
     pipeline_microbatches,
 )
 from dew.objectives.base import (
@@ -83,6 +84,7 @@ from dew.telemetry.records import (
 )
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
+    PARAMETER_AXES,
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
@@ -94,7 +96,6 @@ from dew.training.distributed import (
     data_partition,
     link_bandwidth,
     shard_batch,
-    sharded_share,
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -273,6 +274,22 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     print(colored("the step fits the devices only with XLA's Triton GEMM fusions; "
                   "compiling it with them", "yellow"), file=sys.stderr)
     return default, True
+
+
+def _split_share(params: Variables) -> float:
+    """The share of the bytes of `params`, placed arrays, that a parameter
+    axis splits (`PARAMETER_AXES`): a mesh can name fsdp or tensor and still
+    split nothing of a model whose parameters all sit below `Layout`'s
+    `min_shard`, and the run's banner says how much it does."""
+    total = split = 0
+    for leaf in jax.tree.leaves(params):
+        total += leaf.nbytes
+        sharding = leaf.sharding
+        if isinstance(sharding, NamedSharding) and any(
+                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+                for axis in mesh_axes(assignment) if axis in PARAMETER_AXES):
+            split += leaf.nbytes
+    return split / total if total else 0.0
 
 
 def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
@@ -1506,7 +1523,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape), seed=self.seed,
-            sharded=sharded_share(state.params["params"]))
+            sharded=_split_share(state.params["params"]))
         self._report(started, current)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
