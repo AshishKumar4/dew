@@ -350,11 +350,6 @@ class ImageDataset(DatasetSpec):
     val_batches: int | None = 4
     val_split: str | None = None
     count: int | None = None
-    augment_validation: bool = dataclasses.field(default=False, metadata={"legacy": True})
-    """Whether validation takes the training crop, flip and jitter. Off, it
-    reads the deterministic full-image resize a reference metric compares
-    against. On, each record's draws repeat every pass. A record that lacks
-    the field was written when validation was augmented, and reads as on."""
 
     def __post_init__(self):
         if self.augmentation_backend not in ("host", "device"):
@@ -442,7 +437,9 @@ class ImageDataset(DatasetSpec):
                                      type(self).__name__)
         if self.val_split:
             validation = self.source(self.val_split)
-        evaluated = self if self.augment_validation else dataclasses.replace(
+        # Validation reads the deterministic full-image resize a reference
+        # metric compares against, not the training crop, flip and jitter.
+        evaluated = dataclasses.replace(
             self, augmentation="none", augmentation_backend="host", crop_scale=(1.0, 1.0))
         scored = None if validation is None else tokenized(
             validation_pass(validation, [ImageTransform(evaluated)], batch=batch,
