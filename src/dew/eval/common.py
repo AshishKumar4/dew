@@ -102,6 +102,7 @@ class ImageMetric:
     measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike]
     """One measurement per image or frame, never an already averaged scalar."""
     reads: type = ImageGrid
+    shown = Shown(better='higher')
 
     def __call__(self, artifact, batch) -> tuple[float, int]:
         with metric_device():

@@ -28,11 +28,11 @@ data = Dataset(train=lambda partition: iter([{"text": rows}] * 200), val=None,
 model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
                      emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                      max_seq_len=128)
-objective = LMObjective(model, seq_len=64, ema_decay=None)
+objective = LMObjective(model, seq_len=64)
 state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
-task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
+task = objective.pipeline(state, processor=RunProcessor(tokenizer))
 result = task(["One day", "The dog"], 20, key=0, n=2)
 for text in result.text:
     print(repr(text))
@@ -98,7 +98,7 @@ A run assembled by hand needs its configuration saved next to the checkpoints be
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline` and the tasks' `from_run` and `from_pretrained` default to `ema=None`, which takes the EMA copy when the run stored one and the live weights otherwise; `objective.pipeline` defaults to `ema=True`. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `export_run` default to `ema=None`, which takes the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO use the EMA slot for a frozen reference, so their pipelines always publish the trained policy, never the reference. PPO also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays the trainer has already placed. `LMObjective.policy(params, sampling)` returns a `TextGeneration` bound to the given tree, the task a GRPO rollout samples with. `task.bind(variables)` makes a task over another set of variables; it copies the mapping structure and shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -167,7 +167,7 @@ Use a downloaded checkpoint snapshot's local directory for the path. This path a
 
 `cache_bytes` bounds retained host layers, not the entire process. Complete layers are admitted in read order while they fit and kept until the source closes. A sequential decoder revisits every layer each token, so retaining this prefix avoids the cyclic eviction of a smaller LRU cache. Staging needs up to two host rows plus one leaf's conversion scratch beside that cache. Embeddings, the head, the KV cache and the runtime are separate. Read mapped pages are released; the kernel's shared filesystem cache is not controlled by this budget. Device storage must fit resident entries, two layer rows, activations and the KV cache. Expert tensors stream as part of a whole layer, not just the experts selected for one token. `read_ahead=False` disables the host read-ahead slot.
 
-For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks: the RTX 4080 measurement held about 1.55 GB of reserve above 3.29 GB of live pinned weights. Single-device-to-named assembly shared the same buffer, so this was allocator capacity, not another Dew copy. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
+For `host_banked` and any other pinned-host placement, budget for the allocator's reserve as well as live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and retains freed chunks. The GPT-OSS-20B BF16 two-layer prefix on the RTX 4080 (`host_banked`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve above 3.29 GB of live pinned weights. The sharded array Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity, not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total; the observed reserve is not a fixed overhead to assume for other models.
 
 Streaming is single-device inference only. It requires `scan_layers=True` and a layout without host placement; training, multi-device meshes and pipeline stages are refused. Host callbacks need the CPU backend beside the accelerator: when setting platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights: this path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint to save or export. The original safetensors directory remains the checkpoint.
 

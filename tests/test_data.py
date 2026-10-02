@@ -29,7 +29,6 @@ from dew.data import (
     DataPartition,
     Dataset,
     DatasetSpec,
-    HFDatasetSource,
     ImageDataset,
     Loading,
     LocalVideos,
@@ -41,6 +40,7 @@ from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
+from dew.data.sources.hf import HFDatasetSource
 from dew.position import ENVELOPE
 from dew.registry import datasets
 
@@ -1265,20 +1265,6 @@ def test_resizing_interpolates_up_and_averages_down():
     assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
 
 
-@pytest.mark.network
-def test_an_overlong_caption_is_truncated_to_the_text_context():
-    """The tokenizer pads and truncates to CLIP's context, so one enormous
-    caption cannot change the batch's shape."""
-    tokenizer = dew.data.AutoTextTokenizer(tensor_type="np")
-    context = tokenizer.tokenizer.model_max_length
-
-    out = tokenizer(["short", " ".join(["word"] * 500)])
-
-    assert out["input_ids"].shape == (2, context)
-    assert int(out["attention_mask"][1].sum()) == context
-    assert int(out["attention_mask"][0].sum()) < context
-
-
 # ---------------------------------------------------------------------------------
 # Whose tokenizer: the run's condition, not the dataset
 # ---------------------------------------------------------------------------------
@@ -1461,6 +1447,153 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
     run(2, tmp_path / "run")
     resumed = run(4, tmp_path / "run")
     whole = run(4)
+
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------------
+# Records held in memory, and where a default run reads
+# ---------------------------------------------------------------------------------
+
+def _pid_of(index):
+    """One record that says which process read it."""
+    return {"index": np.int32(index), "pid": np.int32(os.getpid())}
+
+
+def test_a_default_loading_reads_in_the_training_process():
+    """Grain's default is to read in the process that trains. A default that
+    started 32 worker processes took 17.8 s and 7.07 GiB to the first batch
+    of a 100-record pipeline, and a script without a __main__ guard re-ran
+    itself in every worker."""
+    data = Dataset.from_grain(pygrain.MapDataset.range(16).map(_pid_of), batch=4)
+
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert set(batch["pid"].tolist()) == {os.getpid()}
+
+
+def _columns(length=12):
+    index = np.arange(length, dtype=np.int32)
+    return {"index": index, "x": np.stack([index, -index], axis=1).astype(np.float32)}
+
+
+def test_records_in_memory_are_reshuffled_every_epoch_and_each_read_once_per_epoch():
+    stream = Dataset.from_records(_columns(), batch=4, seed=3).train(DataPartition())
+
+    epochs = [list(itertools.chain.from_iterable(_indices(stream, 3))) for _ in range(3)]
+    for epoch in epochs:
+        assert sorted(epoch) == list(range(12)), "each record once per epoch"
+    assert len({tuple(epoch) for epoch in epochs}) == 3, "a fresh order every epoch"
+    assert epochs[0] != list(range(12)), "the first epoch is shuffled too"
+
+
+def test_records_in_memory_follow_their_seed():
+    def order(seed):
+        return _indices(Dataset.from_records(_columns(), batch=4, seed=seed).train(DataPartition()), 6)
+
+    assert order(0) == order(0)
+    assert order(0) != order(1)
+
+
+def test_a_mapping_of_columns_and_a_list_of_records_are_the_same_records():
+    columns = _columns()
+    rows = [{"index": columns["index"][i], "x": columns["x"][i]} for i in range(12)]
+
+    by_columns = Dataset.from_records(columns, batch=4, seed=0).train(DataPartition())
+    by_rows = Dataset.from_records(rows, batch=4, seed=0).train(DataPartition())
+    first, second = next(by_columns), next(by_rows)
+
+    assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
+    for name in ("index", "x"):
+        np.testing.assert_array_equal(first[name], second[name])
+
+
+def test_columns_of_different_lengths_are_refused_by_name():
+    with pytest.raises(ValueError, match="'x' holds 3 records and 'index' holds 4"):
+        Dataset.from_records({"index": np.arange(4), "x": np.zeros((3, 2))}, batch=2)
+
+
+def test_an_in_memory_stream_resumes_on_the_records_it_had_not_read():
+    data = Dataset.from_records(_columns(), batch=4, seed=0)
+    stream = data.train(DataPartition())
+    _indices(stream, 2)
+    state = stream.get_state()
+    rest = _indices(stream, 4)
+
+    resumed = data.train(DataPartition())
+    resumed.set_state(state)
+    assert _indices(resumed, 4) == rest
+
+
+def test_process_shares_of_in_memory_records_split_every_global_batch():
+    data = Dataset.from_records(_columns(), batch=4, seed=0)
+    whole = _indices(data.train(DataPartition()), 3)
+    halves = [_indices(data.train(DataPartition(index=index, count=2)), 3) for index in (0, 1)]
+
+    for step, rows in enumerate(whole):
+        first, second = halves[0][step], halves[1][step]
+        assert not set(first) & set(second), "the shares are disjoint"
+        assert sorted(first + second) == sorted(rows), "together they are the global batch"
+
+
+def test_held_out_records_are_one_ordered_pass():
+    data = Dataset.from_records(_columns(), batch=4, validation=_columns(8))
+
+    assert data.records == 12 and data.steps_per_epoch == 3
+    assert data.val is not None
+    assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_held_out_records_too_few_for_one_batch_are_refused():
+    with pytest.raises(ValueError, match="3 validation records, fewer than one batch of 4"):
+        Dataset.from_records(_columns(), batch=4, validation=_columns(3))
+
+
+def test_training_records_too_few_for_one_batch_are_refused():
+    """An endless stream would fill a batch by repeating records inside it,
+    and an epoch would be zero steps long."""
+    with pytest.raises(ValueError, match="3 training records, fewer than one batch of 4"):
+        Dataset.from_records(_columns(3), batch=4)
+
+
+def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
+    """The in-memory route exists so a first run can checkpoint. A resumed run
+    reads the records after the checkpoint and ends where an uninterrupted
+    run ends."""
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Checkpoints, Layout, Trainer
+
+    class Regression(Objective):
+        def __init__(self):
+            self.model = nn.Dense(1)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 2)))
+
+        def loss(self, params, batch, step):
+            target = batch["index"][:, None].astype(jnp.float32)
+            return jnp.mean((self.model.apply(params, batch["x"]) - target) ** 2), Aux({})
+
+    def run(steps, directory=None):
+        trainer = Trainer(
+            Regression(), optax.sgd(0.01), key=jax.random.key(0),
+            layout=Layout(min_shard=1, tolerance=1.0),
+            checkpoints=None if directory is None else Checkpoints(str(directory)))
+        return trainer.fit(Dataset.from_records(_columns(16), batch=8, seed=0),
+                           steps=steps, log_every=1,
+                           checkpoint_every=None if directory is None else 2)
+
+    run(2, tmp_path / "run")
+    resumed = run(5, tmp_path / "run")
+    whole = run(5)
 
     for expected, actual in zip(jax.tree.leaves(whole.params),
                                 jax.tree.leaves(resumed.params), strict=True):

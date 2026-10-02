@@ -7,10 +7,10 @@ numbers over image sets already in hand, with no trainer and no batch."""
 
 from .common import ImageMetric, Mean, frames
 from .fid import FID, fid, frechet_distance
-from .images import clip, clip_image_text_cosine, clip_score, clip_score_metric
+from .images import CLIPScore, clip, clip_image_text_cosine, clip_score, clip_score_metric
 from .psnr import peak_signal_noise_ratio, psnr
 from .ssim import ssim, structural_similarity
 
-__all__ = ["FID", "ImageMetric", "Mean", "clip", "clip_image_text_cosine", "clip_score",
-           "clip_score_metric", "fid", "frames", "frechet_distance",
-           "peak_signal_noise_ratio", "psnr", "ssim", "structural_similarity"]
+__all__ = ["FID", "CLIPScore", "ImageMetric", "Mean", "clip", "clip_image_text_cosine", "clip_score",
+           "clip_score_metric", "fid", "frames", "frechet_distance", "peak_signal_noise_ratio", "psnr", "ssim",
+           "structural_similarity"]

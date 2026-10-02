@@ -57,7 +57,7 @@ sft_batch = {"text": np.tile(row, (8, 1)), "text_roles": np.tile(roles, (8, 1))}
 sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, pretrained=base,
-                            loss_role=Role.ASSISTANT, ema_decay=None)
+                            loss_role=Role.ASSISTANT)
 sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
 ```
@@ -242,7 +242,7 @@ Completed 2 DPO updates; reference stayed fixed.
 
 The DPO reference lives in `TrainState.ema` with its decay fixed at 1, so the tree never moves; `DPOObjective` refuses an `ema_decay` argument. `rewards/chosen` and `rewards/rejected` are beta times each side's sequence log-ratio of policy over reference, so a policy that has not moved reports zero rewards and no wins. There is no second model object and the reference is not optimized, but it is a separate parameter tree with its own forward passes. Budget memory for the policy parameters, reference parameters, optimizer state, gradients, activations and batches.
 
-SFT uses the language-model objective's moving EMA by default; `ema_decay=None` trains without an averaged copy. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its `pretrained` weights become the frozen reference.
+SFT keeps no moving average unless `ema_decay` is set, as the language-model objective does. GRPO keeps a frozen reference only when `beta > 0`, and refuses `ema_decay` too. When a DPO or GRPO stage starts, its `pretrained` weights become the frozen reference.
 
 ## GRPO
 

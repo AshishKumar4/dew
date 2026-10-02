@@ -734,6 +734,17 @@ def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
         clip_score(images, prompts[:2], modelname=str(CLIP_TINY))
 
 
+def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
+    """A caption past CLIP's context is cut to it, so 500 words and 600 score
+    alike instead of overrunning the position table."""
+    images = np.load(CLIP_TINY / "reference.npz")["images"][:1]
+
+    long = clip_score(images, [" ".join(["word"] * 500)], modelname=str(CLIP_TINY))
+
+    assert np.isfinite(long)
+    assert clip_score(images, [" ".join(["word"] * 600)], modelname=str(CLIP_TINY)) == long
+
+
 def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
     it to a dark pixel, which the old metric did; the score of an overshooting

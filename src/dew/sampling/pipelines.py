@@ -196,7 +196,7 @@ class TextToImage:
                    blank=objective.blank_conditions)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
@@ -599,7 +599,7 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
-def restore_variables(directory: str, *, ema: bool | None, step: int | None, mesh: MeshSpec | None,
+def restore_variables(directory: str, *, ema: bool | None, step: int | str | None, mesh: MeshSpec | None,
                       layout: Layout | None, param_dtype: str | None,
                       parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
     """A run's published variables, restored onto the current mesh under a layout.

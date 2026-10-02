@@ -39,7 +39,7 @@ def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkey
 
     script = example("sft_diffusion_gemma_images")
     config = script.Config(flowers="unused", image_size=16, prompt_tokens=24,
-                           batch_size=8, steps=2, features=16, vision_features=8,
+                           batch_size=8, steps=2, features=16, vision_features=16,
                            out=tmp_path / "caption")
     pixels = np.arange(8 * 16 * 16 * 3, dtype=np.uint8).reshape(8, 16, 16, 3)
     batch = script.caption_batch({"image": pixels, "label": np.arange(8) % 2}, config,

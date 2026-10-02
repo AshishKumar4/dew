@@ -89,7 +89,9 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
         text = None
     if text is not None:
         if processor is None:
-            raise ValueError("text requests need a processor; pass ModelInputs or token rows")
+            raise ValueError("text requests need a processor: pass processor= where the task is built, "
+                             "as objective.pipeline(state, processor=source.processor) does, or request "
+                             "ModelInputs or token rows")
         return processor(text, images=images)
     if images is not None:
         raise ValueError(
@@ -423,7 +425,7 @@ class TextGeneration:
         return replace(self, model=model, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
@@ -463,7 +465,7 @@ class TextGeneration:
                    max_new_tokens=budget if budget else None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -533,7 +535,7 @@ class BlockGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
@@ -563,7 +565,7 @@ class BlockGeneration:
                    processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
@@ -622,7 +624,7 @@ class MaskedGeneration:
         return replace(self, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | None = None,
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
                  dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
@@ -650,7 +652,7 @@ class MaskedGeneration:
                    max_new_tokens=budget or None)
 
     @classmethod
-    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | None = None,
+    def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.

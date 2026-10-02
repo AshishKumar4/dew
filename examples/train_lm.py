@@ -65,10 +65,8 @@ def main(config: Config):
     state = trainer.fit(data, steps=steps, log_every=50)
 
     # No reload is needed; the weights stay where the trainer placed them, and
-    # the tokenizer decodes the rows. Four epochs of tiny Shakespeare are 268
-    # steps, after which a 0.999 average is still three quarters the
-    # initialization, so the sample comes from the live weights.
-    task = objective.pipeline(state, ema=False, processor=RunProcessor(tokenizer))
+    # the tokenizer decodes the rows.
+    task = objective.pipeline(state, processor=RunProcessor(tokenizer))
     text = config.prompt + task(config.prompt, key=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)

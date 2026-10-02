@@ -193,7 +193,13 @@ def unpartition_gpu_pool() -> None:
     takes only for NCCL user or symmetric buffers, a one-shot ragged
     all-to-all or a Mosaic kernel's symmetric operand
     (xla/service/gpu/gpu_memory_space_assignment.cc); Dew asks for none of
-    them. With it off XLA serves that space from an allocator of its own."""
+    them. With it off XLA serves that space from an allocator of its own.
+
+    Steps run as fast either way. On an A100 (jax 0.11.2, bf16, 20 steps,
+    on then off then off then on): the 176M hybrid DiT at batch 32 took a
+    median of 79.6 and 80.2 ms with it on and 80.0 and 80.7 ms with it off,
+    and a 2-layer decoder at Qwen3-0.6B's widths over 8 x 1024 tokens with a
+    tiled head 95.5 and 95.6 ms on, 95.5 and 95.5 ms off."""
     if cuda_plugin() and xla_flag("xla_gpu_enable_allocator_spatial_partitioning") is None:
         apply_xla_flags("--xla_gpu_enable_allocator_spatial_partitioning=false")
 

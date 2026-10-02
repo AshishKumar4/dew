@@ -13,7 +13,7 @@ import functools
 import json
 import math
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -80,6 +80,7 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
 
+    from dew.lora import LoRA
     from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
 
@@ -405,6 +406,9 @@ class Pretrained:
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
+    adapter: LoRA | None = None
+    """The low-rank adapter `lora` put on the model, whose factors the
+    variables hold; None for the source as published."""
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -417,17 +421,48 @@ class Pretrained:
         return {layout.name.removesuffix(".weight").replace("/", "."): layout
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
 
+    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
+             rslora: bool = False, dropout: float = 0.0) -> Pretrained:
+        """Return this source with a fresh low-rank adapter on the projections `modules` name.
+
+        The bundle that comes back holds the adapted model, the variables
+        with the factors in them (B zero, so it computes what the source
+        does) and the adapter, and nothing of a run: `lm_objective` trains
+        the factors alone, `adapter.save` writes PEFT's directory and `save`
+        the source's layout with the factors merged in. `dew.lora.LoRA.fresh`
+        describes the arguments.
+        """
+        from dew.lora import LoRA
+
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        if self.schedule is not None:
+            raise ValueError(
+                "a pipeline's adapter spans its components, each adapted where it runs; "
+                "build one with dew.lora.LoRA.fresh(source.model, source.variables, source.layouts, ...)"
+            )
+        adapter, variables = LoRA.fresh(self.model, self.variables, self.layouts, rank=rank, modules=modules,
+                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
+        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
+
     def lm_objective(self, seq_len: int, **options) -> LMObjective:
         """Build next-token training from this source's model and variables.
 
-        `options` are `LMObjective`'s training and evaluation controls;
-        this bundle supplies `pretrained` itself.
+        `options` are `LMObjective`'s training and evaluation controls. This
+        bundle supplies `pretrained` itself and its processor unless one is
+        passed, and an adapted bundle its adapter's filter as `trainable`,
+        so the run moves the factors alone.
         """
         from dew.objectives.lm import LMObjective
 
         if "pretrained" in options:
             raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
-        return LMObjective(self.model, seq_len, pretrained=self.variables, **options)
+        if self.adapter is not None:
+            if "trainable" in options:
+                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
+            options["trainable"] = self.adapter.trainable
+        return LMObjective(self.model, seq_len, pretrained=self.variables,
+                           **{"processor": self.processor, **options})
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
         """Build the text generation task this source describes.
@@ -511,9 +546,15 @@ class Pretrained:
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
 
-        A diffusion source writes one set per component, so it has none.
+        A diffusion source writes one set per component, so it has none. An
+        adapted bundle (`lora`) writes the source's own tensors with the
+        factors merged into their kernels, PEFT's `merge_and_unload`, from
+        its variables or a trainer's split of them; `adapter.save` writes
+        the factors alone.
         """
         values = self.variables if variables is None else variables
+        if self.adapter is not None:
+            values = self.adapter.merge(values)
         quantization = self._quantization()
         if self.schedule is not None:
             raise ValueError("a diffusion source writes one tensor set per component; save it instead")
