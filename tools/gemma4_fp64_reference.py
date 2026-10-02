@@ -1,28 +1,20 @@
-"""Pin the published tiny Gemma 4 text logits in float64.
+"""The revision-pinned published tiny Gemma 4 text oracle in float64.
 
-Reproduce with Transformers 5.16.1 and Torch 2.14.0 on CPU:
-    PYTHONPATH=src ~/.cache/dew/dew-cpu-run python tools/gemma4_fp64_reference.py
-
+Measured with Transformers 5.16.1 and Torch 2.14.0 on CPU.
 The fp32 checkpoint weights are widened exactly. RMSNorm, softmax and RoPE
 also need widening: the reference pins these operations to fp32 even in a
 double model. RoPE frequencies are recomputed rather than upcast.
 """
 
-import argparse
-from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
 import torch
-import transformers
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm, Gemma4TextRotaryEmbedding
 
 CHECKPOINT = 'trl-internal-testing/tiny-Gemma4ForConditionalGeneration'
 REVISION = '0dc1746b7f9f623b748e735ed5a4302eb4baf346'
 PROMPT = 'The capital of France is'
-OUTPUT = (Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
-          / 'gemma4-published-tiny' / 'text_f64.npz')
 
 
 def norm64(self, hidden_states):
@@ -47,7 +39,8 @@ def rotary64(self, x, position_ids, layer_type):
     return angles.cos(), angles.sin()
 
 
-def write_reference(output):
+def reference_text():
+    """Return (fp64 logits, token ids) on CPU from the pinned fp32 weights."""
     torch.set_num_threads(1)
     processor = AutoProcessor.from_pretrained(CHECKPOINT, revision=REVISION)
     batch = dict(processor(text=[PROMPT], return_tensors='pt'))
@@ -64,18 +57,4 @@ def write_reference(output):
             patch.object(Gemma4TextRotaryEmbedding, 'forward', rotary64), \
             patch.object(torch.nn.functional, 'softmax', softmax64), torch.no_grad():
         logits = model(**batch, use_cache=False).logits.numpy()
-    assert logits.dtype == np.float64
-    output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output, logits=logits, input_ids=batch['input_ids'].numpy(),
-                        checkpoint=CHECKPOINT, revision=REVISION, prompt=PROMPT,
-                        transformers=transformers.__version__, torch=torch.__version__)
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=OUTPUT)
-    write_reference(parser.parse_args().output)
-
-
-if __name__ == '__main__':
-    main()
+    return logits, batch['input_ids'].numpy()
