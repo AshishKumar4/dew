@@ -1,29 +1,20 @@
 """Wan 2.1's causal video autoencoder, `AutoencoderKLWan`.
 
-An independent linen port of diffusers 0.34.0
-src/diffusers/models/autoencoders/autoencoder_kl_wan.py (Apache-2.0),
-channels last: videos are `[B, T, H, W, C]`. Every 3-D convolution is causal
-in time, padded with two zero frames in front, so frame t reads only frames
-up to t. Four frames compress into one latent frame after the first, which is
-compressed alone: a video of 1 + 4k frames has 1 + k latent frames, and an
-image is the one-frame video.
+An independent linen port of diffusers 0.34.0 autoencoder_kl_wan.py
+(Apache-2.0), channels last: videos are `[B, T, H, W, C]`. Every 3-D
+convolution is causal in time, two zero frames in front. The first frame
+compresses alone and every four after it into one latent frame, so 1 + 4k
+frames make 1 + k latent frames and an image is the one-frame video.
 
-The source walks a video in chunks (the first frame, then four at a time;
-one latent frame at a time to decode) and carries each convolution's last
-two input frames across chunks. That is the causal convolution over the
-whole video, which is what this module computes in one pass. The resampling
-blocks keep the first frame out of their temporal convolution, as the
-source's first chunk does:
-
-- a temporally downsampling block passes the first frame through and
-  convolves the whole sequence with stride 2 and no padding, so output
-  frame j > 0 reads frames 2j - 2 to 2j;
-- a temporally upsampling block passes the first frame through and turns
-  every later frame into two, by a causal convolution over the frames after
-  the first that doubles the channels, each half one frame.
-
-The decoder clamps its pixels to [-1, 1], as the source's `_decode` does.
-RMS gammas keep the source's stored `[C, 1, 1(, 1)]` shape.
+The source walks a video in chunks and carries each convolution's last two
+input frames across them, which is the causal convolution over the whole
+video this computes in one pass. The resampling blocks keep the first frame
+out of their temporal convolution, as the source's first chunk does: a
+downsampling block convolves with stride 2 and no padding, so output frame
+j > 0 reads frames 2j - 2 to 2j; an upsampling block turns every later frame
+into two by a causal convolution that doubles the channels. The decoder
+clamps pixels to [-1, 1] (`_decode`), and RMS gammas keep the stored
+`[C, 1, 1(, 1)]` shape.
 """
 from __future__ import annotations
 

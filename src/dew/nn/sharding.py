@@ -92,20 +92,15 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 # those is the output side of one matmul and the input side of the next, so
 # splitting it splits both and leaves the block one reduction.
 #
-# 'embed', the residual width, is the side those matmuls share with every
-# norm, residual add, rotary rotation and the loss. It stays whole on the
-# tensor axis and keeps fsdp, because sharding it would put a collective
-# between every pair of sublayers, the cost tensor parallelism is arranged
-# to avoid. In a kernel that holds both, the residual width takes fsdp and
-# the Megatron width tensor alone, a split in two dimensions, as MaxText's
-# rules make it; the mlp and attention widths name tensor first and fsdp
-# second, and the heads take tensor through the pairs at the end. Split
-# over fsdp and tensor together while the residual width stayed whole, the
-# mlp's and o_proj's widths had GSPMD gather a block's activations over
-# fsdp and repeat their products on both devices of every pair: 1.21 times
-# one device's matmul FLOPs for layout_parity's dense decoder under
-# fsdp2_tensor2. A width no residual shares an array with, the vocabulary
-# of the embedding table, composes the two axes and splits fsdp times
+# 'embed', the residual width every norm, residual add, rotation and the
+# loss share, stays whole on the tensor axis and keeps fsdp: sharding it puts
+# a collective between every pair of sublayers. A kernel holding both splits
+# in two dimensions as MaxText's rules do, the residual width over fsdp and
+# the Megatron width over tensor (the mlp and attention widths name tensor
+# first and fsdp second). Split over fsdp and tensor together, those widths
+# had GSPMD repeat products on both devices of every pair (1.21 times one
+# device's FLOPs, layout_parity's dense decoder on fsdp2_tensor2). The
+# vocabulary, which shares no array with a residual, splits fsdp times
 # tensor ways.
 #
 # The activation_ names place what a step computes rather than what it
@@ -311,13 +306,10 @@ def down_projection(x: jax.Array, latent: int) -> LogicalAxes:
     `[batch, ..., tokens, width]` input whose width the tensor axis does not
     split, to `latent` features in all run: `SPREAD`, each tensor shard on
     its own tokens, where the tensor axis's link pays for it (`_spreads`),
-    else `RESIDUAL`, every tensor shard on every token.
-
-    At DeepSeek-V3's widths in bf16 (7168 into 1536 + 512 + 64) and 16384
-    tokens the link must move 20.3 GB/s for an RTX 3090, which an NVLink
-    pair's 31.0 meets and a PCIe 3.0 pair's 5.8 does not (4x RTX 3090, PCIe
-    3.0, one host), and 283 GB/s for an H100, under NVLink 4's nominal 450
-    a direction; at 4096 tokens an H100 needs 524."""
+    else `RESIDUAL`, every tensor shard on every token. At DeepSeek-V3's widths
+    in bf16 and 16384 tokens the link must move 20.3 GB/s for an RTX 3090
+    (an NVLink pair's 31.0 meets it, PCIe 3.0's 5.8 does not) and 283 GB/s for
+    an H100."""
     mesh = jax.sharding.get_abstract_mesh()
     if mesh.empty or mesh.shape.get(TENSOR_AXIS, 1) == 1 or TENSOR_AXIS in mesh.manual_axes:
         return RESIDUAL
@@ -351,22 +343,13 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     """Project a context's keys and values on each sequence shard's positions.
 
     `project(x)` returns the two HEADS-shaped projections, each ending in
-    `head_shape`. Price the output and weight-gradient bytes and FLOPs at
-    the head width the active rules leave on each device, not at the global
-    width. Where the sequence link pays, pad to a multiple of its shard
-    count, project, and trim the added positions. With the sequence axis at
-    one, a length it already divides, or a link that does not pay, project
-    the context unchanged.
-
-    A cross-attention's context is such an input: SD's 77 text tokens. Left
-    whole, every sequence shard projects all of them into keys and values,
-    and the conditional UNet's step on sequence4 computed 1.57 times one
-    device's FLOPs on a CPU mesh, which splits them; split, the pad rows'
-    projections are what is repeated, 3 of 80 rows at SD's length. The
-    projections are small beside the step and the sum of their weight
-    gradients the split adds is not, so a GPU's link rarely pays: at SDXL's
-    widths in bf16 (2048 into 2 x 1280) and 8 rows a group without a head
-    split, an H100 would need 2.47 TB/s, including the padded positions' work."""
+    `head_shape`. Bytes and FLOPs are priced at the head width the active rules
+    leave on each device. Where the sequence link pays, pad to a multiple of
+    its shard count, project, and trim; otherwise project the context
+    unchanged. A cross-attention's context (SD's 77 text tokens) is the input
+    this serves; its weight-gradient sum usually outweighs the saved
+    projection, so a GPU's link rarely pays (an H100 would need 2.47 TB/s at
+    SDXL's widths), while a CPU mesh splits it."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:

@@ -1,21 +1,12 @@
 """Gemma 3n's MobileNet-v5 encoder, from timm 1.0.29.
 
 The reference is timm/models/mobilenetv5.py, _efficientnet_blocks.py and
-layers/attention2d.py (Apache 2.0). The encoder combines convolutional
-residual blocks, spatial multi-query attention and a multiscale adapter.
-Timm has no Flax implementation. Convolutions use Linen; attention uses
-Dew's kernel seam. Inputs are processor-ready NCHW pixels and outputs are
-row-major spatial tokens, [batch, resolution**2, 2048].
-
-Every parameter's logical axes are declared with `@logical_axes` on the module
-that names the submodule holding it, the way the rest of dew.nn declares
-them. A convolution kernel is `[kh, kw, in, out]`, and its matrix is the
-flattened receptive field contracted into the output channels, so only the
-output side is named and the three leading dimensions stay unnamed: the form
-`PatchSequenceEmbed` already declares for its patch embedding, and the one
-both readers of the table can use, the layout to place the kernel and Muon to
-orthogonalize it. A norm or a bias beside a kernel is that same output width,
-which the trailing names its rank can hold gives it for free.
+layers/attention2d.py (Apache 2.0): convolutional residual blocks, spatial
+multi-query attention through Dew's kernel seam, and a multiscale adapter.
+Inputs are processor-ready NCHW pixels, outputs row-major spatial tokens
+[batch, resolution**2, 2048]. A convolution kernel `[kh, kw, in, out]` names
+only its output side in `@logical_axes`, as `PatchSequenceEmbed` does, which
+the layout and Muon both read; its norm and bias take that width for free.
 """
 
 from __future__ import annotations
