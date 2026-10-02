@@ -45,6 +45,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "HF_HOME": "/opt/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
             "JAX_COMPILATION_CACHE_DIR": "/work/xla", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
             "MALLOC_ARENA_MAX": "2",
+            **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),
         }
         await super()._async_launch_kernel(limited, **{**kwargs, "env": env, "cwd": "/"})
 
