@@ -1,0 +1,11 @@
+{
+  "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "prompt": "The capital of France is",
+  "max_new_tokens": 24,
+  "seed": 0,
+  "sampling": "greedy",
+  "dtype": "float32",
+  "where": "Cloudflare standard-4 CPU container",
+  "dew": "e2579605812c03414241b82a179a2a5c58ed1192",
+  "text": " Paris. Paris is the largest city in France and the capital of the French department of the Espace de Paris.\n\n"
+}
