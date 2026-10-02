@@ -169,6 +169,11 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen2.5's text configs state the multimodal rotary off; on, it is a
     # Qwen2-VL rotary the qwen2 reference never applies.
     'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    # Megatron training/fusion hints retained by the original BLOOM ports;
+    # modeling_bloom.py 5.16.1 reads none and sizes its MLP as 4*hidden_size.
+    'bloom': dict.fromkeys((
+        'attention_softmax_in_fp32', 'bias_dropout_fusion', 'masked_softmax_fusion',
+        'n_inner', 'offset_alibi', 'seq_length', 'skip_bias_add', 'skip_bias_add_qkv'), _any_value),
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
@@ -398,6 +403,7 @@ class DecoderFields(TypedDict, total=False):
     attn_logit_softcap: float | None
     output_gate: bool
     embedding_scale: bool
+    embedding_norm: bool
     embedding_multiplier: float
     residual_multiplier: float
     logits_scaling: float
@@ -2180,6 +2186,7 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
 # The family modules stand below the shared readers they call, so reaching one
 # of them first leaves the hub complete before its body runs. Their names are
 # bound here alone: the table below is the one place a family is registered.
+from dew.interop.families.bloom import _bloom_config, _bloom_export, _bloom_export_weights, _bloom_path, _bloom_prepare
 from dew.interop.families.deepseek import (
     _deepseek_config,
     _deepseek_v2_mixture,
@@ -2268,6 +2275,12 @@ from dew.interop.families.qwen import (
 )
 
 _FAMILY_ENTRIES = (
+    DecoderFamily(('bloom',), _bloom_config,
+                  lambda fields: bool(fields.get('embedding_norm')),
+                  'bloom', 'BloomForCausalLM', _bloom_export,
+                  weight_path=_bloom_path, prepare_weights=_bloom_prepare,
+                  export_weights=_bloom_export_weights, preserve_source_layout=False,
+                  tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight')),
     DecoderFamily(('gpt_neox',), _gpt_neox_config,
                   lambda fields: bool(fields.get('norm_type') == 'layer' and fields.get('norm_bias')
                                       and fields.get('mlp_bias') and fields.get('position_embedding') == 'rotary'),

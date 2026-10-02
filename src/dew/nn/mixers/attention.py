@@ -14,6 +14,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
@@ -90,6 +91,7 @@ class _Masking(NamedTuple):
     documents: jax.Array | None
     implementation: str
     cursor: jax.Array | None
+    bias: jax.Array | None
 
 
 class CausalSelfAttention(nn.Module):
@@ -153,6 +155,8 @@ class CausalSelfAttention(nn.Module):
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078): each head's output loses its component along
     the token's own value vector before the output projection."""
+    alibi: bool = False
+    """BLOOM's head-dependent linear bias over key positions."""
     init_std: float | None = None
     """Normal std of the q/k/v kernels; None keeps flax's lecun normal."""
     output_init_std: float | None = None
@@ -417,7 +421,8 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.kv_store_key] = (key, value, positions)
         sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
                  if self.attention_sinks else None)
-        if self._runs_local(attention_metadata, decode) and not (self.attention_dropout_rate and train):
+        if (self._runs_local(attention_metadata, decode) and not self.alibi
+                and not (self.attention_dropout_rate and train)):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
                 positions=None if logical_positions is None else positions,
@@ -576,14 +581,31 @@ class CausalSelfAttention(nn.Module):
             mask = chunked if base is None else base & chunked
             causal, window = False, None
             implementation = masked
-        return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor)
+        bias = None
+        if self.alibi:
+            width = key.shape[1]
+            if decode:
+                places = jnp.arange(width)[None, :]
+            elif attention_metadata is not None and attention_metadata.valid is not None:
+                places = jnp.cumsum(attention_metadata.valid, axis=1, dtype=jnp.int32) - 1
+            else:
+                places = jnp.arange(width)[None, :]
+            power = 2 ** math.floor(math.log2(self.num_heads))
+            base = np.float32(2 ** (-2 ** -(math.log2(power) - 3)))
+            slopes = (base ** np.arange(1, power + 1, dtype=np.int32)).astype(np.float32)
+            if power != self.num_heads:
+                extra = np.float32(2 ** (-2 ** -(math.log2(2 * power) - 3)))
+                slopes = np.concatenate((slopes, (extra ** np.arange(
+                    1, 2 * (self.num_heads - power) + 1, 2, dtype=np.int32)).astype(np.float32)))
+            bias = jnp.asarray(slopes)[None, :, None, None] * places[:, None, None, :]
+        return _Masking(query, key, value, causal, window, mask, documents, implementation, cursor, bias)
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
         QK-Clip when a caller opened that collection."""
-        query, key, value, causal, window, mask, documents, implementation, cursor = masking
+        query, key, value, causal, window, mask, documents, implementation, cursor, bias = masking
         B, S = query.shape[:2]
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
@@ -592,17 +614,18 @@ class CausalSelfAttention(nn.Module):
         if sowing:
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window,
-                mask=mask if documents is None else with_documents(mask, documents)))
+                mask=mask if documents is None else with_documents(mask, documents), bias=bias))
         if self.attention_dropout_rate and train:
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=self.attention_impl, causal=causal, sliding_window=window,
-                mask=mask, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
+                mask=mask, bias=bias, sinks=sinks, softcap=self.attn_logit_softcap, segment_ids=documents,
                 dropout_rate=self.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
-        plain_step = append is not None and mask is cursor and S == 1 and sinks is None and not sowing
+        plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
+                      and not sowing and bias is None)
         if (append is not None and plain_step and self.attention_impl in ('auto', 'tpu')
                 and append.store.kernel()):
             attention = self._paged(append, query)
@@ -627,7 +650,7 @@ class CausalSelfAttention(nn.Module):
                 query, key, value, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=implementation, causal=causal,
-                sliding_window=window, mask=mask, sinks=sinks,
+                sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.attn_logit_softcap, segment_ids=documents), 'context')
         return attention
 
@@ -705,6 +728,7 @@ class AttentionMixer(MixerBase):
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
+    alibi: bool = False
 
     def __post_init__(self):
         if self.mrope_section is not None:
@@ -750,6 +774,7 @@ class AttentionMixer(MixerBase):
             partial_rotary_type=ctx.partial_rotary_type,
             kv_cache=ctx.kv_cache,
             nope=self.nope,
+            alibi=self.alibi,
             exclusive_self_attention=self.exclusive_self_attention,
             init_std=ctx.init_std,
             output_init_std=ctx.output_init_std,

@@ -711,6 +711,8 @@ class CausalTransformer(nn.Module):
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
+    embedding_norm: bool = False
+    """Normalize token embeddings before the stack, as BLOOM does."""
     embedding_multiplier: float = 1.0
     """Token embeddings times this before the first layer: muP's m_emb in
     lm-engine, GraniteMoeHybrid's `embedding_multiplier`."""
@@ -1364,6 +1366,11 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype, name='embed_tokens',
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
+        if self.embedding_norm:
+            self.embedding_layernorm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype)(name='embedding_layernorm')
         if self.embedding_dropout_rate:
             self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
         if self.position_embedding == 'learned':
@@ -1917,6 +1924,8 @@ class CausalTransformer(nn.Module):
         # splits the rows or the positions.
         x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
                                            input_embeddings, embedding_positions), RESIDUAL)
+        if self.embedding_norm:
+            x = self.embedding_layernorm(x)
         if self.position_embedding == 'learned':
             places = positions
             if places is None:
