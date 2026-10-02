@@ -44,10 +44,29 @@ def test_caption_example_trains_and_executes_its_inference_call(tmp_path, monkey
     pixels = np.arange(8 * 16 * 16 * 3, dtype=np.uint8).reshape(8, 16, 16, 3)
     batch = script.caption_batch({"image": pixels, "label": np.arange(8) % 2}, config,
                                  ["pink rose", "yellow tulip"])
-    def rows(partition):
-        yield from [batch] * config.steps
+    class Rows:
+        def __init__(self):
+            self.index = 0
 
-    data = Dataset(train=rows, val=None,
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index >= config.steps:
+                raise StopIteration
+            self.index += 1
+            return batch
+
+        def close(self):
+            pass
+
+        def get_state(self):
+            return str(self.index).encode()
+
+        def set_state(self, state):
+            self.index = int(state)
+
+    data = Dataset(train=lambda partition: Rows(), val=None,
                    records=8 * config.steps, batch=8)
     monkeypatch.setattr(script, "flowers_data", lambda selected: data)
     state = script.main(config)
