@@ -624,6 +624,36 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
                                   expected(prompt, 3, key=7).host().tokens)
 
 
+def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
+    from pathlib import Path
+
+    import dew
+    from dew.inference.serving import Server
+    from dew.interop import Pretrained
+    from dew.sampling import Sampling
+
+    pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    spec = Quantization(weight_only=True, patterns=(".*_proj",))
+    canonical = Pretrained.load(directory, dtype="float32").text_generation(
+        sampling=Sampling(temperature=0, eos_id=None))
+    packed = dew.pipeline(str(directory), dtype="float32")
+    reference = canonical.quantized(spec)
+    served = packed.quantized(spec)
+    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
+    np.testing.assert_allclose(served.model.apply(served.variables, tokens),
+                               reference.model.apply(reference.variables, tokens), atol=2e-6, rtol=2e-6)
+    expected = reference(tokens, 4, key=5).host()
+    actual = served(tokens, 4, key=5).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
+    server = Server.from_task(served, slots=max(2, jax.device_count()), capacity=64)
+    drawn = server([[1, 2, 3]], 4, key=5)[0].host()
+    np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+    np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
 def test_a_quantized_text_task_without_qwix_names_the_install_extra(monkeypatch):
     import sys
 

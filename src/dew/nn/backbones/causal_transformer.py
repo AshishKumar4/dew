@@ -1856,7 +1856,10 @@ class CausalTransformer(nn.Module):
         leaves alone.
         """
         stages = pipeline_stages()
-        if self.is_initializing() and stages == 1 and not decode:
+        # A seeded initialization (PTQ's abstract annotation pass) reads the
+        # supplied layout; the scan's init=True pass would draw over it first.
+        if (self.is_initializing() and stages == 1 and not decode
+                and not self.has_variable('params', 'layers_0')):
             groups = scan_groups(self.specs, self.bank_layers)
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)

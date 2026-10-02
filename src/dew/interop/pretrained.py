@@ -626,7 +626,7 @@ class PretrainedDecoder(Pretrained):
         the chain was built around the policy the caller just replaced; the
         source's EOS and pad ids fill the ones it leaves None, and
         `num_return_sequences` still comes from the source.
-        Host weights pack before placement; an already placed bundle shares its canonical weights unchanged.
+        The task shares the bundle's canonical weights; `dew.pipeline` packs its decoder during placement.
         Unmerged LoRA models retain their projection paths and are not packed.
         """
         rows = return_sequences(self.config, self.generation_config)
