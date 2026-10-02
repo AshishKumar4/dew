@@ -7,14 +7,15 @@ Every prompt is encoded first; the text encoder's weights then leave the
 task, and the transformer's and the VAE's go to the device once. Each clip
 is sampled with the source's own policy (UniPC over its flow-shifted grid,
 guidance 5.0) and the negative prompt Diffusers' Wan example uses, then
-decoded, and written as an H.264 MP4 at Wan's 16 frames per second, its
+decoded, and written as an H.264 MP4 at Wan's 16 frames per second (CRF
+23 by default, which keeps a 49-frame 480x832 clip a few megabytes), its
 first frame as a PNG poster, and one entry in `manifest.json`: prompt,
 seed, steps, guidance, solver, geometry, revision, Dew commit, hardware and
 the seconds each part took. A clip already written is skipped, so a run
 that stopped resumes.
 
     python tools/wan_samples.py OUTPUT_DIR [--frames 49 --height 480 --width 832 --steps 50]
-        [--source DIR] [--only NAME ...]
+        [--crf 23] [--source DIR] [--only NAME ...]
 """
 
 from __future__ import annotations
@@ -57,12 +58,12 @@ def commit() -> str:
     return found.stdout.strip() if found.returncode == 0 else "unknown (not a git checkout)"
 
 
-def write_clip(frames: np.ndarray, path: Path) -> None:
+def write_clip(frames: np.ndarray, path: Path, crf: int) -> None:
     """`[T, H, W, 3]` uint8 frames as H.264 in a yuv420p MP4 that browsers play."""
     _, height, width, _ = frames.shape
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", f"{width}x{height}", "-r", str(FPS), "-i", "-", "-c:v", "libx264",
-                    "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-preset", "slow", "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     str(path)], input=frames.tobytes(), check=True)
 
 
@@ -73,6 +74,7 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--crf", type=int, default=23, help="the H.264 constant rate factor")
     parser.add_argument("--source", default=REPO, help="a pipeline directory instead of the published repo")
     parser.add_argument("--only", nargs="*", choices=sorted(CLIPS), default=sorted(CLIPS))
     args = parser.parse_args()
@@ -117,7 +119,7 @@ def main() -> None:
         pixels = jax.block_until_ready(pipeline.autoencoder.decode(resident["autoencoder"], latents))
         decode_seconds = time.perf_counter() - start
         frames = uint8_pixels(np.asarray(pixels[0], np.float32))
-        write_clip(frames, args.output / f"{name}.mp4")
+        write_clip(frames, args.output / f"{name}.mp4", args.crf)
         Image.fromarray(frames[0]).save(args.output / f"{name}.png")
         manifest["clips"][name] = {
             "video": f"{name}.mp4", "poster": f"{name}.png", "prompt": prompt, "negative_prompt": NEGATIVE,
@@ -127,6 +129,7 @@ def main() -> None:
                           if isinstance(value, (bool, int, float, str))}},
             "scheduler": dict(pipeline.config["scheduler"]),
             "frames": args.frames, "fps": FPS, "height": args.height, "width": args.width,
+            "encoding": {"codec": "h264", "crf": args.crf, "preset": "slow", "pixel_format": "yuv420p"},
             "repo": args.source, "revision": pipeline.revision, "dew_commit": commit(),
             "dtype": {"compute": "bfloat16", "params": "float32"},
             "hardware": device.device_kind, "platform": device.platform, "jax": jax.__version__,
