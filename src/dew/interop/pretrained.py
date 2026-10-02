@@ -708,6 +708,7 @@ class PretrainedDecoder(Pretrained):
         source's EOS and pad ids fill the ones it leaves None, and
         `num_return_sequences` still comes from the source.
         Host weights pack before placement; an already placed bundle shares its canonical weights unchanged.
+        Unmerged LoRA models retain their projection paths and are not packed.
         """
         rows = return_sequences(self.config, self.generation_config)
         policy, logits, strategy = source_decoding(
