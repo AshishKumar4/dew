@@ -170,7 +170,7 @@ trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
 # A cross-split aggregate: Best(lambda m: m["flowers", fid] + m["faces", fid])
 ```
 
-Recorded runs use `TrainerConfig.best`, a metric name or `Best("fid", top=3, mode="min")`; several selectors can be a tuple of named `Best` policies. A callable cannot be a recorded selector and raises a clear error. All new recorded fields have defaults meaning what older runs did.
+Recorded runs use `TrainerConfig.best`, a metric name or `Best("fid", top=3, mode="min")`; several selectors can be a tuple of named `Best` policies. A callable cannot be a recorded selector and raises a clear error.
 
 ## Time cadence and retention
 
