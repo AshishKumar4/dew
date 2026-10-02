@@ -140,6 +140,21 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     assert trainer.checkpoints.best == 4
 
 
+def test_the_documented_lm_accuracy_fit_runs_with_best(tmp_path, monkeypatch):
+    import re
+    from pathlib import Path
+
+    guide = Path(__file__).resolve().parents[1] / "docs/guides/evaluation.md"
+    blocks = re.findall(r"```python\n(.*?)\n```", guide.read_text(), re.S)
+    monkeypatch.chdir(tmp_path)
+    scope = {}
+    exec(compile(blocks[0], str(guide), "exec"), scope)
+    accuracy = next(block for block in blocks if "accuracy = Mean(" in block)
+    exec(compile(accuracy, str(guide), "exec"), scope)
+    assert int(scope["state"].step) == 10
+    assert scope["run"].checkpoints.best is not None
+
+
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
     features = np.asarray(jax.random.normal(rng, (256, 16)))
     mu, sigma = features.mean(axis=0), np.cov(features, rowvar=False)

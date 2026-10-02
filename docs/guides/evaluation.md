@@ -84,10 +84,12 @@ accuracy = Mean(
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
+accuracy_data = Dataset.from_records({"text": train_tokens}, batch=8,
+                                    validation={"text": val_tokens})
 run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
-    data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+    accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
 )
 run.checkpoints.wait()
 assert run.checkpoints.best is not None
