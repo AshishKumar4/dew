@@ -1,8 +1,4 @@
-"""Hold one module per decoder family, read by the family table in `hf_decoders`.
-
-A family module holds what is true of that family alone: its config
-translation, its tensor path map, the fields its export writes and the tensors
-it prepares. The table that names them is in `dew.interop.hf_decoders`. That
-module imports these below the shared readers they call, so the table is
-complete whichever module is reached first.
+"""One module per decoder family: what is true of that family alone, its
+config translation, tensor path map, export fields and prepared tensors.
+`dew.interop.decoder_families.ENTRIES` registers them in match order.
 """

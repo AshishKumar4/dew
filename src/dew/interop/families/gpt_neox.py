@@ -2,10 +2,19 @@
 
 from collections.abc import Mapping
 
+import jax
 import numpy as np
 
 from dew import records
-from dew.interop.hf_decoders import DecoderFields, _base_config, _dew_path, _refuse
+from dew.interop.hf_decoders import (
+    DecoderFields,
+    Renames,
+    _base_config,
+    _decoder_tensors,
+    _refuse,
+    _renamed_path,
+)
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
 
@@ -78,19 +87,18 @@ def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
     return prepared
 
 
+_GPT_NEOX_NAMES: Renames = (
+    ('embed_out', 'lm_head'), ('gpt_neox.embed_in', 'model.embed_tokens'),
+    ('gpt_neox.final_layer_norm', 'model.norm'), ('gpt_neox.layers', 'model.layers'),
+    ('attention.dense', 'self_attn.o_proj'), ('mlp.dense_h_to_4h', 'mlp.up_proj'),
+    ('mlp.dense_4h_to_h', 'mlp.down_proj'))
+
+
 def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if '.attention.query_key_value.' in name or name.endswith((
             '.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
         return None
-    if name.startswith('embed_out.'):
-        name = name.replace('embed_out.', 'lm_head.')
-    name = name.replace('gpt_neox.embed_in.', 'model.embed_tokens.')
-    name = name.replace('gpt_neox.final_layer_norm.', 'model.norm.')
-    name = name.replace('gpt_neox.layers.', 'model.layers.')
-    name = name.replace('.attention.dense.', '.self_attn.o_proj.')
-    name = name.replace('.mlp.dense_h_to_4h.', '.mlp.up_proj.')
-    name = name.replace('.mlp.dense_4h_to_h.', '.mlp.down_proj.')
-    return _dew_path(name, config)
+    return _renamed_path(_GPT_NEOX_NAMES, name, config)
 
 
 def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -109,40 +117,28 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
-    from flax.traverse_util import flatten_dict
+                             config: Mapping[str, object]) -> LazyTensors:
+    """The shared writer's tensors with each layer's q, k and v interleaved by
+    head into `query_key_value`, the inverse of `_gpt_neox_prepare`."""
+    tensors = _decoder_tensors(model, variables, config)
+    fused: dict[str, tuple[str, ...]] = {}
+    for name in tensors:
+        stem, found, leaf = name.partition('.self_attn.q_proj.')
+        if found:
+            fused[f'{stem}.attention.query_key_value.{leaf}'] = tuple(
+                f'{stem}.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj'))
+    parts = {part for names in fused.values() for part in names}
+    specs = {name: spec for name, spec in tensors.specs.items() if name not in parts}
+    for name, (query, *_) in fused.items():
+        spec = tensors.specs[query]
+        specs[name] = jax.ShapeDtypeStruct((3 * spec.shape[0], *spec.shape[1:]), spec.dtype)
 
-    from dew.interop.hf_decoders import _hf_name
+    def build(name: str) -> np.ndarray:
+        if name not in fused:
+            return tensors[name]
+        values = [tensors[part] for part in fused[name]]
+        grouped = np.stack([value.reshape(model.num_heads, model.features_per_head, *value.shape[1:])
+                            for value in values], axis=1)
+        return grouped.reshape(3 * values[0].shape[0], *values[0].shape[1:])
 
-    params = variables.get('params')
-    if not isinstance(params, Mapping):
-        raise ValueError('params must contain the decoder parameter tree')
-    flat = flatten_dict(dict(params), sep='.')
-    tensors = {}
-    for name, value in flat.items():
-        if '.self_attn.' in name and any(f'.{part}.' in name for part in ('q_proj', 'k_proj', 'v_proj')):
-            continue
-        target = _hf_name(name, config)
-        if target is None:
-            continue
-        target = target.replace('model.embed_tokens.', 'gpt_neox.embed_in.')
-        target = target.replace('model.norm.', 'gpt_neox.final_layer_norm.')
-        target = target.replace('model.layers.', 'gpt_neox.layers.')
-        target = target.replace('lm_head.', 'embed_out.')
-        target = target.replace('.self_attn.o_proj.', '.attention.dense.')
-        target = target.replace('.mlp.up_proj.', '.mlp.dense_h_to_4h.')
-        target = target.replace('.mlp.down_proj.', '.mlp.dense_4h_to_h.')
-        tensors[target] = np.asarray(value).T if name.endswith('.kernel') else np.asarray(value)
-    for index in range(model.num_layers):
-        for leaf, suffix in (('kernel', 'weight'), ('bias', 'bias')):
-            if f'layers_{index}.self_attn.q_proj.{leaf}' not in flat:
-                continue
-            values = [np.asarray(flat[f'layers_{index}.self_attn.{part}.{leaf}'])
-                      for part in ('q_proj', 'k_proj', 'v_proj')]
-            values = [value.T if leaf == 'kernel' else value for value in values]
-            grouped = [value.reshape(model.num_heads, model.features_per_head, *value.shape[1:])
-                       for value in values]
-            stored = np.stack(grouped, axis=1)
-            tensors[f'gpt_neox.layers.{index}.attention.query_key_value.{suffix}'] = stored.reshape(
-                3 * model.emb_features, *values[0].shape[1:])
-    return tensors
+    return LazyTensors(specs, build)

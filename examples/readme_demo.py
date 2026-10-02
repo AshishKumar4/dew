@@ -121,7 +121,7 @@ def flow_images(out: Path):
     trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(3))
     state = trainer.fit(data, steps=3, log_every=1)
     preview = objective.preview(
-        state.params, batch,
+        state.variables, batch,
         Step(step=state.step, key=jax.random.key(4), ema=state.averaged),
     )
     if preview is None:
@@ -145,7 +145,7 @@ def main(config: Config):
     print("Devices:", jax.devices())
     print("Output:", out)
     model, state, lm = language_model(out)
-    dpo = preferences(model, state.params)
+    dpo = preferences(model, state.variables)
     flow = flow_images(out)
     summary = {"language_model": lm, "dpo": dpo, "flow": flow}
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

@@ -41,7 +41,7 @@ from ..conv import Conv
 from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 HEAD_WIDTH = 64
 """Every encoder's attention head width; the source sets the heads from it."""

@@ -704,6 +704,17 @@ class Checkpoints:
             retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
         return retained
 
+    def artifact(self, step: int | str | None = None) -> JSON:
+        """The selected step's inference declaration, or None when its objective
+        declares no inference record."""
+        step = self.resolve(step)
+        step = self.latest if step is None else step
+        if step is None:
+            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        local = step == self._local_latest()
+        custom = self._step_metadata(step, local=local).custom_metadata or {}
+        return json_value(custom.get('artifact'), 'artifact')
+
     def control(self, step: int) -> dict:
         if step == self._local_latest():
             custom = self._open_local().metadata(step).custom_metadata or {}
@@ -879,6 +890,7 @@ class Checkpoints:
         weights_only: bool = False,
         primary: str | None = None,
         rung: JSON = None,
+        artifact: JSON = None,
     ) -> None:
         """Write `state` under `step`, asynchronously.
 
@@ -939,6 +951,7 @@ class Checkpoints:
                     "control": copy.deepcopy(control or {}),
                     "weights_only": weights_only,
                     "rung": rung,
+                    "artifact": artifact,
                 },
             )
         self._pending = (step, scores)
@@ -1028,6 +1041,7 @@ class Checkpoints:
         share: DataPartition | None = None,
         control: dict | None = None,
         rung: JSON = None,
+        artifact: JSON = None,
     ) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it, and as `save`
@@ -1053,6 +1067,7 @@ class Checkpoints:
                     "ema_deltas": deltas,
                     "control": copy.deepcopy(control or {}),
                     "rung": rung,
+                    "artifact": artifact,
                 },
             )
         if _written_in_place(state_tree):
@@ -1077,6 +1092,47 @@ class Checkpoints:
         for a state saved outside `fit`, which trained on no ladder."""
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
+
+    def variables(self, *, step: int | str | None = None, ema: bool | None = None,
+                  mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
+                  parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",))) -> Variables:
+        """Read the selected step's live or averaged variables onto the requested layout.
+
+        Parameter storage conversion applies only to the owner's parameter
+        roots; other collections retain their recorded dtypes and placement.
+        """
+        from dew.objectives.base import merge
+        from dew.registry import resolve_dtype
+        from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
+
+        target = resolve_dtype(param_dtype)
+        stored = self.stored(step)
+        template = {"variables": stored["variables"]}
+        if ema and stored.get("ema") is None:
+            raise ValueError("the run keeps no EMA; request the live policy with ema=False")
+        averaged = stored.get("ema") is not None if ema is None else ema
+        if averaged:
+            template["ema"] = stored["ema"]
+        device_mesh = (DefaultMesh() if mesh is None else mesh).build()
+        chosen_layout = DefaultLayout() if layout is None else layout
+        placement = chosen_layout.shardings(device_mesh, template)
+        chosen_layout.check(template["variables"], placement["variables"], device_mesh)
+        selected = set()
+        if target is not None:
+            roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
+            selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["variables"])[0]
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) and
+                        any(path[:len(root)] == root for root in roots)}
+        template = jax.tree_util.tree_map_with_path(
+            lambda path, leaf, sharding: jax.ShapeDtypeStruct(
+                leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
+            template, placement)
+        values, _ = self.restore(template, step=step)
+        params = values["variables"]
+        if averaged:
+            params = merge(params, values["ema"])
+
+        return params
 
     def stored(self, step: int | str | None = None) -> Variables:
         """Return what the checkpoint at `step` holds, without reading its values.

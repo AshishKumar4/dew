@@ -13,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
-import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
@@ -21,7 +20,9 @@ from dew.interop.hf_decoders import (
     _MOE_SHARED,
     AltUpFields,
     DecoderFields,
+    MixtureFields,
     _base_config,
+    _decoder_tensors,
     _dew_path,
     _fixed_fields,
     _fixed_mixture,
@@ -35,6 +36,7 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _specified_layer_types,
 )
+from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.gemma3n import AltUp
@@ -80,36 +82,34 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     """
     full = records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
     sliding = records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
-    for kind, entry in (('sliding_attention', sliding),):
-        factor = entry.get('partial_rotary_factor')
-        if factor not in (None, 1, 1.0):
-            _refuse(f"rope_parameters.{kind} partial_rotary_factor {factor}",
-                    "partial rotary applies to the full layers only")
-        _rope_theta({**entry, 'rope_type': entry.get('rope_type', entry.get('type', 'default'))},
-                    f"rope_parameters.{kind}")
+    factor = sliding.get('partial_rotary_factor')
+    if factor not in (None, 1, 1.0):
+        _refuse(f"rope_parameters.sliding_attention partial_rotary_factor {factor}",
+                "partial rotary applies to the full layers only")
+    _rope_theta({**sliding, 'rope_type': sliding.get('rope_type', sliding.get('type', 'default'))},
+                "rope_parameters.sliding_attention")
     local = sliding.get('rope_theta', 10000.0)
-    kind, entry = 'full_attention', full
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    factor = entry.get('partial_rotary_factor')
+    rope_type = full.get('rope_type', full.get('type', 'default'))
+    factor = full.get('partial_rotary_factor')
     if rope_type == 'proportional':
         if factor is None:
             _refuse("rope_parameters.full_attention",
                     "proportional rope needs its partial_rotary_factor")
-        extra = sorted(set(entry) - {'rope_type', 'type', 'rope_theta',
-                                     'partial_rotary_factor', 'factor'})
-        if extra or entry.get('factor', 1.0) not in (1, 1.0):
+        extra = sorted(set(full) - {'rope_type', 'type', 'rope_theta',
+                                    'partial_rotary_factor', 'factor'})
+        if extra or full.get('factor', 1.0) not in (1, 1.0):
             _refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
         partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
         theta = records.number(
-            entry.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
+            full.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
         )
     elif rope_type in ('default', 'none'):
         if factor not in (None, 1, 1.0):
             _refuse("rope_parameters.full_attention partial_rotary_factor",
                     "partial rotary comes spelled proportional")
         partial = None
-        theta = _rope_theta(entry, 'rope_parameters.full_attention') or 10000.0
+        theta = _rope_theta(full, 'rope_parameters.full_attention') or 10000.0
     else:
         _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
@@ -398,14 +398,17 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         for field in ('num_experts', 'top_k_experts', 'moe_intermediate_size'):
             if hf_config.get(field) is None:
                 _refuse("enable_moe_block=True", f"the routed branch needs {field}")
-        config['mixture'] = {
-            'experts': records.integer(hf_config['num_experts'], 'num_experts'),
-            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
-            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
-            'parallel': True,
-        }
+        config['mixture'] = _parallel_experts(hf_config)
 
     return config
+
+
+def _parallel_experts(hf_config: Mapping[str, object]) -> MixtureFields:
+    """The routed branch a Gemma 4 layer runs beside its dense MLP."""
+    return {'experts': records.integer(hf_config['num_experts'], 'num_experts'),
+            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+            'parallel': True}
 
 
 def _gemma3_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -502,12 +505,12 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+                           config: Mapping[str, object]) -> LazyTensors:
     """Return the Gemma 4 checkpoint tensors for `model` and `variables`.
 
     This is the one text inverse standalone Gemma 4 and DiffusionGemma share.
-    `flat` holds the flattened params and `fixed` the constants, so a leaf is
-    read from the collection `model.layer_scalar` names.
+    Every layer scalar must sit in the collection `model.layer_scalar` names,
+    and nothing else in `constants`, before the shared writer reads them.
     """
     mode = model.layer_scalar
     if mode not in ('frozen', 'trainable'):
@@ -516,88 +519,20 @@ def _gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, obj
     constants = variables.get('constants', {})
     if not isinstance(params, Mapping) or not isinstance(constants, Mapping):
         raise ValueError('params and constants must contain native variable trees')
-    flat: dict[str, object] = dict(flatten_dict(dict(params), sep='.'))
-    fixed = flatten_dict(dict(constants), sep='.')
-    scalar_names = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
-    if set(fixed) - scalar_names:
-        raise ValueError(f'unrepresented Gemma4 constants: {sorted(set(fixed) - scalar_names)}')
-    for name in scalar_names:
-        if mode == 'frozen':
-            if name in flat or name not in fixed:
-                raise ValueError(f'{name} requires constants only under layer_scalar=frozen')
-            flat[name] = fixed[name]
-        elif name in fixed or name not in flat:
-            raise ValueError(f'{name} requires params only under layer_scalar=trainable')
-    inverse = {value: key for key, value in _GEMMA4_MOE.items()}
-    per_model = {'embed_tokens_per_layer.embedding': 'model.embed_tokens_per_layer.weight',
-                 'per_layer_model_projection.kernel': 'model.per_layer_model_projection.weight',
-                 'per_layer_projection_norm.scale': 'model.per_layer_projection_norm.weight'}
-    tensors: dict[str, np.ndarray] = {}
-    for name, raw in flat.items():
-        parts, leaf = name.split('.'), np.asarray(raw)
-        if parts[0].startswith('layers_') and tuple(parts[1:]) in inverse:
-            layer = parts[0].removeprefix('layers_')
-            target = f"model.layers.{layer}." + '.'.join(inverse[tuple(parts[1:])])
-        elif len(parts) == 5 and parts[1:3] == ['moe', 'experts']:
-            layer = parts[0].removeprefix('layers_')
-            stem = f'model.layers.{layer}.experts.'
-            if parts[-1] != 'kernel':
-                raise ValueError(f'unknown expert parameter {name!r}')
-            if parts[3] == 'up_proj':
-                if name.replace('.up_proj.', '.gate_proj.') not in flat:
-                    raise ValueError(f'{name} has no matching gate projection')
-                continue
-            if parts[3] == 'gate_proj':
-                up = np.asarray(flat[name.replace('.gate_proj.', '.up_proj.')])
-                tensors[stem + 'gate_up_proj'] = np.ascontiguousarray(
-                    np.swapaxes(np.concatenate([leaf, up], axis=-1), -1, -2))
-            elif parts[3] == 'down_proj':
-                tensors[stem + 'down_proj'] = np.ascontiguousarray(np.swapaxes(leaf, -1, -2))
-            else:
-                raise ValueError(f'unknown expert parameter {name!r}')
-            continue
-        elif name in per_model:
-            target = per_model[name]
-        elif (len(parts) == 3 and parts[0].startswith('layers_')
-              and parts[1] in ('per_layer_input_gate', 'per_layer_projection', 'post_per_layer_input_norm')):
-            ending = 'scale' if parts[1] == 'post_per_layer_input_norm' else 'kernel'
-            if parts[2] != ending:
-                raise ValueError(f'unknown per-layer input parameter {name!r}')
-            target = f"model.layers.{parts[0].removeprefix('layers_')}.{parts[1]}.weight"
-        else:
-            target = _hf_name(name, config)
-            if target is None:
-                continue
-        if target in tensors:
-            raise ValueError(f'duplicate canonical tensor {target!r}')
-        tensors[target] = np.ascontiguousarray(leaf.T if parts[-1] == 'kernel' else leaf)
-    return tensors
+    fixed = set(flatten_dict(dict(constants), sep='.'))
+    scalars = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
+    if fixed - scalars:
+        raise ValueError(f'unrepresented Gemma4 constants: {sorted(fixed - scalars)}')
+    trained = set(flatten_dict(dict(params), sep='.')) & scalars
+    held, stray = (fixed, trained) if mode == 'frozen' else (trained, fixed)
+    if held != scalars or stray:
+        raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
+                         f"{'constants' if mode == 'frozen' else 'params'} alone")
+    return _decoder_tensors(model, variables, config)
 
 
 def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
     return {**_gemma3_export(model), 'attn_logit_softcapping': model.attn_logit_softcap}
-
-
-def _gemma4_prepare(tensors: Mapping[str, np.ndarray],
-                     _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
-    """Split the routed branch's fused experts into dew's stacked `[E, in, out]` kernels.
-
-    `Gemma4TextExperts` holds `gate_up_proj` as `[E, 2 * expert, hidden]` with
-    the gate in the first rows and `down_proj` as `[E, hidden, expert]`, each
-    expert a torch Linear's `[out, in]`.
-    """
-    prepared: dict[str, np.ndarray] = {}
-    for name, tensor in tensors.items():
-        if name.endswith('.experts.gate_up_proj'):
-            width = tensor.shape[1] // 2
-            stem = name[:-len('gate_up_proj')]
-            prepared[stem + 'gate_proj'] = np.swapaxes(tensor[:, :width], 1, 2)
-            prepared[stem + 'up_proj'] = np.swapaxes(tensor[:, width:], 1, 2)
-        elif name.endswith('.experts.down_proj'):
-            prepared[name] = np.swapaxes(tensor, 1, 2)
-        else:
-            prepared[name] = tensor
-    return prepared
 
 
 # Gemma 4's routed branch, named for what each norm normalises, as the
@@ -629,3 +564,20 @@ def _gemma4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
         if len(tail) == 2 and tail[0] == 'experts' and tail[1] in _MOE_SHARED:
             return (*layer, 'moe', 'experts', tail[1], 'kernel')
     return _dew_path(name, config)
+
+
+_GEMMA4_MOE_NAMES = {path: name for name, path in _GEMMA4_MOE.items()}
+
+
+def _gemma4_export_path(name: str, config: Mapping[str, object]) -> str | None:
+    """`_gemma4_path` backwards; each stacked expert kernel takes the name its
+    fused tensor is packed from (`_FUSED_EXPERTS`)."""
+    layer, _, rest = name.partition('.')
+    tail = tuple(rest.split('.'))
+    if layer.startswith('layers_'):
+        stem = f"model.layers.{layer.removeprefix('layers_')}."
+        if tail in _GEMMA4_MOE_NAMES:
+            return stem + '.'.join(_GEMMA4_MOE_NAMES[tail])
+        if len(tail) == 4 and tail[:2] == ('moe', 'experts') and tail[3] == 'kernel':
+            return f'{stem}experts.{tail[2]}'
+    return _hf_name(name, config)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
@@ -9,9 +10,11 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 
+from dew.diffusion import schedules, transforms
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
 from dew.objectives.base import Variables
+from dew.records import json_value
 
 
 @struct.dataclass
@@ -88,7 +91,54 @@ class Process:
     sampling: NoiseScheduler | None = None
     interval: bool = False
 
+    def to_json(self) -> dict:
+        """The built-in schedule, prediction and weighting constructor records."""
+        def component(value, module):
+            cls = type(value)
+            if getattr(module, cls.__name__, None) is not cls:
+                raise TypeError(f"{cls.__name__} needs an explicit process record declaration")
+            if isinstance(value, schedules.DiscreteNoiseScheduler):
+                return {'name': 'DiscreteNoiseScheduler', 'fields': value._record_fields}
+            fields = {}
+            for name in inspect.signature(cls).parameters:
+                if name in ('args', 'kwargs'):
+                    continue
+                if name == 'inner':
+                    fields[name] = component(value.inner, transforms)
+                else:
+                    fields[name] = json_value(getattr(value, name), name)
+            return {'name': cls.__name__, 'fields': fields}
+        return {'schedule': component(self.schedule, schedules),
+                'prediction': component(self.prediction, transforms),
+                'weighting': component(self.weighting, transforms),
+                'sampling': None if self.sampling is None else component(self.sampling, schedules),
+                'interval': self.interval}
+
+    @classmethod
+    def from_json(cls, record: Mapping) -> Process:
+        """Rebuild only maintained built-in components; never import arbitrary record classes."""
+        def component[Part](spec, module, expected: type[Part]) -> Part:
+            name, fields = spec['name'], dict(spec['fields'])
+            member = getattr(module, name, None)
+            if not isinstance(member, type) or not issubclass(member, expected):
+                raise ValueError(f"{name!r} is not a built-in process component")
+            if 'inner' in fields:
+                fields['inner'] = component(fields['inner'], transforms, transforms.PredictionTransform)
+            return member(**fields)
+        weights = {'ScheduleWeighting': transforms.ScheduleWeighting,
+                   'MinSNR': transforms.MinSNR, 'VelocityLoss': transforms.VelocityLoss}
+        weighting = record['weighting']
+        if weighting['name'] not in weights:
+            raise ValueError(f"{weighting['name']!r} is not a built-in loss weighting")
+        return cls(component(record['schedule'], schedules, schedules.NoiseScheduler),
+                   component(record['prediction'], transforms, transforms.PredictionTransform),
+                   weights[weighting['name']](**dict(weighting['fields'])),
+                   None if record['sampling'] is None else component(record['sampling'], schedules,
+                                                                     schedules.NoiseScheduler),
+                   record['interval'])
+
     @property
+
     def sampler_schedule(self) -> NoiseScheduler:
         return self.schedule if self.sampling is None else self.sampling
 

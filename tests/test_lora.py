@@ -27,6 +27,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew import lora
@@ -778,3 +779,229 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     uneven = LoRA({**adapter.targets, ("params", "layers_1", "self_attn", "q_proj"): lora.Target(3, 4.0)})
     with pytest.raises(ValueError, match="targets differ"):
         uneven.target_at(("params", "layers_0_1", "self_attn", "q_proj"))
+
+
+# --------------------------------------------------------------------------
+# A published pipeline's own adapter, on its denoiser
+# --------------------------------------------------------------------------
+
+
+DENOISER_MODULES = ("to_q", "to_k", "to_v", "to_out.0")
+PROMPTS = ["a red bird", "two cats"]
+
+
+@pytest.fixture(scope="module")
+def pipelines(tmp_path_factory):
+    """The tiny FLUX and SD3 pipelines and the tiny SD one, loaded at float32."""
+    root = tmp_path_factory.mktemp("pipelines")
+    for family in ("flux", "sd3"):
+        with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
+            archive.extractall(root / family, filter="data")
+    with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
+        archive.extractall(root, members=[m for m in archive.getmembers() if m.name.startswith("sd/")],
+                           filter="data")
+    directories = {"flux": root / "flux" / "pipeline", "sd3": root / "sd3" / "pipeline", "sd": root / "sd"}
+    return {family: Pretrained.load(directory, dtype="float32", attention_impl="xla")
+            for family, directory in directories.items()}
+
+
+def _sampled(task) -> np.ndarray:
+    return np.asarray(task(PROMPTS, steps=2, key=1).host().images)
+
+
+def _wider(tree):
+    """Every floating leaf of `tree` in float64."""
+    return jax.tree.map(
+        lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+
+
+def _moved_b(tuned, seed: int):
+    """The tuned variables with every B drawn away from zero, as a run leaves them."""
+    keys = iter(jax.random.split(jax.random.key(seed), len(tuned.adapter.targets)))
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (0.2 * jax.random.normal(next(keys), leaf.shape, leaf.dtype)
+                            if path[-1].key == "lora_B" else leaf), tuned.variables)
+
+
+@pytest.mark.parametrize("family", ["flux", "sd3", "sd"])
+def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, pipelines):
+    """`source.lora(...)` binds the denoiser's projections the modules name,
+    never a text tower's: `q_proj` names only CLIP and T5 projections here,
+    so it matches nothing. B starts at zero, so the adapted denoiser computes
+    the source's own arithmetic plus exact zeros.
+
+    Called op by op, every base op sees the source's inputs, so one call
+    is bitwise the source's. Compiled whole, XLA fuses the zero branch's add
+    into the reductions that read a projection (the RMSNorms after `to_q`
+    and `to_k`), and how such a fusion vectorizes depends on the CPU: on
+    CI's AMD runner the two sampled programs part by a few float32 ulps. So
+    the sample is held to rounding, the adapted run as exact as the source,
+    both measured from the source in float64 (`reference_error`); a branch
+    that moved the output at all would sit far outside it."""
+    source = pipelines[family]
+    tuned = source.lora(rank=2, modules=DENOISER_MODULES, key=jax.random.key(0))
+    assert source.adapter is None and tuned.adapter is not None
+    assert tuned.adapter.targets and all(path[0] == "params" for path in tuned.adapter.targets)
+    task = source.text_to_image()
+    prepared = task.prepare(PROMPTS, key=1, steps=2)
+    time = jnp.full((prepared.noise.shape[0],), 0.7, jnp.float32)
+    called = [np.asarray(task.process.denoiser(bundle.model, bundle.variables, prepared.conditions)
+                         .raw(prepared.noise, time)) for bundle in (source, tuned)]
+    np.testing.assert_array_equal(*called)
+
+    def sampled(bundle, inputs) -> np.ndarray:
+        return np.asarray(bundle.text_to_image()(inputs, steps=2, key=1, decode=False).host().latents)
+
+    with jax.enable_x64():
+        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
+                                   variables=_wider(source.variables))
+        truth = sampled(wide, _wider(prepared))
+    assert_as_exact_as_the_reference(sampled(tuned, prepared), sampled(source, prepared), truth, family)
+    with pytest.raises(ValueError, match="q_proj match no projection"):
+        source.lora(rank=2, modules=("q_proj",), key=jax.random.key(0))
+    with pytest.raises(ValueError, match="already carries an adapter"):
+        tuned.lora(rank=2, modules=("to_q",), key=jax.random.key(1))
+
+
+@pytest.mark.parametrize("family", ["flux", "sd3"])
+def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipelines):
+    """The adapted pipeline's objective trains the factors: after three steps
+    the base transformer, the text towers and the VAE are bitwise where they
+    started, every B has moved, and the trained state publishes a task."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    tuned = pipelines[family].lora(rank=2, modules=DENOISER_MODULES, key=jax.random.key(0))
+    objective = tuned.diffusion_objective(ema_decay=None, unconditional_prob=0.0)
+    assert type(objective) is DiffusionObjective and objective.trainable == tuned.adapter.trainable
+    rows, (height, width, channels) = jax.device_count(), objective.inputs.sample.shape
+    batch = {"image": np.tile(np.arange(height * width * channels, dtype=np.uint8).reshape(
+                 1, height, width, channels), (rows, 1, 1, 1)),
+             **objective.inputs.tokenize([PROMPTS[row % 2] for row in range(rows)])}
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(3))
+    initial = trainer.initial_state()
+    data = Dataset(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
+    state = trainer.fit(data, steps=3, log_every=3)
+
+    assert set(_flat(state.variables["params"])) == {
+        f"{'.'.join(path[1:])}.{factor}" for path in tuned.adapter.targets for factor in lora.FACTORS}
+    for collection in (FROZEN, "encoders", "autoencoder"):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
+    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.variables["params"]).items()
+               if name.endswith("lora_B"))
+    assert np.isfinite(_sampled(objective.pipeline(state))).all()
+    with pytest.raises(ValueError, match="already selects what trains"):
+        tuned.diffusion_objective(trainable=lambda path: True)
+
+
+@pytest.mark.parametrize("family", ["flux", "sd3"])
+def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipelines, tmp_path):
+    """`adapter.save` writes the Diffusers file under the denoiser's component,
+    which `LoRA.load` reads back to the same adapter, and `save` writes the
+    pipeline with the factors merged into its kernels: reloaded, it samples
+    exactly what the source does over the merged weights."""
+    source = pipelines[family]
+    tuned = source.lora(rank=2, modules=DENOISER_MODULES, key=jax.random.key(0))
+    variables = _moved_b(tuned, 7)
+    tuned.adapter.save(variables, tmp_path / "adapter")
+    tensors, metadata = read_file(tmp_path / "adapter" / lora.DIFFUSERS_WEIGHTS)
+    assert tensors and all(name.startswith("transformer.") for name in tensors)
+    assert json.loads(metadata[lora.DIFFUSERS_METADATA])["transformer.r"] == 2
+    loaded, read = LoRA.load(source.model, source.variables, source.layouts, tmp_path / "adapter")
+    assert loaded == tuned.adapter
+    for name, leaf in _flat(thaw(read)).items():
+        if "lora_" in name:
+            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(variables)[name]), err_msg=name)
+
+    tuned.save(tmp_path / "merged", variables=variables)
+    reloaded = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="xla")
+    merged = dataclasses.replace(source, variables=tuned.adapter.merge(variables))
+    np.testing.assert_array_equal(_sampled(reloaded.text_to_image()), _sampled(merged.text_to_image()))
+    assert np.abs(_sampled(merged.text_to_image()) - _sampled(source.text_to_image())).max() > 0
+
+
+@pytest.mark.parametrize("family", ["flux", "sd3"])
+def test_diffusers_loads_a_saved_pipeline_adapter_and_predicts_what_dew_does(family, pipelines, tmp_path):
+    """tools/lora_reference.py wrote this file with `source.lora(...).adapter.save`
+    and recorded the transformer's prediction after Diffusers'
+    `load_lora_weights` on fixed inputs. The file reads back here to the
+    same prediction, and writes back unchanged."""
+    source = pipelines[family]
+    directory = FIXTURES / f"{family}-tiny"
+    adapter, variables = LoRA.load(source.model, source.variables, source.layouts, directory)
+    with np.load(directory / "reference.npz") as data:
+        arrays = {key: data[key] for key in data}
+    guidance = jnp.asarray(arrays["guidance"]) if arrays["guidance"].size else None
+    condition = DenoisingCondition(jnp.asarray(arrays["context"]), jnp.asarray(arrays["pooled"]),
+                                   guidance=guidance)
+    own = {name: tree for name, tree in variables.items() if name not in ("encoders", "autoencoder")}
+    predicted = adapter.adapt(source.model).apply(
+        own, jnp.asarray(arrays["latent"]), jnp.asarray(arrays["times"]), condition)
+    gap = np.abs(np.asarray(predicted) - arrays["adapted"]).max() / np.abs(arrays["adapted"]).max()
+    assert gap < 1e-5, gap
+    assert np.abs(arrays["adapted"] - arrays["base"]).max() > 1e-2
+
+    adapter.save(variables, tmp_path)
+    ours, metadata = read_file(tmp_path / lora.DIFFUSERS_WEIGHTS)
+    theirs, published = read_file(directory / lora.DIFFUSERS_WEIGHTS)
+    assert ours.keys() == theirs.keys()
+    for name in theirs:
+        np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+    assert json.loads(metadata[lora.DIFFUSERS_METADATA]) == json.loads(published[lora.DIFFUSERS_METADATA])
+
+
+def test_a_filter_trains_the_denoising_loss_alone(pipelines):
+    """`trainable` chooses among the model's leaves, so a loss head beside
+    them, or a subclass with a loss of its own, refuses one at init."""
+    from test_mean_flow import objective as mean_flow
+
+    tuned = pipelines["sd3"].lora(rank=2, modules=("to_q",), key=jax.random.key(0))
+    with pytest.raises(ValueError, match="DiffusionObjective trains a loss or heads of its own"):
+        tuned.diffusion_objective(uncertainty=8).init(jax.random.key(0))
+    own_loss = mean_flow()
+    own_loss.trainable = lambda path: True
+    with pytest.raises(ValueError, match="MeanFlowObjective trains a loss or heads of its own"):
+        own_loss.init(jax.random.key(0))
+
+
+def test_a_run_config_adapter_trains_a_diffusion_models_factors_and_nothing_else(tmp_path):
+    """`--lora` on a diffusion run, as on a decoder run: the adapted model's
+    init draws the factors, and two steps move them and leave the base
+    weights and the text tower bitwise."""
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import TFDSImages
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+    from dew.sampling import Euler
+
+    rows = jax.device_count()
+    config = DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                         "num_heads": 2}, dtype="float32", attention_impl="xla"),
+        data=TFDSImages(image_size=8), solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
+        val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2, eval_every=None,
+                              checkpoint_every=None, compilation_cache_dir=None))
+    objective = config.build()
+    # The DiT's blocks are adaLN-Zero: with their modulation frozen at zero, no
+    # branch inside them carries a gradient, and the output projection does.
+    held = objective.model_variables(objective.init(jax.random.key(0)))
+    adapter, _ = LoRA.fresh(objective.model, held, {}, rank=2, alpha=4.0, modules=("final_proj",),
+                            key=jax.random.key(1))
+    config = dataclasses.replace(config, lora=adapter)
+    batch = {"image": np.full((rows, 8, 8, 3), 200, np.uint8), **objective.inputs.tokenize(["a"] * rows)}
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
+
+    state = config.train(objective, data, name="run")
+
+    assert objective.trainable is not None
+    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
+    moved = _flat(state.variables["params"])
+    assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
+                          for target in adapter.targets for factor in lora.FACTORS}
+    for name, leaf in moved.items():
+        assert bool(jnp.any(leaf != _flat(initial.variables["params"])[name])), f"{name} did not move"
+    for collection in (FROZEN, "encoders"):
+        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+                                 jax.tree.leaves(state.variables[collection]), strict=True):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)

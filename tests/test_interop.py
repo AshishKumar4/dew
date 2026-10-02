@@ -441,7 +441,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     from test_inference import make_lm_run
 
     import dew
-    from dew.interop import Pretrained, export_run
+    from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
@@ -449,7 +449,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     task = dew.pipeline(str(run))
     destination = tmp_path / "export"
 
-    export_run(str(run), destination)
+    Pretrained.from_run(str(run)).save(destination)
 
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "generation_config.json", "model.safetensors"}
@@ -466,11 +466,11 @@ def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
     export."""
     from test_inference import make_run
 
-    from dew.interop import export_run
+    from dew.interop import Pretrained
 
     make_run(tmp_path)
     with pytest.raises(ValueError, match="SimpleDiT has no published layout"):
-        export_run(str(tmp_path), tmp_path / "export")
+        Pretrained.from_run(str(tmp_path)).save(tmp_path / "export")
 
 
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
@@ -496,14 +496,14 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     the published config the run recorded rather than a derived one."""
     from test_inference import make_block_run
 
-    from dew.interop import Pretrained, export_run
+    from dew.interop import Pretrained
 
     run = tmp_path / "run"
     run.mkdir()
     make_block_run(run)
     destination = tmp_path / "export"
 
-    export_run(str(run), destination, ema=False)
+    Pretrained.from_run(str(run), ema=False).save(destination)
 
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
     task = dew.pipeline(str(run), ema=False)

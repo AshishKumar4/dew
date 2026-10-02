@@ -169,7 +169,7 @@ def test_the_uncertainty_head_learns_each_levels_weighted_error():
         for draw in range(16):
             noise = jax.random.normal(jax.random.PRNGKey(draw), samples.shape)
             noisy, c_in, target = process.prediction.forward_diffusion(samples, noise, rates)
-            output = objective.model.apply(objective.trainable(params), noisy * c_in,
+            output = objective.model.apply(objective.model_variables(params), noisy * c_in,
                                            schedule.model_time(times))
             prediction = process.prediction.pred_transform(noisy, output, rates, times)
             errors.append(jnp.mean(optax.l2_loss(prediction, target)

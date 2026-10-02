@@ -107,7 +107,7 @@ class Recipe:
                   f"({stage.kind}, {stage.steps} steps)")
             states.append(trainer.fit(
                 stage.data.load(batch=self.batch), steps=stage.steps))
-            variables = states[-1].params
+            variables = states[-1].variables
         return states
 
     def _build(self, stage: Stage,

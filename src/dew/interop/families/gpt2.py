@@ -5,7 +5,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from dew import records
-from dew.interop.hf_decoders import DecoderFields, _dew_path, _refuse
+from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _refuse, _renamed_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -54,7 +54,7 @@ def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
                    _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-    """Split Conv1D qkv without copying the mapped checkpoint's bytes."""
+    """Check and drop the fixed attention buffers, and nest the bare model's names."""
     prepared = {}
     for name, tensor in tensors.items():
         # The original gpt2 safetensors stores the bare GPT2Model and its
@@ -70,36 +70,37 @@ def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
             if tensor.shape != () or tensor != -1e4:
                 raise ValueError(f'{name} must hold the historical -10000 mask sentinel')
             continue
-        if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')):
-            name = 'transformer.' + name
-        if '.attn.c_attn.' in name:
-            axis = 1 if name.endswith('.weight') else 0
-            for projection, part in zip(('q_proj', 'k_proj', 'v_proj'),
-                                        np.split(tensor, 3, axis=axis), strict=True):
-                prepared[name.replace('attn.c_attn', f'self_attn.{projection}')] = (
-                    part.T if axis == 1 else part)
-        else:
-            linear = any(part in name for part in ('.attn.c_proj.', '.mlp.c_fc.', '.mlp.c_proj.'))
-            prepared[name] = tensor.T if linear and name.endswith('.weight') else tensor
+        prepared[_nested(name)] = tensor
     return prepared
 
 
+def _nested(name: str) -> str:
+    return 'transformer.' + name if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')) else name
+
+
+_GPT2_NAMES: Renames = (
+    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
+    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
+    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
+    ('attn.c_proj', 'self_attn.o_proj'), ('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
+
+# Conv1D stores `[in, out]` where the path map reads a torch Linear's
+# `[out, in]`, and c_attn holds q, k and v side by side on `out`.
+_QKV = ('q_proj', 'k_proj', 'v_proj')
+_GPT2_PACKED = (
+    Packed('.attn.c_attn.weight', tuple(f'.self_attn.{part}.weight' for part in _QKV), 0, (1, 0)),
+    Packed('.attn.c_attn.bias', tuple(f'.self_attn.{part}.bias' for part in _QKV), 0),
+    *(Packed(f'.{conv}.weight', (f'.{conv}.weight',), 0, (1, 0))
+      for conv in ('attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')))
+
+
 def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')):
-        name = 'transformer.' + name
+    name = _nested(name)
     # Alias inspection sees raw names before preparation. A fused qkv
     # has three leaves, and the fixed buffers are validated by preparation.
     if '.attn.c_attn.' in name or name.endswith(('.attn.bias', '.attn.masked_bias')):
         return None
-    if name == 'transformer.wpe.weight':
-        return ('params', 'embed_positions', 'embedding')
-    name = name.replace('transformer.wte.', 'model.embed_tokens.')
-    name = name.replace('transformer.ln_f.', 'model.norm.')
-    name = name.replace('transformer.h.', 'model.layers.')
-    name = name.replace('.ln_1.', '.input_layernorm.').replace('.ln_2.', '.post_attention_layernorm.')
-    name = name.replace('.attn.c_proj.', '.self_attn.o_proj.')
-    name = name.replace('.mlp.c_fc.', '.mlp.up_proj.').replace('.mlp.c_proj.', '.mlp.down_proj.')
-    return _dew_path(name, config)
+    return _renamed_path(_GPT2_NAMES, name, config)
 
 
 def _gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -120,40 +121,3 @@ def _gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
         'num_key_value_heads', 'head_dim', 'intermediate_size',
         'max_position_embeddings', 'rms_norm_eps', 'attention_bias', 'hidden_act', 'rope_theta')))
     return config
-
-
-def _gpt2_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                         config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
-    from flax.traverse_util import flatten_dict
-
-    from dew.interop.hf_decoders import _hf_name
-
-    params = variables.get('params')
-    if not isinstance(params, Mapping):
-        raise ValueError('params must contain the decoder parameter tree')
-    flat = flatten_dict(dict(params), sep='.')
-    tensors = {}
-    for name, value in flat.items():
-        if '.self_attn.' in name and any(f'.{part}.' in name for part in ('q_proj', 'k_proj', 'v_proj')):
-            continue
-        if name == 'embed_positions.embedding':
-            target = 'transformer.wpe.weight'
-        else:
-            target = _hf_name(name, config)
-            if target is None:
-                continue
-            target = target.replace('model.embed_tokens.', 'transformer.wte.')
-            target = target.replace('model.norm.', 'transformer.ln_f.')
-            target = target.replace('model.layers.', 'transformer.h.')
-            target = target.replace(".input_layernorm.", ".ln_1.").replace(
-                ".post_attention_layernorm.", ".ln_2."
-            )
-            target = target.replace('.self_attn.o_proj.', '.attn.c_proj.')
-            target = target.replace('.mlp.up_proj.', '.mlp.c_fc.').replace('.mlp.down_proj.', '.mlp.c_proj.')
-        tensors[target] = np.asarray(value).T if name == 'lm_head.kernel' else np.asarray(value)
-    for index in range(model.num_layers):
-        for leaf, suffix in (('kernel', 'weight'), ('bias', 'bias')):
-            values = [np.asarray(flat[f'layers_{index}.self_attn.{part}.{leaf}'])
-                      for part in ('q_proj', 'k_proj', 'v_proj')]
-            tensors[f'transformer.h.{index}.attn.c_attn.{suffix}'] = np.concatenate(values, axis=-1)
-    return tensors

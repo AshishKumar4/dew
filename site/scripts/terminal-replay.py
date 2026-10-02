@@ -17,7 +17,7 @@ import pyte
 from capture_snippets import DATA, DimScreen, terminal_cells
 
 
-def frames_from_cast(cast: str, count: int = 97) -> dict:
+def frames_from_cast(cast: str, count: int = 41) -> dict:
     records = [json.loads(line) for line in cast.splitlines() if line.strip()]
     header, events = records[0], records[1:]
     if header.get("version") != 2 or not events:
@@ -25,7 +25,9 @@ def frames_from_cast(cast: str, count: int = 97) -> dict:
     seconds = events[-1][0]
     if seconds <= 0 or any(a[0] > b[0] for a, b in pairwise(events)):
         raise ValueError("recording times must increase and end after zero")
-    screen = DimScreen(header["width"], header["height"])
+    source = DimScreen(header["width"], header["height"])
+    source_stream = pyte.Stream(source)
+    screen = DimScreen(header["width"], max(200, header["height"]))
     stream = pyte.Stream(screen)
     frames = []
     index = 0
@@ -36,6 +38,7 @@ def frames_from_cast(cast: str, count: int = 97) -> dict:
             timestamp, kind, payload = events[index]
             if kind == "o":
                 stream.feed(payload)
+                source_stream.feed(payload)
             index += 1
             # A PTY may split one refresh over several reads. Snapshot after
             # that burst, not halfway through the panel being repainted.
@@ -69,6 +72,15 @@ def frames_from_cast(cast: str, count: int = 97) -> dict:
     if len(frames) > count:
         frames = [frames[round(i * (len(frames) - 1) / (count - 1))] for i in range(count)]
     frames[-1]["time"] = seconds
+    # Keeping scrollback must not alter the source viewport, even its blank
+    # cells and styles. Check the actual terminal cells before serializing.
+    offset = screen.cursor.y - source.cursor.y
+    for y in range(header["height"]):
+        for x in range(header["width"]):
+            if screen.buffer[offset + y][x] != source.buffer[y][x]:
+                raise ValueError(f"expanded viewport changes recorded cell ({x}, {y})")
+    source_rows = terminal_cells(source, header["width"])
+    source_rows += [[] for _ in range(header["height"] - len(source_rows))]
     elapsed = 0
     for previous, frame in zip([None, *frames[:-1]], frames, strict=True):
         if previous is not None:
@@ -76,6 +88,8 @@ def frames_from_cast(cast: str, count: int = 97) -> dict:
         frame["at"] = elapsed
     return {"columns": header["width"], "seconds": seconds,
             "duration": elapsed, "frames": frames,
+            "source_rows": header["height"], "viewer_rows": screen.lines,
+            "final_cursor_row": screen.cursor.y - (panels[-1] if panels else 0), "source_final_screen": source_rows,
             "sha256": hashlib.sha256(cast.encode()).hexdigest()}
 
 
@@ -95,9 +109,10 @@ def main() -> None:
     (output / "train.cast").write_text(cast)
     (output / "train.json").write_text(json.dumps(replay, separators=(",", ":")) + "\n")
     capture = {"about": "Terminal frames from public/hero/train.cast, prepared by scripts/terminal-replay.py.",
-               "meta": meta, "hero": {"returncode": 0, "seconds": replay["seconds"],
+               "meta": meta, "hero": {"returncode": 0, "seconds": meta.get("wall_seconds", replay["seconds"]),
                                       "columns": replay["columns"], "screen": replay["frames"][-1]["screen"],
                                       "rows": max(len(frame["screen"]) for frame in replay["frames"]),
+                                      "source_rows": replay["source_rows"], "viewer_rows": replay["viewer_rows"],
                                       "replay": "/hero/train.json"}}
     (DATA / "capture.json").write_text(json.dumps(capture, indent="\t") + "\n")
     (DATA / "hero.py").write_text(options.script.read_text())

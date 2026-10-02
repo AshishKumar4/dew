@@ -209,7 +209,7 @@ def dew_side(args, images, total, attention):
             t, noise = batch["t"], batch["noise"]
             rates = broadcast_rates(schedule, t, samples)
             noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
-            preds = self.model.apply(self.trainable(variables), noisy * c_in, schedule.model_time(t),
+            preds = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
                                      train=True, rngs={"dropout": step.key})
             preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
             losses = optax.l2_loss(preds, target)

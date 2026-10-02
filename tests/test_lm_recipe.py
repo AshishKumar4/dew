@@ -666,7 +666,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
 
 
 def test_the_shipped_lm_run_config_round_trips_through_its_record():
-    """`LMRunConfig` is what `TextGeneration.from_run` and `export_run` read
+    """`LMRunConfig` is what `TextGeneration.from_run` and `Pretrained.from_run(...).save(...)` read
     back: the tokenizer the ids came from, the preview budget and the
     sampling policy survive `run.json` as the values they went in as. The
     recipe's own class is that one narrowed to token files, so a chat spec

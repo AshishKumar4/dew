@@ -302,14 +302,14 @@ class ConsistencyDistillation:
     def teacher_variables(self, variables: Variables | None) -> Variables:
         """The teacher model's variables: a saved distilled tree's own, else
         the teacher run's published ones."""
-        from dew.sampling.pipelines import restore_variables
+        from dew.checkpoints import Checkpoints
 
         from .objective import TEACHER, _without_loss_heads
 
         if variables is not None:
             return variables[TEACHER]
-        restored = restore_variables(
-            self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None
+        restored = Checkpoints(self.teacher).variables(
+            ema=None, step=None, mesh=None, layout=None, param_dtype=None
         )
         return _without_loss_heads({name: tree for name, tree in restored.items()
                                     if name not in ("encoders", "autoencoder")})
@@ -334,15 +334,15 @@ class GuidanceDistillation:
     def teacher_objective(self, variables: Variables | None) -> tuple[DiffusionObjective, Variables]:
         """The teacher run's objective over its variables: a saved student
         tree's copy of them, else the run's published ones."""
-        from dew.sampling.pipelines import restore_variables
+        from dew.checkpoints import Checkpoints
 
         from .objective import TEACHER
 
         held = (
             variables[TEACHER]
             if variables is not None
-            else restore_variables(
-                self.teacher, ema=None, step=None, mesh=None, layout=None, param_dtype=None
+            else Checkpoints(self.teacher).variables(
+                ema=None, step=None, mesh=None, layout=None, param_dtype=None
             )
         )
         return DiffusionRunConfig.load(self.teacher).build(variables=held), held
@@ -741,7 +741,7 @@ class DiffusionRunConfig(RunConfig):
         name, revision = split_revision(self.pretrained)
         height, width = self.sample_field().shape[-3:-1]
         return load_diffusion_source(
-            name, revision=revision, dtype=self.model.dtype,
+            name, revision=revision, dtype=self.model.dtype or "bfloat16",
             param_dtype=self.model.param_dtype or "float32",
             attention_impl=self.model.attention_impl, size=(height, width), variables=variables)
 

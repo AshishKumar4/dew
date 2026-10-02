@@ -59,8 +59,9 @@ def main(repo: str, revision: str) -> dict[str, float]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from dew.diffusion.process import DenoisingCondition
+    from dew.inputs.diffusion import HiddenStatesConditioner
     from dew.interop import sources
-    from dew.interop.pretrained import _denoiser, _diffusion_vae, load_hidden_states_conditioner
+    from dew.interop.pretrained import _denoiser, _diffusion_vae
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -76,7 +77,7 @@ def main(repo: str, revision: str) -> dict[str, float]:
             device=device).cpu().numpy()
     del text_encoder
     free()
-    encoder = load_hidden_states_conditioner(str(directory), dtype="float32", param_dtype="float32")
+    encoder = HiddenStatesConditioner.from_pretrained(str(directory), dtype="float32", param_dtype="float32")
     gaps["context"] = gap(encoder.encode(encoder.params, encoder.tokenize(PROMPTS)).context, expected)
     del encoder
     gc.collect()
