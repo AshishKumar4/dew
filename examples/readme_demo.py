@@ -116,7 +116,7 @@ def flow_images(out: Path):
     )
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-        sampler=Euler(), guidance=None, steps=4,
+        solver=Euler(), guidance=None, steps=4,
     )
     trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(3))
     state = trainer.fit(data, steps=3, log_every=1)

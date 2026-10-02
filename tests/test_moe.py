@@ -102,12 +102,12 @@ def mixtral_router(**overrides) -> Router:
 
 def deepseek_router(**overrides) -> Router:
     config = CONFIG["deepseek"]
-    settings = dict(score_function='sigmoid',
-                    normalize_weights=config["norm_topk_prob"],
-                    routed_scaling_factor=config["routed_scaling_factor"],
-                    expert_groups=config["n_group"],
-                    groups_per_token=config["topk_group"],
-                    expert_bias=True)
+    settings = {"score_function": 'sigmoid',
+                    "normalize_weights": config["norm_topk_prob"],
+                    "routed_scaling_factor": config["routed_scaling_factor"],
+                    "expert_groups": config["n_group"],
+                    "groups_per_token": config["topk_group"],
+                    "expert_bias": True}
     settings.update(overrides)
     return Router(num_experts=config["n_routed_experts"],
                   in_features=config["hidden_size"],
@@ -272,9 +272,9 @@ def test_deepseek_parity_needs_the_shared_branch():
 
 def v4_router(**overrides) -> Router:
     config = CONFIG["deepseek_v4"]
-    settings = dict(score_function='sqrtsoftplus',
-                    routed_scaling_factor=config["routed_scaling_factor"],
-                    expert_bias=True)
+    settings = {"score_function": 'sqrtsoftplus',
+                    "routed_scaling_factor": config["routed_scaling_factor"],
+                    "expert_bias": True}
     settings.update(overrides)
     return Router(num_experts=config["num_local_experts"],
                   in_features=config["hidden_size"],
@@ -527,7 +527,7 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
     bincount defaults to int64 under x64; TPU ragged-dot cannot lower those
     group sizes. Exercise the routed experts, not just a hand-typed count.
     """
-    with jax.enable_x64(False):
+    with jax.enable_x64(new_val=False):
         experts, variables, x, weights, indices = routed_experts(top_k=2)
 
     def step(variables, x):
@@ -602,8 +602,8 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 # --------------------------------------------------------------------------
 
 def decoder_fields(**overrides) -> dict:
-    settings = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=2,
-                    num_kv_heads=1, mlp_features=64, max_seq_len=SEQ_LEN)
+    settings = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 2,
+                    "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
     settings.update(overrides)
     return settings
 
@@ -619,8 +619,6 @@ def leaf_names(variables):
 
 @pytest.mark.parametrize("settings,expected", [
     ({"mixture": {"experts": 4}}, (0, 1, 2, 3)),
-    ({"mixture": {"experts": 4, "every": 2}}, (1, 3)),
-    ({"mixture": {"experts": 4, "every": 4}}, (3,)),
     ({"mixture": {"experts": 4, "layers": (0, 2)}}, (0, 2)),
     ({}, ()),
 ])
@@ -680,8 +678,8 @@ def test_the_mixture_sizes_the_experts_and_the_shared_branch_apart():
 
 
 @pytest.mark.parametrize("mixture, message", [
-    (dict(experts=8, expert_features=0), "expert_features"),
-    (dict(experts=8, shared_features=-1), "shared_features"),
+    ({"experts": 8, "expert_features": 0}, "expert_features"),
+    ({"experts": 8, "shared_features": -1}, "shared_features"),
 ])
 def test_a_misconfigured_width_is_rejected(mixture, message):
     with pytest.raises(ValueError, match=message):
@@ -728,9 +726,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
 
 @pytest.mark.parametrize("mixture,message", [
     ({"experts": 0}, "dense model has no mixture"),
-    ({"experts": 4, "every": 2, "layers": (1,)}, "only"),
     ({"experts": 4, "layers": (4,)}, "outside"),
-    ({"experts": 4, "every": 0}, "positive"),
     ({"experts": 4, "top_k": 5}, "top_k"),
     ({"experts": 4, "implementation": "megablox"}, "implementation"),
 ])
@@ -748,11 +744,11 @@ def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
     same weights through either kernel give the same logits."""
     pytest.importorskip("tokamax")
     tokens = jax.random.randint(jax.random.key(0), (2, SEQ_LEN), 0, VOCAB)
-    reference = decoder(mixture=Mixture(experts=4, top_k=2, every=2))
+    reference = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1, 3)))
     variables = reference.init(jax.random.key(1), tokens)
     expected = reference.apply(variables, tokens)
     logits = decoder(mixture=Mixture(
-        experts=4, top_k=2, every=2, implementation='tokamax')).apply(variables, tokens)
+        experts=4, top_k=2, layers=(1, 3), implementation='tokamax')).apply(variables, tokens)
 
     # Observed 0 on CPU, where tokamax lowers to the same ragged_dot.
     assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5
@@ -1049,7 +1045,7 @@ def single_device_bias(steps):
     A fresh process is the only way to change the device count, so this
     subprocess runs the same trainer at one device and prints the bias.
     """
-    script = """
+    script = f"""
 import numpy as np, jax, optax
 from dew.registry import models
 import dew.nn.backbones
@@ -1057,16 +1053,16 @@ from dew.objectives.lm import LMObjective
 from dew.training import Trainer, MeshSpec, Layout
 import test_moe as suite
 
-model = models.build("causal_transformer", **{
+model = models.build("causal_transformer", **{{
     **suite.moe_config(),
-    "mixture": {**suite.moe_config()["mixture"], "bias": True}})
+    "mixture": {{**suite.moe_config()["mixture"], "bias": True}}}})
 trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
-state = trainer.fit(suite.Data(suite.token_batches), steps=%d)
+state = trainer.fit(suite.Data(suite.token_batches), steps={steps})
 bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
-""" % steps
+"""
     environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
                    "JAX_PLATFORMS": "cpu",
                    "PYTHONPATH": os.pathsep.join(

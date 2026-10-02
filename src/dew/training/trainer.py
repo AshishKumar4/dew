@@ -23,7 +23,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -104,7 +104,6 @@ from dew.training.transaction import Transaction, compact_qk, with_ema
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import TrainerConfig
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -123,14 +122,6 @@ microbatch was accepted."""
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
-
-ObjectiveLoss = TypeVar("ObjectiveLoss")
-ObjectiveEffects = TypeVar("ObjectiveEffects")
-"""The two parameters of the objective `Trainer.from_config` is handed.
-
-A classmethod cannot solve the class's own `Loss` and `Effects` from an
-argument, since an unparameterized `Trainer.from_config` binds them to their
-defaults. So the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -244,16 +235,28 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
 
 
 def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
-    """XLA options for this objective's training step on this device: Triton
-    GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
-    no mixer of the model keeps them, unless the run set the flag itself."""
-    if (device_generation() not in TRITON_GEMM_OFF_GENERATIONS
-            or xla_flag('xla_gpu_enable_triton_gemm') is not None):
-        return None
+    """XLA options for this objective's training step on this device, each
+    unless the run set its flag itself.
+
+    On a GPU, dots that share an input (q, k and v; gate and up) run apart:
+    XLA's dot merger would run them as one GEMM over their weights
+    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024,
+    and an RTX 4080 trained Qwen3-0.6B's widths, a 3-layer decoder,
+    SimpleDiT-B and the hybrid DiT 0.4-3.5% faster without it
+    (docs/performance.md), full steps from 32 tokens up. Decoding keeps the
+    merger: its 32-token GEMMs lost 5-15% apart, as a LoRA step of 128
+    tokens or fewer loses up to 3.6%. And Triton GEMM fusions go off where
+    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model
+    keeps them."""
+    generation = device_generation()
+    options: dict[str, bool | int] = {}
+    if generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None:
+        options['xla_gpu_dot_merger_threshold_mb'] = 0
     model = _model_of(objective)
-    if model is None or _keeps_triton_gemm(model):
-        return None
-    return {'xla_gpu_enable_triton_gemm': False}
+    if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
+            and model is not None and not _keeps_triton_gemm(model)):
+        options['xla_gpu_enable_triton_gemm'] = False
+    return options or None
 
 
 def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
@@ -261,12 +264,13 @@ def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
-    The Triton GEMM fusions can hold fewer temporaries, so they come back
-    before the ladder's first rung."""
+    The Triton GEMM fusions can hold fewer temporaries, so XLA's defaults
+    come back before the ladder's first rung."""
     default = program.compile()
     if not step_fits(default, mesh, held):
         return executable, False
-    _log.warning("the step fits the devices only with XLA's Triton GEMM fusions; compiling it with them")
+    _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
+                 "merged dots); compiling it with them")
     return default, True
 
 
@@ -779,51 +783,6 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults = False
         self._resumed_rung: JSON = None
 
-    @classmethod
-    def from_config(
-        cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
-        optimizer: optax.GradientTransformation, *, key: int | jax.Array,
-        checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
-        step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
-                        optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-    ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
-        """Build the trainer a `TrainerConfig` describes.
-
-        The mapping from the config's field names to this constructor's is
-        written once, here. `mesh`, `layout`, `accumulation`,
-        `dynamic_scale` and `profile` are the config fields a trainer holds.
-        `key` is the run key, which `RunConfig.train` draws from
-        `config.key`.
-
-        The rest of the config belongs to the capabilities and to the loop,
-        and reaches them from their own owners. `checkpoint_dir` and `keep`
-        build the `Checkpoints` passed in here, and `wandb` the tracker.
-        `xla_flags`, `multi_host` and `compilation_cache_dir` are read by
-        `prepare_process` before JAX opens a backend. `batch_ramp` wraps the
-        dataset with `dew.data.ramped`. `steps`, `epochs`, `log_every`,
-        `eval_every` and `checkpoint_every` are arguments of `fit`. `step`
-        and `rollout` are not configurable: they are code a caller hands
-        over.
-
-        It builds a `Trainer`, whatever it is called on. The objective's two
-        parameters are the factory's own, so a subclass that wants one of
-        itself constructs it.
-        """
-        return Trainer(
-            objective, optimizer,
-            key=key,
-            mesh=config.mesh,
-            layout=config.layout,
-            accumulation=config.accumulation,
-            dynamic_scale=config.dynamic_scale,
-            checkpoints=checkpoints,
-            tracker=tracker,
-            step=step,
-            rollout=rollout,
-            profile=config.profile,
-        )
-
     # ------------------------------------------------------------------
     # The state
     # ------------------------------------------------------------------
@@ -968,8 +927,6 @@ class Trainer(Generic[Loss, Effects]):
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
-        template = self._with_drawn_tables(template, shardings, checkpoints.stored(resume),
-                                           initializer, key)
         state, position = checkpoints.restore(template, resume,
                                               share=DataPartition.of(self.device_mesh))
         self._climb_to(checkpoints.rung(resume))
@@ -1039,42 +996,6 @@ class Trainer(Generic[Loss, Effects]):
         # buffer the target shares with the source, which donation would free.
         owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, initializer)
         return jax.device_put(owned, jax.tree_util.tree_map_with_path(placement, initializer))
-
-    def _with_drawn_tables(self, template: TrainState, shardings: Placement[TrainState],
-                           stored: Variables, initializer, key) -> TrainState:
-        """`template` with every Fourier table the checkpoint lacks drawn by
-        the fresh init, where `restore` keeps it (`is_fourier_table`).
-
-        A checkpoint written before the table became a variable trained
-        against the table init draws. Only those leaves are computed: the
-        rest of the initial state is dead code to the compiler.
-        """
-        from dew.checkpoints import absent
-        from dew.nn.blocks import is_fourier_table
-
-        drawn = [(field, path) for field in ("params", "ema")
-                 if getattr(template, field) is not None and stored.get(field) is not None
-                 for path in absent(getattr(template, field), stored[field]) if is_fourier_table(path)]
-        if not drawn:
-            return template
-
-        def leaf(tree, path):
-            for entry in path:
-                tree = tree[entry.key]
-            return tree
-
-        values = jax.jit(
-            lambda initializer, key: [leaf(getattr(self.initial_state(initializer, key), field), path)
-                                      for field, path in drawn],
-            out_shardings=[leaf(getattr(shardings, field), path) for field, path in drawn],
-        )(initializer, key)
-        filled = {(field, jax.tree_util.keystr(path)): value
-                  for (field, path), value in zip(drawn, values, strict=True)}
-        return dataclasses.replace(template, **{
-            field: jax.tree_util.tree_map_with_path(
-                lambda path, stub, field=field: filled.get((field, jax.tree_util.keystr(path)), stub),
-                getattr(template, field))
-            for field in {field for field, _ in drawn}})
 
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.

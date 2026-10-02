@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.interop import load_pretrained, sources
+from dew.interop import Pretrained, sources
 
 torch = pytest.importorskip("torch")
 
@@ -54,10 +54,10 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     source = pickled_fixture(tmp_path / "source")
     reference = np.load(FIXTURE / "logits.npy")
 
-    first = load_pretrained(source, dtype="float32", attention_impl="reference")
+    first = Pretrained.load(source, dtype="float32", attention_impl="reference")
     conversions = sorted((cache / "dew" / "converted").iterdir())
     monkeypatch.setitem(sys.modules, "torch", None)
-    second = load_pretrained(source, dtype="float32", attention_impl="reference")
+    second = Pretrained.load(source, dtype="float32", attention_impl="reference")
 
     assert float(np.max(np.abs(logits(first) - reference))) < 1e-5
     assert len(conversions) == 1 and sorted((cache / "dew" / "converted").iterdir()) == conversions
@@ -91,14 +91,14 @@ def test_without_torch_a_pickle_checkpoint_is_refused_naming_the_extra(tmp_path,
     monkeypatch.setitem(sys.modules, "torch", None)
 
     with pytest.raises(ImportError, match=r"dewml\[torch\].*huggingface\.co/spaces/safetensors/convert"):
-        load_pretrained(source)
+        Pretrained.load(source)
 
 
 
 def test_a_pickle_directory_without_a_config_is_refused_before_it_converts(tmp_path, cache):
     (tmp_path / "pytorch_model.bin").write_bytes(b"not read")
     with pytest.raises(FileNotFoundError, match=r"no config\.json"):
-        load_pretrained(tmp_path)
+        Pretrained.load(tmp_path)
     assert not cache.exists()
 
 
@@ -108,9 +108,9 @@ def test_mamba2_130ms_pickle_converts_to_its_safetensors_conversions_weights(cac
     refs/pr/1, then the pytorch_model.bin itself, with the pull request
     lookup made to find nothing. The same fp32 weights, bit for bit."""
     commit = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
-    pull = load_pretrained("state-spaces/mamba2-130m", revision=commit, dtype="float32")
+    pull = Pretrained.load("state-spaces/mamba2-130m", revision=commit, dtype="float32")
     monkeypatch.setattr(sources, "_conversion_revision", lambda name, commit: None)
-    pickled = load_pretrained("state-spaces/mamba2-130m", revision=commit, dtype="float32")
+    pickled = Pretrained.load("state-spaces/mamba2-130m", revision=commit, dtype="float32")
 
     assert (pull.revision, pickled.revision) == ("ea6060f68a4289e9c06f80effa896629ba519216", commit)
     assert jax.tree.all(jax.tree.map(np.array_equal, pull.variables, pickled.variables))

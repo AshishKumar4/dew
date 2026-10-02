@@ -313,17 +313,6 @@ def reload(directory: str, recorded: str) -> None:
     print("the source reads the native update")
 
 
-def bundle(directory: str, destination: str) -> None:
-    """Pack the saved components and the recorded arrays for the suite."""
-    import tarfile
-
-    root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in sorted(root.iterdir()):
-            archive.add(path, arcname=path.name)
-    print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
-
-
 def main(destination: str) -> None:
     import inspect
 
@@ -362,6 +351,8 @@ def main(destination: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
+        from diffusers_dc_ae_reference import bundle
+
         bundle(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 3 and sys.argv[1] == "reload":
         reload(sys.argv[2], sys.argv[3])

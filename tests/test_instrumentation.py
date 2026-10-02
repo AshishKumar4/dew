@@ -11,9 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -31,6 +28,10 @@ from dew.telemetry.instrumentation import (
 )
 from dew.training import ProfileWindow, Trainer
 from dew.training.distributed import shard_batch
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 BATCH = 8
 
@@ -638,7 +639,7 @@ def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
     make_trainer(profile=ProfileWindow(str(tmp_path), steps=1, warmup=0)).fit(
         Data(batches), steps=6, log_every=1)
 
-    captures = [path for path in (tmp_path).glob("capture-*")]
+    captures = list((tmp_path).glob("capture-*"))
     assert len(captures) == 1
     assert list(captures[0].glob("**/*.xplane.pb")), "no trace to read"
 
@@ -655,10 +656,9 @@ def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
 def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch):
     """Both must refuse before training: neither trace is dropped silently."""
     _capture_env(monkeypatch)
-    with dew.Profiler(tmp_path / "outer"):
-        with pytest.raises(ValueError, match="dew.Profiler capture is active"):
-            make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
-                Data(batches), steps=2)
+    with dew.Profiler(tmp_path / "outer"), pytest.raises(ValueError, match=r"dew.Profiler capture is active"):
+        make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
+            Data(batches), steps=2)
 
 
 def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):

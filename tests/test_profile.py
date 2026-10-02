@@ -85,10 +85,9 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
 
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):
     failure = ValueError("user computation failed")
-    with pytest.raises(ValueError) as raised:
-        with dew.Profiler(tmp_path):
-            work()
-            raise failure
+    with pytest.raises(ValueError) as raised, dew.Profiler(tmp_path):
+        work()
+        raise failure
     assert raised.value is failure and active_profile() is None
     assert manifest(captures(tmp_path)[0])["body_status"] == "failed"
     with dew.Profiler(tmp_path):
@@ -98,13 +97,11 @@ def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native
 
 def test_nested_and_concurrent_refusals_do_not_stop_owner(tmp_path, native_reports):
     with dew.Profiler(tmp_path / "outer") as outer:
-        with pytest.raises(RuntimeError, match="already running"):
-            with dew.Profiler(tmp_path / "nested"):
-                pytest.fail("nested capture must not run its body")
+        with pytest.raises(RuntimeError, match="already running"), dew.Profiler(tmp_path / "nested"):
+            pytest.fail("nested capture must not run its body")
         other = dew.Profiler(tmp_path / "concurrent")
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            with pytest.raises(RuntimeError, match="already running"):
-                pool.submit(other.start).result()
+        with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(RuntimeError, match="already running"):
+            pool.submit(other.start).result()
         with pytest.raises(RuntimeError, match="does not own"):
             other.stop()
         assert outer.running
@@ -154,9 +151,8 @@ def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, n
     value = jnp.ones((64, 64), jnp.float32)
     compute(value).block_until_ready()
     observed.clear()
-    with guarded(allow=("host_to_device",)):
-        with dew.Profiler(tmp_path):
-            pending = compute(value)
+    with guarded(allow=("host_to_device",)), dew.Profiler(tmp_path):
+        pending = compute(value)
     assert pending.is_ready()
     assert observed == ["effect"]
 
@@ -194,12 +190,13 @@ def test_explicit_options_control_native_host_events(tmp_path, native_reports):
     options = jax.profiler.ProfileOptions()
     options.host_tracer_level = 0
     options.python_tracer_level = 0
-    with dew.Profiler(tmp_path / "disabled-host", options=options):
-        with jax.profiler.TraceAnnotation("host_option_marker"):
-            work()
-    with dew.Profiler(tmp_path / "default"):
-        with jax.profiler.TraceAnnotation("host_option_marker"):
-            work()
+    with (
+        dew.Profiler(tmp_path / "disabled-host", options=options),
+        jax.profiler.TraceAnnotation("host_option_marker"),
+    ):
+        work()
+    with dew.Profiler(tmp_path / "default"), jax.profiler.TraceAnnotation("host_option_marker"):
+        work()
     assert options.host_tracer_level == 0
     assert "host_option_marker" not in event_names(captures(tmp_path / "disabled-host")[0])
     assert "host_option_marker" in event_names(captures(tmp_path / "default")[0])
@@ -235,9 +232,8 @@ def test_missing_extra_fails_at_start_without_running_body(tmp_path, monkeypatch
 
     monkeypatch.setattr(module.importlib, "import_module", missing)
     profiler = dew.Profiler(tmp_path / "not-created")
-    with pytest.raises(ImportError):
-        with profiler:
-            pytest.fail("missing optional dependency must prevent user work")
+    with pytest.raises(ImportError), profiler:
+        pytest.fail("missing optional dependency must prevent user work")
     assert not profiler.running and not profiler.directory.exists()
 
 
@@ -249,16 +245,14 @@ def test_native_export_failure_keeps_body_exception_and_trace(tmp_path, native_r
 
     monkeypatch.setattr(native_reports, "xspace_to_tool_data", broken)
     failure = ValueError("primary user error")
-    with pytest.raises(ValueError) as raised:
-        with dew.Profiler(tmp_path / "body-failed"):
-            work()
-            raise failure
+    with pytest.raises(ValueError) as raised, dew.Profiler(tmp_path / "body-failed"):
+        work()
+        raise failure
     assert raised.value is failure and failure.__notes__
     assert list((tmp_path / "body-failed").glob("capture-*/plugins/profile/*/*.xplane.pb"))
     assert manifest(captures(tmp_path / "body-failed")[0])["export_status"] == "failed"
-    with pytest.raises(ExceptionGroup, match="cleanup or export"):
-        with dew.Profiler(tmp_path / "export-failed"):
-            work()
+    with pytest.raises(ExceptionGroup, match="cleanup or export"), dew.Profiler(tmp_path / "export-failed"):
+        work()
     assert active_profile() is None
     monkeypatch.setattr(native_reports, "xspace_to_tool_data", original)
     with dew.Profiler(tmp_path / "recovered"):
@@ -296,9 +290,8 @@ def test_default_directory_is_allocated_on_start_and_survives_stop(native_report
 
 def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_reports, monkeypatch):
     monkeypatch.setattr(native_reports, "xspace_to_tool_names", lambda paths: [])
-    with pytest.raises(ExceptionGroup):
-        with dew.Profiler(tmp_path):
-            work()
+    with pytest.raises(ExceptionGroup), dew.Profiler(tmp_path):
+        work()
     capture = captures(tmp_path)[0]
     record = manifest(capture)
     assert record["export_status"] == "failed"
@@ -359,7 +352,9 @@ def test_blocked_lifecycle_drain_refuses_conflicts_without_holding_mutex(
     assert record["capture_status"] == "completed"
 
 
-def test_interrupted_publication_closes_only_its_successfully_started_trace(tmp_path, native_reports, monkeypatch):
+def test_interrupted_publication_closes_only_its_successfully_started_trace(
+    tmp_path, native_reports, monkeypatch
+):
     module = importlib.import_module("dew.telemetry.profile")
     native_lock = module._lifecycle
     failure = KeyboardInterrupt("publication interrupted")

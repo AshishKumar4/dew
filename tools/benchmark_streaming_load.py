@@ -5,10 +5,10 @@
 one JSON line: wall time, peak RSS (VmHWM), the RSS left after, the placed
 bytes, the largest device's share and the first device's allocator peak.
 
-- `host` is the path before streaming: `load_pretrained` builds the whole
+- `host` is the path before streaming: `Pretrained.load` builds the whole
   translated tree in host memory, then one `jax.device_put` places it under
   the trainer's `Layout`.
-- `stream` is `load_pretrained(mesh=..., layout=...)`: every decoder leaf is
+- `stream` is `Pretrained.load(mesh=..., layout=...)`: every decoder leaf is
   a `SourceLeaf` over the mapped checkpoint, and each device's shard is read,
   cast and transposed on its own (`dew.interop.streaming`).
 
@@ -54,7 +54,7 @@ def status() -> dict[str, float]:
 def measure(mode: str, param_dtype: str) -> dict[str, object]:
     import jax
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.training import Layout, MeshSpec
 
     repo, revision = QWEN3
@@ -62,10 +62,10 @@ def measure(mode: str, param_dtype: str) -> dict[str, object]:
     before = status()
     start = time.perf_counter()
     if mode == "host":
-        loaded = load_pretrained(repo, revision=revision, param_dtype=param_dtype)
+        loaded = Pretrained.load(repo, revision=revision, param_dtype=param_dtype)
         variables = jax.device_put(loaded.variables, layout.shardings(mesh.build(), loaded.variables))
     else:
-        variables = load_pretrained(repo, revision=revision, param_dtype=param_dtype,
+        variables = Pretrained.load(repo, revision=revision, param_dtype=param_dtype,
                                     mesh=mesh, layout=layout).variables
     jax.block_until_ready(variables)
     seconds = time.perf_counter() - start
@@ -124,7 +124,7 @@ def abstract() -> dict[str, object]:
         return variables
 
     pretrained.place = placement
-    loaded = pretrained.load_pretrained(repo, revision=revision, dtype="bfloat16", param_dtype="bfloat16",
+    loaded = pretrained.Pretrained.load(repo, revision=revision, dtype="bfloat16", param_dtype="bfloat16",
                                         mesh=MeshSpec(fsdp=8), layout=Layout())
     template = jax.eval_shape(lambda: loaded.model.init(jax.random.key(0), np.zeros((1, 2), np.int32)))
     shapes = {jax.tree_util.keystr(path): tuple(leaf.shape)

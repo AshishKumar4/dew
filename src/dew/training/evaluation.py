@@ -143,19 +143,6 @@ class _Accumulators:
         return float(metric.finalize(self._held[metric.name]))
 
 
-@dataclass(frozen=True)
-class _Configuration:
-    """What every rank must agree on before a validation pass walks its phases."""
-    validation: bool
-    split: str
-    metrics: tuple[tuple[str, str, str], ...]
-    """Each metric's name and the module and qualified name of the artifact it reads."""
-
-    def broadcast(self) -> list[bool | str | list[list[str]]]:
-        """The record as rank zero's ranks see it, through the JSON broadcast."""
-        return [self.validation, self.split, [list(entry) for entry in self.metrics]]
-
-
 def _agree_configuration(
     metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False
 ) -> None:
@@ -165,18 +152,17 @@ def _agree_configuration(
     validation stream would walk different phases below, and hang at a
     collective one of them never reaches.
     """
-    def checked() -> _Configuration:
+    def checked() -> list[bool | str | list[list[str]]]:
         names = [metric.name for metric in metrics]
         if len(names) != len(set(names)):
             raise ValueError("evaluation metric names must be unique")
         if not split or "/" in split:
             raise ValueError("evaluation split must be a nonempty name without '/'")
-        return _Configuration(
-            validation=batches is not None, split=split,
-            metrics=tuple((metric.name, metric.reads.__module__, metric.reads.__qualname__)
-                          for metric in metrics))
+        # Each metric's name and the module and qualified name of the artifact it reads.
+        return [batches is not None, split,
+                [[metric.name, metric.reads.__module__, metric.reads.__qualname__] for metric in metrics]]
 
-    configuration = [agreed("configuration", checked).broadcast(), loss, training]
+    configuration = [agreed("configuration", checked), loss, training]
     root_configuration = broadcast_from_process_zero(configuration)
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")

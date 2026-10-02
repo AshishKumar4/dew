@@ -9,14 +9,14 @@ import numpy as np
 import optax
 import pytest
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.sampling.text import Sampling
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'qwen35-moe-native-tiny'
 
 
 def test_qwen35_moe_text_and_images_match_the_conditional_reference():
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     assert loaded.processor is not None
     text = loaded.processor.from_hf({
         'input_ids': np.load(DIRECTORY / 'text_input_ids.npy'),
@@ -46,15 +46,15 @@ def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_p
     config = json.loads((checkpoint / 'config.json').read_text())
     config['text_config']['mtp_num_hidden_layers'] = 1
     (checkpoint / 'config.json').write_text(json.dumps(config))
-    advertised = load_pretrained(checkpoint, dtype='float32', attention_impl='reference')
-    original = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    advertised = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
+    original = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'text_input_ids.npy')
     np.testing.assert_array_equal(advertised.model.apply(advertised.variables, ids),
                                   original.model.apply(original.variables, ids))
 
 
 def test_qwen35_moe_conditioning_has_finite_trainable_gradients():
-    loaded = load_pretrained(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     images = np.load(DIRECTORY / 'raw_images.npy')
     inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
                               images=[[images[0]], [images[1], images[2]]])

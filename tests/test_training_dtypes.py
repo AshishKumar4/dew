@@ -134,7 +134,9 @@ def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=Fa
 ON_TPU = jax.default_backend() == "tpu"
 
 
-def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None):
+def exercise_updates_and_resume(
+    tmp_path, parameter_kind, loss_kind, k, *, dynamic_scale=False, ema_decay=None
+):
     objective = DenseObjective(parameter_kind, loss_kind)
     if ON_TPU and "64" in parameter_kind:
         with pytest.raises(ValueError, match="a TPU has no float64"):
@@ -171,7 +173,9 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
             def average(old, new):
                 work = np.float64 if old.dtype == jnp.float64 or new.dtype == jnp.float64 else np.float32
                 weight = np.asarray(ema_decay, work)
-                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(new, work)
+                value = weight * np.asarray(old, work) + (np.asarray(1, work) - weight) * np.asarray(
+                    new, work
+                )
                 return value.astype(old.dtype)
             expected_ema = jax.tree.map(average, expected_ema, {"params": expected_params})
         for micro in range(k):
@@ -278,7 +282,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
                       accumulation=2, dynamic_scale=True)
     initial = trainer.initial_state()
     initial = dataclasses.replace(initial, scale=dataclasses.replace(initial.scale, scale=jnp.array(1.)))
-    batch = {"first": jnp.array(True)}
+    batch = {"first": jnp.ones((), dtype=bool)}
     step = trainer.compile(initial, batch)
     prefix, _, _, _, accepted = step(initial, batch)
     assert bool(accepted)
@@ -286,7 +290,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.params)
     # Each finalized contribution fits fp16; their fp32 sum does not.
-    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.array(False)})
+    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5

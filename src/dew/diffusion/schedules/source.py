@@ -486,7 +486,9 @@ class SourceSchedule:
     betas: np.ndarray
     prediction: PredictionTransform
     policy: _Policy
-    sampler: Solver
+    # The native solver this file's class and controls name, resolved once
+    # when the file was read.
+    solver: Solver
     # The grids one schedule has already built, keyed by the call that built
     # them. Held here rather than in an lru_cache over the method, whose keys
     # are the schedules themselves: those outlive every pipeline that asks.
@@ -535,9 +537,9 @@ class SourceSchedule:
             zero_snr=records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
-        policy, sampler = _resolve(kind, source, value, betas)
+        policy, solver = _resolve(kind, source, value, betas)
         return cls(MappingProxyType(dict(config)), betas,
-                   _prediction_transform(policy, prediction), policy, sampler)
+                   _prediction_transform(policy, prediction), policy, solver)
 
     @property
     def train_steps(self) -> int:
@@ -566,11 +568,6 @@ class SourceSchedule:
                                          sigma_data=self.policy.sigma_data)
             return Process(schedule, self.prediction)
         return Process(DiscreteNoiseScheduler(self.betas, p2_loss_weight_gamma=0), self.prediction)
-
-    def solver(self) -> Solver:
-        """The native solver this file's class and controls name, resolved
-        once when the file was read."""
-        return self.sampler
 
     def _training_sigmas(self) -> tuple[np.ndarray, np.ndarray]:
         """The training sigma table sigma/alpha and its logarithm, with the
@@ -1070,7 +1067,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     """The native solver this class and its controls name, built once.
 
     A solver is a frozen value, so the file's class and controls resolve into
-    one here and `SourceSchedule.solver()` hands that same value out. Nothing
+    one here and `SourceSchedule.solver` holds that same value. Nothing
     downstream re-reads a control to rebuild it.
     """
     if kind == "DDIM":

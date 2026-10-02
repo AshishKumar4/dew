@@ -49,7 +49,7 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=site/src/data/sampler.py,site/src/data/text.py
     - name: Lint
       run: |
-        uvx ruff@0.14.3 check src/dew tools/lint_slop.py tools/complexity.py tools/mutation.py examples recipes
+        uvx ruff@0.14.3 check src/dew tests tools/lint_slop.py tools/complexity.py tools/mutation.py examples recipes
         JAX_PLATFORMS=cpu python tools/lint_slop.py
         python tools/complexity.py src/dew tools/lint_slop.py examples recipes > complexity.json
     - name: Upload the complexity distribution
@@ -72,6 +72,7 @@ jobs:
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
         uv run --no-project --with griffe==2.3.0 python site/scripts/gen_api.py --check
+        uv run --no-project --with griffe==2.3.0 --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
         JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
         python site/scripts/gen_examples.py --check
     - name: Type check

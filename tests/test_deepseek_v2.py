@@ -117,5 +117,8 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
         for layer in ("layers_0", "layers_1"))
     assert float(loss - base) == pytest.approx(float(expected), rel=1e-5)
     assert float(aux.metrics["aux_loss"]) == pytest.approx(float(expected), rel=1e-5)
-    grads = jax.grad(lambda p: balanced.scalar_loss(p, {TEXT_KEY: tokens}, step)[0] - plain.scalar_loss(p, {TEXT_KEY: tokens}, step)[0])(params)
+    grads = jax.grad(
+        lambda p: balanced.scalar_loss(p, {TEXT_KEY: tokens}, step)[0]
+        - plain.scalar_loss(p, {TEXT_KEY: tokens}, step)[0]
+    )(params)
     assert float(jnp.abs(grads["params"]["layers_0"]["mlp"]["gate"]["kernel"]).max()) > 0

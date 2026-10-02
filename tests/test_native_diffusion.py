@@ -26,22 +26,40 @@ def saved_pipelines(tmp_path_factory):
 
 
 def run_check(*arguments):
-    result = subprocess.run([sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
-                            cwd=ROOT, capture_output=True, text=True, timeout=240,
-                            env={**os.environ, "JAX_PLATFORMS": "cpu", "USE_TF": "0",
-                                 "PYTHONPATH": str(ROOT / "src"), "OMP_NUM_THREADS": "2",
-                                 "OPENBLAS_NUM_THREADS": "1"})
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=240,
+        env={
+            **os.environ,
+            "JAX_PLATFORMS": "cpu",
+            "USE_TF": "0",
+            "PYTHONPATH": str(ROOT / "src"),
+            "OMP_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "1",
+        },
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"])
+@pytest.mark.parametrize(
+    "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
+)
 def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
     run_check(saved_pipelines / task)
 
 
 @pytest.mark.parametrize("solver", ["pndm-prk", "pndm-plms", "lms", "lms-v", "lms-karras", "euler", "dpm"])
 def test_native_solver_consumes_the_complete_source_grid(saved_pipelines, solver):
-    run_check(saved_pipelines / "sd", "--grids", ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz", "--case", solver)
+    run_check(
+        saved_pipelines / "sd",
+        "--grids",
+        ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz",
+        "--case",
+        solver,
+    )
 
 
 @pytest.mark.parametrize("task", ["sd", "xl"])
@@ -114,11 +132,11 @@ def test_a_directory_declaring_another_familys_pipeline_is_refused(
         saved_pipelines, tmp_path, case, declared, held):
     """SD and XL share the UNet denoiser, so the component check cannot tell
     them apart; the gate reads the pipeline family and names both classes."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = _declared(saved_pipelines, tmp_path, case, declared)
     with pytest.raises(ValueError, match=f"{declared}.*{held}"):
-        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+        Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 
 @pytest.mark.parametrize("case, declared, guidance", [
@@ -128,19 +146,21 @@ def test_a_directory_declaring_another_familys_pipeline_is_refused(
 def test_a_matching_image_task_variant_loads(saved_pipelines, tmp_path, case, declared, guidance):
     """A pipeline of the denoiser's own family keeps loading with its own
     defaults: each img2img variant is accepted and guides at its scale."""
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
     directory = _declared(saved_pipelines, tmp_path, case, declared)
-    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
     assert loaded.text_to_image().guidance.scale == guidance
 
 
 @pytest.mark.parametrize("family", ["sd", "xl", "safety", "sd3", "flux"])
-def test_public_source_precision_covers_denoiser_and_frozen_component_weights(saved_pipelines, tmp_path, family):
+def test_public_source_precision_covers_denoiser_and_frozen_component_weights(
+    saved_pipelines, tmp_path, family
+):
     import jax.numpy as jnp
     from test_interop import assert_parameter_storage
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     if family in ("sd3", "flux"):
         with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
@@ -148,8 +168,8 @@ def test_public_source_precision_covers_denoiser_and_frozen_component_weights(sa
         directory = tmp_path / "pipeline"
     else:
         directory = saved_pipelines / family
-    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
-    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    masters = Pretrained.load(directory, dtype="bfloat16", attention_impl="xla")
+    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert masters.model.dtype == jnp.bfloat16
     assert native.model.dtype == jnp.float32
 
@@ -178,13 +198,13 @@ def test_component_binding_preserves_large_integer_indices():
 def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(saved_pipelines, tmp_path):
     import numpy as np
 
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
-    source = load_pretrained(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
     original = {layout.name: layout.export(source.variables) for layout in source.weight_layouts}
     destination = tmp_path / "export"
     source.save(destination)
-    mapped = load_pretrained(destination, dtype="float32", attention_impl="xla")
+    mapped = Pretrained.load(destination, dtype="float32", attention_impl="xla")
     assert {layout.name for layout in mapped.weight_layouts} == set(original)
     for layout in mapped.weight_layouts:
         np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
@@ -200,9 +220,11 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
     mapped.save(destination, variables=updated)
     for layout in mapped.weight_layouts:
         np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
-    latest = load_pretrained(destination, dtype="float32", attention_impl="xla")
+    latest = Pretrained.load(destination, dtype="float32", attention_impl="xla")
     for layout in latest.weight_layouts:
-        expected = original[layout.name] + np.float32(1.) if layout.name == changed.name else original[layout.name]
+        expected = (
+            original[layout.name] + np.float32(1.0) if layout.name == changed.name else original[layout.name]
+        )
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
 
 
@@ -217,7 +239,7 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
 
     from dew.inputs.diffusion import DiffusionConditioner
     from dew.inputs.encoders import rebuild
-    from dew.interop import diffusion, load_pretrained
+    from dew.interop import Pretrained, diffusion
 
     if family in ("sd3", "flux"):
         with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
@@ -225,7 +247,7 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
         directory = tmp_path / "pipeline"
     else:
         directory = saved_pipelines / family
-    source = load_pretrained(directory, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     assert source.inputs is not None
     encoder = source.inputs.conditions["conditioning"].encoder
     assert isinstance(encoder, DiffusionConditioner)

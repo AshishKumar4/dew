@@ -51,11 +51,11 @@ def clip(tmp_path_factory):
 
 
 def _frame_indices(frames):
-    return [int(round(int(frame[16, 16, 0]) / GREY_STEP)) for frame in frames]
+    return [round(int(frame[16, 16, 0]) / GREY_STEP) for frame in frames]
 
 
 def _audio_indices(audio):
-    return [int(round(float(np.median(row)) * 32768 / SAMPLE_STEP)) for row in audio]
+    return [round(float(np.median(row)) * 32768 / SAMPLE_STEP) for row in audio]
 
 
 @pytest.mark.parametrize("seed", [0, 3, 7])
@@ -96,8 +96,12 @@ def test_an_audio_window_is_the_samples_between_its_times(clip):
     window = audio_window(clip, 3 / FPS, 2 / FPS, SAMPLE_RATE)
 
     assert window.shape == (2 * SAMPLES_PER_FRAME,) and window.dtype == np.float32
-    assert np.array_equal(window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32))
-    assert np.array_equal(window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32))
+    assert np.array_equal(
+        window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32)
+    )
+    assert np.array_equal(
+        window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32)
+    )
 
 
 def test_a_clip_longer_than_the_video_is_refused(clip):
@@ -125,5 +129,5 @@ def test_a_missing_decoded_frame_reports_its_time(monkeypatch):
     video = SimpleNamespace(duration=2.0, get_frame=lambda timestamp: None)
     monkeypatch.setattr(moviepy, "VideoFileClip",
                         lambda path, audio: nullcontext(video))
-    with pytest.raises(ValueError, match="missing.mp4 returned no video frame at"):
+    with pytest.raises(ValueError, match=r"missing.mp4 returned no video frame at"):
         read_av_random_clip("missing.mp4", num_frames=1, audio_padding=0, seed=0)
