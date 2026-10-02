@@ -141,7 +141,7 @@ def adjoint(p, u, w, op: Arithmetic):
     }
 
 
-EXACT, MAGNITUDES = Arithmetic(False), Arithmetic(True)
+EXACT, MAGNITUDES = Arithmetic(absolute=False), Arithmetic(absolute=True)
 
 
 @pytest.fixture(scope="module")

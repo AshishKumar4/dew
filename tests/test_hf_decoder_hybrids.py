@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 from test_hf_decoders import DEEPSEEK, fixture_config, flat_tree, fp32_decoder, scaled_difference
 
-from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop import PretrainedDecoder
+from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -188,7 +188,7 @@ def test_a_per_layer_count_equal_to_the_models_still_translates():
     assert translate_config(config)["kinds"]["full_attention"] == {"head_dim": 32}
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
@@ -206,7 +206,7 @@ def test_gemma4_checkpoints_load_through_the_translator(name):
         assert "embed_tokens_per_layer.embedding" in leaves
 
 
-@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
+@pytest.mark.parametrize("name", (*GEMMA4, "gemma4-e2b"))
 def test_gemma4_logits_match_the_reference_implementation(name):
     """Full-model parity, fully live on both branches. Largest observed max
     |logit difference| on CPU: gemma4-ple 4.9e-07, gemma4-kvshare 8.6e-07,
@@ -247,7 +247,7 @@ def test_sharing_without_a_provider_and_sharing_everything_are_refused():
     base = with_precision("causal_transformer", config,
                           dtype="float32", attention_impl="xla")
     with pytest.raises(ValueError, match="no earlier full_attention layer"):
-        models.build("causal_transformer", **{**base, "kv_shared_layers": (1, 2, 3)}).kv_sharing
+        _ = models.build("causal_transformer", **{**base, "kv_shared_layers": (1, 2, 3)}).kv_sharing
     with pytest.raises(ValueError, match="leave a provider"):
         translate_config({**gemma4_config("gemma4-kvshare"), "num_kv_shared_layers": 4})
 
@@ -818,7 +818,7 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
         return GatedDeltaNet(emb_features=16, num_k_heads=2, num_v_heads=4, head_k_dim=4,
                              head_v_dim=6, fused_in_proj=fused)
 
-    fused, split = net(True), net(False)
+    fused, split = net(fused=True), net(fused=False)
     x = jax.random.normal(jax.random.key(0), (1, 5, 16))
     variables = fused.init(jax.random.key(1), x)
     params = dict(variables["params"])
@@ -826,11 +826,15 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
     ba_kernel = np.asarray(params.pop("in_proj_ba")["kernel"])
     q, k, v, z = np.split(qkvz_kernel.reshape(16, 2, 2 * 4 + 2 * 2 * 6), [4, 8, 8 + 12], axis=-1)
     ba = ba_kernel.reshape(16, 2, 4)
-    regrouped = {**params,
-                 "in_proj_qkv": {"kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)},
-                 "in_proj_z": {"kernel": z.reshape(16, -1)},
-                 "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
-                 "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)}}
+    regrouped = {
+        **params,
+        "in_proj_qkv": {
+            "kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)
+        },
+        "in_proj_z": {"kernel": z.reshape(16, -1)},
+        "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
+        "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)},
+    }
     whole = {**regrouped,
              "in_proj_qkv": {"kernel": qkvz_kernel[:, :2 * 8 + 24]},
              "in_proj_z": {"kernel": qkvz_kernel[:, 2 * 8 + 24:]}}

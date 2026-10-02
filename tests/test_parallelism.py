@@ -13,15 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-from dew.data import DataPartition, Loading
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import Representations
+from dew.data import DataPartition, Loading
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -31,12 +27,23 @@ from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
 from dew.training.optim import OPTIMIZER_MAP
 
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
+
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
 # the threshold is lowered; at the production value "FSDP on" would replicate
 # everything.
 TINY = 256
+
+
+_DEFAULT_INIT_DECAY = optax.constant_schedule(0.999)
 
 
 class DeterministicObjective(Objective):
@@ -52,7 +59,7 @@ class DeterministicObjective(Objective):
 
     artifact = Representations
 
-    def __init__(self, decay=optax.constant_schedule(0.999), emb_features=32):
+    def __init__(self, decay=_DEFAULT_INIT_DECAY, emb_features=32):
         self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
                                num_heads=2, mlp_ratio=1)
         self.ema = EMASpec(decay=decay)
@@ -375,7 +382,7 @@ def test_the_layout_default_tolerance_is_two_percent():
     """A layout that names no tolerance carries the library's 2%, without
     the config repeating the number."""
     assert Layout().tolerance == 0.02
-    with pytest.raises(ValueError, match="2.00%"):
+    with pytest.raises(ValueError, match=r"2.00%"):
         Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
                 mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1)).fit(Data(batches), steps=0)
 
@@ -540,7 +547,7 @@ def test_fsdp_shards_parameters_and_optimizer_state():
         # Exactly the dimension the spec names is halved. Which dimension that
         # is belongs to the declarations, not to this test.
         split = [axis for axis, (whole, part) in enumerate(
-            zip(param.shape, local.shape)) if whole != part]
+            zip(param.shape, local.shape, strict=True)) if whole != part]
         assert len(split) == 1, f"{param.shape} -> {local.shape}"
         assert param.shape[split[0]] // 2 == local.shape[split[0]]
         assert param.sharding.spec[split[0]] == 'fsdp'
@@ -724,9 +731,9 @@ def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts():
 
     # the comparison is only meaningful if the EMA left its starting point
     assert moved(snapshot(plain.params), snapshot(plain.ema))
-    for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params)):
+    for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
-    for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema)):
+    for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema), strict=True):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
 
 
@@ -791,12 +798,13 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
 
     mesh = MeshSpec().build()
     with DevicePrefetchIterator(grain_image_loader(), mesh,
-                                source_state=position) as resumed:
-        with DevicePrefetchIterator(grain_image_loader(), mesh) as fresh:
-            for _ in range(3):
-                next(fresh)
-            np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
-                                          np.asarray(next(fresh)["image"]))
+                                source_state=position) as resumed, (
+            DevicePrefetchIterator(grain_image_loader(), mesh)
+    ) as fresh:
+        for _ in range(3):
+            next(fresh)
+        np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
+                                      np.asarray(next(fresh)["image"]))
 
 
 def test_fit_resumes_the_unfinished_part_of_a_run(tmp_path):

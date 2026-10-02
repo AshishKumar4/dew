@@ -96,7 +96,9 @@ def test_each_loss_trains_its_own_side():
     assert total(joint[AUTOENCODER]) > 0
     for name in joint:
         if name != AUTOENCODER:
-            for got, want in zip(jax.tree.leaves(joint[name]), jax.tree.leaves(model_only[name]), strict=True):
+            for got, want in zip(
+                jax.tree.leaves(joint[name]), jax.tree.leaves(model_only[name]), strict=True
+            ):
                 np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     _, aligned_only = gradients(EndToEnd(reconstruction_weight=0.0, kl_weight=0.0))
     assert total(aligned_only[AUTOENCODER]) > 0

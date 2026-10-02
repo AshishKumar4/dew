@@ -74,7 +74,10 @@ class StubText(ConditionEncoder[str]):
         return {"checkpoint": self.checkpoint}
 
 
-def make_objective(*, guidance: CFG | None = CFG(2.0)):
+_DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
+
+
+def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
@@ -228,7 +231,9 @@ def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
 
 def test_a_solver_named_by_a_string_is_refused_with_the_object_to_pass():
     unconditional = InputSpec(Field("image", (RES, RES, 3)))
-    with pytest.raises(TypeError, match=r"solver='euler' names a solver; pass the solver itself, as Euler\(\)"):
+    with pytest.raises(
+        TypeError, match=r"solver='euler' names a solver; pass the solver itself, as Euler\(\)"
+    ):
         DiffusionObjective(Zero(), presets.Flow(), unconditional, solver="euler")
 
 

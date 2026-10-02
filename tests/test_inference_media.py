@@ -29,16 +29,26 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
     again = task(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     np.testing.assert_array_equal(again, raw)
     loaded = TextToImage.from_run(str(tmp_path), ema=False)
-    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images,
-                               raw, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(
+        loaded(["flower", "tree"], steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images,
+        raw,
+        atol=2e-6,
+        rtol=2e-6,
+    )
     mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
-    np.testing.assert_array_equal(bound(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images, raw)
+    np.testing.assert_array_equal(
+        bound(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images, raw
+    )
     changed = task.bind(mutable)(prepared, steps=3, solver=Heun(), guidance=CFG(2.0), key=key).host().images
     assert np.max(np.abs(changed - raw)) > 1e-4
-    np.testing.assert_allclose(task("flower", steps=3, solver=Heun(), key=key).host().images,
-                               task(["flower"], steps=3, solver=Heun(), key=key).host().images, atol=0, rtol=0)
+    np.testing.assert_allclose(
+        task("flower", steps=3, solver=Heun(), key=key).host().images,
+        task(["flower"], steps=3, solver=Heun(), key=key).host().images,
+        atol=0,
+        rtol=0,
+    )
     with pytest.raises(ValueError, match="initial noise"):
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 

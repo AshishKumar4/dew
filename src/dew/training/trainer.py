@@ -234,22 +234,43 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
-def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
+def step_compiler_options(objective, rows: int, frozen: bool) -> jax.stages.CompilerOptions | None:
     """XLA options for this objective's training step on this device, each
-    unless the run set its flag itself.
+    unless the run set its flag itself. `rows` is the batch rows one device
+    steps, and `frozen` says whether the step trains beside frozen weights.
 
     On a GPU, dots that share an input (q, k and v; gate and up) run apart:
     XLA's dot merger would run them as one GEMM over their weights
-    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024,
-    and an RTX 4080 trained Qwen3-0.6B's widths, a 3-layer decoder,
-    SimpleDiT-B and the hybrid DiT 0.4-3.5% faster without it
-    (docs/performance.md). Decoding keeps the merger: its 32-token GEMMs
-    lost 5-15% apart. And Triton GEMM fusions go off where
-    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model
-    keeps them."""
+    concatenated afresh every step, 4.0 ms of Qwen3-0.6B's step at 1 x 1024.
+    A step beside frozen weights (a LoRA adapter's) on 128 tokens or fewer a
+    device keeps the merger, as decoding does, whose 32-token GEMMs ran 5-15%
+    faster merged. On an RTX 4080, bf16, ms a step (docs/performance.md has
+    every row):
+
+        step                       tokens    merged   apart
+        Qwen3-0.6B, LoRA r16       1 x 32     15.92   16.48
+        Qwen3-0.6B, LoRA r16       4 x 32     18.64   18.99
+        Qwen3-0.6B, LoRA r16       2 x 64     18.59   18.89
+        Qwen3-0.6B, LoRA r16      1 x 128     20.79   19.18
+        Qwen3-0.6B, LoRA r16       8 x 32     24.02   22.97
+        Qwen3-0.6B, LoRA r16     1 x 1024     60.61   59.19
+        Qwen3-0.6B widths, full    1 x 32     46.83   44.93
+        Qwen3-0.6B widths, full  1 x 1024     97.7    94.1
+        3-layer decoder, full      1 x 32      5.01    4.89
+
+    At 128 tokens the shapes disagree: 1 x 128 runs faster apart, 2 x 64
+    and 4 x 32 merged. The boundary includes 128, so no step runs slower
+    than XLA's default, and 1 x 128 gives up 1.6 ms to apart.
+
+    Only an LM objective names the tokens in a row, its `seq_len`, so
+    another objective's frozen step runs apart. And Triton GEMM fusions go
+    off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of
+    the model keeps them."""
     generation = device_generation()
     options: dict[str, bool | int] = {}
-    if generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None:
+    small = rows * _row_tokens(objective) <= 128
+    if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
+            and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     model = _model_of(objective)
     if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
@@ -296,6 +317,13 @@ def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
     the trainer reads it at this boundary: LM, diffusion and masked
     objectives name theirs `model`."""
     return getattr(objective, 'model', None)
+
+
+def _row_tokens(objective: Objective[Loss, Effects]) -> float:
+    """The tokens one row of an objective's batch carries, or infinity. An
+    `Objective` declares none, since images and pairs have no context, so the
+    trainer reads it at this boundary: LM objectives name theirs `seq_len`."""
+    return getattr(objective, 'seq_len', math.inf)
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -1231,7 +1259,9 @@ class Trainer(Generic[Loss, Effects]):
                                                 replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
-                options = None if self._xla_defaults else step_compiler_options(self.objective)
+                rows = rows_of(batch) // math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+                options = None if self._xla_defaults else step_compiler_options(
+                    self.objective, rows, FROZEN in prepared.params)
                 self.executable = self.program.compile(options)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:

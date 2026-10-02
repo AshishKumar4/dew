@@ -58,6 +58,7 @@ whose dtypes are worth counting.
 import math
 import re
 from dataclasses import dataclass
+from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -65,10 +66,6 @@ import optax
 import pytest
 from test_precision_policy import build_model, tiny_inputs
 
-import dew.nn.backbones  # noqa: F401  (registers the kind)
-import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
-import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
-import dew.nn.multimodal  # noqa: F401  (registers the kind)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import bf16_dot_runs
 from dew.objectives.base import Step
@@ -86,6 +83,9 @@ from dew.telemetry.instrumentation import (
     _weights,
     hlo_flops,
 )
+
+import_module("dew.nn.multimodal")  # registers the fixture kind
+
 
 # The element type of an HLO shape: `f32[4,8]{1,0}` and `bf16[]` both start
 # with it, and a tuple shape starts with its first member's.

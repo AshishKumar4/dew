@@ -1,0 +1,5 @@
+{
+  "peft": "0.20.0",
+  "transformers": "4.49.0",
+  "diffusers": "0.34.0"
+}

@@ -51,8 +51,14 @@ def sampled(softcap=None, temperature=0.7):
         ids = [int(token) for token in np.asarray(tokens[row])]
         support = tuple(tuple(int(token) for token in np.flatnonzero(kept[row, position - 1]))
                         for position in range(PROMPT, PROMPT + NEW))
-        call = Call(tuple(ids[:PROMPT]), tuple(ids[PROMPT:]),
-                    tuple(float(value) for value in drawn.behavior_log_probs[row]), "length", 0, support=support)
+        call = Call(
+            tuple(ids[:PROMPT]),
+            tuple(ids[PROMPT:]),
+            tuple(float(value) for value in drawn.behavior_log_probs[row]),
+            "length",
+            0,
+            support=support,
+        )
         rollouts.append(Session("t", "g", row, 0, (call,), Status.COMPLETED, float(row)))
     return obj, params, drawn, sampling, rollouts
 
@@ -149,7 +155,10 @@ def test_supports_need_a_fixed_capacity_so_every_batch_has_one_shape():
 
     with pytest.raises(ValueError, match="support_capacity"):
         batch((3, 5))
-    assert batch((3, 5), support_capacity=8)[SUPPORT_KEY].shape == batch((3,), support_capacity=8)[SUPPORT_KEY].shape
+    assert (
+        batch((3, 5), support_capacity=8)[SUPPORT_KEY].shape
+        == batch((3,), support_capacity=8)[SUPPORT_KEY].shape
+    )
 
 
 @pytest.mark.mesh(devices=4)
@@ -174,8 +183,14 @@ def test_padded_support_entries_keep_the_gradient_finite():
     head = jnp.eye(4, 6)
 
     def total(hidden, head):
-        scores, present = support_log_probs(hidden, head, jnp.asarray([[1, 3]]), jnp.asarray([[1, 2, -1, -1]]),
-                                            jnp.asarray([[0, 0, -1, -1]]), temperature=0.5)
+        scores, present = support_log_probs(
+            hidden,
+            head,
+            jnp.asarray([[1, 3]]),
+            jnp.asarray([[1, 2, -1, -1]]),
+            jnp.asarray([[0, 0, -1, -1]]),
+            temperature=0.5,
+        )
         return jnp.sum(jnp.where(present, scores, 0.0))
 
     assert np.isfinite(float(total(hidden, head)))

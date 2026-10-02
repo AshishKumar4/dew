@@ -11,21 +11,22 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import grain.python as pygrain
 import numpy as np
 import pytest
 from absl import flags
+
+from dew.data import DataPartition, HFImages, HFOptions, Loading
+from dew.data.sources.hf import HFDatasetSource
 
 # grain's worker processes read absl flags; a test that never ran absl.app
 # would trip UnparsedFlagAccessError at any worker_count > 0.
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import DataPartition, HFImages, HFOptions, Loading  # noqa: E402
-from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
 IMAGE_SIZE = 12

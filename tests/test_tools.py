@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -301,9 +302,10 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch, tmp_path):
     import argparse
 
+    from test_serving import task
+
     import dew
     from dew.sampling import Sampling
-    from test_serving import task
 
     tool = load("benchmark_lm_serving")
     bound = task(Sampling(temperature=0, eos_id=None))
@@ -358,7 +360,7 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
     for name in ("baseline", "stored", "remat"):
         head = tool.HEADS[name]
         (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
-            lambda s, t: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
+            lambda s, t, head=head: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
         outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
 
     reference = outputs["baseline"]
@@ -417,7 +419,7 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
 
     case = dataclasses.replace(tool.zoo()[model], dtype="float32")
     # As the tool runs: the reference and the anchor both under x64.
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         batch = benchmark_step.global_batch(case)
         reference = tool.computed_reference(case, batch, 1)
         loss, gradient = tool.anchor_step(case, batch)
@@ -458,7 +460,10 @@ def test_layout_parity_bounds_a_split_losss_sum_by_its_contraction():
     judged = tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 5.96e-7, 1.4e-7, 1.2114, terms=32768)
     assert judged["status"] == "works"
     assert judged["loss_bound"] == pytest.approx(tool.contraction_floor(32768, 1.2114))
-    assert tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 1e-2, 1.4e-7, 1.2114, terms=32768)["status"] == "MISMATCH"
+    assert (
+        tool.judged({"['w']": 1e-7}, {"['w']": 1e-6}, 1e-2, 1.4e-7, 1.2114, terms=32768)["status"]
+        == "MISMATCH"
+    )
 
 
 def test_layout_parity_passes_a_layout_refused_by_design_and_fails_an_error(monkeypatch):
@@ -666,10 +671,6 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     through the registry inside their objective, so their rows are its rows.
     An architecture named as covered without a case measuring it would leave
     the difference here nonempty."""
-    import dew.nn.backbones  # noqa: F401  (registers the kind)
-    import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
-    import dew.nn.diffusion_gemma  # noqa: F401  (registers the kind)
-    import dew.nn.multimodal  # noqa: F401  (registers the kind)
     from dew.registry import models
 
     tool = load("benchmark_step")
@@ -875,7 +876,7 @@ def test_the_quantized_serving_benchmark_counts_nonfinite_values_before_it_clips
     class Pipe:
         """The part of TextToImage that sampling reads: latents, and an
         autoencoder that passes them through with one pixel infinite."""
-        params = {"autoencoder": {}}
+        params: ClassVar = {"autoencoder": {}}
         autoencoder = SimpleNamespace(decode=lambda params, z: z.at[0, 0, 0, 0].set(jnp.inf))
 
         def __call__(self, prompts, **controls):

@@ -147,7 +147,7 @@ class MeanFlowObjective(DiffusionObjective):
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
-        variables = self.trainable(params)
+        variables = self.model_variables(params)
 
         def velocity(conditions, *, train: bool) -> Velocity:
             def average(z, t, r) -> jax.Array:
@@ -254,12 +254,12 @@ class ShortcutObjective(DiffusionObjective):
                 return output
             return over
 
-        teacher = self.trainable(jax.lax.stop_gradient(params if step.ema is None else step.ema))
+        teacher = self.model_variables(jax.lax.stop_gradient(params if step.ema is None else step.ema))
         leading = jax.tree.map(lambda value: value[:rows], given)
         bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
                                        step_size[:rows])
         target = jnp.concatenate([bootstrapped, v[rows:]])
-        u = velocity(self.trainable(params), conditions, train=True)(x, sigma, sigma - step_size)
+        u = velocity(self.model_variables(params), conditions, train=True)(x, sigma, sigma - step_size)
         losses = optax.l2_loss(u, target)
         return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
 
