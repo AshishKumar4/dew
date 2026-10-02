@@ -82,7 +82,7 @@ from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
@@ -705,7 +705,7 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         grid = (case.image_size // patch, case.image_size // patch)
         objective = JepaObjective(
             model, built("jepa_predictor", {**case.predictor, "grid": grid}),
-            multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
+            MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)

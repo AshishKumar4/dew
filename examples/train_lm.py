@@ -6,7 +6,6 @@
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
     python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,7 +14,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import ByteTokenizer, Loading, TokenWindows
+from dew.data import ByteTokenizer, Loading, TokenCorpus, TokenWindows
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
@@ -40,14 +39,14 @@ class Config:
 
 
 def main(config: Config):
-    meta = json.loads((config.tokens / "meta.json").read_text())
+    corpus = TokenCorpus.read(config.tokens)
     tokenizer = ByteTokenizer()
     data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length,
                         loading=Loading(workers=4)).load(batch=config.batch_size)
     steps = config.steps or data.epoch_steps(config.epochs)
 
     prompt = tokenizer.encode(config.prompt)
-    model = CausalTransformer(**config.model, vocab_size=int(meta["vocab_size"]),
+    model = CausalTransformer(**config.model, vocab_size=corpus.vocab_size,
                               max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
                               dtype=jnp.bfloat16)
     objective = LMObjective(

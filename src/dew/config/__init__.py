@@ -30,6 +30,7 @@ import sys
 import types
 import typing
 from collections.abc import Callable, Mapping, Mapping as MappingABC, MutableMapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 import jax
@@ -43,15 +44,16 @@ import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.data import Dataset, DatasetSpec, Ramp, ramped
-from dew.data.dataset import json_list_argument
+from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.data import Dataset, DatasetSpec, Ramp
+from dew.data.dataset import json_list_argument, ramped
 from dew.lora import LoRA, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
-from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import (
@@ -66,7 +68,7 @@ from dew.training.optim import (
 from dew.training.quantization import Quantization, _quantize
 from dew.training.selection import Best
 from dew.training.state import TrainState
-from dew.training.tracker import LocalTracker, Trackers, WandbTracker
+from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Rollout, Trainer
 
 JsonDict = Annotated[
@@ -822,3 +824,31 @@ class RunConfig:
 
         finally:
             _closed(tracker, sys.exception())
+
+    def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
+              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+        """Train `trials` trials of this config over `space` and return the ledger.
+
+        Each trial draws a point from `space`, trains under the run name
+        `<trainer.name>/trial-<index>` so trials keep their own checkpoints and
+        tracking, and records the score `train` returns for it. `tracker`
+        receives that score as `sweep/value` at the trial's number and the
+        trial's `TrialFinished` record. A trial reaches `ledger` before it is
+        reported, so rerunning the same call continues an interrupted sweep.
+        """
+        path = Path(ledger)
+        if self.trainer.name is None:
+            raise ValueError("a sweep needs trainer.name: every trial trains under "
+                             "<trainer.name>/trial-<index>, and trials sharing one name would "
+                             "resume from each other")
+        finished = _read(path, space)
+        for index in range(len(finished), trials):
+            point = search(space, finished, seed)
+            name = f"{self.trainer.name}/trial-{index}"
+            value = train(override(self, {**point, "trainer.name": name}))
+            trial = TrialFinished(index, name, point, value)
+            finished.append(trial)
+            _write(path, space, finished)
+            tracker.log({"sweep/value": value}, index)
+            tracker.artifact(trial, index)
+        return finished

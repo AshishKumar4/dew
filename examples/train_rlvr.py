@@ -62,7 +62,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import Loading, tokenizer_for
+from dew.data import HFTokenizer, Loading
 from dew.data.prompts import Prompts
 from dew.inference import (
     NativeRolloutServer,
@@ -480,7 +480,7 @@ def main(config: Config) -> dict:
     source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
                              param_dtype="float32", max_seq_len=context)
     stock = source.text_generation().sampling
-    words = tokenizer_for(tokenizer)
+    words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
     eos = stock.eos_id if stock.eos_id is not None else words.eos_id
     # Temperature one without filters: the engine's reported likelihoods are
