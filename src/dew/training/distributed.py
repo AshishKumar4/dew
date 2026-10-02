@@ -303,7 +303,7 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     return P()
 
 
-HOST_RESIDENT = ("params", "opt_state", "ema")
+HOST_RESIDENT = ("variables", "opt_state", "ema")
 """The train-state fields a layout may keep in pinned host memory between
 steps. Naming params selects a CPU-owned complete transaction state, including
 optimizer, EMA and accumulation. The accelerator scan fetches parameter rows
@@ -487,7 +487,7 @@ class Layout:
                 f"in pinned host memory, which only a stack that fetches a layer's "
                 f"parameters as it reaches it reads; this placement keeps every "
                 f"parameter on the device. Place the weights for generation with "
-                f"dew.inference.host_banked, or use host=('params',) for a "
+                f"dew.inference.host_banked, or use host=('variables',) for a "
                 f"CPU-owned training transaction and drop the inference-only patterns")
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
