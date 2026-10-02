@@ -29,28 +29,46 @@ rows from `tools/reference_runs/dew_lm.py` and `tools/benchmark_step.py`;
 `tools/reference_runs/scoreboard.py` builds the reference-run rows into one
 table.
 
-RTX 4080 16 GiB, Dew at `42ddfc14` (jax 0.11.2.post3), torch 2.13.0+cu130,
+RTX 4080 16 GiB, Dew at `01c6e693` (jax 0.11.2.post3), torch 2.13.0+cu130,
 transformers 5.17.0, SDPA attention:
 
 | model | step | Dew | best torch.compile | Dew / torch |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 105.7 ms, MFU 42.5% | 112.4 ms, 40.0% | 1.06 |
-| Qwen3-0.6B, pretrained | 2 x 1024 tokens | 185.7 ms, MFU 48.4% (`e868862f`) | 168.6 ms, 53.3% | 0.91 |
-| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 63.6 ms | 49.4 ms | 0.78 |
-| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.43 ms | 8.07 ms | 1.09 |
-| SimpleDiT, width 768, 12 layers, 64 px | batch 32 | 76.1 ms, MFU 59.6% | 76.5 ms | 1.01 |
-| 176M hybrid DiT (published config) | batch 16 | 75.4 ms; 62.8 ms with the two fixes below | no torch port | |
+| Qwen3-0.6B, pretrained | 1 x 1024 tokens, AdamW | 103.8 ms, MFU 43.3% | 112.4 ms, 40.0% | 1.08 |
+| Qwen3-0.6B, pretrained | 2 x 1024 tokens, AdamW | 161.2 ms, MFU 55.8% | 168.6 ms, 53.3% | 1.05 |
+| 99M Qwen3-MoE shape, 8 experts, top 2 | 8 x 1024 tokens, AdamW | 93.1 ms | 112.5 ms | 1.21 |
+| decoder, GPT-2 small widths, 3 layers | 16 x 512, Adam, EMA | 60.0 ms | 49.4 ms | 0.83 |
+| SimpleDiT, width 384, 6 layers, 64 px | batch 16, Adam, EMA | 7.4-8.4 ms | 8.1-8.5 ms | 1.0-1.1 |
+| SimpleDiT, width 768, 12 layers, 64 px | batch 32, Adam, EMA | 76.0 ms, MFU 59.6% | 76.4 ms | 1.00 |
+| 176M hybrid DiT (published config) | batch 16, Adam, EMA | 69.9 ms, MFU 37.3% | no torch port | |
+| 176M hybrid DiT (published config) | batch 32 | 116.5 ms, MFU 44.8% | no torch port | |
 
-The decoder and SimpleDiT rows take a fresh host batch every step on both
-sides; the fixed-batch rows and the commands are under "Comparison with
-PyTorch" below.
+The decoder and SimpleDiT rows match whether each step takes a fresh host
+batch or reuses one on the device ("Comparison with PyTorch" below has both
+and the commands). The small SimpleDiT's step is short enough that its
+repeats spread by 1 ms on both sides. On Qwen3-0.6B, at 1 x 1024, torch
+waits 25.1 ms a step on its host, which its 2 x 1024 step hides; on the
+MoE it waits 20.9 ms, and on device time alone Dew is 1.06x faster
+(92.6 against 98.3 ms busy).
+
+Since `42ddfc14`: the hybrid DiT's dilated depthwise convolutions run as
+undilated ones over their interleaved grids (75.4 to 70.2 ms), the head's
+gradient product reads one bf16 copy of the logits' cotangent and its
+logsumexp, maximum and argmax come from one pass (the MoE 119.6 to 92.7 ms,
+whose whole logits now fit), and pretrained weights are placed without the
+hole that made Qwen3-0.6B at 2 x 1024 recompute (185.7 to 161.2 ms). Two
+changes are in review: the S5 layer's chunked recurrence takes the hybrid
+DiT to 62.2 ms at batch 16 (MFU 42.9%) and 107.7 ms at 32 (49.6%), and the
+reference rounding of the vocabulary head takes the 3-layer decoder to
+52.2 ms (0.95x) and Qwen3-0.6B's widths at 1 x 1024 a further 3%.
 
 Where Dew wins: the optimizer update. XLA fuses Adam (or AdamW), the EMA
 and the finiteness guard into one bandwidth-bound pass over the state,
 6.9 ms on the 768-wide SimpleDiT against torch's fused Adam and foreach EMA
 at 16.2, and 27.6 ms on Qwen3-0.6B against torch's fused AdamW and gradient
-clipping at 39.5. GEMMs run at par or better (44.5
-against 47.2 ms on the 768-wide SimpleDiT).
+clipping at 39.5. GEMMs run at par or better (44.5 against 47.2 ms on the
+768-wide SimpleDiT). Dew's host cost is at most 2.6 ms a step on these
+rows, where torch.compile's reaches 25 ms.
 
 Where Dew loses:
 
@@ -61,23 +79,13 @@ Where Dew loses:
   than cuDNN but recovers only 1.2-1.7% of these steps, at larger gradient
   errors ("Faster kernels not adopted" below).
 - The vocabulary head, where it dominates the step: Dew keeps the logits
-  and their cotangent in fp32 and multiplies the cotangent into the states
-  as two bf16 products; torch rounds both to bf16. On the 3-layer decoder
-  (vocabulary 50304, 8192 tokens) that is about 12 of its 14 ms behind.
-- Memory: at 2 x 1024 tokens torch fits in 11.8 GiB without
-  recomputation. At `42ddfc14` Dew's step planned a 5.83 GiB temporary
-  that no free block held, because placing the pretrained weights left a
-  hole below the state, and failed out of memory. At `e868862f` the fit
-  check sees the hole and climbs its ladder: the head tiles at 4096 x 8192
-  and the blocks keep only their projections, 185.7 ms a step.
-
-Fixed on the hybrid DiT, whose SSM blocks spent 21% of the step in the S5
-layer and 12% in the dilated depthwise convolutions: the S5 recurrence runs
-as chunked pole-power products in real arithmetic (75.8 to 68.1 ms), and a
-dilated depthwise convolution runs on CUDA as an undilated one over its
-interleaved grids (75.3 to 70.2 ms); together 75.4 to 62.8 ms, MFU 34.5% to
-42.5%, with the loss after 55 steps 0.5595186 against 0.5595197. "The
-hybrid DiT's SSM blocks" below has the attribution and the numerics.
+  and their gradient in fp32 and multiplies the gradient into the states as
+  two bf16 products; torch rounds both to bf16. On the 3-layer decoder
+  (vocabulary 50304, 8192 tokens) that is most of its 10.6 ms behind; the
+  rounding change in review recovers 7.8 of it.
+- Converts: 11.7 ms of Qwen3-0.6B's step at 1 x 1024 and 20.2 ms of the
+  MoE's, where torch.compile casts inside its GEMMs and elementwise kernels.
+  Not yet attributed by scope.
 
 A100 40 GB (Colab), the latest records:
 
@@ -127,14 +135,17 @@ HLO gives its JAX scope; per step, at `42ddfc14`:
 
 The S5 layer's complex einsums ran as CUTLASS complex TF32 GEMMs, and
 `associative_scan` over 256 positions ran log2(256) rounds of slicing,
-padding and concatenation, twice per direction in the backward. Now the
+padding and concatenation, twice per direction in the backward. In
+`perf/s5-scan` (in review; its A100 and v6e step A/B is queued) the
 products with the input and with C are real GEMMs over stacked real and
 imaginary parts, at the same default precision; the recurrence runs in
 chunks of 16 positions as one product with the running powers of the pole
 at fp32's full precision, and `associative_scan` carries each chunk's last
 state across chunks; the bidirectional layer projects its input once for
 both directions and reverses the narrow projected stream. The S5 work is
-then 8.5 ms, and the step 75.83 to 68.08 ms. Parameters, names and init
+then 8.5 ms, and the step 75.83 to 68.08 ms; at `01c6e693`, with the
+depthwise change in, 69.86 to 62.22 ms at batch 16 and 116.55 to 107.73
+at 32. Parameters, names and init
 are unchanged. Against tests/test_ssm.py's float64 oracle, forward errors
 are 0.1-0.2 u and gradient errors 0.5-1.1 u of the absolute terms at 16,
 40 and 256 positions, as with `associative_scan`, and the test now runs
