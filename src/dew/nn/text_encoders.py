@@ -820,9 +820,10 @@ class T5SelfAttention(nn.Module):
     dew's kernel path scales the query by 1/sqrt(head_dim), so the query
     carries sqrt(head_dim) to cancel it; mathematically exact, and the parity
     test states what the fp32 rounding costs. The bias table rides the
-    kernel's additive bias and the padding the boolean mask. Only layer 0
-    holds the table, as `T5Block(..., has_relative_attention_bias=bool(i ==
-    0))` does upstream; every later layer reuses layer 0's bias.
+    kernel's additive bias and the padding the boolean mask. In T5 only
+    layer 0 holds the table, as `T5Block(..., has_relative_attention_bias=
+    bool(i == 0))` does upstream, and every later layer reuses layer 0's
+    bias; in UMT5 every layer holds and reads its own.
     """
     num_heads: int
     head_dim: int
@@ -966,8 +967,9 @@ class T5Block(nn.Module):
 class T5EncoderTransformer(nn.Module):
     """The T5 encoder stack: token embedding, pre-norm blocks of
     bidirectional relative-bias attention and feed-forward, a final RMS norm,
-    modeling_t5.py `T5Stack` as `T5EncoderModel` runs it. Returns the last
-    hidden states; there is no pooled row."""
+    modeling_t5.py `T5Stack` as `T5EncoderModel` runs it, or modeling_umt5.py
+    `UMT5Stack` as `UMT5EncoderModel` runs it with `per_layer_bias`. Returns
+    the last hidden states; there is no pooled row."""
     vocab_size: int = 32128
     d_model: int = 512
     d_ff: int = 1024
@@ -979,6 +981,10 @@ class T5EncoderTransformer(nn.Module):
     feed_forward_proj: str = "relu"
     dropout_rate: float = 0.0
     layer_norm_epsilon: float = 1e-6
+    per_layer_bias: bool = False
+    """UMT5's: every layer holds its own relative bias table (`UMT5Attention`
+    built with `has_relative_attention_bias=True` in each block), where T5's
+    later layers reuse layer 0's."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -986,7 +992,7 @@ class T5EncoderTransformer(nn.Module):
         self.embed_tokens = nn.Embed(self.vocab_size, self.d_model, name="embed_tokens")
         self.layers = [
             T5Block(self.d_model, self.d_ff, self.num_heads, self.head_dim,
-                    index == 0, self.num_buckets, self.max_distance,
+                    index == 0 or self.per_layer_bias, self.num_buckets, self.max_distance,
                     self.feed_forward_proj, self.dropout_rate, self.layer_norm_epsilon,
                     dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
             for index in range(self.num_layers)]
@@ -1001,7 +1007,8 @@ class T5EncoderTransformer(nn.Module):
             mask = jnp.asarray(attention_mask)
         position_bias = None
         for layer in self.layers:
-            hidden_states, position_bias = layer(hidden_states, mask, position_bias, train)
+            hidden_states, shared = layer(hidden_states, mask, position_bias, train)
+            position_bias = None if self.per_layer_bias else shared
         hidden_states = self.final_norm(hidden_states)
         return self.dropout(hidden_states, deterministic=not train)
 
@@ -1020,10 +1027,12 @@ class T5Fields(TypedDict):
     feed_forward_proj: str
     dropout_rate: float
     layer_norm_epsilon: float
+    per_layer_bias: bool
 
 
 def translate_t5_config(hf_config: Mapping[str, object]) -> T5Fields:
-    """A T5 config into `T5EncoderTransformer` fields."""
+    """A T5 or UMT5 config into `T5EncoderTransformer` fields; a `umt5`
+    model gives every layer its own relative bias."""
     return {
         "vocab_size": records.integer(hf_config["vocab_size"], "vocab_size"),
         "d_model": records.integer(hf_config["d_model"], "d_model"),
@@ -1038,6 +1047,7 @@ def translate_t5_config(hf_config: Mapping[str, object]) -> T5Fields:
         "feed_forward_proj": records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
         "dropout_rate": records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
         "layer_norm_epsilon": records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
+        "per_layer_bias": hf_config.get("model_type") == "umt5",
     }
 
 
