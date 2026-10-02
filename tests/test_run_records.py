@@ -22,7 +22,7 @@ import pytest
 from flax import linen as nn
 
 from dew import registry
-from dew.config import RunConfig, TrainerConfig, _FIELD_RENAMES, _recorded, _registry_for, _to_json
+from dew.config import _FIELD_RENAMES, RunConfig, TrainerConfig, _recorded, _registry_for, _to_json
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization

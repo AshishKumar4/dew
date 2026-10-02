@@ -15,7 +15,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Ratio, Objective, merge
+from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, merge
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer

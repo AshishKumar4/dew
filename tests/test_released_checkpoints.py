@@ -57,7 +57,6 @@ import pytest
 
 from dew.interop import load_pretrained
 from dew.objectives.base import Step, scalar_loss
-
 from dew.sampling import Sampling
 
 # Pinned: the numbers above are these commits' weights, and a repository

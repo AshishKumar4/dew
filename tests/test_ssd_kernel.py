@@ -44,14 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kernels.ssd import (
-    MIN_CHUNK,
-    MIN_WIDTH,
-    TPU_PROGRAM_WORDS,
-    ssd_chunk_scan,
-    ssd_kernel_platform,
-    ssd_kernel_runs,
-)
+from dew.nn.kernels.ssd import MIN_CHUNK, MIN_WIDTH, ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"

@@ -14,7 +14,7 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-from dew import models  # noqa: F401  registers the models
+from dew import models
 from dew.config import OptimConfig, _rebuild
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, scalar_loss
@@ -241,7 +241,6 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
     convolutions)."""
     qwix = pytest.importorskip("qwix")
     from qwix._src.core import conv_general, qarray
-    from reference_error import assert_fp32_reduction_bound
 
     from dew.nn.conv import Conv
 

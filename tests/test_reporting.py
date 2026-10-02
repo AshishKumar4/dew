@@ -102,11 +102,10 @@ def test_fanout_continues_to_local_sink_and_context_preserves_primary(tmp_path):
             raise OSError('close offline')
 
     local = LocalTracker(tmp_path)
-    with pytest.raises(ValueError) as raised:
-        with Trackers(Broken(), local) as tracker:
-            with pytest.raises(OSError):
-                tracker.log({'loss': 3.}, 1)
-            raise primary
+    with pytest.raises(ValueError) as raised, Trackers(Broken(), local) as tracker:
+        with pytest.raises(OSError):
+            tracker.log({'loss': 3.}, 1)
+        raise primary
     assert raised.value is primary
     assert 'close offline' in '\n'.join(primary.__notes__)
     assert json.loads((tmp_path / 'scalars.jsonl').read_text())['scalars'] == {'loss': 3.}

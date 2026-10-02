@@ -11,7 +11,6 @@ trainer drives it on both a data-parallel and an FSDP mesh. The real
 sampler runs in test_lm_recipe.
 """
 
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -58,7 +57,7 @@ class TinyCausalLM(nn.Module):
     num_layers: int = 2
     max_seq_len: int = 64
     dropout_rate: float = 0.0
-    final_logit_softcap: Optional[float] = None
+    final_logit_softcap: float | None = None
     precision = None
 
     def setup(self):

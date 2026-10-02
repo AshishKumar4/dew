@@ -471,9 +471,8 @@ def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
         raise failure
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
-    with pytest.raises(RuntimeError) as caught:
-        with DevicePrefetchIterator(Source(), build_mesh()) as stream:
-            next(stream)
+    with pytest.raises(RuntimeError) as caught, DevicePrefetchIterator(Source(), build_mesh()) as stream:
+        next(stream)
     assert caught.value is failure
     assert owners == [threading.get_ident()]
     stream.close()

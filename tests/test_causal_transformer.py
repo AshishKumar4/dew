@@ -15,9 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
-from flax import linen as nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm.chunked import head_logits
@@ -81,9 +81,10 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
 
 
 def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
-    from dew.config import ModelConfig
     from flax.traverse_util import unflatten_dict
     from jax import export
+
+    from dew.config import ModelConfig
 
     config = dict(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
                   mlp_features=16, max_seq_len=8)

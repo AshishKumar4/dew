@@ -516,10 +516,9 @@ def test_decoding_is_refused_under_a_sequence_axis():
     model = tiny()
     tokens = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
-    with jax.set_mesh(build_mesh(SPLIT)):
-        with pytest.raises(ValueError, match="sequence axis of 2"):
-            jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
-                variables, tokens)
+    with jax.set_mesh(build_mesh(SPLIT)), pytest.raises(ValueError, match="sequence axis of 2"):
+        jax.jit(lambda v, t: model.apply(v, t, decode=True, mutable=["cache"]))(
+            variables, tokens)
 
 
 # --------------------------------------------------------------------------
