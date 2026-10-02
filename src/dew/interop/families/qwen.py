@@ -257,7 +257,9 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
                  'shared_expert_intermediate_size', 'num_experts_per_tok',
                  'output_router_logits', 'router_aux_loss_coef'))
     experts = _record_int(hf_config, 'num_experts')
-    sparse = _sparse_step_layers(hf_config, records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'), used)
+    sparse = _sparse_step_layers(
+        hf_config, records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"), used
+    )
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
         config['mixture'] = _softmax_mixture(
@@ -309,8 +311,11 @@ _QWEN_MTP_FIELDS = {
 }
 
 
-def _qwen_mtp_path(name: str, config: Mapping[str, object],
-                   block_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None]) -> tuple[str, ...]:
+def _qwen_mtp_path(
+    name: str,
+    config: Mapping[str, object],
+    block_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None],
+) -> tuple[str, ...]:
     """Return the variables-tree path for one Qwen MTP tensor name.
 
     The names are vLLM qwen3_5_mtp.py's, for the shared-embedding single
@@ -346,6 +351,11 @@ def _qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
             return (*layer, "experts", tail[2], "kernel")
         if tail == ["mlp", "shared_expert_gate", "weight"]:
             return (*layer, "shared_expert_gate", "kernel")
-        if len(tail) == 4 and tail[:2] == ["mlp", "shared_expert"] and tail[2] in _MOE_SHARED and tail[3] == "weight":
+        if (
+            len(tail) == 4
+            and tail[:2] == ["mlp", "shared_expert"]
+            and tail[2] in _MOE_SHARED
+            and tail[3] == "weight"
+        ):
             return (*layer, "shared_experts", tail[2], "kernel")
     return _dew_path(name, config)

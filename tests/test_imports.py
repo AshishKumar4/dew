@@ -51,7 +51,7 @@ np.testing.assert_array_equal(restored['params']['weight'], weights['params']['w
 pipe = TextToImage(Zero(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
                    InputSpec(Field('image', (2, 2, 1))),
                    {}, steps=1, guidance=None, sampler=Euler())
-result = pipe('', seed=0).host()
+result = pipe('', key=0).host()
 assert result.images.shape == (1, 2, 2, 1)
 np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
 '''

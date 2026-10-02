@@ -291,6 +291,7 @@
   "start": "required"
  },
  "dew.data.images.ArrayRecordImages": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -311,6 +312,7 @@
   "val_split": null
  },
  "dew.data.images.CC12M": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -333,6 +335,7 @@
   "val_split": null
  },
  "dew.data.images.CC3M": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -355,6 +358,7 @@
   "val_split": null
  },
  "dew.data.images.Combined30M": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -380,6 +384,7 @@
   "val_split": null
  },
  "dew.data.images.CombinedMsml612": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -405,6 +410,7 @@
   "val_split": null
  },
  "dew.data.images.DiffusionDB": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -427,14 +433,20 @@
   "val_split": null
  },
  "dew.data.images.HFImages": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
+  "caption_columns": [
+   "caption",
+   "text"
+  ],
   "count": null,
   "crop_scale": [
    1.0,
    1.0
   ],
+  "image_column": "image",
   "image_size": 128,
   "loading": {
    "class": "dew.data.dataset.Loading",
@@ -451,6 +463,7 @@
   "val_split": null
  },
  "dew.data.images.Laion12mCoco": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -473,6 +486,7 @@
   "val_split": null
  },
  "dew.data.images.Laion2bAesthetic": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,
@@ -495,6 +509,7 @@
   "val_split": null
  },
  "dew.data.images.OxfordFlowers": {
+  "augment_validation": true,
   "augmentation": "flip_jitter",
   "augmentation_backend": "host",
   "augmentation_size": null,

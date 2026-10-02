@@ -174,8 +174,11 @@ class FlowTrajectory:
         return self.states[:, -1]
 
 
+_DEFAULT_SOLVER = FlowSDE()
+
+
 def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
-                      solver: FlowSDE = FlowSDE(), guidance: Guidance | None = None,
+                      solver: FlowSDE = _DEFAULT_SOLVER, guidance: Guidance | None = None,
                       key: int | jax.Array) -> FlowTrajectory:
     """Record FlowSDE transitions over the same time grid and keys as sample.
 

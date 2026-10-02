@@ -18,6 +18,10 @@ from collections.abc import Callable, Mapping
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from dew.logging import configure as _configure_logging
+
+_configure_logging()
+
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset

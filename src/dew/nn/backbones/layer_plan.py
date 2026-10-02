@@ -8,7 +8,7 @@ consecutive layers whose specs agree, which `nn.scan` stacks into one group.
 """
 
 import dataclasses
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from dew.registry import mixers
 

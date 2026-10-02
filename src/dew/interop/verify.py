@@ -297,7 +297,9 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
             try:
                 decoders._check_tree(variables, model)
             except ValueError as error:
-                raise _refuse(model_type, f"its tensors do not fill the convention's model ({error})") from error
+                raise _refuse(
+                    model_type, f"its tensors do not fill the convention's model ({error})"
+                ) from error
             # `_ROUNDING` was measured at fp32 matmul precision; a GPU's
             # default runs fp32 matmuls in TF32, which alone misses it.
             with jax.default_matmul_precision("highest"):

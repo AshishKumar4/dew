@@ -31,13 +31,13 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     PredictionPhase,
     RowPlan,
@@ -68,6 +68,8 @@ from dew.sampling.decoding import (
     Typical,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -301,11 +303,14 @@ def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = 
         raise ValueError("min_new_tokens holds EOS back, and this policy names no eos_id; "
                          "set it, or let a task fill it")
     own: dict[str, LogitsTransform | None] = {
-        "repetition_penalty": RepetitionPenalty(policy.repetition_penalty) if policy.repetition_penalty != 1.0 else None,
+        "repetition_penalty": (RepetitionPenalty(policy.repetition_penalty)
+                               if policy.repetition_penalty != 1.0 else None),
         "presence_penalty": PresencePenalty(policy.presence_penalty) if policy.presence_penalty else None,
         "frequency_penalty": FrequencyPenalty(policy.frequency_penalty) if policy.frequency_penalty else None,
-        "no_repeat_ngram_size": NoRepeatNGram(policy.no_repeat_ngram_size) if policy.no_repeat_ngram_size else None,
-        "min_new_tokens": None if eos is None or not policy.min_new_tokens else MinNewTokens(policy.min_new_tokens, eos),
+        "no_repeat_ngram_size": (NoRepeatNGram(policy.no_repeat_ngram_size)
+                                 if policy.no_repeat_ngram_size else None),
+        "min_new_tokens": (MinNewTokens(policy.min_new_tokens, eos)
+                           if eos is not None and policy.min_new_tokens else None),
         "temperature": Temperature(policy.temperature) if policy.temperature not in (0.0, 1.0) else None,
         "top_k": None if policy.top_k is None else TopK(policy.top_k),
         "top_p": TopP(policy.top_p) if policy.top_p < 1.0 else None,
@@ -407,11 +412,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
-        {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])], rngs=None,
-        method=("states_and_logits_at" if selective else
-                "states_and_logits" if exposed else None), capture_intermediates=False,
-        **inputs.kwargs())
+        {**params, "cache": held},
+        *scored,
+        decode=True,
+        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
+        rngs=None,
+        method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
+        capture_intermediates=False,
+        **inputs.kwargs(),
+    )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
         states = _context(model, params, updated)
@@ -445,7 +454,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
     cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
-        cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
+        cache.update(
+            flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"]))
+        )
     return unflatten_dict(cache)
 
 
@@ -878,10 +889,13 @@ def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
                                          "attention_mask": valid & ~plan.padding[:, None]})
 
 
+_DEFAULT_SAMPLING = Sampling()
+
+
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array | None = None,
-             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
+             sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 

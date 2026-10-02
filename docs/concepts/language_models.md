@@ -37,7 +37,7 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 48830 training tokens, 2569 validation tokens
 ```
 
-This is the layout `tools/tokenize_text.py` writes: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
+This is the layout `dew tokenize` writes: `train.bin` and `val.bin` hold the token IDs back to back, and `meta.json` records the tokenizer, vocabulary size, dtype and counts. The validation split is the head of the stream.
 
 ```python
 import jax
@@ -84,7 +84,7 @@ The same code trains a decoder on TinyStories, a corpus of short stories in simp
 ```bash
 hf download roneneldan/TinyStories TinyStoriesV2-GPT4-valid.txt \
     --repo-type dataset --local-dir data
-python tools/tokenize_text.py --input data/TinyStoriesV2-GPT4-valid.txt \
+dew tokenize --input data/TinyStoriesV2-GPT4-valid.txt \
     --out data/tinystories --tokenizer gpt2
 ```
 
@@ -112,10 +112,10 @@ Use one tokenizer everywhere: data preparation, model construction, decoding and
 
 `ByteTokenizer` and `HFTokenizer` have `encode` and `decode`, and `tokenizer_for(name)` returns the first for `"byte"` and the second for any other name. A source loaded with `load_pretrained` carries the checkpoint's own processor instead, which has no `encode`. Call it on text: `bundle.processor(["The capital of France is", "Hello"])` returns `ModelInputs`, whose `tokens` are the id rows padded the way the tokenizer pads and whose `kwargs()` hold the attention mask and positions. `bundle.processor.decode(rows)` turns ids back into strings, and `bundle.processor.chat(messages)` runs the checkpoint's chat template when it has one. `RunProcessor(tokenizer)` in `dew.inference` wraps an `encode`/`decode` tokenizer into the same callable, which is what a task takes as `processor=`. A text-to-image run's captions are tokenized by its condition encoder, for example `CLIPText.tokenize` in `dew.inputs`.
 
-`tools/tokenize_text.py` (in a repository checkout) tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
+`dew tokenize`, or `dew.data.write_tokens` in Python, tokenizes a file, or every `.txt` file under a directory, into `train.bin`, `val.bin` and `meta.json`:
 
 ```bash
-python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-byte \
+dew tokenize --input data/corpus.txt --out data/corpus-byte \
     --tokenizer byte --val-fraction 0.1
 ```
 
@@ -188,7 +188,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 `load_pretrained(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` wraps the same loader and returns a `TextGeneration` (a `BlockGeneration` for DiffusionGemma, a `MaskedGeneration` for LLaDA and Dream) with the weights placed on the current devices and the sampling policy and budget taken from the checkpoint.
 
-`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`tools/tokenize_text.py --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
+`bundle.lm_objective(seq_len, **options)` builds an `LMObjective` starting from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
 ```python
 from dew.interop import load_pretrained

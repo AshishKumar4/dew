@@ -21,11 +21,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax.experimental import multihost_utils
+from typing_extensions import TypeVar
 
 from dew.artifacts import agreed
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
-    ArrayT,
     ModelInputs,
     RowPlan,
     agreed_validity,
@@ -37,6 +37,8 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.objectives.base import Variables
+
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
 
 @struct.dataclass
@@ -62,8 +64,9 @@ class CanvasGeneration(Generic[ArrayT]):
     decoder_steps: ArrayT
     rows: int | None = struct.field(pytree_node=False, default=None)
     prompt_width: int | None = struct.field(pytree_node=False, default=None)
-    decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = struct.field(
-        pytree_node=False, default=None)
+    decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = (
+        struct.field(pytree_node=False, default=None)
+    )
 
     def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays, without the padding a

@@ -573,7 +573,16 @@ in this change reaches them.
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`. `prepare_process` applies
-it before JAX opens a backend. The default is None, and this sweep is the
+it before JAX opens a backend, and also sets `--xla_allow_excess_precision=false`
+unless the run named that flag (`dew.training.runtime.keep_roundings`): with
+XLA's default a fusion may skip a bf16 rounding the program states, and which
+it skips depends on the layout, so one device and four computed different
+bf16 forwards of one model. The recipes and the CLI call `prepare_process`;
+a script or notebook that builds a `Trainer` itself calls it first, or sets
+`XLA_FLAGS=--xla_allow_excess_precision=false` before importing jax. On the
+RTX 4080 the flag was faster: the 176M hybrid DiT at batch 16 69.60 to 66.62
+ms, SimpleDiT-B at batch 32 76.00 to 73.03, Qwen3-0.6B's widths at 1 x 1024
+110.52 to 109.62. The default `xla_flags` is None, and this sweep is the
 reason. It covers three architectures, with one fresh process per
 configuration. Each cell is the median of the runs, with the range and count
 where a configuration was repeated.
@@ -662,7 +671,7 @@ workstation CPU does nine of them in under an hour.
 ```
 curl -o data/shakespeare.txt --create-dirs \
     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-python tools/tokenize_text.py --input data/shakespeare.txt \
+dew tokenize --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \

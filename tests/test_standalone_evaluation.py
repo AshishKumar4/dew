@@ -7,6 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec as P
+from steady_state import steady_state
 
 from dew import Dataset, Trainer, evaluate
 from dew.artifacts import TextSamples, TokenScores
@@ -14,6 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, Objective
 from dew.objectives.lm import LMObjective, Samples, perplexity
 from dew.sampling import Sampling
+from dew.training import build_mesh
 
 
 class Recording:
@@ -123,3 +126,28 @@ def test_preview_only_closes_first_batch_and_no_consumers_never_open_source():
 
     empty = evaluate(objective, {}, unopened, key=jax.random.key(0))
     assert empty.scores == {} and empty.previews == () and empty.records == 0
+
+
+def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
+    """A validation pass repeated at a later step, over other batches of the
+    same shapes, reuses the programs the first compiled, and moves only what
+    it places and what it brings home for the metrics (`steady_state`). The
+    variables and the key are placed over the mesh, as fit's state keeps them."""
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
+    objective = LMObjective(model, seq_len=4)
+    mesh = build_mesh()
+    params = jax.device_put(objective.init(jax.random.key(0)), NamedSharding(mesh, P()))
+    rows = np.random.default_rng(0).integers(1, 8, (6, 8, 5), dtype=np.int32)
+
+    def split(start):
+        return lambda partition: iter([{"text": rows[index]} for index in range(start, start + 3)])
+
+    key = jax.device_put(jax.random.key(1), NamedSharding(mesh, P()))
+    first = evaluate(objective, params, split(0), key=key, step=2,
+                     metrics=(perplexity(),), loss=True, mesh=mesh)
+    with steady_state():
+        second = evaluate(objective, params, split(3), key=key, step=3,
+                          metrics=(perplexity(),), loss=True, mesh=mesh)
+    assert second.coordinated_batches == first.coordinated_batches == 3
+    assert second.scores["val/perplexity"] != first.scores["val/perplexity"]

@@ -76,6 +76,8 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    # The gate's behavior tests run the same linter and rule set as CI.
+    "ruff==0.14.3",
     # The legacy decoder graph test deserializes jax.export; JAX does not
     # declare flatbuffers. This version wrote the committed export fixture.
     "flatbuffers==25.12.19",
@@ -118,6 +120,9 @@ test = [
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
 ]
+# Run mutation tests in CI, one source module at a time. Pin the operators so
+# two reports describe the same mutation population.
+mutation = ["cosmic-ray==8.7.0"]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
 # FID (scipy sqrtm) and Inception weight download
@@ -172,30 +177,19 @@ line-length = 110
 [tool.ruff.lint]
 select = [
     "E", "F", "W", "I", "UP", "B", "C4", "PERF", "PIE", "RET", "SIM", "PGH",
-    "T20", "ERA", "ANN401", "FBT003", "PLW0120", "RUF",
+    "ERA", "ANN401", "FBT003", "PLW0120", "RUF", "C901", "PLR0912", "PLR0915",
 ]
-ignore = [
-    "E501",    # the formatter owns width; line-length above is its target, not a gate
-    "RUF012",  # mutable class attributes are Flax module fields, not shared state
-    "RUF001",  # unicode in docstrings is mathematical notation
-    "RUF002",  # unicode in docstrings is mathematical notation
-    "RUF003",  # unicode in comments is mathematical notation
-    "UP035",   # typing imports; the floor is 3.12, not 3.13
-    "SIM108",  # a ternary is not clearer than the if/else it replaces
-    "RET505",  # else-after-return keeps symmetric branches symmetric
-    "B008",    # nn.Module field defaults are evaluated once at class creation
-    "B023",    # every flagged closure is consumed inside its own iteration (nn.scan,
-               # jax.lax.*, an immediate call); ruff cannot see the consumption site
-    "RUF009",  # dataclass defaults are frozen dataclasses, so the shared instance is safe
-    "UP046",   # the generic classes' parameters carry PEP 696 defaults (Loss, Effects, ArrayT),
-               # which PEP 695 class syntax can only spell from 3.13; the floor is 3.12
-]
+# Scripts use stdout as their interface; src/dew/ruff.toml adds T20 for the
+# library, whose output is rendered by the display or reported through logging.
+allowed-confusables = ["×", "γ", "σ"]
 
-[tool.ruff.lint.flake8-boolean-trap]
-# Two library contracts take their flag positionally and have no keyword worth
-# writing: jnp.asarray's `a` is the value itself, and nn.map_variables' second
-# parameter selects the collections. Every other boolean positional is ours.
-extend-allowed-calls = ["jax.numpy.asarray", "flax.linen.map_variables"]
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.lint.pylint]
+max-branches = 25
+max-statements = 75
+
 
 [tool.ruff.lint.isort]
 known-first-party = ["dew"]
@@ -205,39 +199,6 @@ combine-as-imports = true
 # A trailing comma in a wrapped import is this tree's punctuation, not a
 # request for one name per line; a wrapped import that fits joins back up.
 split-on-trailing-comma = false
-
-[tool.ruff.lint.per-file-ignores]
-# The suite prints its own diagnostics and calls library predicates positionally.
-"tests/**" = ["T20", "FBT003"]
-# Reference generators, recipes and examples are scripts; stdout is their interface.
-"tools/**" = ["T20"]
-"recipes/**" = ["T20"]
-"examples/**" = ["T20"]
-# The training display's lines off a terminal, the trainer's remat warnings and
-# the device count are the user-facing output of a run, not logging.
-"src/dew/training/display.py" = ["T201"]
-"src/dew/training/trainer.py" = ["T201"]
-"src/dew/training/runtime.py" = ["T201"]
-# `dew config show` prints the resolved configuration for a person to read.
-"src/dew/config/__init__.py" = ["T201"]
-# A stalled url loader says so on stdout instead of inventing a batch;
-# tests/test_online_loader.py asserts that line. Its other diagnostics log.
-"src/dew/data/online_loader.py" = ["T201"]
-# A stop of grain's workers that runs past a few seconds says on stderr what it
-# waits for, so a long close does not read as a hang; tests/test_data.py
-# asserts that line.
-"src/dew/data/dataset.py" = ["T201"]
-# Four modules import at the bottom on purpose. The mixer hub imports each
-# kind module after the base class those modules subclass; `mla` imports the
-# hub back after the indexer name and cache `dsa_kpool` reads, so either
-# import order resolves; `dew.inputs` imports its diffusion conditioner after
-# the Condition it registers against; and the decoder hub imports the family
-# modules after the shared readers they call, which is the same order.
-# Each says so where the import stands.
-"src/dew/nn/mixers/__init__.py" = ["E402"]
-"src/dew/nn/mla.py" = ["E402"]
-"src/dew/inputs/__init__.py" = ["E402"]
-"src/dew/interop/hf_decoders.py" = ["E402"]
 
 [tool.pyright]
 # The declared boundary: dew's own source, checked against the project venv.

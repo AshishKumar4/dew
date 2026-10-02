@@ -105,9 +105,13 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
             record: dict[str, JSON] = {"tool": tool, "session": str(session.relative_to(directory))}
             records.append(record)
             if tool in ("graph_viewer", "memory_viewer", "trace_viewer@", "trace_viewer"):
-                record.update(status="interactive", reason="Use the native XProf viewer and retained trace/HLO files")
+                record.update(
+                    status="interactive", reason="Use the native XProf viewer and retained trace/HLO files"
+                )
                 continue
-            if not tool or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in tool):
+            if not tool or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in tool
+            ):
                 error = ValueError(f"Unexpected native tool name: {tool!r}")
                 record.update(status="error", error=str(error))
                 failures.append(error)
@@ -123,7 +127,9 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
                         record.update(status="unavailable", reason="Native converter returned no data")
                         continue
                     if not isinstance(payload, (bytes, str)):
-                        raise TypeError(f"Native {tool} returned {type(payload).__name__}; expected bytes or str")
+                        raise TypeError(
+                            f"Native {tool} returned {type(payload).__name__}; expected bytes or str"
+                        )
                     extension = {"application/json": ".json", "text/html": ".html",
                                  "text/plain": ".txt", "application/octet-stream": ".bin"}.get(mime, ".bin")
                     suffix = (f"-session-{index}" if len(sessions) > 1 else "")
