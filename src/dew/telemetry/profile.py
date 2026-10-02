@@ -76,7 +76,14 @@ def active_profile() -> Profiler | None:
 
 
 def _drain() -> None:
-    jax.block_until_ready(jax.live_arrays())
+    """Wait for the work in flight: every live array, then the effects.
+
+    An array some code still holds after a step donated it can list as live
+    with only its first buffer left, since XLA counts an array deleted by
+    that buffer (jax 0.11.2), and waiting on it raises. Its work is done,
+    and the step's outputs are the arrays to wait on, so it is passed over."""
+    jax.block_until_ready([array for array in jax.live_arrays()
+                           if not any(shard.data.is_deleted() for shard in array.addressable_shards)])
     jax.effects_barrier()
 
 
@@ -309,9 +316,3 @@ def region(name: str) -> AbstractContextManager[None]:
     """
     active = active_profile()
     return nullcontext() if active is None else active.region(name)
-
-
-def profile(directory: str | os.PathLike[str] | None = None, *,
-            options: jax.profiler.ProfileOptions | None = None) -> Profiler:
-    """Configure native profiling; capture starts only on enter or start()."""
-    return Profiler(directory, options=options)

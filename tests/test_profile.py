@@ -47,7 +47,7 @@ def event_names(capture):
 def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, native_reports):
     sentinel = tmp_path / "existing.txt"
     sentinel.write_text("keep")
-    profiler = dew.profile(tmp_path)
+    profiler = dew.Profiler(tmp_path)
     assert profiler.directory == tmp_path and not profiler.running
     assert captures(tmp_path) == []
     assert profiler.start() is profiler
@@ -85,22 +85,22 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):
     failure = ValueError("user computation failed")
     with pytest.raises(ValueError) as raised:
-        with dew.profile(tmp_path):
+        with dew.Profiler(tmp_path):
             work()
             raise failure
     assert raised.value is failure and active_profile() is None
     assert manifest(captures(tmp_path)[0])["body_status"] == "failed"
-    with dew.profile(tmp_path):
+    with dew.Profiler(tmp_path):
         work()
     assert len(captures(tmp_path)) == 2
 
 
 def test_nested_and_concurrent_refusals_do_not_stop_owner(tmp_path, native_reports):
-    with dew.profile(tmp_path / "outer") as outer:
+    with dew.Profiler(tmp_path / "outer") as outer:
         with pytest.raises(RuntimeError, match="already running"):
-            with dew.profile(tmp_path / "nested"):
+            with dew.Profiler(tmp_path / "nested"):
                 pytest.fail("nested capture must not run its body")
-        other = dew.profile(tmp_path / "concurrent")
+        other = dew.Profiler(tmp_path / "concurrent")
         with ThreadPoolExecutor(max_workers=1) as pool:
             with pytest.raises(RuntimeError, match="already running"):
                 pool.submit(other.start).result()
@@ -117,7 +117,7 @@ def test_external_jax_capture_survives_failed_dew_start(tmp_path, native_reports
     jax.profiler.start_trace(native)
     try:
         with pytest.raises(RuntimeError, match="already been started"):
-            dew.profile(tmp_path / "refused").start()
+            dew.Profiler(tmp_path / "refused").start()
         assert active_profile() is None
         with jax.profiler.TraceAnnotation("external_survived"):
             work().block_until_ready()
@@ -127,8 +127,8 @@ def test_external_jax_capture_survives_failed_dew_start(tmp_path, native_reports
 
 
 def test_manual_stop_inside_context_does_not_stop_another_owner(tmp_path, native_reports):
-    second = dew.profile(tmp_path / "second")
-    with dew.profile(tmp_path / "first") as first:
+    second = dew.Profiler(tmp_path / "second")
+    with dew.Profiler(tmp_path / "first") as first:
         work()
         first.stop()
         second.start()
@@ -154,7 +154,7 @@ def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, n
     compute(value).block_until_ready()
     observed.clear()
     with jax.transfer_guard_device_to_host("disallow"):
-        with dew.profile(tmp_path):
+        with dew.Profiler(tmp_path):
             pending = compute(value)
     assert pending.is_ready()
     assert observed == ["effect"]
@@ -163,20 +163,40 @@ def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, n
 def test_capture_does_not_retain_donated_arrays(tmp_path, native_reports):
     update = jax.jit(lambda value: value + 1, donate_argnums=(0,))
     value = jnp.ones((16,), jnp.float32)
-    with dew.profile(tmp_path):
+    with dew.Profiler(tmp_path):
         previous = value
         value = update(value)
     assert previous.is_deleted() and value.is_ready()
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_capture_drains_past_an_array_a_donation_consumed(tmp_path, native_reports):
+    """An array still held after a step donated it can list as live with
+    only its first buffer left: XLA counts an array deleted by that buffer,
+    and a host read of a replicated array keeps it from the donation (jax
+    0.11.2 on CPU). The capture's drain waits on the work in flight without
+    waiting on the consumed array."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = jax.make_mesh((jax.device_count(),), ("data",))
+    consumed = jax.device_put(jnp.asarray(0, jnp.int32), NamedSharding(mesh, P()))
+    assert int(consumed) == 0
+    stepped = jax.jit(lambda value: value + 1, donate_argnums=0)(consumed)
+    assert any(array is consumed for array in jax.live_arrays())
+    assert consumed.addressable_shards[1].data.is_deleted()
+    with dew.Profiler(tmp_path):
+        stepped = stepped + 1
+    assert stepped.is_ready() and int(stepped) == 2
 
 
 def test_explicit_options_control_native_host_events(tmp_path, native_reports):
     options = jax.profiler.ProfileOptions()
     options.host_tracer_level = 0
     options.python_tracer_level = 0
-    with dew.profile(tmp_path / "disabled-host", options=options):
+    with dew.Profiler(tmp_path / "disabled-host", options=options):
         with jax.profiler.TraceAnnotation("host_option_marker"):
             work()
-    with dew.profile(tmp_path / "default"):
+    with dew.Profiler(tmp_path / "default"):
         with jax.profiler.TraceAnnotation("host_option_marker"):
             work()
     assert options.host_tracer_level == 0
@@ -195,7 +215,7 @@ def test_a_default_capture_leaves_python_calls_out_of_the_trace(tmp_path, native
     traced = jax.profiler.ProfileOptions()
     traced.python_tracer_level = 1
     for name, options in (("traced", traced), ("default", None)):
-        with dew.profile(tmp_path / name, options=options):
+        with dew.Profiler(tmp_path / name, options=options):
             python_tracer_marker()
     marked = {name: [event for event in event_names(captures(tmp_path / name)[0])
                      if "python_tracer_marker" in event]
@@ -213,7 +233,7 @@ def test_missing_extra_fails_at_start_without_running_body(tmp_path, monkeypatch
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(module.importlib, "import_module", missing)
-    profiler = dew.profile(tmp_path / "not-created")
+    profiler = dew.Profiler(tmp_path / "not-created")
     with pytest.raises(ImportError):
         with profiler:
             pytest.fail("missing optional dependency must prevent user work")
@@ -229,18 +249,18 @@ def test_native_export_failure_keeps_body_exception_and_trace(tmp_path, native_r
     monkeypatch.setattr(native_reports, "xspace_to_tool_data", broken)
     failure = ValueError("primary user error")
     with pytest.raises(ValueError) as raised:
-        with dew.profile(tmp_path / "body-failed"):
+        with dew.Profiler(tmp_path / "body-failed"):
             work()
             raise failure
     assert raised.value is failure and failure.__notes__
     assert list((tmp_path / "body-failed").glob("capture-*/plugins/profile/*/*.xplane.pb"))
     assert manifest(captures(tmp_path / "body-failed")[0])["export_status"] == "failed"
     with pytest.raises(ExceptionGroup, match="cleanup or export"):
-        with dew.profile(tmp_path / "export-failed"):
+        with dew.Profiler(tmp_path / "export-failed"):
             work()
     assert active_profile() is None
     monkeypatch.setattr(native_reports, "xspace_to_tool_data", original)
-    with dew.profile(tmp_path / "recovered"):
+    with dew.Profiler(tmp_path / "recovered"):
         work()
 
 
@@ -248,16 +268,16 @@ def test_construction_is_configuration_only_in_a_fresh_process(tmp_path):
     script = """import sys
 import dew
 assert 'jax' not in sys.modules and 'xprof' not in sys.modules
-p = dew.profile(sys.argv[1])
+p = dew.Profiler(sys.argv[1])
 assert not p.running and 'xprof' not in sys.modules
 assert not p.directory.exists()
-assert dew.profile().directory is None
+assert dew.Profiler().directory is None
 """
     subprocess.run([sys.executable, "-c", script, str(tmp_path / "not-created")], check=True)
 
 
 def test_default_directory_is_allocated_on_start_and_survives_stop(native_reports):
-    profiler = dew.profile()
+    profiler = dew.Profiler()
     assert profiler.directory is None
     with pytest.raises(RuntimeError, match="does not own"):
         profiler.stop()
@@ -276,7 +296,7 @@ def test_default_directory_is_allocated_on_start_and_survives_stop(native_report
 def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_reports, monkeypatch):
     monkeypatch.setattr(native_reports, "xspace_to_tool_names", lambda paths: [])
     with pytest.raises(ExceptionGroup):
-        with dew.profile(tmp_path):
+        with dew.Profiler(tmp_path):
             work()
     capture = captures(tmp_path)[0]
     record = manifest(capture)
@@ -293,8 +313,8 @@ def test_blocked_lifecycle_drain_refuses_conflicts_without_holding_mutex(
     module = importlib.import_module("dew.telemetry.profile")
     original = module._drain
     entered, release = Event(), Event()
-    profiler = dew.profile(tmp_path / "owner")
-    competitor = dew.profile(tmp_path / "competitor")
+    profiler = dew.Profiler(tmp_path / "owner")
+    competitor = dew.Profiler(tmp_path / "competitor")
     if phase == "stop":
         profiler.start()
         work()
@@ -357,7 +377,7 @@ def test_interrupted_publication_closes_only_its_successfully_started_trace(tmp_
         def __exit__(self, *exception):
             native_lock.release()
 
-    profiler = dew.profile(tmp_path / "interrupted")
+    profiler = dew.Profiler(tmp_path / "interrupted")
     monkeypatch.setattr(module, "_lifecycle", InterruptedPublication())
     with pytest.raises(KeyboardInterrupt) as raised:
         profiler.start()
@@ -365,6 +385,6 @@ def test_interrupted_publication_closes_only_its_successfully_started_trace(tmp_
     assert not profiler.running and active_profile() is None
     assert list((tmp_path / "interrupted").glob("capture-*/plugins/profile/*/*.xplane.pb"))
     monkeypatch.setattr(module, "_lifecycle", native_lock)
-    with dew.profile(tmp_path / "next"):
+    with dew.Profiler(tmp_path / "next"):
         work()
     assert manifest(captures(tmp_path / "next")[0])["capture_status"] == "completed"

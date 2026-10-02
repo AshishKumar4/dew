@@ -3,7 +3,7 @@
 A `DPOObjective` is an `LMObjective` whose loss is the preference term from
 `dew.rl` instead of the cross entropy: policy and reference log-probabilities
 as negated per-token cross entropies, summed under the shifted completion
-mask, through `preference_logsigmoid`. The reference is the objective's own
+mask, through `preference_logsigmoid_terms`, averaged over pairs. The reference is the objective's own
 frozen tree, `step.ema` at unit decay, so the run carries no second model.
 Batches hold pairs, `[B, 2, S]` with the chosen row at index 0, so shuffling
 never separates a pair; the loss reads them in TRL's stacked order.

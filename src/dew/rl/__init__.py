@@ -11,6 +11,11 @@ keeps the split into a separate distribution a directory move
 (`docs/design/plan.md`, section 5.1). tests/test_rl_imports.py walks the tree
 and fails when either half of that stops being true.
 
+`sandbox` runs untrusted programs and tool sessions in bounded subprocesses
+or containers, which a verifiable reward scores completions with. It reads
+the episode types in `dew.objectives.rl`, so it is imported as
+`dew.rl.sandbox` and not from this package.
+
 `advantage` and `surrogate` port Apache-2.0 code from Tunix and verl and carry
 their notice; the rest of Dew is MIT.
 """
@@ -18,27 +23,25 @@ their notice; the rest of Dew is MIT.
 from .advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
 from .surrogate import (
     behavior_importance_weights,
-    clipped_surrogate,
+    clipped_surrogate_terms,
     clipped_value_loss_terms,
     k3_kl,
-    preference_logsigmoid,
+    preference_logsigmoid_terms,
     sequence_log_ratio,
     token_log_ratio,
-    token_mean,
 )
 
 __all__ = [
     "behavior_importance_weights",
-    "clipped_surrogate",
+    "clipped_surrogate_terms",
     "clipped_value_loss_terms",
     "gae",
     "group_advantage",
     "k3_kl",
     "masked_mean",
     "masked_whiten",
-    "preference_logsigmoid",
+    "preference_logsigmoid_terms",
     "rloo_advantage",
     "sequence_log_ratio",
     "token_log_ratio",
-    "token_mean",
 ]

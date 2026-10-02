@@ -56,8 +56,7 @@ import optax
 import pytest
 
 from dew.interop import load_pretrained
-from dew.objectives.base import Step, scalar_loss
-
+from dew.objectives.base import Step
 from dew.sampling import Sampling
 
 # Pinned: the numbers above are these commits' weights, and a repository
@@ -296,7 +295,7 @@ def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, 
     objective, variables, _ = scoring
     state, batch = trained
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    gradient = jax.grad(lambda values: scalar_loss(objective, values, batch, step)[0])(variables)
+    gradient = jax.grad(lambda values: objective.scalar_loss(values, batch, step)[0])(variables)
 
     held, updated, grads = flat(variables), flat(state.params), flat(gradient)
     assert int(state.updates) == 1 and held.keys() == updated.keys()

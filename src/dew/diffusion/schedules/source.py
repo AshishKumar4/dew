@@ -85,12 +85,6 @@ from dew.sampling.solvers import (
     UniPC,
 )
 
-Kind = Literal[
-    "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
-    "HeunDiscrete", "KDPM2Discrete", "KDPM2AncestralDiscrete", "DPMSolverMultistep",
-    "DPMSolverSinglestep", "DPMSolverSDE", "DEISMultistep", "UniPCMultistep",
-    "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
-]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
 Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
@@ -546,10 +540,6 @@ class SourceSchedule:
                    _prediction_transform(policy, prediction), policy, sampler)
 
     @property
-    def kind(self) -> str:
-        return self.policy.kind
-
-    @property
     def train_steps(self) -> int:
         """The training step count the class declares, which is the beta
         table's length wherever the class tabulates one."""
@@ -559,15 +549,10 @@ class SourceSchedule:
         """The process Dew fine-tunes the checkpoint on, at `tokens` latent
         tokens.
 
-        A scheduler file states how its checkpoint samples, not the noise
-        distribution it was trained on, so this is the convention its sampler
-        reads. Every class but the EDM one tabulates a VP beta table, which
-        the process draws from. EDM's convention has no beta table and no VP
-        law; its process is EDM's own log-normal sigma draw, over the
-        preconditioning the sampler reads. A flow file's process takes the
-        shift its sampler walks at the same geometry, so a dynamic file needs
-        `tokens`; the terminal stretch is a sampling grid's alone. A log-SNR
-        class on flow sigmas takes the flow path at its `flow_shift`.
+        A scheduler file states how its checkpoint samples, so this is the
+        convention its sampler reads: the VP beta table, EDM's log-normal
+        sigma draw, or the flow path at the shift its sampler walks (a
+        dynamic file needs `tokens`; the terminal stretch is sampling's alone).
         """
         if self.policy.family == "flow":
             flow = self.policy.flow
@@ -719,15 +704,10 @@ class SourceSchedule:
     def _check_unique_start(times: np.ndarray) -> None:
         """Refuse a grid whose first model time appears again in it.
 
-        The source finds the step it starts at by matching that time against
-        the whole list of times it will evaluate. A repeated first time makes
-        it take the second match, which shifts its walk by one and runs off
-        the end of its sigma table, so such a list has no source trajectory
-        to reproduce. The Karras grid of a cosine table at a small step count
-        is the case that reaches it, because the largest sigmas of that table
-        all recover the same index. Repeats after the first entry are left
-        alone: the two-evaluation classes and PNDM's warmup place them on
-        purpose and count from where they started.
+        The source looks its starting step up by that time and takes the
+        second match, which runs its walk off the end of its sigma table (a
+        cosine table's Karras grid at few steps does this). Later repeats are
+        the deliberate ones of the two-evaluation classes and PNDM's warmup.
         """
         if len(times) > 1 and float(np.sum(times == times[0])) > 1:
             raise ValueError(

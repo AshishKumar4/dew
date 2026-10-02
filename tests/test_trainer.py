@@ -156,6 +156,30 @@ class RecordingTracker:
 # The loop
 # --------------------------------------------------------------------------
 
+def test_fit_lets_go_of_each_state_its_step_consumed():
+    """A step donates the state it is handed, so once the next state exists
+    nothing in fit may still hold the old one: its arrays have lost their
+    buffers, and a drain of every live array (`dew.Profiler`) waits on them."""
+    trainer = make_trainer()
+    placed, held, alive = trainer.place, [], []
+
+    def place():
+        state, shardings, position = placed()
+        held.append(weakref.ref(state))
+        return state, shardings, position
+
+    class Watching(RecordingTracker):
+        def log(self, scalars, step):
+            if "train/loss" in scalars:
+                gc.collect()
+                alive.append(held[0]() is not None)
+
+    trainer.place = place
+    trainer.tracker = Watching()
+    trainer.fit(Data(), steps=2, log_every=1)
+    assert alive == [False, False]
+
+
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
@@ -691,11 +715,11 @@ import optax
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import models
+from dew.nn.backbones import SimpleDiT
 from dew.sampling import Euler
 from dew.training import Trainer
 
-model = models.SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+model = SimpleDiT(patch_size=2, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
 objective = DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (16, 16, 3))), guidance=None,
                                sampler=Euler(), steps=2, ema_decay=None)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
@@ -1066,8 +1090,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None, rung=None):
-        save_local(step, state, position, share=share, rung=rung)
+    def save_then_stop(step, state, position, **options):
+        save_local(step, state, position, **options)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -1232,6 +1256,17 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
+
+
+def test_a_global_position_round_trips_and_a_partial_one_is_refused():
+    """Dew writes every field of its global position, the phases a run
+    completed among them, and reads back only a position with all of them:
+    one without its completed phases is damaged, not a shorter format."""
+    for place in (position.Global(records=16, order="Counting"),
+                  position.Global(records=20, order="B", completed=(("A", 12),))):
+        assert position.decode(position.encode(place)) == place
+    with pytest.raises(ValueError, match=r"missing \['completed'\]"):
+        position.decode(json.dumps({position.ENVELOPE: {"records": 16, "order": "Counting"}}).encode())
 
 
 def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
@@ -1495,7 +1530,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
-    compile_step, evaluate, save = trainer.compile, trainer_module.evaluate, trainer.checkpoints.save
+    compile_step, evaluate, save = trainer.compile, trainer_module.Evaluation.run, trainer.checkpoints.save
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -1516,7 +1551,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
         return save(*args, **keywords)
 
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
-    monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer_module.Evaluation, "run", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
     trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
                 metrics=(Spread([]),))
@@ -2082,11 +2117,11 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    from dew.objectives.base import Step, scalar_loss
+    from dew.objectives.base import Step
 
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = scalar_loss(trainer.objective, state.params, batch,
+    expected, _ = trainer.objective.scalar_loss(state.params, batch,
                               Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
     advanced, loss, _, finite, _ = jax.block_until_ready(compiled(state, batch))
     assert loss == pytest.approx(float(expected), rel=1e-6)

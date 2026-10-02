@@ -32,15 +32,9 @@ class DenoisingCondition:
     mask: jax.Array | None = None
 
     def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
-        """This conditioning with `given`'s own model inputs.
-
-        A distilled guidance value belongs to the row rather than to its
-        caption. Dropping the caption, or guiding against an unconditional
-        one, changes what the model reads about the text and not the scale
-        the checkpoint was distilled to walk at. The two seams that pair a
-        conditional record with an unconditional one align them here first,
-        so both keep each row's own scalar.
-        """
+        """This conditioning with `given`'s distilled guidance value, which
+        belongs to the row rather than to its caption, so a dropped or
+        unconditional caption keeps the scale the checkpoint walks at."""
         return replace(self, guidance=given.guidance)
 
 

@@ -10,6 +10,7 @@ from flax import linen as nn
 
 from dew.checkpoints import Checkpoints
 from dew.diffusion.discrete import MDLM
+from dew.diffusion.presets import EDM
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import Step
@@ -17,7 +18,6 @@ from dew.objectives.base import select
 from dew.objectives.diffusion import DiffusionObjective, MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.rl import GRPOObjective
-from dew.registry import presets
 from dew.sampling import Sampling
 from dew.training import Trainer
 from dew.training.state import TrainState
@@ -84,7 +84,7 @@ def make_case(kind, decay):
                                              ema_decay=decay, head_chunks=1, steps=2)
         batch = {"text": jnp.tile(jnp.array([[1, 2, 3, 4]], jnp.int32), (rows, 1))}
     else:
-        objective = DiffusionObjective(Denoiser(), presets.EDM(regime="pixel"),
+        objective = DiffusionObjective(Denoiser(), EDM(regime="pixel"),
                                        InputSpec(Field("image", (2, 2, 3))),
                                        ema_decay=decay, guidance=None, steps=2)
         batch = {"image": jnp.arange(rows * 12, dtype=jnp.uint8).reshape(rows, 2, 2, 3)}

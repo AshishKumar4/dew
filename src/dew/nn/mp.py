@@ -14,7 +14,7 @@ magnitude as well, so an update's relative size, and with it the effective
 learning rate, does not decay as the weights grow. The paper applies it in
 the training forward pass, in place; here it is `forced_weight_normalization`,
 an optimizer step that renormalizes every `mp_kernel` after its update, which
-`dew.training.optim.build_optimizer` appends under
+`OptimConfig.build` appends under
 `OptimConfig.forced_weight_normalization`.
 """
 

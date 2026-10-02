@@ -26,13 +26,13 @@ from test_chunked_cross_entropy import equations
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
     FID,
-    clip,
+    PSNR,
+    SSIM,
+    CLIPDistance,
+    CLIPScore,
     clip_score,
-    clip_score_metric,
     fid,
     peak_signal_noise_ratio as psnr,
-    psnr as psnr_metric,
-    ssim as ssim_metric,
     structural_similarity as ssim,
 )
 from dew.eval.fid import frechet_distance
@@ -80,17 +80,19 @@ def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
 
 
 def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
-    from dew import Checkpoints, Mean, Trainer, models
+    import optax
+
+    from dew import Checkpoints, Mean, Trainer
     from dew.artifacts import TokenScores
     from dew.data import Dataset, Loading
+    from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
-    import optax
 
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
     data = Dataset.from_records({"text": tokens}, batch=8, validation={"text": tokens},
                                 loading=Loading(workers=0, threads=1, read_buffer=1))
-    model = models.build("causal_transformer", vocab_size=4, emb_features=8, num_layers=1,
-                         num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
+    model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1,
+                              num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None)
     metric = Mean(lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
                   reads=TokenScores, name="accuracy", better="higher")
@@ -111,10 +113,11 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
 
 def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
+    import optax
+
     from dew import Checkpoints, Mean, Trainer
     from dew.data import Dataset, Loading
     from dew.objectives.base import Aux, Objective
-    import optax
 
     class Pixels(Objective):
         def init(self, key, variables=None):
@@ -605,13 +608,13 @@ def test_psnr_metric_scores_a_perfect_reconstruction_as_infinite(rng):
     """The trainer hands the metric the objective's [-1, 1] artifact and the
     loader's uint8 batch, and the same image on both sides has zero error."""
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    metric = psnr_metric()
+    metric = PSNR()
     assert np.isinf(metric.finalize(metric(ImageGrid(_normalised(batch)), batch)))
 
 
 def test_ssim_metric_scores_a_perfect_reconstruction_as_one(rng):
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    metric = ssim_metric()
+    metric = SSIM()
     assert metric.finalize(metric(ImageGrid(_normalised(batch)), batch)) == pytest.approx(1.0, abs=1e-4)
 
 
@@ -622,7 +625,7 @@ def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
     batch = {'image': jnp.full((2, 8, 8, 3), 100, dtype=jnp.uint8)}
     generated = jnp.full((2, 8, 8, 3), (151 - 127.5) / 127.5)
     expected = 10.0 * np.log10(2.0**2 / 0.4**2)
-    metric = psnr_metric()
+    metric = PSNR()
     assert metric.name == "psnr"
     assert metric.finalize(metric(ImageGrid(generated), batch)) == pytest.approx(expected, rel=1e-5)
 
@@ -636,14 +639,14 @@ def test_ssim_metric_matches_the_closed_form_on_constant_images():
     mu_y = (128 - 127.5) / 127.5
     c1 = (0.01 * 2.0) ** 2
     expected = c1 / (mu_y**2 + c1)
-    metric = ssim_metric()
+    metric = SSIM()
     assert metric.name == "ssim"
     assert metric.finalize(metric(ImageGrid(jnp.zeros((1, 16, 16, 1))), batch)) == pytest.approx(
         expected, rel=1e-4
     )
 
 
-@pytest.mark.parametrize("factory,raw", [(psnr_metric, psnr), (ssim_metric, ssim)],
+@pytest.mark.parametrize("factory,raw", [(PSNR, psnr), (SSIM, ssim)],
                          ids=["psnr", "ssim"])
 def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
     """A video run explicitly scores VideoGrid frames against the video field."""
@@ -658,10 +661,10 @@ def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
         float(raw(degraded, reference, data_range=2.0)), rel=1e-5)
 
 
-def test_the_registry_names_every_metric_factory():
+def test_the_registry_names_every_metric_class():
     """A run configures metrics through `dew.registry.metrics`, so a
-    factory that loses its decorator is a metric no run can ask for."""
-    assert registry['psnr'] is psnr_metric and registry.psnr is psnr_metric
+    class that loses its decorator is a metric no run can ask for."""
+    assert registry['psnr'] is PSNR and registry['ssim'] is SSIM and registry['clip'] is CLIPDistance
     assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
 
 
@@ -699,7 +702,7 @@ def test_clip_metric_scores_the_reference_cosine():
     mean(1 - cos): observed 3.2e-08 off it against a tolerance of 1e-5. Before
     the towers were vendored, the factory raised ImportError on
     `FlaxCLIPModel`, which transformers 5 removed."""
-    metric = clip(modelname=str(CLIP_TINY))
+    metric = CLIPDistance(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_similarity' and metric.reads is ImageGrid
     generated, batch, cosine = clip_fixture()
 
@@ -709,12 +712,23 @@ def test_clip_metric_scores_the_reference_cosine():
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
 
 
+def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
+    """CLIP distance is 1 - cos, so the best checkpoint is the closest one:
+    the metric declares lower is better, and a selection by it minimizes."""
+    from dew.training.selection import Best
+    from dew.training.trainer import Trainer
+
+    metric = CLIPDistance(modelname="never/downloaded")
+    assert metric.shown.better == "lower"
+    assert Trainer._best_selection(Best(metric), [metric]).mode == "min"
+
+
 def test_clip_score_metric_clamps_the_reference_cosine():
     """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
     cosine (-0.072) among three positive ones, so the clamp does work here.
     Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
     against a tolerance of 1e-3 on a score of order 15."""
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_score'
     generated, batch, cosine = clip_fixture()
     assert (cosine < 0).any() and (cosine > 0).any()
@@ -736,7 +750,7 @@ def test_clip_score_over_images_and_prompts_is_the_metric_number():
     prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
     images = np.load(CLIP_TINY / "reference.npz")["images"]
     generated, batch, cosine = clip_fixture()
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
 
     score = clip_score(images, prompts, modelname=str(CLIP_TINY))
 
@@ -776,7 +790,7 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
     it to a dark pixel, which the old metric did; the score of an overshooting
     white image has to be the score of a white one."""
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
@@ -806,12 +820,12 @@ def test_constructing_a_metric_opens_no_weights(monkeypatch):
     def refused(*args, **kwargs):
         raise AssertionError("constructing a metric loaded weights")
 
-    monkeypatch.setattr(fid_module, "_get_inception", refused)
+    monkeypatch.setattr(fid_module, "_extractor", refused)
     monkeypatch.setattr(images_module, "_get_clip", refused)
 
     FID()
-    clip(modelname="never/downloaded")
-    clip_score_metric(modelname="never/downloaded")
+    CLIPDistance(modelname="never/downloaded")
+    CLIPScore(modelname="never/downloaded")
 
 
 ############################################################################################################

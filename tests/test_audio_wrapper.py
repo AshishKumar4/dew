@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from jax.experimental import checkify
 from safetensors.numpy import load_file
+from test_audio import gemma_features
 
-from dew.data.audio import AudioProcessor
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
@@ -110,10 +110,11 @@ def wrapper(request):
 def _inputs(wrapper):
     reference = np.load(wrapper.path / "reference.npz")
     meta = json.loads((wrapper.path / "meta.json").read_text())
-    processor = AudioProcessor(wrapper.config["audio_config"]["model_type"],
-                               json.loads((wrapper.path / "processor_config.json").read_text())["feature_extractor"])
-    features = processor([np.load(wrapper.path / f"waveform_{index}.npy") for index in range(2)],
-                         sampling_rate=meta["sampling_rate"])
+    assert meta["sampling_rate"] == 16000
+    features = gemma_features(
+        wrapper.config["audio_config"]["model_type"],
+        json.loads((wrapper.path / "processor_config.json").read_text())["feature_extractor"],
+        [np.load(wrapper.path / f"waveform_{index}.npy") for index in range(2)])
     np.testing.assert_array_equal(features["input_features_mask"], reference["input_features_mask"])
     np.testing.assert_allclose(features["input_features"], reference["input_features"], rtol=0, atol=1e-6)
     return reference, jnp.asarray(reference["input_ids"]), jnp.asarray(reference["attention_mask"].astype(bool)), \

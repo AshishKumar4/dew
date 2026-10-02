@@ -41,7 +41,7 @@ Every reader returns the same `Dataset` value:
 
 `train` and `val` are functions rather than iterators so that every new or resumed run opens a fresh iterator. The iterator belongs to the caller that opened it: close it after use if it has a `close` method, and never close the dataset or its backing store. `Trainer.fit` closes the iterators it opens, whether the run finishes or fails, and a training step's exception kept after the run does not keep its closed prefetch iterator alive.
 
-The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`dew.training.distributed.data_partition`), and the built-in readers read only that share.
+The argument is a `DataPartition`, the share of every global batch this process reads. `DataPartition()` reads every row, which is correct for a single process. With several processes the trainer asks the mesh for each process's share (`DataPartition.of(mesh)`), and the built-in readers read only that share.
 
 A `Dataset` can also be built from the two functions directly, for a stream no reader covers:
 

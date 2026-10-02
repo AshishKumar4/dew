@@ -1,6 +1,6 @@
 # Language models
 
-`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `causal_transformer` from `dew.models`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `load_pretrained`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
+`LMObjective` trains a decoder on next-token prediction: it reads rows of token IDs, feeds all but the last token to the model and scores its predictions against the following tokens with cross entropy. The decoder is usually `CausalTransformer` from `dew.nn.backbones`, and `dew.sampling.generate` draws text from the trained weights. The same page covers loading published checkpoints with `load_pretrained`, and the two non-autoregressive language objectives, `MaskedDiffusionObjective` and `BlockDiffusionObjective`.
 
 ## Example
 
@@ -43,19 +43,20 @@ This is the layout `dew tokenize` writes: `train.bin` and `val.bin` hold the tok
 import jax
 import optax
 
-from dew import Trainer, metrics, models
+from dew import Trainer
 from dew.data import Loading, TokenWindows
-from dew.objectives.lm import LMObjective
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 data = TokenWindows(path="data/stories-byte", seq_len=64,
                     loading=Loading(workers=0)).load(batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=128)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 lm_state = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0)).fit(
-    data, steps=300, log_every=100, eval_every=300, metrics=(metrics.perplexity(),))
+    data, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.params, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -339,7 +340,7 @@ Each family's processor emits what its reference implementation expects:
 
 Audio clips carry a mask that is True for valid frames. Gemma 4 inserts one placeholder per encoded frame. Gemma 3n inserts a fixed `audio_soft_tokens_per_image` per clip and fills the remaining slots with the embedder's padding token.
 
-The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as the towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. `dew.data.audio.AudioProcessor` builds the checkpoint's feature extractor from its `preprocessor_config.json` record and turns 16 kHz mono waveforms into those two arrays; it does not resample. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
+The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as the towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`load_pretrained(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays; nothing resamples. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
 
 ## Masked diffusion language models
 
@@ -353,9 +354,9 @@ masked_data = TokenWindows(path="data/stories-byte", seq_len=63,
                            loading=Loading(workers=0)).load(batch=16)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
-masked_model = models.build("causal_transformer", vocab_size=mask_id + 1,
-                            emb_features=64, num_layers=2, num_heads=2,
-                            mlp_features=256, max_seq_len=64, causal=False)
+masked_model = CausalTransformer(vocab_size=mask_id + 1,
+                                 emb_features=64, num_layers=2, num_heads=2,
+                                 mlp_features=256, max_seq_len=64, causal=False)
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
 masked_state = Trainer(masked_objective, optax.adamw(3e-3), key=jax.random.key(4)).fit(
     masked_data, steps=1000, log_every=500)
