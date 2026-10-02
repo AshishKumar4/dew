@@ -137,7 +137,9 @@ class SimpleDiT(nn.Module):
         cond_emb = self.conditioning(temb, textcontext, duration)
         freqs_cis = rope_for_scan(x_seq, self.emb_features // self.num_heads, self.scan_order)
 
-        starts = {int(start): (ratio, int(end)) for ratio, start, end in self.checked_routes()} if train else {}
+        starts = (
+            {int(start): (ratio, int(end)) for ratio, start, end in self.checked_routes()} if train else {}
+        )
         rotation, held, kept, end = freqs_cis, None, None, None
         for index, block in enumerate(self.blocks):
             if index in starts:

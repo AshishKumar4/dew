@@ -25,20 +25,10 @@ import functools
 import json
 import operator
 import os
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Collection,
-    Literal,
-    Mapping,
-    NoReturn,
-    Protocol,
-    TypedDict,
-    Unpack,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -183,7 +173,10 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
 
 def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
     """Return the `_INERT_FIELDS` a config carries, refusing a value that is not inert."""
-    rules = {**_INERT_FIELDS[None], **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {})}
+    rules = {
+        **_INERT_FIELDS[None],
+        **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {}),
+    }
     present = set(rules) & set(hf_config)
     for key in sorted(present):
         if not rules[key](key, hf_config):
@@ -516,13 +509,18 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
             _refuse(f"{field} (rope_type 'llama3') fields",
                     f"the llama3 ramp reads exactly {list(_LLAMA3_FIELDS)}; "
                     f"missing {missing}, unexpected {extra}")
-        return _Rope(theta, {
-            'rope_type': 'llama3',
-            'factor': records.number(entry['factor'], 'factor'),
-            'low_freq_factor': records.number(entry['low_freq_factor'], 'low_freq_factor'),
-            'high_freq_factor': records.number(entry['high_freq_factor'], 'high_freq_factor'),
-            'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
-        })
+        return _Rope(
+            theta,
+            {
+                "rope_type": "llama3",
+                "factor": records.number(entry["factor"], "factor"),
+                "low_freq_factor": records.number(entry["low_freq_factor"], "low_freq_factor"),
+                "high_freq_factor": records.number(entry["high_freq_factor"], "high_freq_factor"),
+                "original_max_position_embeddings": records.integer(
+                    entry["original_max_position_embeddings"], "original_max_position_embeddings"
+                ),
+            },
+        )
     if rope_type == 'yarn' and yarn_max_pos is not None:
         # The base an entry names, or the shared default until `_at_base`
         # stamps in the one the entry's layers resolved to: a released
@@ -642,7 +640,11 @@ def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     if layers is not None:
         used.add('layer_types')
         return records.strings(layers, 'layer_types')
-    return default if default is not None else ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return (
+        default
+        if default is not None
+        else ("full_attention",) * records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
+    )
 
 
 def _kinds(layer_types: tuple[str, ...], window: int | None,
@@ -709,22 +711,30 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
                 "the mixer's YaRN ramp runs over the whole rope width")
     factor = entry.get('factor')
     if factor is None:
-        factor = (float(max_pos)
-                  / records.number(entry['original_max_position_embeddings'], 'original_max_position_embeddings'))
+        factor = float(max_pos) / records.number(
+            entry["original_max_position_embeddings"], "original_max_position_embeddings"
+        )
     return {
-        'rope_type': 'yarn',
-        'rope_theta': theta,
-        'factor': records.number(factor, f'{field} factor'),
-        'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
-        'beta_fast': records.number(entry.get('beta_fast') or 32, 'beta_fast'),
-        'beta_slow': records.number(entry.get('beta_slow') or 1, 'beta_slow'),
-        'mscale': (None if entry.get('mscale') is None
-                   else records.number(entry['mscale'], 'mscale')),
-        'mscale_all_dim': (None if entry.get('mscale_all_dim') is None
-                           else records.number(entry['mscale_all_dim'], 'mscale_all_dim')),
-        'truncate': bool(entry.get('truncate', True)),
-        'attention_factor': (None if entry.get('attention_factor') is None
-                             else records.number(entry['attention_factor'], 'attention_factor')),
+        "rope_type": "yarn",
+        "rope_theta": theta,
+        "factor": records.number(factor, f"{field} factor"),
+        "original_max_position_embeddings": records.integer(
+            entry["original_max_position_embeddings"], "original_max_position_embeddings"
+        ),
+        "beta_fast": records.number(entry.get("beta_fast") or 32, "beta_fast"),
+        "beta_slow": records.number(entry.get("beta_slow") or 1, "beta_slow"),
+        "mscale": (None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
+        "mscale_all_dim": (
+            None
+            if entry.get("mscale_all_dim") is None
+            else records.number(entry["mscale_all_dim"], "mscale_all_dim")
+        ),
+        "truncate": bool(entry.get("truncate", True)),
+        "attention_factor": (
+            None
+            if entry.get("attention_factor") is None
+            else records.number(entry["attention_factor"], "attention_factor")
+        ),
     }
 
 
@@ -794,7 +804,9 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'layer_types' in reads:
         layer_types = _specified_layer_types(hf_config, used, layer_types)
     elif layer_types is None:
-        layer_types = ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+        layer_types = ("full_attention",) * records.integer(
+            hf_config["num_hidden_layers"], "num_hidden_layers"
+        )
     stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
     if 'sliding_window' in reads:
         used.add('sliding_window')
@@ -1192,7 +1204,9 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     bare = name.removeprefix("model.")
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
-        return "language_model", tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+        return "language_model", tail if tail.startswith(
+            ("model.", "lm_head.weight", "mtp.")
+        ) else f"model.{tail}"
     if bare.startswith(projector_prefix):
         return "projector", bare[len(projector_prefix):]
     if bare.startswith(tower_prefix):
@@ -1367,7 +1381,9 @@ def translate_wrapper_weights(
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
+        variables["audio_tower"] = audio_nn.audio_weights(
+            tables["audio_tower"], encoder, param_dtype=param_dtype
+        )
         variables["audio_projector"] = {"params": vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)}
     return variables
@@ -1471,90 +1487,101 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
 
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        layer, module, leaf = f'layers_{parts[2]}', parts[3], parts[-1]
-        if config.get('hyper_connections') is not None:
-            if len(parts) == 4 and module.startswith(('hc_attn_', 'hc_ffn_')):
-                site, suffix = module[3:].split('_', 1)
-                if suffix in ('fn', 'base', 'scale'):
-                    return (layer, f'{site}_hc', suffix)
-            if module == 'self_attn':
-                tail = tuple(parts[4:])
-                if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
-                    return (layer, module, *tail)
-                if len(tail) == 2 and tail[1] == 'weight':
-                    if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                        return (layer, module, *tail)
-                    if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
-                        return (layer, module, tail[0], 'kernel')
-                if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
-                        'index_kpool_compress_ape', 'index_kpool_compress_gate'):
-                    return (layer, module, *tail)
-        if module in _PROJECTIONS and len(parts) == 6:
-            sublayer = parts[4]
-            if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
-                # torch Linear holds [out, in]; nn.Dense keeps [in, out]
-                return (layer, module, sublayer,
-                        'kernel' if leaf == 'weight' else 'bias')
-            if (module == 'self_attn' and sublayer in _HEAD_NORMS
-                    and leaf == 'weight'):
-                return (layer, module, sublayer, 'scale')
-            if (module == 'self_attn' and sublayer in _MLA_PROJECTIONS
-                    and leaf in ('weight', 'bias')):
-                return (layer, module, sublayer,
-                        'kernel' if leaf == 'weight' else 'bias')
-            if (module == 'self_attn' and sublayer in _MLA_NORMS
-                    and leaf == 'weight'):
-                return (layer, module, sublayer, 'scale')
-        if (len(parts) == 7 and module == 'self_attn'
-                and parts[4] == 'indexer'):
-            # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
-            # and k_norm.{weight,bias}: the sparse selector's own tensors.
-            sublayer, leaf = parts[5], parts[6]
-            if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
-                return (layer, 'self_attn', 'indexer', sublayer, 'kernel')
-            if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
-                return (layer, 'self_attn', 'indexer', sublayer,
-                        'scale' if leaf == 'weight' else 'bias')
-        if module == 'self_attn':
-            tail = _v4_attention_leaf(parts[4:])
-            if tail is not None:
-                return (layer, module, *tail)
-        if (len(parts) == 5 and module in ('attn_hc', 'ffn_hc')
-                and leaf in _V4_HC):
-            # mHC's residual mapping around each sublayer, its tensors in
-            # the reference's own layout (modeling_deepseek_v4.py:902-913).
-            return (layer, module, leaf)
-        if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
-                and parts[5].isdigit() and parts[6] in _MOE_SHARED
-                and leaf == 'weight'):
-            # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
-            # tensor per expert, stacked by _stack_experts below.
-            return (layer, 'mlp', 'experts', parts[5], parts[6], 'kernel')
-        if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
-                and parts[5] in _MOE_SHARED and leaf == 'weight'):
-            # The dense shared experts beside them, one MLP however many the
-            # config counts.
-            return (layer, 'mlp', 'shared_experts', parts[5], 'kernel')
-        if (module == 'linear_attn'
-                and records.strings(config['layer_types'], 'layer_types')[int(parts[2])]
-                == 'linear_attention'):
-            tail = tuple(parts[4:])
-            if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
-                return (layer, 'self_attn', tail[0], 'kernel')
-            if tail in _LINEAR_LEAVES:
-                return (layer, 'self_attn', *tail)
-        # Gemma 4's per-layer residual. Gate and projection are kernels, the
-        # post norm is a scale. The values norm carries no weight, so it maps
-        # nothing.
-        if len(parts) == 5 and leaf == 'weight':
-            if module in ('per_layer_input_gate', 'per_layer_projection'):
-                return (layer, module, 'kernel')
-            if module == 'post_per_layer_input_norm':
-                return (layer, module, 'scale')
-        norms = _norm_names(bool(config.get('sandwich_norms')))
-        if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
-            return (layer, norms[module], 'scale' if leaf == 'weight' else 'bias')
+        path = _layer_param_path(parts, config)
+        if path is not None:
+            return (f'layers_{parts[2]}', *path)
     raise ValueError(f"unknown tensor name {hf_name!r}")
+
+
+def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The path within one decoder layer, before adding its layer-bank name."""
+    module, leaf = parts[3], parts[-1]
+    if config.get('hyper_connections') is not None:
+        path = _hyper_connection_param_path(parts)
+        if path is not None:
+            return path
+    if module in _PROJECTIONS and len(parts) == 6:
+        sublayer = parts[4]
+        if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
+            # torch Linear holds [out, in]; nn.Dense keeps [in, out]
+            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
+        if module == 'self_attn' and sublayer in _HEAD_NORMS and leaf == 'weight':
+            return (module, sublayer, 'scale')
+        if module == 'self_attn' and sublayer in _MLA_PROJECTIONS and leaf in ('weight', 'bias'):
+            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
+        if module == 'self_attn' and sublayer in _MLA_NORMS and leaf == 'weight':
+            return (module, sublayer, 'scale')
+    if module == 'self_attn':
+        return _attention_param_path(parts)
+    if len(parts) == 5 and module in ('attn_hc', 'ffn_hc') and leaf in _V4_HC:
+        # mHC's residual mapping around each sublayer, its tensors in
+        # the reference's own layout (modeling_deepseek_v4.py:902-913).
+        return (module, leaf)
+    if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
+            and parts[5].isdigit() and parts[6] in _MOE_SHARED and leaf == 'weight'):
+        # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
+        # tensor per expert, stacked by _stack_experts below.
+        return ('mlp', 'experts', parts[5], parts[6], 'kernel')
+    if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
+            and parts[5] in _MOE_SHARED and leaf == 'weight'):
+        # The dense shared experts beside them, one MLP however many the
+        # config counts.
+        return ('mlp', 'shared_experts', parts[5], 'kernel')
+    if (module == 'linear_attn'
+            and records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
+        tail = tuple(parts[4:])
+        if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
+            return ('self_attn', tail[0], 'kernel')
+        if tail in _LINEAR_LEAVES:
+            return ('self_attn', *tail)
+    # Gemma 4's per-layer residual. Gate and projection are kernels, the
+    # post norm is a scale. The values norm carries no weight, so it maps
+    # nothing.
+    if len(parts) == 5 and leaf == 'weight':
+        if module in ('per_layer_input_gate', 'per_layer_projection'):
+            return (module, 'kernel')
+        if module == 'post_per_layer_input_norm':
+            return (module, 'scale')
+    norms = _norm_names(bool(config.get('sandwich_norms')))
+    if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
+        return (norms[module], 'scale' if leaf == 'weight' else 'bias')
+    return None
+
+
+def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
+    """The V4 stream mappings and attention leaves in a hyper-connected layer."""
+    module = parts[3]
+    if len(parts) == 4 and module.startswith(('hc_attn_', 'hc_ffn_')):
+        site, suffix = module[3:].split('_', 1)
+        if suffix in ('fn', 'base', 'scale'):
+            return (f'{site}_hc', suffix)
+    if module == 'self_attn':
+        tail = tuple(parts[4:])
+        if tail in (('A_log',), ('dt_bias',), ('o_norm', 'weight')):
+            return (module, *tail)
+        if len(tail) == 2 and tail[1] == 'weight':
+            if tail[0] in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
+                return (module, *tail)
+            if tail[0] in ('f_a_proj', 'f_b_proj', 'b_proj', 'g_a_proj', 'g_b_proj'):
+                return (module, tail[0], 'kernel')
+        if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
+                'index_kpool_compress_ape', 'index_kpool_compress_gate'):
+            return (module, *tail)
+    return None
+
+
+def _attention_param_path(parts: list[str]) -> tuple[str, ...] | None:
+    """The sparse selector's leaves, followed by DeepSeek V4's nested leaves."""
+    if len(parts) == 7 and parts[4] == 'indexer':
+        # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
+        # and k_norm.{weight,bias}: the sparse selector's own tensors.
+        sublayer, leaf = parts[5], parts[6]
+        if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
+            return ('self_attn', 'indexer', sublayer, 'kernel')
+        if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
+            return ('self_attn', 'indexer', sublayer, 'scale' if leaf == 'weight' else 'bias')
+    tail = _v4_attention_leaf(parts[4:])
+    return None if tail is None else ('self_attn', *tail)
 
 
 def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
@@ -1682,8 +1709,12 @@ def translate_weights(
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
-        insert(variables, path, SourceLeaf((stored,), dtype, transposed=path[-1] == 'kernel' and stored.ndim == 2),
-               name)
+        insert(
+            variables,
+            path,
+            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
+            name,
+        )
     _stack_experts(params)
     return variables if lazy else materialize(variables)
 
@@ -1719,7 +1750,8 @@ def translate_denoiser_weights(
 
 
 class ExportTokenizer(Protocol):
-    """A tokenizer that writes its own HF files. The byte vocabulary has none, so it is recorded by name only."""
+    """A tokenizer that writes its own HF files. The byte vocabulary has
+    none, so it is recorded by name only."""
 
     def save_pretrained(self, directory: str, /) -> tuple[str, ...] | None:
         """Return the files it wrote, which transformers returns and this module does not read."""
@@ -1999,14 +2031,15 @@ forward multiplies by them. `scale_after_cast` orders a norm's scale and its
 cast to the compute dtype, which are the same product in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
-    'num_kv_heads': lambda model: model.kv_heads,
-    'head_dim': lambda model: model.features_per_head,
-    'layer_types': lambda model: model.per_layer_types,
-    'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
-    'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
-    'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
-    'position_embedding_size': lambda model: (
-        model.position_embedding_size or model.max_seq_len if model.position_embedding == 'learned' else None),
+    "num_kv_heads": lambda model: model.kv_heads,
+    "head_dim": lambda model: model.features_per_head,
+    "layer_types": lambda model: model.per_layer_types,
+    "kinds": lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
+    "partial_rotary_factor": lambda model: model.partial_rotary_factor or 1.0,
+    "per_layer_input_vocab": lambda model: model.per_layer_input_vocab or model.vocab_size,
+    "position_embedding_size": lambda model: (
+        model.position_embedding_size or model.max_seq_len if model.position_embedding == "learned" else None
+    ),
 }
 """Fields whose None stands for a value the forward derives, spelled out."""
 
@@ -2041,8 +2074,10 @@ def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object])
         raise ValueError(
             f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
             f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
-            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, so transformers would compute "
-            "another model; no exported family carries this computation")
+            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
+            "so transformers would compute "
+            "another model; no exported family carries this computation"
+        )
 
 
 def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -2176,6 +2211,9 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
     check_tree(variables, model, np.zeros((1, 2), np.int32))
 
 
+# Each family imports these shared readers, so its table is loaded only
+# after their module is complete, including when a cold import starts in a
+# family module. decoder_families.ENTRIES is the single ordered registration.
 @functools.cache
 def family_entries() -> tuple[DecoderFamily, ...]:
     """The registered layouts, loaded after their shared readers are defined."""
@@ -2187,7 +2225,6 @@ def family_entries() -> tuple[DecoderFamily, ...]:
 def families() -> dict[str, DecoderFamily]:
     """The single mutable name table, also used for registered source aliases."""
     return {name: family for family in family_entries() for name in family.model_types}
-
 
 def _backbone_defaults() -> DecoderFields:
     """Return what the backbone takes for a field a config leaves unset, so a partial

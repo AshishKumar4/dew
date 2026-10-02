@@ -19,9 +19,9 @@ import operator
 import sys
 import types
 import typing
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, Protocol, TypedDict, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union
 
 import jax
 import jax.numpy as jnp
@@ -44,9 +44,7 @@ if TYPE_CHECKING:
     from dew.sampling.solvers import Solver
     from dew.training.optim import ScheduleBase
 
-T = TypeVar("T", bound=Callable[..., Any])
 M = TypeVar("M", bound=Callable[..., Any])
-Built = TypeVar("Built")
 """What calling a member builds: the module a model name builds, the spec a
 dataset name builds. A registry is generic over both, since the table holds
 the callable and `build` hands back what it returned."""
@@ -73,7 +71,7 @@ type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
 NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
-class Registry(Mapping[str, T], Generic[T, Built]):
+class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
     """Names one kind of thing: a decorator, a mapping and an attribute view."""
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
@@ -519,6 +517,22 @@ schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", rec
 REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors, schedules)
 
-__all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "float64_twin", "metrics", "mixers",
-           "models", "objectives", "presets", "projectors", "resolve_dtype", "samplers", "schedules", "towers",
-           "with_precision"]
+__all__ = [
+    "REGISTRIES",
+    "Registry",
+    "datasets",
+    "dtype_name",
+    "encoders",
+    "float64_twin",
+    "metrics",
+    "mixers",
+    "models",
+    "objectives",
+    "presets",
+    "projectors",
+    "resolve_dtype",
+    "samplers",
+    "schedules",
+    "towers",
+    "with_precision",
+]

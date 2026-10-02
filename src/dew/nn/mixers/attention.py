@@ -35,7 +35,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.rope import (
     RopeScaling,
@@ -480,8 +480,21 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
-    def _masking(self, query, key, value, positions, rotary_positions, append, prefix, kv_len: int,
-                 kv_store, segment_ids, attention_metadata: AttentionMetadata | None, decode: bool) -> _Masking:
+    def _masking(
+        self,
+        query,
+        key,
+        value,
+        positions,
+        rotary_positions,
+        append,
+        prefix,
+        kv_len: int,
+        kv_store,
+        segment_ids,
+        attention_metadata: AttentionMetadata | None,
+        decode: bool,
+    ) -> _Masking:
         """What the kernel reads beside the rotated query and keys: the keys
         and values with the cache's or the prefix's joined, and the causal
         flag, window, mask, document ids and kernel the layer's visibility

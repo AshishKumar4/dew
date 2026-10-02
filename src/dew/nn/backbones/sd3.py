@@ -20,7 +20,8 @@ values are what the model reads and what export writes back.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -147,10 +148,7 @@ class _JointAttention(nn.Module):
             return self._projection("to_out_0", inner)(attended), None
         image_out = self._projection("to_out_0", inner)(attended[:, :tokens])
         context_out = attended[:, tokens:]
-        if self.context_out:
-            context_out = self._projection("to_add_out", inner)(context_out)
-        else:
-            context_out = None
+        context_out = self._projection("to_add_out", inner)(context_out) if self.context_out else None
         return image_out, context_out
 
 
