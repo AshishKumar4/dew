@@ -154,6 +154,13 @@ class RecordingTracker:
 # The loop
 # --------------------------------------------------------------------------
 
+def test_train_state_exposes_the_whole_variables_tree():
+    trainer = Trainer(Regression(), optax.sgd(.1), key=0)
+    state = trainer.initial_state()
+    assert "params" in state.variables
+    assert not hasattr(state, "params")
+
+
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
