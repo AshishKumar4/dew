@@ -105,7 +105,7 @@ class Inference:
                 pipe = TextToImage.from_pretrained(IMAGE_MODEL)
                 for steps in (15, 30):
                     pipe(["a turquoise alpine lake"], key=0, steps=steps,
-                         sampler=DPMSolverMultistep(), guidance=CFG(5.0)).host()
+                         solver=DPMSolverMultistep(), guidance=CFG(5.0)).host()
                 self.metrics = {"prepare_seconds": time.perf_counter() - started}
                 self.ready.set()
                 while True:
@@ -114,7 +114,7 @@ class Inference:
                         continue
                     try:
                         result = pipe([request.prompt], key=request.key, steps=request.steps,
-                                      sampler=DPMSolverMultistep(), guidance=CFG(5.0))
+                                      solver=DPMSolverMultistep(), guidance=CFG(5.0))
                         buffer = io.BytesIO()
                         result.pil()[0].save(buffer, format="PNG")
                         future.set_result({"png": base64.b64encode(buffer.getvalue()).decode(),

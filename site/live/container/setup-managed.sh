@@ -44,7 +44,7 @@ from jax._src.lib import xla_client
 pipe=TextToImage.from_pretrained(repo)
 for steps in (15,30):
     t=time.perf_counter()
-    pipe(['a turquoise alpine lake'],key=0,steps=steps,sampler=DPMSolverMultistep(),guidance=CFG(5.0)).host()
+    pipe(['a turquoise alpine lake'],key=0,steps=steps,solver=DPMSolverMultistep(),guidance=CFG(5.0)).host()
     print('image_warm',steps,time.perf_counter()-t,flush=True)
 bundle=PretrainedDecoder.load('/opt/models/HuggingFaceTB/SmolLM2-135M-Instruct',dtype=jnp.float32,max_seq_len=256)
 server=Server.from_task(bundle.text_generation(sampling=Sampling(temperature=0)),slots=4,capacity=128)
