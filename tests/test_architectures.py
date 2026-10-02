@@ -15,31 +15,31 @@ afterwards.
 
 import json
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig
-from dew.data import OxfordFlowers
+from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
 from dew.nn.dit import TextContext
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
-from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 
 RES = 16
 FRAMES = 2
@@ -56,7 +56,7 @@ TINY_SHARD = 256
 # two-step run can be about.
 SAMPLER_STEPS = 2
 # 2x2 target blocks on the 4x4 grid, which leaves 8 context tokens.
-MASK = multi_block_mask(GRID, num_targets=2, scale=(0.2, 0.3))
+MASK = MultiBlockMask.for_grid(GRID, num_targets=2, scale=(0.2, 0.3))
 
 TEXT_TOKENS = 8
 TEXT_FEATURES = 32
@@ -106,7 +106,7 @@ class Case:
     config: dict
     frames: int = 0
     """Video architectures take (frames, H, W, C) samples; 0 means images."""
-    predictor: Optional[dict] = None
+    predictor: dict | None = None
     """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
     seq_len: int = 0
     """Set for language models: batches are token windows, not images."""
@@ -256,7 +256,7 @@ CASES = [
         "layer_types": ("sliding_attention", "sliding_attention"),
         "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
         "altup": {"num_inputs": 3}, "laurel_rank": 8,
-        "per_layer_input_dim": 8, "num_kv_shared_layers": 1,
+        "per_layer_input_dim": 8, "kv_shared_layers": (1,),
     }, seq_len=SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
@@ -281,7 +281,8 @@ def model_variables(case: Case):
     """The case's variables as shapes."""
     model = models.build(case.architecture, **case.config)
     rng = jax.random.key(0)
-    init = lambda *args: jax.eval_shape(model.init, *args)
+    def init(*args):
+        return jax.eval_shape(model.init, *args)
     if case.is_lm:
         return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
     sample = jnp.ones((1, *case.sample_shape), jnp.float32)
@@ -295,7 +296,7 @@ def text_condition() -> Condition:
     return Condition(StubText.from_pretrained("stub"), field="text", unconditional="")
 
 
-def batches(case: Case, encoder: Optional[ConditionEncoder]):
+def batches(case: Case, encoder: ConditionEncoder | None):
     """uint8-range samples, as the data pipeline delivers them, with labels for
     the probes and tokenized text for the conditioned models."""
     rng = np.random.default_rng(0)
@@ -359,7 +360,7 @@ def make_objective(case: Case, model, encoder):
                              MASK, sample=sample)
     inputs = InputSpec(sample, {"textcontext": Condition(encoder, field="text")})
     return DiffusionObjective(model, presets.EDM(regime="pixel"), inputs, steps=SAMPLER_STEPS,
-                              guidance=CFG(2.0), sampler=Euler())
+                              guidance=CFG(2.0), solver=Euler())
 
 
 def make_trainer(case: Case, tmp_path, fsdp, tracker=None):
@@ -466,7 +467,7 @@ def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsd
     run is quietly training a replicated model on every device.
     """
     variables = model_variables(case)
-    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    mesh = MeshSpec(fsdp=fsdp_size).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables)
     specs = jax.tree.map(lambda sharding: sharding.spec, shardings)
@@ -531,8 +532,8 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
-        data=OxfordFlowers(image_size=8), text=None, guidance=None,
-        sampler=Euler(), sampling_steps=SAMPLER_STEPS)
+        data=TFDSImages(image_size=8), text=None, guidance=None,
+        solver=Euler(), sampling_steps=SAMPLER_STEPS)
 
 
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():

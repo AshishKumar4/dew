@@ -5,7 +5,7 @@ a range of message sizes: a shift to the next device (`ppermute`, what the
 windowed halo and the Mamba-2 conv history and state send), the tiled
 all-to-all (Ulysses' exchange) and the all-gather (the whole-K/V exchange).
 The groups are two-device pairs and all devices, laid out as the mesh's
-innermost axis the way `build_mesh` lays out the sequence axis, so on a box
+innermost axis the way `MeshSpec.build` lays out the sequence axis, so on a box
 whose pairs differ (an NVLink pair, a PCIe pair, pairs across sockets) each
 line is one link class. Several groups run at once where the mesh holds
 several, as the sequence axis beside a data axis does.
@@ -45,7 +45,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 
 from dew.nn.attention import attention_kernel, exchanged_heads_attention, gathered_keys_attention
 from dew.telemetry.profile import capture_options
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 EXCHANGES: dict[str, Callable] = {
     "all_to_all": exchanged_heads_attention,
@@ -128,7 +128,7 @@ def attention_case(batch: int, length: int, heads: int, kv_heads: int, head_dim:
               "batch": batch,
               "length": length, "heads": heads, "kv_heads": kv_heads, "head_dim": head_dim,
               "devices": [int(d.id) for d in devices]}
-    mesh = build_mesh(MeshSpec(sequence=len(devices)), devices)
+    mesh = MeshSpec(sequence=len(devices)).build(devices)
     context = contextlib.nullcontext() if exchange is None else jax.set_mesh(mesh)
     try:
         with context:

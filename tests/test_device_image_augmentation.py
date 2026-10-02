@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from steady_state import guarded, steady_state
 
 from dew.data import DataPartition, Loading
 from dew.data.images import ImageDataset
@@ -55,7 +56,7 @@ def test_supplied_parameters_match_opencv_at_highest_precision(order, crop):
     from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 
     image = np.random.default_rng(7).integers(0, 256, (17, 21, 3)).astype(np.float64)
-    parameters = ImageParameters(np.asarray(crop), np.asarray(True),
+    parameters = ImageParameters(np.asarray(crop), np.ones((), dtype=bool),
                                  np.asarray([1.13, 0.97, 0.86]), np.asarray(order))
     # Observed on RTX 4080/OpenCV 5.0.0: maximum fp64 error 6.55e-6,
     # with identical rounded uint8 codes in all 18 cases.
@@ -97,7 +98,7 @@ def test_production_fp32_crop_and_colour_are_within_one_uint8_code():
     from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 
     image = np.random.default_rng(13).integers(0, 256, (160, 160, 3), dtype=np.uint8)
-    parameters = ImageParameters(np.asarray([5, 11, 143, 139]), np.asarray(True),
+    parameters = ImageParameters(np.asarray([5, 11, 143, 139]), np.ones((), dtype=bool),
                                  np.asarray([1.19, 1.05, 0.8]), np.asarray([2, 1, 0]))
     expected = apply_host(image.astype(np.float64), parameters, 128)
     actual = jax.jit(lambda x, p: apply_device(x, p, 128))(image, parameters)
@@ -113,7 +114,7 @@ def test_model_float64_mode_changes_no_data_draw():
     keys = np.random.default_rng(2).integers(0, 2**32, (4, 2), dtype=np.uint32)
     run = jax.jit(lambda images, raw: augment_batch(images, raw, size=12,
                   flip=True, jitter=True, crop_scale=(0.4, 0.9)))
-    with jax.enable_x64(False):
+    with jax.enable_x64(new_val=False):
         expected = run(image, keys)
     with jax.enable_x64():
         actual = run(image, keys)
@@ -131,13 +132,13 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 
 
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
-    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, shard_batch
 
     stream = spec(augmentation_backend="device").load(batch=4).train(DataPartition())
     try:
         batch = next(stream)
-        mesh = build_mesh(devices=[jax.devices()[0]])
-        with jax.transfer_guard_device_to_host("disallow"):
+        mesh = MeshSpec().build([jax.devices()[0]])
+        with guarded(allow=("host_to_device",)):
             placed = shard_batch(mesh, batch)
             jax.block_until_ready(placed)
         np.testing.assert_array_equal(placed["image"], batch["image"])
@@ -187,3 +188,22 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
 def test_invalid_augmentation_configuration_is_rejected(options):
     with pytest.raises(ValueError):
         spec(**options)
+
+
+def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_on_alone():
+    """Once a few batches have been augmented and placed, the stream the
+    trainer reads compiles nothing more for records of other sizes and
+    crops, and handing the loop a placed batch moves nothing it did not ask
+    for (`steady_state`): the augmentation and the placement stay on the
+    devices and on the prefetch worker."""
+    from dew.training.distributed import DevicePrefetchIterator, MeshSpec
+
+    mesh = MeshSpec().build([jax.devices()[0]])
+    stream = spec(augmentation_backend="device", crop_scale=(0.5, 0.9)).load(batch=4).train(DataPartition())
+    with DevicePrefetchIterator(stream, mesh) as prefetch:
+        for _ in range(3):
+            jax.block_until_ready(next(prefetch))
+        with steady_state():
+            batches = [next(prefetch) for _ in range(3)]
+            jax.block_until_ready(batches)
+    assert all(batch["image"].shape == (4, 12, 12, 3) for batch in batches)

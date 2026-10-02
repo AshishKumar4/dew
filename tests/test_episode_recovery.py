@@ -76,7 +76,9 @@ def test_sigkill_resumes_completed_turns_and_produces_the_same_update(tmp_path):
         deadline = time.monotonic() + 60
         while not (resumed / "ready").exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.05)
-        assert (resumed / "ready").exists(), process.communicate(timeout=1)[0] if process.poll() is not None else "no pending tool"
+        assert (resumed / "ready").exists(), (
+            process.communicate(timeout=1)[0] if process.poll() is not None else "no pending tool"
+        )
     finally:
         process.kill()
         process.wait()

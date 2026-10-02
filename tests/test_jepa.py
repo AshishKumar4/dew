@@ -10,18 +10,19 @@ import pytest
 from dew.artifacts import Representations
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step, merge, scalar_loss
+from dew.objectives.base import Step, merge
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
     JepaVideoEncoder,
+    KnnProbe,
+    LinearProbe,
+    MultiBlockMask,
     knn_probe_accuracy,
     linear_probe_accuracy,
-    multi_block_mask,
     normalize_targets,
     representation_health,
 )
-from dew.registry import metrics
 from dew.training import Layout, MeshSpec, Trainer
 
 RES = 32
@@ -32,7 +33,7 @@ FRAMES = 3
 
 @pytest.fixture
 def mask():
-    return multi_block_mask(GRID, num_targets=4, scale=(0.15, 0.2))
+    return MultiBlockMask.for_grid(GRID, num_targets=4, scale=(0.15, 0.2))
 
 
 def make_encoder(**kwargs):
@@ -88,7 +89,7 @@ def test_context_and_targets_are_disjoint(mask):
 
 def test_target_coverage_sits_inside_the_configured_scale():
     scale = (0.15, 0.2)
-    mask = multi_block_mask(GRID, num_targets=4, scale=scale)
+    mask = MultiBlockMask.for_grid(GRID, num_targets=4, scale=scale)
     coverage = mask.block_area / mask.num_patches
     assert scale[0] <= coverage <= scale[1]
     for h, w in mask.block_shapes:
@@ -100,8 +101,8 @@ def test_masks_are_reproducible_from_a_seed(mask):
     a = mask.sample(jax.random.PRNGKey(11), 4)
     b = mask.sample(jax.random.PRNGKey(11), 4)
     c = mask.sample(jax.random.PRNGKey(12), 4)
-    assert all(jnp.array_equal(x, y) for x, y in zip(a, b))
-    assert not all(jnp.array_equal(x, y) for x, y in zip(a, c))
+    assert all(jnp.array_equal(x, y) for x, y in zip(a, b, strict=True))
+    assert not all(jnp.array_equal(x, y) for x, y in zip(a, c, strict=True))
 
 
 def test_block_shapes_and_positions_actually_vary(mask):
@@ -114,9 +115,9 @@ def test_block_shapes_and_positions_actually_vary(mask):
 
 def test_geometry_that_cannot_exist_is_rejected():
     with pytest.raises(ValueError, match="aspect ratio"):
-        multi_block_mask((4, 4), num_targets=2, scale=(0.18, 0.19))
+        MultiBlockMask.for_grid((4, 4), num_targets=2, scale=(0.18, 0.19))
     with pytest.raises(ValueError, match="no context"):
-        multi_block_mask(GRID, num_targets=6, scale=(0.15, 0.2))
+        MultiBlockMask.for_grid(GRID, num_targets=6, scale=(0.15, 0.2))
 
 
 # --- the encoders and the predictor ----------------------------------------
@@ -189,7 +190,7 @@ def test_fresh_loss_is_non_trivial_and_training_reduces_it(mask, rng):
     batch = {"image": images()}
 
     def loss_of(p):
-        return scalar_loss(objective, p, batch, step_with(params))[0]
+        return objective.scalar_loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     assert initial > 0.1, "a fresh model already predicts the targets"
@@ -214,7 +215,7 @@ def test_video_objective_trains(mask, rng):
     batch = {"video": videos()}
 
     def loss_of(p):
-        return scalar_loss(objective, p, batch, step_with(params))[0]
+        return objective.scalar_loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     optimizer = optax.adam(3e-3)
@@ -234,7 +235,7 @@ def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
                               make_predictor(dtype=jnp.bfloat16), mask,
                               sample=Field("image", (RES, RES, 3)))
     params = objective.init(rng)
-    loss, aux = scalar_loss(objective, params, {"image": images()}, step_with(params))
+    loss, aux = objective.scalar_loss(params, {"image": images()}, step_with(params))
     assert loss.dtype == jnp.float32
     assert all(a.dtype == jnp.float32 for a in aux.metrics.values())
 
@@ -302,7 +303,7 @@ def test_no_gradient_reaches_the_target_branch(mask, rng):
     batch = {"image": images()}
 
     grads = jax.grad(
-        lambda ema: scalar_loss(objective, params, batch, step_with(ema))[0]
+        lambda ema: objective.scalar_loss(params, batch, step_with(ema))[0]
     )(params)
     assert all(float(jnp.max(jnp.abs(g))) == 0.0 for g in jax.tree.leaves(grads))
 
@@ -318,8 +319,8 @@ def test_the_targets_come_from_the_ema_encoder(mask, rng):
     moved = {"params": {"context_encoder": jax.tree.map(
         lambda p: p + 0.1, params["params"]["context_encoder"])}}
 
-    same = float(scalar_loss(objective, params, batch, step_with(params))[0])
-    other = float(scalar_loss(objective, params, batch, step_with(merge(params, moved)))[0])
+    same = float(objective.scalar_loss(params, batch, step_with(params))[0])
+    other = float(objective.scalar_loss(params, batch, step_with(merge(params, moved)))[0])
     assert abs(other - same) > 1e-2 * same
 
 
@@ -346,11 +347,11 @@ def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
                         mlp_ratio=2),
         make_predictor(), mask, sample=Field("image", (RES, RES, 3)))
     collapsed_params = collapsed.init(rng)
-    _, collapsed_aux = scalar_loss(collapsed, collapsed_params, batch, step_with(collapsed_params))
+    _, collapsed_aux = collapsed.scalar_loss(collapsed_params, batch, step_with(collapsed_params))
 
     healthy = make_objective(mask)
     healthy_params = healthy.init(rng)
-    _, healthy_aux = scalar_loss(healthy, healthy_params, batch, step_with(healthy_params))
+    _, healthy_aux = healthy.scalar_loss(healthy_params, batch, step_with(healthy_params))
 
     assert float(collapsed_aux.metrics["repr_std"]) < 1e-5
     assert float(healthy_aux.metrics["repr_std"]) > 1e-3
@@ -404,13 +405,13 @@ def test_target_encoder_tracks_the_context_encoder(mask):
     context_moved = any(
         not np.allclose(a, b) for a, b in zip(
             jax.tree.leaves(state.ema["params"]["context_encoder"]),
-            jax.tree.leaves(initial["params"]["context_encoder"])))
+            jax.tree.leaves(initial["params"]["context_encoder"]), strict=True))
     assert context_moved, "the target encoder never followed the context encoder"
 
     # and it followed without jumping: still between where it started and now
     ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
     live = jax.tree.leaves(state.variables["params"]["context_encoder"])
-    assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
+    assert any(not np.allclose(a, b) for a, b in zip(ema, live, strict=True)), "EMA is not lagging"
 
 
 @pytest.mark.mesh(devices=2)
@@ -483,7 +484,7 @@ def test_probes_separate_clustered_embeddings():
 def test_probe_metrics_score_representations_and_average_over_the_pass():
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
-    linear, knn = metrics.linear_probe(4, steps=200), metrics.knn_probe(4, k=3)
+    linear, knn = LinearProbe(4, steps=200), KnnProbe(4, k=3)
     assert linear.reads is Representations and linear.name == "batch_linear_probe_accuracy"
     assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)

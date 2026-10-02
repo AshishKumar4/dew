@@ -2,7 +2,7 @@
 jax opens a backend, checked on dictionaries so no GPU is needed."""
 
 import pytest
-from conftest import MESH_DEVICES, configure_lane
+from lane_environment import MESH_DEVICES, configure_lane
 
 
 def test_the_cpu_lane_simulates_the_mesh_devices():

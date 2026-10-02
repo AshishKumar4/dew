@@ -34,9 +34,10 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.records import integer, record as named_fields, text as named
+from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate
+from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate, with_ids_of
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -50,17 +51,13 @@ Request = str | Sequence[str] | Rows
 SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
 """The shapes a text request is rounded up to: powers of two.
 
-Every distinct prompt width, batch, budget and continuation count is its
-own several-second XLA compile, and served requests are rarely the same
-length twice. So a prompt pads left to the smallest bucket of 64 or more,
-where the attention mask hides the filler as it already hides the padding
-a ragged batch needs; a budget rounds up to the next power of two, so a
-one-token request scans one trip and a scoring probe pays no decode it did
-not ask for, and the trips past the request come off the result; the cache for
-the call is the two together, rounded up again, in place of the model's
-whole `max_seq_len`. Rows are the caller's and are not bucketed. A request
-whose buckets would need more capacity than the model's `max_seq_len`
-keeps its own shapes, so the ceiling refuses what it refuses today.
+Every distinct prompt width, budget and continuation count is its own
+several-second XLA compile. So a prompt pads left to the smallest bucket of 64
+or more, behind the attention mask; a budget rounds up to the next power of
+two and the extra trips come off the result; and the call's cache is the two
+together, rounded up again, in place of the model's whole `max_seq_len`. Rows
+are not bucketed, and a request whose buckets would exceed `max_seq_len`
+keeps its own shapes, so the ceiling refuses what it would refuse anyway.
 """
 
 
@@ -286,7 +283,7 @@ def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig
 
 def _saved_processor(record: Mapping[str, object]) -> Processor:
     """Build the run's tokenizer into a task's host processor."""
-    from dew.data import tokenizer_for
+    from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
 
     return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))
@@ -345,20 +342,16 @@ def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Samplin
 
 
 def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
-    """Read the run's quantization spec, wherever its `run.json` carries it.
+    """Read the run's quantization spec from its `run.json`'s `trainer.quantization`.
 
-    The spec is read from `trainer.quantization`, or from the top level, which
-    is where some run records carry it. It comes back through the config layer
-    that wrote it, the one place a saved dataclass record becomes its class
-    again.
+    It comes back through the config layer that wrote it, the one place a
+    saved dataclass record becomes its class again.
     """
     from dew.config import _built
     from dew.training.quantization import Quantization
 
     trainer = record.get("trainer")
     section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
-    if section is None:
-        section = record.get("quantization")
     return None if section is None else _built(Quantization, named_fields(section, "quantization"))
 
 
@@ -376,12 +369,16 @@ class TextGeneration:
     split over its batch axes and results keep that sharding.
 
     `logits` is the whole transform chain, `stopping` the criteria that run
-    beside the policy's EOS one, and `strategy` the device loop. `logits=None`
-    means the chain `sampling` compiles to. A call replaces each of them
-    whole, so a caller that wants to add to a bound chain writes
-    `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
-    replaces a bound chain with its own, because the policy it overrides is
-    what that chain was built from.
+    beside the policy's EOS and stop-string ones, and `strategy` the device
+    loop. `logits=None` means the chain `sampling` compiles to. A call
+    replaces each of them whole, so a caller that wants to add to a chain
+    writes `logits=task.sampling.transforms() + (mine,)`, and an explicit
+    `sampling=` on a call replaces a bound chain with its own, because the
+    policy it overrides is what that chain was built from. A call's policy
+    takes the task's EOS and pad ids where it leaves them None, so changing
+    one control is `sampling=replace(task.sampling, repetition_penalty=1.1)`
+    or a fresh `Sampling(...)`, and either still stops where the task does.
+    `sampling.stop` strings compile against `processor` once per policy.
 
     A call runs at `SHAPE_BUCKETS` shapes over a cache the bucket sizes,
     and hands back the shapes the request asked for, so two requests of
@@ -399,9 +396,31 @@ class TextGeneration:
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _freeze_variables(self, self.variables)
+        object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
+
+    def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
+        """Compile stop strings against the processor's vocabulary, sized for the model's head."""
+        if not strings:
+            return ()
+        if not isinstance(self.processor, (decoding.Referencing, decoding.Tokenizing, decoding.Vocabulary)):
+            raise ValueError("stop strings compile against the task's processor, and this task has none "
+                             "that lists its vocabulary; pass processor=")
+        return (decoding.stop_strings(self.processor, strings,
+                                      self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
+                  ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
+        """The policy, chain and criteria a call runs, the stop strings compiled
+        into criteria and the EOS and pad ids filled from the task's policy."""
+        policy = self.sampling if sampling is None else with_ids_of(sampling, self.sampling)
+        stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
+        chain = (self.logits if sampling is None else None) if logits is None else logits
+        criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
+        return replace(policy, stop=(), pad_id=policy.pad), chain, criteria
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -434,9 +453,8 @@ class TextGeneration:
 
         `ema` reads the averaged weights (None: when the run kept them), except
         under an objective whose average is a reference policy rather than the
-        trained one. With
-        `mesh` the weights restore straight onto that mesh under `layout`,
-        the way the trainer places them. dtype overrides computation;
+        trained one. With `mesh` the weights restore straight onto that mesh
+        under `layout`, the way the trainer places them. dtype overrides computation;
         param_dtype overrides parameter storage, and None preserves what the
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
@@ -459,8 +477,7 @@ class TextGeneration:
         model = model_config.build()
         quantization = _saved_quantization(record)
         if quantization is not None:
-            from dew.training.quantization import apply_quantization
-            model = apply_quantization(model, quantization)
+            model = quantization.apply(model)
         return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
                    max_new_tokens=budget if budget else None)
 
@@ -470,7 +487,7 @@ class TextGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -487,12 +504,9 @@ class TextGeneration:
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
-            chain = self.logits if sampling is None else None
+            policy, chain, criteria = self._controls(sampling, logits, stopping)
             generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
-                              sampling=self.sampling if sampling is None else sampling,
-                              n=self.n if n is None else n,
-                              logits=chain if logits is None else logits,
-                              stopping=self.stopping if stopping is None else stopping,
+                              sampling=policy, n=self.n if n is None else n, logits=chain, stopping=criteria,
                               strategy=self.strategy if strategy is None else strategy)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
@@ -570,7 +584,7 @@ class BlockGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -608,7 +622,7 @@ class MaskedGeneration:
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    sampler: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
@@ -657,7 +671,7 @@ class MaskedGeneration:
                         dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
-        `dew.interop.hub.push_to_hub(..., raw=True)` is what writes it.
+        `HfApi().upload_folder` of the run directory itself is what writes it.
         """
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
@@ -671,7 +685,7 @@ class MaskedGeneration:
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key)
             generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
-                sampler=self.sampler, steps=self.steps if steps is None else steps,
+                solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)

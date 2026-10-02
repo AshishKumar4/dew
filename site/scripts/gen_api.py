@@ -7,8 +7,10 @@ it list it with a link. The build fails when
 
 - a module declares `__all__` but has no page of its own,
 - a module's `__all__` exports a name that no page documents, or
-- a docs page, the README, an example, a recipe or a tutorial imports a name
-  from Dew that no page documents,
+- a docs page, the README, an example, a recipe, a tutorial or a landing
+  snippet imports a name from Dew that no page documents, or reaches one
+  through a dotted name (`dew.pipeline`, `TextToImage.from_run`) that the
+  module or class it starts from does not have,
 
 so a new public module has to be placed in GROUPS below before it ships.
 """
@@ -41,11 +43,12 @@ GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.diffusion.end_to_end", "dew.objectives.diffusion.few_step",
                     "dew.objectives.diffusion.guidance_distillation",
                     "dew.objectives.jepa", "dew.objectives.rl", "dew.objectives.rl.flow",
-                    "dew.objectives.rl.harbor", "dew.objectives.rl.scheduler"]),
+                    "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.harbor"]),
     ("Data", ["dew.data", "dew.data.chat", "dew.data.dataset", "dew.data.images"]),
     ("Models", ["dew.registry", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
                 "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
-                "dew.nn.backbones.edm2", "dew.nn.backbones.flux", "dew.nn.backbones.flux2",
+                "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
+                "dew.nn.backbones.flux2",
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
                 "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.kernels", "dew.nn.sharding", "dew.lora"]),
@@ -55,15 +58,17 @@ GROUPS: list[tuple[str, list[str]]] = [
                                 "dew.sampling.solvers", "dew.sampling.flow", "dew.sampling.guidance",
                                 "dew.sampling.decoding"]),
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
-                              "dew.interop", "dew.interop.diffusion_gemma", "dew.interop.flaxdiff"]),
+                              "dew.interop", "dew.interop.diffusion_gemma"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),
 ]
 PAGES = [module for _, modules in GROUPS for module in modules]
 
-# Places that show users Dew code; every name they import must be documented.
-USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py", "tutorials/*.ipynb"]
+# Places that show users Dew code; every Dew name they use must resolve to the
+# documented API. A landing snippet file shows only its marked regions.
+USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py",
+         "tutorials/*.ipynb", "site/snippets/*.py", "site/src/data/*.py"]
 USAGE_SKIP = ("docs/research/", "docs/design/")
 
 
@@ -357,27 +362,172 @@ def render_object(entry: Entry, linker: Linker, context: str, registered: dict[s
 def usage_imports() -> Iterator[tuple[str, str, str]]:
     """(file, module, name) for every `from dew... import name` users are shown."""
     pattern = re.compile(r"from\s+(dew(?:\.\w+)*)\s+import\s+(\([^)]*\)|[^\n#]+)")
+    for relative, path in usage_files():
+        if path.suffix == ".ipynb":
+            text = "\n".join(code for code, _ in usage_code(relative, path))
+        elif path.suffix == ".md":
+            # Only code a reader can run: fenced blocks and inline code spans.
+            raw = path.read_text()
+            fenced = re.findall(r"^(`{3,}|~{3,})[^\n]*\n(.*?)^\1", raw, re.S | re.M)
+            inline = re.findall(r"`([^`\n]+)`", re.sub(r"^(`{3,}|~{3,}).*?^\1", "", raw, flags=re.S | re.M))
+            text = "\n".join([block for _, block in fenced] + inline)
+        else:
+            text = path.read_text()
+        for match in pattern.finditer(text):
+            names = re.sub(r"\s+as\s+\w+", "", match.group(2).strip("() \n"))
+            for name in re.split(r"[,\s]+", names):
+                if re.fullmatch(r"[A-Za-z_]\w*", name):
+                    yield relative, match.group(1), name
+
+
+def usage_files() -> Iterator[tuple[str, Path]]:
     for glob in USAGE:
         for path in sorted(REPO.glob(glob)):
             relative = path.relative_to(REPO).as_posix()
-            if relative.startswith(USAGE_SKIP):
+            if not relative.startswith(USAGE_SKIP):
+                yield relative, path
+
+
+def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None]]:
+    """The Python units a file shows, each with the lines a reader sees (None
+    for all): a fenced python block, a notebook code cell, a whole example or
+    recipe, or a landing snippet file's marked regions."""
+    if path.suffix == ".ipynb":
+        for cell in json.loads(path.read_text())["cells"]:
+            if cell["cell_type"] == "code":
+                # IPython's `%` and `!` lines are not Python.
+                yield "".join(re.sub(r"^\s*[%!].*", "", line) for line in cell["source"]), None
+    elif path.suffix == ".md":
+        for block in re.findall(r"^```(?:python|py)[^\n]*\n(.*?)^```", path.read_text(), re.S | re.M):
+            yield block, None
+    elif relative.startswith("site/snippets/"):
+        code = path.read_text()
+        shown, inside = set(), False
+        for number, line in enumerate(code.splitlines(), 1):
+            if "# Begin snippet" in line:
+                inside = True
+            elif "# End snippet" in line:
+                inside = False
+            elif inside:
+                shown.add(number)
+        yield code, shown
+    else:
+        yield path.read_text(), None
+
+
+def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
+                    code: str, shown: set[int] | None,
+                    bound: dict[str, griffe.Object]) -> Iterator[str]:
+    """Each dotted use of a Dew name in `code` that does not reach the
+    documented API: an attribute a module or class does not have, or a
+    module member no page documents. Names come from `import dew...` and
+    `from dew... import ...`, in this unit or an earlier one of the same file
+    (`bound`, which this updates); a name the code assigns is its own."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return
+    assigned = {node.id for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    assigned |= {node.name for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
+    assigned |= {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "dew" or alias.name.startswith("dew."):
+                    name = alias.asname or "dew"
+                    target = alias.name if alias.asname else "dew"
+                    try:
+                        bound[name] = package if target == "dew" else package[target.removeprefix("dew.")]
+                    except KeyError:
+                        continue
+        elif isinstance(node, ast.ImportFrom) and node.module and (node.module + ".").startswith("dew."):
+            try:
+                module = package if node.module == "dew" else package[node.module.removeprefix("dew.")]
+                for alias in node.names:
+                    member = module.members.get(alias.name)
+                    if member is not None:
+                        bound[alias.asname or alias.name] = resolve(member)
+            except (KeyError, Unresolved):
                 continue
-            if path.suffix == ".ipynb":
-                notebook = json.loads(path.read_text())
-                text = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
-            elif path.suffix == ".md":
-                # Only code a reader can run: fenced blocks and inline code spans.
-                raw = path.read_text()
-                fenced = re.findall(r"^(`{3,}|~{3,})[^\n]*\n(.*?)^\1", raw, re.S | re.M)
-                inline = re.findall(r"`([^`\n]+)`", re.sub(r"^(`{3,}|~{3,}).*?^\1", "", raw, flags=re.S | re.M))
-                text = "\n".join([block for _, block in fenced] + inline)
-            else:
-                text = path.read_text()
-            for match in pattern.finditer(text):
-                names = re.sub(r"\s+as\s+\w+", "", match.group(2).strip("() \n"))
-                for name in re.split(r"[,\s]+", names):
-                    if re.fullmatch(r"[A-Za-z_]\w*", name):
-                        yield relative, match.group(1), name
+    for name in assigned:
+        bound.pop(name, None)
+
+    def chain(node: ast.expr) -> list[str] | None:
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Attribute):
+            inner = chain(node.value)
+            return None if inner is None else [*inner, node.attr]
+        return None
+
+    # Each outermost dotted name once: `dew.interop.hub.pull_from_hub`, not also `dew.interop.hub`.
+    inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    seen = set()
+    for node in ast.walk(tree):
+        if (not isinstance(node, ast.Attribute) or id(node) in inner
+                or (shown is not None and node.lineno not in shown)):
+            continue
+        path = chain(node)
+        if path is None or path[0] not in bound or ".".join(path) in seen:
+            continue
+        seen.add(".".join(path))
+        problem = unresolved_chain(bound[path[0]], path, home, pages)
+        if problem:
+            yield problem
+
+
+def outside_bases(cls: griffe.Class) -> bool:
+    """Whether a base of `cls`, or of one of its bases, is defined outside Dew."""
+    try:
+        resolved = cls.resolved_bases
+    except (griffe.AliasResolutionError, griffe.CyclicAliasError):
+        return True
+    named = [base for base in cls.bases if str(base) != "object"]
+    return len(resolved) < len(named) or any(outside_bases(base) for base in resolved)
+
+
+def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str],
+                     pages: dict[str, Page]) -> str | None:
+    """Why `path`, which starts at `start`, leaves the documented API, or None."""
+    current = start
+    for depth, attribute in enumerate(path[1:], 2):
+        used = ".".join(path[:depth])
+        if current.is_module:
+            if attribute.startswith("__"):
+                return None
+            member = current.members.get(attribute)
+            if member is None or attribute.startswith("_"):
+                return f"`{used}`: {current.path} has no public {attribute}"
+            try:
+                current = resolve(member)
+                # `dew.pipeline` names the function its own module exports.
+                if current.is_module and f"{current.path}.{attribute}" in home:
+                    current = resolve(current.members[attribute])
+            except Unresolved:
+                return None
+            if not current.is_module and current.path not in home:
+                return f"`{used}` ({current.path}) is not documented"
+        elif current.is_class:
+            if attribute.startswith("_") and not attribute.startswith("__"):
+                return f"`{used}`: {attribute} is private to {current.path}"
+            try:
+                members = current.all_members
+            except (griffe.AliasResolutionError, griffe.CyclicAliasError):
+                return None
+            if attribute not in members:
+                # A base outside Dew (flax, a TypedDict) may define it.
+                return None if outside_bases(current) else f"`{used}`: {current.path} has no {attribute}"
+            try:
+                current = resolve(members[attribute])
+            except Unresolved:
+                return None
+        else:
+            return None
+    if current.is_module and current.path not in pages:
+        return f"`{'.'.join(path)}` is the module {current.path}, which has no API page"
+    return None
 
 
 def load() -> griffe.Module:
@@ -405,28 +555,42 @@ def load() -> griffe.Module:
     return package
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
-    args = parser.parse_args()
-    package = load()
+def module_of(package: griffe.Module, path: str) -> griffe.Module:
+    obj = package if path == "dew" else package[path.removeprefix("dew.")]
+    if not obj.is_module:
+        raise SystemExit(f"GROUPS lists {path}, which is not a module")
+    return obj
 
-    def module_of(path: str) -> griffe.Module:
-        obj = package if path == "dew" else package[path.removeprefix("dew.")]
-        if not obj.is_module:
-            raise SystemExit(f"GROUPS lists {path}, which is not a module")
-        return obj
 
-    pages = {path: Page(module_of(path), list(public_entries(module_of(path)))) for path in PAGES}
-
-    # Each object's home: the page with the longest module prefix of its path,
-    # else the first page that exports it.
+def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]:
+    """Each page, and each documented object's home: the page with the longest
+    module prefix of its path, else the first page that exports it."""
+    pages = {path: Page(module_of(package, path), list(public_entries(module_of(package, path))))
+             for path in PAGES}
     home: dict[str, str] = {}
     for path in PAGES:
         for entry in pages[path].entries:
             prefixes = [page for page in PAGES if entry.canonical.startswith(page + ".")
                         and any(e.canonical == entry.canonical for e in pages[page].entries)]
             home.setdefault(entry.canonical, max(prefixes, key=len) if prefixes else path)
+    return pages, home
+
+
+def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
+                  home: dict[str, str]) -> list[str]:
+    """What `unresolved_uses` reports for each Python unit `path` shows, in
+    order, a unit seeing the names the units before it bound."""
+    bound: dict[str, griffe.Object] = {}
+    return [problem for code, shown in usage_code(file, path)
+            for problem in unresolved_uses(package, home, pages, code, shown, bound)]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
+    args = parser.parse_args()
+    package = load()
+    pages, home = documented(package)
 
     linker = Linker()
     for path in PAGES:
@@ -459,7 +623,8 @@ def main() -> None:
                 problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
     for file, module_path, name in usage_imports():
         try:
-            module = module_of(module_path) if module_path == "dew" else package[module_path.removeprefix("dew.")]
+            module = (module_of(package, module_path) if module_path == "dew"
+                      else package[module_path.removeprefix("dew.")])
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -475,6 +640,8 @@ def main() -> None:
                 problems.append(f"{file}: imports the module {target.path}, which has no API page")
         elif target.path not in home:
             problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
+    for file, path in usage_files():
+        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, package, pages, home))
     if problems:
         print("gen_api: the API reference does not cover what is public:", file=sys.stderr)
         for problem in sorted(set(problems)):

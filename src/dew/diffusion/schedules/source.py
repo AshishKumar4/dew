@@ -85,12 +85,6 @@ from dew.sampling.solvers import (
     UniPC,
 )
 
-Kind = Literal[
-    "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
-    "HeunDiscrete", "KDPM2Discrete", "KDPM2AncestralDiscrete", "DPMSolverMultistep",
-    "DPMSolverSinglestep", "DPMSolverSDE", "DEISMultistep", "UniPCMultistep",
-    "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
-]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
 Origin = Literal["scheduler", "linspace", "empirical"]
 Spacing = Literal["leading", "linspace", "trailing"]
@@ -492,7 +486,9 @@ class SourceSchedule:
     betas: np.ndarray
     prediction: PredictionTransform
     policy: _Policy
-    sampler: Solver
+    # The native solver this file's class and controls name, resolved once
+    # when the file was read.
+    solver: Solver
     # The grids one schedule has already built, keyed by the call that built
     # them. Held here rather than in an lru_cache over the method, whose keys
     # are the schedules themselves: those outlive every pipeline that asks.
@@ -541,13 +537,9 @@ class SourceSchedule:
             zero_snr=records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
-        policy, sampler = _resolve(kind, source, value, betas)
+        policy, solver = _resolve(kind, source, value, betas)
         return cls(MappingProxyType(dict(config)), betas,
-                   _prediction_transform(policy, prediction), policy, sampler)
-
-    @property
-    def kind(self) -> str:
-        return self.policy.kind
+                   _prediction_transform(policy, prediction), policy, solver)
 
     @property
     def train_steps(self) -> int:
@@ -559,15 +551,10 @@ class SourceSchedule:
         """The process Dew fine-tunes the checkpoint on, at `tokens` latent
         tokens.
 
-        A scheduler file states how its checkpoint samples, not the noise
-        distribution it was trained on, so this is the convention its sampler
-        reads. Every class but the EDM one tabulates a VP beta table, which
-        the process draws from. EDM's convention has no beta table and no VP
-        law; its process is EDM's own log-normal sigma draw, over the
-        preconditioning the sampler reads. A flow file's process takes the
-        shift its sampler walks at the same geometry, so a dynamic file needs
-        `tokens`; the terminal stretch is a sampling grid's alone. A log-SNR
-        class on flow sigmas takes the flow path at its `flow_shift`.
+        A scheduler file states how its checkpoint samples, so this is the
+        convention its sampler reads: the VP beta table, EDM's log-normal
+        sigma draw, or the flow path at the shift its sampler walks (a
+        dynamic file needs `tokens`; the terminal stretch is sampling's alone).
         """
         if self.policy.family == "flow":
             flow = self.policy.flow
@@ -581,11 +568,6 @@ class SourceSchedule:
                                          sigma_data=self.policy.sigma_data)
             return Process(schedule, self.prediction)
         return Process(DiscreteNoiseScheduler(self.betas, p2_loss_weight_gamma=0), self.prediction)
-
-    def solver(self) -> Solver:
-        """The native solver this file's class and controls name, resolved
-        once when the file was read."""
-        return self.sampler
 
     def _training_sigmas(self) -> tuple[np.ndarray, np.ndarray]:
         """The training sigma table sigma/alpha and its logarithm, with the
@@ -719,15 +701,10 @@ class SourceSchedule:
     def _check_unique_start(times: np.ndarray) -> None:
         """Refuse a grid whose first model time appears again in it.
 
-        The source finds the step it starts at by matching that time against
-        the whole list of times it will evaluate. A repeated first time makes
-        it take the second match, which shifts its walk by one and runs off
-        the end of its sigma table, so such a list has no source trajectory
-        to reproduce. The Karras grid of a cosine table at a small step count
-        is the case that reaches it, because the largest sigmas of that table
-        all recover the same index. Repeats after the first entry are left
-        alone: the two-evaluation classes and PNDM's warmup place them on
-        purpose and count from where they started.
+        The source looks its starting step up by that time and takes the
+        second match, which runs its walk off the end of its sigma table (a
+        cosine table's Karras grid at few steps does this). Later repeats are
+        the deliberate ones of the two-evaluation classes and PNDM's warmup.
         """
         if len(times) > 1 and float(np.sum(times == times[0])) > 1:
             raise ValueError(
@@ -1090,7 +1067,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     """The native solver this class and its controls name, built once.
 
     A solver is a frozen value, so the file's class and controls resolve into
-    one here and `SourceSchedule.solver()` hands that same value out. Nothing
+    one here and `SourceSchedule.solver` holds that same value. Nothing
     downstream re-reads a control to rebuild it.
     """
     if kind == "DDIM":

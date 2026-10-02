@@ -27,15 +27,16 @@ import sys
 import time
 from pathlib import Path
 
+import multiprocess_worker as worker
 import numpy as np
 import pytest
+
+from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
-import multiprocess_worker as worker
 
-from dew.position import ENVELOPE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
@@ -140,7 +141,7 @@ def run_pool(mode, directory: Path, processes: int, *, timeout=600, **flags) -> 
               **flags)
         for index, out in enumerate(outs)]
     try:
-        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs)]
+        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs, strict=True)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -245,7 +246,7 @@ def two_processes(tmp_path_factory):
 def test_the_mesh_covers_every_process_in_the_pool(two_processes):
     """A mesh that stopped at the local devices would train two models.
 
-    build_mesh takes jax.devices(), which inside a pool is every device of
+    MeshSpec.build takes jax.devices(), which inside a pool is every device of
     every process, so its axes have to multiply out to the global count and
     its devices have to come from every process. Nothing in a simulated
     single-process run can tell the two apart.
@@ -444,7 +445,7 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     pool = run_pool("pipeline", tmp_path / "pool", 2, fsdp_size=2, stage_size=2,
                     microbatches=2, steps=steps)
 
-    piped, piped_state = worker.pipeline_losses(
+    piped, _piped_state = worker.pipeline_losses(
         worker.pipeline_trainer(2, 2, 2), worker.token_batch(), steps)
     whole, whole_state = worker.pipeline_losses(
         worker.pipeline_trainer(1, None, 4), worker.token_batch(), steps)
@@ -502,7 +503,14 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1, "stage": 1}
+        assert report["mesh_shape"] == {
+            "data": 2,
+            "expert": 1,
+            "fsdp": 4,
+            "tensor": 1,
+            "sequence": 1,
+            "stage": 1,
+        }
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
@@ -693,7 +701,7 @@ def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_chec
                     run_dir=tmp_path / "pool-run", **flags)
 
     for step in range(POOL_STEPS):
-        rows = [row for held in zip(*(report["windows"][step] for report in pool))
+        rows = [row for held in zip(*(report["windows"][step] for report in pool), strict=True)
                 for row in held]
         assert rows == single["windows"][step], f"step {step} read other windows"
 
@@ -1120,8 +1128,7 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     np.testing.assert_allclose(reports[0]["raw_log_probs"] + reports[1]["raw_log_probs"],
                                single["raw_log_probs"], rtol=1e-5, atol=1e-6)
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
-    assert single["loss"] == pytest.approx(reports[0]["loss"], **{
-        "rel": PARITY["rtol"], "abs": PARITY["atol"]})
+    assert single["loss"] == pytest.approx(reports[0]["loss"], rel=PARITY["rtol"], abs=PARITY["atol"])
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
 
@@ -1154,7 +1161,7 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
 
     make_run(tmp_path / "diffusion", encoder="char_table", checkpoint="char_table")
     make_lm_run(tmp_path / "lm")
-    runs = dict(run_dir=str(tmp_path / "diffusion"), lm_dir=str(tmp_path / "lm"))
+    runs = {"run_dir": str(tmp_path / "diffusion"), "lm_dir": str(tmp_path / "lm")}
     reports = run_pool("inference_pipeline", tmp_path, 2, devices=2, fsdp_size=2, timeout=240, **runs)
     single = run_worker("inference_pipeline", tmp_path / "single.json", fsdp_size=1, devices=1, **runs)
 
@@ -1166,7 +1173,9 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
                                            "prepared", "prepared_rows", "request_kind", "budget"}
         assert any("fsdp" in spec for spec in report["parameter_specs"])
     assert single["image_rows"] == single["rows"] == 6
-    np.testing.assert_allclose(reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(
+        reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5
+    )
     assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
     assert reports[0]["text"] + reports[1]["text"] == single["text"]
 
@@ -1272,8 +1281,6 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
         assert report["measured"]["val/count"] == 3
         assert report["measured"]["evaluation/records"] == 3
         assert report["no_consumer"] == {}
-    assert reports[0]["local"] == [0, 1, 2]
-    assert reports[1]["local"] is None
 
 
 @pytest.mark.distributed

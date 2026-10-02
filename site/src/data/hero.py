@@ -7,8 +7,9 @@ import jax
 import numpy as np
 import optax
 
-from dew import Trainer, models
+from dew import Trainer
 from dew.data import ByteTokenizer, Loading, TokenWindows
+from dew.nn.backbones import CausalTransformer, Mixture
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
@@ -29,9 +30,9 @@ if not tokens.exists():
 
 data = TokenWindows(path=str(tokens), seq_len=128, val_batches=4,
                     loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=16)
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=4, max_seq_len=256,
-                     mixture={"experts": 8, "top_k": 2, "dispatch": "global"})
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=4, max_seq_len=256,
+                          mixture=Mixture(experts=8, top_k=2, dispatch="global"))
 objective = LMObjective(model, seq_len=128, aux_loss_alpha=0.01, ema_decay=None)
 trainer = Trainer(objective, optax.adamw(3e-3), key=jax.random.key(0))
 state = trainer.fit(data, steps=200, log_every=10, eval_every=50, metrics=(Perplexity(),))

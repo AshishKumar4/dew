@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from test_quantized import decode_e4m3fn, fetch
 
-from dew.interop import codecs, load_pretrained
+from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -104,7 +104,9 @@ FP4_TABLE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 def e8m0(scale: np.ndarray) -> np.ndarray:
     """E8M0 bytes as float32 2 ** (b - 127), 255 as NaN, from the bytes alone."""
     exponent = scale.view(np.uint8).astype(np.int32)
-    return np.where(exponent == 255, np.float32(np.nan), np.ldexp(np.float32(1), exponent - 127)).astype(np.float32)
+    return np.where(exponent == 255, np.float32(np.nan), np.ldexp(np.float32(1), exponent - 127)).astype(
+        np.float32
+    )
 
 
 def release_scale(scale: np.ndarray) -> np.ndarray:
@@ -273,25 +275,74 @@ def v4_read(tensors: dict[str, np.ndarray], name: str, fp4_experts: bool = True)
     return codecs.deepseek_v4(32, fp4_experts=fp4_experts).read(tensors, name)
 
 
-@pytest.mark.parametrize("refused, message", [
-    (lambda: codecs.source_quantization({"quantization_config": {**FP8_CONFIG, "scale_fmt": "float"},
-                                         "expert_dtype": "fp4"}), "scale_fmt 'float'.*'ue8m0'"),
-    (lambda: codecs.source_quantization({"quantization_config": {**FP8_CONFIG, "scale_fmt": "ue8m0",
-                                                                 "expert_dtype": "nvfp4"}}), "expert_dtype 'nvfp4'"),
-    (lambda: codecs.deepseek_v4(128, fp4_experts=True).names({"a.scale": E8M0_BYTE}), r"a\.scale .*a\.weight"),
-    (lambda: v4_read({EXPERT: E4M3_PAIR, EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT),
-     r"experts\.0\.w1\.weight .*int8 \[out, in / 2\].*got float8_e4m3fn \(2, 32\)"),
-    (lambda: v4_read({EXPERT: np.zeros((2, 16), np.int8), EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT, False),
-     r"experts\.0\.w1\.weight .*float8_e4m3fn.*got int8 \(2, 16\)"),
-    (lambda: v4_read({"l.wkv.weight": np.zeros((2, 32), ml_dtypes.bfloat16), "l.wkv.scale": E8M0_BYTE},
-                     "l.wkv.weight"), r"l\.wkv\.weight .*got bfloat16 \(2, 32\)"),
-    (lambda: v4_read({"l.engram.embed.weight": E4M3_PAIR, "l.engram.embed.scale": E8M0_BYTE}, "l.engram.embed.weight"),
-     r"l\.engram\.embed\.weight .*\(2, 32\) and \(1, 1\)"),
-    (lambda: codecs.deepseek_v4(128, fp4_experts=True).scale_dtype({"a.weight": E4M3_PAIR, "a.scale": E8M0_BYTE, "b.weight": E4M3_PAIR,
-                                             "b.scale": np.ones((1, 1), np.float32)}),
-     r"\['float32', 'float8_e8m0fnu'\]"),
-], ids=["scale-fmt", "expert-dtype", "scale-without-weight", "fp4-expert-dtype", "pairs-under-fp8",
-        "fp8-dtype", "engram-grid", "mixed-scale-dtypes"])
+@pytest.mark.parametrize(
+    "refused, message",
+    [
+        (
+            lambda: codecs.source_quantization(
+                {"quantization_config": {**FP8_CONFIG, "scale_fmt": "float"}, "expert_dtype": "fp4"}
+            ),
+            "scale_fmt 'float'.*'ue8m0'",
+        ),
+        (
+            lambda: codecs.source_quantization(
+                {"quantization_config": {**FP8_CONFIG, "scale_fmt": "ue8m0", "expert_dtype": "nvfp4"}}
+            ),
+            "expert_dtype 'nvfp4'",
+        ),
+        (
+            lambda: codecs.deepseek_v4(128, fp4_experts=True).names({"a.scale": E8M0_BYTE}),
+            r"a\.scale .*a\.weight",
+        ),
+        (
+            lambda: v4_read({EXPERT: E4M3_PAIR, EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT),
+            r"experts\.0\.w1\.weight .*int8 \[out, in / 2\].*got float8_e4m3fn \(2, 32\)",
+        ),
+        (
+            lambda: v4_read(
+                {EXPERT: np.zeros((2, 16), np.int8), EXPERT[:-6] + "scale": E8M0_BYTE},
+                EXPERT,
+                fp4_experts=False,
+            ),
+            r"experts\.0\.w1\.weight .*float8_e4m3fn.*got int8 \(2, 16\)",
+        ),
+        (
+            lambda: v4_read(
+                {"l.wkv.weight": np.zeros((2, 32), ml_dtypes.bfloat16), "l.wkv.scale": E8M0_BYTE},
+                "l.wkv.weight",
+            ),
+            r"l\.wkv\.weight .*got bfloat16 \(2, 32\)",
+        ),
+        (
+            lambda: v4_read(
+                {"l.engram.embed.weight": E4M3_PAIR, "l.engram.embed.scale": E8M0_BYTE},
+                "l.engram.embed.weight",
+            ),
+            r"l\.engram\.embed\.weight .*\(2, 32\) and \(1, 1\)",
+        ),
+        (
+            lambda: codecs.deepseek_v4(128, fp4_experts=True).scale_dtype(
+                {
+                    "a.weight": E4M3_PAIR,
+                    "a.scale": E8M0_BYTE,
+                    "b.weight": E4M3_PAIR,
+                    "b.scale": np.ones((1, 1), np.float32),
+                }
+            ),
+            r"\['float32', 'float8_e8m0fnu'\]",
+        ),
+    ],
+    ids=[
+        "scale-fmt",
+        "expert-dtype",
+        "scale-without-weight",
+        "fp4-expert-dtype",
+        "pairs-under-fp8",
+        "fp8-dtype",
+        "engram-grid",
+        "mixed-scale-dtypes",
+    ],
+)
 def test_a_v4_checkpoint_refuses_what_its_format_cannot_hold(refused, message):
     """Each refusal names the tensor or the field, and what it holds."""
     with pytest.raises(ValueError, match=message):
@@ -308,7 +359,9 @@ indexer's query, the shared and routed experts, and the prediction depth's
 input projections."""
 
 
-def v4_release_storage(directory: Path, experts: str, scale_dtype: str) -> tuple[dict[str, np.ndarray], tuple[str, ...]]:
+def v4_release_storage(
+    directory: Path, experts: str, scale_dtype: str
+) -> tuple[dict[str, np.ndarray], tuple[str, ...]]:
     """deepseek-v4-tiny stored as V4-Flash stores its weights, under
     `directory`/quantized, and the same weights decoded by the release's
     formulas, dense, under `directory`/dense.
@@ -323,15 +376,21 @@ def v4_release_storage(directory: Path, experts: str, scale_dtype: str) -> tuple
     dense = {}
     for name, tensor in read_weights(V4_TINY).items():
         if "experts." in name:
-            shape = (32, tensor.shape[1]) if name.endswith(("w1.weight", "w3.weight")) else (tensor.shape[0], 32)
+            shape = (
+                (32, tensor.shape[1]) if name.endswith(("w1.weight", "w3.weight")) else (tensor.shape[0], 32)
+            )
             tensor = (rng.standard_normal(shape) * np.std(tensor)).astype(np.float32)
         dense[name] = tensor
     names = tuple(name for name in dense if V4_QUANTIZED.search(name))
-    stored = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).requantize(dense, names)
+    stored = codecs.deepseek_v4(128, fp4_experts=experts == "fp4", scale_dtype=scale_dtype).requantize(
+        dense, names
+    )
     decoded = dict(dense)
     for name in names:
         weight, scale = stored[name], stored[name.removesuffix("weight") + "scale"]
-        decoded[name] = release_fp4(weight, scale) if weight.dtype == np.int8 else release_fp8(weight, scale, 128)
+        decoded[name] = (
+            release_fp4(weight, scale) if weight.dtype == np.int8 else release_fp8(weight, scale, 128)
+        )
     config = {**json.loads((V4_TINY / "config.json").read_text()), "moe_intermediate_size": 32}
     released = json.loads((V4_TINY.parent / "deepseek-v4-flash" / "config.json").read_text())
     save_hf_layout(stored, {**config, "expert_dtype": experts,
@@ -351,14 +410,18 @@ def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, 
     weights that decode to the source's values."""
     stored, names = v4_release_storage(tmp_path, experts, scale_dtype)
 
-    loaded = load_pretrained(tmp_path / "quantized", dtype="float32", attention_impl="reference")
-    dense = load_pretrained(tmp_path / "dense", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "quantized", dtype="float32", attention_impl="reference")
+    dense = Pretrained.load(tmp_path / "dense", dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "export")
 
     assert set(loaded.quantized_tensors) == set(names)
     jax.tree_util.tree_map_with_path(
-        lambda path, ours, theirs: np.testing.assert_array_equal(ours, theirs, err_msg=jax.tree_util.keystr(path)),
-        loaded.variables, dense.variables)
+        lambda path, ours, theirs: np.testing.assert_array_equal(
+            ours, theirs, err_msg=jax.tree_util.keystr(path)
+        ),
+        loaded.variables,
+        dense.variables,
+    )
     written = read_weights(tmp_path / "export")
     assert set(written) == set(stored)
     read = codecs.deepseek_v4(128, fp4_experts=experts == "fp4").read
@@ -388,7 +451,9 @@ def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.nd
     from huggingface_hub import hf_hub_download, hf_hub_url
 
     revision = V4_RELEASES[repo]
-    index = json.loads(Path(hf_hub_download(repo, "model.safetensors.index.json", revision=revision)).read_text())
+    index = json.loads(
+        Path(hf_hub_download(repo, "model.safetensors.index.json", revision=revision)).read_text()
+    )
     url = hf_hub_url(repo, index["weight_map"][name], revision=revision)
     length = struct.unpack("<Q", fetch(url, 0, 7))[0]
     meta = json.loads(fetch(url, 8, 7 + length))[name]
@@ -414,7 +479,9 @@ def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.nd
     ("deepseek-ai/DeepSeek-V4.1-Flash", "layers.0.ffn.experts.0.w1.weight", None, 32, True),
     ("deepseek-ai/DeepSeek-V4.1-Flash", "layers.1.engram.embed.weight", (200_000_000, 200_002_048), 32, True),
 ], ids=["v4-fp8", "v4-fp4", "v4-base-fp8-float32-scale", "v41-fp8", "v41-fp4", "v41-engram"])
-def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(repo, name, rows, block, fp4_experts):
+def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(
+    repo, name, rows, block, fp4_experts
+):
     """Real tensors at the pinned commits, one engram table read as 2048 of
     its 384 M rows. Decoding matches the release's formulas bit for bit
     (FP4: in value, code 8 aside). Encoding the decoded weight writes the
@@ -436,7 +503,9 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(r
         np.testing.assert_array_equal(again[name].view(np.uint8), weight.view(np.uint8))
         np.testing.assert_array_equal(again[partner].view(np.uint8), scale.view(np.uint8))
         return
-    expected = release_fp8(weight, scale, block) if layout == "blocks" else release_engram(weight, scale, block)
+    expected = (
+        release_fp8(weight, scale, block) if layout == "blocks" else release_engram(weight, scale, block)
+    )
     np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
     magnitudes = np.abs(weight.astype(np.float32))
     if layout == "blocks":
@@ -445,7 +514,9 @@ def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(r
         largest = magnitudes.reshape(*scale.shape, block).max(axis=-1)
     moved = again[partner].astype(np.float32) != scale.astype(np.float32)
     np.testing.assert_array_equal(moved, largest == 224)
-    np.testing.assert_array_equal(again[partner].astype(np.float32)[moved], scale.astype(np.float32)[moved] / 2)
+    np.testing.assert_array_equal(
+        again[partner].astype(np.float32)[moved], scale.astype(np.float32)[moved] / 2
+    )
     kept = np.repeat(np.repeat(~moved, block if layout == "blocks" else 1, axis=0), block, axis=1)
     np.testing.assert_array_equal(again[name].view(np.uint8)[kept], weight.view(np.uint8)[kept])
 
@@ -502,12 +573,23 @@ def integer_checkpoint(directory: Path, method: str) -> dict[str, np.ndarray]:
         stem = name.removesuffix(".weight")
         if method == "awq":
             order = list(codecs.AWQ_ORDER)
-            def pack(values):
-                return codecs._words(values.reshape(values.shape[0], -1, 8)[..., order].reshape(values.shape), 4)
-            stored |= {stem + ".qweight": pack(codes), stem + ".qzeros": pack(zeros), stem + ".scales": scales}
+            def pack(values, *, order=order):
+                return codecs._words(
+                    values.reshape(values.shape[0], -1, 8)[..., order].reshape(values.shape), 4
+                )
+
+            stored |= {
+                stem + ".qweight": pack(codes),
+                stem + ".qzeros": pack(zeros),
+                stem + ".scales": scales,
+            }
         else:
-            stored |= {stem + ".qweight": codecs._words(codes.T, 4).T, stem + ".qzeros": codecs._words(zeros - 1, 4),
-                       stem + ".scales": scales, stem + ".g_idx": (np.arange(w.shape[0]) // 16).astype(np.int32)}
+            stored |= {
+                stem + ".qweight": codecs._words(codes.T, 4).T,
+                stem + ".qzeros": codecs._words(zeros - 1, 4),
+                stem + ".scales": scales,
+                stem + ".g_idx": (np.arange(w.shape[0]) // 16).astype(np.int32),
+            }
     config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
     config["quantization_config"] = ({"quant_method": "awq", "bits": 4, "group_size": 16, "version": "gemm",
                                       "zero_point": True} if method == "awq" else
@@ -527,7 +609,7 @@ def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_
     value its source grid cannot hold is refused: AutoAWQ's packing would
     spill it into the neighbouring codes and gptqmodel's would clamp it."""
     stored = integer_checkpoint(tmp_path / "source", method)
-    loaded = load_pretrained(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "export")
     written = read_weights(tmp_path / "export")
     assert set(written) == set(stored)
@@ -538,7 +620,9 @@ def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_
     variables = jax.tree.map(np.array, loaded.variables)
     kernel = variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     kernel[0, 0] = 1e3
-    with pytest.raises(ValueError, match=r"q_proj\.weight: 1 trained values fall outside the source's 4-bit grid"):
+    with pytest.raises(
+        ValueError, match=r"q_proj\.weight: 1 trained values fall outside the source's 4-bit grid"
+    ):
         loaded.save(tmp_path / "trained", variables=variables)
 
 
@@ -571,13 +655,24 @@ def ct_case(label: str) -> tuple[dict[str, np.ndarray], dict[str, dict[str, np.n
     parts = [key.split("/", 1)[1] for key in fixture.files if key.startswith(f"{label}/")
              and key.count("/") == 1 and not key.endswith(("dequantized", "trained"))]
     stored = {f"m.{part}": read(f"{label}/{part}", part) for part in parts}
-    requantized = {kind: {f"m.{key.rsplit('/', 1)[1]}": read(key, key.rsplit("/", 1)[1]) for key in fixture.files
-                          if key.startswith(f"{label}/{kind}/")} for kind in ("requantized", "requantized32")}
+    requantized = {
+        kind: {
+            f"m.{key.rsplit('/', 1)[1]}": read(key, key.rsplit("/", 1)[1])
+            for key in fixture.files
+            if key.startswith(f"{label}/{kind}/")
+        }
+        for kind in ("requantized", "requantized32")
+    }
     trained = {"requantized": fixture[f"{label}/trained"].view(ml_dtypes.bfloat16),
                "requantized32": fixture[f"{label}/trained32"]}
     weights = {**meta["weights"], "dynamic": False}
-    config = {"quantization_config": {"quant_method": "compressed-tensors", "format": meta["format"],
-                                      "config_groups": {"group_0": {"targets": ["Linear"], "weights": weights}}}}
+    config = {
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": meta["format"],
+            "config_groups": {"group_0": {"targets": ["Linear"], "weights": weights}},
+        }
+    }
     return stored, requantized, trained, config
 
 
@@ -597,16 +692,29 @@ def test_a_compressed_tensors_weight_decodes_and_saves_as_the_library_does(label
         assert set(written) == set(requantized[kind]), kind
         for name, value in requantized[kind].items():
             assert written[name].dtype == value.dtype, (kind, name)
-            np.testing.assert_array_equal(written[name].view(np.uint8), value.view(np.uint8), err_msg=f"{kind} {name}")
+            np.testing.assert_array_equal(
+                written[name].view(np.uint8), value.view(np.uint8), err_msg=f"{kind} {name}"
+            )
 
 
-@pytest.mark.parametrize("change, message", [
-    ({"format": "marlin-24"}, "compressed-tensors format 'marlin-24'"),
-    ({"kv_cache_scheme": {"num_bits": 8}}, "kv_cache_scheme"),
-    ({"config_groups": {"g": {"weights": {"num_bits": 4, "type": "int", "strategy": "group", "group_size": 32},
-                              "input_activations": {"num_bits": 8, "type": "float", "dynamic": False}}}},
-     "input_activations have dynamic=False"),
-])
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"format": "marlin-24"}, "compressed-tensors format 'marlin-24'"),
+        ({"kv_cache_scheme": {"num_bits": 8}}, "kv_cache_scheme"),
+        (
+            {
+                "config_groups": {
+                    "g": {
+                        "weights": {"num_bits": 4, "type": "int", "strategy": "group", "group_size": 32},
+                        "input_activations": {"num_bits": 8, "type": "float", "dynamic": False},
+                    }
+                }
+            },
+            "input_activations have dynamic=False",
+        ),
+    ],
+)
 def test_a_compressed_tensors_config_this_loader_cannot_read_is_refused_by_name(change, message):
     _, _, _, config = ct_case("pack_int4_group_sym")
     config["quantization_config"] |= change

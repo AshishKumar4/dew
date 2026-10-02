@@ -282,8 +282,9 @@ def prompt_batch(rows=2):
     prompts[0] = [1, 2, 3, 4, 5, 6, 7, 1]
     prompts[1] = [2, 3, 4, 5, 6, 7, 1, 2]
     info = max(len("rule"), len("other"), 1)
-    pad = lambda text: np.pad(
-        np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+    def pad(text):
+        return np.pad(
+            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
     return {
         "prompt": prompts,
         "prompt_length": np.full(rows, width, np.int32),

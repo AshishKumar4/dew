@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def progress():
-    spec = importlib.util.spec_from_file_location("live_progress", ROOT / "site" / "live" / "container" / "progress.py")
+    spec = importlib.util.spec_from_file_location(
+        "live_progress", ROOT / "site" / "live" / "container" / "progress.py"
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module  # its dataclass resolves annotations through it
     spec.loader.exec_module(module)
@@ -37,13 +39,13 @@ def pipe(tmp_path_factory):
     return TextToImage.from_run(str(directory))
 
 
-@pytest.mark.parametrize("sampler", [None, DPMSolverMultistep()], ids=["task-default", "dpm-solver"])
-def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, monkeypatch, sampler):
+@pytest.mark.parametrize("solver", [None, DPMSolverMultistep()], ids=["task-default", "dpm-solver"])
+def test_reporting_samples_the_same_bits_and_reports_each_step(progress, pipe, monkeypatch, solver):
     reports = []
     monkeypatch.setattr(progress, "_show", lambda report, png=None: reports.append(report))
     steps = 4
-    expected = pipe(["a lily"], steps=steps, key=0, sampler=sampler).host().images
-    images = progress.Reporting(pipe)(["a lily"], steps=steps, key=0, sampler=sampler).host().images
+    expected = pipe(["a lily"], steps=steps, key=0, solver=solver).host().images
+    images = progress.Reporting(pipe)(["a lily"], steps=steps, key=0, solver=solver).host().images
     np.testing.assert_array_equal(images, expected)
     # A walk of `steps` points takes steps - 1 solver steps; the model's last call,
     # the clean prediction at the final point, runs with the decode.

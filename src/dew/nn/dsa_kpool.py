@@ -1,34 +1,26 @@
 """GLM-5.3-Flash's sparse attention: NoPE latent attention under a k-pool indexer.
 
 The reference is transformers 5.16.1 models/glm5_next/modeling_glm5_next.py
-(`Glm5NextTextAttention`, lines 1064-1256, and `Glm5NextTextIndexer`, lines
-736-1024), read as the specification. The attention is DeepSeek V3.2's
-(`dew.nn.mla`) with no rope head at all: the released config's
+(`Glm5NextTextAttention`, 1064-1256; `Glm5NextTextIndexer`, 736-1024). The
+attention is DeepSeek V3.2's (`dew.nn.mla`) with no rope head: the released
 `qk_rope_head_dim` is 0 and the reference refuses anything else
-(configuration_glm5_next.py:225-228), so the queries and keys are the
-`qk_nope_head_dim` latents alone, scaled by that width, and positions enter
-only through causality.
+(configuration_glm5_next.py:225-228), so positions enter only through
+causality.
 
-The indexer scores pools of `index_kpool` consecutive keys, not single keys.
-A pool's key is a softmax average of its members' indexer keys, weighted by
-learned gate scores plus a per-slot term. Each query picks
-`index_topk // index_kpool` pools and attends every token in them. With
-`index_kpool_always_select_tail`, the incomplete pool at the causal frontier
-rides along, so a query always sees its most recent keys. Pools count from a
-row's first real key, which makes a left-padded row pool like the same
-tokens unpadded. The selection is integer indices under
-`torch.no_grad` in the reference, so it is detached here as well: the main
-loss reaches none of the indexer's weights.
+The indexer scores pools of `index_kpool` consecutive keys, each pool's key a
+softmax average of its members' keys under learned gate scores plus a
+per-slot term. Each query attends every token of its top `index_topk //
+index_kpool` pools, plus the incomplete frontier pool with
+`index_kpool_always_select_tail`. Pools count from a row's first real key,
+so left padding pools like the unpadded tokens. The selection is detached,
+as the reference's `torch.no_grad` indices are.
 
-Decode caches the expanded keys and values and the indexer's packed state
-`[k | gate_scores | valid]` per slot, as the reference's indexed cache layers
-do, in the fixed-capacity cache MLA's sparse variant uses; unused slots carry
-a zero valid channel, which is what keeps their pools out of the candidates.
-
-Opted-in prediction caches also retain the complete selected token list and
-its physical origin. Extend publishes the last valid query; draft reuses it
-until replay publishes another. Ordinary steps recompute and invalidate it.
-An origin of -1 means no seed, distinct from a valid empty selection.
+Decode caches the expanded keys and values and the packed indexer state
+`[k | gate_scores | valid]` per slot in MLA's fixed-capacity sparse cache; a
+zero valid channel keeps unused slots out of the candidates. Opted-in
+prediction caches also keep the selected token list and its origin: extend
+publishes the last valid query's, draft reuses it, ordinary steps recompute
+and invalidate it, and an origin of -1 means no seed.
 """
 
 from __future__ import annotations
@@ -56,7 +48,7 @@ from .kv_cache import KVCache
 from .mixer_base import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
-from .sharding import RESIDUAL, constrain, down_projection, logical_axes
+from .sharding import RESIDUAL, constrain, down_projection
 from .sparse_selection import selection_mask
 
 
@@ -69,7 +61,6 @@ def _first_valid(valid, total: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
-@logical_axes({}, heuristic=(("index_kpool_compress_*",),))
 class KPoolIndexer(nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
@@ -218,27 +209,19 @@ class KPoolSparseAttention(nn.Module):
     """GLM-5.3-Flash's `deepseek_sparse_attention` layer
     (`Glm5NextTextAttention`, modeling_glm5_next.py:1064-1256).
 
-    Low-rank queries (`q_a_proj`, `q_a_layernorm`, `q_b_proj`) and a latent
-    the keys and values expand from (`kv_a_proj_with_mqa`, `kv_a_layernorm`,
-    `kv_b_proj`), with no rope head: the width the logits scale by is
-    `qk_nope_head_dim`. Each query attends the keys its `KPoolIndexer`
-    selects, through an fp32 softmax over the boolean mask the reference's
-    eager path builds; the indexer folds causality and row validity into the
-    selection, so nothing else masks. Row validity (`attention_metadata.valid`)
-    enters the indexer's valid channel and blanks the selection of an
-    invalid query (modeling_glm5_next.py:801, 875); the hidden states are
-    not zeroed, as the reference zeroes them for its linear layers only.
+    Low-rank queries (`q_a_proj`, `q_a_layernorm`, `q_b_proj`) and a latent the
+    keys and values expand from (`kv_a_proj_with_mqa`, `kv_a_layernorm`,
+    `kv_b_proj`), the logits scaled by `qk_nope_head_dim`. Each query attends its
+    `KPoolIndexer` selection through an fp32 softmax over the reference's eager
+    boolean mask; the indexer folds causality and row validity in, and an
+    invalid query's selection is blank (modeling_glm5_next.py:801, 875).
 
-    decode=True runs against a fixed-capacity cache of `max_seq_len` slots
-    of the expanded keys and values and the packed indexer state, the first
-    call writing the prompt and each later call appending its tokens, with
-    causality read off the cache slots. Packed documents have no reference
-    form (pools run over one row's consecutive keys) and are refused. The
-    latent norms are the model's RMSNorm at the model's epsilon
-    (modeling_glm5_next.py:1103, 1116) under its `scale_offset` and
-    `scale_after_cast`. `attention_impl` reaches the shared kernel path as
-    MLA's does; the selection is a materialized mask, so outside decode
-    'auto' and 'cudnn' run xla.
+    decode=True runs against a `max_seq_len`-slot cache of expanded keys,
+    values and packed indexer state, causality read off the slots. Packed
+    documents have no reference form and are refused. The latent norms are the
+    model's RMSNorm at its epsilon (modeling_glm5_next.py:1103, 1116). The
+    selection is a materialized mask, so outside decode 'auto' and 'cudnn' run
+    xla.
     """
 
     emb_features: int
@@ -403,16 +386,12 @@ class KPoolSparseAttention(nn.Module):
 @dataclasses.dataclass(frozen=True)
 class KPoolSparseAttentionMixer(MixerBase):
     """The `kpool_sparse_attention` kind, by GLM-5.3-Flash's config fields
-    (configuration_glm5_next.py:112-116, 134-136, 153-154).
-
-    The record has no `qk_rope_head_dim`: the layer is NoPE by construction,
-    as the reference requires (configuration_glm5_next.py:225-228), so a
-    config that names one is refused by the registry as an unknown field.
-    The latent norms take the model's `norm_eps`, which is where the
-    reference points them (modeling_glm5_next.py:1103, 1116). The context's
-    grouped-query geometry, rotary base and `qk_norm` are not read; the
-    dials a standard attention honours and this cannot are refused, as is a
-    sharing layer, since every released layer runs its own indexer.
+    (configuration_glm5_next.py:112-116, 134-136, 153-154). It has no
+    `qk_rope_head_dim` (NoPE by construction, :225-228), so a config naming one
+    is refused as an unknown field; the latent norms take the model's
+    `norm_eps`. The context's GQA geometry, rotary base and `qk_norm` are not
+    read, and sharing layers are refused: every released layer has its own
+    indexer.
     """
 
     q_lora_rank: int = 1536

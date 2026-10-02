@@ -23,11 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
-from dew.nn.vision import PIXEL_VALUES_KEY
 from dew.objectives.base import Variables
 
-# The conditioner depends on the separate encoders module, not this hub's
-# Condition and InputSpec, so the re-export needs no late cyclic import.
 from .diffusion import DiffusionConditioner
 from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
 
@@ -35,15 +32,6 @@ from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, re
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
-
-
-def pixel_field(height: int, width: int, channels: int = 3) -> Field:
-    """The batch field carrying one image per row for a vision tower.
-
-    It is float32 [channels, height, width], as the checkpoint's processor
-    emitted it, and rides beside the decoder's token field.
-    """
-    return Field(PIXEL_VALUES_KEY, (channels, height, width))
 
 
 @dataclass(frozen=True)
@@ -142,4 +130,4 @@ class InputSpec:
 
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
-           "HFAudio", "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]
+           "HFAudio", "InputSpec", "T5Text", "unit_range"]

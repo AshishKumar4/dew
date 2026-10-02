@@ -28,17 +28,18 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Dataset, Trainer, models
+from dew import Dataset, Trainer
 from dew.data import ByteTokenizer, Loading, PreferencePairs
 from dew.data.chat import Role
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
 from dew.sampling import Sampling
 
 tokenizer = ByteTokenizer()
-model = models.build("causal_transformer", vocab_size=tokenizer.vocab_size,
-                     emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
-                     max_seq_len=64)
+model = CausalTransformer(vocab_size=tokenizer.vocab_size,
+                          emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
+                          max_seq_len=64)
 base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 ```
 
@@ -199,8 +200,9 @@ import jax
 import numpy as np
 import optax
 
-from dew import Trainer, models
+from dew import Trainer
 from dew.data import Loading, PreferencePairs
+from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
 
 rows = [
@@ -214,8 +216,8 @@ spec = PreferencePairs(records=tuple(json.dumps(row) for row in rows * 4),
                        seq_len=row_width, pad_id=0,
                        loading=Loading(workers=0, threads=1, read_buffer=2))
 data = spec.load(batch=8)
-model = models.build("causal_transformer", vocab_size=8, emb_features=16, num_layers=1,
-                     num_heads=2, mlp_features=32, max_seq_len=row_width)
+model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                          num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 initial = trainer.initial_state()
@@ -246,7 +248,7 @@ SFT keeps no moving average unless `ema_decay` is set, as the language-model obj
 
 ## GRPO
 
-GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly through `tokenizer_for`, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
+GRPO needs a stream of prompts and a reward function before it can build a training batch. `Prompts(tokenizer, path=... or records=...)` accepts a Parquet file in the verl layout or JSON records with `prompt`, `data_source`, `ground_truth` and `extra_info`. The prompt can be token IDs, a string or a list of role and content messages. Strings encode directly, without added special tokens, so `tokenizer="byte"` uses Dew's UTF-8 vocabulary locally and any other name its Hugging Face tokenizer. Messages use the Hugging Face tokenizer's chat template, and `thinking` sets a reasoning template's `enable_thinking`. An optional `tools` column holds tool schemas, which are rendered into the prompt tokens. Missing reward fields become empty strings, and reward metadata that is not a string is passed along as JSON text.
 
 ```python
 import json
@@ -314,7 +316,7 @@ Generation prefills the padded batch once and packs the real tokens into each ro
 
 The input dataset yields integer `task_id` rows. Your environment factory receives an `EpisodeId` with the task, the attempted step, the sample index and a random seed, and returns an `Environment` to use as a context manager. Its `reset()` returns an `Observation` with the first context. `step(action)` takes a finished model turn and returns either the exact next context or a terminal result. The environment is responsible for decoding, validating tool calls, chat formatting, execution, timeouts and cleaning up resources. Dew itself never executes generated code by default.
 
-`SubprocessEnvironment(command, limits)` is one environment factory you can choose. It starts the argv `command` in its own session and temporary directory, and talks to it in JSON lines. `reset` carries the episode identity. `step` carries the action's context, tokens, termination flag and policy step. Replies carry `context`, `status` and `detail`. `SandboxLimits` sets RLIMIT_CPU and RLIMIT_AS in the worker, plus a wall-clock deadline per session and a message size cap in the parent. On exit, Dew kills the worker's process group, and the worker gets SIGKILL if the parent dies. The worker runs with the caller's OS permissions and has no filesystem or network isolation, so untrusted code needs an outer sandbox. `tests/test_sandbox.py` runs a real worker through round trips, a hang, an exceeded memory limit, a crash, malformed output, parent death and a full `EpisodeRollout` cohort.
+`SubprocessEnvironment(command, limits)`, in `dew.rl.sandbox`, is one environment factory you can choose. It starts the argv `command` in its own session and temporary directory, and talks to it in JSON lines. `reset` carries the episode identity. `step` carries the action's context, tokens, termination flag and policy step. Replies carry `context`, `status` and `detail`. `SandboxLimits` sets RLIMIT_CPU and RLIMIT_AS in the worker, plus a wall-clock deadline per session and a message size cap in the parent. On exit, Dew kills the worker's process group, and the worker gets SIGKILL if the parent dies. The worker runs with the caller's OS permissions and has no filesystem or network isolation, so untrusted code needs an outer sandbox. `tests/test_sandbox.py` runs a real worker through round trips, a hang, an exceeded memory limit, a crash, malformed output, parent death and a full `EpisodeRollout` cohort.
 
 `Observation.status` tells apart running, completed, truncated, cancelled and error outcomes. Model EOS ends an action, and the environment decides when the episode ends. A response that hits its token limit without EOS is recorded as truncated and is not sent to a tool. A context longer than `max_prompt_tokens` also truncates the episode, without cutting off the input already recorded. `max_turns` limits the number of model calls.
 
@@ -365,7 +367,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 - `VLLMGenerateServer(base_url, sampling, weights, routing=False)` posts to vLLM's token route, `/inference/v1/generate`, which returns the ids the sampler kept for every drawn token (`sampling_mask`) beside the filtered likelihoods, so a top-k or top-p policy trains on its recorded support. Start vLLM with `--enable-scale-out` (or `--tokens-only`), `--return-sampling-mask`, `--logprobs-mode processed_logprobs`, and `--enable-return-routed-experts` for `routing=True`. vLLM builds the mask only under a finite top-k, so the server refuses a `Sampling` without one.
 - `SafetensorsReload(pretrained, directory, engines, engine)` publishes a policy version to every replica in `engines` (their root URLs). It writes the policy once with `Pretrained.save` in bfloat16, stages the files beside `directory` and moves each in with `os.replace`, then runs the replica sequence on all replicas concurrently. Launch every replica on the same directory, initially written by `SafetensorsReload.write`. For `engine="vllm"` (checked against v0.30.0) it calls `POST /pause?mode=wait`, which lets in-flight requests finish and schedules no new ones, then `POST /collective_rpc {"method": "reload_weights"}`, `POST /reset_prefix_cache`, `POST /update_weight_version {"new_version": "v"}` and `POST /resume`. Those are vLLM development endpoints, enabled by `VLLM_SERVER_DEV_MODE=1`; expose them only on a trusted network. vLLM reports a reset that did not happen as HTTP 200 with `{"success": false}`, so the push fails unless the reset answers `{"success": true}`. A push that fails after the pause leaves vLLM paused, so no draw comes from weights the push may have half loaded; the next successful push resumes it. For `engine="sglang"` it makes one call, `POST /update_weights_from_disk {"model_path": directory, "flush_cache": true, "abort_all_requests": false, "weight_version": "v"}`. SGLang starts the load once every in-flight request has finished, holds new requests until it returns, and flushes the radix cache before answering. In-flight draws therefore finish on the old weights, and the push takes as long as the longest of them. A failed SGLang load answers 400 with `{"success": false}`, and the push fails on either, and SGLang then re-reads the same directory as its rollback. In both cases a failed push leaves the server's `version` where it was. `Publication(push, version=v0, stamp=gateway.stamp)` makes a push a versioned publisher: `load(variables, v)` runs the push and then the stamp, and moves `version` to `v` only when both succeed. The stamp goes to a recording gateway (`Gateway.stamp` posts rllm-model-gateway's `/admin/weight_version`), only after every replica serves `v`: the gateway stamps each call with its version when the request arrives, so a stamp ahead of any replica would claim weights a call was not sampled from, while a stamp behind them only overstates the call's lag. Construction stamps `v0`, the launch version, so a stamp an earlier run left behind never labels this run's calls. On a multi-process trainer every process calls the push: the pool gathers the tree to host memory (`collective_host`), process 0 writes and publishes, and all processes agree on the outcome, so a failed push raises everywhere.
 - `NCCLPush(pretrained, engines, library)` publishes to vLLM replicas without the disk. It sends the tensors `Pretrained.save` would write (`Pretrained.export`) from one trainer GPU into each replica's GPUs by NCCL broadcast, over a group the trainer opens with each replica on the first push: the trainer mints the NCCL unique id, posts it to `/init_weight_transfer_engine` and joins the group from ctypes, so the trainer needs no torch. `library` is the engine's own `libnccl.so.2` (for a pip-installed vLLM, `<venv>/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2`); NCCL refuses a peer of another version. Launch vLLM with `--weight-transfer-config '{"backend": "nccl"}'` and `VLLM_SERVER_DEV_MODE=1` (checked against v0.30.0). A push pauses each replica with `mode=wait`, runs `/start_weight_update`, `/update_weights` while it broadcasts, `/finish_weight_update`, a reset of the prefix cache that must answer success, and `/resume`. Every process of a multi-process trainer calls it. The pool gathers the policy to host memory leaf by leaf, as `SafetensorsReload` does, and the process holding the mesh's first device exports it and sends from that device, at most two `chunk`s (or two of its largest tensor) there at a time beside the trainer's state. `close` aborts the groups: NCCL's destroy would wait for the engine's side, which the engine keeps until it exits. Measured on 4x RTX 3090 (PCIe 3.0, one host) with a three-process trainer on GPUs 0 to 2 and vLLM on GPU 3, Qwen3-0.6B in bfloat16 (1.1 GiB): a push took 6.8 to 7.3 s (the gather 4.6 to 5.1 s, the export 1.2 s, the broadcast 0.9 s) and a `SafetensorsReload` 8.7 to 9.8 s. After either one, the engine's prompt log-probabilities for the same weights were identical. Pushing the launch weights back reproduced the engine's first answers exactly, and a policy with its `down_proj` halved moved them by up to 8.5 nats.
-- `HarborSource(Gateway(url, sandbox_url=...), harbor=..., model=..., trials=...)` in `dew.objectives.rl.harbor` (trained through by `examples/train_harbor.py`) runs each sample as one Harbor trial whose harness reaches the model through rllm-model-gateway at `/sessions/{session}/v1`, and reads the session's calls back from the gateway's traces. The gateway has no authentication, and the port that proxies model calls also serves every session's traces and its admin routes (`/admin/workers`, `/admin/weight_version`). Sandboxes run the policy's commands, so they must never reach that port: keep `url` on an interface only the trainer reaches, give the sandboxes a `sandbox_url` that is a reverse proxy forwarding only `POST /sessions/<session>/v1/chat/completions`, and restrict the task's agent phase to that proxy with Harbor's `network_mode = "allowlist"` (`allowed_hosts`, or `--allow-agent-host`). Harbor's allowlist filters hosts, not paths, so the proxy is what keeps the admin and trace routes out of reach.
+- `HarborSource(Gateway(url, sandbox_url=...), harbor=..., model=..., trials=...)` in `dew.interop.harbor` (trained through by `examples/train_harbor.py`) runs each sample as one Harbor trial whose harness reaches the model through rllm-model-gateway at `/sessions/{session}/v1`, and reads the session's calls back from the gateway's traces. The gateway has no authentication, and the port that proxies model calls also serves every session's traces and its admin routes (`/admin/workers`, `/admin/weight_version`). Sandboxes run the policy's commands, so they must never reach that port: keep `url` on an interface only the trainer reaches, give the sandboxes a `sandbox_url` that is a reverse proxy forwarding only `POST /sessions/<session>/v1/chat/completions`, and restrict the task's agent phase to that proxy with Harbor's `network_mode = "allowlist"` (`allowed_hosts`, or `--allow-agent-host`). Harbor's allowlist filters hosts, not paths, so the proxy is what keeps the admin and trace routes out of reach.
 - Dew does not start the gateway or its engines; it attaches to ones you run. Two things keep the gateway from turning a busy engine into failed trials. First, warm each engine before the gateway takes traffic: send one short chat request of each shape you will serve (with and without tools) straight to the engine. SGLang 0.5.20 spent 108 s compiling on its first chat request on an L4, and during that time its `/health` did not answer. Second, rllm-model-gateway (3b40c37) marks a worker dead after 3 failed health probes of 5 s each, and while no worker is healthy it answers every call with a plain-text 500 and records nothing. Only the probe interval can be configured, so set `health_check_interval` to make 3 × interval longer than the longest stall you expect. Sixty seconds covers the 108 s compile. `HarborSource` checks the gateway before its first submission (`Gateway.ready`): it waits up to `ready_timeout` seconds for `/health/workers` to report a healthy worker and for `GET /v1/models` to answer through the gateway. A worker that goes dead later in the run shows up as `INFRA_ERROR` sessions, which the scheduler retries. A gateway config for one engine on the trainer host:
 
   ```yaml
@@ -403,14 +405,14 @@ Two sources run on a `RolloutServer`. `PromptSource(server, reward, decode=..., 
 
 ### Sandbox fleet and verifiable rewards
 
-A `Program` is files written into a fresh temporary directory, an argv run there without a shell, and its stdin. `SandboxFleet(runner, limits=SandboxLimits(...), workers=N)` runs programs on `N` threads, each in its own process, and returns an `Outcome` per program: its `Verdict` (`COMPLETED`, `FAILED`, `TIMEOUT`, `CRASHED` or `OUTPUT_LIMIT`), exit code, captured output and seconds. A failed program returns an `Outcome` like any other.
+`dew.rl.sandbox` holds the program runners. A `Program` is files written into a fresh temporary directory, an argv run there without a shell, and its stdin. `SandboxFleet(runner, limits=SandboxLimits(...), workers=N)` runs programs on `N` threads, each in its own process, and returns an `Outcome` per program: its `Verdict` (`COMPLETED`, `FAILED`, `TIMEOUT`, `CRASHED` or `OUTPUT_LIMIT`), exit code, captured output and seconds. A failed program returns an `Outcome` like any other.
 
 - `ProcessRunner` starts the program through the `SubprocessEnvironment` launcher: RLIMIT_CPU, RLIMIT_AS, no core dumps, its own session, SIGKILL on parent death and a minimal environment. The process group is killed at the wall deadline, on excess output, and after exit. It keeps your user, filesystem and network, so a program can read and reach whatever you can.
 - `ContainerRunner(image, runtime="docker")` runs each program in a fresh container with no network, a read-only root, the job directory mounted read-only at `/work`, all capabilities dropped, `no-new-privileges`, an unprivileged user, and memory, CPU-share, process-count and CPU-time limits. The container is killed by name at the deadline. Use this runner for untrusted code.
 
-`CodeReward(fleet)` extracts the last fenced `python` block from a completion and runs it once per test case. The reward's ground truth is a JSON list of `{"stdin", "stdout"}` cases. The reward is the fraction of cases whose stdout matches line by line, or all-or-nothing with `all_or_nothing=True`. `MathReward()` reads the last `\boxed{}` answer and compares it with the reference as an exact rational, so `0.5`, `1/2` and `\frac{1}{2}` agree. Both have the `Reward` signature and work with `SampledRollout` and `PromptSource`. `PromptSource` scores each completion on a thread pool as its draw finishes, so verification overlaps generation and the update.
+A reward is a recipe's own `Reward` callable, `(data_source, completion, ground_truth, extra_info) -> float`, and works with `SampledRollout` and `PromptSource`. `examples/train_rlvr.py` defines `CodeReward(fleet)`, which extracts the last fenced `python` block from a completion and runs it once per test case: its ground truth is a JSON list of `{"stdin", "stdout"}` cases, and the reward is the fraction of cases whose stdout matches line by line (`outputs_match`), or all-or-nothing with `all_or_nothing=True`. `MathReward()` in `dew.rl.sandbox` reads the last `\boxed{}` answer and compares it with the reference as an exact rational, so `0.5`, `1/2` and `\frac{1}{2}` agree. `PromptSource` scores each completion on a thread pool as its draw finishes, so verification overlaps generation and the update.
 
-`tests/test_fleet.py` runs real programs through each verdict, including a forked child that must die at the timeout and, when Docker and `python:3.12-slim` are present, a container that must have no network and a read-only mount. `tests/test_rollout_scheduler.py` checks admission, retries, truncation masks, stragglers, the staleness bound, resume and a `Trainer` run through multi-turn environments on the native server. `tests/test_rollout_sources.py` checks both sources' statuses and cancellation. `tests/test_rollout_servers.py` checks the vLLM and SGLang requests and responses against each engine's wire format, the version of a draw in flight across a push, a safetensors reload read back by `load_pretrained`, and reloads refused on both engines, by status or by a 200 that says `success: false`.
+`tests/test_fleet.py` runs real programs through each verdict, including a forked child that must die at the timeout and, when Docker and `python:3.12-slim` are present, a container that must have no network and a read-only mount. `tests/test_rollout_scheduler.py` checks admission, retries, truncation masks, stragglers, the staleness bound, resume and a `Trainer` run through multi-turn environments on the native server. `tests/test_rollout_sources.py` checks both sources' statuses and cancellation. `tests/test_rollout_servers.py` checks the vLLM and SGLang requests and responses against each engine's wire format, the version of a draw in flight across a push, a safetensors reload read back by `Pretrained.load`, and reloads refused on both engines, by status or by a 200 that says `success: false`.
 
 ## Sessions and packed rows
 
@@ -506,14 +508,16 @@ import itertools
 import jax
 import numpy as np
 import optax
-from dew import Field, InputSpec, Trainer, models, presets
+from dew import Field, InputSpec, Trainer
 from dew.data import Dataset
+from dew.diffusion.presets import Flow
+from dew.nn.backbones import SimpleDiT
 from dew.objectives.rl import FlowGRPOObjective, FlowRollout
 
 inputs = InputSpec(Field("image", (4, 4, 1)))
-model = models.SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
-                         num_layers=1, num_heads=2, mlp_ratio=2)
-objective = FlowGRPOObjective(model, presets.Flow(), inputs,
+model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
+                  num_layers=1, num_heads=2, mlp_ratio=2)
+objective = FlowGRPOObjective(model, Flow(), inputs,
                               guidance=None, beta=0.01, steps=5)
 
 def brightness(images, batch):
@@ -531,7 +535,7 @@ This prints two committed updates. A conditioned run can supply the fields from 
 
 Callback scores stay float64 through collection, JSON and byte transfer between ranks, and the group statistics. The normalized training advantages are then cast to float32. The host rollout's `rewards` column keeps float64 values. The objective's `reward` metric is a float32 diagnostic, and with JAX x64 off, moving the reward column to the device also narrows it. Those diagnostics can round away differences that still affect learning. This differs on purpose from the [released SD3 trainer's float32 score conversion](https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/scripts/train_sd3.py#L695-L698). A callback that returns values already rounded to float32 cannot get the lost precision back.
 
-`steps` counts time points, including both endpoints. Here five points give four stochastic transitions, and `train_steps=2` picks the first two for the update. `train_steps=None` uses all transitions. The objective's own `steps` and `sampler` set up evaluation. The public `sample_trajectory` function returns a FlowTrajectory with states, times, joint log densities and marks for stochastic support. Deterministic intervals have no defined Gaussian density and never enter the policy loss.
+`steps` counts time points, including both endpoints. Here five points give four stochastic transitions, and `train_steps=2` picks the first two for the update. `train_steps=None` uses all transitions. The objective's own `steps` and `solver` set up evaluation. `FlowSDE.trajectory(denoise, x_T, steps, guidance=, key=)` returns a FlowTrajectory with states, times, joint log densities and marks for stochastic support. Deterministic intervals have no defined Gaussian density and never enter the policy loss.
 
 `FlowGRPOObjective` uses per-coordinate log-density ratios and averages the loss over the selected stochastic transitions. A positive `beta` freezes the starting policy in the EMA slot. A `beta` of zero keeps no reference. Evaluation and previews use the live policy. The KL metric is `transition_kl`, the per-coordinate conditional Gaussian KL from [section 4 of the paper](https://arxiv.org/html/2505.05470v5#S4), with the elapsed time included in the transition variance. The [released SD3 training script](https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/scripts/train_sd3.py#L897-L899) uses a time-reweighted regularizer, so its `beta` values do not carry over directly to this conditional KL.
 

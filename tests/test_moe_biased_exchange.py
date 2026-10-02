@@ -10,7 +10,7 @@ import optax
 import pytest
 
 from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
-from dew.training import Layout, MeshSpec, build_mesh
+from dew.training import Layout, MeshSpec
 
 
 @pytest.mark.mesh(devices=4)
@@ -21,7 +21,7 @@ def test_gpt_oss_experts_split_over_the_expert_axis_beside_fsdp():
     x = jnp.zeros((1, 4, 64))
     variables = jax.eval_shape(GptOssMLP(64, 128, 8, 2).init, jax.random.key(0), x)
     shardings = Layout(min_shard=1).shardings(
-        build_mesh(MeshSpec(expert=2, fsdp=2), jax.devices()[:4]), variables)
+        MeshSpec(expert=2, fsdp=2).build(jax.devices()[:4]), variables)
     for name, sharding in shardings['params']['experts'].items():
         shape = variables['params']['experts'][name].shape
         assert sharding.spec[0] == 'expert', name
@@ -43,7 +43,7 @@ def test_biased_exchange_keeps_every_selected_expert_and_requires_its_mesh():
     exchanged = GptOssExperts(8, 12, 4, dispatch='exchange')
     with pytest.raises(ValueError, match='expert mesh axis'):
         exchanged.apply(variables, x, weights, indices)
-    with jax.set_mesh(build_mesh(MeshSpec(expert=4))):
+    with jax.set_mesh(MeshSpec(expert=4).build()):
         actual = jax.jit(exchanged.apply)(variables, x, weights, indices)
     np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
 
@@ -70,7 +70,7 @@ def test_biased_exchange_preserves_all_gradients_and_idle_experts(dtype, expert,
         bias[0, :2] = [12, -12]
         variables['params']['gate_up_proj_bias'] = jnp.asarray(bias, master)
         variables['params']['down_proj_bias'] = jnp.asarray(rng.normal(size=(4, 8)), master)
-        mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+        mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
         specs = {'params': {
             'gate_up_proj': NamedSharding(mesh, P('expert', None, 'fsdp')),
             'gate_up_proj_bias': NamedSharding(mesh, P('expert', 'fsdp')),
@@ -83,7 +83,7 @@ def test_biased_exchange_preserves_all_gradients_and_idle_experts(dtype, expert,
         for dispatch in ('global', 'exchange'):
             layer = model.clone(dispatch=dispatch)
 
-            def loss(p, x, weights, indices):
+            def loss(p, x, weights, indices, *, layer=layer):
                 y = jnp.asarray(layer.apply(p, x, weights, indices))
                 work = y.astype(jnp.promote_types(y.dtype, jnp.float32))
                 return jnp.mean(jnp.sin(work)), y
@@ -137,11 +137,11 @@ def test_biased_exchange_padding_never_creates_an_expert_contribution(tokens):
     for dispatch in ('global', 'exchange'):
         layer = model.clone(dispatch=dispatch)
 
-        def loss(p, x, weights, indices):
+        def loss(p, x, weights, indices, *, layer=layer):
             output = jnp.asarray(layer.apply(p, x, weights, indices))
             return output.astype(jnp.float32).sum(), output
 
-        with jax.set_mesh(build_mesh(MeshSpec(expert=4))):
+        with jax.set_mesh(MeshSpec(expert=4).build()):
             results.append(jax.jit(jax.value_and_grad(loss, (0, 1, 2), has_aux=True))(
                 variables, x, weights, indices))
     for a, b in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
@@ -178,7 +178,7 @@ def test_biased_mlp_matches_transformers_outputs_and_every_parameter_gradient(sk
         y = jnp.asarray(model.apply({'params': parameters}, x))
         return jnp.mean(jnp.sin(y)), y
 
-    context = (jax.set_mesh(build_mesh(MeshSpec(expert=2, fsdp=4)))
+    context = (jax.set_mesh(MeshSpec(expert=2, fsdp=4).build())
                if dispatch == 'exchange' else contextlib.nullcontext())
     with context:
         (loss_value, output), (gradient, input_gradient) = jax.jit(
@@ -205,7 +205,7 @@ def test_decoder_mixture_can_select_biased_expert_exchange():
     variables = model.init(jax.random.key(19), tokens)
     expected = jnp.asarray(model.apply(variables, tokens))
     exchanged = model.clone(mixture=replace(mixture, dispatch='exchange'))
-    with jax.set_mesh(build_mesh(MeshSpec(expert=2, fsdp=4))):
+    with jax.set_mesh(MeshSpec(expert=2, fsdp=4).build()):
         actual = jax.jit(exchanged.apply)(variables, tokens)
     np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
 
@@ -245,7 +245,7 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
 
     arrays, parameters, _ = reference_case(skewed)
     model = GptOssMLP(8, 12, 4, 2, dtype=dtype)
-    mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+    mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     specs = training_shardings(mesh)
     # Rows over every batch axis, as a decoder's residual stream holds them:
     # a bf16 router's bias gradient sums its rows in bf16 per device.
@@ -319,7 +319,7 @@ def test_biased_router_and_bias_parameters_keep_forward_mode(dtype, skewed):
         direction = jax.tree.map(lambda value: jnp.asarray(rng.normal(scale=.02, size=value.shape),
                                                           value.dtype), parameters)
         input_direction = jnp.asarray(rng.normal(scale=.02, size=x.shape), dtype)
-        mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
+        mesh = MeshSpec(expert=4, fsdp=2).build()
         specs, tokens = training_shardings(mesh), NamedSharding(mesh, P(('expert', 'fsdp')))
         parameters, direction = (jax.device_put(value, specs) for value in (parameters, direction))
         x, input_direction = (jax.device_put(value, tokens) for value in (x, input_direction))
@@ -327,8 +327,8 @@ def test_biased_router_and_bias_parameters_keep_forward_mode(dtype, skewed):
         for dispatch in ('global', 'exchange'):
             layer = model.clone(dispatch=dispatch)
 
-            def run(parameters, x, direction, input_direction):
-                def forward(parameters, x):
+            def run(parameters, x, direction, input_direction, *, layer=layer):
+                def forward(parameters, x, *, layer=layer):
                     return jnp.asarray(layer.apply({'params': parameters}, x))
                 return jax.jvp(forward, (parameters, x), (direction, input_direction))
 

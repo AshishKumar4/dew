@@ -2,8 +2,8 @@
 """The Dew side of a language-model reference run.
 
 The same windows in the same order as `torch_lm.py`, through the trainer's
-own compiled step: `LMObjective` over the checkpoint `load_pretrained`
-reads (fp32 masters, `--dtype` compute), the solver `build_optimizer` makes
+own compiled step: `LMObjective` over the checkpoint `Pretrained.load`
+reads (fp32 masters, `--dtype` compute), the solver `OptimConfig.build` makes
 from an `OptimConfig` (global-norm clip, then AdamW on the cosine schedule),
 and the mesh `MeshSpec` describes. One transformation is chained in front of
 that solver, `recorded_norm`, which keeps the global norm of the gradient it
@@ -130,12 +130,12 @@ def build(args: argparse.Namespace) -> Run:
         jax.config.update("jax_default_matmul_precision", "highest")
 
     from dew.config import OptimConfig
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
-    from dew.training.optim import Cosine, build_optimizer
+    from dew.training.optim import Cosine
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -144,7 +144,7 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
-    pretrained = load_pretrained(args.model, dtype=args.dtype, param_dtype="float32",
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention)
     model = pretrained.model
     if args.dispatch is not None:
@@ -155,9 +155,9 @@ def build(args: argparse.Namespace) -> Run:
                             pretrained=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
-    solver = build_optimizer(OptimConfig(
+    solver = OptimConfig(
         optimizer="adamw", optimizer_opts={"b1": args.b1, "b2": args.b2, "eps": args.eps},
-        schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip), schedule_steps)
+        schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     layout = Layout() if args.tolerance is None else Layout(tolerance=args.tolerance)
@@ -277,7 +277,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps, "seq": run.seq,
                    "data_sha256": sha256(args.data), "model_type": hf_config["model_type"],
                    "mesh": dict(run.trainer.device_mesh.shape),
-                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) via build_optimizer",
+                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) via OptimConfig.build",
                    "schedule": "dew.training.optim.Cosine", "ema": None,
                    "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
                                     if isinstance(v, (int, float, str, bool, type(None)))}},

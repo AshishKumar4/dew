@@ -19,7 +19,7 @@ from scipy.special import erfc
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
-from dew.training import MeshSpec, build_mesh
+from dew.training import MeshSpec
 
 # The multi-device layouts need the eight simulated CPU devices conftest
 # configures; a 1x1 mesh runs on the GPU lane's single device, where the
@@ -118,7 +118,7 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
         projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
         return jnp.sum(projected.astype(jnp.float32) * dy), projected
 
-    mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+    mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     kernels, inputs, outputs = shardings(mesh, rows)
     replicated = NamedSharding(mesh, P())
     arrays = (jnp.asarray(kernel, master), jnp.asarray(x, input_dtype), jnp.asarray(dy), jnp.asarray(sizes))
@@ -275,7 +275,7 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
                 jax.jvp(jax.grad(scalar, (0, 1)), (x, kernel), (dx, dkernel))[1],
                 jax.grad(directional, (0, 1))(x, kernel))
 
-    mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+    mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     kernels, inputs, outputs = shardings(mesh, rows)
     specs = (inputs, kernels, inputs, kernels, outputs, NamedSharding(mesh, P()))
     arguments = tuple(jax.device_put(jnp.asarray(value), spec) for value, spec in zip(
@@ -425,7 +425,7 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
     1.5e-8 random and 6e-8 skewed. 'pallas' runs its kernels (interpreted on
     a CPU) on every device's own rows, the exchange included on a mesh whose
     only split axis is the expert one."""
-    mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+    mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
         mesh, activation, skewed, scale_inputs, limit, implementation)
     optimizer = optax.adam(1e-3)
@@ -437,7 +437,7 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def objective(parameters, x, weights, choices):
+        def objective(parameters, x, weights, choices, *, network=network):
             y = jnp.asarray(network.apply(parameters, x, weights, choices))
             return jnp.mean(jnp.sin(y.astype(jnp.float32))), y
 
@@ -457,7 +457,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
         trajectories.append(trajectory)
     for first, second in zip(*trajectories, strict=True):
         for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
-            np.testing.assert_allclose(np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE)
+            np.testing.assert_allclose(
+                np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE
+            )
 
 
 @pytest.mark.mesh
@@ -465,9 +467,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
 def test_both_dispatches_carry_the_same_tangents(activation):
     """A JVP through the whole routed layer, parameters, tokens and router
     weights all perturbed, agrees exactly between the dispatches."""
-    mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
+    mesh = MeshSpec(expert=4, fsdp=2).build()
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, False, False, None)
+        mesh, activation, skewed=False, scale_inputs=False, limit=None)
     rng = np.random.default_rng(523)
     dp = jax.device_put(jax.tree.map(
         lambda value: jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype), parameters), specs)
@@ -477,8 +479,8 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     for dispatch in ('global', 'exchange'):
         network = model.clone(dispatch=dispatch)
 
-        def run(parameters, x, weights, dp, dx, dw, choices):
-            return jax.jvp(lambda parameters, x, weights: jnp.asarray(
+        def run(parameters, x, weights, dp, dx, dw, choices, *, network=network):
+            return jax.jvp(lambda parameters, x, weights, network=network: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
 
         with jax.set_mesh(mesh):
@@ -520,7 +522,7 @@ def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
     x, kernel, dy = exchange_residue_case()
     expected = (rounded(x @ kernel[0]), rounded(np.einsum('ti,to->io', x, dy)),
                 rounded(dy @ kernel[0].T))
-    mesh = build_mesh(spec, jax.devices()[:4])
+    mesh = spec.build(jax.devices()[:4])
     rows = NamedSharding(mesh, P(tuple(axis for axis in ('data', 'expert', 'fsdp')
                                        if mesh.shape[axis] > 1)))
 
@@ -572,7 +574,7 @@ def test_rows_past_the_groups_stay_zero_where_the_ragged_dot_writes_them(monkeyp
     def project(x, kernel):
         if implementation == 'xla':
             return jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
-        return grouped_projection(x, kernel, sizes, jnp.bfloat16, False)
+        return grouped_projection(x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False)
 
     y, pullback = jax.vjp(project, x, kernel)
     dx, _ = pullback(jnp.ones_like(y))
@@ -593,8 +595,10 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
     kernel = jnp.ones((8, 16, 16), jnp.float32)
     sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
     projections = {
-        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
-        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, False),
+        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, "xla", None),
+        "pallas-fallback": lambda x, kernel: grouped_projection(
+            x, kernel, sizes, jnp.bfloat16, interpret_on_cpu=False
+        ),
     }
     for name, project in projections.items():
         def loss(x, kernel, project=project):
@@ -603,7 +607,7 @@ def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
             program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, kernel)
         refused = []
 
-        def walk(jaxpr):
+        def walk(jaxpr, *, refused=refused):
             for equation in jaxpr.eqns:
                 if equation.primitive.name.startswith("ragged_dot"):
                     kinds = {jnp.dtype(v.aval.dtype) for v in equation.invars[:2]}

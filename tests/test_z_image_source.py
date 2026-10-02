@@ -103,7 +103,9 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     probe = nhwc(arrays[f"{name}.probe"])
 
     def objective(params, latents, context):
-        return jnp.sum(model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe)
+        return jnp.sum(
+            model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe
+        )
 
     flow = model.apply({"params": params}, latents, time, DenoisingCondition(jnp.asarray(context), mask=mask))
     gaps = {"forward": relative_gap(-flow, nhwc(arrays[f"{name}.output"]))}
@@ -111,7 +113,9 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
                                                                                      jnp.asarray(context))
     gaps["latents"] = relative_gap(-grad_latents, nhwc(arrays[f"{name}.grad_latents"]))
     for row, length in enumerate(record["cases"][name]["lengths"]):
-        gaps[f"prompt {row}"] = relative_gap(-grad_context[row, :length], arrays[f"{name}.grad_caption.{row}"])
+        gaps[f"prompt {row}"] = relative_gap(
+            -grad_context[row, :length], arrays[f"{name}.grad_caption.{row}"]
+        )
         assert not np.asarray(grad_context[row, length:]).any()
     for layout in layouts:
         key = f"{name}.grad_param.{layout.name.removeprefix('transformer/')}"
@@ -136,9 +140,9 @@ def test_an_unsupported_config_is_refused(source, change):
 
 @pytest.fixture(scope="module")
 def pipeline(source):
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
 
-    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
@@ -157,7 +161,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, arrays, record):
 
 
 def test_pipeline_walk_matches_the_source(pipeline, arrays, record):
-    """`load_pretrained().text_to_image()` reproduces the source's call: its
+    """`Pretrained.load().text_to_image()` reproduces the source's call: its
     50 default steps guided at 5.0 its way, which is Dew's 6.0, and at the
     recorded step count the latent it ends on and the image it decodes."""
     recorded = record["pipeline"]

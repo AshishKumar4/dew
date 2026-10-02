@@ -3,7 +3,8 @@
 import dataclasses
 import json
 import os
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,7 @@ from dew.training import Layout, MeshSpec
 def test_to_dict_and_from_dict_round_trip_a_run():
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
-        data=datasets["oxford_flowers102"](image_size=64),
+        data=datasets["tfds_images"](image_size=64),
         optim=OptimConfig(optimizer="muon", learning_rate=1e-3, weight_decay=0.1),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
@@ -40,7 +41,8 @@ def test_a_tuple_field_comes_back_a_tuple_from_a_record():
     """JSON has no tuple, so a record holds a list where the class declares
     one. The class gets its tuple back: with a list in its place the loaded
     config compares unequal to the saved one and its spec is unhashable."""
-    config = RunConfig(data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1))
+    config = RunConfig(data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+                       trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
     assert loaded == config
@@ -182,14 +184,14 @@ def test_a_model_config_that_carries_a_precision_setting_the_run_names_is_refuse
     """The run owns these fields, so a --model.config that carries one names
     it twice and is refused with the flag that sets it."""
     fields = {"vocab_size": 64, "precision": "highest"}
-    with pytest.raises(ValueError, match="--model.matmul-precision"):
+    with pytest.raises(ValueError, match=r"--model.matmul-precision"):
         ModelConfig("causal_transformer", fields, matmul_precision="high").fields()
     # Unset, the run claims nothing and the config keeps its own precision.
     assert ModelConfig("causal_transformer", fields).fields()["precision"] == "highest"
 
 
 def test_a_model_config_that_names_the_precision_twice_is_refused():
-    with pytest.raises(ValueError, match="--model.dtype"):
+    with pytest.raises(ValueError, match=r"--model.dtype"):
         ModelConfig("simple_dit", {"dtype": "float32"}).fields()
 
 
@@ -212,7 +214,7 @@ def test_the_run_length_is_steps_or_epochs():
     assert TrainerConfig(epochs=4).total_steps(Sized()) == 100
     with pytest.raises(ValueError, match="record count"):
         TrainerConfig(epochs=4).total_steps(Streamed())
-    with pytest.raises(ValueError, match="--trainer.steps or --trainer.epochs"):
+    with pytest.raises(ValueError, match=r"--trainer.steps or --trainer.epochs"):
         TrainerConfig().total_steps(Sized())
 
 
@@ -278,14 +280,14 @@ def test_a_multi_union_leaves_the_selected_opaque_record_for_its_consumer():
 
 @dataclasses.dataclass(frozen=True)
 class Kind:
-    window: Optional[int] = None
+    window: int | None = None
     rope_theta: float = 10_000.0
 
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
     width: int = 8
-    mix: Optional[Kind] = None
+    mix: Kind | None = None
     kinds: Mapping[str, Kind] = dataclasses.field(default_factory=dict)
     layers: tuple[Kind, ...] = ()
     size: tuple[int, int] = (1, 1)
@@ -366,6 +368,30 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Experiment_Name: batch" in output
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
+
+
+@pytest.mark.mesh(devices=2)
+def test_train_runs_the_trainer_its_config_describes(tmp_path):
+    """Every field a trainer holds, off its default, shows in the run `train`
+    makes of it: the parameters split over fsdp, a dynamic loss scale, an
+    accumulator for two microbatches and the profiler window's trace."""
+    import jax
+
+    from dew.training import ProfileWindow
+
+    trace = tmp_path / "trace"
+    config = TrainerConfig(
+        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, batch_size=8, accumulation=2,
+        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
+
+    state = RunConfig(trainer=config).train(Regression(), Dataset(lambda partition: batches(), None, None, 8),
+                                            name="built")
+
+    assert any(not leaf.sharding.is_fully_replicated for leaf in jax.tree.leaves(state.variables))
+    assert state.scale is not None
+    assert state.accumulation is not None
+    assert any(path.is_file() for path in trace.rglob("*"))
 
 
 def test_a_pass_over_the_data_needs_a_record_count():
@@ -466,7 +492,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
         vision: dict[str, object] = dataclasses.field(default_factory=lambda: {
             "tower": SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1,
                                    num_heads=1, image_size=2, patch_size=1),
-            "projector": GemmaProjector(vision_width=4, text_width=2,
+            "projector": GemmaProjector(text_width=2,
                                          patches_per_side=2, tokens_per_side=1),
         })
 
@@ -532,11 +558,12 @@ class Spec(Base):
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     """A run's record reads back the schedule it names, its tail and the muP
     groups included."""
-    from dew.training.optim import Power, PowerTail, mup_param_groups
+    from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1),
+        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
-                          param_groups=mup_param_groups(4.0)))
+                          param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config

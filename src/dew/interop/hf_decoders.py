@@ -4,9 +4,9 @@ translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 helpers around them fetch a repo (or read a local directory) and read the
 safetensors shards in their stored dtype without torch. Parameter binding
-defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
+defaults to FP32, independently of compute dtype, so dew.interop.Pretrained.load
 builds a model whose variables a forward pass takes straight away, and
-save_pretrained_decoder writes one back out in the HF layout.
+`PretrainedDecoder.from_model(...).save` writes one back out in the HF layout.
 
 Each family is one `DecoderFamily` entry in `decoder_families.ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
@@ -28,17 +28,19 @@ import os
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from flax.traverse_util import flatten_dict
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors
+from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
@@ -278,7 +280,6 @@ class MixtureFields(TypedDict, total=False):
     experts: int
     top_k: int
     layers: tuple[int, ...] | None
-    every: int | None
     score_function: str
     norm_topk_prob: bool
     scaling: float
@@ -408,7 +409,6 @@ class DecoderFields(TypedDict, total=False):
     causal: bool
     per_layer_input_dim: int | None
     per_layer_input_vocab: int | None
-    num_kv_shared_layers: int
     kv_shared_layers: tuple[int, ...] | None
     mixer: Mapping[str, object] | MixerBase | None
     """The mixer as its registry record, or as the built value a family
@@ -1028,7 +1028,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_llama4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
@@ -1068,7 +1068,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
         projector = vision_nn.translate_gemma4_projector_config(
-            {"hidden_size": encoder.output_proj_dims, "rms_norm_eps": encoder.rms_norm_eps}, text_width)
+            {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
@@ -1118,7 +1118,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
-        tower, records.integer(text.get("emb_features"), "emb_features"))
+        hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
@@ -1767,6 +1767,11 @@ class NamedTokenizer(Protocol):
     name: str
 
 
+GENERATION_DEFAULTS: Mapping[str, object] = MappingProxyType({"do_sample": True, "use_cache": True})
+"""The generation_config.json an export writes when nothing names one: sampling
+with the KV cache, which is what transformers' generate reads by default."""
+
+
 def save_export_assets(
     directory,
     *,
@@ -1780,11 +1785,7 @@ def save_export_assets(
     A name is resolved through `tokenizer_for` from local files only and recorded under
     `tokenizer_name`, which is the whole record for the byte vocabulary.
     """
-    values: dict[str, object] = (
-        {"do_sample": True, "use_cache": True}
-        if generation_config is None
-        else dict(generation_config)
-    )
+    values = dict(GENERATION_DEFAULTS if generation_config is None else generation_config)
     name: str | None = None
     writer: ExportTokenizer | None = None
     if isinstance(tokenizer, str):
@@ -1807,39 +1808,7 @@ def save_export_assets(
         json.dump(values, handle, indent=2)
 
 
-def save_pretrained_decoder(model, variables, directory, *,
-                            tokenizer: str | ExportTokenizer | None = None,
-                            generation_config: Mapping[str, object] | None = None,
-                            max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-    """Write a decoder back out in the HF layout: config.json and its weights,
-    in shards of at most `max_shard_size` with their index once they exceed it.
-
-    Derive the config from native computation and encode all variable
-    collections through the matching family. Source-bound exports instead
-    retain their source layout in Pretrained.save. Gemma4 writes frozen or
-    trainable layer-scalar values into HF buffers; reloading that layout
-    preserves computation, not the native scalar training policy.
-
-    `tokenizer` is the vocabulary the weights were trained against, by object
-    or by name; `save_export_assets` writes its files beside them, so one call
-    leaves a directory `load_pretrained` reads back with its processor.
-    `Pretrained.save` writes a decoder's weights through the same encoder
-    (`Pretrained.export`), so the two leave the same weights behind.
-    """
-    from dew.interop.safetensors_io import save_hf_layout
-
-    if not isinstance(model, CausalTransformer):
-        raise ValueError(
-            f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    config = _export_config(model)
-    _refuse_lossy_export(model, config)
-    hf_tensors = export_decoder_weights(model, variables, config)
-
-    save_hf_layout(hf_tensors, config, directory, max_shard_size)
-    save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
-
-
-def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+def export_decoder_weights(model: nn.Module, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Encode whole native variables as canonical model.* / lm_head.* tensors.
 
@@ -1872,7 +1841,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'per-layer input embeddings, KV sharing and the values norm have '
             'no counterpart in this dense tensor encoder: per_layer_input_dim, '
-            'num_kv_shared_layers, kv_shared_layers or v_norm is set')
+            'kv_shared_layers or v_norm is set')
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
     if (model.output_gate or model.partial_rotary_factor is not None
             or any(mixer is not None and not isinstance(mixer, AttentionMixer) for mixer in mixers)):
@@ -2146,7 +2115,7 @@ class DecoderFamily:
     prepare_weights: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
     split their fused expert kernels. A quantized format is undone before this,
-    by `load_pretrained`, which records what it undid for the export."""
+    by `Pretrained.load`, which records what it undid for the export."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""

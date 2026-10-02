@@ -1,17 +1,11 @@
 """EDM2's magnitude-preserving U-Net (Karras et al. 2024, Figure 21).
 
-The network of NVlabs/edm2's `training/networks_edm2.py`, `UNet`, in Flax's
-channels-last layout, built from `dew.nn.mp`: every convolution and dense
-layer is an `MPConv`, the embedding is `MPFourier` features of the model
-time, residual and attention branches join the main path through `mp_sum`
-and skips through `mp_cat`, and nothing holds a bias or a normalization
-layer's gain. Train it under the `edm` preset, whose preconditioning and
-c_noise are EDM2's `Precond`, with `OptimConfig.forced_weight_normalization`.
-
-Where the reference embeds a one-hot class label, this model embeds a text
-condition: the mask-weighted mean of the `textcontext` states at unit
-magnitude, as the reference's one-hot times the square root of its width
-is, through the same dense layer.
+NVlabs/edm2's `training/networks_edm2.py` `UNet`, channels last, from
+`dew.nn.mp`: every convolution and dense layer an `MPConv`, `MPFourier` time
+features, `mp_sum` branches and `mp_cat` skips, no biases or gains. Train it
+under the `edm` preset with `OptimConfig.forced_weight_normalization`. In
+place of the one-hot class label it embeds the mask-weighted mean of the
+`textcontext` states at unit magnitude through the same dense layer.
 """
 
 from __future__ import annotations

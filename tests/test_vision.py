@@ -29,6 +29,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   (norm, block grouping, exact GELU) on the reference trunk output.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -119,9 +120,7 @@ def test_llama4_projector_matches_the_reference_implementation():
     """fp32 parity on the tiny outer projector over the reference trunk
     output."""
     fixture = load_fixture("llama4-vision-tiny")
-    trunk = V.translate_llama4_vision_config(fixture["config"])
-    record = V.translate_llama4_projector_config(
-        trunk, fixture["projector"]["text_width"])
+    record = V.translate_llama4_projector_config(fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_llama4_projector_weights(
         fixture["projector_tensors"])}
@@ -229,12 +228,13 @@ def test_gemma4_widened_head_computes_the_reference_features():
 
     fixture = load_fixture('gemma4-vision-wide-tiny')
     record = V.translate_gemma4_vision_config(fixture['config'])
-    tower = towers.from_record(record).build()
+    vision = towers.from_record(record)
+    tower = vision.build()
     variables = V.translate_gemma4_vision_weights(fixture['tensors'])
     positions = np.load(FIXTURES / 'gemma4-vision-wide-tiny' / 'positions.npy')
     actual = np.asarray(tower.apply(variables, fixture['pixels'], positions))
     np.testing.assert_allclose(actual, fixture['tower_ref'], atol=1e-4, rtol=0)
-    wrong = tower.clone(head_dim=None)
+    wrong = dataclasses.replace(vision, head_dim=None).build()
     with pytest.raises(ScopeParamShapeError):
         wrong.apply(variables, fixture['pixels'], positions)
 
@@ -263,9 +263,8 @@ def test_qwen35_projector_matches_the_reference_implementation():
     output, and the merger is live: with its first map zeroed the soft
     tokens leave the reference by more than 10.0."""
     fixture = load_fixture("qwen35-vision-tiny")
-    trunk = V.translate_qwen35_vision_config(fixture["config"])
     record = V.translate_qwen35_projector_config(
-        trunk, fixture["projector"]["text_width"])
+        fixture["config"], fixture["projector"]["text_width"])
     projector = projectors.from_record(record).build()
     variables = {"params": V.translate_qwen35_projector_weights(
         fixture["projector_tensors"])}
@@ -311,10 +310,9 @@ def test_a_qwen35_field_with_no_counterpart_is_refused(field, value, message):
 def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
     """The merger output enters the text embeddings directly, so a width
     beside the decoder's refuses with both."""
-    trunk = V.translate_qwen35_vision_config(json.loads(
-        (FIXTURES / "qwen35-vision-tiny" / "config.json").read_text()))
+    config = json.loads((FIXTURES / "qwen35-vision-tiny" / "config.json").read_text())
     with pytest.raises(ValueError, match="out_hidden_size"):
-        V.translate_qwen35_projector_config(trunk, 32)
+        V.translate_qwen35_projector_config(config, 32)
 
 
 def test_gemma4_clipping_matches_reference_forward_and_backward():
@@ -336,6 +334,8 @@ def test_gemma4_clipping_matches_reference_forward_and_backward():
     weights, pixels = jax.grad(lambda weight, x: value(weight, x).sum(), argnums=(0, 1))(kernel, inputs)
     np.testing.assert_allclose(pixels, [[0, -0.1, 0]], atol=1e-7, rtol=0)
     np.testing.assert_allclose(weights, [[0, -1], [0, 0.4], [0, 1]], atol=1e-7, rtol=0)
-    unclipped = jnp.asarray(linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs))
+    unclipped = jnp.asarray(
+        linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs)
+    )
     assert np.max(np.abs(unclipped - value(kernel, inputs))) > 0.25
 

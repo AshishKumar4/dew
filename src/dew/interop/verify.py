@@ -64,7 +64,7 @@ _WINDOW = 4
 # plain floats.
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders._CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
-_FALLBACK = 'load_pretrained(..., fallback="torchax")'
+_FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # fp32 rounding between Dew and transformers on a registered family, in eps
 # per layer per unit of the largest reference logit. The thirteen dense and
 # routed tier-1 tiny fixtures (tests/fixtures/hf, written by

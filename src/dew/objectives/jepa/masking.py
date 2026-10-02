@@ -19,6 +19,8 @@ PatchSequenceEmbed produces, and come out sorted so that an SSM mixer scans
 them in a meaningful order.
 """
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 
@@ -46,6 +48,38 @@ class MultiBlockMask:
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
     num_context: int
+
+    @classmethod
+    def for_grid(cls, grid: tuple[int, int], num_targets: int = 4,
+                 scale: tuple[float, float] = (0.15, 0.2),
+                 aspect: tuple[float, float] = (0.75, 1.5)) -> MultiBlockMask:
+        """Resolve the I-JEPA mask geometry for a patch grid."""
+        S = grid[0] * grid[1]
+        candidates = [
+            (area, _factorizations(area, grid, aspect))
+            for area in range(max(1, math.ceil(scale[0] * S)), math.floor(scale[1] * S) + 1)
+        ]
+        candidates = [(area, shapes) for area, shapes in candidates if shapes]
+        if not candidates:
+            raise ValueError(
+                f"No block of scale {scale} on a {grid} grid has an aspect ratio in "
+                f"{aspect}; widen one of the ranges or use a finer patch grid.")
+
+        midpoint = 0.5 * (scale[0] + scale[1]) * S
+        area, shapes = min(candidates, key=lambda c: (-len(c[1]), abs(c[0] - midpoint)))
+
+        num_context = S - num_targets * area
+        if num_context <= 0:
+            raise ValueError(
+                f"{num_targets} target blocks of {area} tokens leave no context on a "
+                f"{grid} grid ({S} tokens).")
+
+        return cls(
+            grid=grid,
+            num_targets=num_targets,
+            block_shapes=tuple(shapes),
+            num_context=num_context,
+        )
 
     @property
     def num_patches(self) -> int:
@@ -86,38 +120,3 @@ class MultiBlockMask:
         order = jax.random.uniform(context_key, (batch_size, S)) + is_target
         context_idx = jnp.sort(jnp.argsort(order, axis=1)[:, :self.num_context], axis=1)
         return context_idx, target_idx
-
-
-def multi_block_mask(
-    grid: tuple[int, int],
-    num_targets: int = 4,
-    scale: tuple[float, float] = (0.15, 0.2),
-    aspect: tuple[float, float] = (0.75, 1.5),
-) -> MultiBlockMask:
-    """Resolve the I-JEPA mask geometry for a patch grid."""
-    S = grid[0] * grid[1]
-    candidates = [
-        (area, _factorizations(area, grid, aspect))
-        for area in range(max(1, math.ceil(scale[0] * S)), math.floor(scale[1] * S) + 1)
-    ]
-    candidates = [(area, shapes) for area, shapes in candidates if shapes]
-    if not candidates:
-        raise ValueError(
-            f"No block of scale {scale} on a {grid} grid has an aspect ratio in "
-            f"{aspect}; widen one of the ranges or use a finer patch grid.")
-
-    midpoint = 0.5 * (scale[0] + scale[1]) * S
-    area, shapes = min(candidates, key=lambda c: (-len(c[1]), abs(c[0] - midpoint)))
-
-    num_context = S - num_targets * area
-    if num_context <= 0:
-        raise ValueError(
-            f"{num_targets} target blocks of {area} tokens leave no context on a "
-            f"{grid} grid ({S} tokens).")
-
-    return MultiBlockMask(
-        grid=grid,
-        num_targets=num_targets,
-        block_shapes=tuple(shapes),
-        num_context=num_context,
-    )

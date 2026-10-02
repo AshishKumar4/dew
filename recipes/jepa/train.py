@@ -16,8 +16,8 @@ import tyro
 from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
-from dew.objectives.jepa import JepaObjective, multi_block_mask
-from dew.registry import datasets, metrics, models
+from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlockMask
+from dew.registry import datasets
 from dew.training import TrainState, prepare_process, run_timestamp
 
 DEFAULT_ENCODER_CONFIG = {"precision": "default"}
@@ -75,8 +75,7 @@ def sample_field(config: JepaRunConfig) -> Field:
 
 def build_encoder(config: JepaRunConfig):
     """The encoder, and the fields the registry built it from."""
-    fields = config.model.fields()
-    return models.build(config.model.architecture, **fields), fields
+    return config.model.build(), config.model.fields()
 
 
 def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object], encoder, grid,
@@ -89,9 +88,9 @@ def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object],
         "factorized": is_video,
         "scan_order": encoder.scan_order,
     }
-    fields = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
-                         attention_impl=config.model.attention_impl).fields()
-    return models.build('jepa_predictor', **fields), fields
+    record = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
+                         attention_impl=config.model.attention_impl)
+    return record.build(), record.fields()
 
 
 def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> dict:
@@ -125,7 +124,7 @@ def main(config: JepaRunConfig) -> TrainState:
     predictor, predictor_fields = build_predictor(
         config, encoder_fields, encoder, grid, is_video)
 
-    mask = multi_block_mask(
+    mask = MultiBlockMask.for_grid(
         grid,
         num_targets=config.num_target_blocks,
         scale=config.target_scale,
@@ -146,8 +145,7 @@ def main(config: JepaRunConfig) -> TrainState:
 
     probes = ()
     if config.probe_classes:
-        probes = (metrics.linear_probe(config.probe_classes),
-                  metrics.knn_probe(config.probe_classes, k=config.knn_k))
+        probes = (LinearProbe(config.probe_classes), KnnProbe(config.probe_classes, k=config.knn_k))
 
     name = config.trainer.name or (
         f"jepa-{datasets.name_of(type(config.data))}/res-{sample.shape[-2]}/"

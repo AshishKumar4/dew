@@ -8,10 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew import models
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import models
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
@@ -45,7 +45,7 @@ def test_gpt2_same_weight_logits_and_cached_generation():
     these paths a numerical failure.
     """
     directory = FIXTURES / 'gpt2-tiny'
-    loaded = load_pretrained(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     model = loaded.model.clone(precision=jax.lax.Precision.HIGHEST)
     ids = np.load(directory / 'input_ids.npy')
     expected = np.load(directory / 'logits.npy')
@@ -62,16 +62,18 @@ def test_gpt2_public_generation_matches_the_reference_continuation():
     from dew.inference.tasks import TextGeneration
     from dew.sampling.text import Sampling
 
-    loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')[:1, :4]
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
     generated = task(ids, max_new_tokens=6, key=0)
-    np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(FIXTURES / 'gpt2-tiny' / 'generated.npy'))
+    np.testing.assert_array_equal(
+        np.asarray(generated.tokens), np.load(FIXTURES / "gpt2-tiny" / "generated.npy")
+    )
 
 
 @pytest.mark.parametrize('term', ['norm_bias', 'mlp_bias', 'learned_positions'])
 def test_gpt2_reference_detects_a_dropped_classic_term(term):
-    loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     variables = jax.tree.map(jnp.asarray, loaded.variables)
     params = variables['params']
     if term == 'norm_bias':
@@ -92,10 +94,10 @@ def test_gpt2_reference_detects_a_dropped_classic_term(term):
 
 
 def test_gpt2_export_is_read_by_transformers(tmp_path):
-    from transformers import AutoModelForCausalLM
     import torch
+    from transformers import AutoModelForCausalLM
 
-    loaded = load_pretrained(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'gpt2-tiny', dtype='float32', attention_impl='reference')
     loaded.save(tmp_path)
     reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation='eager').float().eval()
     ids = np.load(FIXTURES / 'gpt2-tiny' / 'input_ids.npy')
@@ -104,7 +106,7 @@ def test_gpt2_export_is_read_by_transformers(tmp_path):
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
-    reloaded = load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
+    reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(
         np.asarray(reloaded.model.apply(reloaded.variables, jnp.asarray(ids))), actual)
 
@@ -114,7 +116,7 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / 'gpt2-tiny'
-    loaded = load_pretrained(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     tensors = {name.removeprefix('transformer.'): value for name, value in load_shards(directory).items()}
     for index in range(loaded.model.num_layers):
         tensors[f'h.{index}.attn.bias'] = np.tril(np.ones((1, 1, 64, 64), np.uint8))
@@ -122,7 +124,9 @@ def test_original_bare_gpt2_weights_and_causal_buffers_preserve_logits():
     config = translate_config(loaded.config)
     variables = translate_weights(tensors, config, 'gpt2')
     ids = jnp.asarray(np.load(directory / 'input_ids.npy'))
-    np.testing.assert_array_equal(loaded.model.apply(variables, ids), loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_array_equal(
+        loaded.model.apply(variables, ids), loaded.model.apply(loaded.variables, ids)
+    )
     tensors['h.0.attn.bias'][0, 0, 0, 1] = 1
     with pytest.raises(ValueError, match='causal mask'):
         translate_weights(tensors, config, 'gpt2')

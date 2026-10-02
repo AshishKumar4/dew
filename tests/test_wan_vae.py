@@ -18,6 +18,7 @@ same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 import json
 import shutil
 import tarfile
+from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -104,8 +105,9 @@ def test_an_image_is_the_one_frame_video(loaded, reference):
     assert scaled_gap(latent, channels_last(reference["image_mean"])) < FORWARD
     # The batch path runs the model jitted and the reference path op by op;
     # XLA fuses them differently, a float32 rounding apart.
-    np.testing.assert_allclose(np.asarray(autoencoder.encode_batch(params, first[:, 0])), np.asarray(latent[:, 0]),
-                               rtol=0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(autoencoder.encode_batch(params, first[:, 0])), np.asarray(latent[:, 0]), rtol=0, atol=1e-6
+    )
 
 
 def test_the_decode_matches_the_source(loaded, reference):
@@ -199,7 +201,9 @@ def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):
     assert autoencoder.latent_shape(video.shape[1:]) == (3, 4, 6, 4)
     assert autoencoder.latent_shape(video.shape[2:]) == (4, 6, 4)
     raw = np.asarray(autoencoder.encode_video(params, video))
-    np.testing.assert_allclose(np.asarray(autoencoder.encode(params, video)), (raw - mean) * scale, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(autoencoder.encode(params, video)), (raw - mean) * scale, rtol=1e-6, atol=1e-6
+    )
 
     latent = channels_last(reference["latent"])
     decoded = np.asarray(autoencoder.decode(params, latent))
@@ -251,25 +255,36 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
-    from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
+    import_module("test_diffusion_objective")  # registers "stub_text"
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-    from dew.registry import samplers
+    from dew.sampling import Euler
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig("video_dit", dict(patch_size=1, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-                          dtype="float32", attention_impl="reference"),
-        data=VideoDataset(frame_size=32, frames=9), trainer=TrainerConfig(batch_size=8, steps=1),
-        sampler=samplers.Euler(), sampling_steps=2, val_metrics=(),
+        model=ModelConfig(
+            "video_dit",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
+            dtype="float32",
+            attention_impl="reference",
+        ),
+        data=VideoDataset(frame_size=32, frames=9),
+        trainer=TrainerConfig(batch_size=8, steps=1),
+        solver=Euler(),
+        sampling_steps=2,
+        val_metrics=(),
         text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
-        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"))
+        autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"),
+    )
     objective = config.build()
     assert objective.latent_shape == (3, 4, 4, 4)
     clips = (np.random.default_rng(0).random((8, 9, 32, 32, 3)) * 255).astype(np.uint8)
-    batch = {"video": clips, "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh"))}
+    batch = {
+        "video": clips,
+        "text": objective.inputs.conditions["textcontext"].encoder.tokenize(list("abcdefgh")),
+    }
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=1, log_every=100)

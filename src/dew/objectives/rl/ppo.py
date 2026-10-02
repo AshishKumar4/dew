@@ -15,7 +15,7 @@ from jax.experimental import multihost_utils
 from dew.artifacts import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, mean_loss
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
@@ -184,7 +184,7 @@ class PPOObjective(Objective[Ratio, Variables]):
         terms = clipped_value_loss_terms(self.values(variables, batch), jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
-        metrics = {**aux.metrics, "critic/loss": mean_loss(critic)[0]}
+        metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
         return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
 
     def evaluate(self, params: Variables, batch, step: Step):
@@ -294,8 +294,7 @@ class PPORollout:
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        values = agreed(
-            "PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
+        values = agreed("PPO critic values", lambda: local_rows(self._compiled_values(state.variables, device)))
         rewards = np.asarray(
             [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
         )

@@ -62,9 +62,9 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 |---|---|
 | `interop` | safetensors reading and writing |
 | `torch` | PyTorch on the host, to read `pytorch_model.bin` files and to check unregistered decoders against Transformers |
-| `diffusers` | Loading original-format single-file diffusion checkpoints (`load_pretrained(..., single_file=)`) |
-| `gguf` | Loading GGUF files (`load_pretrained(..., gguf_file=)`) |
-| `torchax` | `load_pretrained(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
+| `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
+| `gguf` | Loading GGUF files (`Pretrained.load(..., gguf_file=)`) |
+| `torchax` | `Pretrained.load(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
 | `tfds` | Reading prepared TFDS ArrayRecords without TensorFlow |
@@ -93,7 +93,7 @@ uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-tokamax kernels have no extra (`dew.nn.moe` says why).
+tokamax is not a dependency. With it installed, 'auto' runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it as `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`: tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes, and the constraints name the tokamax commit that dropped it.
 
 ## Development install
 
@@ -139,16 +139,16 @@ The script downloads the data if needed and prints an `export` line with the pre
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
 import os
-from dew.data import Loading, OxfordFlowers
+from dew.data import Loading, TFDSImages
 
-data = OxfordFlowers(
+data = TFDSImages(
     path=os.environ["DEW_FLOWERS_PATH"],
     image_size=64,
     loading=Loading(workers=0),
 ).load(batch=4)
 ```
 
-Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`. With `labels=None`, `OxfordFlowers` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
+Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
 
 ## Building the documentation
 

@@ -1,25 +1,16 @@
 """Gemma 3n's residual stream: AltUp, the LAuReL block and activation sparsity.
 
 `Gemma3nTextModel` (modeling_gemma3n.py) carries `altup_num_inputs` copies of
-the residual stream. The embeddings are the first; each other copy is the
-embeddings through its own projection, rescaled to the embeddings' RMS
-magnitude.
-
-Every layer predicts all copies from the active one
-(`Gemma3nTextAltUp.predict`), runs the transformer block on that prediction,
-and corrects every copy by the block's innovation
-(`Gemma3nTextAltUp.correct`). It then adds the per-layer input's
-contribution to the copies past the first. After the last layer those
-copies are projected back and rescaled to the first's magnitude, and their
-mean is what the final norm reads.
-
-`Gemma3nTextLaurelBlock` is the learned augmented residual: a rank-`laurel_rank`
-map of the block's normed input, normed and added back, which the block
-averages with the attention residual over sqrt(2).
-
-`Gemma3nTextMLP._gaussian_topk` keeps, per token, the gate activations above
-the mean by `norm.ppf(sparsity)` standard deviations, so a sparsity of 0.95
-zeros about 95% of them before the activation.
+the residual: the embeddings, and each other copy their own projection
+rescaled to the embeddings' RMS. Every layer predicts all copies from the
+active one (`Gemma3nTextAltUp.predict`), runs the block on that prediction,
+corrects every copy by the block's innovation (`correct`), and adds the
+per-layer input to the copies past the first. After the last layer the
+copies project back, rescale to the first's magnitude, and their mean meets
+the final norm. `Gemma3nTextLaurelBlock` is a rank-`laurel_rank` map of the
+block's normed input, normed and added back, averaged with the attention
+residual over sqrt(2). `Gemma3nTextMLP._gaussian_topk` keeps the gate
+activations above the mean by `norm.ppf(sparsity)` standard deviations.
 """
 
 import dataclasses

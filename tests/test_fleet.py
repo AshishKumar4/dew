@@ -15,17 +15,12 @@ import sys
 import time
 
 import pytest
+from test_examples import load_example
 
-from dew.objectives.rl import (
-    CodeReward,
-    ContainerRunner,
-    MathReward,
-    Program,
-    SandboxFleet,
-    SandboxLimits,
-    Verdict,
-    code_block,
-)
+from dew.rl.sandbox import ContainerRunner, MathReward, Program, SandboxFleet, SandboxLimits, Verdict
+
+RLVR = load_example("train_rlvr")
+CodeReward, code_block = RLVR.CodeReward, RLVR.code_block
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="the fleet's limits are Linux process limits")
 
@@ -194,9 +189,11 @@ def test_a_container_has_no_network_a_read_only_root_and_a_deadline():
 
 def test_a_runtime_that_cannot_start_the_container_raises():
     # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
-    with SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet:
-        with pytest.raises(RuntimeError, match="created no container"):
-            fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+    with (
+        SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet,
+        pytest.raises(RuntimeError, match="created no container"),
+    ):
+        fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
 
 
 @pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")

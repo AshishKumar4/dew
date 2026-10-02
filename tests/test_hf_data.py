@@ -7,24 +7,26 @@ itself, which is the streaming extra, so it skips without it.
 """
 
 import pickle
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import grain.python as pygrain
 import numpy as np
 import pytest
 from absl import flags
+
+from dew.data import DataPartition, HFImages, HFOptions, Loading
+from dew.data.sources.hf import HFDatasetSource
 
 # grain's worker processes read absl flags; a test that never ran absl.app
 # would trip UnparsedFlagAccessError at any worker_count > 0.
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import DataPartition, HFImages, HFOptions, Loading  # noqa: E402
-from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
 IMAGE_SIZE = 12
@@ -131,7 +133,8 @@ def test_pickling_leaves_the_table_behind_and_still_reads_the_records():
     payload = pickle.dumps(source)
 
     assert b"caption number 3" not in payload  # the rows stayed behind
-    assert len(payload) < 1024
+    larger = pickle.dumps(HFDatasetSource(dataset=_table(records=64)))
+    assert abs(len(larger) - len(payload)) < 64, "the pickle does not grow with the rows"
 
     reloaded = pickle.loads(payload)
     assert len(reloaded) == 4
@@ -139,7 +142,10 @@ def test_pickling_leaves_the_table_behind_and_still_reads_the_records():
     assert np.array_equal(reloaded[3]["image"], source[3]["image"])
 
 
-def test_a_named_dataset_reloads_by_name_and_split(hub):
+def test_a_worker_maps_the_table_the_parent_loaded_without_loading_it_again(hub):
+    """load_dataset resolves the name against the hub on every call; a worker
+    handed a loaded table maps its files instead (0.73 s against 2 ms for a
+    cached CIFAR-10 split)."""
     source = HFDatasetSource(name="acme/pets", split="validation")
     assert len(source) == RECORDS
     assert hub == [{"name": "acme/pets", "split": "validation"}]
@@ -149,8 +155,23 @@ def test_a_named_dataset_reloads_by_name_and_split(hub):
 
     reloaded = pickle.loads(payload)
     assert reloaded[3]["caption"] == "caption number 3"
-    # The worker's copy went back to load_dataset and carried no rows.
-    assert hub == [{"name": "acme/pets", "split": "validation"}] * 2
+    assert hub == [{"name": "acme/pets", "split": "validation"}], "no second load"
+
+
+def test_a_table_read_from_files_travels_as_its_paths(tmp_path, monkeypatch):
+    _table(records=4).save_to_disk(str(tmp_path / "saved"))
+    source = HFDatasetSource(dataset=datasets.load_from_disk(str(tmp_path / "saved")))
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **kwargs: pytest.fail("wrote a copy"))
+
+    reloaded = pickle.loads(pickle.dumps(source))
+    assert reloaded[3]["caption"] == "caption number 3"
+
+
+def test_a_named_dataset_the_parent_never_read_loads_by_name_in_the_worker(hub):
+    reloaded = pickle.loads(pickle.dumps(HFDatasetSource(name="acme/pets", split="validation")))
+
+    assert reloaded[3]["caption"] == "caption number 3"
+    assert hub == [{"name": "acme/pets", "split": "validation"}]
 
 
 def test_the_table_loads_once_under_concurrent_reads(monkeypatch):
@@ -239,16 +260,15 @@ def test_the_hub_options_reach_load_dataset(forwarded):
 
 
 def test_the_options_travel_to_a_worker_with_the_source(forwarded):
-    """grain pickles the source into every worker, which reloads the table
-    there; a worker that lost the options would read another dataset."""
-    source = _hub_images(options=HFOptions(config="full", revision="v2")).source()
-    len(source)
+    """A worker handed a source its parent never read loads the table
+    itself; a worker that lost the options would read another dataset."""
+    source = HFDatasetSource(name="acme/pets", options=HFOptions(config="full", revision="v2"))
 
     reloaded = pickle.loads(pickle.dumps(source))
     len(reloaded)
 
-    assert [call["name"] for call in forwarded] == ["full", "full"]
-    assert [call["revision"] for call in forwarded] == ["v2", "v2"]
+    assert [call["name"] for call in forwarded] == ["full"]
+    assert [call["revision"] for call in forwarded] == ["v2"]
 
 
 def test_the_caption_comes_from_the_record(hub):
@@ -336,7 +356,7 @@ def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fi
         _hub_images(**fields).load(batch=4)
 
 
-def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
+def test_validation_is_scored_on_unaugmented_images(hub):
     """Training augments; a validation pass that crops, flips and jitters
     scores different images from the ones a reference metric reads."""
     def first_validation(**fields):
@@ -347,7 +367,9 @@ def test_validation_is_scored_on_unaugmented_images_unless_asked(hub):
 
     plain = first_validation(augmentation="none")
     np.testing.assert_array_equal(first_validation(augmentation="flip_jitter"), plain)
-    assert not np.array_equal(first_validation(augmentation="flip_jitter", augment_validation=True), plain)
+    np.testing.assert_array_equal(
+        first_validation(augmentation="flip_jitter", crop_scale=(0.5, 0.5), augmentation_size=SCALE * 2),
+        plain)
 
 
 def test_a_spec_that_holds_validation_out_of_training_says_how_many(hub):

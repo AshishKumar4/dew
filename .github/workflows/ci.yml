@@ -49,7 +49,7 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=site/src/data/sampler.py,site/src/data/text.py
     - name: Lint
       run: |
-        uvx ruff@0.14.3 check src/dew tools/lint_slop.py tools/complexity.py tools/mutation.py examples recipes
+        uvx ruff@0.14.3 check src/dew tests tools/lint_slop.py tools/complexity.py tools/mutation.py examples recipes
         JAX_PLATFORMS=cpu python tools/lint_slop.py
         python tools/complexity.py src/dew tools/lint_slop.py examples recipes > complexity.json
     - name: Upload the complexity distribution
@@ -72,6 +72,7 @@ jobs:
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
         uv run --no-project --with griffe==2.3.0 python site/scripts/gen_api.py --check
+        uv run --no-project --with griffe==2.3.0 --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
         JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
         python site/scripts/gen_examples.py --check
     - name: Type check
@@ -108,7 +109,7 @@ jobs:
         import jax.numpy as jnp
 
         import dew
-        from dew import models
+        from dew.nn.backbones import CausalTransformer
         from dew.training.runtime import _pool_keys_alike
 
         assert "site-packages" in dew.__file__, dew.__file__
@@ -117,8 +118,8 @@ jobs:
         # PyPI's jax 0.11.2 lacks jax-ml/jax#40940, and Dew sees that it does.
         assert not _pool_keys_alike()
         import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
-        model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2,
-                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
+        model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
+                                  num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
         tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))

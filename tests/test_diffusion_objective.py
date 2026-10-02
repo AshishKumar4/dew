@@ -20,11 +20,12 @@ from flax import linen as nn
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CLIPText, CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, Variables, scalar_loss
+from dew.objectives.base import Step, Variables
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
-from dew.registry import encoders, models
+from dew.registry import encoders
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
@@ -73,13 +74,16 @@ class StubText(ConditionEncoder[str]):
         return {"checkpoint": self.checkpoint}
 
 
-def make_objective(*, guidance: CFG | None = CFG(2.0)):
-    model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+_DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
+
+
+def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
     return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
-                              sampler=Euler())
+                              solver=Euler())
 
 
 def make_batch(count=8):
@@ -200,8 +204,8 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
     variables = objective.init(jax.random.key(0))
     batch = {"image": np.arange(8, dtype=np.uint8).reshape(2, 2, 2, 1)}
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    np.testing.assert_array_equal(scalar_loss(objective, variables, batch, step)[0],
-                                  scalar_loss(explicit, variables, batch, step)[0])
+    np.testing.assert_array_equal(objective.scalar_loss(variables, batch, step)[0],
+                                  explicit.scalar_loss(variables, batch, step)[0])
     direct = TextToImage.from_objective(objective, variables)
     built = TextToImage.from_objective(explicit, variables)
     np.testing.assert_array_equal(direct(["", ""], key=2).host().images,
@@ -221,8 +225,16 @@ def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
     from dew.sampling import RK4
     unconditional = InputSpec(Field("image", (RES, RES, 3)))
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
-        DiffusionObjective(Zero(), presets.Cosine(), unconditional, sampler=RK4())
-    DiffusionObjective(Zero(), presets.Karras(), unconditional, sampler=RK4())
+        DiffusionObjective(Zero(), presets.Cosine(), unconditional, solver=RK4())
+    DiffusionObjective(Zero(), presets.Karras(), unconditional, solver=RK4())
+
+
+def test_a_solver_named_by_a_string_is_refused_with_the_object_to_pass():
+    unconditional = InputSpec(Field("image", (RES, RES, 3)))
+    with pytest.raises(
+        TypeError, match=r"solver='euler' names a solver; pass the solver itself, as Euler\(\)"
+    ):
+        DiffusionObjective(Zero(), presets.Flow(), unconditional, solver="euler")
 
 
 @pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
@@ -232,7 +244,7 @@ def test_singlestep_solver_generates_through_the_objective(order, steps):
 
     process = Process(LinearNoiseScheduler(1000), DirectPredictionTransform())
     objective = DiffusionObjective(Zero(), process, InputSpec(Field("image", (2, 2, 1))),
-                                   sampler=DPMSolverSinglestep(order), steps=steps, guidance=None)
+                                   solver=DPMSolverSinglestep(order), steps=steps, guidance=None)
     params = objective.init(jax.random.key(1))
     result = objective.evaluate(params, {"image": np.zeros((2, 2, 2, 1), np.uint8)},
                                 Step(step=jnp.asarray(0), key=jax.random.key(2), ema=None))
@@ -244,7 +256,7 @@ def test_objective_validates_the_real_terminal_grid_before_sampling():
 
     with pytest.raises(ValueError, match="sigma=0 target"):
         DiffusionObjective(Zero(), presets.Flow(), InputSpec(Field("image", (2, 2, 1))),
-                           sampler=UniPC(3, lower_order_final=False), steps=7, guidance=None)
+                           solver=UniPC(3, lower_order_final=False), steps=7, guidance=None)
 
 
 def test_loss_is_the_weighted_error_of_the_prediction():
@@ -259,7 +271,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     batch = make_batch()
     step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None)
 
-    loss, aux = scalar_loss(objective, params, batch, step)
+    loss, aux = objective.scalar_loss(params, batch, step)
 
     _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
     x0 = unit_range(batch["image"])
@@ -433,8 +445,12 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     `params["autoencoder"]`, so the loss's jaxpr has no constant of the
     encoder kernel's shape. The mutation that reads them off the autoencoder
     object instead bakes them in, and this assertion catches that."""
-    from dew.nn.autoencoders import SimpleAutoEncoder
-    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(8,))
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+    model = AutoencoderKL(channels=(8, 8), latent_channels=2, blocks_per_level=1, norm_groups=4,
+                          dtype=jnp.float32)
+    autoencoder = StableDiffusionVAE(
+        model=model, params=model.init(jax.random.PRNGKey(0), jnp.zeros((1, RES, RES, 3)))["params"],
+        dtype=jnp.float32, latent_shift=0.0, latent_scale=1.0)
     inputs = InputSpec(Field("image", (RES, RES, 3)))
     objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel"), inputs,
                                    autoencoder=autoencoder)
@@ -558,10 +574,10 @@ GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
 def conditional_mmdit():
     encoder = CharTable.from_pretrained(tokens=3, features=6, vocab=16)
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
-    model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
+    model = SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
                                num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
     preset = presets.EDM(sigma_max=1.0, regime="pixel")
-    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
+    objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(), guidance=CFG(2.0))
     variables = objective.init(jax.random.key(0))
     # The initialized zero output head otherwise hides conditioning gradients.
     variables = {**variables, "params": jax.tree.map(lambda leaf: leaf + 0.02, variables["params"])}
@@ -569,7 +585,7 @@ def conditional_mmdit():
     variables = {**variables, "encoders": {"textcontext": {"table": table}}}
     # The objective encodes the unconditional branch from the weights it is
     # built over, so it is rebuilt over the ones these tests sample under.
-    objective = DiffusionObjective(model, preset, inputs, steps=3, sampler=Euler(),
+    objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(),
                                    guidance=CFG(2.0), pretrained=variables)
     batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
              **inputs.tokenize(["ab", "cd", "ef", "gh"])}
@@ -581,19 +597,19 @@ def conditional_mmdit():
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
-                                 unconditional_prob=probability, steps=3, sampler=Euler(),
+                                 unconditional_prob=probability, steps=3, solver=Euler(),
                                  pretrained=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
-                                     unconditional_prob=0.0, steps=3, sampler=Euler(),
+                                     unconditional_prob=0.0, steps=3, solver=Euler(),
                                      pretrained=variables)
     mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
     explicit = source.inputs.tokenize([""] * 4)
     explicit = {"image": batch["image"], "text": jax.tree.map(
         lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
     expected = jax.jit(jax.value_and_grad(
-        lambda values: scalar_loss(conditional, values, explicit, step)[0]))(variables)
+        lambda values: conditional.scalar_loss(values, explicit, step)[0]))(variables)
     actual = jax.jit(jax.value_and_grad(
-        lambda values: scalar_loss(dropped, values, batch, step)[0]))(variables)
+        lambda values: dropped.scalar_loss(values, batch, step)[0]))(variables)
     assert float(jnp.linalg.norm(expected[1]["encoders"]["textcontext"]["table"])) > 1e-6
     # The trained weights, on the loss the two routes agree on. The dropped
     # rows read a blank the objective encoded once, so the frozen tower is a
@@ -611,14 +627,14 @@ def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mm
     encoded the prompt again would not notice."""
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
-                                 unconditional_prob=1.0, steps=3, sampler=Euler(),
+                                 unconditional_prob=1.0, steps=3, solver=Euler(),
                                  pretrained=variables)
     held = dropped.unconditional_conditions
-    before = float(scalar_loss(dropped, variables, batch, step)[0])
+    before = float(dropped.scalar_loss(variables, batch, step)[0])
     dropped.unconditional_conditions = jax.tree.map(
         lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf, held)
 
-    assert float(scalar_loss(dropped, variables, batch, step)[0]) != pytest.approx(before)
+    assert float(dropped.scalar_loss(variables, batch, step)[0]) != pytest.approx(before)
 
 
 def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):
@@ -627,7 +643,7 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     rebound = replace(condition.encoder, params=variables["encoders"]["textcontext"])
     inputs = replace(objective.inputs, conditions={"textcontext": replace(condition, encoder=rebound)})
     reconstructed = DiffusionObjective(objective.model, objective.process, inputs,
-                                       steps=3, sampler=Euler(), guidance=CFG(2.0))
+                                       steps=3, solver=Euler(), guidance=CFG(2.0))
     expected = reconstructed.evaluate(variables, batch, step).images
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)

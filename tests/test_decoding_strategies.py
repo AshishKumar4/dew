@@ -37,10 +37,12 @@ def test_terminal_greedy_matches_the_categorical_point_mass_and_float64_likeliho
                           jnp.asarray([0, 1, 7], jnp.int32), jnp.ones(3, bool),
                           jax.random.split(jax.random.key(seed), 3), prompt_width=1)
         checked = checkify.checkify(draw)
-        error, actual = jax.jit(lambda state, scores: checked(state, scores, chain))(state, jnp.asarray(values))
+        error, actual = jax.jit(lambda state, scores, checked=checked: checked(state, scores, chain))(
+            state, jnp.asarray(values)
+        )
         error.throw()
         # A plain callable retains the categorical point-mass implementation.
-        error, categorical = jax.jit(lambda state, scores: checked(
+        error, categorical = jax.jit(lambda state, scores, checked=checked: checked(
             state, scores, lambda step, logits: chain(step, logits)))(state, jnp.asarray(values))
         error.throw()
         for mine, reference in zip(actual, categorical, strict=True):
@@ -170,9 +172,10 @@ def test_a_partial_carries_its_array_configuration_without_recompiling(model):
 
     first = jnp.asarray(np.eye(VOCAB, dtype=np.float32)[2] * 20.0)
     second = jnp.asarray(np.eye(VOCAB, dtype=np.float32)[7] * 20.0)
-    draw = lambda bias: generate(  # noqa: E731
-        module, params, prompt, 3, key=jax.random.key(0), sampling=Sampling(temperature=0),
-        logits=(jax.tree_util.Partial(shifted, bias), decoding.Greedy()))
+    def draw(bias):
+        return generate(
+            module, params, prompt, 3, key=jax.random.key(0), sampling=Sampling(temperature=0),
+            logits=(jax.tree_util.Partial(shifted, bias), decoding.Greedy()))
     np.testing.assert_array_equal(np.asarray(draw(first).tokens)[0, 3:], [2, 2, 2])
     np.testing.assert_array_equal(np.asarray(draw(second).tokens)[0, 3:], [7, 7, 7])
 

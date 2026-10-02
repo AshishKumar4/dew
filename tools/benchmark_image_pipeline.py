@@ -31,7 +31,7 @@ import tensorflow_datasets as tfds
 import tyro
 from PIL import Image
 
-from dew.data import DataPartition, Loading, OxfordFlowers
+from dew.data import DataPartition, Loading, TFDSImages
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.images import decode_image, resize_image
 
@@ -123,7 +123,7 @@ def augmentation_accuracy():
 
 
 def pipeline_timing(config, backend, crop_scale):
-    spec = OxfordFlowers(path=config.flowers, image_size=config.image_size,
+    spec = TFDSImages(path=config.flowers, image_size=config.image_size,
                          augmentation_backend=backend, crop_scale=crop_scale, val_batches=0,
                          loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
     stream = spec.load(batch=config.batch).train(DataPartition())
@@ -155,9 +155,9 @@ def training_timing(config, backend):
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator, data_partition
+    from dew.training.distributed import DevicePrefetchIterator
 
-    spec = OxfordFlowers(path=config.flowers, image_size=config.image_size,
+    spec = TFDSImages(path=config.flowers, image_size=config.image_size,
                          augmentation_backend=backend, val_batches=0,
                          loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
@@ -167,7 +167,7 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    source = spec.load(batch=config.batch).train(data_partition(trainer.device_mesh))
+    source = spec.load(batch=config.batch).train(DataPartition.of(trainer.device_mesh))
     durations = []
     with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
         step = trainer.compile(state, next(batches))
@@ -190,7 +190,7 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
-    source = OxfordFlowers(path=config.flowers).source()
+    source = TFDSImages(path=config.flowers).source()
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
     if not encoded:
         raise ValueError("the Flowers corpus contains no images")

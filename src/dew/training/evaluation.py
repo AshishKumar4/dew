@@ -10,7 +10,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
@@ -22,10 +21,10 @@ from dew.artifacts import (
     broadcast_from_process_zero,
     collective_host,
 )
-from dew.data.dataset import Closeable, Reader
+from dew.data.dataset import Closeable, DataPartition, Reader
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 
-from .distributed import build_mesh, data_partition, shard_batch
+from .distributed import MeshSpec, shard_batch
 
 
 @dataclass(frozen=True)
@@ -57,6 +56,59 @@ class Evaluation:
                 "evaluation/records": float(self.records),
                 "evaluation/uneven_shards": float(self.uneven_shards)}
 
+    @classmethod
+    def run(cls, objective: Objective[Loss, Effects], variables: Variables,
+            batches: Reader | None, *,
+            key: int | jax.Array, metrics: Sequence[Metric] = (),
+            step: int | jax.Array = 0, averaged: Variables | None = None,
+            preview: bool = False, mesh: Mesh | None = None, split: str = "val",
+            schedule_step: int | jax.Array | None = None, loss: bool = False,
+            training: Mapping[str, jax.Array] | None = None) -> Evaluation:
+        """Evaluate a finite coordinated prefix without an optimizer or tracker.
+
+        batches opens a fresh iterator over this process's share of the split
+        (`DataPartition.of(mesh)`), owned and closed by this call;
+        Dataset.val can be passed directly. Every rank runs it with
+        the same objective, metrics and numerical settings. Only root's preview
+        flag controls the once-per-event display. No consumers means no iterator
+        or objective work; preview alone consumes at most the first coordinated batch.
+
+        variables is the complete Flax variables tree. averaged, when supplied,
+        is the complete overlay seen as Step.ema, not an optimizer state. Passing
+        state.averaged as variables evaluates those weights directly. step tags
+        the event RNG and report; schedule_step defaults to step and preserves an
+        objective's accepted-work schedule when training attempts were rejected.
+
+        Scalars are broadcast to every rank. Previews remain hosted on root and
+        are bounded by one objective preview, independent of validation length.
+        Reporting is the caller's job; pool callers must agree reporting failures
+        before entering their next collective. In-flight device failures still
+        require distributed runtime termination.
+        """
+        from dew.nn.inputs import request_key
+        key = request_key(key)
+        started = time.perf_counter()
+        root = jax.process_index() == 0
+        _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
+        preview_enabled = bool(broadcast_from_process_zero(root and preview))
+        event_step, context, event_words, training_scores = _event(
+            key, step, schedule_step, averaged, training)
+        score_key = _folded(context.key, 0x53434F52)
+        preview_key = _folded(context.key, 0x50524556)
+        scores: dict[str, float] = {}
+        previews: tuple[Artifact, ...] = ()
+        scored = records = 0
+        uneven = False
+        if batches is not None and (metrics or preview_enabled or loss):
+            scores, previews, scored, records, uneven = _score_split(
+                objective, variables, batches, context, mesh, metrics=metrics, split=split,
+                root=root, preview_enabled=preview_enabled, score_key=score_key,
+                preview_key=preview_key, loss=loss)
+        scores.update(training_scores)
+        elapsed = time.perf_counter() - started
+        scores, elapsed = broadcast_from_process_zero((scores, elapsed))
+        return cls(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
+
 
 def _pick(artifacts: tuple[Artifact, ...], reads: type):
     """Find the one artifact a metric reads, refusing an ambiguous report."""
@@ -71,58 +123,6 @@ def _pick(artifacts: tuple[Artifact, ...], reads: type):
 def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
     """Read an objective's report as a tuple, whether it returned one or many."""
     return () if value is None else value if isinstance(value, tuple) else (value,)
-
-
-def evaluate(objective: Objective[Loss, Effects], variables: Variables,
-             batches: Reader | None, *,
-             key: int | jax.Array, metrics: Sequence[Metric] = (),
-             step: int | jax.Array = 0, averaged: Variables | None = None,
-             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
-             schedule_step: int | jax.Array | None = None, loss: bool = False,
-             training: Mapping[str, jax.Array] | None = None) -> Evaluation:
-    """Evaluate a finite coordinated prefix without an optimizer or tracker.
-
-    batches opens a fresh iterator over this process's share of the split
-    (`data_partition` of the mesh), owned and closed by this call;
-    Dataset.val can be passed directly. Every rank calls evaluate with
-    the same objective, metrics and numerical settings. Only root's preview
-    flag controls the once-per-event display. No consumers means no iterator
-    or objective work; preview alone consumes at most the first coordinated batch.
-
-    variables is the complete Flax variables tree. averaged, when supplied,
-    is the complete overlay seen as Step.ema, not an optimizer state. Passing
-    state.averaged as variables evaluates those weights directly. step tags
-    the event RNG and report; schedule_step defaults to step and preserves an
-    objective's accepted-work schedule when training attempts were rejected.
-
-    Scalars are broadcast to every rank. Previews remain hosted on root and
-    are bounded by one objective preview, independent of validation length.
-    Reporting is the caller's job; pool callers must agree reporting failures
-    before entering their next collective. In-flight device failures still
-    require distributed runtime termination.
-    """
-    from dew.nn.inputs import request_key
-    key = request_key(key)
-    started = time.perf_counter()
-    root = jax.process_index() == 0
-    _agree_configuration(metrics, batches, split, loss=loss, training=training is not None)
-    preview_enabled = bool(broadcast_from_process_zero(root and preview))
-    event_step, context, event_words, training_scores = _event(key, step, schedule_step, averaged, training)
-    score_key = jax.random.fold_in(context.key, 0x53434F52)
-    preview_key = jax.random.fold_in(context.key, 0x50524556)
-    scores: dict[str, float] = {}
-    previews: tuple[Artifact, ...] = ()
-    scored = records = 0
-    uneven = False
-    if batches is not None and (metrics or preview_enabled or loss):
-        scores, previews, scored, records, uneven = _score_split(
-            objective, variables, batches, context, mesh, metrics=metrics, split=split,
-            root=root, preview_enabled=preview_enabled, score_key=score_key,
-            preview_key=preview_key, loss=loss)
-    scores.update(training_scores)
-    elapsed = time.perf_counter() - started
-    scores, elapsed = broadcast_from_process_zero((scores, elapsed))
-    return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
 
 
 class _Accumulators:
@@ -143,19 +143,6 @@ class _Accumulators:
         return float(metric.finalize(self._held[metric.name]))
 
 
-@dataclass(frozen=True)
-class _Configuration:
-    """What every rank must agree on before a validation pass walks its phases."""
-    validation: bool
-    split: str
-    metrics: tuple[tuple[str, str, str], ...]
-    """Each metric's name and the module and qualified name of the artifact it reads."""
-
-    def broadcast(self) -> list[bool | str | list[list[str]]]:
-        """The record as rank zero's ranks see it, through the JSON broadcast."""
-        return [self.validation, self.split, [list(entry) for entry in self.metrics]]
-
-
 def _agree_configuration(
     metrics: Sequence[Metric], batches, split: str, *, loss: bool = False, training: bool = False
 ) -> None:
@@ -165,18 +152,17 @@ def _agree_configuration(
     validation stream would walk different phases below, and hang at a
     collective one of them never reaches.
     """
-    def checked() -> _Configuration:
+    def checked() -> list[bool | str | list[list[str]]]:
         names = [metric.name for metric in metrics]
         if len(names) != len(set(names)):
             raise ValueError("evaluation metric names must be unique")
         if not split or "/" in split:
             raise ValueError("evaluation split must be a nonempty name without '/'")
-        return _Configuration(
-            validation=batches is not None, split=split,
-            metrics=tuple((metric.name, metric.reads.__module__, metric.reads.__qualname__)
-                          for metric in metrics))
+        # Each metric's name and the module and qualified name of the artifact it reads.
+        return [batches is not None, split,
+                [[metric.name, metric.reads.__module__, metric.reads.__qualname__] for metric in metrics]]
 
-    configuration = [agreed("configuration", checked).broadcast(), loss, training]
+    configuration = [agreed("configuration", checked), loss, training]
     root_configuration = broadcast_from_process_zero(configuration)
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")
@@ -199,14 +185,21 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
 
     def event() -> tuple[int, Step, jax.Array]:
         at = int(step_home)
-        event_key = jax.random.fold_in(jax.random.fold_in(key, 0x4556414C), at)
-        return (at, Step(step=jnp.asarray(schedule_home), key=event_key, ema=averaged),
+        event_key = _folded(_folded(key, 0x4556414C), at)
+        return (at, Step(step=jax.device_put(schedule_home), key=event_key, ema=averaged),
                 jax.random.key_data(event_key))
 
     event_step, context, event_data = agreed("evaluation context", event)
     event_words = tuple(int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity")))
     return event_step, context, event_words, {name: float(value) for name, value in reports.items()}
+
+
+def _folded(key: jax.Array, word: int) -> jax.Array:
+    """`jax.random.fold_in(key, word)`, the host integer placed beside the
+    key by name rather than moved there implicitly by the fold: on the key's
+    devices, or uncommitted with an uncommitted key."""
+    return jax.random.fold_in(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
 
 
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,
@@ -236,8 +229,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             # Each name is bound as it is built, so a failure part way
             # through still leaves the cleanup below what to close.
             nonlocal mesh, source, iterator
-            mesh = build_mesh() if mesh is None else mesh
-            source = batches(data_partition(mesh))
+            mesh = MeshSpec().build() if mesh is None else mesh
+            source = batches(DataPartition.of(mesh))
             iterator = iter(source)
 
         agreed("iterator construction", open_source)
@@ -271,7 +264,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                                 objective._validation_loss(
                                 loss_variables,
                                 loss_batch,
-                                replace(context, key=jax.random.fold_in(score_key, scored)),
+                                replace(context, key=_folded(score_key, scored)),
                                 )
                             ),
                         )
@@ -292,7 +285,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             if loss_stats is not None and f'{split}/loss' not in scores:
-                value, valid = objective.reduce_loss(jax.tree.map(jnp.asarray, loss_stats))
+                value, valid = jax.device_get(objective._validation_reduction(jax.device_put(loss_stats)))
                 if not bool(valid) or not np.isfinite(float(value)):
                     raise ValueError("validation loss has no finite statistical support")
                 scores[f'{split}/loss'] = float(value)
@@ -343,7 +336,7 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
     whether or not it holds an accumulator.
     """
     produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
-        variables, batch, replace(context, key=jax.random.fold_in(score_key, index))))
+        variables, batch, replace(context, key=_folded(score_key, index))))
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
     artifacts = _artifacts(produced)
     for metric in metrics:

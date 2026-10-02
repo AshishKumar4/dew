@@ -30,7 +30,7 @@ data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, record
 model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                   mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
 objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),
-                               sampler=Euler(), steps=4)
+                               solver=Euler(), steps=4)
 trainer = Trainer(objective, optax.adam(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
 info = Step(step=state.step, key=jax.random.key(1), ema=state.averaged)

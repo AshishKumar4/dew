@@ -18,7 +18,6 @@ import optax
 import pytest
 from safetensors.numpy import load_file
 
-from dew.data.audio import AudioProcessor
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import (
     Gemma3nProjectorModule,
@@ -29,6 +28,22 @@ from dew.nn.vision import (
 from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
+
+def gemma_features(model_type, config, waveforms):
+    """The float32 `input_features` and boolean `input_features_mask` the
+    checkpoint's own Transformers extractor makes of 16 kHz `waveforms`,
+    with the arguments `Processor` passes it: padded to the longest, 30 s
+    at most, frames a multiple of the encoder's 128."""
+    from transformers import Gemma3nAudioFeatureExtractor, Gemma4AudioFeatureExtractor
+
+    extractor = {"gemma3n_audio": Gemma3nAudioFeatureExtractor,
+                 "gemma4_audio": Gemma4AudioFeatureExtractor}[model_type].from_dict(dict(config))
+    features = extractor([np.asarray(waveform, np.float32) for waveform in waveforms],
+                         padding="longest", max_length=480000, truncation=True,
+                         pad_to_multiple_of=128, return_tensors="np", return_attention_mask=True)
+    return {"input_features": np.asarray(features["input_features"], np.float32),
+            "input_features_mask": np.asarray(features["input_features_mask"], np.bool_)}
+
 
 
 on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
@@ -65,9 +80,8 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     data = np.load(path / "reference.npz")
     preprocessor = json.loads((path / "preprocessor_config.json").read_text())
     kind = "gemma3n_audio" if isinstance(config, Gemma3nAudio) else "gemma4_audio"
-    process = AudioProcessor(kind, preprocessor)
     waveforms = [np.load(path / f"waveform_{index}.npy") for index in range(2)]
-    features = process(waveforms, sampling_rate=16000)
+    features = gemma_features(kind, preprocessor, waveforms)
     np.testing.assert_array_equal(features["input_features_mask"], data["input_features_mask"])
     np.testing.assert_allclose(features["input_features"], data["input_features"], rtol=0, atol=1e-6)
     encoded = jax.jit(model.apply)(variables, **features)
@@ -118,7 +132,9 @@ def test_audio_input_gradients_and_sgd_step_match_reference(audio):
     def loss(variables, inputs):
         return jnp.mean(forward(variables, inputs) * data["coefficient"])
 
-    value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(state, data["input_features"])
+    value, (grads, input_grad) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        state, data["input_features"]
+    )
     np.testing.assert_allclose(value, data["loss"], rtol=0, atol=1e-6)
     np.testing.assert_allclose(input_grad, data["input_gradient"], rtol=1e-4, atol=1e-7)
     optimizer = optax.sgd(json.loads((path / "meta.json").read_text())["learning_rate"])
@@ -142,7 +158,9 @@ def test_gemma4_checkpoint_clipping_bounds_change_the_computation():
 
 def test_audio_mask_and_feature_shape_are_part_of_the_contract(audio):
     _, config, variables, model, _, _, _ = audio
-    features = config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
+    features = (
+        config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
+    )
     with pytest.raises(ValueError, match="input_features_mask"):
         model.apply(variables, jnp.ones((1, 16, features)), jnp.ones((1, 16), jnp.int32))
     with pytest.raises(ValueError, match="input_features"):
@@ -183,14 +201,6 @@ def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
         np.testing.assert_array_equal(restored, tensor)
 
 
-def test_processor_rejects_wrong_sampling_rate_without_resampling():
-    processor = AudioProcessor("gemma4_audio", {"feature_size": 16})
-    with pytest.raises(ValueError, match="sampling_rate"):
-        processor(np.ones(1000, np.float32), sampling_rate=8000)
-    with pytest.raises(ValueError, match="nonempty mono"):
-        processor([np.ones((100, 2), np.float32)], sampling_rate=16000)
-
-
 def test_released_geometries_emit_the_processor_token_counts():
     """30 s of 10 ms frames become 188 Gemma 3n and 750 Gemma 4 soft tokens.
 
@@ -198,7 +208,9 @@ def test_released_geometries_emit_the_processor_token_counts():
     audio_seq_length=188, Gemma4Processor audio_seq_length=750). Checked
     abstractly, without allocating the 681M and 305M encoder parameters.
     """
-    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())["audio_config"]
+    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())[
+        "audio_config"
+    ]
     for record, tokens in ((released, 188), ({"model_type": "gemma4_audio"}, 750)):
         encoder = audio_config(record).build()
         output, _ = jax.eval_shape(encoder.init_with_output, jax.random.key(0),

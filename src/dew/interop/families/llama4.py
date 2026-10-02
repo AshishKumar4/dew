@@ -87,10 +87,12 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         'expert_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
         'shared_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
     }
-    if moe_layers is not None:
-        mixture['layers'] = records.integers(moe_layers, 'moe_layers')
-    else:
-        mixture['every'] = step
+    if moe_layers is None:
+        if step < 1:
+            _refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
+        # Llama4TextConfig's default (configuration_llama4.py:186-194).
+        moe_layers = list(range(step - 1, layers, step))
+    mixture['layers'] = records.integers(moe_layers, 'moe_layers')
     config.update(
         # The dense layers take intermediate_size_mlp; the experts and the
         # shared expert take intermediate_size.

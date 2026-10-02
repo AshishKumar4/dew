@@ -23,10 +23,10 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
 from dew.nn.ssm import SpatialFusionConv
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models, with_precision
-from dew.training import Layout, MeshSpec, Trainer, build_mesh
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import batch_shardings, shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -65,7 +65,7 @@ def tensor_layout():
 
 def test_the_default_mesh_places_like_the_three_axis_one():
     """New axes at size 1 change no spec: widths keep fsdp, and the layout fits."""
-    mesh = build_mesh(MeshSpec(fsdp=8))
+    mesh = MeshSpec(fsdp=8).build()
     assert mesh.axis_names == ("data", "expert", "fsdp", "tensor", "sequence", "stage")
     specs = jax.tree.map(
         lambda sharding: sharding.spec,
@@ -85,7 +85,7 @@ def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
     vocabulary take the tensor axis, and the residual width the blocks pass
     between themselves does not: in each projection it takes fsdp, a split
     in two dimensions."""
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=4))
+    mesh = MeshSpec(fsdp=2, tensor=4).build()
     layout = Layout(min_shard=TINY_SHARD)
     specs = jax.tree.map(
         lambda sharding: sharding.spec, layout.shardings(mesh, variables()))["params"]
@@ -119,7 +119,7 @@ def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
         trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                           mesh=mesh, layout=Layout(min_shard=TINY_SHARD), checkpoints=None,
                           tracker=None)
-        trainer.device_mesh = build_mesh(mesh, devices)
+        trainer.device_mesh = mesh.build(devices)
         state, _, _ = trainer.place()
         trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
         assert trainer.executable is not None
@@ -154,7 +154,7 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
         trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                           mesh=mesh, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
                           checkpoints=None, tracker=None)
-        trainer.device_mesh = build_mesh(mesh, devices)
+        trainer.device_mesh = mesh.build(devices)
         state, _, _ = trainer.place()
         trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
         assert trainer.executable is not None
@@ -191,7 +191,7 @@ def test_a_down_projection_spreads_only_where_the_link_pays_for_it(bytes_per_sec
     token; a CPU mesh spreads."""
     from dew.nn.sharding import RESIDUAL, SPREAD, TENSOR_AXIS, Link, down_projection, measured_links
 
-    mesh = build_mesh(MeshSpec(tensor=4), jax.devices()[:4])
+    mesh = MeshSpec(tensor=4).build(jax.devices()[:4])
     residual = jax.ShapeDtypeStruct((4, 4096, 7168), jnp.bfloat16)
     link = None if platform is None else Link(bytes_per_second, peak, platform)
     with jax.set_mesh(mesh), measured_links({} if link is None else {TENSOR_AXIS: link}):
@@ -226,7 +226,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     params = model.init(jax.random.key(23), query, context)["params"]
 
     def compiled(sequence, tensor, link):
-        mesh = build_mesh(MeshSpec(sequence=sequence, tensor=tensor), jax.devices()[:sequence * tensor])
+        mesh = MeshSpec(sequence=sequence, tensor=tensor).build(jax.devices()[:sequence * tensor])
         whole = NamedSharding(mesh, P())
         inputs = jax.tree.map(lambda value: jax.device_put(value, whole), (params, query, context))
 
@@ -267,7 +267,7 @@ def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
     """Tensor parallelism alone, no fsdp: every attention and mlp projection
     names the tensor axis, so the default tolerance holds with nothing but
     the norms left whole."""
-    mesh = build_mesh(MeshSpec(tensor=4))
+    mesh = MeshSpec(tensor=4).build()
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(mesh, variables())
     attention = jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]["layers_0"]["self_attn"]
@@ -279,7 +279,7 @@ def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
 
 def test_redirected_widths_take_the_tensor_axis():
     """A run's rules move the big matmul dims onto tensor; the layout fits."""
-    mesh = build_mesh(MeshSpec(fsdp=4, tensor=2))
+    mesh = MeshSpec(fsdp=4, tensor=2).build()
     layout = tensor_layout()
     specs = jax.tree.map(
         lambda sharding: sharding.spec,
@@ -295,7 +295,7 @@ def test_redirected_widths_take_the_tensor_axis():
 def test_the_batch_sequence_dimension_takes_the_sequence_axis():
     """Sequence parallelism splits activations: rows over every other axis,
     positions over sequence."""
-    mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
+    mesh = MeshSpec(fsdp=4, sequence=2).build()
     batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
@@ -305,7 +305,7 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
 def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     """Seventeen columns over two sequence shards divide nothing, so the
     rows still split and the width replicates."""
-    mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
+    mesh = MeshSpec(fsdp=4, sequence=2).build()
     batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
     assert batch.sharding.spec == P(("data", "expert", "fsdp"))
@@ -316,7 +316,7 @@ def test_an_image_batch_never_takes_the_sequence_axis():
     """Only a sequence per row splits over the sequence axis. An image's
     second dimension is its height, so a rank-4 leaf keeps every dimension
     but its rows whole, and a global array is placed from its shape alone."""
-    mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
+    mesh = MeshSpec(fsdp=4, sequence=2).build()
     images = np.zeros((BATCH, 8, 8, 3), np.float32)
     batch = shard_batch(mesh, {"image": images, "label": np.zeros((BATCH,), np.int32)})
 
@@ -325,12 +325,15 @@ def test_an_image_batch_never_takes_the_sequence_axis():
     assert batch_shardings(mesh, batch)["image"].spec == batch["image"].sharding.spec
 
 
-def test_build_mesh_rejects_sizes_the_devices_cannot_hold():
+def test_mesh_build_rejects_sizes_the_devices_cannot_hold():
     """The refusal names the axes the spec splits and their product against
     the devices, not the axes it leaves at one."""
-    with pytest.raises(ValueError, match=rf"^fsdp 4 x tensor 2 x sequence 3 is 24 devices a data "
-                                         rf"replica, which does not divide the {jax.device_count()} devices$"):
-        build_mesh(MeshSpec(fsdp=4, tensor=2, sequence=3))
+    with pytest.raises(
+        ValueError,
+        match=rf"^fsdp 4 x tensor 2 x sequence 3 is 24 devices a data "
+        rf"replica, which does not divide the {jax.device_count()} devices$",
+    ):
+        MeshSpec(fsdp=4, tensor=2, sequence=3).build()
 
 
 def token_batches():
@@ -415,7 +418,7 @@ def one_step(spec):
     it, so a gradient that moved means the collectives GSPMD derived from the
     tensor axis are not the ones the rules meant.
     """
-    mesh = build_mesh(spec)
+    mesh = spec.build()
     objective = LMObjective(tiny(), SEQ_LEN)
     initial = objective.init(jax.random.key(0))
     placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
@@ -424,7 +427,7 @@ def one_step(spec):
     @jax.jit
     def step(trainable):
         def loss_fn(inner):
-            return scalar_loss(objective, {**placed, "params": inner}, batch,
+            return objective.scalar_loss({**placed, "params": inner}, batch,
                                Step(step=jnp.zeros((), jnp.int32),
                                     key=jax.random.key(1), ema=None))
 
@@ -457,7 +460,7 @@ def test_a_dit_steps_under_a_tensor_axis():
     decoder's gated ones, and carries an adaLN projection and a patch
     embedding besides: two tensor shards initialise it in place and
     differentiate one forward pass over it."""
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+    mesh = MeshSpec(fsdp=2, tensor=2).build()
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=4, mlp_ratio=2)
     images = jax.random.normal(jax.random.key(1), (BATCH, 8, 8, 3), jnp.float32)
     times = jnp.full((BATCH,), 0.5, jnp.float32)
@@ -485,7 +488,18 @@ COLLECTIVE = re.compile(
     r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
 ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
 TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
-ITEMSIZE = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8, "s64": 8}
+ITEMSIZE = {
+    "pred": 1,
+    "s8": 1,
+    "u8": 1,
+    "bf16": 2,
+    "f16": 2,
+    "f32": 4,
+    "s32": 4,
+    "u32": 4,
+    "f64": 8,
+    "s64": 8,
+}
 
 
 def collectives(spec, model):
@@ -517,19 +531,25 @@ def collective_bytes(spec, model, ops):
 def step_text(spec, model):
     """The compiled text of one loss-and-gradient step of an LM objective
     over `model` under `spec` on four devices."""
-    mesh = build_mesh(spec, jax.devices()[:4])
+    mesh = spec.build(jax.devices()[:4])
     objective = LMObjective(model, SEQ_LEN)
     initial = jax.eval_shape(objective.init, jax.random.key(0))
     shardings = Layout(min_shard=TINY_SHARD).shardings(mesh, initial)
-    tokens = jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32,
-                                  sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"])
+    tokens = jax.ShapeDtypeStruct(
+        (BATCH, SEQ_LEN + 1),
+        jnp.int32,
+        sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"],
+    )
 
     def loss(variables, rest, text):
-        return scalar_loss(objective, {**rest, "params": variables}, {"text": text},
+        return objective.scalar_loss({**rest, "params": variables}, {"text": text},
                            Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))[0]
 
-    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-                          initial, shardings)
+    placed = jax.tree.map(
+        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+        initial,
+        shardings,
+    )
     rest = {name: value for name, value in placed.items() if name != "params"}
     with jax.set_mesh(mesh):
         # The gradient lands where its parameter is, as the optimizer reads it.
@@ -670,7 +690,7 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
         return jnp.sum(causal_conv1d(x, taps, activation=False) * cotangent)
 
     alone = jax.grad(loss, argnums=1)(x, taps, cotangent)
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
+    mesh = MeshSpec(fsdp=2, tensor=2).build(jax.devices()[:4])
     rows = NamedSharding(mesh, P("fsdp"))
     with jax.set_mesh(mesh):
         split = jax.jit(jax.grad(loss, argnums=1))(
@@ -721,16 +741,17 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
             out = jax.lax.with_sharding_constraint(out, outputs)
         return jnp.sum(out * cotangent)
 
-    alone = jax.grad(loss)(params, x, cotangent, False)
-    mesh = build_mesh(spec, jax.devices()[:4])
+    alone = jax.grad(loss)(params, x, cotangent, constrained=False)
+    mesh = spec.build(jax.devices()[:4])
     with jax.set_mesh(mesh):
+        constrained = True
         split = jax.jit(jax.grad(loss), static_argnums=3)(
-            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, True)
+            params, jax.device_put(x, NamedSharding(mesh, rows)), cotangent, constrained)
 
     # Each kernel entry's and bias entry's gradient sums one product per row
     # and output position, bounded as the taps' above.
     terms = shape[0] * shape[1] * shape[2]
-    magnitude = jax.grad(loss)(params, np.abs(x), np.abs(cotangent), False)
+    magnitude = jax.grad(loss)(params, np.abs(x), np.abs(cotangent), constrained=False)
     for got, want, size in zip(jax.tree.leaves(split), jax.tree.leaves(alone),
                                jax.tree.leaves(magnitude), strict=True):
         np.testing.assert_array_less(np.abs(got - want), terms * np.finfo(np.float32).eps * size)
@@ -750,7 +771,7 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
     conv = Conv(64, (3, 3))
     params = conv.init(jax.random.key(0), x[:1])["params"]
     alone = conv.apply({"params": params}, x)
-    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
+    mesh = MeshSpec(fsdp=2, tensor=2).build(jax.devices()[:4])
     with jax.set_mesh(mesh):
         stored = {"kernel": jax.device_put(params["kernel"], NamedSharding(mesh, P(None, None, "fsdp"))),
                   "bias": params["bias"]}

@@ -110,7 +110,7 @@ def test_both_gradients_match_the_full_vocabulary_pass(chunks):
     expected = jax.grad(full, argnums=(0, 1))(hidden, head)
     got = jax.grad(chunked, argnums=(0, 1))(hidden, head)
 
-    for name, want, have in zip(("hidden", "head"), expected, got):
+    for name, want, have in zip(("hidden", "head"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(have - want).max() <= 1e-4 * largest, name
@@ -129,7 +129,7 @@ def test_a_tie_goes_to_the_lowest_column_across_chunk_boundaries():
     _, expected_top1 = reference(hidden, head, targets)
     assert int(expected_top1[0, 0]) == 5, "the reference argmax did not tie-break low"
 
-    for chunks in CHUNKS + [6]:
+    for chunks in [*CHUNKS, 6]:
         _, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
         assert jnp.array_equal(predicted, expected_top1), chunks
 
@@ -149,7 +149,7 @@ def test_the_prediction_is_the_int32_column_under_x64():
     """jax_enable_x64 widens argmax to int64, while the tile loop carries its
     best column as int32; the prediction is still the reference's argmax,
     as int32 columns."""
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         hidden, head, targets = inputs()
         _, predicted, _ = chunked_cross_entropy(hidden, head, targets.astype(jnp.int32), 4)
         assert predicted.dtype == jnp.int32
@@ -172,7 +172,7 @@ def test_float64_states_and_head_compute_nothing_in_float32(tile):
     float32, the reference shared the float32 run's roundings of the head,
     so the run's distance from it understated the run's own rounding. It
     traces on the CPU backend, since a TPU has no float64."""
-    with jax.enable_x64(True), jax.default_device(jax.devices("cpu")[0]):
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         hidden, head, targets = jax.tree.map(
             lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
             inputs())
@@ -242,8 +242,8 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 # --- against the real backbone ---------------------------------------------
 
 def small_model(**overrides):
-    config = dict(vocab_size=97, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16, dtype=jnp.bfloat16)
+    config = {'vocab_size': 97, 'emb_features': 32, 'num_layers': 2, 'num_heads': 4,
+                  'mlp_features': 64, 'max_seq_len': 16, 'dtype': jnp.bfloat16}
     return CausalTransformer(**{**config, **overrides})
 
 
@@ -318,7 +318,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     flat_expected = jax.tree_util.tree_flatten_with_path(expected)[0]
     flat_got = jax.tree_util.tree_leaves(got)
     assert len(flat_expected) == len(flat_got)
-    for (path, want), have in zip(flat_expected, flat_got):
+    for (path, want), have in zip(flat_expected, flat_got, strict=True):
         largest = jnp.abs(want).max()
         name = jax.tree_util.keystr(path)
         assert largest > 0, f"{name} has a zero gradient, so nothing is checked"
@@ -397,7 +397,7 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
     got_loss, got = jax.jit(jax.value_and_grad(tiled, argnums=(0, 1)))(hidden, head)
 
     assert jnp.abs(got_loss - want_loss) <= 1e-5 * jnp.abs(want_loss)
-    for name, expected, actual in zip(("hidden", "head"), want, got):
+    for name, expected, actual in zip(("hidden", "head"), want, got, strict=True):
         largest = jnp.abs(expected).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(actual - expected).max() <= 1e-5 * largest, name
@@ -421,7 +421,7 @@ def test_the_softcap_gradient_survives_saturated_logits():
 
     expected = jax.grad(full, argnums=(0, 1, 2))(hidden, head, 30.)
     got = jax.grad(tiled, argnums=(0, 1, 2))(hidden, head, 30.)
-    for name, want, have in zip(("hidden", "head", "softcap"), expected, got):
+    for name, want, have in zip(("hidden", "head", "softcap"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         assert jnp.abs(have - want).max() <= 1e-5 * largest, name
@@ -500,7 +500,7 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     got = jax.grad(tiled, argnums=(0, 1))(hidden, head)
 
     assert got[0].dtype == hidden.dtype and got[1].dtype == head.dtype == dtype
-    for name, want, have in zip(("hidden", "head"), expected, got):
+    for name, want, have in zip(("hidden", "head"), expected, got, strict=True):
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
         half_ulp = jnp.spacing(jnp.abs(want).astype(dtype)).astype(jnp.float32) / 2
@@ -758,13 +758,15 @@ def test_the_forward_rounds_the_table_once_not_once_per_token_tile():
                      for sub in (param if isinstance(param, tuple) else (param,))
                      if isinstance(sub, jax.extend.core.ClosedJaxpr | jax.extend.core.Jaxpr)]
             for sub in inner:
-                found += converts(getattr(sub, "jaxpr", sub), looped or eqn.primitive.name in ("while", "scan"))
+                found += converts(
+                    getattr(sub, "jaxpr", sub), looped or eqn.primitive.name in ("while", "scan")
+                )
             if eqn.primitive.name == "convert_element_type" and eqn.outvars[0].aval.ndim == 2 \
                     and eqn.outvars[0].aval.shape[-1] == 16 and eqn.outvars[0].aval.dtype == jnp.bfloat16:
                 found.append((eqn.outvars[0].aval.shape, looped))
         return found
 
-    tables = converts(program.jaxpr, False)
+    tables = converts(program.jaxpr, looped=False)
     assert tables == [((64, 16), False)], tables
 
 
@@ -792,7 +794,7 @@ def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
             return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
         return loss
 
-    rounded = strict_or_rounded(True)
+    rounded = strict_or_rounded(round_logits=True)
     want_states, want_table = jax.grad(rounded, argnums=(0, 1))(hidden, table)
     have_states, have_table = jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
         states, matrix.T, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1))(hidden, table)
@@ -805,7 +807,7 @@ def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
 
     assert jnp.all(jnp.abs(have_states - want_states) <= slack * terms_states)
     assert jnp.all(jnp.abs(have_table - want_table) <= slack * terms_table)
-    strict_states, _ = jax.grad(strict_or_rounded(False), argnums=(0, 1))(hidden, table)
+    strict_states, _ = jax.grad(strict_or_rounded(round_logits=False), argnums=(0, 1))(hidden, table)
     assert not jnp.all(jnp.abs(strict_states - have_states) <= 2 ** -20 * terms_states)
 
 
@@ -858,7 +860,10 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
         bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
     else:
         bound = 2.0**-7
-    for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
+    for have, want in [
+        *zip(whole[::2], tiled[::2], strict=True),
+        *zip(whole_grads, tiled_grads, strict=True),
+    ]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
 

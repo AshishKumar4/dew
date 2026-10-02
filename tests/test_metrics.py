@@ -26,13 +26,11 @@ from test_chunked_cross_entropy import equations
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
     FID,
-    clip,
-    clip_score,
-    clip_score_metric,
-    fid,
+    PSNR,
+    SSIM,
+    CLIPDistance,
+    CLIPScore,
     peak_signal_noise_ratio as psnr,
-    psnr as psnr_metric,
-    ssim as ssim_metric,
     structural_similarity as ssim,
 )
 from dew.eval.fid import frechet_distance
@@ -80,17 +78,19 @@ def test_mean_metric_requires_a_direction_and_keeps_no_pass_state():
 
 
 def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
-    from dew import Checkpoints, Mean, Trainer, models
+    import optax
+
+    from dew import Checkpoints, Mean, Trainer
     from dew.artifacts import TokenScores
     from dew.data import Dataset, Loading
+    from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
-    import optax
 
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
     data = Dataset.from_records({"text": tokens}, batch=8, validation={"text": tokens},
                                 loading=Loading(workers=0, threads=1, read_buffer=1))
-    model = models.build("causal_transformer", vocab_size=4, emb_features=8, num_layers=1,
-                         num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
+    model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1,
+                              num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None)
     metric = Mean(lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
                   reads=TokenScores, name="accuracy", better="higher")
@@ -111,10 +111,11 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
 
 def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
+    import optax
+
     from dew import Checkpoints, Mean, Trainer
     from dew.data import Dataset, Loading
     from dew.objectives.base import Aux, Objective
-    import optax
 
     class Pixels(Objective):
         def init(self, key, variables=None):
@@ -240,7 +241,7 @@ def test_the_extractor_gives_pytorch_fids_features_and_distance_on_the_published
                                rtol=0, atol=1e-4)
     np.testing.assert_allclose(np.asarray(extract(unit_range(images_b))), reference["features_b"],
                                rtol=0, atol=1e-4)
-    assert fid(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
+    assert FID().score(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
 
 
 @pytest.mark.network
@@ -267,24 +268,24 @@ def fid_sets():
 
 
 def test_fid_refuses_an_image_set_it_cannot_score():
-    """Both sides of `fid` are uint8 [N, H, W, 3]. The refusal comes out of the
+    """Both sides of `FID.score` are uint8 [N, H, W, 3]. The refusal comes out of the
     batch parser before the extractor is asked for, so a call that cannot be
     scored never pays for the 90 MB of Inception weights, which is why this
     test needs no network."""
     images = np.zeros((4, 8, 8, 3), np.uint8)
     with pytest.raises(ValueError, match="generated: expected uint8"):
-        fid(images.astype(np.float32), images)
+        FID().score(images.astype(np.float32), images)
     with pytest.raises(ValueError, match="real: expected uint8"):
-        fid(images, images[0])
+        FID().score(images, images[0])
     with pytest.raises(ValueError, match="generated: no images"):
-        fid([], images)
+        FID().score([], images)
     with pytest.raises(ValueError, match="at least one image"):
-        fid(images, images, batch_size=0)
+        FID().score(images, images, batch_size=0)
 
 
 @pytest.mark.network
 def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it():
-    """`fid` scores two image sets with no objective, no dataset and no batch.
+    """`FID.score` scores two image sets with no objective, no dataset and no batch.
 
     One set twice has identical pooled statistics, so the distance is zero up
     to the rounding in the matrix square root. Observed -2.0e-05 with the
@@ -292,13 +293,13 @@ def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it()
     Adding 40 counts to every pixel moves the population, observed 10.6."""
     images, brighter = fid_sets()
 
-    assert abs(fid(images, images)) < 1e-3
-    assert fid(brighter, images) > 0
+    assert abs(FID().score(images, images)) < 1e-3
+    assert FID().score(brighter, images) > 0
 
 
 def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     """`weights` names the extractor's variables as a safetensors file, the way
-    `clip_score(modelname=)` names a local CLIP, so a distance is computable
+    `CLIPScore(modelname)` names a local CLIP, so a distance is computable
     with no download.
 
     The committed fixture is this module's own InceptionV3 at a sixteenth of
@@ -317,9 +318,9 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     weights = str(INCEPTION_TINY)
     record = json.loads((INCEPTION_TINY.parent / "source.json").read_text())
 
-    assert abs(fid(images, images, weights=weights)) < 1e-6
-    shifted = fid(brighter, images, weights=weights)
-    assert 0 < shifted < fid(np.full_like(images, 128), images, weights=weights)
+    assert abs(FID(weights=weights).score(images, images)) < 1e-6
+    shifted = FID(weights=weights).score(brighter, images)
+    assert 0 < shifted < FID(weights=weights).score(np.full_like(images, 128), images)
 
     metric = FID(weights=weights)
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
@@ -376,7 +377,7 @@ def test_fid_extraction_is_independent_of_small_batch_boundaries():
 @pytest.mark.network
 def test_the_fid_metric_and_the_function_report_the_same_distance():
     """The registered metric is that same path with a trainer's artifact and
-    batch in front of it, so a validation pass lands on the number `fid` gives
+    batch in front of it, so a validation pass lands on the number `FID.score` gives
     for the same pixels.
 
     One pass over one batch splits nothing, so the features and the statistics
@@ -389,7 +390,7 @@ def test_the_fid_metric_and_the_function_report_the_same_distance():
 
     pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
 
-    assert pooled == pytest.approx(fid(brighter, images), rel=1e-6)
+    assert pooled == pytest.approx(FID().score(brighter, images), rel=1e-6)
 
 
 @pytest.mark.network
@@ -404,8 +405,8 @@ def test_fid_pools_a_streamed_set_into_the_distance_of_the_whole_set():
     rounds differently the same headroom."""
     images, brighter = fid_sets()
 
-    whole = fid(brighter, images)
-    streamed = fid([brighter[:7], brighter[7:]], images, batch_size=3)
+    whole = FID().score(brighter, images)
+    streamed = FID().score([brighter[:7], brighter[7:]], images, batch_size=3)
 
     assert streamed == pytest.approx(whole, rel=1e-5)
 
@@ -586,7 +587,7 @@ def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
 @pytest.mark.parametrize("shape", [(2, 32, 32, 3), (2, 3, 32, 32, 3), (2, 32, 32, 1)])
 def test_per_example_scores_have_one_entry_per_frame(rng, metric_fn, shape):
     key_x, key_noise = jax.random.split(rng)
-    x = _ramp_image((int(np.prod(shape[:-3])),) + shape[-3:], key_x).reshape(shape)
+    x = _ramp_image((int(np.prod(shape[:-3])), *shape[-3:]), key_x).reshape(shape)
     y = x + 0.1 * jax.random.normal(key_noise, x.shape)
     scores = metric_fn(x, y, data_range=2.0, per_example=True)
     assert scores.shape == (int(np.prod(shape[:-3])),)
@@ -605,13 +606,13 @@ def test_psnr_metric_scores_a_perfect_reconstruction_as_infinite(rng):
     """The trainer hands the metric the objective's [-1, 1] artifact and the
     loader's uint8 batch, and the same image on both sides has zero error."""
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    metric = psnr_metric()
+    metric = PSNR()
     assert np.isinf(metric.finalize(metric(ImageGrid(_normalised(batch)), batch)))
 
 
 def test_ssim_metric_scores_a_perfect_reconstruction_as_one(rng):
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    metric = ssim_metric()
+    metric = SSIM()
     assert metric.finalize(metric(ImageGrid(_normalised(batch)), batch)) == pytest.approx(1.0, abs=1e-4)
 
 
@@ -622,7 +623,7 @@ def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
     batch = {'image': jnp.full((2, 8, 8, 3), 100, dtype=jnp.uint8)}
     generated = jnp.full((2, 8, 8, 3), (151 - 127.5) / 127.5)
     expected = 10.0 * np.log10(2.0**2 / 0.4**2)
-    metric = psnr_metric()
+    metric = PSNR()
     assert metric.name == "psnr"
     assert metric.finalize(metric(ImageGrid(generated), batch)) == pytest.approx(expected, rel=1e-5)
 
@@ -636,14 +637,14 @@ def test_ssim_metric_matches_the_closed_form_on_constant_images():
     mu_y = (128 - 127.5) / 127.5
     c1 = (0.01 * 2.0) ** 2
     expected = c1 / (mu_y**2 + c1)
-    metric = ssim_metric()
+    metric = SSIM()
     assert metric.name == "ssim"
     assert metric.finalize(metric(ImageGrid(jnp.zeros((1, 16, 16, 1))), batch)) == pytest.approx(
         expected, rel=1e-4
     )
 
 
-@pytest.mark.parametrize("factory,raw", [(psnr_metric, psnr), (ssim_metric, ssim)],
+@pytest.mark.parametrize("factory,raw", [(PSNR, psnr), (SSIM, ssim)],
                          ids=["psnr", "ssim"])
 def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
     """A video run explicitly scores VideoGrid frames against the video field."""
@@ -658,10 +659,10 @@ def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
         float(raw(degraded, reference, data_range=2.0)), rel=1e-5)
 
 
-def test_the_registry_names_every_metric_factory():
+def test_the_registry_names_every_metric_class():
     """A run configures metrics through `dew.registry.metrics`, so a
-    factory that loses its decorator is a metric no run can ask for."""
-    assert registry['psnr'] is psnr_metric and registry.psnr is psnr_metric
+    class that loses its decorator is a metric no run can ask for."""
+    assert registry['psnr'] is PSNR and registry['ssim'] is SSIM and registry['clip'] is CLIPDistance
     assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
 
 
@@ -699,7 +700,7 @@ def test_clip_metric_scores_the_reference_cosine():
     mean(1 - cos): observed 3.2e-08 off it against a tolerance of 1e-5. Before
     the towers were vendored, the factory raised ImportError on
     `FlaxCLIPModel`, which transformers 5 removed."""
-    metric = clip(modelname=str(CLIP_TINY))
+    metric = CLIPDistance(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_similarity' and metric.reads is ImageGrid
     generated, batch, cosine = clip_fixture()
 
@@ -709,12 +710,23 @@ def test_clip_metric_scores_the_reference_cosine():
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
 
 
+def test_a_run_ranked_by_clip_distance_keeps_its_lowest():
+    """CLIP distance is 1 - cos, so the best checkpoint is the closest one:
+    the metric declares lower is better, and a selection by it minimizes."""
+    from dew.training.selection import Best
+    from dew.training.trainer import Trainer
+
+    metric = CLIPDistance(modelname="never/downloaded")
+    assert metric.shown.better == "lower"
+    assert Trainer._best_selection(Best(metric), [metric]).mode == "min"
+
+
 def test_clip_score_metric_clamps_the_reference_cosine():
     """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
     cosine (-0.072) among three positive ones, so the clamp does work here.
     Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
     against a tolerance of 1e-3 on a score of order 15."""
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_score'
     generated, batch, cosine = clip_fixture()
     assert (cosine < 0).any() and (cosine > 0).any()
@@ -727,7 +739,7 @@ def test_clip_score_metric_clamps_the_reference_cosine():
 
 
 def test_clip_score_over_images_and_prompts_is_the_metric_number():
-    """`clip_score` takes uint8 images and prompt strings, with no artifact
+    """`CLIPScore.score` takes uint8 images and prompt strings, with no artifact
     and no tokenized batch, and tokenizes them the way a run's loader does. It
     lands on the metric's value for the same fixture, and both land on the
     reference's own cosines: a different padding or truncation would move the
@@ -736,9 +748,9 @@ def test_clip_score_over_images_and_prompts_is_the_metric_number():
     prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
     images = np.load(CLIP_TINY / "reference.npz")["images"]
     generated, batch, cosine = clip_fixture()
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
 
-    score = clip_score(images, prompts, modelname=str(CLIP_TINY))
+    score = CLIPScore(str(CLIP_TINY)).score(images, prompts)
 
     pooled = metric.finalize(metric(ImageGrid(generated), batch))
     assert score == pytest.approx(pooled, abs=1e-9), f"{score} against {pooled}"
@@ -753,12 +765,12 @@ def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
     prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
     images = np.load(CLIP_TINY / "reference.npz")["images"]
 
-    whole = clip_score(images, prompts, modelname=str(CLIP_TINY))
-    batched = clip_score(images, prompts, modelname=str(CLIP_TINY), batch_size=3)
+    whole = CLIPScore(str(CLIP_TINY)).score(images, prompts)
+    batched = CLIPScore(str(CLIP_TINY)).score(images, prompts, batch_size=3)
 
     assert batched == pytest.approx(whole, rel=1e-6)
     with pytest.raises(ValueError, match="equal counts"):
-        clip_score(images, prompts[:2], modelname=str(CLIP_TINY))
+        CLIPScore(str(CLIP_TINY)).score(images, prompts[:2])
 
 
 def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
@@ -766,23 +778,29 @@ def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
     alike instead of overrunning the position table."""
     images = np.load(CLIP_TINY / "reference.npz")["images"][:1]
 
-    long = clip_score(images, [" ".join(["word"] * 500)], modelname=str(CLIP_TINY))
+    long = CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 500)])
 
     assert np.isfinite(long)
-    assert clip_score(images, [" ".join(["word"] * 600)], modelname=str(CLIP_TINY)) == long
+    assert CLIPScore(str(CLIP_TINY)).score(images, [" ".join(["word"] * 600)]) == long
 
 
 def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
     it to a dark pixel, which the old metric did; the score of an overshooting
     white image has to be the score of a white one."""
-    metric = clip_score_metric(modelname=str(CLIP_TINY))
+    metric = CLIPScore(modelname=str(CLIP_TINY))
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
-    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(metric(ImageGrid(white), batch))
-    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(metric(ImageGrid(-white), batch))
-    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(metric(ImageGrid(-white), batch))
+    assert metric.finalize(metric(ImageGrid(1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(-1.2 * white), batch)) == metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
+    assert metric.finalize(metric(ImageGrid(white), batch)) != metric.finalize(
+        metric(ImageGrid(-white), batch)
+    )
 
 
 @pytest.mark.parametrize("rows", [4, 12])
@@ -806,12 +824,12 @@ def test_constructing_a_metric_opens_no_weights(monkeypatch):
     def refused(*args, **kwargs):
         raise AssertionError("constructing a metric loaded weights")
 
-    monkeypatch.setattr(fid_module, "_get_inception", refused)
+    monkeypatch.setattr(fid_module, "_extractor", refused)
     monkeypatch.setattr(images_module, "_get_clip", refused)
 
     FID()
-    clip(modelname="never/downloaded")
-    clip_score_metric(modelname="never/downloaded")
+    CLIPDistance(modelname="never/downloaded")
+    CLIPScore(modelname="never/downloaded")
 
 
 ############################################################################################################
@@ -840,7 +858,7 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
 
     hostile = tmp_path / "hostile.pickle"
     hostile.write_bytes(pickle.dumps(print))
-    with pytest.raises(pickle.UnpicklingError, match="builtins.print"):
+    with pytest.raises(pickle.UnpicklingError, match=r"builtins.print"):
         load_arrays(hostile)
 
 

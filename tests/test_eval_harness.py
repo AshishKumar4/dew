@@ -18,10 +18,10 @@ from test_inference import make_lm_run
 
 pytest.importorskip("lm_eval")
 
-from lm_eval.api.instance import Instance  # noqa: E402  the extra has to be there first
+from lm_eval.api.instance import Instance
 
-from dew.eval.harness import DewLM  # noqa: E402
-from dew.inference import TextGeneration  # noqa: E402
+from dew.eval.harness import DewLM
+from dew.inference import TextGeneration
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 
@@ -78,7 +78,7 @@ def _pair(max_length: int, bos_directory=None):
 
     from dew.data.text import ByteTokenizer, HFTokenizer
     from dew.inference.pipeline import RunProcessor
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
     reference = _byte_tokenizer(bos_directory is not None)
@@ -87,7 +87,7 @@ def _pair(max_length: int, bos_directory=None):
     else:
         reference.save_pretrained(str(bos_directory))
         run_tokenizer = HFTokenizer(str(bos_directory), local_files_only=True)
-    loaded = load_pretrained(LLAMA, dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
     ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
                                 sampling=Sampling(eos_id=255)), batch_size=2)
@@ -129,8 +129,8 @@ def test_a_source_processor_reads_bos_off_the_tokenizer_it_holds():
     over it does not fall back to EOS."""
     from dew.interop.pretrained import Processor
 
-    assert Processor(_byte_tokenizer(True), {}, {}, 256).bos_id == BOS
-    assert Processor(_byte_tokenizer(False), {}, {}, 256).bos_id is None
+    assert Processor(_byte_tokenizer(bos=True), {}, {}, 256).bos_id == BOS
+    assert Processor(_byte_tokenizer(bos=False), {}, {}, 256).bos_id is None
 
 
 def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_path):
@@ -242,6 +242,17 @@ def test_the_registry_answers_dew_with_this_adapter_built_from_a_run(run):
     assert isinstance(built, DewLM) and built.batch_size == 2
     with pytest.raises(ValueError, match="name it with --model_args run="):
         get_model("dew").create_from_arg_string("batch_size=2")
+
+
+def test_the_registry_builds_a_run_that_kept_no_average(tmp_path):
+    """A run trained without an EMA loads its live weights through the
+    registry, as `dew.pipeline` loads it; asking for the average still refuses."""
+    from lm_eval.api.registry import get_model
+
+    make_lm_run(tmp_path, ema_decay=None)
+    assert isinstance(get_model("dew").create_from_arg_string(f"run={tmp_path}"), DewLM)
+    with pytest.raises(ValueError, match="keeps no EMA"):
+        DewLM.from_run(str(tmp_path), ema=True)
 
 
 @pytest.mark.network

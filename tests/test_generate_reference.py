@@ -41,7 +41,7 @@ from flax import struct
 from jax import lax
 from reference_error import FACTOR
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, generate
 from dew.sampling.strategies import Draws
@@ -55,7 +55,7 @@ SAMPLED = Sampling(temperature=0.7, top_k=20, top_p=0.9)
 @pytest.fixture(scope="module", params=FAMILIES)
 def family(request):
     directory = FIXTURES / request.param
-    pretrained = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     with np.load(directory / "generate.npz") as stored:
         fixture = {name: stored[name] for name in stored.files}
     return request.param, pretrained, fixture

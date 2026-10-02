@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Aux, Ratio, Shown, Variables, mean_loss
+from dew.objectives.base import Aux, Ratio, Shown, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
@@ -282,7 +282,7 @@ class GRPOObjective(LMObjective):
         weights = self._weights(terms, effective, keep)
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         pg = Ratio(jnp.sum(jnp.where(weights != 0, per_token, 0) * weights), mass)
-        pg_loss, _ = mean_loss(pg)
+        pg_loss, _ = pg.mean()
         metrics = {"pg": pg_loss, **{f"actor/{k}": v for k, v in aux.items()}, **metrics}
         if self.beta > 0:
             if step.ema is None:
@@ -291,7 +291,7 @@ class GRPOObjective(LMObjective):
                     "a GRPO run with beta above zero always freezes one")
             kl_terms = k3_kl(terms.policy, self.packed_log_probs(step.ema, batch))
             kl = Ratio(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
-            metrics["kl"], _ = mean_loss(kl)
+            metrics["kl"], _ = kl.mean()
             return Ratio(pg.total + self.beta * kl.total, mass), Aux[Variables](metrics)
         return pg, Aux[Variables](metrics)
 

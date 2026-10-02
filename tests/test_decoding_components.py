@@ -61,7 +61,7 @@ def rows(prompts, drawn, sides=("left", "right")):
     tokens = np.zeros((count, PROMPT + BUDGET), np.int32)
     valid = np.zeros((count, PROMPT + BUDGET), bool)
     step = np.zeros(count, np.int32)
-    for row, (prompt, drew) in enumerate(zip(prompts, drawn)):
+    for row, (prompt, drew) in enumerate(zip(prompts, drawn, strict=True)):
         start = PROMPT - len(prompt) if sides[row % len(sides)] == "left" else 0
         tokens[row, start:start + len(prompt)] = prompt
         valid[row, start:start + len(prompt)] = True
@@ -77,7 +77,7 @@ def rows(prompts, drawn, sides=("left", "right")):
 
 
 def histories(prompts, drawn):
-    return [list(prompt) + list(drew) for prompt, drew in zip(prompts, drawn)]
+    return [list(prompt) + list(drew) for prompt, drew in zip(prompts, drawn, strict=True)]
 
 
 def logits_of(count, seed=0):
@@ -211,7 +211,7 @@ def test_prompt_no_repeat_ngram_matches_the_reference_encoder_processor(size):
         EncoderNoRepeatNGramLogitsProcessor(size, torch.tensor([prompt], dtype=torch.long))(
             torch.tensor([history], dtype=torch.long),
             torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
-        for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn)))])
+        for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn), strict=True))])
     np.testing.assert_array_equal(np.isfinite(got), np.isfinite(want))
     np.testing.assert_allclose(np.where(np.isfinite(want), got, 0.0),
                                np.where(np.isfinite(want), want, 0.0), atol=1e-6, rtol=0)
@@ -249,7 +249,7 @@ def test_min_new_tokens_counts_only_the_drawn_tokens(count):
         MinNewTokensLengthLogitsProcessor(len(prompt), count, torch.tensor([2, 6]))(
             torch.tensor([history], dtype=torch.long),
             torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
-        for row, (prompt, history) in enumerate(zip(PROMPTS, histories(PROMPTS, DRAWN)))])
+        for row, (prompt, history) in enumerate(zip(PROMPTS, histories(PROMPTS, DRAWN), strict=True))])
     np.testing.assert_array_equal(np.isfinite(got), np.isfinite(want))
 
 
@@ -281,7 +281,7 @@ def test_begin_suppress_tokens_fires_at_the_first_drawn_token():
             SuppressTokensAtBeginLogitsProcessor([2, 6], len(prompt))(
                 torch.tensor([history], dtype=torch.long),
                 torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
-            for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn)))])
+            for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn), strict=True))])
         np.testing.assert_array_equal(np.isfinite(got), np.isfinite(want))
         assert np.isfinite(got[:, 2]).all() == (step == 1)
 
@@ -297,7 +297,7 @@ def test_exponential_decay_grows_the_eos_score_after_its_start():
         ExponentialDecayLengthPenalty((1, 1.4), torch.tensor([6]), len(prompt))(
             torch.tensor([history], dtype=torch.long),
             torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
-        for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn)))])
+        for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn), strict=True))])
     np.testing.assert_allclose(got, want, atol=1e-5, rtol=0)
     # The first row is three tokens past the start and the second one is at it,
     # so a penalty that ignored the count would not separate them.
@@ -341,8 +341,24 @@ def stop_string_tokenizer(tmp_path):
     from tokenizers import Tokenizer, decoders, models
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    pieces = ["st", "op", "sto", "pper", "las", "topper", "s", "to", "pped", "stop",
-              "at", "opera", "tion", "x", "yy"] + list("abcdef")
+    pieces = [
+        "st",
+        "op",
+        "sto",
+        "pper",
+        "las",
+        "topper",
+        "s",
+        "to",
+        "pped",
+        "stop",
+        "at",
+        "opera",
+        "tion",
+        "x",
+        "yy",
+        *list("abcdef"),
+    ]
     vocabulary = {"<unk>": 0}
     vocabulary.update({piece: index for index, piece in enumerate(pieces, start=1)})
     backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
@@ -409,8 +425,9 @@ def byte_level_tokenizer(tmp_path):
     """A byte-level BPE over all 256 bytes, so a code point splits in two."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
 
-    alphabet = {byte: char for char, byte in decoding.byte_alphabet().items()}
+    alphabet = bytes_to_unicode()
     backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [],
                                    unk_token=None))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -434,7 +451,7 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
     native = decoding.stop_strings(tokenizer, ["é", "stop"], 256)
     oracle = StopStringCriteria(tokenizer, ["é", "stop"])
     checked = jax.jit(decoding.criterion((native,)))
-    rows = [pair, [ord("a")] + pair, [pair[0]], [pair[1]], tokenizer.encode("stop"),
+    rows = [pair, [ord("a"), *pair], [pair[0]], [pair[1]], tokenizer.encode("stop"),
             tokenizer.encode("laststop"), tokenizer.encode("stopat"), tokenizer.encode("héllo")]
     for row in rows:
         width = len(row)

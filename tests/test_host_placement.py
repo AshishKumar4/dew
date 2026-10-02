@@ -37,7 +37,7 @@ import pytest
 from test_trainer import BATCH, Counting, Features, Regression, Spread, val_batches
 
 from dew.data import Dataset
-from dew.inference.banks import CheckpointBanks, HeldBanks, host_banked
+from dew.inference.banks import CheckpointBanks, HeldBanks
 from dew.nn.backbones.causal_transformer import StackView
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -55,7 +55,9 @@ def fit(layout, directory, steps):
     # features stands in for the plain regression and a metric reads them.
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                       checkpoints=checkpoints)
-    data = Dataset(train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH)
+    data = Dataset(
+        train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH
+    )
     state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2,
                         metrics=(Spread([]),))
     checkpoints.wait()
@@ -105,8 +107,8 @@ def test_a_layout_places_only_the_state_it_can_fetch():
 
 VOCAB = 32
 PROMPT = 5
-SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
-             mlp_features=32, max_seq_len=16)
+SHAPE = {"vocab_size": VOCAB, "emb_features": 16, "num_heads": 4, "num_kv_heads": 2,
+             "mlp_features": 32, "max_seq_len": 16}
 
 # Every layer kind whose parameters a bank has to hold and a fetched run has
 # to read: the dense block, the routed one, the two mixers with a state of
@@ -115,26 +117,26 @@ SHAPE = dict(vocab_size=VOCAB, emb_features=16, num_heads=4, num_kv_heads=2,
 # stack of nothing but runs of one, and one run cut into banks by
 # bank_layers.
 SHAPES = {
-    "dense": dict(num_layers=4),
-    "narrow": dict(num_layers=8, emb_features=4, num_heads=1, num_kv_heads=1, mlp_features=8),
-    "moe": dict(num_layers=4, mixture={"experts": 4, "top_k": 2, "bias": True}),
-    "gated_delta_net": dict(num_layers=4, layer_types=("linear_attention",) * 4,
-                            kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}),
-    "latent_attention": dict(num_layers=4, mixer={
+    "dense": {"num_layers": 4},
+    "narrow": {"num_layers": 8, "emb_features": 4, "num_heads": 1, "num_kv_heads": 1, "mlp_features": 8},
+    "moe": {"num_layers": 4, "mixture": {"experts": 4, "top_k": 2, "bias": True}},
+    "gated_delta_net": {"num_layers": 4, "layer_types": ("linear_attention",) * 4,
+                            "kinds": {"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}},
+    "latent_attention": {"num_layers": 4, "mixer": {
         "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
-        "qk_nope_head_dim": 4, "v_head_dim": 8}),
-    "indexed_latent_attention": dict(num_layers=4, mixer={
+        "qk_nope_head_dim": 4, "v_head_dim": 8}},
+    "indexed_latent_attention": {"num_layers": 4, "mixer": {
         "kind": "mla", "kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
         "qk_nope_head_dim": 4, "v_head_dim": 8, "index_n_heads": 2, "index_head_dim": 8,
-        "index_topk": 4}),
-    "untied_head": dict(num_layers=4, tie_embeddings=False),
-    "unequal_runs": dict(num_layers=5, layer_types=(
+        "index_topk": 4}},
+    "untied_head": {"num_layers": 4, "tie_embeddings": False},
+    "unequal_runs": {"num_layers": 5, "layer_types": (
         "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",
-        "full_attention"), kinds={"sliding_attention": {"window": 8}}),
-    "runs_of_one": dict(num_layers=3, layer_types=(
+        "full_attention"), "kinds": {"sliding_attention": {"window": 8}}},
+    "runs_of_one": {"num_layers": 3, "layer_types": (
         "full_attention", "sliding_attention", "full_attention"),
-        kinds={"sliding_attention": {"window": 8}}),
-    "capped_banks": dict(num_layers=6, bank_layers=2),
+        "kinds": {"sliding_attention": {"window": 8}}},
+    "capped_banks": {"num_layers": 6, "bank_layers": 2},
 }
 
 # The scanned stack against the plain loop. Both are fp32 evaluations of the
@@ -163,8 +165,8 @@ def pair(**overrides):
 
 def stores(scanned, variables, **kwargs):
     """The same weights banked twice: resident, and with the layers on the host."""
-    return (host_banked(scanned, HeldBanks(variables), layout=DEVICE, **kwargs),
-            host_banked(scanned, HeldBanks(variables), layout=BANKS, **kwargs))
+    return (HeldBanks(variables).place(scanned, layout=DEVICE, **kwargs),
+            HeldBanks(variables).place(scanned, layout=BANKS, **kwargs))
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -230,11 +232,11 @@ def test_a_bank_holds_the_layers_a_checkpoint_stores(tmp_path):
 def test_a_layout_offloads_only_the_layers_it_names():
     """Banks the patterns do not name stay on the device, and a stack split
     between the two places computes what the resident one computes."""
-    plain, scanned, variables, tokens = pair(num_layers=4, bank_layers=2)
+    _plain, scanned, variables, tokens = pair(num_layers=4, bank_layers=2)
     selected = Layout(min_shard=1, tolerance=1.0,
                       host_parameters=("params/layers_0", "params/layers_1"))
-    resident = host_banked(scanned, HeldBanks(variables), layout=DEVICE)
-    split = host_banked(scanned, HeldBanks(variables), layout=selected)
+    resident = HeldBanks(variables).place(scanned, layout=DEVICE)
+    split = HeldBanks(variables).place(scanned, layout=selected)
     kinds = {name: memory_kinds(tree) for name, tree in split["params"].items()}
     assert kinds == {"embed_tokens": {"device"}, "norm": {"device"},
                      "layers_0_1": {"pinned_host"}, "layers_2_3": {"device"}}
@@ -248,7 +250,7 @@ def test_a_run_split_between_the_two_memories_is_refused():
     _, scanned, variables, _ = pair(num_layers=4)
     half = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_0",))
     with pytest.raises(ValueError, match="layers 0 to 3 are one run"):
-        host_banked(scanned, HeldBanks(variables), layout=half)
+        HeldBanks(variables).place(scanned, layout=half)
 
 
 def test_a_run_whose_layers_offload_different_leaves_is_refused():
@@ -264,7 +266,7 @@ def test_a_run_whose_layers_offload_different_leaves_is_refused():
         "params/layers_0/self_attn/q_proj", "params/layers_1/mlp",
         "params/layers_2/self_attn/q_proj", "params/layers_3/mlp"))
     with pytest.raises(ValueError, match=r"disagree about .* of them"):
-        host_banked(scanned, HeldBanks(variables), layout=crossed)
+        HeldBanks(variables).place(scanned, layout=crossed)
 
 
 def test_a_selector_that_names_nothing_is_refused_beside_ones_that_do():
@@ -274,7 +276,7 @@ def test_a_selector_that_names_nothing_is_refused_beside_ones_that_do():
     stale = Layout(min_shard=1, tolerance=1.0,
                    host_parameters=("params/layers_*", "params/blocks_*"))
     with pytest.raises(ValueError, match=r"\['params/blocks_\*'\] names none"):
-        host_banked(scanned, HeldBanks(variables), layout=stale)
+        HeldBanks(variables).place(scanned, layout=stale)
 
 
 def test_a_load_leaves_the_source_it_borrowed_usable():
@@ -282,7 +284,7 @@ def test_a_load_leaves_the_source_it_borrowed_usable():
     caller's tree still scores what it scored before the load."""
     plain, scanned, variables, tokens = pair(num_layers=4)
     before = np.asarray(plain.apply(variables, tokens))
-    host_banked(scanned, HeldBanks(variables), layout=BANKS)
+    HeldBanks(variables).place(scanned, layout=BANKS)
     assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
     assert np.array_equal(np.asarray(plain.apply(variables, tokens)), before)
 
@@ -294,7 +296,7 @@ def test_an_offloaded_variable_no_layer_fetches_is_refused(pattern, held):
     which a tied head reads as well, would come over whole."""
     _, scanned, variables, _ = pair(num_layers=4, tie_embeddings=True)
     with pytest.raises(ValueError, match=f"stack does not fetch|{held}"):
-        host_banked(scanned, HeldBanks(variables),
+        HeldBanks(variables).place(scanned,
                     layout=Layout(min_shard=1, tolerance=1.0, host_parameters=(pattern,)))
 
 
@@ -303,7 +305,7 @@ def test_host_parameters_that_name_nothing_are_refused():
     device and save nothing, silently."""
     _, scanned, variables, _ = pair(num_layers=4)
     with pytest.raises(ValueError, match="names none of this tree"):
-        host_banked(scanned, HeldBanks(variables),
+        HeldBanks(variables).place(scanned,
                     layout=Layout(min_shard=1, tolerance=1.0,
                                   host_parameters=("params/blocks_*",)))
 
@@ -314,7 +316,7 @@ def test_inference_parameter_patterns_are_not_a_training_layout():
     trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0,
                                     host_parameters=("params/*",)))
-    with pytest.raises(ValueError, match="dew.inference.host_banked"):
+    with pytest.raises(ValueError, match="LayerBanks source's place"):
         trainer.place()
 
 
@@ -427,8 +429,8 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
     checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})
     checkpoints.wait()
 
-    resident = host_banked(scanned, CheckpointBanks(directory), layout=DEVICE)
-    on_host = host_banked(scanned, CheckpointBanks(directory), layout=BANKS)
+    resident = CheckpointBanks(directory).place(scanned, layout=DEVICE)
+    on_host = CheckpointBanks(directory).place(scanned, layout=BANKS)
     assert memory_kinds(on_host["params"]["layers_0_3"]) == {"pinned_host"}
     assert np.array_equal(np.asarray(scanned.apply(on_host, tokens)),
                           np.asarray(scanned.apply(resident, tokens)))
@@ -440,13 +442,11 @@ def test_a_checkpoint_restores_bank_by_bank_into_host_memory(tmp_path):
 def test_a_pipeline_over_stages_refuses_a_banked_store():
     """A pipeline stacks every stage's copy of a layer, which a store already
     banked by run cannot be reshaped into."""
-    from dew.training.distributed import build_mesh
 
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
-    with jax.set_mesh(build_mesh(MeshSpec(stage=2))):
-        with pytest.raises(ValueError, match="already banked by run"):
-            scanned.apply(on_host, tokens)
+    with jax.set_mesh(MeshSpec(stage=2).build()), pytest.raises(ValueError, match="already banked by run"):
+        scanned.apply(on_host, tokens)
 
 
 # --------------------------------------------------------------------------
@@ -483,8 +483,7 @@ def run_pool(directory: Path, processes: int, devices: int, **flags) -> list[dic
             stderr=subprocess.STDOUT, text=True, start_new_session=True))
     logs = []
     try:
-        for process in running:
-            logs.append(process.communicate(timeout=600)[0])
+        logs.extend(process.communicate(timeout=600)[0] for process in running)
     finally:
         for process in running:
             if process.poll() is None:
@@ -537,14 +536,14 @@ def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     model, variables, tokens, indices, media = fixture(kind)
     sites = model.bank_sites
     source = SyntheticBanks(HeldBanks(variables).shapes(), seed=17)
-    resident = host_banked(model, source, layout=DEVICE)
+    resident = source.place(model, layout=DEVICE)
     selected = SelectedReads(source, sites)
-    hosted = host_banked(model, selected, layout=host_layout(sites[0]))
+    hosted = selected.place(model, layout=host_layout(sites[0]))
     identical(scores(model, hosted, tokens, indices, media),
               scores(model, resident, tokens, indices, media))
     one = (model.clone(language_model=model.language_model.clone(bank_layers=1))
            if isinstance(model, MultimodalTransformer) else model.clone(bank_layers=1))
-    separate = host_banked(one, source, layout=DEVICE)
+    separate = source.place(one, layout=DEVICE)
     identical(unpack(separate, one.bank_sites, source.shapes()),
               unpack(resident, sites, source.shapes()))
 

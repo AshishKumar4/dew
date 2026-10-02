@@ -12,7 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import RMSNorm
 from .conv import Conv
 from .precision import at_least_fp32
-from .sharding import constrain, logical_axes
+from .sharding import constrain
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -81,12 +81,11 @@ class FourierEmbedding(nn.Module):
     The frequencies, already multiplied by `scale`, are the `constants`
     variable `frequencies`, so a checkpoint carries the table its weights
     learned against. `init` draws it from numpy's RandomState(42), which gives
-    the same table on every jax version, so a Dew checkpoint written before
-    the table became a variable restores with the table init draws
-    (`is_fourier_table`). A checkpoint converted from elsewhere brings its
-    own: FlaxDiff 0.2 (commit 3e3497e, the code flaxdiff 0.2.8 shipped) drew
-    its with `jax.random.normal`, whose stream changed in jax 0.5.0, and
-    FlaxDiff's main branch draws numpy's, as Dew does (commit 63f2427).
+    the same table on every jax version. A checkpoint converted from
+    elsewhere brings its own: FlaxDiff 0.2 (commit 3e3497e, the code flaxdiff
+    0.2.8 shipped) drew its with `jax.random.normal`, whose stream changed in
+    jax 0.5.0, and FlaxDiff's main branch draws numpy's, as Dew does (commit
+    63f2427).
     """
     features: int
     scale: float = 16
@@ -111,20 +110,6 @@ class FourierEmbedding(nn.Module):
         return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
 
 
-def is_fourier_table(path: jax.tree_util.KeyPath) -> bool:
-    """Whether `path`, the keys from a variables tree's root to one of its
-    leaves, names a `FourierEmbedding` table.
-
-    A checkpoint written before the table became a variable lacks it, and a
-    restore takes it from the model's init: the draw depends on nothing but
-    the module's `features` and `scale`, so it is the table those weights
-    trained against.
-    """
-    names = jax.tree_util.keystr(path, simple=True, separator="/").split("/")
-    return len(names) > 1 and names[0] == "constants" and names[-1] == "frequencies"
-
-
-@logical_axes({}, heuristic=(("DenseGeneral_*",),))
 class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
@@ -206,7 +191,6 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
-@logical_axes({}, heuristic=(("Conv_*",),))
 class Upsample(nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
     features: int
@@ -234,7 +218,6 @@ class Downsample(nn.Module):
                     dtype=self.dtype, precision=self.precision)(x)
 
 
-@logical_axes({}, heuristic=(("conv1",), ("conv2",), ("residual_conv",), ("temb_projection",)))
 class ResidualBlock(nn.Module):
     """Norm, activation, convolution, the projected time embedding added,
     norm, activation, convolution, plus the input (through a 1x1 convolution

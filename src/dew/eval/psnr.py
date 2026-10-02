@@ -43,7 +43,7 @@ def peak_signal_noise_ratio(
 
 
 @metrics("psnr")
-def psnr(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid) -> ImageMetric:
+class PSNR(ImageMetric):
     """Mean PSNR in dB between the sampled frames and the batch's, higher is
     better.
 
@@ -52,8 +52,10 @@ def psnr(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid)
     default data_range of 2.0 describes. `reads` names the artifact type the
     trainer hands this metric; a video run passes `VideoGrid`.
     """
-    def measure(artifact, batch):
-        samples, targets = paired(artifact, batch, field)
-        return peak_signal_noise_ratio(samples, targets, data_range, per_example=True)
 
-    return ImageMetric(name="psnr", measure=measure, reads=reads)
+    def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
+        def measure(artifact, batch):
+            samples, targets = paired(artifact, batch, field)
+            return peak_signal_noise_ratio(samples, targets, data_range, per_example=True)
+
+        super().__init__(name="psnr", measure=measure, reads=reads)

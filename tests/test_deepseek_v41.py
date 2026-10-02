@@ -37,7 +37,7 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
@@ -77,7 +77,7 @@ def fp32_matmuls():
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
 
 
@@ -147,10 +147,16 @@ def test_the_quantizers_round_as_the_release_kernels():
     x = np.concatenate([*blocks, np.stack([ties, -ties])]).astype(np.float32)
     x[3, :32] = 0
     for jax_quant, torch_quant in (
-            (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
-            (lambda v: fake_quant_fp4(v, 16, True),
-             lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn)),
-            (lambda v: fake_quant_fp4(v, 32, False), lambda v: kernels.fp4_act_quant(v, 32, inplace=True))):
+        (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
+        (
+            lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
+            lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn),
+        ),
+        (
+            lambda v: fake_quant_fp4(v, 32, e4m3_scale=False),
+            lambda v: kernels.fp4_act_quant(v, 32, inplace=True),
+        ),
+    ):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
         # under jit, where XLA GPU would delete a convert-pair rounding
         actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
@@ -186,8 +192,8 @@ def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, fo
 
 def test_the_quantizers_pass_their_gradient_straight_through():
     x = jnp.linspace(-3.0, 3.0, 64).reshape(2, 32)
-    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, True)):
-        np.testing.assert_array_equal(jax.grad(lambda v: jnp.sum(quant(v) * v))(x),
+    for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, e4m3_scale=True)):
+        np.testing.assert_array_equal(jax.grad(lambda v, quant=quant: jnp.sum(quant(v) * v))(x),
                                       quant(x) + x)
 
 
@@ -197,7 +203,7 @@ def test_a_value_far_past_the_clamp_reads_back_as_what_it_rounds_to():
     that is the forward value in either dtype. `x + (rounded - x)` rounds
     the correction when x is far from what it rounds to: summed in bf16 it
     gives 2560 for 1e5, summed in fp32 3072 for 1e10."""
-    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, True))
+    quantize = jax.jit(lambda v: fake_quant_fp4(v, 16, e4m3_scale=True))
     for dtype in (jnp.bfloat16, jnp.float32):
         big = jnp.asarray([[lead] + [3.0] * 15 for lead in (1e5, 1e10)], dtype)
         expected = np.zeros(big.shape, np.float32)
@@ -241,7 +247,9 @@ def released():
 
     config = json.loads((RELEASED / "config.json").read_text())
     record = translate_wrapper_config(config)
-    model = _wrapper_model(config, record, models.build("causal_transformer", record["text"]), dtype="float32")
+    model = _wrapper_model(
+        config, record, models.build("causal_transformer", record["text"]), dtype="float32"
+    )
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     return config, record, model, shapes
 
@@ -292,14 +300,18 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
 def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released):
     """No decoder weight of two or more axes is left to the shape heuristic
     unasked: the engram tables alone hold 384M rows a layer, which shard as
-    a vocabulary's do. The ViT's, like every tower's, are the heuristic's."""
-    from dew.nn.sharding import declared_axes, is_heuristic
+    a vocabulary's do. The hyper-connection mixes and DSpark's Markov tables
+    have no side worth naming, and the ViT's, like every tower's, are the
+    heuristic's."""
+    from dew.nn.sharding import declared_axes, parameter_path
 
+    heuristic = {"attn_hc", "ffn_hc", "markov_embed", "markov_head"}
     *_, shapes = released
     leaves = [(jax.tree_util.keystr(path), path, leaf)
               for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]]
     uncovered = [name for name, path, leaf in leaves if "['language_model']" in name and leaf.ndim >= 2
-                 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
+                 and declared_axes(path, leaf.ndim) is None
+                 and not heuristic.intersection(parameter_path(path))]
     assert uncovered == []
     engram = [declared_axes(path, leaf.ndim) for name, path, leaf in leaves
               if name.endswith("['engram']['embed']['embedding']")]
@@ -358,11 +370,15 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
         lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
     loss_close(value, "")
     loss_close(twin_value, "")
-    indexer = [np.max(np.abs(leaf)) for path, leaf in flatten_dict(gradient, sep=".").items() if ".indexer." in f".{path}."]
+    indexer = [
+        np.max(np.abs(leaf))
+        for path, leaf in flatten_dict(gradient, sep=".").items()
+        if ".indexer." in f".{path}."
+    ]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     loaded.save(tmp_path, variables=variables)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     held, again = flatten_dict(variables, sep="."), flatten_dict(dict(restored.variables), sep=".")
     assert held.keys() == again.keys()
     for name, leaf in again.items():
@@ -497,7 +513,9 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))
     variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding("logits")
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
+        "logits"
+    )
 
 
 def test_a_config_without_swiglu_limit_clamps_nothing():
@@ -514,7 +532,7 @@ def test_the_vision_half_matches_the_reference(tmp_path):
     through a prefill with the image and text steps after it, against the
     release's Transformer.forward with the quantizers off."""
     reference = np.load(TINY / "vision.npz")
-    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     (span, prompt_logits, steps), twin, _ = decided(
         lambda model, variables: vision_run(model, variables, reference), loaded.model, loaded.variables)
     assert_as_exact_as_the_reference(span, reference["vision_span"], TRUTH["vision_span"], "vision_span")
@@ -530,7 +548,7 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     positions change the n-gram ids of the text after them, so the fixture
     exercises both."""
     reference = np.load(TINY / "vision.npz")
-    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
@@ -541,6 +559,8 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
     hashed = [np.asarray(loaded.model.language_model.apply(
         language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
-        False, mask, method=lambda module, *inputs: module.engram_hashes(*inputs))) for mask in (media, None)]
+        decode=False, media=mask,
+        method=lambda module, tokens, valid, positions, *, decode, media: module.engram_hashes(
+            tokens, valid, positions, decode=decode, media=media))) for mask in (media, None)]
     after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
     assert np.any(hashed[0][:, after] != hashed[1][:, after])

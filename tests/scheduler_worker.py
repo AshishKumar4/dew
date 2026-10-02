@@ -39,12 +39,12 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.data import Dataset
+    from dew.data import DataPartition, Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler
     from dew.objectives.rl.sessions import Call, Session, Status
-    from dew.training import Layout, MeshSpec, Trainer, data_partition
+    from dew.training import Layout, MeshSpec, Trainer
 
     process = jax.process_index()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
@@ -59,7 +59,9 @@ def main() -> None:
                 call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), (3 + draw % 4, 4 + sample),
                             (-0.5 - 0.01 * sample, -0.25), "stop", version)
                 future = Future()
-                future.set_result(Session(str(task.id), "", 0, 0, (call,), Status.COMPLETED, float(sample), {}, ""))
+                future.set_result(
+                    Session(str(task.id), "", 0, 0, (call,), Status.COMPLETED, float(sample), {}, "")
+                )
                 futures.append(future)
             return futures
 
@@ -86,9 +88,15 @@ def main() -> None:
         return packed
 
     objective = GRPOObjective(model, seq_len=7, pretrained=params, behavior_importance=2.0)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(**json.loads(args.mesh)),
-                      layout=Layout(min_shard=TINY_SHARD), rollout=rollout)
-    partition = data_partition(trainer.device_mesh)
+    trainer = Trainer(
+        objective,
+        optax.sgd(0.1),
+        key=jax.random.key(5),
+        mesh=MeshSpec(**json.loads(args.mesh)),
+        layout=Layout(min_shard=TINY_SHARD),
+        rollout=rollout,
+    )
+    partition = DataPartition.of(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(objective, Scripted(), Publisher(), width=8, rows=partition.rows(TASKS),
                                  groups=2, max_lag=1, ahead=1)

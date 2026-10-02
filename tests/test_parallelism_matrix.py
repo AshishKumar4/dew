@@ -10,7 +10,12 @@ that runs no pipeline is; any other status is a defect. The models are the
 tool's zoo, sized so every layout divides them. Each row lists the layouts
 that split its model in a way no other row covers: a pair's second axis, a
 packed or masked column under a sequence split, a bidirectional exchange, a
-vision tower beside a pipelined decoder.
+vision tower beside a pipelined decoder, a tensor or sequence axis over
+experts.
+
+The tool draws every parameter an initializer leaves all zeros, so a
+DiT's zeroed output and modulations do not hide the layers above them
+from the first step's gradient (2 of its 70 leaves were judged before).
 
 A layout's data axis takes the devices its other axes leave, so on eight
 devices every pipeline below splits the rows over data. The rows of
@@ -27,7 +32,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "dense_dpo": ("fsdp4", "sequence4"),
     "dense_grpo": ("tensor4", "sequence4"),
     "dense_mdlm": ("sequence4", "fsdp2_tensor2"),
-    "moe_grpo": ("expert4", "expert2_fsdp2"),
+    "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4"),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
@@ -48,7 +53,7 @@ CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
       for model, layouts in sorted(CELLS_ON_FOUR.items()))])
 def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layouts, devices):
     tool = load("layout_parity")
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         rows = tool.run([model], layouts, dtype="float32", steps=1, anchor=True, mixture={},
                         objective={}, references=tool.References(), speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
