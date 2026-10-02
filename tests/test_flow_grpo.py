@@ -526,7 +526,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     previewed = objective.preview(initial.params, prompts, step)
     tokens = {keyword: prompts[condition.field] for keyword, condition in inputs.conditions.items()}
     conditions = objective.encode(initial.params["encoders"], tokens)
-    denoiser = process.denoiser(model, objective.trainable(initial.params), conditions,
+    denoiser = process.denoiser(model, objective.model_variables(initial.params), conditions,
                                objective.encode(initial.params["encoders"]))
     noise_key, sample_key = jax.random.split(step.key)
     expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),

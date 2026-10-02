@@ -86,7 +86,7 @@ def test_the_objective_adds_the_weighted_alignment_to_the_denoising_mean(kind):
 
     plain = DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
                                solver=Euler(), steps=2)
-    denoising, _ = plain.scalar_loss({**objective.trainable(params), "encoders": params["encoders"]},
+    denoising, _ = plain.scalar_loss({**objective.model_variables(params), "encoders": params["encoders"]},
                                batch, step)
     # REPA's total is mse + proj_coeff * alignment; Dew's L2 halves the
     # first, so the second is halved with it: 0.5 / 2.

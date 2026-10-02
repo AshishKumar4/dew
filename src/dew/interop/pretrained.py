@@ -83,6 +83,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
 
     from dew.lora import LoRA
+    from dew.objectives.diffusion import DiffusionObjective
     from dew.objectives.lm import LMObjective
     from dew.training.distributed import Layout, MeshSpec
 
@@ -764,8 +765,10 @@ class PretrainedBlockDecoder(Pretrained):
 @dataclass(frozen=True, kw_only=True)
 class PretrainedPipeline(Pretrained):
     """A latent diffusion pipeline: the denoiser as `model`, its processes,
-    conditions and autoencoder, and the policy the source calls it with.
-    `save` writes one tensor set per component, in the diffusers layout."""
+    conditions and autoencoder, and the policy the source calls it with. It
+    samples, fine-tunes by denoising and takes a low-rank adapter on its
+    denoiser; `save` writes one tensor set per component, in the diffusers
+    layout."""
 
     process: Process
     inputs: InputSpec
@@ -780,17 +783,70 @@ class PretrainedPipeline(Pretrained):
                            grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
+    def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
+             rslora: bool = False, dropout: float = 0.0) -> PretrainedPipeline:
+        """Return this pipeline with a fresh low-rank adapter on the denoiser projections `modules` name.
+
+        `modules` match the denoiser's projections alone, by their names
+        relative to its component (`to_q`, `attn.to_out.0`), so the text
+        towers and the VAE stay as published. The bundle that comes back
+        holds the adapted denoiser, the variables with the factors in them
+        (B zero, so it samples what the source does) and the adapter:
+        `diffusion_objective` trains the factors alone, `adapter.save` writes
+        the Diffusers file the family's `load_lora_weights` reads, and `save`
+        writes the pipeline with the factors merged in. `dew.lora.LoRA.fresh`
+        describes the arguments.
+        """
+        from dew.lora import LoRA
+
+        if self.adapter is not None:
+            raise ValueError("this bundle already carries an adapter; adapt the source it was made from")
+        denoiser = {name: layout for name, layout in self.layouts.items() if layout.paths[0][0] == "params"}
+        adapter, variables = LoRA.fresh(self.model, self.variables, denoiser, rank=rank, modules=modules,
+                                        key=key, alpha=alpha, rslora=rslora, dropout=dropout)
+        return replace(self, model=adapter.adapt(self.model), variables=variables, adapter=adapter)
+
+    def diffusion_objective(self, **options) -> DiffusionObjective:
+        """Build denoising training from this pipeline's denoiser, process, conditions and autoencoder.
+
+        `options` are `DiffusionObjective`'s training and evaluation
+        controls. This bundle supplies `pretrained` itself, evaluation
+        samples the way the source does (its solver, step count and
+        guidance) unless they are passed, and an adapted bundle supplies its
+        adapter's filter as `trainable`, so the run moves the factors alone.
+        The text towers and the VAE never train. An inpainting pipeline
+        trains on masks an image dataset does not carry, and is refused.
+        """
+        from dew.objectives.diffusion import DiffusionObjective
+
+        if "pretrained" in options:
+            raise ValueError("a Pretrained bundle already supplies the initial variables; omit pretrained=")
+        if self.inputs.mask is not None:
+            raise ValueError("an inpainting pipeline trains on masks an image dataset does not carry")
+        if self.adapter is not None:
+            if "trainable" in options:
+                raise ValueError("the adapter already selects what trains, its own factors; omit trainable=")
+            options["trainable"] = self.adapter.trainable
+        policy = {"solver": self.schedule.solver, "steps": self.task.steps, "guidance": self.task.guidance}
+        return DiffusionObjective(self.model, self.process, self.inputs, autoencoder=self.autoencoder,
+                                  pretrained=self.variables, **{**policy, **options})
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         raise ValueError("a diffusion source writes one tensor set per component; save it instead")
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write each component's tensors and config in the diffusers layout."""
+        """Write each component's tensors and config in the diffusers layout,
+        an adapted bundle's factors merged into the denoiser's kernels
+        (PEFT's `merge_and_unload`) from its variables or a trainer's split
+        of them; `adapter.save` writes the factors alone."""
         from dew.interop import diffusion
 
         self._quantization()
-        diffusion.save_source(self, self.variables if variables is None else variables, Path(directory))
+        values = self.variables if variables is None else variables
+        if self.adapter is not None:
+            values = self.adapter.merge(values)
+        diffusion.save_source(self, values, Path(directory))
 
 
 @dataclass(frozen=True)

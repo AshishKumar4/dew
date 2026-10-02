@@ -308,7 +308,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         effective = jnp.where(warm, iteration, self.tangent_warmup
                               + (iteration - self.tangent_warmup) // self.student_update_freq)
         def student_losses(params):
-            student_params = self.trainable(params)
+            student_params = self.model_variables(params)
             total = jnp.zeros((count,), jnp.float32)
             if self.consistency_weight > 0 and self.consistency == "discrete":
                 network = self._network(student_params, given)
@@ -337,7 +337,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             generate, time_key, noise_key = jax.random.split(generate_key, 3)
             x_T = jax.random.normal(noise_key, samples.shape)
             generated = jax.lax.stop_gradient(self._generated(
-                self.trainable(params), given, x_T, generate, iteration - effective - 1))
+                self.model_variables(params), given, x_T, generate, iteration - effective - 1))
             t = self._times(time_key, count, self.critic_times)
             noise = jax.random.normal(jax.random.fold_in(noise_key, 1), samples.shape)
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
