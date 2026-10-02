@@ -696,6 +696,8 @@ class CausalTransformer(nn.Module):
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
+    parallel_residual: bool = False
+    """Attention and feed-forward read the same residual, as GPT-NeoX does."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -1393,7 +1395,7 @@ class CausalTransformer(nn.Module):
             nope=self.position_embedding != 'rotary')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
