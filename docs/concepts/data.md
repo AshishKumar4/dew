@@ -125,6 +125,31 @@ The default reads in the training process, as Grain's own default does. Worker p
 
 Image sources can need network access the first time. Token-window sources read files written by `dew tokenize`. Streaming sources can depend on remote servers and may have no position to restore. [Recipes](../recipes.md) lists the command-line entry points and [Installation](../installation.md#optional-extras) the extras each source needs. `OnlineImages` and `OnlineVideos` (`data:online-videos` in a recipe) stream Hugging Face tables of urls and captions. `OnlineVideos` decodes each url's video the way `LocalVideos` reads a file: `frames` consecutive frames at 25 fps, resized to `image_size` squares, without audio.
 
+## Image datasets on the Hugging Face Hub
+
+`HFImages` reads a Hub image dataset by index through the image pipeline: decode, resize to `image_size`, augmentation, and captions for text conditioning. Its column fields say where a record keeps its fields. `image_column` holds the image, the caption is the first of `caption_columns` a record has, and `label_column` is the class index a record carries as `label`. CIFAR-10 keeps its image under `img`, a class under `label` and no caption:
+
+<!-- not run: downloads CIFAR-10 on first use -->
+```python
+from dew.data import DataPartition, HFImages
+
+data = HFImages(name="uoft-cs/cifar10", image_column="img", caption_columns=(),
+                image_size=32, augmentation="flip_only", val_split="test",
+                val_batches=None).load(batch=64)
+batch = next(data.train(DataPartition()))
+print({name: (value.shape, value.dtype) for name, value in batch.items()})
+print(data.records, data.steps_per_epoch)
+```
+
+```text
+{'image': ((64, 32, 32, 3), dtype('uint8')), 'label': ((64,), dtype('int32'))}
+50000 781
+```
+
+`caption_columns=()` reads a dataset without captions, for an unconditional or class-conditional run, and refuses a caption reader. A column the split does not hold is refused when the spec loads, with the columns it does hold. Without `val_split`, `val_batches` batches are held out of the head of the training split; `val_batches=None` with a `val_split` scores the whole named split.
+
+Validation reads each image through the deterministic resize, without the crop, flip and jitter training applies, so a metric scores the images a reference implementation would. `augment_validation=True` applies the training augmentation to validation too, with draws that repeat on every pass. A run record written before this field existed reads it as on, which is what those runs did.
+
 ## Device image augmentation
 
 `OxfordFlowers`, `HFImages` and the prepared `ArrayRecordImages` readers share
@@ -172,10 +197,9 @@ local device. With several local devices, that device augments the whole
 local batch before the trainer redistributes the rows onto its mesh. This
 option does not shard augmentation across the local devices.
 
-Training and validation both use the configured crop, flip and colour jitter.
-The validation draws repeat per record on every pass, so validation is stable
-but cropped when `crop_scale` is below one. Use `augmentation="none"` on a
-separate validation spec when evaluation should use the full-image resize.
+Validation reads through the host's deterministic resize unless
+`augment_validation=True`, in which case it takes the training crop, flip and
+jitter on the same backend, with draws that repeat per record on every pass.
 
 Given identical crop/flip/colour parameters, the JAX op is tested against the
 OpenCV bilinear host op in float64. On the RTX 4080 the largest absolute error
