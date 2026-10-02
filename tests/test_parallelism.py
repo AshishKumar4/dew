@@ -39,6 +39,9 @@ BATCH = 8
 TINY = 256
 
 
+_DEFAULT_INIT_DECAY = optax.constant_schedule(0.999)
+
+
 class DeterministicObjective(Objective):
     """Squared error against the input, straight through the real DiT.
 
@@ -52,7 +55,7 @@ class DeterministicObjective(Objective):
 
     artifact = Representations
 
-    def __init__(self, decay=optax.constant_schedule(0.999), emb_features=32):
+    def __init__(self, decay=_DEFAULT_INIT_DECAY, emb_features=32):
         self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
                                num_heads=2, mlp_ratio=1)
         self.ema = EMASpec(decay=decay)

@@ -38,7 +38,10 @@ RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
 
 
-def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
+_DEFAULT_RUN_CONFIG_PRESET = presets.EDM()
+
+
+def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder="stub_text", checkpoint="stub-clip"):
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
@@ -49,7 +52,10 @@ def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint=
         text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
-def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip", steps=2):
+_DEFAULT_MAKE_RUN_PRESET = presets.EDM()
+
+
+def make_run(directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder="stub_text", checkpoint="stub-clip", steps=2):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build. A directory that already holds the run resumes

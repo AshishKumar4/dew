@@ -73,7 +73,10 @@ class StubText(ConditionEncoder[str]):
         return {"checkpoint": self.checkpoint}
 
 
-def make_objective(*, guidance: CFG | None = CFG(2.0)):
+_DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
+
+
+def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
     model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})

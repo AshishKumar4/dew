@@ -1042,7 +1042,10 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     assert sorted(index for index, _, _ in seen + rest[:4]) == list(range(8, 16))
 
 
-def _validated(length, val_batches, batch, partition=DataPartition(), **read):
+_DEFAULT_VALIDATED_PARTITION = DataPartition()
+
+
+def _validated(length, val_batches, batch, partition=_DEFAULT_VALIDATED_PARTITION, **read):
     """{record index: (pixels, caption)} for one share's validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
                       loading=Loading(workers=0, worker_buffer=1, **read)).load(
