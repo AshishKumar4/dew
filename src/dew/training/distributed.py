@@ -300,7 +300,7 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
 
 HOST_RESIDENT = ("variables", "opt_state", "ema")
 """The train-state fields a layout may keep in pinned host memory between
-steps. Naming params selects a CPU-owned complete transaction state, including
+steps. Naming variables selects a CPU-owned complete transaction state, including
 optimizer, EMA and accumulation. The accelerator scan fetches parameter rows
 and rematerialization refetches them in backward. Naming only opt_state or
 ema retains accelerator execution with pinned-host storage."""
