@@ -22,7 +22,7 @@ from socketserver import ThreadingTCPServer
 
 TEXT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 IMAGE_MODEL = "dewml/hybrid-dit-176m"
-MAX_QUEUE = 32
+MAX_QUEUE = 64
 
 
 @dataclass(frozen=True)
@@ -169,6 +169,11 @@ class Inference:
             active = remaining
 
 
+class DemoHTTPServer(ThreadingTCPServer):
+    request_queue_size = MAX_QUEUE
+    allow_reuse_address = True
+
+
 def main():
     kind = os.environ["DEW_DEMO_KIND"]
     if kind not in ("text", "image"):
@@ -215,7 +220,7 @@ def main():
             except Exception as error:
                 self.reply(503, {"error": str(error)})
 
-    ThreadingTCPServer(("0.0.0.0", 8888), Handler).serve_forever()
+    DemoHTTPServer(("0.0.0.0", 8888), Handler).serve_forever()
 
 
 if __name__ == "__main__":

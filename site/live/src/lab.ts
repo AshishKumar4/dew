@@ -146,10 +146,14 @@ export class SnapshotLab extends DurableObject<Env> {
 		const started = Date.now();
 		const rows = await Promise.all(Array.from({ length: count }, async () => {
 			const begin = Date.now();
+			try {
 			const response = await port.fetch('http://container/generate', { method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ prompt: 'The capital of France is', key: 0, tokens: 24 }) });
 			return { status: response.status, seconds: (Date.now() - begin) / 1000, result: await response.json() };
+			} catch (error) {
+				return { status: 503, seconds: (Date.now() - begin) / 1000, error: String(error) };
+			}
 		}));
 		return { count, totalSeconds: (Date.now() - started) / 1000, rows };
 	}
