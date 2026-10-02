@@ -2118,7 +2118,8 @@ APART = {"xla_gpu_dot_merger_threshold_mb": 0}
     ("v6e", "", 4, False, None),
     ("cpu", "", 4, True, None),
 ])
-def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, tokens, frozen, expected):
+def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, flags, tokens, frozen,
+                                                       expected):
     """A GPU training step runs dots that share an input apart, where XLA's
     merger would concatenate their weights every step, except a step beside
     frozen weights on 128 tokens or fewer a device (32 rows of 4 at most), which
