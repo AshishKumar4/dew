@@ -205,7 +205,8 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
 # How the display shows the metrics the trainer itself logs; an objective,
 # a rollout and a validation metric declare their own (`Shown`).
 TRAINER_SHOWN = {"loss": Shown(better="lower"),
-                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "grad_norm": Shown(group="optimizer"), "learning_rate": Shown(group="optimizer"),
+                 "loss_scale": Shown(group="optimizer"),
                  "accepted": Shown(percent=True, group="optimizer"),
                  "step_time_ms": Shown(better="lower", group="throughput"),
                  "samples_per_sec": Shown(better="higher", group="throughput"),
@@ -1122,7 +1123,7 @@ class Trainer(Generic[Loss, Effects]):
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.params)
 
         def loss(params, batch, microstep, key, step, ema):
-            return self.objective.loss(
+            return self.objective._loss(
                 params, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(params, ema)))
 
         return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
@@ -1341,9 +1342,12 @@ class Trainer(Generic[Loss, Effects]):
         stop: Plateau | None = None,
         validation: Mapping[str, Reader] | None = None,
         restore_best: bool = False,
+        state: TrainState | None = None,
     ) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
-        step when the directory holds one.
+        step when the directory holds one. An explicit `state` takes precedence
+        over initialization and checkpoint restoration; its input reader starts
+        at the position supplied by `dataset`, not a checkpoint's data position.
 
         Every `log_every` steps the tracker receives the loss, the objective's
         metrics and the throughput.
@@ -1392,28 +1396,29 @@ class Trainer(Generic[Loss, Effects]):
                 validation=validation is not None
                 or (bool(eval_every or metrics) and dataset.val is not None),
             )
-            state, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints)
+            trained, complete = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
         finally:
             primary = sys.exception()
             error = self._closed(run, primary, profiler)
             if primary is None and error is not None:
                 raise error
         if complete:
-            return state
+            return trained
         if run.preempted is not None:
             raise Preempted(run.preempted)
         if restore_best and checkpoints is not None:
-            state, _ = checkpoints.restore(
+            trained, _ = checkpoints.restore(
                 jax.tree.map(
-                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), state
+                    lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), trained
                 ),
                 step="best",
             )
-        return state
+        return trained
 
     def _training_loop(self, plan: _FitPlan, run: _FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
-                       checkpoints: Checkpoints | None) -> tuple[TrainState, bool]:
+                       checkpoints: Checkpoints | None,
+                       initial: TrainState | None = None) -> tuple[TrainState, bool]:
         """Place the state, dispatch the numerical steps and finish their loop
         before resource cleanup. Returns the final state and whether the run
         was already complete, its last checkpoint written, so nothing ran.
@@ -1421,7 +1426,13 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
-        state, shardings, position = self.place()
+        if initial is None:
+            state, shardings, position = self.place()
+        else:
+            shardings = self.shardings(initial)
+            self.layout.check(initial.params, shardings.params, self.device_mesh)
+            state = jax.device_put(initial, shardings)
+            position = None
         run.last_checkpoint = time.perf_counter()
         if checkpoints is not None and checkpoints.latest is not None:
             run.stop_control = checkpoints.control(checkpoints.latest)
@@ -1453,6 +1464,8 @@ class Trainer(Generic[Loss, Effects]):
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
+                if not compiled:
+                    agreed("training input declaration", functools.partial(self._check_inputs, batch))
                 first_compile = not compiled
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
                 if first_compile:
@@ -1903,6 +1916,8 @@ class Trainer(Generic[Loss, Effects]):
         minutes or run out of memory before the error. Every other mesh's
         batch is checked with its stream (`_check_stream`), a ramp's at each
         of its stages."""
+        if metrics and eval_every is None:
+            raise ValueError("metrics need eval_every to schedule their validation pass")
         if stop is None or not isinstance(stop.metric, TrainingScalar):
             self._check_validation_is_read(eval_every, metrics, preview=preview)
         if self.mesh.stage > 1:
@@ -1956,6 +1971,25 @@ class Trainer(Generic[Loss, Effects]):
             return telemetry_profile.Profiler(profile.directory)
 
         return agreed("profiling window setup", own_window)
+
+    def _check_inputs(self, batch: Batch) -> None:
+        """Check the first real batch against the objective's declared sample and mask."""
+        inputs = getattr(self.objective, 'inputs', None)
+        if inputs is None:
+            return
+        for condition in inputs.conditions.values():
+            if condition.field not in batch:
+                raise ValueError(f"objective.inputs needs condition field {condition.field!r} "
+                                 "in the training batch")
+        for field in (inputs.sample, inputs.mask):
+            if field is None:
+                continue
+            if field.key not in batch:
+                raise ValueError(f"objective.inputs needs field {field.key!r} in the training batch")
+            actual = batch[field.key].shape[1:]
+            if tuple(actual) != tuple(field.shape):
+                raise ValueError(f"objective.inputs field {field.key!r} declares shape {field.shape}, "
+                                 f"but the first training batch has shape {actual}")
 
     def _check_batch(self, batch: int, mesh: Mesh) -> None:
         """Refuse, before anything is placed, a global batch the mesh cannot

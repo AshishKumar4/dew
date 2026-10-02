@@ -190,7 +190,7 @@ class Transaction:
         other one, and `step` takes either.
         """
         def loss(trainable):
-            return self.objective.loss({**variables, "params": trainable}, batch, step_info)
+            return self.objective._loss({**variables, "params": trainable}, batch, step_info)
         stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
         return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
 
@@ -401,6 +401,7 @@ class Transaction:
         advanced = chosen(accepted, numerical, state)
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
+        aux = dataclasses.replace(aux, metrics={**aux.metrics, "grad_norm": optax.tree.norm(gradient)})
         return advanced, loss, aux
 
     def step(self, *, realize=None, host=False):
