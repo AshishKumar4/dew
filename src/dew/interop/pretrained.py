@@ -88,14 +88,8 @@ if TYPE_CHECKING:
 
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Map a per-expert leaf path to the stacked leaf the loaded tree holds.
-
-    A checkpoint that names one tensor per expert maps through the family
-    to `experts/K/projection/kernel`, a path `hf_decoders._stack_experts`
-    consumed on the way in: the tree keeps one `experts/projection/kernel`
-    stacked in expert order, so that leaf and K are where the tensor's
-    values live.
-    """
+    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
+    `experts/K/projection/kernel` path into, and K."""
     if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
             and path[-1] == "kernel"):
         return (*path[:-3], path[-2], path[-1]), int(path[-3])
@@ -895,14 +889,9 @@ class _HiddenStatesText:
 
 @dataclass(frozen=True)
 class _Denoiser:
-    """Holds what one architecture contributes to a diffusion source.
-
-    Model construction and conditioning conventions use metadata only.
-    The weight reader is invoked only by a complete source load; a restored
-    conditioner can reuse the same architecture metadata without reading
-    denoiser or autoencoder weights. `text` is the family's text
-    conditioning: which components it reads, how it builds its encoder and
-    the unconditional row its pipeline guides against.
+    """Holds what one architecture contributes to a diffusion source, from
+    metadata alone: only a complete source load calls `weights`, and `text`
+    is how the family conditions on its prompt.
     """
 
     component: str
@@ -924,12 +913,10 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                            variables: Variables | None = None) -> PretrainedPipeline:
     """Read a published latent diffusion directory into native modules and variables.
 
-    Two denoiser families ship this layout: a UNet reading one or two CLIP
-    towers through cross attention, and an MM-DiT transformer reading them
-    jointly beside a T5 tower. The directory's own denoiser component selects
-    the family, and everything the families share - the autoencoder, the text
-    towers, the geometry, the conditioning, the safety head a file declares,
-    the schedule and the call policy - is read once here.
+    The directory's own denoiser component selects the family (`_denoiser`),
+    and everything the families share - the autoencoder, the text towers,
+    the geometry, the conditioning, the safety head a file declares, the
+    schedule and the call policy - is read once here.
 
     Supplied `variables` are a saved tree in this layout, bound as they are:
     every module is built from the directory's metadata and no weight file is
