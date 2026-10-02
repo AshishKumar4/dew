@@ -944,6 +944,12 @@ def _evaluation_parts(case: _EvaluationCase):
                 raise ValueError("tracker rendering failed")
             assert np.shape(artifact.features) == (8, 1)
 
+    batches, validation = _evaluation_data(case)
+    return Numerical, Ratio, Drawing, batches, validation
+
+
+def _evaluation_data(case: _EvaluationCase):
+    """The validation iterator and its failure lifecycle, separate from consumers."""
     def batches():
         try:
             count = 0 if case.failure == "empty" else (
@@ -965,7 +971,7 @@ def _evaluation_parts(case: _EvaluationCase):
             raise OSError("iterator construction failed")
         return batches()
 
-    return Numerical, Ratio, Drawing, batches, validation
+    return batches, validation
 
 
 def mode_evaluation_contract(args) -> dict:
@@ -1061,12 +1067,37 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed, "local": local}
 
 
+def _builtin_sampler_failure(kind, phase, source, rank, fault):
+    """A sampler failure at its public invocation or artifact preflight seam."""
+    import jax
+
+    import dew.sampling.text as text_sampling
+
+    def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
+        if phase == "generation" and rank == source:
+            raise fault
+        if kind == "diffusion":
+            result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
+        else:
+            result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
+        if phase == "preflight" and rank == source:
+            result = jax.device_put(result, jax.local_devices()[0])
+            result.delete()
+        if kind == "lm":
+            return text_sampling.Generation(
+                tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
+                terminated=jax.numpy.zeros((1,), bool),
+                behavior_log_probs=jax.numpy.zeros((1, 1)),
+                raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
+        return result
+    return sample_failure
+
+
 def mode_builtin_preview_failures(args) -> dict:
     """Exercise nested builtin preview failures while both ranks remain alive."""
     import jax
     import optax
 
-    import dew.sampling.text as text_sampling
     from dew.data import Dataset
     from dew.diffusion import presets
     from dew.diffusion.discrete import MDLM
@@ -1123,23 +1154,7 @@ def mode_builtin_preview_failures(args) -> dict:
                 data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(),
                                records=6, batch=6)
 
-                def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
-                    if phase == "generation" and rank == source:
-                        raise fault
-                    if kind == "diffusion":
-                        result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
-                    else:
-                        result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
-                    if phase == "preflight" and rank == source:
-                        result = jax.device_put(result, jax.local_devices()[0])
-                        result.delete()
-                    if kind == "lm":
-                        return text_sampling.Generation(
-                            tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
-                            terminated=jax.numpy.zeros((1,), bool),
-                            behavior_log_probs=jax.numpy.zeros((1, 1)),
-                            raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
-                    return result
+                sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
 
                 if phase == "setup":
                     if rank == source:
