@@ -280,14 +280,31 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
     return options or None
 
 
-def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled,
-                    mesh: Mesh, held: int = 0) -> tuple[jax.stages.Compiled, bool]:
+def compiled_if_it_fits(program: jax.stages.Lowered,
+                        options: jax.stages.CompilerOptions | None) -> jax.stages.Compiled | None:
+    """`program` compiled under `options`, or None where XLA refuses it for
+    memory. XLA:TPU checks a program's temporaries against HBM as it compiles
+    and raises RESOURCE_EXHAUSTED instead of returning an executable whose
+    memory `step_fits` could read, so the refusal is the step not fitting:
+    on a v6e Qwen3-0.6B at 16 x 1024 tokens asked for 38.47G of temporaries
+    beside 31.24G of HBM. Any other compile error raises."""
+    try:
+        return program.compile(options)
+    except jax.errors.JaxRuntimeError as error:
+        if not str(error).startswith('RESOURCE_EXHAUSTED'):
+            raise
+        _log.info("XLA refused the step for memory: %s", error)
+        return None
+
+
+def fitting_default(program: jax.stages.Lowered, executable: jax.stages.Compiled | None,
+                    mesh: Mesh, held: int = 0) -> tuple[jax.stages.Compiled | None, bool]:
     """Fall back to the step compiled under XLA's default options where it
     fits and the one compiled under `step_compiler_options` does not.
     Returns the step to run and whether it fits; `held` is `step_fits`'s.
     The Triton GEMM fusions can hold fewer temporaries, so XLA's defaults
     come back before the ladder's first rung."""
-    default = program.compile()
+    default = compiled_if_it_fits(program, None)
     if not step_fits(default, mesh, held):
         return executable, False
     _log.warning("the step fits the devices only with XLA's default options (Triton GEMM fusions, "
@@ -484,12 +501,13 @@ def fits_everywhere(headroom: int | None) -> bool:
     return bool(np.min(gathered) >= 0)
 
 
-def step_fits(executable: jax.stages.Compiled, mesh: Mesh, held: int = 0) -> bool:
+def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> bool:
     """Whether the compiled step fits the free memory of every device of
     `mesh` beside `held` bytes more on each, agreed across the processes that
-    hold them."""
+    hold them. A step XLA refused for memory (`compiled_if_it_fits`) does
+    not, and its process still takes part in the agreement."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return fits_everywhere(step_headroom(executable, local, held=held))
+    return fits_everywhere(-1 if executable is None else step_headroom(executable, local, held=held))
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
@@ -1267,7 +1285,7 @@ class Trainer(Generic[Loss, Effects]):
                 options = None if self._xla_defaults else step_compiler_options(
                     self.objective, _device_tokens(self.objective, batch, shards),
                     FROZEN in prepared.params)
-                self.executable = self.program.compile(options)
+                self.executable = compiled_if_it_fits(self.program, options)
                 fits = step_fits(self.executable, mesh, held)
                 if not fits and options is not None:
                     self.executable, fits = fitting_default(self.program, self.executable, mesh, held)
@@ -1281,6 +1299,9 @@ class Trainer(Generic[Loss, Effects]):
                     resumed = None
                 if fits or not recompute_more(self.objective):
                     break
+            if self.executable is None:
+                # XLA refused the last rung too: compile it once more for its refusal.
+                self.executable = self.program.compile(options)
             self.flops_per_step = compiled_flops(self.executable)
             self.links = links
         # The program compiled above, not the jit: a call through the jit
