@@ -856,13 +856,13 @@ class Checkpoints:
         """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
         if persistent is not None and (not self._complete(persistent) or
-                (self._open().metadata(persistent).custom_metadata or {}).get('weights_only', False)):
+                (self._step_metadata(persistent).custom_metadata or {}).get('weights_only', False)):
             persistent = max(
                 (
                     step
                     for step in self._open().all_steps()
                     if self._complete(step)
-                    and not (self._open().metadata(step).custom_metadata or {}).get("weights_only", False)
+                    and not (self._step_metadata(step).custom_metadata or {}).get("weights_only", False)
                 ),
                 default=None,
             )
