@@ -6,6 +6,7 @@ import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { pages } from '../src/manifest.mjs';
 import {
+	checkOnly,
 	contentRoot,
 	describe,
 	editUrl,
@@ -20,10 +21,12 @@ import {
 	writePage,
 } from './lib.mjs';
 
-await rm(contentRoot, { recursive: true, force: true });
-await rm(generatedRoot, { recursive: true, force: true });
-await rm(path.join(siteRoot, 'src/assets/repo'), { recursive: true, force: true });
-await rm(publicRepoRoot, { recursive: true, force: true });
+if (!checkOnly) {
+	await rm(contentRoot, { recursive: true, force: true });
+	await rm(generatedRoot, { recursive: true, force: true });
+	await rm(path.join(siteRoot, 'src/assets/repo'), { recursive: true, force: true });
+	await rm(publicRepoRoot, { recursive: true, force: true });
+}
 
 let count = 0;
 for (const page of pages) {
