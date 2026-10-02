@@ -298,3 +298,14 @@ def test_a_task_reads_an_older_record_with_the_spec_at_the_top_level(tmp_path):
     (tmp_path / "run.json").write_text(json.dumps(older))
     assert _saved_quantization(run_record(str(tmp_path))) == Quantization()
 
+
+
+def test_an_image_record_without_augment_validation_keeps_augmenting_its_validation():
+    """Image specs now score validation on unaugmented images; a record that
+    lacks the field was written when validation took the training
+    augmentation, and it reads back that way."""
+    run = DiffusionRunConfig.from_dict(record("hybrid-dit-176m-dfa94d6"))
+    assert run.data.augment_validation is True
+
+    written = json.loads(json.dumps(DiffusionRunConfig().to_dict()))
+    assert DiffusionRunConfig.from_dict(written).data.augment_validation is False
