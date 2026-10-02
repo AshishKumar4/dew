@@ -2061,7 +2061,8 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-                         ranking=ranking, control=control, weights_only=weights_only, rung=self._rung(), artifact=self.objective.inference_record())
+                         ranking=ranking, control=control, weights_only=weights_only,
+                         rung=self._rung(), artifact=self.objective.inference_record())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
