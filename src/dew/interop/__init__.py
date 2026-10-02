@@ -13,12 +13,22 @@ if TYPE_CHECKING:
     from .export import export_run
     from .hf_decoders import save_pretrained_decoder, translate_config, translate_weights
     from .hub import pull_from_hub, push_to_hub
-    from .pretrained import Pretrained, Processor, load_pretrained, split_revision
+    from .pretrained import (
+        Pretrained,
+        PretrainedBlockDecoder,
+        PretrainedDecoder,
+        PretrainedFallback,
+        PretrainedMaskedDecoder,
+        PretrainedPipeline,
+        Processor,
+        split_revision,
+    )
     from .safetensors_io import load_params, save_hf_layout, save_params
 
 _EXPORTS = {
-    "Pretrained": "pretrained", "Processor": "pretrained", "load_pretrained": "pretrained",
-    "split_revision": "pretrained",
+    **dict.fromkeys(("Pretrained", "PretrainedBlockDecoder", "PretrainedDecoder", "PretrainedFallback",
+                     "PretrainedMaskedDecoder", "PretrainedPipeline", "Processor", "split_revision"),
+                    "pretrained"),
     "dequantize_fp8_blocks": "codecs", "fp8_format": "codecs",
     "export_run": "export",
     "pull_from_hub": "hub", "push_to_hub": "hub",
@@ -40,12 +50,16 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "Pretrained",
+    "PretrainedBlockDecoder",
+    "PretrainedDecoder",
+    "PretrainedFallback",
+    "PretrainedMaskedDecoder",
+    "PretrainedPipeline",
     "Processor",
     "dequantize_fp8_blocks",
     "export_run",
     "fp8_format",
     "load_params",
-    "load_pretrained",
     "pull_from_hub",
     "push_to_hub",
     "save_hf_layout",

@@ -105,7 +105,7 @@ def test_a_pipeline_downloads_only_the_component_files_it_reads(hub, monkeypatch
     monkeypatch.setattr(pretrained, "_load_diffusion_source", lambda directory, index, **kwargs:
                         pretrained.Pretrained(None, {}, None, index, directory, {}))
 
-    loaded = pretrained.load_pretrained(repo)
+    loaded = pretrained.Pretrained.load(repo)
 
     assert loaded.source == fake.snapshot and loaded.revision == fake.commit
     assert sorted(fake.fetched) == sorted(
@@ -244,7 +244,7 @@ def test_a_gguf_repo_names_its_files_and_the_gguf_file_that_loads_one(hub):
     fake = hub("qwen3-4b-gguf")
 
     with pytest.raises(FileNotFoundError, match="gguf_file="):
-        pretrained.load_pretrained("unsloth/Qwen3-4B-GGUF")
+        pretrained.Pretrained.load("unsloth/Qwen3-4B-GGUF")
     assert fake.fetched == []
 
 
@@ -398,7 +398,7 @@ def leaf_dtypes(variables):
 def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
     """transformers' dtype='auto' rule: config.json's dtype, else the
     dtype of the first floating tensor."""
-    loaded = pretrained.load_pretrained(bf16_source(tmp_path, **stated), dtype="float32",
+    loaded = pretrained.Pretrained.load(bf16_source(tmp_path, **stated), dtype="float32",
                                         param_dtype="auto", attention_impl="xla")
 
     assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
@@ -454,7 +454,7 @@ def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
     config = {**fixture_config(name), "max_position_embeddings": 40960}
     (source / "config.json").write_text(json.dumps(config))
 
-    loaded = pretrained.load_pretrained(source, dtype="float32", attention_impl="xla")
+    loaded = pretrained.Pretrained.load(source, dtype="float32", attention_impl="xla")
     loaded.save(tmp_path / "saved")
 
     assert loaded.model.max_seq_len == 8192
@@ -482,9 +482,9 @@ def test_a_cached_repo_id_loads_offline_when_the_commit_lists_files_never_downlo
     (repo / "refs" / "main").write_text(commit)
     script = """
 import sys
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 for revision in (None, sys.argv[1]):
-    print(load_pretrained("dew/qwen3-tiny", revision=revision, dtype="float32").revision)
+    print(Pretrained.load("dew/qwen3-tiny", revision=revision, dtype="float32").revision)
 """
     run = subprocess.run([sys.executable, "-c", script, commit], capture_output=True, text=True,
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "HF_HUB_CACHE": str(tmp_path / "hub"),

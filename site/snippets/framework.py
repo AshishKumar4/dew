@@ -25,7 +25,7 @@ from dew.data import ByteTokenizer, Loading, Prompts, TokenWindows
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor
 from dew.inference.serving import Server
-from dew.interop import load_pretrained
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
@@ -177,7 +177,7 @@ def pretrained(out, smoke):
     if smoke:
         source = str(ROOT / "tests/fixtures/hf/qwen3-tiny")
     # Begin snippet: pretrained
-    bundle = load_pretrained(source, dtype="bfloat16", max_seq_len=128)
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     # End snippet: pretrained
     if smoke:
@@ -204,8 +204,8 @@ def pretrained(out, smoke):
 
 def serving(out, smoke):
     source = str(ROOT / "tests/fixtures/hf/qwen3-tiny") if smoke else "Qwen/Qwen3-0.6B"
-    bundle = load_pretrained(source, dtype="bfloat16", param_dtype="bfloat16",
-                             max_seq_len=128, mesh=MeshSpec())
+    bundle = PretrainedDecoder.load(source, dtype="bfloat16", param_dtype="bfloat16",
+                                    max_seq_len=128, mesh=MeshSpec())
     if smoke:
         bundle = replace(bundle, processor=RunProcessor(ByteTokenizer()))
         prompts = ["dew", "jax"]

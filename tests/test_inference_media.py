@@ -12,7 +12,7 @@ from steady_state import guarded
 from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import CFG, Heun
 
@@ -44,7 +44,7 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
 
 
 def test_canvas_raw_media_processing_reaches_the_real_conditioner():
-    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as reference:
         prompt = np.asarray(reference["image_prompt"])
         pixels = np.asarray(reference["pixels"])
@@ -107,7 +107,7 @@ def test_host_and_resident_media_generate_equivalent_public_results(family):
     from dew.training import Layout, MeshSpec
 
     directory = FIXTURE.parent / family
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
     if family == "diffusion-gemma-workflow":
         with np.load(directory / "reference.npz") as reference:
             tokens = reference["image_prompt"]

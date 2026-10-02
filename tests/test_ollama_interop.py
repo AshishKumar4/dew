@@ -55,7 +55,7 @@ from test_lm_recipe import load_recipe
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import save_pretrained_decoder
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
@@ -308,7 +308,7 @@ def test_zero_temperature_repeats_itself(client):
 def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     """The conversion repacked the computation, it did not change it.
 
-    The export is read back through `load_pretrained`, drawn from at
+    The export is read back through `Pretrained.load`, drawn from at
     temperature zero, and compared with the daemon handed the same policy as
     a `Sampling` value, which is what stops its penalties from standing
     between the checkpoint and the answer. The two agree token for token.
@@ -321,7 +321,7 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
 
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
@@ -352,7 +352,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
-    loaded = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
 
     worst = 0.0
     for prompt in PROMPTS:

@@ -248,7 +248,7 @@ def pretrained_config(recipe, tokens, pretrained, *args, model_config="{}"):
 
 def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     """The path a --pretrained user runs, end to end: a local HF-layout
-    checkpoint through load_pretrained, the tokenizer of the token
+    checkpoint through Pretrained.load, the tokenizer of the token
     files checked against the one the checkpoint records, a step taken on
     the loaded weights and the run spec written back.
 
@@ -275,7 +275,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     """Zero steps hold what the checkpoint carries, leaf for leaf: the load
     is a continuation, not a fresh init of the same shape."""
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -285,7 +285,7 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
 
     state = recipe.main(config)
 
-    expected = load_pretrained(str(checkpoint), dtype="float32",
+    expected = Pretrained.load(str(checkpoint), dtype="float32",
                                attention_impl="reference").variables
     for path, leaf in jax.tree_util.tree_flatten_with_path(expected["params"])[0]:
         held = state.params["params"]
@@ -364,7 +364,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
     `ollama create` and llama.cpp's converter refuse.
     """
     from dew.data.text import tokenizer_for
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     recipe = load_recipe()
     tokenizer = tokenizer_for(str(TOKENIZER), local_files_only=True)
@@ -384,9 +384,9 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
         "--tokenizer", str(TOKENIZER), "--trainer.name", "exported"))
 
     trained = tmp_path / "trained"
-    load_pretrained(str(checkpoint), dtype="float32", attention_impl="reference").save(
+    Pretrained.load(str(checkpoint), dtype="float32", attention_impl="reference").save(
         trained, variables=state.params)
-    again = load_pretrained(str(trained), dtype="float32", attention_impl="reference")
+    again = Pretrained.load(str(trained), dtype="float32", attention_impl="reference")
 
     assert again.processor is not None, "the saved export carries no tokenizer"
     generated = again.text_generation()("The trainer", 4, key=jax.random.key(0))
@@ -467,7 +467,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     scores its documents and weighs its padded tail at nothing. A batch that
     lost its segment ids on the way would count the tail as text."""
     from dew.data.dataset import DataPartition
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.objectives.base import Step
 
     recipe = load_recipe()
@@ -493,7 +493,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     state = recipe.main(config)
 
     assert int(state.updates) == 2
-    original = load_pretrained(str(checkpoint), dtype="float32", attention_impl="xla")
+    original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = recipe.build_masked_objective(config, original.model, original.model_config, None)
     batch = next(iter(config.data.load(batch=8).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
@@ -548,7 +548,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     A window is `--data.seq-len + 1` ids wide and masked diffusion has no
     shift, so the objective denoises all twelve; the trainer's step would
     raise on an eleven-token objective."""
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     recipe = load_recipe()
     checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
@@ -572,7 +572,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     state = recipe.main(config)
 
     assert int(state.updates) == 1
-    original = load_pretrained(str(checkpoint), dtype="float32", attention_impl="xla")
+    original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = recipe.build_masked_objective(
         config, original.model, original.model_config, original.variables)
     assert objective.seq_len == 12, "the objective has to take the window's whole width"
@@ -587,7 +587,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
 
 
 def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     recipe = load_recipe()
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
@@ -609,7 +609,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
     state = recipe.main(config)
     assert int(state.updates) == 1
-    original = load_pretrained(checkpoint, dtype="float32", attention_impl="xla")
+    original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla")
     initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
                      for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial)))
@@ -634,12 +634,12 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     import optax
 
     from dew import Dataset, Trainer
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.objectives.base import Step, thaw
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
-    source = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
                                         pretrained=source.variables)
     rows = jax.device_count()
@@ -652,7 +652,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
     source.save(tmp_path / "trained", variables=thaw(state.params))
 
-    read = load_pretrained(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
+    read = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
                                        pretrained=read.variables)
     rebuilt = restored.init(jax.random.key(0))

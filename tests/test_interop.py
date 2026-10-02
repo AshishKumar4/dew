@@ -284,7 +284,7 @@ def test_a_metadata_only_file_reads_empty(tmp_path):
 def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     """A bfloat16 checkpoint reads in its stored dtype and widens exactly,
     so the public fp32 default is unchanged."""
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     tensors, _ = read_file(source / "model.safetensors")
@@ -297,7 +297,7 @@ def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     (directory / "config.json").write_text((source / "config.json").read_text())
     write_file(bf16, directory / "model.safetensors", {"format": "pt"})
 
-    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
     leaves, _ = jax.tree_util.tree_flatten(loaded.variables)
     assert all(np.asarray(leaf).dtype == np.float32 for leaf in leaves)
@@ -326,12 +326,12 @@ def assert_parameter_storage(reference, actual, is_parameter):
     "llama-tiny", "gemma4-tiny-mm", "gemma-4-audio-tiny", "diffusion-gemma-workflow",
 ])
 def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_path, family):
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
 
     directory = Path(__file__).resolve().parent / "fixtures" / "hf" / family
-    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
-    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    masters = Pretrained.load(directory, dtype="bfloat16", attention_impl="xla")
+    native = Pretrained.load(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     master_model = masters.model.text if isinstance(masters.model, DiffusionGemma) else masters.model
     native_model = native.model.text if isinstance(native.model, DiffusionGemma) else native.model
     assert jnp.dtype(master_model.dtype) == jnp.dtype(jnp.bfloat16)
@@ -339,7 +339,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
     assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
     destination = tmp_path / "export"
     native.save(destination)
-    restored = load_pretrained(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    restored = Pretrained.load(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
     assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
     for before, after in zip(jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True):
         assert np.asarray(before).dtype == np.asarray(after).dtype
@@ -347,7 +347,7 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
 
 
 def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
-    from dew.interop import load_pretrained
+    from dew.interop import Pretrained
 
     source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     tensors, _ = read_file(source / "model.safetensors")
@@ -359,7 +359,7 @@ def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
     directory = tmp_path / "different-aliases"
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="tie_word_embeddings"):
-        load_pretrained(directory, param_dtype="bfloat16")
+        Pretrained.load(directory, param_dtype="bfloat16")
 
 
 # ---------------------------------------------------------------------------------
@@ -450,12 +450,12 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
 
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
-    a Hugging Face directory out, and `load_pretrained` reads it back at the
+    a Hugging Face directory out, and `Pretrained.load` reads it back at the
     logits the run's own task computes."""
     from test_inference import make_lm_run
 
     import dew
-    from dew.interop import export_run, load_pretrained
+    from dew.interop import Pretrained, export_run
 
     run = tmp_path / "run"
     run.mkdir()
@@ -468,7 +468,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "generation_config.json", "model.safetensors"}
     assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(task.model.apply(task.variables, ids)))
@@ -529,7 +529,7 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     the published config the run recorded rather than a derived one."""
     from test_inference import make_block_run
 
-    from dew.interop import export_run, load_pretrained
+    from dew.interop import Pretrained, export_run
 
     run = tmp_path / "run"
     run.mkdir()
@@ -538,7 +538,7 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
 
     export_run(str(run), destination, ema=False)
 
-    reloaded = load_pretrained(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
+    reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
     task = dew.pipeline(str(run), ema=False)
     # The export writes the layer scalars into the reference's buffers, so
     # the reloaded tree is the source's shape, not the run's; what has to

@@ -19,7 +19,7 @@ from safetensors.numpy import load_file
 
 from dew import Dataset, Trainer
 from dew.checkpoints import Checkpoints
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step
@@ -31,7 +31,7 @@ REFERENCES = FIXTURE / "reference"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
@@ -147,7 +147,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     assert_tree_close(updated.params, expected, 2e-6)
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     assert_tree_close(objective(readback).init(jax.random.key(0)), updated.params, 0)
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
@@ -160,7 +160,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters():
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    source = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = BlockDiffusionObjective(source.model, prompt_length=8, pad_token_id=0)
     parameters = jax.jit(objective.init)(jax.random.key(0))
     with np.load(directory / "reference.npz") as reference:
@@ -181,7 +181,7 @@ def test_fresh_diffusion_gemma_sft_initializes_and_trains_its_vision_parameters(
 def image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(directory / "reference.npz") as reference:
         pixels = jnp.asarray(reference["pixels"])
     pixels = jnp.concatenate([pixels, pixels[..., ::-1]], axis=-1)
@@ -299,7 +299,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert int(resumed.updates) == 2
 
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.params)
-    readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
+    readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, pretrained=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.params, 0)
     original_loss = obj.scalar_loss(resumed.params, {"text": inputs}, step)[0]

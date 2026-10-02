@@ -22,7 +22,7 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.data.dataset import Dataset
-from dew.interop.pretrained import load_pretrained
+from dew.interop.pretrained import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
@@ -35,7 +35,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
 @pytest.fixture(scope="module")
 def source():
-    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
     images = np.load(FIXTURE / "raw_images.npy")
     prompts = json.loads((FIXTURE / "prompts.json").read_text())
     assert loaded.processor is not None
@@ -100,7 +100,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     before = np.load(FIXTURE / "logits.npy")
     assert np.max(np.abs(np.asarray(output)[valid] - before[valid])) > 1e-3
     loaded.save(tmp_path, variables=state.params)
-    reloaded = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.params),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
@@ -138,7 +138,7 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
 def gemma4_video_batch():
     from transformers.video_utils import VideoMetadata
 
-    loaded = load_pretrained(FIXTURE.parent / 'gemma4-native-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURE.parent / 'gemma4-native-tiny', dtype='float32', attention_impl='reference')
     native = loaded.processor
     if native is None:
         raise ValueError('the Gemma4 fixture requires its saved Processor')
@@ -294,7 +294,7 @@ def test_public_cached_generation_preserves_image_conditioning(source):
 def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_path):
     """The exported HF buffers stay bitwise unchanged while AdamW updates weights."""
     directory = FIXTURE.parent / "gemma4-tiny-mm"
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     patches = np.load(directory / "pixels.npy")
     batch, count, _ = patches.shape
     side = int(count ** 0.5)
@@ -419,7 +419,7 @@ def _family(family: str):
     references, checkpoint, *_ = FAMILIES[family]
     directory = FIXTURE.parent / references
     source = FIXTURE.parent / checkpoint
-    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     images = np.load(directory / "raw_images.npy")
     waveforms = sorted(source.glob("waveform_*.npy"))
     assert loaded.processor is not None
@@ -460,7 +460,7 @@ def test_training_reaches_the_gemma3n_vision_drop_path():
 def audio_source(request):
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
     directory = FIXTURE.parent / request.param
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     meta = json.loads((directory / "meta.json").read_text())
     assert loaded.processor is not None
     inputs = loaded.processor(meta["prompts"], audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
@@ -490,7 +490,7 @@ def test_gemma3n_left_padded_batch_has_finite_gradients():
     finite derivative there the masked slot's zero upstream gradient became
     NaN in the embedding table (observed on the pad row alone).
     """
-    loaded = load_pretrained(FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference")
     model = loaded.model.language_model
     params = {"params": loaded.variables["params"]["language_model"]}
     tokens = jnp.asarray([[0, 0, 0, 5, 4, 7, 9, 3], [8, 4, 9, 7, 3, 2, 5, 6]], jnp.int32)
@@ -573,7 +573,7 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
     def trained(gradient, destination):
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
         loaded.save(destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)})
-        restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+        restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
         return restored, np.asarray(restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs()))[valid]
 
     restored, output = trained(gradient, tmp_path / "trained")

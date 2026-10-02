@@ -78,7 +78,7 @@ def _pair(max_length: int, bos_directory=None):
 
     from dew.data.text import ByteTokenizer, HFTokenizer
     from dew.inference.pipeline import RunProcessor
-    from dew.interop.pretrained import load_pretrained
+    from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
     reference = _byte_tokenizer(bos_directory is not None)
@@ -87,7 +87,7 @@ def _pair(max_length: int, bos_directory=None):
     else:
         reference.save_pretrained(str(bos_directory))
         run_tokenizer = HFTokenizer(str(bos_directory), local_files_only=True)
-    loaded = load_pretrained(LLAMA, dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
     ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
                                 sampling=Sampling(eos_id=255)), batch_size=2)

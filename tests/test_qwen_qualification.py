@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
 
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import _wrapper_sources, families, translate_config, translate_wrapper_config
 from dew.objectives.base import Step
 from dew.registry import models
@@ -29,7 +29,7 @@ def source(request):
     if request.param == "dense":
         pytest.importorskip("torchvision")
     directory = ROOT / f"qwen38-{request.param}-tiny"
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     assert loaded.processor is not None
     prompts = json.loads((directory / "prompts.json").read_text())
     if request.param == "dense":
@@ -116,7 +116,7 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
         lambda weight, grad: weight - reference["learning_rate"] * grad,
         loaded.variables["params"], gradient)}
     loaded.save(tmp_path, variables=variables)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     for before, after in zip(jax.tree.leaves(variables), jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(before, after)
     output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
@@ -128,7 +128,7 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
 
 
 def test_moe_shared_gate_cannot_be_replaced_by_an_ungated_branch():
-    loaded = load_pretrained(ROOT / "qwen38-moe-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(ROOT / "qwen38-moe-tiny", dtype="float32", attention_impl="reference")
     reference = np.load(ROOT / "qwen38-moe-tiny/reference.npz")
     wrong = loaded.model.clone(mixture=dataclasses.replace(loaded.model.mixture, shared_gate=False))
     output = wrong.apply(loaded.variables, reference["input_ids"], attention_mask=reference["attention_mask"].astype(bool))
@@ -211,7 +211,7 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
     variables = {**loaded.variables, "params": jax.tree.map(
         lambda weight, grad: weight - 1e-4 * grad, loaded.variables["params"], gradient)}
     loaded.save(tmp_path, variables=variables)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     hidden = restored.model.apply(restored.variables, inputs.tokens,
                                    method=restored.model.hidden_states, **inputs.kwargs())
     logits = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
@@ -228,7 +228,7 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
 def video_source():
     pytest.importorskip("torchvision")
     path = ROOT / "qwen38-dense-tiny"
-    loaded = load_pretrained(path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(path, dtype="float32", attention_impl="reference")
     assert loaded.processor is not None
     raw = json.loads((path / "video_inputs.json").read_text())
     inputs = loaded.processor(raw["prompts"], images=[[image] for image in np.load(path / "images.npy")],
@@ -285,7 +285,7 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     variables = {**loaded.variables, "params": jax.tree.map(
         lambda weight, grad: weight - 1e-4 * grad, loaded.variables["params"], gradient)}
     loaded.save(tmp_path, variables=variables)
-    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     logits = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["updated_logits"][valid], atol=1e-4, rtol=0)

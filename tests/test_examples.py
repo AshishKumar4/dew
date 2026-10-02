@@ -470,7 +470,7 @@ def test_train_rlvr_native_holds_one_copy_of_the_served_weights_after_pushes(tmp
                "    return packed\n"
                "RolloutScheduler.__call__ = counted\n"
                "example.main(example.Config(smoke=True, out=Path(sys.argv[1])))\n"
-               "source = example.load_pretrained(str(example.SMOKE_MODEL), dtype='float32')\n"
+               "source = example.PretrainedDecoder.load(str(example.SMOKE_MODEL), dtype='float32')\n"
                "shapes = collections.Counter(str(leaf.shape) for leaf in jax.tree.leaves(source.variables))\n"
                "print('counts', json.dumps({'updates': len(counts), 'shapes': shapes, 'live': counts[-1]}))\n")
     finished = subprocess.run([sys.executable, "-c", program, str(tmp_path)], cwd=REPO_ROOT, env=single_device(),

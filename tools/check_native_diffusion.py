@@ -17,7 +17,7 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import DenoisingInputs
 from dew.inputs import Condition, Field, unit_range
 from dew.inputs.diffusion import latent_image_conditions
-from dew.interop import load_pretrained
+from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
@@ -25,7 +25,7 @@ from dew.sampling.sample import sample
 
 
 def bundle(directory):
-    return load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
 
 
 def compare(errors, name, actual, expected, tolerance=5e-5):
