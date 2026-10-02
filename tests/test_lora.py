@@ -27,6 +27,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew import lora
@@ -807,6 +808,12 @@ def _sampled(task) -> np.ndarray:
     return np.asarray(task(PROMPTS, steps=2, key=1).host().images)
 
 
+def _wider(tree):
+    """Every floating leaf of `tree` in float64."""
+    return jax.tree.map(
+        lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+
+
 def _moved_b(tuned, seed: int):
     """The tuned variables with every B drawn away from zero, as a run leaves them."""
     keys = iter(jax.random.split(jax.random.key(seed), len(tuned.adapter.targets)))
@@ -819,13 +826,36 @@ def _moved_b(tuned, seed: int):
 def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, pipelines):
     """`source.lora(...)` binds the denoiser's projections the modules name,
     never a text tower's: `q_proj` names only CLIP and T5 projections here,
-    so it matches nothing. B starts at zero, so the adapted pipeline samples
-    exactly what the source does."""
+    so it matches nothing. B starts at zero, so the adapted denoiser computes
+    the source's own arithmetic plus exact zeros.
+
+    Called op by op, every base op sees the source's inputs, so one call
+    is bitwise the source's. Compiled whole, XLA fuses the zero branch's add
+    into the reductions that read a projection (the RMSNorms after `to_q`
+    and `to_k`), and how such a fusion vectorizes depends on the CPU: on
+    CI's AMD runner the two sampled programs part by a few float32 ulps. So
+    the sample is held to rounding, the adapted run as exact as the source,
+    both measured from the source in float64 (`reference_error`); a branch
+    that moved the output at all would sit far outside it."""
     source = pipelines[family]
     tuned = source.lora(rank=2, modules=DENOISER_MODULES, key=jax.random.key(0))
     assert source.adapter is None and tuned.adapter is not None
     assert tuned.adapter.targets and all(path[0] == "params" for path in tuned.adapter.targets)
-    np.testing.assert_array_equal(_sampled(tuned.text_to_image()), _sampled(source.text_to_image()))
+    task = source.text_to_image()
+    prepared = task.prepare(PROMPTS, key=1, steps=2)
+    time = jnp.full((prepared.noise.shape[0],), 0.7, jnp.float32)
+    called = [np.asarray(task.process.denoiser(bundle.model, bundle.variables, prepared.conditions)
+                         .raw(prepared.noise, time)) for bundle in (source, tuned)]
+    np.testing.assert_array_equal(*called)
+
+    def sampled(bundle, inputs) -> np.ndarray:
+        return np.asarray(bundle.text_to_image()(inputs, steps=2, key=1, decode=False).host().latents)
+
+    with jax.enable_x64():
+        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
+                                   variables=_wider(source.variables))
+        truth = sampled(wide, _wider(prepared))
+    assert_as_exact_as_the_reference(sampled(tuned, prepared), sampled(source, prepared), truth, family)
     with pytest.raises(ValueError, match="q_proj match no projection"):
         source.lora(rank=2, modules=("q_proj",), key=jax.random.key(0))
     with pytest.raises(ValueError, match="already carries an adapter"):
