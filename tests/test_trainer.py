@@ -158,6 +158,74 @@ def test_fit_trains_to_the_step_it_was_asked_for():
     assert int(state.step) == 4
 
 
+def test_integer_root_key_matches_a_typed_key_bit_exactly():
+    integer = Trainer(Regression(), optax.adam(1e-3), key=0)
+    typed = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    left = integer.fit(Data(), steps=3, log_every=1)
+    right = typed.fit(Data(), steps=3, log_every=1)
+    assert jax.tree.structure(left) == jax.tree.structure(right)
+    for actual, expected in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(actual)), np.asarray(raw_leaf(expected)))
+
+
+def test_integer_root_seed_is_recorded_at_fit_start():
+    from dew.telemetry.records import FitStarted
+
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(.1), key=23, tracker=tracker).fit(Data(), steps=1)
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.seed == 23
+
+
+def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
+    def build(path=None):
+        return Trainer(Regression(), optax.adam(1e-3), key=0,
+                       checkpoints=None if path is None else Checkpoints(str(path)))
+
+    baseline = build().fit(Data(), steps=4, log_every=1)
+    split = build(tmp_path / "typed")
+    prefix = split.fit(Data(), steps=2, checkpoint_every=1, log_every=1)
+    assert jnp.issubdtype(prefix.key.dtype, jax.dtypes.prng_key)
+    fresh = build(tmp_path / "typed")
+    restored, _, _ = fresh.place()
+    assert restored.key.dtype == prefix.key.dtype
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), jax.random.key_data(prefix.key))
+    resumed = fresh.fit(Data(), steps=4, checkpoint_every=1, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+def test_legacy_key_checkpoint_restores_as_a_typed_key(tmp_path):
+    reference = Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0))
+    baseline = reference.fit(Data(), steps=4, log_every=1)
+    prefix = Trainer(Regression(), optax.adam(1e-3), key=0).fit(Data(), steps=2, log_every=1)
+    legacy = dataclasses.replace(prefix, key=jax.random.key_data(prefix.key))
+    checkpoints = Checkpoints(str(tmp_path / "legacy"))
+    checkpoints.save(2, legacy, json.dumps({"index": 2}).encode(), share=DataPartition())
+    checkpoints.wait()
+    fresh = Trainer(Regression(), optax.adam(1e-3), key=0,
+                    checkpoints=Checkpoints(str(tmp_path / "legacy")))
+    restored, _, _ = fresh.place()
+    assert jnp.issubdtype(restored.key.dtype, jax.dtypes.prng_key)
+    np.testing.assert_array_equal(jax.random.key_data(restored.key), legacy.key)
+    resumed = fresh.fit(Data(), steps=4, log_every=1)
+    for left, right in zip(jax.tree.leaves(resumed), jax.tree.leaves(baseline), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(left)), np.asarray(raw_leaf(right)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_root_key_stays_replicated_on_a_multi_device_mesh():
+    trainer = Trainer(Regression(), optax.sgd(.1), key=0, mesh=MeshSpec(fsdp=2),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    state, shardings, _ = trainer.place()
+    legacy = dataclasses.replace(state, key=jax.random.key_data(state.key))
+    legacy_shardings = trainer.shardings(legacy)
+    assert shardings.key.spec == legacy_shardings.key.spec == jax.sharding.PartitionSpec()
+    assert state.key.sharding.mesh == shardings.key.mesh
+    for shard in state.key.addressable_shards:
+        np.testing.assert_array_equal(jax.random.key_data(shard.data), jax.random.key_data(state.key))
+
+
 def test_a_held_fit_error_releases_the_prefetch_iterator(monkeypatch):
     refs = []
 
@@ -234,11 +302,11 @@ def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
     hand, for a config whose every trainer-held field is off its default: one
     mapping from the config's names to this constructor's, in one place."""
     config = TrainerConfig(
-        batch_size=8, seed=7, steps=3, accumulation=2, dynamic_scale=True,
+        batch_size=8, key=7, steps=3, accumulation=2, dynamic_scale=True,
         mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
     objective, optimizer = Regression(), optax.sgd(0.1)
-    key = jax.random.key(config.seed)
+    key = jax.random.key(config.key)
     checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()
 
     built = Trainer.from_config(config, objective, optimizer, key=key,
@@ -447,6 +515,75 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     _, whole_place = Checkpoints(str(tmp_path / "whole/run")).restore(share=DataPartition())
     assert resumed_place == whole_place
     assert position.read(resumed_place).records == 4 * BATCH
+
+
+def ladder_lm_trainer(directory, fits):
+    """An LM trainer on a decoder whose fit check answers `fits(rung)` for
+    the rung each compile is at: (whether the head is tiled, the remat's
+    record). It stands in for the free memory a process finds."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    objective = LMObjective(model, seq_len=4)
+    trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
+
+    def headroom(executable, devices, held=0):
+        rung = (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat))
+        return 0 if fits(rung) else -1
+    return trainer, objective, headroom
+
+
+def lm_windows(tmp_path):
+    from dew.data import Loading, TokenWindows
+
+    tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
+    tokens.tofile(tmp_path / "train.bin")
+    tokens.tofile(tmp_path / "val.bin")
+    return TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
+                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+
+
+def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, monkeypatch):
+    """The rung a run settles on is part of what it resumes: a process that
+    restores the state finds other free memory than the one that built it
+    (on an A100 a Qwen3-1.7B run took 'full', and its resumed process,
+    without the fresh state's hole, 'minimal', and parted from step 70). The
+    resumed run compiles the checkpoint's rung where the step fits more
+    lightly too, and trains bit for bit as the uninterrupted one."""
+    def tiled_and_minimal(rung):
+        return rung in ((True, 'minimal'), (True, 'full'))
+
+    whole, _, headroom = ladder_lm_trainer(tmp_path / "whole", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    expected = whole.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", tiled_and_minimal)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
+    assert (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat)) == (
+        True, 'minimal')
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
+
+
+def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(tmp_path, monkeypatch, capsys):
+    """A process that cannot fit the rung its checkpoint trained on moves up
+    the ladder, never down, and says the run now computes otherwise."""
+    split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
+    capsys.readouterr()
+
+    resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
+    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
+    assert trainer_module.remat_record(objective.model.remat) == 'full'
+    assert "the rung its checkpoint trained on" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
@@ -874,8 +1011,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position, *, share=None):
-        save_local(step, state, position, share=share)
+    def save_then_stop(step, state, position, *, share=None, rung=None):
+        save_local(step, state, position, share=share, rung=rung)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -1801,6 +1938,40 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
     measured, baseline = (float(np.median(values)) for values in samples)
     assert measured < baseline * 1.04, (tokens, measured, baseline)
 
+
+
+@pytest.mark.mesh
+def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(monkeypatch):
+    """A held checkpoint reaches the state's JIT as a copy placed where the
+    state keeps each variable, sharded as it is, and the JIT takes those
+    buffers over. Handed over as they are, the arrays were placed below the
+    state and freed after it was built, a hole as large as the checkpoint:
+    on an A100 Qwen3-1.7B's 'minimal' rung then found no block for its
+    temporaries. The objective's own arrays stay as they were."""
+    from jax.tree_util import Partial
+
+    held = {}
+    put = jax.device_put
+
+    def recorded(x, *args, **kwargs):
+        out = put(x, *args, **kwargs)
+        if isinstance(out, Partial):
+            held.update(jax.tree_util.tree_leaves_with_path(out.keywords["variables"]))
+        return out
+
+    monkeypatch.setattr(jax, "device_put", recorded)
+    trainer, objective, weights = held_lm_trainer(mesh=MeshSpec(fsdp=jax.device_count()))
+    state, shardings, _ = trainer.place()
+    params = dict(jax.tree_util.tree_leaves_with_path(shardings.params))
+    sharded = 0
+    for path, leaf in jax.tree_util.tree_leaves_with_path(weights):
+        copy = held[path]
+        assert copy.is_deleted(), jax.tree_util.keystr(path)
+        assert copy.sharding == params[path], jax.tree_util.keystr(path)
+        sharded += not copy.sharding.is_fully_replicated
+        assert not leaf.is_deleted()
+    assert sharded
+    jax.tree.map(np.testing.assert_array_equal, state.params, weights)
 
 
 def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():

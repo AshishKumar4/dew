@@ -116,16 +116,16 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     assert dataclasses.replace(recorded, model=config.model) == config
     task = dew.pipeline(str(run))
     assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
-    drawn = task("the ", seed=1, sampling=Sampling(temperature=0))
+    drawn = task("the ", key=1, sampling=Sampling(temperature=0))
     assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
     np.testing.assert_array_equal(
         drawn.host().tokens,
-        TextGeneration(task.model, state.averaged)([list(b"the ")], 4, seed=1,
+        TextGeneration(task.model, state.averaged)([list(b"the ")], 4, key=1,
                                                    sampling=Sampling(temperature=0)).host().tokens)
     objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
     trained = objective.pipeline(state, processor=task.processor)
-    actual = task("the ", seed=11).host()
-    expected = trained("the ", seed=11).host()
+    actual = task("the ", key=11).host()
+    expected = trained("the ", key=11).host()
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
@@ -621,8 +621,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
     trained = recipe.build_block_objective(config, original.model, original.variables).pipeline(state, ema=False)
     prompt = [[4, 5, 6, 7]]
-    np.testing.assert_array_equal(task(prompt, 4, seed=9).host().tokens,
-                                  trained(prompt, 4, seed=9).host().tokens)
+    np.testing.assert_array_equal(task(prompt, 4, key=9).host().tokens,
+                                  trained(prompt, 4, key=9).host().tokens)
 
 
 def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):

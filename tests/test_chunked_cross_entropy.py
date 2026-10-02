@@ -18,6 +18,7 @@ short. The two reductions run in different orders, so nothing there is exact;
 the one case whose head is bf16 rounds at the end and holds to 1e-4.
 """
 
+import contextlib
 import math
 
 import jax
@@ -795,15 +796,33 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
         return outputs, jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1))(
             hidden, head, softcap)
 
-    (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
+    # fp32 products at full precision, so the fp32 bound below holds on a
+    # backend whose default fp32 product is TF32 too.
+    with (jax.default_matmul_precision("highest") if dtype == jnp.float32 else contextlib.nullcontext()):
+        (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
     assert jnp.array_equal(tiled[1], whole[1])
     # The two take log Z in a different order, so a probability can move by
     # an fp32 ulp; where the head's gradient multiplies bf16 operands, that
     # ulp can flip the cotangent's bf16 rounding: one bf16 ulp of an entry,
     # which is 2^-7 of an entry sitting at a power of two, the bottom of its
     # binade, and the flipped entry can be the largest.
-    # fp32 compute keeps fp32's order-of-summation bound.
-    bound = 2e-6 if dtype == jnp.float32 else 2.0**-7
+    # In fp32 each path's log Z is one running reduction over its row
+    # (`_row_terms`). A merge rounds the exponential that rescales a partial
+    # sum, the product and the add, three roundings, and XLA's merge order is
+    # not shown here, so its depth is taken as the row's V entries, the
+    # conservative count: the sum of positive terms is off by at most
+    # gamma(3V) relative, which is log Z's absolute error from the sum, and
+    # log Z = m + log(s) rounds twice more, gamma(2) |log Z|. A probability
+    # exp(x - log Z) carries that error relative and three roundings of its
+    # own, and a gradient entry sums V of them, V more roundings. Two paths,
+    # so twice gamma(4V + 5) + gamma(2) max |log Z|, 9.8e-4 here. Measured:
+    # 4.9e-6 of the largest entry on CPU and 1.5e-6 on an RTX 4080.
+    if dtype == jnp.float32:
+        def gamma(steps):
+            return steps * 2.0**-24 / (1 - steps * 2.0**-24)
+        bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
+    else:
+        bound = 2.0**-7
     for have, want in [*zip(whole[::2], tiled[::2]), *zip(whole_grads, tiled_grads)]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
@@ -848,3 +867,31 @@ def test_the_split_cotangent_reaches_its_products_in_bf16():
     dots = [equation for equation in program.jaxpr.eqns if equation.primitive.name == "dot_general"]
     assert len(dots) == 2
     assert all(v.aval.dtype == jnp.bfloat16 for equation in dots for v in equation.invars), dots
+
+
+@pytest.mark.parametrize("tile", [None, RAGGED])
+def test_the_head_gradient_reads_the_cotangents_bf16_high_half(tile):
+    """Under the bf16 algorithm the head's own gradient multiplies the logits'
+    cotangent as bf16, the value the state product's high half holds, so the
+    backward hands both products one bf16 copy of it rather than a second
+    rounding: XLA wrote three bf16 copies of a 4096 x 151936 cotangent for
+    Qwen3-0.6B's head where two carry it. Every product into a gradient
+    (the ones whose result is feature-wide) multiplies bf16 operands; the
+    tiled backward's logits products read fp32-stored bf16 values under the
+    algorithm, as its forward does."""
+    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
+    program = jax.make_jaxpr(jax.grad(lambda states, matrix: jnp.mean(chunked_cross_entropy(
+        states, matrix, targets, 4, tile=tile, precision=chunked.BF16)[0]), argnums=(0, 1)))(hidden, head)
+
+    def dots(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name == "dot_general":
+                yield equation
+            for param in equation.params.values():
+                for sub in (param if isinstance(param, tuple) else (param,)):
+                    if isinstance(sub, jax.extend.core.ClosedJaxpr | jax.extend.core.Jaxpr):
+                        yield from dots(getattr(sub, "jaxpr", sub))
+
+    found = [equation for equation in dots(program.jaxpr) if equation.outvars[0].aval.shape[-1] == 16]
+    assert len(found) >= 3, found
+    assert all(v.aval.dtype == jnp.bfloat16 for equation in found for v in equation.invars), found

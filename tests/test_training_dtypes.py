@@ -10,6 +10,7 @@ from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss
 from dew.training import Trainer
+from test_trainer import raw_leaf
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
@@ -98,6 +99,7 @@ class DenseObjective(Objective):
 
 def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=False):
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        got, want = raw_leaf(got), raw_leaf(want)
         assert got.dtype == want.dtype
         if moment_rounding and not exact and got.dtype == jnp.bfloat16:
             # A materialized accumulation boundary can round the gradient before

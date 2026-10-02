@@ -157,7 +157,7 @@ def test_top_k_top_p_and_min_p_reach_the_servers_sampler(client, continuation):
     of a model with nothing to choose.
     """
     def drawn(**controls: int | float) -> str:
-        return client(PROMPTS[0], DRAWN, seed=1234,
+        return client(PROMPTS[0], DRAWN, key=1234,
                       sampling=Sampling(temperature=1.0, **controls)).texts[0]
 
     assert drawn(top_k=1) == continuation

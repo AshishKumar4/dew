@@ -14,6 +14,7 @@ from dew.data import DataPartition
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
 from dew.objectives.base import under
 from dew.training import Trainer
+from test_trainer import raw_leaf
 
 
 @struct.dataclass
@@ -89,7 +90,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     run = train.compile(initial, data[0])
     # the step consumes the state
     start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     prefix, *_ = run(initial, data[0])
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
@@ -158,7 +159,7 @@ def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, 
     assert int(resumed.scale.fin_steps) == 0
     uninterrupted = trainer(composite).fit(Data(), steps=4)
     for want, got in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     class Unused(Data):
         def train(self, partition):
             raise AssertionError("same-target resume opened the data stream")
@@ -220,7 +221,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     run = train.compile(initial, data[0])
     # the step consumes the state
     start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
-                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(jax.random.key_data(initial.key)))
     partial, *_ = run(initial, data[0])
     for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.params), strict=True):
         np.testing.assert_array_equal(before, after)
@@ -238,7 +239,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
     expected_moe = objective.apply_effects(start, aux.effects)["moe"]
     for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.params["moe"]), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     # An independent role-mask equation catches a shared bug in both batching paths.
     if auxiliary is None:
@@ -293,10 +294,10 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     resumed, *_ = step(restored, data[1])
     resumed, *_ = step(resumed, data[2])
     for want, got in zip(jax.tree.leaves(final), jax.tree.leaves(resumed), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     template = {"params": jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.params)}
     selected, _ = checkpoints.restore(template, 1)
     for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["params"]), strict=True):
-        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 

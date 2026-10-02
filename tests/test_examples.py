@@ -295,7 +295,7 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
         sampling = Sampling(temperature=1.0, eos_id=eos)
         version = 0
 
-        def submit(self, prompt, max_new_tokens, *, seed):
+        def submit(self, prompt, max_new_tokens, *, key):
             program = failing if not runs else passing
             future = Future()
             future.set_result(Draw(tuple(prompt), (*program, eos), (-.5,) * 3, None, True, 0))

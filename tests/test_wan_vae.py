@@ -273,5 +273,5 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         Dataset(train=lambda partition: iter(lambda: batch, None), val=None, records=None, batch=8),
         steps=1, log_every=100)
-    sampled = objective.pipeline(state)(["a", "b"], seed=0).host()
+    sampled = objective.pipeline(state)(["a", "b"], key=0).host()
     assert sampled.images.shape == (2, 9, 32, 32, 3)

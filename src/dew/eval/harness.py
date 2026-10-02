@@ -294,7 +294,7 @@ class DewLM(TemplateLM):
             ids = self.tok_encode(context)[-(self.max_length - budget):]
             sampling = Sampling(temperature=float(controls.get("temperature", 0.0)),
                                 eos_id=self.task.sampling.eos_id)
-            drawn = self.task([ids], budget, seed=int(raw.get("seed", 0)), sampling=sampling)
+            drawn = self.task([ids], budget, key=int(raw.get("seed", 0)), sampling=sampling)
             stops = handle_stop_sequences(controls.get("until"), eos=eos)
             answers.append(postprocess_generated_text(self.task.decode(drawn)[0], stops, None))
         return answers

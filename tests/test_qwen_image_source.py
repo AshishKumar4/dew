@@ -285,14 +285,14 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, r
     assert task.guidance is None and pipeline["true_cfg"] == 1.0
     rows, columns = pipeline["height"] // 16, pipeline["width"] // 16
     initial = nhwc(arrays["pipeline.x_T"], rows, columns)
-    walked = task(task.prepare(pipeline["prompts"], initial=initial, seed=0),
+    walked = task(task.prepare(pipeline["prompts"], initial=initial, key=0),
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     for row, prompt in enumerate(pipeline["prompts"]):
         expected = nhwc(arrays[f"pipeline.latents.{row}"], rows, columns)[0]
         assert relative_gap(np.asarray(walked.latents)[row], expected) < 2e-5
         assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5
-        alone = task(task.prepare([prompt], initial=initial[row:row + 1], seed=0),
+        alone = task(task.prepare([prompt], initial=initial[row:row + 1], key=0),
                      key=jax.random.PRNGKey(0)).host()
         assert relative_gap(np.asarray(alone.latents)[0], expected) < 2e-5
 
@@ -354,7 +354,8 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        np.testing.assert_array_equal(got, want)
+        from test_trainer import raw_leaf
+        np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.params)

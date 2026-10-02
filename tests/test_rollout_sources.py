@@ -39,7 +39,7 @@ class Server:
     def sampling(self):
         return self._sampling
 
-    def submit(self, prompt, max_new_tokens, *, seed):
+    def submit(self, prompt, max_new_tokens, *, key):
         self.prompts.append(tuple(prompt))
         future = Future()
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
@@ -122,8 +122,8 @@ def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
     from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, SUPPORT_KEY
 
     class Recording(Server):
-        def submit(self, prompt, max_new_tokens, *, seed):
-            draw = super().submit(prompt, max_new_tokens, seed=seed).result()
+        def submit(self, prompt, max_new_tokens, *, key):
+            draw = super().submit(prompt, max_new_tokens, key=key).result()
             done = Future()
             done.set_result(replace(draw, routed_experts=np.full((len(prompt) + 1, 2, 1), len(prompt), np.uint8),
                                     support=((5, 6), (EOS,))))
@@ -232,8 +232,8 @@ def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch(
     from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, pack
 
     class Routed(Server):
-        def submit(self, prompt, max_new_tokens, *, seed):
-            future = super().submit(prompt, max_new_tokens, seed=seed)
+        def submit(self, prompt, max_new_tokens, *, key):
+            future = super().submit(prompt, max_new_tokens, key=key)
             draw = future.result()
             routed = np.full((len(draw.prompt) + len(draw.tokens) - 1, 2, 1), 3, np.uint8)
             done = Future()
@@ -250,7 +250,7 @@ def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch(
 
 def test_a_failed_draw_or_reward_is_an_infra_error():
     class Failing(Server):
-        def submit(self, prompt, max_new_tokens, *, seed):
+        def submit(self, prompt, max_new_tokens, *, key):
             future = Future()
             future.set_exception(ConnectionError("engine restarted"))
             return future

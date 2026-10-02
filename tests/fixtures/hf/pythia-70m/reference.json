@@ -1,0 +1,23 @@
+{
+  "checkpoint": "EleutherAI/pythia-70m",
+  "revision": "a39f36b100fe8a5377810d56c3f4789b9c53ac42",
+  "dtype": "float32",
+  "precision": "highest",
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cu130",
+  "jax": "0.11.2.post3",
+  "device": "NVIDIA GeForce RTX 4080",
+  "reference_attention": "eager",
+  "tf32": false,
+  "max_abs_error": 0.002197265625,
+  "bound": 0.009973074309527874,
+  "argmax_agreement": true,
+  "generated": [[510, 5347, 273, 6181, 310, 253, 5347, 273, 253, 2586, 13]],
+  "generation_agreement": true,
+  "reference_fp32_vs_fp64_rms": 0.0002741600998917667,
+  "dew_fp32_vs_reference_fp64_rms": 0.0005064763935335897,
+  "prior_erfc_max_error": 0.0125732421875,
+  "prior_erfc_fp64_rms": 0.002253912364018773,
+  "activation": "Ungated GELU follows Torch 1+erf, preserving its trained fp32 rounding. Existing gated activations retain their arithmetic.",
+  "command": "PYTHONPATH=src python tools/classic_gpt_reference.py --checkpoint EleutherAI/pythia-70m --revision a39f36b100fe8a5377810d56c3f4789b9c53ac42 --output pythia-parity.json"
+}

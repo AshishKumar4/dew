@@ -264,5 +264,5 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     for before, after in zip(jax.tree.leaves(initial.params["autoencoder"]),
                              jax.tree.leaves(state.params["autoencoder"]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    sampled = objective.pipeline(state)(["a", "b"], seed=0).host()
+    sampled = objective.pipeline(state)(["a", "b"], key=0).host()
     assert sampled.images.shape == (2, 64, 64, 3)

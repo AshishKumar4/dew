@@ -98,8 +98,8 @@ def banked(args) -> dict:
     resident_logits = local(scanned.apply(resident, tokens))
     host_logits = local(scanned.apply(on_host, tokens))
     sampling = Sampling(temperature=0.0)
-    resident_tokens = generate(scanned, resident, tokens, NEW_TOKENS, seed=0, sampling=sampling)
-    host_tokens = generate(scanned, on_host, tokens, NEW_TOKENS, seed=0, sampling=sampling)
+    resident_tokens = generate(scanned, resident, tokens, NEW_TOKENS, key=0, sampling=sampling)
+    host_tokens = generate(scanned, on_host, tokens, NEW_TOKENS, key=0, sampling=sampling)
 
     record = {
         "processes": jax.process_count(),
