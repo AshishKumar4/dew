@@ -147,7 +147,8 @@ class PPOObjective(Objective[Ratio, Variables]):
         """Bind the policy subtree when an episode collector supplies the full tree."""
         return _Policy(self.actor.policy(_part(variables, "policy")))
 
-    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None,
+                 processor: Processor | None = None) -> TextGeneration:
         """Publish the trained actor, without the critic or the frozen KL reference."""
         actor_state = replace(state, params=_part(state.params, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
