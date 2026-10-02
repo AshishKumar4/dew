@@ -46,7 +46,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import json_list_argument, ramped
-from dew.lora import LoRA, _attach
+from dew.lora import LoRA, _Adapted, _attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
@@ -101,6 +101,8 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
+    adapter: JsonDict | None = None
+    """The bound LoRA record; its factors are stored with the checkpoint variables."""
     dtype: registry.DtypeName | None = "bfloat16"
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
@@ -141,7 +143,12 @@ class ModelConfig:
     @classmethod
     def from_model(cls, model) -> Self:
         """The registered module's constructor fields, with its actual compute settings."""
-        architecture = models.name_of(type(model))
+        model_type = type(model)
+        adapter = None
+        if isinstance(model_type, _Adapted):
+            adapter = model_type._dew_lora_spec.to_json()
+            model_type = model_type._dew_lora_base
+        architecture = models.name_of(model_type)
         fields = {}
         compute, storage, attention = None, None, 'auto'
         precision: Literal['default', 'high', 'highest'] | None = None
@@ -169,12 +176,13 @@ class ModelConfig:
             elif callable(value) and value is field.default:
                 continue
             else:
-                fields[field.name] = _to_json(value, _declared_type(type(model), field.name))
-        return cls(architecture, fields, dtype=compute, param_dtype=storage,
+                fields[field.name] = _to_json(value, _declared_type(model_type, field.name))
+        return cls(architecture, fields, adapter=adapter, dtype=compute, param_dtype=storage,
                    matmul_precision=precision, attention_impl=attention)
 
     def build(self):
-        return models.build(self.architecture, self.fields())
+        model = models.build(self.architecture, self.fields())
+        return model if self.adapter is None else LoRA.from_json(self.adapter).adapt(model)
 
 
 @dataclasses.dataclass(frozen=True)

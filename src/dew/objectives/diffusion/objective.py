@@ -218,11 +218,13 @@ class DiffusionObjective(Objective[Ratio]):
     def inference_record(self):
         """Declare the model, input encoders and sampling convention of this step."""
         from dew.config import ModelConfig, _to_json
-        from dew.registry import models, objectives
-        if (not any(member is type(self.model) for member in models.values())
-                or not any(member is type(self) for member in objectives.values())):
+        from dew.registry import objectives
+        if not any(member is type(self) for member in objectives.values()):
             return None
-        model = ModelConfig.from_model(self.model)
+        try:
+            model = ModelConfig.from_model(self.model)
+        except (TypeError, ValueError):
+            return None
         return {'objective': objectives.name_of(type(self)), 'model': _to_json(model, ModelConfig),
                 'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),

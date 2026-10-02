@@ -427,7 +427,11 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     """
     member = models[name]
     declared = {f.name for f in dataclasses.fields(member) if f.init}
-    written: PrecisionFields = {"dtype": dtype, "attention_impl": attention_impl}
+    written: PrecisionFields = {}
+    if "dtype" in declared:
+        written["dtype"] = dtype
+    if "attention_impl" in declared:
+        written["attention_impl"] = attention_impl
     if param_dtype is not None and "param_dtype" in declared:
         written["param_dtype"] = param_dtype
     if matmul_precision is not None and "precision" in declared:
