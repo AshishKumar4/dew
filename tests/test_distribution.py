@@ -518,23 +518,28 @@ def resumed_where_it_stopped(tmp_path: Path, run) -> None:
     assert code == 0, output
     whole, resumed = (json.loads((tmp_path / name).read_text()) for name in ("whole.json", "resumed.json"))
     # The state, the key and the data position all came back: every loss
-    # after the stop is the uninterrupted run's, to the bit.
+    # after the stop is the uninterrupted run's, to the bit, and so is every
+    # leaf of the state it ends with.
     assert resumed["loss_steps"] == list(range(at + 1, steps + 1)), output
     assert resumed["losses"] == whole["losses"][at:], output
+    assert resumed["state_digest"] == whole["state_digest"], output
 
 
-@pytest.mark.mesh(devices=2)
-def test_a_pool_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_path):
+@pytest.mark.parametrize("processes", [pytest.param(2, marks=pytest.mark.mesh(devices=2)),
+                                       pytest.param(4, marks=pytest.mark.mesh(devices=4))])
+def test_a_pool_stopped_by_sigterm_checkpoints_and_resumes_where_it_stopped(tmp_path, processes):
     """A scheduler stops a job with SIGTERM and SIGKILLs it a grace later:
     Slurm's KillWait, Kubernetes' termination grace, a spot VM's notice.
     JAX's preemption service takes the signal in every rank of a pool, so the
     ranks ran on until the SIGKILL, and everything since the last checkpoint
     was lost. The fit now stops at the step the ranks agree on, writes that
     step's state and data position, and exits with SIGTERM's code; run
-    again, it resumes there."""
+    again, it resumes there, bit for bit the run it continues. A pool of four
+    over fsdp 4 is issue #11's: its resume against a continuous pool of four,
+    which reduces in the same order."""
     def run(arguments: list[str], stop: bool) -> tuple[int, str]:
-        pool = start("--processes-per-host", "2", "--", sys.executable, str(WORKER),
-                     "--mesh", json.dumps({"fsdp": 2}), *arguments, devices=1)
+        pool = start("--processes-per-host", str(processes), "--", sys.executable, str(WORKER),
+                     "--mesh", json.dumps({"fsdp": processes}), *arguments, devices=1)
         if stop:
             return stopped_by_sigterm(pool, "] step 2/")
         done = finished(pool, timeout=300)
