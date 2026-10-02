@@ -186,7 +186,7 @@ class Indexed(DatasetSpec):
     val_batches: int | None = None
     count: int | None = None
     seed: int = 0
-    loading: Loading = Loading(workers=0)
+    loading: Loading = dataclasses.field(default_factory=lambda: Loading(workers=0))
 
     def source(self):
         return _Indexed(self.length)
