@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from flax.core import unfreeze
 from jax.core import eval_context
 
 from dew.artifacts import ImageGrid, VideoGrid, agreed, collective_host
@@ -126,7 +127,7 @@ class FixedBlank:
 
     def __init__(self, inputs: InputSpec, encoders: Variables, precision):
         self.inputs = inputs
-        self.encoders = encoders
+        self.encoders = unfreeze(dict(encoders))
         self.precision = precision
 
     @cached_property
@@ -139,6 +140,19 @@ class FixedBlank:
             encoded = {keyword: condition.encoder.encode(self.encoders[keyword], tokens[keyword])
                        for keyword, condition in self.inputs.conditions.items()}
             return jax.tree.map(np.asarray, encoded)
+
+    def rebind(self, encoders: Variables) -> FixedBlank:
+        """Keep the cache when the bound encoder leaves are the same objects;
+        otherwise encode the new tree lazily at the recorded precision.
+        Identity checks do not synchronize device arrays or compare values.
+        """
+        previous, tree = jax.tree.flatten(self.encoders)
+        following, following_tree = jax.tree.flatten(unfreeze(dict(encoders)))
+        same_leaves = tree == following_tree and all(
+            left is right for left, right in zip(previous, following, strict=True))
+        if same_leaves:
+            return self
+        return FixedBlank(self.inputs, encoders, self.precision)
 
     def __call__(self, like: dict) -> dict:
         return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype), self.values, like)
@@ -257,7 +271,8 @@ class DiffusionObjective(Objective[Ratio]):
                 'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': _to_json(self.solver, type(self.solver)),
-                'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps}
+                'guidance': _to_json(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
+                'condition_precision': self._condition_precision}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`
