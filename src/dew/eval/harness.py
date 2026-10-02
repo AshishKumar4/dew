@@ -1,32 +1,22 @@
 """Run a saved run as an lm-evaluation-harness model.
 
-`DewLM` puts a `TextGeneration` behind lm-eval-harness's `TemplateLM`, so
-any task suite runs against a run directory. The trainer's own perplexity
-says how well a run predicts its training data and nothing about what it
-can do, which is the other question a suite answers.
+`DewLM` puts a `TextGeneration` behind lm-eval-harness's `TemplateLM`, so any
+task suite runs against a run directory.
 
-`lm_eval` is an optional extra (`pip install dewml[eval-harness]`), so this
-module is the only one that imports it and `dew.eval` does not import this
-module: a caller who never asks for a harness never needs it installed.
-Importing this module registers the adapter under `dew`, which is what the
-harness's registry reads, and lm_eval 0.4 has no plugin discovery of its
-own, so the import has to happen in the process that runs the command:
+`lm_eval` is an optional extra (`pip install dewml[eval-harness]`), imported
+only here, and `dew.eval` does not import this module. Importing it registers
+the adapter under `dew`; lm_eval 0.4 has no plugin discovery, so the import
+has to happen in the process that runs the command, which `python -m dew.eval`
+(`lm_eval`'s own command line) does:
 
     python -m dew.eval --model dew --model_args run=runs/shakespeare \\
         --tasks hellaswag --limit 4
 
-is `lm_eval`'s own command line with this module imported first. In a
-program that already imported it, plain `lm_eval --model dew` finds it too.
-
-Everything that decides which tokens are scored is lm-eval's own code:
-`TemplateLM.loglikelihood` splits each pair (moving a context's trailing
-whitespace into the continuation, conditioning an empty context on the
-prefix token), and `get_rolling_token_windows` with `make_disjoint_window`
-cuts a long string so every token is scored exactly once. What this module
-adds is `_loglikelihood_tokens`, the row `HFLM` builds from each
-`(context, continuation)` pair, scored by the model's own forward under
-`jax.jit`: slot `i` of the logits predicts token `i + 1` of the row, so a
-continuation of `n` tokens is read at the `n` slots ending one before the
+lm-eval's own code decides which tokens are scored (`TemplateLM.loglikelihood`,
+`get_rolling_token_windows`). This module adds `_loglikelihood_tokens`, the
+row `HFLM` builds from each `(context, continuation)` pair, scored by the
+model's forward under `jax.jit`: slot `i` of the logits predicts token `i + 1`,
+so a continuation of `n` tokens is read at the `n` slots ending one before the
 row's last token.
 """
 
@@ -112,9 +102,10 @@ class DewLM(TemplateLM):
         self.batch_size = batch_size
 
     @classmethod
-    def from_run(cls, run: str, *, batch_size: int = 1, ema: bool = True,
+    def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
                  step: int | str | None = None, dtype: str | None = None) -> DewLM:
-        """Load the run in `run` as a harness model, the way `dew.pipeline` builds it."""
+        """Load the run in `run` as a harness model, the way `dew.pipeline` builds it:
+        its averaged weights when it kept them (`ema=None`), else its live ones."""
         return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype),
                    batch_size=batch_size)
 
@@ -141,11 +132,8 @@ class DewLM(TemplateLM):
         """
         arguments.update({name: value for name, value in (additional or {}).items()
                           if value is not None})
-        # The harness hands every model the same placement argument. A run's
-        # weights are placed on a JAX mesh when the task is built, so there
-        # is no device for a caller to pick here and the name is dropped
-        # rather than refused; anything else it passes reaches `from_run`,
-        # which names what it does not take.
+        # The harness hands every model a device; a run's weights are placed
+        # on a JAX mesh when the task is built, so it is dropped, not refused.
         arguments.pop("device", None)
         run = arguments.pop("run", None)
         if run is None:
