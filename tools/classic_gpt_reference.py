@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config, OPTConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BloomConfig, GPT2Config, OPTConfig
 
 from dew.interop import load_pretrained
 from dew.interop.verify import _ROUNDING, probe_ids, scatter_weights
@@ -23,7 +23,10 @@ FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 
 def write_fixture(family):
-    config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
+    config = (BloomConfig(vocab_size=128, hidden_size=32, n_layer=2, n_head=4,
+                          attention_dropout=0, hidden_dropout=0, bos_token_id=1,
+                          eos_token_id=None, pad_token_id=0) if family == 'bloom' else
+              OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
                         num_attention_heads=4, ffn_dim=48, max_position_embeddings=64,
                         dropout=0, attention_dropout=0, bos_token_id=1,
                         eos_token_id=None, pad_token_id=0) if family == 'opt' else
@@ -123,7 +126,7 @@ def check_checkpoint(checkpoint, output, revision=None, safetensors_directory=No
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', action='store_true')
-    parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
+    parser.add_argument('--family', choices=('gpt2', 'opt', 'bloom'), default='gpt2')
     parser.add_argument('--checkpoint')
     parser.add_argument('--revision')
     parser.add_argument('--safetensors-directory')

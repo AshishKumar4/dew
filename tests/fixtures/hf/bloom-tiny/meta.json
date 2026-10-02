@@ -5,5 +5,5 @@
   "attention": "eager",
   "device": "NVIDIA GeForce RTX 4080",
   "seed": 1234,
-  "command": "PYTHONPATH=src python tools/bloom_reference.py"
+  "command": "PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family bloom"
 }
