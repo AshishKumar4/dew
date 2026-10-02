@@ -76,8 +76,8 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert set(scores) == {3, 12}
     assert scores[3]['val/loss'] < scores[12]['val/loss']
     assert scores[3]['train/loss'] > scores[12]['train/loss']
-    restored, _ = run.checkpoints.restore({'params': result.variables}, step='best')
-    assert float(restored['params']['params']['w']) == pytest.approx(0.488)
+    restored, _ = run.checkpoints.restore({'variables': result.variables}, step='best')
+    assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
 def test_multiple_directions_and_threshold(tmp_path):

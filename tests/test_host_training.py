@@ -20,7 +20,7 @@ from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
 
-HOST = Layout(host=("params",), min_shard=1, tolerance=1.)
+HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
 
 
@@ -73,7 +73,7 @@ def close(left, right, bound=STREAMED_BOUND):
     (`execution.banked`) read row by row."""
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
-    elif FROZEN in getattr(left, "params", {}):
+    elif FROZEN in getattr(left, "variables", {}):
         left = dataclasses.replace(left, variables={**left.variables, FROZEN: unbanked(left.variables[FROZEN])})
     for path, a, b in _leaves(left, right):
         np.testing.assert_allclose(a, b, atol=bound, rtol=0, err_msg=path)

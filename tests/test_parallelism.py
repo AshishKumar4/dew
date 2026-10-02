@@ -622,9 +622,9 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
     """
     trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
     before = {field: [np.asarray(leaf).copy() for leaf in jax.tree.leaves(getattr(trained, field))]
-              for field in ("params", "ema")}
+              for field in ("variables", "ema")}
     assert any(not np.array_equal(average, live) for average, live
-               in zip(before["ema"], before["params"], strict=True)), "the EMA is its weights"
+               in zip(before["ema"], before["variables"], strict=True)), "the EMA is its weights"
 
     reopened = make_trainer(tmp_path, fsdp=restored).fit(Data(batches), steps=1)
     assert int(reopened.step) == 1
