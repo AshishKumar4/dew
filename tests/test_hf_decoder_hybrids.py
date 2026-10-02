@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 from test_hf_decoders import DEEPSEEK, fixture_config, flat_tree, fp32_decoder, scaled_difference
 
-from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.interop.hf_decoders import translate_config, translate_weights
+from dew.interop import PretrainedDecoder
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -469,7 +470,7 @@ def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
     checkpoint."""
     model, variables = fp32_decoder(FIXTURES / name)
     with pytest.raises(ValueError, match="lacks 'qk_nope_head_dim'"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
     config = translate_config(fixture_config(name))
     routed = models.build("causal_transformer", **with_precision(
@@ -478,7 +479,7 @@ def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
         dtype="float32", attention_impl="reference"))
     variables = routed.init(rng, jnp.ones((1, 4), jnp.int32))
     with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
-        save_pretrained_decoder(routed, variables, str(tmp_path))
+        PretrainedDecoder.from_model(routed, variables).save(str(tmp_path))
 
 
 # --------------------------------------------------------------------------
@@ -671,7 +672,7 @@ def test_export_refuses_the_qwen35_features(tmp_path):
     the exported families, and a refused model publishes nothing."""
     model, variables = fp32_decoder(FIXTURES / "qwen35-tiny")
     with pytest.raises(ValueError):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
     assert not list(tmp_path.iterdir())
 
 
@@ -1059,7 +1060,7 @@ def test_gemma3n_export_is_refused_as_an_unrepresentable_model(tmp_path):
     by name and leaves nothing behind, whichever feature is met first."""
     model, variables = fp32_decoder(GEMMA3N)
     with pytest.raises(ValueError):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+        PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
     assert not list(tmp_path.iterdir())
 
 

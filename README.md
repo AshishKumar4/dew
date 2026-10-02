@@ -1084,9 +1084,11 @@ its shutdown is part of the run.
 
 ### Exporting a decoder and serving it
 
-`save_pretrained_decoder` writes the Hugging Face layout and asks the tokenizer
-the run trained with to save its own files into the same directory. Another
-runtime can read that directory as it is.
+`PretrainedDecoder.from_model(model, variables, tokenizer=...)` is a model
+trained in Dew as a source bundle, and its `save(directory)` writes the
+Hugging Face layout and asks the tokenizer the run trained with to save its
+own files into the same directory. Another runtime can read that directory as
+it is.
 
 Tokenize a corpus with the tokenizer the export will carry, so the token ids
 and the exported vocabulary are the same one. `tiny-tools` is the small
@@ -1110,7 +1112,7 @@ import optax
 
 from dew import Trainer
 from dew.data import HFTokenizer, Loading, TokenCorpus, TokenWindows
-from dew.interop import PretrainedDecoder, save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
@@ -1131,7 +1133,7 @@ state = Trainer(LMObjective(model, seq_len=128),
                 optax.adamw(3e-3), key=jax.random.key(0)).fit(
     data, steps=400, log_every=200)
 
-save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(export)
 print(sorted(path.name for path in export.iterdir()))
 
 task = PretrainedDecoder.load(str(export), dtype="float32").text_generation()

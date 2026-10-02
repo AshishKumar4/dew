@@ -6,7 +6,7 @@ tokenizer is the committed byte-level BPE fixture the token files were
 written with.
 
 What is held to account is the artifact contract. `ollama create` reads the
-HF layout `save_pretrained_decoder` writes, so the GGUF its converter emits
+HF layout `PretrainedDecoder.from_model(...).save` writes, so the GGUF its converter emits
 carries the exported config's own numbers and serves the computation the
 export describes: asked for the model's own argmax, the daemon reproduces
 Dew's greedy draw token for token. That is what catches a conversion which
@@ -26,7 +26,7 @@ the GGUF records the pre-tokenizer as `default`, whose regex cuts digit runs
 into groups of three, where the exported ByteLevel tokenizer keeps a run
 whole. One test pins that too, so nobody reads the length check as identity.
 
-`save_pretrained_decoder` writes the tokenizer's own files beside the
+`PretrainedDecoder.save` writes the tokenizer's own files beside the
 weights: handed the tokenizer the run trained with, it asks that tokenizer
 to save itself, so the directory it leaves is already complete and this file
 copies nothing into it. `Pretrained.save` delegates a decoder to the same
@@ -56,7 +56,7 @@ from test_lm_recipe import load_recipe
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
@@ -157,7 +157,7 @@ def train_and_export(root: Path) -> Path:
         config.model.architecture, {**FIELDS, "vocab_size": meta["vocab_size"]},
         dtype="float32", attention_impl="xla"))
     export = root / "export"
-    save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
+    PretrainedDecoder.from_model(model, state.params, tokenizer=tokenizer).save(str(export))
     return export
 
 
@@ -391,7 +391,7 @@ def test_backend_options_alone_are_not_the_models_policy(client):
 
 
 def test_what_the_export_writes_is_enough_to_import(imported, tmp_path):
-    """The gap `save_pretrained_decoder` used to leave, closed.
+    """The gap the decoder export used to leave, closed.
 
     It wrote config.json, model.safetensors and a generation_config naming a
     tokenizer it did not copy, and that directory did not convert: the

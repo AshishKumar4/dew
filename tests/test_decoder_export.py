@@ -440,15 +440,14 @@ SYNTHETIC_CHECKPOINT = """
 import sys
 from pathlib import Path
 import jax, jax.numpy as jnp, numpy as np
-from dew.interop import Pretrained
-from dew.interop.hf_decoders import save_pretrained_decoder
+from dew.interop import Pretrained, PretrainedDecoder
 
 source = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
 model = source.model.clone(num_layers=12, layer_types=("full_attention",) * 12, vocab_size=16000,
                            emb_features=1024, num_heads=16, num_kv_heads=8, head_dim=64, mlp_features=3072)
 variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
                          model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
-save_pretrained_decoder(model, variables, sys.argv[2])
+PretrainedDecoder.from_model(model, variables).save(sys.argv[2])
 for asset in Path(sys.argv[1]).glob("tokenizer*"):
     (Path(sys.argv[2]) / asset.name).write_bytes(asset.read_bytes())
 """
@@ -849,7 +848,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
     from flax.core import unfreeze
     from transformers import Gemma4ForCausalLM
 
-    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.interop import PretrainedDecoder
 
     loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
     model = loaded.model.clone(layer_scalar=mode)
@@ -865,7 +864,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
         collection = "params" if mode == "trainable" else "constants"
         variables[collection][layer]["layer_scalar"] = jnp.full_like(scalar, 0.75 + index * 0.125)
     expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
-    save_pretrained_decoder(model, variables, tmp_path)
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
 
     restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
@@ -942,7 +941,7 @@ def glm5_native_export_case(variant):
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp
 
-    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.interop import PretrainedDecoder
     from dew.sampling import Sampling, Speculative, generate
 
     model, variables, ids = glm5_native_export_case(variant)
@@ -950,7 +949,7 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
     if model.num_nextn_predict_layers:
         cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[1]
-    save_pretrained_decoder(model, {**variables, **cache}, tmp_path)
+    PretrainedDecoder.from_model(model, {**variables, **cache}).save(tmp_path)
     restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
     np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)

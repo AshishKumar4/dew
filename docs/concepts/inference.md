@@ -79,10 +79,10 @@ This exports the decoder from the example in the Hugging Face layout and loads i
 
 ```python
 import dew
-from dew.interop import save_pretrained_decoder
+from dew.interop import PretrainedDecoder
 from dew.training import MeshSpec
 
-save_pretrained_decoder(model, state.params, "lily-decoder", tokenizer="byte")
+PretrainedDecoder.from_model(model, state.params, tokenizer="byte").save("lily-decoder")
 loaded = dew.pipeline("lily-decoder", mesh=MeshSpec(), dtype="float32")
 loaded = dataclasses.replace(loaded, processor=RunProcessor(tokenizer),
                              sampling=Sampling(temperature=0.0))
@@ -344,4 +344,4 @@ Decode on a tensor axis is bound by the host on these cards. Each step runs 57 a
 
 ## Other runtimes
 
-To serve with vLLM or Ollama instead, export with `save_pretrained_decoder` or `Pretrained.save` and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
+To serve with vLLM or Ollama instead, export with `Pretrained.save` (a trained model through `PretrainedDecoder.from_model`) and point the runtime at the directory. `OllamaCompletion` and `OpenAICompletion` (`dew.inference`) call those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.

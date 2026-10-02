@@ -46,7 +46,8 @@ def _export_model(model, variables, destination: Path, record: Mapping[str, obje
     The family is chosen before any field is read out of `record`. A model with
     no published layout is therefore refused by type, not by a missing field.
     """
-    from dew.interop.hf_decoders import save_export_assets, save_pretrained_decoder
+    from dew.interop.hf_decoders import save_export_assets
+    from dew.interop.pretrained import PretrainedDecoder
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.records import record as named_fields, text as named
@@ -65,8 +66,8 @@ def _export_model(model, variables, destination: Path, record: Mapping[str, obje
         save_export_assets(destination, tokenizer=named(record["tokenizer"], "tokenizer"))
         return
     if isinstance(model, CausalTransformer):
-        save_pretrained_decoder(model, variables, destination,
-                                tokenizer=named(record["tokenizer"], "tokenizer"))
+        PretrainedDecoder.from_model(model, variables,
+                                     tokenizer=named(record["tokenizer"], "tokenizer")).save(destination)
         return
     raise ValueError(
         f"{type(model).__name__} has no published layout to export to; a run exports "

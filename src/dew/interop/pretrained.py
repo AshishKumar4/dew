@@ -10,6 +10,7 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 import math
@@ -389,7 +390,9 @@ class Pretrained:
     variables: Variables
     processor: Processor | None
     config: Mapping[str, object]
-    source: Path
+    source: Path | None
+    """The directory the source was read from; None for a model trained in
+    Dew (`PretrainedDecoder.from_model`)."""
     model_config: Mapping[str, object]
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
@@ -411,6 +414,9 @@ class Pretrained:
     adapter: LoRA | None = None
     """The low-rank adapter `lora` put on the model, whose factors the
     variables hold; None for the source as published."""
+    tokenizer: str | decoders.ExportTokenizer | None = None
+    """The vocabulary `save` writes beside the weights, by name or by object,
+    for a bundle with no source processor to write (`from_model`)."""
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
@@ -530,7 +536,7 @@ class Pretrained:
             ).preserve_source_layout
             and quantization is None
         ):
-            # The decoder export's own encoder, so this and `save_pretrained_decoder`
+            # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
             # leave the same weights. A quantized source keeps its packed format
             # by going back over its source names, below.
             return decoders.export_decoder_weights(self.model, values, decoders._export_config(self.model))
@@ -580,7 +586,8 @@ class Pretrained:
         values = self.variables if variables is None else variables
         destination = Path(directory)
         save_hf_layout(self.export(values), dict(self.config), destination, max_shard_size)
-        decoders.save_export_assets(destination, tokenizer=self.processor,
+        decoders.save_export_assets(destination,
+                                    tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config))
 
 
@@ -591,6 +598,34 @@ class PretrainedDecoder(Pretrained):
     low-rank adapter."""
 
     model: CausalTransformer | MultimodalTransformer
+
+    @classmethod
+    def from_model(cls, model: CausalTransformer, variables: Variables, *,
+                   tokenizer: str | decoders.ExportTokenizer | None = None,
+                   generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
+        """A decoder trained in Dew, as the bundle `save` writes in its family's
+        Hugging Face layout.
+
+        The config is derived from the native computation and every variable
+        collection is encoded through the matching family, which is the
+        encoder a loaded source of a derived family exports through, so the
+        two leave the same weights behind. Gemma 4 writes frozen or trainable
+        layer-scalar values into HF buffers; reloading that layout preserves
+        computation, not the native scalar training policy.
+
+        `tokenizer` is the vocabulary the weights were trained against, by
+        object or by name; `save` writes its files beside them, so the
+        directory `Pretrained.load` reads back carries its processor.
+        `generation_config` is what generation_config.json records,
+        `GENERATION_DEFAULTS` when None.
+        """
+        config = decoders._export_config(model)
+        decoders._refuse_lossy_export(model, config)
+        built = {entry.name: getattr(model, entry.name) for entry in dataclasses.fields(model)
+                 if entry.init and entry.name not in ("parent", "name")}
+        return cls(model, variables, None, config, None, built,
+                   decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
     def lora(self, *, rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
              rslora: bool = False, dropout: float = 0.0) -> PretrainedDecoder:

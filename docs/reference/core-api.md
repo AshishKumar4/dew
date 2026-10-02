@@ -491,7 +491,7 @@ An explicit `sampling=Sampling(...)` sets the native policy controls supported b
 
 `export_run(run_dir, destination, *, ema=None, step=None)` writes a saved run into that same layout: it loads the run the way `dew.pipeline` does and hands the rebuilt model to its family's writer, refusing a model with no published layout by name. `dew export <run> <dest>` is the command over it, and `push_to_hub` exports a run directory before uploading unless `raw=True`, which uploads the run itself for `from_pretrained` to pull back.
 
-A decoder trained through the LM recipe, exported with `save_pretrained_decoder` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. `Pretrained.save` and `save_pretrained_decoder` leave the same files, so either export converts.
+A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_model(...).save` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. A loaded source's `save` and a `from_model` bundle's leave the same files, so either export converts.
 
 ## Diffusion and JEPA objectives
 
