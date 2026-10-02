@@ -302,7 +302,7 @@ class SafetensorsBanks(LayerBanks):
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
         family = records.text(self.config.get("model_type"), "model_type")
-        if families()[family].prepare_weights is not DecoderFamily.prepare_weights:
+        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)

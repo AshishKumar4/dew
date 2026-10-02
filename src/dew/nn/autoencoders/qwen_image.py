@@ -35,7 +35,7 @@ from .vae import FlaxDownsample2D, FlaxUpsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
 def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Module:

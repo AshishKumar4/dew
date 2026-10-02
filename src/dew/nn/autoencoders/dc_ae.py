@@ -34,7 +34,7 @@ from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import ModuleAutoEncoder
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 _EPS = 1e-5
 _ATTENTION_EPS = 1e-15

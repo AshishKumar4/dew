@@ -26,7 +26,7 @@ from dew.nn.vision import (
     translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables
-from dew.registry import models, precision_fields, projectors, towers
+from dew.registry import from_record, precision_fields, projectors, towers
 
 
 # The wrapper config states these three with a default this assembly supplies
@@ -58,9 +58,7 @@ def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
         fields["max_seq_len"] = max_seq_len
     precise: DecoderFields = {**fields, **precision_fields(
         "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl)}
-    text = models.build("causal_transformer", precise)
-    if not isinstance(text, CausalTransformer):
-        raise TypeError("the causal_transformer registry entry must build a CausalTransformer")
+    text = from_record(CausalTransformer, precise)
     conditioner = None
     if config.get("vision_config") is not None:
         tower = translate_gemma4_vision_config(_section(config, "vision_config"))

@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.hf_decoders import DEFAULT_MAX_SEQ_LEN, DecoderFields, _dew_path, _refuse
+from dew.interop.hf_decoders import DEFAULT_MAX_SEQ_LEN, DecoderFields, Renames, _refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -51,17 +51,10 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     }
 
 
-def _opt_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name == 'model.decoder.embed_positions.weight':
-        return ('params', 'embed_positions', 'embedding')
-    if name.startswith('model.decoder.final_layer_norm.'):
-        name = name.replace('model.decoder.final_layer_norm.', 'model.norm.')
-    name = name.replace('model.decoder.', 'model.')
-    name = name.replace('.self_attn_layer_norm.', '.input_layernorm.')
-    name = name.replace('.final_layer_norm.', '.post_attention_layernorm.')
-    name = name.replace('.fc1.', '.mlp.up_proj.').replace('.fc2.', '.mlp.down_proj.')
-    name = name.replace('.self_attn.out_proj.', '.self_attn.o_proj.')
-    return _dew_path(name, config)
+_OPT_NAMES: Renames = (
+    ('model.decoder.final_layer_norm', 'model.norm'), ('model.decoder', 'model'),
+    ('self_attn_layer_norm', 'input_layernorm'), ('final_layer_norm', 'post_attention_layernorm'),
+    ('fc1', 'mlp.up_proj'), ('fc2', 'mlp.down_proj'), ('self_attn.out_proj', 'self_attn.o_proj'))
 
 
 def _opt_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -79,19 +72,3 @@ def _opt_export(model: CausalTransformer) -> Mapping[str, object]:
     fields.update(dict.fromkeys(('intermediate_size', 'rms_norm_eps', 'hidden_act', 'head_dim',
                                  'num_key_value_heads', 'attention_bias', 'rope_theta')))
     return fields
-
-
-def _opt_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    from dew.interop.hf_decoders import _hf_name
-
-    if name == 'embed_positions.embedding':
-        return 'model.decoder.embed_positions.weight'
-    mapped = _hf_name(name, config)
-    if mapped is None or mapped.startswith('lm_head.'):
-        return mapped
-    mapped = mapped.replace('model.norm.', 'model.final_layer_norm.')
-    mapped = mapped.replace('model.', 'model.decoder.', 1)
-    mapped = mapped.replace('.input_layernorm.', '.self_attn_layer_norm.')
-    mapped = mapped.replace('.post_attention_layernorm.', '.final_layer_norm.')
-    mapped = mapped.replace('.mlp.up_proj.', '.fc1.').replace('.mlp.down_proj.', '.fc2.')
-    return mapped.replace('.self_attn.o_proj.', '.self_attn.out_proj.')

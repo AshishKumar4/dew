@@ -46,8 +46,8 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 
-from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
+from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select, thaw
 
