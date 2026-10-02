@@ -539,3 +539,6 @@ class RolloutScheduler:
         """
         scored = self._rescore(params, packed if mesh is None else shard_batch(mesh, packed))
         return local_rows(scored).astype(np.float32)
+
+
+__all__ = ["Publisher", "RolloutScheduler", "SchedulerRecord", "task_ids"]

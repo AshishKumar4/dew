@@ -26,6 +26,7 @@ from jax.tree_util import Partial
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifact, Artifacts
+from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -434,6 +435,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             return state.variables
         return state.averaged
 
+    def inference_record(self) -> JSON:
+        """The registered model and task settings a saved step can rebuild.
+
+        An objective without a declared inference contract returns None;
+        raw state restore remains available for custom research methods.
+        """
+
     def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
         """The trained model as its inference task over `state`'s weights.
 
@@ -510,3 +518,28 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
+
+
+__all__ = [
+    "FROZEN",
+    "Aux",
+    "Batch",
+    "EMASpec",
+    "Metric",
+    "Objective",
+    "Path",
+    "PathFilter",
+    "Prediction",
+    "Ratio",
+    "Shown",
+    "Step",
+    "TrainingScalar",
+    "TrainingScalars",
+    "Variables",
+    "everything",
+    "freeze",
+    "merge",
+    "select",
+    "thaw",
+    "under",
+]

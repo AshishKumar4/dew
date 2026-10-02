@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
 import jax
@@ -29,6 +31,27 @@ class AutoEncoder(ABC):
     latent_shift: float | np.ndarray | jax.Array = 0.0
     latent_scale: float | np.ndarray | jax.Array = 1.0
     params: Variables
+
+    def to_json(self) -> dict:
+        """Declare this built-in autoencoder's constructor, without its parameters."""
+        raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+
+    @classmethod
+    def from_json(cls, record, *, params: Variables) -> AutoEncoder:
+        """Rebuild maintained autoencoders around the checkpoint's own parameters."""
+        from .sd_vae import StableDiffusionVAE
+        if record['name'] == 'sd_vae':
+            from dew.registry import resolve_dtype
+
+            from .kl import AutoencoderKL
+            fields = dict(record['fields'])
+            model = dict(fields.pop('model'))
+            model['dtype'] = resolve_dtype(model['dtype'])
+            for name in ('channels', 'decoder_channels'):
+                if model.get(name) is not None:
+                    model[name] = tuple(model[name])
+            return StableDiffusionVAE(model=AutoencoderKL(**model), params=params, **fields)
+        raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,

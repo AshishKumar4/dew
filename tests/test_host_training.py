@@ -644,7 +644,7 @@ def test_place_streams_the_held_tree_and_releases_each_source():
             ),
             tokens(),
             HOST,
-        ).params,
+        ).variables,
         resident.variables,
     )
 

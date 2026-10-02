@@ -43,30 +43,30 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     return config
 
 
+# The layer's own tensors beside the shared map's, read one way on load and
+# the other on export.
+_GPT_OSS_LEAVES: Mapping[str, tuple[str, ...]] = {
+    'self_attn.sinks': ('self_attn', 'sinks'),
+    'mlp.router.weight': ('mlp', 'router', 'kernel'), 'mlp.router.bias': ('mlp', 'router', 'bias'),
+    **{f'mlp.experts.{leaf}': ('mlp', 'experts', leaf)
+       for leaf in ('gate_up_proj', 'gate_up_proj_bias', 'down_proj', 'down_proj_bias')}}
+_GPT_OSS_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _GPT_OSS_LEAVES.items()}
+
+
 def _gpt_oss_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     parts = name.split('.')
     if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        prefix = ('params', f'layers_{parts[2]}')
-        if parts[3:] == ['self_attn', 'sinks']:
-            return (*prefix, 'self_attn', 'sinks')
-        if len(parts) == 6 and parts[3:5] == ['mlp', 'router'] and parts[5] in ('weight', 'bias'):
-            return (*prefix, 'mlp', 'router', 'kernel' if parts[5] == 'weight' else 'bias')
-        if (len(parts) == 6 and parts[3:5] == ['mlp', 'experts']
-                and parts[5] in ('gate_up_proj', 'gate_up_proj_bias', 'down_proj', 'down_proj_bias')):
-            return (*prefix, 'mlp', 'experts', parts[5])
+        leaf = _GPT_OSS_LEAVES.get('.'.join(parts[3:]))
+        if leaf is not None:
+            return ('params', f'layers_{parts[2]}', *leaf)
     return _dew_path(name, config)
 
 
 def _gpt_oss_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    parts = name.split('.')
-    if parts[0].startswith('layers_'):
-        prefix = f"model.layers.{parts[0].removeprefix('layers_')}"
-        if parts[1:] == ['self_attn', 'sinks']:
-            return prefix + '.self_attn.sinks'
-        if len(parts) == 4 and parts[1:3] == ['mlp', 'router']:
-            return prefix + '.mlp.router.' + ('weight' if parts[3] == 'kernel' else 'bias')
-        if len(parts) == 4 and parts[1:3] == ['mlp', 'experts']:
-            return prefix + '.mlp.experts.' + parts[3]
+    layer, _, rest = name.partition('.')
+    tail = tuple(rest.split('.'))
+    if layer.startswith('layers_') and tail in _GPT_OSS_NAMES:
+        return f"model.layers.{layer.removeprefix('layers_')}.{_GPT_OSS_NAMES[tail]}"
     return _hf_name(name, config)
 
 

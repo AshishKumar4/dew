@@ -7,7 +7,6 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from importlib import import_module
 from typing import TYPE_CHECKING, Generic
 
 import jax
@@ -16,7 +15,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.core import freeze
 from jax.experimental import multihost_utils
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
 from dew.artifacts import agreed, uint8_pixels
@@ -24,7 +23,7 @@ from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.objectives.base import FROZEN, Variables
+from dew.objectives.base import Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
@@ -198,7 +197,7 @@ class TextToImage:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`).
 
@@ -212,28 +211,37 @@ class TextToImage:
         dtype overrides computation in the model, encoders and VAE. param_dtype
         overrides parameter storage; None preserves checkpoint storage exactly.
         """
-        from dew.objectives.diffusion import DiffusionRunConfig
-        from dew.registry import objectives
+        from dew.checkpoints import Checkpoints
+        from dew.config import ModelConfig, _built
+        from dew.diffusion.process import Process
+        from dew.inference.tasks import run_record
+        from dew.nn.autoencoders import AutoEncoder
+        from dew.records import integer, record as fields, text
+        from dew.registry import objectives, solvers
 
-        import_module("dew.objectives.rl.flow")  # registers the flow_grpo a record names
-        config = DiffusionRunConfig.load(directory)
+        record = run_record(directory, step)
+        config = ModelConfig.from_dict(fields(record['model'], 'model'))
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
-            config = replace(config, model=replace(config.model, dtype=compute),
-                             text=None if config.text is None else replace(config.text, dtype=compute),
-                             audio=None if config.audio is None else replace(config.audio, dtype=compute),
-                             autoencoder=None if config.autoencoder is None else
-                             replace(config.autoencoder, dtype=compute))
-        averaged = False if objectives[config.objective]._ema_is_reference else ema
-        params = restore_variables(directory, ema=averaged, step=step, mesh=mesh, layout=layout,
-                                   param_dtype=param_dtype, parameter_roots=config.parameter_roots)
-        objective = config.build(variables=params)
-        return cls.from_objective(objective, params)
+            config = replace(config, dtype=compute)
+        averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
+        params = Checkpoints(directory).variables(ema=averaged, step=step, mesh=mesh, layout=layout,
+                                                 param_dtype=param_dtype)
+        inputs = InputSpec.from_json(fields(record['inputs'], 'inputs'), params=params.get('encoders', {}))
+        autoencoder = None if record['autoencoder'] is None else AutoEncoder.from_json(
+            fields(record['autoencoder'], 'autoencoder'), params=params['autoencoder'])
+        solver_record = fields(record['solver'], 'solver')
+        solver = solvers.build(text(solver_record['name'], 'solver name'),
+                                fields(solver_record['fields'], 'solver fields'))
+        guidance = None if record['guidance'] is None else _built(CFG, fields(record['guidance'], 'guidance'))
+        return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
+                   inputs, params, autoencoder, steps=integer(record['sampling_steps'], 'sampling_steps'),
+                   guidance=guidance, solver=solver)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, mesh: MeshSpec | None = None,
-                        layout: Layout | None = None, dtype: str | None = None,
-                        param_dtype: str | None = None) -> TextToImage:
+                        layout: Layout | None = None, dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `HfApi().upload_folder` of the run directory writes it."""
         from dew.interop.hub import pull_from_hub
@@ -243,7 +251,7 @@ class TextToImage:
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
-                      ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
+                      ema: bool = True, best: bool = False, dtype: DTypeLike | None = None) -> TextToImage:
         """A FlaxDiff text-to-image run (`simple_udit` or `hybrid_dit` on the
         SD VAE) over Dew's own model.
 
@@ -601,50 +609,8 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
-def restore_variables(directory: str, *, ema: bool | None, step: int | str | None, mesh: MeshSpec | None,
-                      layout: Layout | None, param_dtype: str | None,
-                      parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
-    """A run's published variables, restored onto the current mesh under a layout.
 
-    The checkpoint is its own template. Owner-declared parameter roots select
-    floating weights for param_dtype; other leaves keep their stored dtype.
-    EMA uses the live tree's selection, restricted to the leaves it contains.
-    `ema` None takes the averaged weights when the run kept them; True
-    requires them.
-    """
-    from dew.checkpoints import Checkpoints
-    from dew.objectives.base import merge
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
-    target = resolve_dtype(param_dtype)
-    checkpoints = Checkpoints(directory)
-    stored = checkpoints.stored(step)
-    template = {"params": stored["params"]}
-    if ema and stored.get("ema") is None:
-        raise ValueError("the run keeps no EMA; request the live policy with ema=False")
-    averaged = stored.get("ema") is not None if ema is None else ema
-    if averaged:
-        template["ema"] = stored["ema"]
-    device_mesh = (DefaultMesh() if mesh is None else mesh).build()
-    chosen_layout = DefaultLayout() if layout is None else layout
-    placement = chosen_layout.shardings(device_mesh, template)
-    chosen_layout.check(template["params"], placement["params"], device_mesh)
-    selected = set()
-    if target is not None:
-        roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
-        selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["params"])[0]
-                    if jnp.issubdtype(leaf.dtype, jnp.floating) and
-                    any(path[:len(root)] == root for root in roots)}
-    template = jax.tree_util.tree_map_with_path(
-        lambda path, leaf, sharding: jax.ShapeDtypeStruct(
-            leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
-        template, placement)
-    values, _ = checkpoints.restore(template, step=step)
-    params = values["params"]
-    if averaged:
-        params = merge(params, values["ema"])
-
-    return params
 
 
 @functools.cache

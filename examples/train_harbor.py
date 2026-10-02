@@ -40,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
@@ -97,8 +98,8 @@ def main(config: Config) -> dict:
     config.out.mkdir(parents=True, exist_ok=True)
     source = PretrainedDecoder.load(
         config.model,
-        dtype="float32" if config.smoke else "bfloat16",
-        param_dtype="float32",
+        dtype=jnp.float32 if config.smoke else jnp.bfloat16,
+        param_dtype=jnp.float32,
         max_seq_len=config.width,
     )
     objective = GRPOObjective(source.model, config.width - 1, pretrained=source.variables,

@@ -40,7 +40,7 @@ from .api import AutoEncoder
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
-    from dew.interop.pretrained import WeightLayout
+    from dew.interop.streaming import WeightLayout
 
 
 class WanRMSNorm(nn.Module):
@@ -56,7 +56,11 @@ class WanRMSNorm(nn.Module):
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
         wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-        norm = jnp.sqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
+        # F.normalize clamps the norm at 1e-12. Clamping its square first
+        # keeps a zero row's gradient finite (sqrt's derivative at zero would
+        # meet the clamp's zero); the second clamp, the same value, keeps the
+        # division off a bare square root, which XLA rewrites to rsqrt.
+        norm = jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(wide), axis=-1, keepdims=True), 1e-24))
         return (wide / jnp.maximum(norm, 1e-12) * math.sqrt(self.features) * gamma.reshape(-1)).astype(
             self.dtype
         )

@@ -469,3 +469,6 @@ def gather_cache_rows(cache, rows):
         raise ValueError("beam search and speculative decoding regroup cache rows, which a "
                          "paged cache's shared pool cannot do; decode them with a dense cache")
     return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)
+
+
+__all__ = ["Append", "KVCache", "KVStore", "Layered"]

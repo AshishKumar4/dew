@@ -610,3 +610,15 @@ class ArrayRecordImages(ImageDataset):
             return (image, element['caption'].decode('utf-8'),
                     None if label is None else int(np.frombuffer(label, np.int32)[0]))
         return element['jpg'], element['txt'].decode('utf-8'), None
+
+
+__all__ = [
+    "ArrayRecordImages",
+    "Augment",
+    "HFImages",
+    "ImageDataset",
+    "ImageTransform",
+    "TFDSImages",
+    "class_names",
+    "pack_dict_of_byte_arrays",
+]

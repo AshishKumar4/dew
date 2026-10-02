@@ -28,13 +28,14 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.backbones.causal_transformer import DecoderBank
@@ -189,7 +190,7 @@ class CheckpointBanks(LayerBanks):
     """Serve banks by restoring a run's published weights one bank at a time.
 
     `ema` merges the averaged copy over the live weights, as
-    `dew.sampling.pipelines.restore_variables` does, so a bank holds what the
+    `Checkpoints.variables` does, so a bank holds what the
     run publishes. `step` selects a checkpoint and is resolved to the latest
     one when it is built, so every bank of one load comes from one
     checkpoint.
@@ -217,7 +218,7 @@ class CheckpointBanks(LayerBanks):
     def shapes(self) -> Variables:
         if self.ema and self.stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; read the live weights with ema=False")
-        return self.stored["params"]
+        return self.stored["variables"]
 
     def entry(self, placement: Placement) -> Variables:
         return self._restored(placement)
@@ -238,13 +239,13 @@ class CheckpointBanks(LayerBanks):
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
-        template = {"params": _typed(shapes, narrowed(placement, shapes))}
+        template = {"variables": _typed(shapes, narrowed(placement, shapes))}
         if self.ema:
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
                 template["ema"] = _typed(averaged, narrowed(placement, averaged))
         values, _ = Checkpoints(self.directory).restore(template, step=self.step)
-        return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
+        return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,7 +282,7 @@ class SafetensorsBanks(LayerBanks):
     """
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
-                 param_dtype: str = "auto", read_ahead: bool = True):
+                 param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
         from dew.interop.hf_decoders import (
             DecoderFamily,
             _check_tree,
@@ -290,7 +291,7 @@ class SafetensorsBanks(LayerBanks):
             translate_weights,
         )
         from dew.interop.safetensors_io import read_weights
-        from dew.registry import models, with_precision
+        from dew.registry import dtype_name, models, with_precision
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
@@ -301,15 +302,17 @@ class SafetensorsBanks(LayerBanks):
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
         family = records.text(self.config.get("model_type"), "model_type")
-        if families()[family].prepare_weights is not DecoderFamily.prepare_weights:
+        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
         if param_dtype == "auto":
             from dew.interop.pretrained import _checkpoint_dtype
-            param_dtype = _checkpoint_dtype(self.config, tensors)
+            storage = _checkpoint_dtype(self.config, tensors)
+        else:
+            storage = dtype_name(param_dtype)
         self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype=param_dtype, lazy=True)
+            tensors, record, family, param_dtype=storage, lazy=True)
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
@@ -736,3 +739,14 @@ def _check_consumers(placement: Placement, groups: Sequence[tuple[int, int]]) ->
                         f"{reference.get(first_path)} in layer {held[0]} and "
                         f"{places.get(first_path)} in layer {index}. Select whole "
                         f"runs, or set bank_layers so the runs follow the selection")
+
+
+__all__ = [
+    "BankedModel",
+    "CheckpointBanks",
+    "DiskBankStats",
+    "HeldBanks",
+    "LayerBanks",
+    "SafetensorsBanks",
+    "StreamedBank",
+]

@@ -96,12 +96,12 @@ def test_the_loss_is_the_papers_equation(runs):
     x = alpha * samples + sigma * noise
     teacher = task.teacher
     given, blank = teacher._conditions(params[TEACHER], batch, drop_key, dropout=False)
-    variables = teacher.trainable(params[TEACHER])
+    variables = teacher.model_variables(params[TEACHER])
     conditional = teacher.model.apply(variables, x, schedule.model_time(t), **given)
     unconditional = teacher.process.denoiser(teacher.model, variables, given, blank).raw_both(x, t)[1]
     target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
     student_given, _ = task._conditions(params, batch, drop_key, dropout=False)
-    output = task.model.apply(task.trainable(params), x, schedule.model_time(t),
+    output = task.model.apply(task.model_variables(params), x, schedule.model_time(t),
                               **with_guidance(student_given, scale))
     expected = jnp.mean(0.5 * jnp.square(output - target))
     assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)

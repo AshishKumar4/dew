@@ -35,6 +35,7 @@ import jax
 import optax
 import tyro
 from etils import epath
+from flax import linen as nn
 
 import dew.data  # registers the datasets a config names
 import dew.io
@@ -100,7 +101,7 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
-    dtype: registry.DtypeName = "bfloat16"
+    dtype: registry.DtypeName | None = "bfloat16"
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
     """Parameter storage, where the model declares the field. Unset stores
@@ -136,6 +137,41 @@ class ModelConfig:
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back the record `RunConfig.to_dict` writes for this field."""
         return _built(cls, values)
+
+    @classmethod
+    def from_model(cls, model) -> Self:
+        """The registered module's constructor fields, with its actual compute settings."""
+        architecture = models.name_of(type(model))
+        fields = {}
+        compute, storage, attention = None, None, 'auto'
+        precision: Literal['default', 'high', 'highest'] | None = None
+        for field in dataclasses.fields(model):
+            if not field.init or field.name in ('parent', 'name'):
+                continue
+            value = getattr(model, field.name)
+            if field.name == 'dtype':
+                compute = registry.dtype_name(value)
+            elif field.name == 'param_dtype':
+                storage = registry.dtype_name(value)
+            elif field.name == 'precision':
+                if value is not None:
+                    setting = str(value).lower()
+                    if setting == 'default':
+                        precision = 'default'
+                    elif setting == 'high':
+                        precision = 'high'
+                    elif setting == 'highest':
+                        precision = 'highest'
+                    else:
+                        raise ValueError(f'model precision {value!r} has no recorded counterpart')
+            elif field.name == 'attention_impl':
+                attention = value
+            elif callable(value) and value is field.default:
+                continue
+            else:
+                fields[field.name] = _to_json(value, _declared_type(type(model), field.name))
+        return cls(architecture, fields, dtype=compute, param_dtype=storage,
+                   matmul_precision=precision, attention_impl=attention)
 
     def build(self):
         return models.build(self.architecture, self.fields())
@@ -496,6 +532,8 @@ def _to_json(value, annotation) -> JSON:
     registry and member types the read side rebuilds from."""
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)
+    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+        return registry.dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(annotation)
         if held is not None and not any(type(value) is member
@@ -507,7 +545,8 @@ def _to_json(value, annotation) -> JSON:
         if held is None:
             held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value) if _recorded(f)}
+                  for f in dataclasses.fields(value) if _recorded(f)
+                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
         if held is None:
             return fields
         name = held.name_of(type(value))
@@ -835,3 +874,6 @@ class RunConfig:
             tracker.log({"sweep/value": value}, index)
             tracker.artifact(trial, index)
         return finished
+
+
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]

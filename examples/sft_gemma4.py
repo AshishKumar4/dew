@@ -29,7 +29,7 @@ import tyro
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ChatMessages, HFTokenizer, Loading
 from dew.data.chat import Role
-from dew.interop import PretrainedDecoder, export_run
+from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.training import MeshSpec, TrainState, prepare_process
 
@@ -142,7 +142,7 @@ def main(config: Config) -> Path:
 
     run_dir = Path(run.trainer.checkpoint_dir) / name
     export = config.out / "export"
-    export_run(str(run_dir), export)
+    PretrainedDecoder.from_run(str(run_dir)).save(export)
     print(f"trained {int(state.step)} steps; run {run_dir}; exported {export}")
     return export
 

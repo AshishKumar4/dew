@@ -433,3 +433,14 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     # The bound only keeps an exit from waiting on a service that stopped
     # answering.
     stop_at_exit(watcher, stop.set, timeout=5.0)
+
+
+__all__ = [
+    "ImageGrid",
+    "PeerFailure",
+    "Representations",
+    "TextSamples",
+    "TokenScores",
+    "VideoGrid",
+    "uint8_pixels",
+]

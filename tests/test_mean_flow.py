@@ -105,7 +105,7 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
     x_T = jax.random.normal(jax.random.PRNGKey(3), (4, 4, 4, 3))
     walked = sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
     schedule = task.process.schedule
-    u = task.model.apply(task.trainable(params), x_T, schedule.model_time(jnp.ones((4,))), **given,
+    u = task.model.apply(task.model_variables(params), x_T, schedule.model_time(jnp.ones((4,))), **given,
                          duration=schedule.model_time(jnp.ones((4,))) - schedule.model_time(jnp.zeros((4,))))
     np.testing.assert_allclose(np.asarray(walked), np.asarray(x_T - u), rtol=1e-5, atol=1e-6)
 

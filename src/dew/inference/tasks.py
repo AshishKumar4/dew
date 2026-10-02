@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
@@ -261,17 +261,17 @@ def _pulled(repo_id: str) -> str:
     return os.fspath(pull_from_hub(repo_id))
 
 
-def run_record(directory: str) -> Mapping[str, object]:
-    """Read the `run.json` a run directory publishes beside its checkpoints."""
-    import json
+def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
+    """The inference declaration of the selected checkpoint, not training configuration."""
+    from dew.checkpoints import Checkpoints
+    record = Checkpoints(directory).artifact(step)
+    if record is None:
+        raise ValueError("this checkpoint names no registered inference model; register it and declare "
+                         "Objective.inference_record, or call objective.pipeline(state)")
+    return named_fields(record, 'checkpoint artifact')
 
-    from etils import epath
 
-    from dew.checkpoints import RUN_FILE
-    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
-
-
-def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
+def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
     from dew.config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
@@ -281,12 +281,13 @@ def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig
     return config if compute is None else replace(config, dtype=compute)
 
 
-def _saved_processor(record: Mapping[str, object]) -> Processor:
+def _saved_processor(record: Mapping[str, object]) -> Processor | None:
     """Build the run's tokenizer into a task's host processor."""
     from dew.data.text import tokenizer_for
     from dew.inference.pipeline import RunProcessor
 
-    return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))
+    tokenizer = record.get('tokenizer')
+    return None if tokenizer is None else RunProcessor(tokenizer_for(named(tokenizer, "tokenizer")))
 
 
 def _saved_budget(record: Mapping[str, object]) -> int | None:
@@ -299,9 +300,10 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
+def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None
+               ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory)
+    record = run_record(directory, step)
     return record, _saved_model(record, dtype), _saved_processor(record)
 
 
@@ -399,7 +401,12 @@ class TextGeneration:
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _freeze_variables(self, self.variables)
+        variables = self.variables
+        if all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(variables)):
+            from dew.inference.serving import _inference_projections
+
+            variables = jax.device_put(_inference_projections(self.model, variables))
+        _freeze_variables(self, variables)
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -446,7 +453,7 @@ class TextGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load the causal run in `directory`: the model its `run.json` records,
         rebuilt the way the recipe built it, over the weights of its latest
         checkpoint (or `step`), decoding through the run's own tokenizer.
@@ -459,17 +466,17 @@ class TextGeneration:
         checkpoint stored. The run's preview budget and sampling policy
         become the task's defaults.
         """
+        from dew.checkpoints import Checkpoints
         from dew.objectives.base import thaw
         from dew.registry import objectives
-        from dew.sampling.pipelines import restore_variables
 
         import_module("dew.objectives.lm")  # registers the saved objective kinds
         import_module("dew.objectives.rl")
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         kind = named(record["objective"], "objective")
         budget = _saved_budget(record)
         objective_type = objectives[kind]
-        variables = restore_variables(directory, ema=False if objective_type._ema_is_reference else ema,
+        variables = Checkpoints(directory).variables( ema=False if objective_type._ema_is_reference else ema,
                                       step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if kind == "ppo":
             from dew.objectives.rl.ppo import _part
@@ -484,7 +491,8 @@ class TextGeneration:
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -551,7 +559,7 @@ class BlockGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory`: the DiffusionGemma its
         `run.json` records over the weights of its latest checkpoint (or
         `step`), sampling over the canvas the model declares.
@@ -560,28 +568,23 @@ class BlockGeneration:
         selects the averaged weights, `mesh` and `layout` place them, and
         the two dtypes override computation and storage.
         """
-        from dew.interop import diffusion_gemma
-        from dew.sampling.pipelines import restore_variables
-
-        record, model_config, processor = _saved_run(directory, dtype)
-        canvas = model_config.config["max_seq_len"]
-        if not isinstance(canvas, int):
-            raise ValueError(
-                f"run.json records max_seq_len as {canvas!r}; the canvas a "
-                f"block-diffusion run decodes is a number of tokens")
-        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
-                                      attention_impl=model_config.attention_impl,
-                                      max_seq_len=canvas)
-        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
-        return cls(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
-                   processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
+        from dew.checkpoints import Checkpoints
+        from dew.diffusion.block import BlockProcess
+        record, model_config, processor = _saved_run(directory, dtype, step)
+        model = model_config.build()
+        if not isinstance(model, DiffusionGemma):
+            raise TypeError("block checkpoint must declare DiffusionGemma")
+        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout,
+                                                      param_dtype=param_dtype)
+        return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
+                   processor,
+                   max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -640,7 +643,7 @@ class MaskedGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory`: the bidirectional model
         its `run.json` records over the weights of its latest checkpoint (or
         `step`), refined with MDLM over the run's own mask token.
@@ -648,10 +651,11 @@ class MaskedGeneration:
         The arguments carry what `TextGeneration.from_run` carries, and the
         run's preview budget becomes the response length a call omits.
         """
-        from dew.diffusion.discrete import MDLM
-        from dew.sampling.pipelines import restore_variables
+        from dew.checkpoints import Checkpoints
+        from dew.diffusion.discrete import DiscreteProcess
+        from dew.registry import solvers
 
-        record, model_config, processor = _saved_run(directory, dtype)
+        record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
         model = model_config.build()
         if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
@@ -659,16 +663,25 @@ class MaskedGeneration:
                 "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
             )
         mask_id = model.mask_token_id
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+        variables = Checkpoints(directory).variables( ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
-        return cls(model, variables, MDLM(mask_id=mask_id)(), processor,
+        process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
+        if process.mask_id != mask_id:
+            raise ValueError("model and process mask token disagree")
+        solver = named_fields(record['solver'], 'solver')
+        unmask = solvers.build(named(solver['name'], 'solver'), named_fields(solver['fields'], 'fields'))
+        if not isinstance(unmask, Unmask):
+            raise ValueError("a saved masked run requires an Unmask solver")
+        return cls(model, variables, process, processor, solver=unmask,
+                   steps=integer(record['sampling_steps'], 'sampling_steps'),
                    pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
                    max_new_tokens=budget or None)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
-                        dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+                        dtype: DTypeLike | None = None,
+                        param_dtype: DTypeLike | None = None) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         `HfApi().upload_folder` of the run directory itself is what writes it.
@@ -696,3 +709,4 @@ class MaskedGeneration:
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 
+__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration"]

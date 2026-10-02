@@ -229,7 +229,7 @@ def main(config: Config) -> None:
     print(f"Mesh {dict(mesh.shape)} over {mesh.devices.size} {jax.devices()[0].device_kind} device(s)")
 
     state, _, _ = trainer.place()
-    kernel = state.params["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
+    kernel = state.variables["params"]["layers_0"]["mlp"]["experts"]["gate_proj"]["kernel"]
     print(f"Expert kernel {kernel.shape} placed as {kernel.sharding.spec}")
     shards = mesh.shape["expert"]
     where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
@@ -248,7 +248,7 @@ def main(config: Config) -> None:
         for current in range(1, config.steps + 1):
             # LMObjective predicts text[:, 1:] from text[:, :-1].
             inputs = batch["text"][:, :-1]
-            layers = routing_record(routing(selections, state.params, inputs, trainer), np.asarray(inputs),
+            layers = routing_record(routing(selections, state.variables, inputs, trainer), np.asarray(inputs),
                                     where, config.experts, shards, config.dispatch)
             state, loss, _, _, _ = step(state, batch)
             steps.append({"step": current, "loss": float(loss),
@@ -271,7 +271,7 @@ def main(config: Config) -> None:
     starts = ["the cat ", "a dog li", "my frien", "12+30=", "7+41=", "x = y * ", "total = ", "count = "]
     width = max(len(start) for start in starts)
     starts = [start.rjust(width, "\n") for start in starts]
-    task = TextGeneration(model, state.params, RunProcessor(tokenizer), sampling=Sampling(temperature=0.0))
+    task = TextGeneration(model, state.variables, RunProcessor(tokenizer), sampling=Sampling(temperature=0.0))
     server = Server.from_task(task, slots=len(starts), capacity=64)
     generations = [generation.host() for generation in
                    server(starts, config.sequence_length - width, key=config.seed)]
@@ -284,7 +284,7 @@ def main(config: Config) -> None:
         "label": "after training: one forward over the prompts and their greedy continuations", "step": None,
         "loss": None,
         "rows": [[rows.start, rows.stop] for rows in inference.rows],
-        "layers": routing_record(routing(selections, state.params, sequences_on_mesh, trainer), sequences,
+        "layers": routing_record(routing(selections, state.variables, sequences_on_mesh, trainer), sequences,
                                  inference, config.experts, shards, config.dispatch)})
 
     record = {

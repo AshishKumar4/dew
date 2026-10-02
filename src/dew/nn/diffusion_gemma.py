@@ -214,3 +214,6 @@ def translate_weights(
     if missing:
         raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
     return params
+
+
+__all__ = ["DiffusionGemma", "SelfConditioning"]

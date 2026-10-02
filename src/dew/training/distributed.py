@@ -347,7 +347,7 @@ class Layout:
     `host` names the fields of `HOST_RESIDENT` kept in pinned host memory
     between steps. The step fetches them to the device, updates them as it
     would have, and writes them back, so what they hold is the same and only
-    where changes. Naming params instead selects canonical CPU ownership of
+    where changes. Naming variables instead selects canonical CPU ownership of
     the entire TrainState, including optimizer, EMA and accumulation. The
     full logical optimizer transaction then runs on a CPU companion of this
     mesh, and accelerator parameter banks are immutable execution snapshots,
@@ -482,7 +482,7 @@ class Layout:
                 f"in pinned host memory, which only a stack that fetches a layer's "
                 f"parameters as it reaches it reads; this placement keeps every "
                 f"parameter on the device. Place the weights for generation with a "
-                f"dew.inference.LayerBanks source's place, or use host=('params',) for a "
+                f"dew.inference.LayerBanks source's place, or use host=('variables',) for a "
                 f"CPU-owned training transaction and drop the inference-only patterns")
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
@@ -851,3 +851,6 @@ class DevicePrefetchIterator:
             self.source_state = position
             return batch
         raise StopIteration
+
+
+__all__ = ["DevicePrefetchIterator", "Layout", "MeshSpec", "batch_shardings"]

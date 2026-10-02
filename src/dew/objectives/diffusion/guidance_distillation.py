@@ -97,7 +97,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         teacher = self.teacher
         frozen = jax.lax.stop_gradient(variables[TEACHER])
         given, blank = teacher._conditions(frozen, batch, drop_key, dropout=False)
-        denoise = teacher.process.denoiser(teacher.model, teacher.trainable(frozen), given, blank)
+        denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank)
         conditional, unconditional = denoise.raw_both(noisy, t)
         target = jax.lax.stop_gradient(guided_target(conditional, unconditional, scale))
 
@@ -105,7 +105,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         if not any(isinstance(value, DenoisingCondition) and value.guidance is not None
                    for value in conditions.values()):
             raise ValueError("the student's conditioning carries no guidance input to distill into")
-        output = self.model.apply(self.trainable(variables), noisy * c_in, schedule.model_time(t),
+        output = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=True,
                                   rngs={"dropout": jax.random.fold_in(step.key, 1)})
         assert isinstance(output, jax.Array)
