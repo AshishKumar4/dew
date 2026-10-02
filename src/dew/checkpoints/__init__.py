@@ -1,6 +1,6 @@
 """Save and restore a run's train state and data position through orbax.
 
-A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
+A checkpoint holds `step`, `variables`, `opt_state`, `ema`, `key` and, when the
 data iterator can report one, `position`. Metrics, the loss scale and epoch
 counters are the loop's business and are rebuilt on resume. A position is
 either global, and readable by any partition of the data, or one share's

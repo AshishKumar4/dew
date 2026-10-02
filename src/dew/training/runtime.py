@@ -78,7 +78,7 @@ def prepare_process(wandb: Wandb | None = None,
     never runs a recipe, sets XLA_FLAGS in the environment.
 
     The same Layout passed to Trainer selects CPU transaction ownership when
-    host includes params. JAX_PLATFORMS must then permit CPU beside the
+    host includes variables. JAX_PLATFORMS must then permit CPU beside the
     accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
     establish one CPU device per local accelerator before this call.
     Validation never changes backend configuration after initialization.
