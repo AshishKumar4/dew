@@ -483,7 +483,7 @@ def recompute_more(objective) -> bool:
 @dataclasses.dataclass(frozen=True)
 class Plateau:
     """Stop after `evals` eligible evaluations without an improvement larger than min_delta."""
-    metric: Metric | TrainingScalar
+    metric: Metric | TrainingScalar | types.MethodType
     evals: int = 5
     min_delta: float = 0.0
     mode: Literal['min', 'max'] | None = None
@@ -497,7 +497,7 @@ class Plateau:
 class _MetricValues[Statistics, Additions](Mapping):
     def __init__(self, metrics: Sequence[Metric], scores: Mapping[str, float], objective: Objective[Statistics, Additions]):
         self.objective = objective
-        self.metrics = tuple(metrics) + tuple(objective.values[name] for name in ('loss', *objective.shown)
+        self.metrics = tuple(metrics) + tuple(objective.scalars[name] for name in ('loss', *objective.shown)
                                               if name == 'loss' or f'train/{name}' in scores)
         self.scores = scores
 
@@ -1207,7 +1207,7 @@ class Trainer(Generic[Loss, Effects]):
     def fit(self, dataset: Dataset, *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | datetime.timedelta | None = None,
             metrics: Sequence[Metric] = (), preview: bool = False,
-            best: str | Metric | TrainingScalar | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
+            best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None, stop: Plateau | None = None,
             validation: Mapping[str, Reader] | None = None, restore_best: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
@@ -1249,7 +1249,7 @@ class Trainer(Generic[Loss, Effects]):
             plan = _FitPlan(dataset, steps, log_every, eval_every, checkpoint_every,
                             None if checkpoints is None else checkpoints.local_every, metrics, preview,
                             best=selection, stop=stop, validation_splits=validation, restore_best=restore_best,
-                            validation=validation is not None or (dataset.val is not None and bool(eval_every or metrics or checkpoints)))
+                            validation=validation is not None or (bool(eval_every or metrics) and dataset.val is not None))
             state, shardings, position = self.place()
             run.last_checkpoint = time.perf_counter()
             if checkpoints is not None and checkpoints.latest is not None:
@@ -1393,8 +1393,8 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(data_partition(mesh))
             self._check_stream(run.source, mesh,
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
-                                   checkpoints is not None and plan.eval_every and (
-                                       not plan.best or any(not choice.weights_only for choice in plan.best)))))
+                                   checkpoints is not None and plan.eval_every and plan.best and
+                                   any(not choice.weights_only for choice in plan.best))))
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
@@ -1436,7 +1436,8 @@ class Trainer(Generic[Loss, Effects]):
                 run.other += run.evaluation.elapsed_seconds
         scores = {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         ranking = self._ranking(plan, scores)
-        winners = checkpoints._candidates(ranking) if evaluation_due and checkpoints is not None else ()
+        winners = checkpoints._candidates(ranking) if (
+            evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
         candidate = bool(winners)
         if scores and self._plateau(plan, run, scores):
             run.stopped = True
@@ -1531,14 +1532,14 @@ class Trainer(Generic[Loss, Effects]):
         def owned(choice):
             if isinstance(choice, types.MethodType):
                 if choice.__name__ == 'loss' and choice.__self__ is self.objective:
-                    return self.objective.values.loss
+                    return self.objective.scalars.loss
                 raise TypeError("a training selector must be this objective's loss or declared scalar")
             if isinstance(choice, TrainingScalar) and choice.owner is not self.objective:
                 raise ValueError("training scalar belongs to a different objective")
             if isinstance(choice, Best):
                 source = choice._source
                 if source is None and (choice.metric.startswith('train/') or choice.split == 'train'):
-                    source = self.objective.values[choice.metric.removeprefix('train/')]
+                    source = self.objective.scalars[choice.metric.removeprefix('train/')]
                 return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
             return choice
         selection = tuple(self._best_selection(owned(Best(choice) if isinstance(choice, str) else choice), metrics, splits)
@@ -1619,6 +1620,7 @@ class Trainer(Generic[Loss, Effects]):
         stop = plan.stop
         if stop is None:
             return False
+        assert isinstance(stop.metric, (Metric, TrainingScalar)), "fit binds the stopping selector before stepping"
         name = f'{stop.split}/{stop.metric.name}'
         if name not in scores:
             return False

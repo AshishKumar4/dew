@@ -303,10 +303,10 @@ def test_record_metrics_and_keep_predicate_accept_unhashable_metric_objects(tmp_
     class WithCe(Overfit):
         shown = {'ce': Shown(better='lower')}
     objective = WithCe()
-    assert 'ce' in dir(objective.values)
-    assert objective.values.ce.owner is objective
+    assert 'ce' in dir(objective.scalars)
+    assert objective.scalars.ce.owner is objective
     with pytest.raises(AttributeError, match='does not declare'):
-        _ = objective.values.unknown_report
+        _ = objective.scalars.unknown_report
 
 
 @pytest.mark.parametrize('given', ['fid', '{"metric":"fid","top":3}',
@@ -356,3 +356,31 @@ def test_recorded_retention_and_cadence_roundtrip_without_losing_microseconds():
     assert RunConfig.from_dict(config.to_dict()) == config
     with pytest.raises(TypeError, match='code-only'):
         TrainerConfig(keep=Keep(where=lambda c: True))
+
+
+def test_committed_metadata_is_cached_and_deleted_steps_leave_the_cache(tmp_path, monkeypatch):
+    run = trainer(tmp_path / 'run')
+    state = run.fit(Data(train=data()._train), steps=1, log_every=1)
+    checkpoints = Checkpoints(str(tmp_path / 'isolated'), keep=1)
+    checkpoints.save(1, state, None, ranking=Ranking('value', 1.))
+    checkpoints.wait()
+    persistent = checkpoints._open()
+    original = persistent.metadata
+    reads = []
+    def metadata(step):
+        reads.append(step)
+        return original(step)
+    monkeypatch.setattr(persistent, 'metadata', metadata)
+    assert checkpoints.would_keep(Ranking('value', .5))
+    first_reads = list(reads)
+    assert first_reads
+    assert checkpoints.would_keep(Ranking('value', .4))
+    assert reads == first_reads
+    # Better step 2 replaces step 1 under both latest and best policies.
+    checkpoints.save(2, state.replace(step=jnp.int32(2)), None, ranking=Ranking('value', .5))
+    checkpoints.wait()
+    assert [checkpoint.step for checkpoint in checkpoints.kept()] == [2]
+    assert 1 not in checkpoints._step_cache
+    records = checkpoints.kept()
+    records[0].rankings['value']['top'] = 99
+    assert checkpoints.kept()[0].rankings['value']['top'] == 1

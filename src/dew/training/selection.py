@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import types
 from collections.abc import Callable, Mapping
 from typing import Literal
 
@@ -25,7 +26,7 @@ class Best:
     _source: Metric | TrainingScalar | Callable[[Mapping], float] | None = dataclasses.field(
         default=None, repr=False, compare=False, metadata={'record': False})
 
-    def __init__(self, metric: str | Metric | TrainingScalar | Callable[[Mapping], float],
+    def __init__(self, metric: str | Metric | TrainingScalar | types.MethodType | Callable[[Mapping], float],
                  top: int = 1, mode: Literal['min', 'max'] | None = None,
                  threshold: float | None = None, weights_only: bool = False, split: str | None = None,
                  *, _source: Metric | TrainingScalar | Callable[[Mapping], float] | None = None):
