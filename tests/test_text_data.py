@@ -607,6 +607,49 @@ def test_the_tokenize_command_writes_what_the_library_writes(tmp_path, capsys):
     assert f"wrote {library['train_tokens']} tokens to" in capsys.readouterr().out
 
 
+def _bos_tokenizer(directory):
+    """A word-level tokenizer that starts every encode with its bos id, as
+    Llama's does, saved where `HFTokenizer` loads it without the hub."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    from transformers import PreTrainedTokenizerFast
+
+    words = ["<s>", "</s>", "<unk>", *(f"w{index}" for index in range(20))]
+    core = Tokenizer(models.WordLevel({word: index for index, word in enumerate(words)},
+                                      unk_token="<unk>"))
+    core.pre_tokenizer = pre_tokenizers.Whitespace()
+    core.post_processor = processors.TemplateProcessing(single="<s> $A", special_tokens=[("<s>", 0)])
+    PreTrainedTokenizerFast(tokenizer_object=core, bos_token="<s>", eos_token="</s>",
+                            unk_token="<unk>").save_pretrained(str(directory))
+    return str(directory)
+
+
+def test_a_bos_adding_tokenizer_starts_each_document_once_however_it_is_chunked(tmp_path, monkeypatch):
+    """A file is encoded in chunks. Encoding each with the tokenizer's special
+    tokens put a bos id at every chunk boundary, in the middle of documents."""
+    from dew.data.sources import text as token_files
+
+    tokenizer = _bos_tokenizer(tmp_path / "tokenizer")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    lines = "".join(f"w{index % 20} w{(index + 3) % 20}\n" for index in range(40))
+    (raw / "a.txt").write_text(lines, encoding="utf-8")
+    (raw / "b.txt").write_text(lines[:90], encoding="utf-8")
+    monkeypatch.setattr(token_files, "CHUNK_CHARS", 16)
+
+    meta = write_tokens(raw, tmp_path / "files", tokenizer=tokenizer, val_fraction=0.0, pack=True)
+    stream = np.fromfile(tmp_path / "files" / "train.bin", dtype=meta["dtype"])
+
+    bos, eos = 0, meta["eos_id"]
+    starts = np.flatnonzero(stream == bos)
+    ends = np.flatnonzero(stream == eos)
+    assert len(starts) == 2 and len(ends) == 2, "one bos and one eos per document"
+    assert starts[0] == 0 and starts[1] == ends[0] + 1, "each bos opens its document"
+
+    write_tokens(["w1 w2 w3", "w4"], tmp_path / "strings", tokenizer=tokenizer, val_fraction=0.0)
+    strings = np.fromfile(tmp_path / "strings" / "train.bin", dtype=meta["dtype"])
+    assert strings.tolist() == [bos, 4, 5, 6, bos, 7]
+
+
 def test_written_tokens_take_the_smallest_dtype_that_fits():
     assert dtype_for(256) == np.dtype("uint8")
     assert dtype_for(257) == np.dtype("uint16")

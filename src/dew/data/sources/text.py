@@ -26,9 +26,12 @@ import json
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from dew.data.text import ByteTokenizer, HFTokenizer
 
 # meta.json's "dtype" names numpy dtypes; uint16 covers byte tokenizers and
 # most HF ones, uint32 the rest.
@@ -134,8 +137,9 @@ def write_tokens(documents: str | os.PathLike[str] | Iterable[str], out: str | o
 
     The ids go to `train.bin` and `val.bin` at the smallest unsigned width
     the vocabulary fits, with `val_fraction` of the stream, from its head,
-    held out. `pack` ends every document with the tokenizer's eos id, which
-    `PackedTokens` cuts documents at. A file is read in line-bounded chunks
+    held out. The ids the tokenizer adds to one encode, a bos id for many,
+    are written once per document. `pack` ends every document with the
+    tokenizer's eos id, which `PackedTokens` cuts documents at. A file is read in line-bounded chunks
     so a corpus larger than memory costs disk, and each chunk ends at a
     newline, so a tokenizer that merges across its input sees whole lines.
     Returns what `meta.json` records.
@@ -156,20 +160,24 @@ def write_tokens(documents: str | os.PathLike[str] | Iterable[str], out: str | o
     # point needs the total count, and slicing a memmap of it costs a linear
     # copy, not a second tokenization.
     scratch = root / "all.bin"
+    opening, closing = _added(encoder)
+    # Every document is terminated, the last included, because the packing
+    # source reads a record as the span up to an eos.
+    closing = closing if eos is None else [*closing, eos]
     total = 0
     try:
         with open(scratch, "wb") as handle:
             for document in _documents(documents):
                 written = 0
                 for chunk in document:
-                    ids = encoder.encode(chunk)
+                    ids = encoder.encode(chunk, add_special_tokens=False)
+                    if ids and not written:
+                        ids = [*opening, *ids]
                     handle.write(np.asarray(ids, dtype=dtype).tobytes())
                     written += len(ids)
-                if written and eos is not None:
-                    # Every document is terminated, the last included, because
-                    # the packing source reads a record as the span up to an eos.
-                    handle.write(np.asarray([eos], dtype=dtype).tobytes())
-                    written += 1
+                if written:
+                    handle.write(np.asarray(closing, dtype=dtype).tobytes())
+                    written += len(closing)
                 total += written
         if total < 2:
             raise ValueError(f"the corpus tokenized to {total} tokens; a window needs at least 2")
@@ -184,6 +192,23 @@ def write_tokens(documents: str | os.PathLike[str] | Iterable[str], out: str | o
                      train_tokens=total - held_out, val_tokens=held_out, eos_id=eos)
     (root / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
+
+
+def _added(encoder: ByteTokenizer | HFTokenizer) -> tuple[list[int], list[int]]:
+    """The ids the tokenizer adds before and after the text of one encode.
+
+    A document is encoded in chunks, each without them, so a tokenizer that
+    starts a sequence with its bos id puts it once at the document's start
+    rather than once per chunk. Read off one probe encode.
+    """
+    plain = encoder.encode("a", add_special_tokens=False)
+    whole = encoder.encode("a")
+    for start in range(len(whole) - len(plain) + 1):
+        if whole[start:start + len(plain)] == plain:
+            return whole[:start], whole[start + len(plain):]
+    raise ValueError(
+        f"{encoder!r} encodes a probe with special tokens to {whole}, which does not "
+        f"contain its plain encoding {plain}; the ids it adds cannot be placed per document")
 
 
 def dtype_for(vocab_size: int) -> np.dtype:
